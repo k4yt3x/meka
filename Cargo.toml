@@ -2,6 +2,9 @@
 name = "agsh"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "An agentic shell"
+repository = "https://github.com/k4yt3x/agsh"
 
 [[bin]]
 name = "agsh"

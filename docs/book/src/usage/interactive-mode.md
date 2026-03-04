@@ -103,6 +103,13 @@ PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
 
 The command runs with inherited stdin/stdout/stderr, so it behaves exactly like a regular shell. This is useful for quick checks without waiting for the LLM.
 
+## Exiting
+
+You can exit agsh in any of these ways:
+
+- Type `exit` or `quit`
+- Press **Ctrl+D** on an empty line
+
 ## Interrupting the Agent
 
 Press **Ctrl+C** while the agent is running to interrupt it. This cancels the current LLM request and kills any running shell commands that were spawned by the agent.

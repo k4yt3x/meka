@@ -105,6 +105,11 @@ pub fn run_repl(
                     continue;
                 }
 
+                if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+                    let _ = input_sender.send(ShellEvent::Exit);
+                    break;
+                }
+
                 if let Some(shell_command) = trimmed.strip_prefix('!') {
                     if shell_command.is_empty() {
                         continue;
