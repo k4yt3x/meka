@@ -97,3 +97,18 @@ model = "anthropic/claude-sonnet-4-20250514"
 base_url = "https://openrouter.ai/api/v1"
 # API key via env: export OPENAI_API_KEY=sk-or-...
 ```
+
+## `[web]`
+
+Settings for web-related tools (fetch_url, web_search).
+
+### `web.user_agent`
+
+Custom User-Agent string for HTTP requests. Some search engines may block requests with non-browser User-Agent strings.
+
+Default: `Mozilla/5.0 (compatible; agsh/0.1)`
+
+```toml
+[web]
+user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+```

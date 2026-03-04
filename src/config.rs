@@ -9,6 +9,7 @@ use crate::permission::Permission;
 pub struct ConfigFile {
     pub provider: Option<ProviderConfig>,
     pub display: Option<DisplayConfig>,
+    pub web: Option<WebConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -16,6 +17,11 @@ pub struct DisplayConfig {
     pub newline_before_prompt: Option<bool>,
     pub newline_after_prompt: Option<bool>,
     pub show_session_id: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct WebConfig {
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -40,6 +46,7 @@ pub struct ResolvedConfig {
     pub newline_before_prompt: bool,
     pub newline_after_prompt: bool,
     pub show_session_id: bool,
+    pub user_agent: String,
 }
 
 fn config_file_path() -> Option<PathBuf> {
@@ -72,6 +79,7 @@ impl ResolvedConfig {
         let config_file = load_config_file();
         let file_provider = config_file.provider.unwrap_or_default();
         let file_display = config_file.display.unwrap_or_default();
+        let file_web = config_file.web.unwrap_or_default();
 
         let provider_name = cli
             .provider
@@ -115,6 +123,9 @@ impl ResolvedConfig {
             newline_before_prompt: file_display.newline_before_prompt.unwrap_or(true),
             newline_after_prompt: file_display.newline_after_prompt.unwrap_or(true),
             show_session_id: file_display.show_session_id.unwrap_or(false),
+            user_agent: file_web
+                .user_agent
+                .unwrap_or_else(|| "Mozilla/5.0 (compatible; agsh/0.1)".to_string()),
         }
     }
 

@@ -53,15 +53,19 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub fn build_default() -> Self {
+    pub fn build_default(user_agent: String) -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(ReadFileTool));
         registry.register(Box::new(EditFileTool));
         registry.register(Box::new(WriteFileTool));
         registry.register(Box::new(FindFilesTool));
         registry.register(Box::new(SearchContentsTool));
-        registry.register(Box::new(FetchUrlTool));
-        registry.register(Box::new(WebSearchTool));
+        registry.register(Box::new(FetchUrlTool {
+            user_agent: user_agent.clone(),
+        }));
+        registry.register(Box::new(WebSearchTool {
+            user_agent: user_agent.clone(),
+        }));
         registry.register(Box::new(ExecuteCommandTool));
         registry
     }
@@ -591,9 +595,21 @@ impl Tool for ExecuteCommandTool {
         let command = require_str(&input, "command", "execute_command")?;
         let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(30000);
 
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
+        #[cfg(windows)]
+        let mut command_builder = {
+            let mut cmd = tokio::process::Command::new("powershell");
+            cmd.arg("-Command").arg(&command);
+            cmd
+        };
+
+        #[cfg(not(windows))]
+        let mut command_builder = {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(&command);
+            cmd
+        };
+
+        let mut child = command_builder
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -670,7 +686,9 @@ impl Tool for ExecuteCommandTool {
 // fetch_url
 // ---------------------------------------------------------------------------
 
-struct FetchUrlTool;
+struct FetchUrlTool {
+    user_agent: String,
+}
 
 #[async_trait]
 impl Tool for FetchUrlTool {
@@ -703,7 +721,7 @@ impl Tool for FetchUrlTool {
         let url = require_str(&input, "url", "fetch_url")?;
 
         let client = reqwest::Client::builder()
-            .user_agent("agsh/0.1")
+            .user_agent(&self.user_agent)
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|error| AgshError::ToolExecution {
@@ -761,7 +779,9 @@ impl Tool for FetchUrlTool {
 // web_search
 // ---------------------------------------------------------------------------
 
-struct WebSearchTool;
+struct WebSearchTool {
+    user_agent: String,
+}
 
 #[async_trait]
 impl Tool for WebSearchTool {
@@ -805,10 +825,7 @@ impl Tool for WebSearchTool {
             .unwrap_or("duckduckgo");
 
         let client = reqwest::Client::builder()
-            .user_agent(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-                 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
+            .user_agent(&self.user_agent)
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|error| AgshError::ToolExecution {
@@ -1185,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_tool_registry() {
-        let registry = ToolRegistry::build_default();
+        let registry = ToolRegistry::build_default("test-agent/0.1".to_string());
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
@@ -1199,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_permission_filtering() {
-        let registry = ToolRegistry::build_default();
+        let registry = ToolRegistry::build_default("test-agent/0.1".to_string());
 
         let none_tools = registry.definitions_for_permission(Permission::None);
         assert!(none_tools.is_empty());

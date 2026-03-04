@@ -81,6 +81,24 @@ pub fn build_system_prompt(permission: Permission, tools: &[ToolDefinition]) -> 
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+        {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                prompt.push_str(&format!("- OS: macOS {}\n", version));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        prompt.push_str("- OS: Windows\n");
+    }
+
     let now = chrono::Local::now().to_rfc2822();
     prompt.push_str(&format!("- Date: {}\n", now));
 

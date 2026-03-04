@@ -4,6 +4,9 @@ An agentic shell where you speak human, not bash.
 
 ![agsh Screenshot](https://github.com/user-attachments/assets/26d8cb43-234d-45dd-aca6-67ce86fff91a)
 
+> [!CAUTION]
+> Agents can perform potentially destructive actions. Exercise caution when granting write permissions. It is not recommended to run agsh on important systems with write permissions enabled.
+
 ## Overview
 
 agsh (agentic shell) is an interactive shell that replaces traditional command syntax with natural language. Describe what you want, and the agent reads files, searches code, runs commands, and browses the web to get it done. One binary, one config, works with any OpenAI-compatible or Anthropic API.

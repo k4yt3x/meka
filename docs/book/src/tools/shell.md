@@ -15,7 +15,7 @@ Execute a shell command and return its output.
 
 ### Behavior
 
-- Executes the command via `sh -c "<command>"`.
+- Executes the command via `sh -c "<command>"` on Unix or `powershell -Command "<command>"` on Windows.
 - Captures both stdout and stderr.
 - Returns the exit code along with the output.
 - Default timeout is 30 seconds. If the command exceeds the timeout, it is killed.

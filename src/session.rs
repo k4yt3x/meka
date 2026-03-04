@@ -248,13 +248,26 @@ impl SessionManager {
 }
 
 fn is_process_alive(pid_str: &str) -> bool {
-    pid_str
-        .parse::<u32>()
-        .map(|pid| {
-            // On Linux, /proc/{pid} exists iff the process is alive
-            std::path::Path::new(&format!("/proc/{}", pid)).exists()
-        })
-        .unwrap_or(false)
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        return false;
+    };
+
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output()
+            .map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

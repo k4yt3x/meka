@@ -68,7 +68,7 @@ fn create_agent_from_config(
         config.base_url.clone(),
     )?;
 
-    let tool_registry = ToolRegistry::build_default();
+    let tool_registry = ToolRegistry::build_default(config.user_agent.clone());
 
     Ok(Agent::new(
         provider,

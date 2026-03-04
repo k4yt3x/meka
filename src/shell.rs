@@ -114,6 +114,13 @@ pub fn run_repl(
                     if shell_command.is_empty() {
                         continue;
                     }
+                    #[cfg(windows)]
+                    let status = std::process::Command::new("powershell")
+                        .arg("-Command")
+                        .arg(shell_command)
+                        .status();
+
+                    #[cfg(not(windows))]
                     let status = std::process::Command::new("sh")
                         .arg("-c")
                         .arg(shell_command)

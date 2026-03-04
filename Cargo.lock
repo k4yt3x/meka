@@ -18,6 +18,7 @@ dependencies = [
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "libc",
  "reedline",
  "reqwest",
  "reqwest-eventsource",
