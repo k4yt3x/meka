@@ -9,8 +9,9 @@ Create `~/.config/agsh/config.toml` with your provider settings:
 ```toml
 [provider]
 name = "openai"
-model = "gpt-4o"
-api_key = "sk-..."
+base_url = "https://openrouter.ai/api/v1"
+api_key = "sk-or-v1-..."
+model = "anthropic/claude-opus-4.6"
 ```
 
 **Anthropic:**
@@ -18,7 +19,7 @@ api_key = "sk-..."
 ```toml
 [provider]
 name = "anthropic"
-model = "claude-sonnet-4-20250514"
+model = "claude-opus-4.6"
 api_key = "sk-ant-..."
 ```
 
@@ -71,3 +72,19 @@ agsh -p "what is my current working directory?"
 ```
 
 The process exits after the agent responds.
+
+## 6. Continue a Previous Session
+
+To pick up where you left off, continue the last session:
+
+```bash
+agsh -c
+```
+
+Or resume a specific session by its UUID:
+
+```bash
+agsh -s 550e8400-e29b-41d4-a716-446655440000
+```
+
+See [Sessions](../usage/sessions.md) for more details.

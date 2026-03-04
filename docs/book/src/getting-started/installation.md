@@ -2,6 +2,34 @@
 
 agsh is written in Rust and builds as a single binary.
 
+## Pre-Built Binaries
+
+Download the latest release for your platform from the [GitHub Releases](https://github.com/k4yt3x/agsh/releases/latest) page.
+
+| Platform | Archive |
+|----------|---------|
+| Linux (x86_64) | `agsh-linux-amd64.tar.gz` |
+| macOS (Apple Silicon) | `agsh-macos-arm64.tar.gz` |
+| Windows (x86_64) | `agsh-windows-amd64.zip` |
+
+Extract the binary and place it somewhere on your `$PATH`:
+
+```bash
+# Linux/macOS
+tar -xzf agsh-*.tar.gz
+cp agsh ~/.local/bin/
+```
+
+## Cargo Install
+
+If you have [Rust](https://www.rust-lang.org/tools/install) installed, you can install agsh directly from the Git repository:
+
+```bash
+cargo install --git https://github.com/k4yt3x/agsh.git
+```
+
+This builds the latest version from source and installs it to `~/.cargo/bin/`.
+
 ## Building from Source
 
 ### Prerequisites
@@ -23,7 +51,7 @@ The binary will be at `target/release/agsh`. Copy it somewhere on your `$PATH`:
 cp target/release/agsh ~/.local/bin/
 ```
 
-### Verify
+## Verify
 
 ```bash
 agsh --version
