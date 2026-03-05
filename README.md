@@ -56,7 +56,7 @@ The agent has access to the following built-in tools:
 The prompt indicator shows the current permission mode. Press **Shift+Tab** to cycle between modes:
 
 - `[n]` **none**: no tools available, text-only responses
-- `[r]` **read**: read-only tools (file reading, searching, web); cannot modify anything
+- `[r]` **read**: read-only tools (file reading, searching, web, sandboxed shell); cannot modify anything
 - `[w]` **write**: all tools enabled, including shell execution and file writes
 
 ## Sessions

@@ -53,7 +53,12 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub fn build_default(user_agent: String) -> Self {
+    pub fn build_default(
+        user_agent: String,
+        shared_permission: crate::permission::SharedPermission,
+        sandbox_enabled: bool,
+        sandbox_capability: crate::sandbox::SandboxCapability,
+    ) -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(ReadFileTool));
         registry.register(Box::new(EditFileTool));
@@ -66,7 +71,11 @@ impl ToolRegistry {
         registry.register(Box::new(WebSearchTool {
             user_agent: user_agent.clone(),
         }));
-        registry.register(Box::new(ExecuteCommandTool));
+        registry.register(Box::new(ExecuteCommandTool {
+            sandbox_capability,
+            shared_permission,
+            sandbox_enabled,
+        }));
         registry
     }
 }
@@ -558,14 +567,20 @@ fn walk_directory(
 // execute_command
 // ---------------------------------------------------------------------------
 
-struct ExecuteCommandTool;
+struct ExecuteCommandTool {
+    sandbox_capability: crate::sandbox::SandboxCapability,
+    shared_permission: crate::permission::SharedPermission,
+    sandbox_enabled: bool,
+}
 
 #[async_trait]
 impl Tool for ExecuteCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "execute_command".to_string(),
-            description: "Execute a shell command and return its output.".to_string(),
+            description: "Execute a shell command and return its output. In read mode, \
+                the command runs in a read-only sandbox where filesystem writes are blocked."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -584,7 +599,16 @@ impl Tool for ExecuteCommandTool {
     }
 
     fn required_permission(&self) -> Permission {
-        Permission::Write
+        if self.sandbox_enabled
+            && !matches!(
+                self.sandbox_capability,
+                crate::sandbox::SandboxCapability::Unavailable
+            )
+        {
+            Permission::Read
+        } else {
+            Permission::Write
+        }
     }
 
     async fn execute(
@@ -594,6 +618,23 @@ impl Tool for ExecuteCommandTool {
     ) -> Result<ToolOutput> {
         let command = require_str(&input, "command", "execute_command")?;
         let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(30000);
+        let permission = self.shared_permission.get();
+        let sandboxed = self.sandbox_enabled && permission < Permission::Write;
+
+        if sandboxed
+            && matches!(
+                self.sandbox_capability,
+                crate::sandbox::SandboxCapability::Unavailable
+            )
+        {
+            return Ok(ToolOutput {
+                content: "Shell command execution in read mode is not available on this \
+                    platform because filesystem sandboxing is not supported. Switch to \
+                    write mode (Shift+Tab) to execute commands without sandboxing."
+                    .to_string(),
+                is_error: true,
+            });
+        }
 
         #[cfg(windows)]
         let mut command_builder = {
@@ -602,10 +643,41 @@ impl Tool for ExecuteCommandTool {
             cmd
         };
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let mut command_builder = if sandboxed
+            && matches!(
+                self.sandbox_capability,
+                crate::sandbox::SandboxCapability::SandboxExec
+            ) {
+            let mut cmd = tokio::process::Command::new("sandbox-exec");
+            cmd.arg("-p")
+                .arg(crate::sandbox::SANDBOX_PROFILE_READONLY)
+                .arg("sh")
+                .arg("-c")
+                .arg(&command);
+            cmd
+        } else {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(&command);
+            cmd
+        };
+
+        #[cfg(target_os = "linux")]
         let mut command_builder = {
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c").arg(&command);
+            if sandboxed {
+                if let crate::sandbox::SandboxCapability::Landlock { abi_version } =
+                    self.sandbox_capability
+                {
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            crate::sandbox::apply_landlock_readonly(abi_version)
+                                .map_err(std::io::Error::from_raw_os_error)
+                        });
+                    }
+                }
+            }
             cmd
         };
 
@@ -761,7 +833,7 @@ impl Tool for FetchUrlTool {
         let content = if markdown.len() > max_length {
             format!(
                 "{}\n\n... (truncated, showing first {} characters)",
-                &markdown[..max_length],
+                &markdown[..markdown.floor_char_boundary(max_length)],
                 max_length
             )
         } else {
@@ -895,7 +967,10 @@ fn parse_duckduckgo_results(html: &str) -> String {
         let absolute_start = position + result_start;
 
         // Extract the URL from href
-        let url = extract_href(&html[..absolute_start + 200], absolute_start);
+        let url = extract_href(
+            &html[..html.floor_char_boundary(absolute_start + 200)],
+            absolute_start,
+        );
 
         // Extract the title text (between > and </a>)
         let title = if let Some(tag_end) = html[absolute_start..].find('>') {
@@ -1188,7 +1263,7 @@ fn truncate_string(string: &str, max_length: usize) -> &str {
     if string.len() <= max_length {
         string
     } else {
-        &string[..max_length]
+        &string[..string.floor_char_boundary(max_length)]
     }
 }
 
@@ -1200,9 +1275,18 @@ fn truncate_string(string: &str, max_length: usize) -> &str {
 mod tests {
     use super::*;
 
+    fn test_shared_permission() -> crate::permission::SharedPermission {
+        crate::permission::SharedPermission::new(Permission::Write)
+    }
+
     #[test]
     fn test_tool_registry() {
-        let registry = ToolRegistry::build_default("test-agent/0.1".to_string());
+        let registry = ToolRegistry::build_default(
+            "test-agent/0.1".to_string(),
+            test_shared_permission(),
+            true,
+            crate::sandbox::detect(),
+        );
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
@@ -1216,7 +1300,12 @@ mod tests {
 
     #[test]
     fn test_permission_filtering() {
-        let registry = ToolRegistry::build_default("test-agent/0.1".to_string());
+        let registry = ToolRegistry::build_default(
+            "test-agent/0.1".to_string(),
+            test_shared_permission(),
+            true,
+            crate::sandbox::detect(),
+        );
 
         let none_tools = registry.definitions_for_permission(Permission::None);
         assert!(none_tools.is_empty());
@@ -1224,8 +1313,8 @@ mod tests {
         let read_tools = registry.definitions_for_permission(Permission::Read);
         assert!(read_tools.iter().any(|t| t.name == "read_file"));
         assert!(read_tools.iter().any(|t| t.name == "find_files"));
+        assert!(read_tools.iter().any(|t| t.name == "execute_command"));
         assert!(!read_tools.iter().any(|t| t.name == "write_file"));
-        assert!(!read_tools.iter().any(|t| t.name == "execute_command"));
 
         let write_tools = registry.definitions_for_permission(Permission::Write);
         assert!(write_tools.iter().any(|t| t.name == "read_file"));
@@ -1401,7 +1490,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_command() {
-        let tool = ExecuteCommandTool;
+        let tool = ExecuteCommandTool {
+            sandbox_capability: crate::sandbox::detect(),
+            shared_permission: test_shared_permission(),
+            sandbox_enabled: true,
+        };
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo hello"}),
@@ -1416,7 +1509,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_command_failure() {
-        let tool = ExecuteCommandTool;
+        let tool = ExecuteCommandTool {
+            sandbox_capability: crate::sandbox::detect(),
+            shared_permission: test_shared_permission(),
+            sandbox_enabled: true,
+        };
         let result = tool
             .execute(
                 serde_json::json!({"command": "false"}),

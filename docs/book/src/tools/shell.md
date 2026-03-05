@@ -4,7 +4,7 @@
 
 Execute a shell command and return its output.
 
-**Permission:** Write
+**Permission:** Read (sandboxed) / Write (unsandboxed)
 
 ### Parameters
 
@@ -65,6 +65,23 @@ agsh [w] > run the full integration test suite (it might take a while)
 
 The agent may call `execute_command` with a higher `timeout_ms` value.
 
+### Read-Only Sandbox
+
+In **read mode**, commands run inside a read-only filesystem sandbox. The child process can read files and execute programs, but any attempt to write to the filesystem is blocked by the kernel:
+
+- **Linux**: Uses [Landlock LSM](https://landlock.io/) (kernel 5.13+). The child process is restricted via `landlock_restrict_self` before exec. Only `READ_FILE`, `READ_DIR`, and `EXECUTE` access rights are granted.
+- **macOS**: Uses `sandbox-exec` with a SBPL profile that denies all `file-write*` operations.
+- **Windows / unsupported platforms**: Shell commands are not available in read mode. Switch to write mode to execute commands.
+
+In **write mode**, commands run without any sandbox restrictions.
+
+To disable sandboxed shell execution in read mode, set `sandbox = false` under `[shell]` in the config file. When disabled, shell commands require write mode.
+
+```toml
+[shell]
+sandbox = false
+```
+
 ### Safety
 
-The agent is instructed (via the system prompt) to explain what it intends to do before running potentially destructive commands. However, the permission system is the primary safety mechanism: write-permission tools are only available when you explicitly enable write mode.
+The agent is instructed (via the system prompt) to explain what it intends to do before running potentially destructive commands. In read mode, the filesystem sandbox provides an additional layer of protection by physically preventing writes. In write mode, the permission system is the primary safety mechanism.

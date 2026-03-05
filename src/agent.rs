@@ -23,6 +23,7 @@ pub struct Agent {
     newline_before_prompt: bool,
     newline_after_prompt: bool,
     show_session_id: bool,
+    sandboxed_shell: bool,
 }
 
 impl Agent {
@@ -35,6 +36,7 @@ impl Agent {
         newline_before_prompt: bool,
         newline_after_prompt: bool,
         show_session_id: bool,
+        sandboxed_shell: bool,
     ) -> Self {
         Self {
             provider,
@@ -45,6 +47,7 @@ impl Agent {
             newline_before_prompt,
             newline_after_prompt,
             show_session_id,
+            sandboxed_shell,
         }
     }
 
@@ -82,7 +85,7 @@ impl Agent {
 
             let permission = self.shared_permission.get();
             let tools = self.available_tools(permission);
-            let system_prompt = build_system_prompt(permission, &tools);
+            let system_prompt = build_system_prompt(permission, &tools, self.sandboxed_shell);
 
             let (assistant_message, stop_reason) = if self.streaming {
                 self.run_streaming(&system_prompt, messages, &tools, cancellation.clone())

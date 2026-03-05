@@ -5,6 +5,7 @@ mod error;
 mod permission;
 mod provider;
 mod render;
+mod sandbox;
 mod session;
 mod shell;
 mod system_prompt;
@@ -68,7 +69,19 @@ fn create_agent_from_config(
         config.base_url.clone(),
     )?;
 
-    let tool_registry = ToolRegistry::build_default(config.user_agent.clone());
+    let sandbox_capability = crate::sandbox::detect();
+    let sandboxed_shell = config.sandbox
+        && !matches!(
+            sandbox_capability,
+            crate::sandbox::SandboxCapability::Unavailable
+        );
+
+    let tool_registry = ToolRegistry::build_default(
+        config.user_agent.clone(),
+        shared_permission.clone(),
+        config.sandbox,
+        sandbox_capability,
+    );
 
     Ok(Agent::new(
         provider,
@@ -79,6 +92,7 @@ fn create_agent_from_config(
         config.newline_before_prompt,
         config.newline_after_prompt,
         config.show_session_id,
+        sandboxed_shell,
     ))
 }
 

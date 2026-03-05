@@ -1,7 +1,11 @@
 use crate::permission::Permission;
 use crate::provider::ToolDefinition;
 
-pub fn build_system_prompt(permission: Permission, tools: &[ToolDefinition]) -> String {
+pub fn build_system_prompt(
+    permission: Permission,
+    tools: &[ToolDefinition],
+    sandboxed_shell: bool,
+) -> String {
     let mut prompt = String::new();
 
     prompt.push_str(
@@ -21,13 +25,27 @@ pub fn build_system_prompt(permission: Permission, tools: &[ToolDefinition]) -> 
             );
         }
         Permission::Read => {
-            prompt.push_str(
-                "You can use READ-ONLY tools: reading files, searching files and contents, \
-                 fetching web pages, and searching the web. You CANNOT write files, \
-                 edit files, or execute shell commands. If the user asks you to perform \
-                 a write operation, inform them that the current permission mode does not \
-                 allow it and suggest they press Shift+Tab to cycle to 'write' mode.\n\n",
-            );
+            if sandboxed_shell {
+                prompt.push_str(
+                    "You can use READ-ONLY tools: reading files, searching files and contents, \
+                     fetching web pages, searching the web, and executing shell commands in a \
+                     read-only sandboxed environment. Shell commands run with the filesystem \
+                     mounted read-only — you can run commands like `ls`, `cat`, `df`, `ps`, \
+                     `uname`, `grep`, `find`, `git log`, `git diff`, etc., but any command \
+                     that writes to the filesystem will fail. You CANNOT write files or edit \
+                     files directly. If the user asks you to perform a write operation, inform \
+                     them that the current permission mode does not allow it and suggest they \
+                     press Shift+Tab to cycle to 'write' mode.\n\n",
+                );
+            } else {
+                prompt.push_str(
+                    "You can use READ-ONLY tools: reading files, searching files and contents, \
+                     fetching web pages, and searching the web. You CANNOT write files, \
+                     edit files, or execute shell commands. If the user asks you to perform \
+                     a write operation, inform them that the current permission mode does not \
+                     allow it and suggest they press Shift+Tab to cycle to 'write' mode.\n\n",
+                );
+            }
         }
         Permission::Write => {
             prompt.push_str(
@@ -111,21 +129,31 @@ mod tests {
 
     #[test]
     fn test_system_prompt_none_mode() {
-        let prompt = build_system_prompt(Permission::None, &[]);
+        let prompt = build_system_prompt(Permission::None, &[], false);
         assert!(prompt.contains("NO tools available"));
         assert!(prompt.contains("Shift+Tab"));
     }
 
     #[test]
-    fn test_system_prompt_read_mode() {
-        let prompt = build_system_prompt(Permission::Read, &[]);
+    fn test_system_prompt_read_mode_with_sandbox() {
+        let prompt = build_system_prompt(Permission::Read, &[], true);
         assert!(prompt.contains("READ-ONLY"));
+        assert!(prompt.contains("read-only sandboxed"));
         assert!(prompt.contains("CANNOT write"));
     }
 
     #[test]
+    fn test_system_prompt_read_mode_without_sandbox() {
+        let prompt = build_system_prompt(Permission::Read, &[], false);
+        assert!(prompt.contains("READ-ONLY"));
+        assert!(prompt.contains("CANNOT write"));
+        assert!(prompt.contains("execute shell commands"));
+        assert!(!prompt.contains("sandboxed"));
+    }
+
+    #[test]
     fn test_system_prompt_write_mode() {
-        let prompt = build_system_prompt(Permission::Write, &[]);
+        let prompt = build_system_prompt(Permission::Write, &[], false);
         assert!(prompt.contains("FULL access"));
         assert!(prompt.contains("destructive"));
     }
@@ -145,7 +173,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_system_prompt(Permission::Write, &tools);
+        let prompt = build_system_prompt(Permission::Write, &tools, false);
         assert!(prompt.contains("read_file"));
         assert!(prompt.contains("execute_command"));
         assert!(prompt.contains("Available Tools"));
@@ -153,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_has_environment() {
-        let prompt = build_system_prompt(Permission::Read, &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], false);
         assert!(prompt.contains("Environment"));
         assert!(prompt.contains("Date:"));
     }

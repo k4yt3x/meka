@@ -112,3 +112,20 @@ Default: `Mozilla/5.0 (compatible; agsh/0.1)`
 [web]
 user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ```
+
+## `[shell]`
+
+Settings for shell command execution.
+
+### `shell.sandbox`
+
+Whether to enable read-only filesystem sandboxing for shell commands in read mode. When enabled (default), shell commands can be executed in read mode but with the filesystem physically write-protected. When disabled, shell commands require write mode.
+
+Default: `true`
+
+```toml
+[shell]
+sandbox = false  # disable sandboxed shell in read mode
+```
+
+The sandbox uses Landlock on Linux (kernel 5.13+) and sandbox-exec on macOS. On platforms where sandboxing is unavailable, shell commands always require write mode regardless of this setting.

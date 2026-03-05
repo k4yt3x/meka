@@ -10,6 +10,7 @@ pub struct ConfigFile {
     pub provider: Option<ProviderConfig>,
     pub display: Option<DisplayConfig>,
     pub web: Option<WebConfig>,
+    pub shell: Option<ShellConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -22,6 +23,11 @@ pub struct DisplayConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct WebConfig {
     pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ShellConfig {
+    pub sandbox: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -47,6 +53,7 @@ pub struct ResolvedConfig {
     pub newline_after_prompt: bool,
     pub show_session_id: bool,
     pub user_agent: String,
+    pub sandbox: bool,
 }
 
 fn config_file_path() -> Option<PathBuf> {
@@ -80,6 +87,7 @@ impl ResolvedConfig {
         let file_provider = config_file.provider.unwrap_or_default();
         let file_display = config_file.display.unwrap_or_default();
         let file_web = config_file.web.unwrap_or_default();
+        let file_shell = config_file.shell.unwrap_or_default();
 
         let provider_name = cli
             .provider
@@ -126,6 +134,7 @@ impl ResolvedConfig {
             user_agent: file_web
                 .user_agent
                 .unwrap_or_else(|| "Mozilla/5.0 (compatible; agsh/0.1)".to_string()),
+            sandbox: file_shell.sandbox.unwrap_or(true),
         }
     }
 
