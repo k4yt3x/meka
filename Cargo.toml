@@ -24,7 +24,7 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 reedline = "0.38"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 reqwest-eventsource = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -47,3 +47,8 @@ winres = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+strip = "symbols"
+lto = "fat"
+codegen-units = 1

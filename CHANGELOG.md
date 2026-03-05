@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Switched `reqwest` from `native-tls` (OpenSSL) to `rustls-tls` for pure-Rust TLS, eliminating C compilation dependency
+- Added release profile optimizations (`lto`, `codegen-units = 1`, `strip`)
+- Added Rust dependency caching in CI workflow
+- Removed OpenSSL system dependency installation from CI
+
 ## [0.1.2] - 2026-03-05
 
 ### Added
