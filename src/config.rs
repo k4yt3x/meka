@@ -11,6 +11,7 @@ pub struct ConfigFile {
     pub display: Option<DisplayConfig>,
     pub web: Option<WebConfig>,
     pub shell: Option<ShellConfig>,
+    pub session: Option<SessionConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -28,6 +29,13 @@ pub struct WebConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct ShellConfig {
     pub sandbox: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SessionConfig {
+    pub context_messages: Option<usize>,
+    pub retention_days: Option<u64>,
+    pub max_storage_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -54,6 +62,9 @@ pub struct ResolvedConfig {
     pub show_session_id: bool,
     pub user_agent: String,
     pub sandbox: bool,
+    pub context_messages: Option<usize>,
+    pub retention_days: Option<u64>,
+    pub max_storage_bytes: Option<u64>,
 }
 
 fn config_file_path() -> Option<PathBuf> {
@@ -88,6 +99,7 @@ impl ResolvedConfig {
         let file_display = config_file.display.unwrap_or_default();
         let file_web = config_file.web.unwrap_or_default();
         let file_shell = config_file.shell.unwrap_or_default();
+        let file_session = config_file.session.unwrap_or_default();
 
         let provider_name = cli
             .provider
@@ -135,6 +147,9 @@ impl ResolvedConfig {
                 .user_agent
                 .unwrap_or_else(|| "Mozilla/5.0 (compatible; agsh/0.1)".to_string()),
             sandbox: file_shell.sandbox.unwrap_or(true),
+            context_messages: file_session.context_messages.or(Some(200)),
+            retention_days: file_session.retention_days.or(Some(90)),
+            max_storage_bytes: file_session.max_storage_bytes.or(Some(52_428_800)),
         }
     }
 
@@ -217,5 +232,64 @@ name = "anthropic"
         assert!(provider.model.is_none());
         assert!(provider.api_key.is_none());
         assert!(provider.base_url.is_none());
+    }
+
+    #[test]
+    fn test_session_config_deserialization() {
+        let toml_str = r#"
+[session]
+context_messages = 100
+retention_days = 90
+max_storage_bytes = 52428800
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let session = config.session.expect("session should be present");
+        assert_eq!(session.context_messages, Some(100));
+        assert_eq!(session.retention_days, Some(90));
+        assert_eq!(session.max_storage_bytes, Some(52428800));
+    }
+
+    #[test]
+    fn test_session_config_partial() {
+        let toml_str = r#"
+[session]
+context_messages = 50
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let session = config.session.expect("session should be present");
+        assert_eq!(session.context_messages, Some(50));
+        assert!(session.retention_days.is_none());
+        assert!(session.max_storage_bytes.is_none());
+    }
+
+    #[test]
+    fn test_session_defaults_applied() {
+        let file_session = SessionConfig::default();
+        let context_messages = file_session.context_messages.or(Some(200));
+        let retention_days = file_session.retention_days.or(Some(90));
+        let max_storage_bytes = file_session.max_storage_bytes.or(Some(52_428_800));
+
+        assert_eq!(context_messages, Some(200));
+        assert_eq!(retention_days, Some(90));
+        assert_eq!(max_storage_bytes, Some(52_428_800));
+    }
+
+    #[test]
+    fn test_session_config_overrides_defaults() {
+        let toml_str = r#"
+[session]
+context_messages = 50
+retention_days = 30
+max_storage_bytes = 10485760
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let file_session = config.session.unwrap_or_default();
+        let context_messages = file_session.context_messages.or(Some(200));
+        let retention_days = file_session.retention_days.or(Some(90));
+        let max_storage_bytes = file_session.max_storage_bytes.or(Some(52_428_800));
+
+        assert_eq!(context_messages, Some(50));
+        assert_eq!(retention_days, Some(30));
+        assert_eq!(max_storage_bytes, Some(10_485_760));
     }
 }

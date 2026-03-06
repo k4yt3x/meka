@@ -24,6 +24,7 @@ pub struct Agent {
     newline_after_prompt: bool,
     show_session_id: bool,
     sandboxed_shell: bool,
+    context_messages: Option<usize>,
 }
 
 impl Agent {
@@ -37,6 +38,7 @@ impl Agent {
         newline_after_prompt: bool,
         show_session_id: bool,
         sandboxed_shell: bool,
+        context_messages: Option<usize>,
     ) -> Self {
         Self {
             provider,
@@ -48,6 +50,7 @@ impl Agent {
             newline_after_prompt,
             show_session_id,
             sandboxed_shell,
+            context_messages,
         }
     }
 
@@ -87,12 +90,14 @@ impl Agent {
             let tools = self.available_tools(permission);
             let system_prompt = build_system_prompt(permission, &tools, self.sandboxed_shell);
 
+            let api_messages = truncate_messages_for_context(messages, self.context_messages);
+
             let (assistant_message, stop_reason) = if self.streaming {
-                self.run_streaming(&system_prompt, messages, &tools, cancellation.clone())
+                self.run_streaming(&system_prompt, &api_messages, &tools, cancellation.clone())
                     .await?
             } else {
                 self.provider
-                    .complete(&system_prompt, messages, &tools)
+                    .complete(&system_prompt, &api_messages, &tools)
                     .await?
             };
 
@@ -303,5 +308,163 @@ impl Agent {
 
     fn available_tools(&self, permission: crate::permission::Permission) -> Vec<ToolDefinition> {
         self.tool_registry.definitions_for_permission(permission)
+    }
+}
+
+fn truncate_messages_for_context(
+    messages: &[Message],
+    context_messages: Option<usize>,
+) -> Vec<Message> {
+    let Some(limit) = context_messages else {
+        return messages.to_vec();
+    };
+
+    if messages.len() <= limit {
+        return messages.to_vec();
+    }
+
+    let mut start_index = messages.len().saturating_sub(limit);
+
+    // Walk backward to find a safe cut point: a user message that is NOT a
+    // tool_results message. This avoids splitting assistant(ToolUse) →
+    // user(ToolResult) chains and ensures the first message has role User
+    // (required by Anthropic).
+    loop {
+        if start_index == 0 {
+            break;
+        }
+
+        let message = &messages[start_index];
+        if message.role == Role::User && !has_tool_results(&message.content) {
+            break;
+        }
+
+        start_index -= 1;
+    }
+
+    messages[start_index..].to_vec()
+}
+
+fn has_tool_results(content: &[ContentBlock]) -> bool {
+    content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_msg(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    fn assistant_msg(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn assistant_tool_use() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/tmp/test"}),
+            }],
+        }
+    }
+
+    fn tool_result_msg() -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "file contents".to_string(),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_truncate_no_limit() {
+        let messages = vec![user_msg("hello"), assistant_msg("hi")];
+        let result = truncate_messages_for_context(&messages, None);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_truncate_under_limit() {
+        let messages = vec![user_msg("hello"), assistant_msg("hi")];
+        let result = truncate_messages_for_context(&messages, Some(10));
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_truncate_over_limit() {
+        let messages = vec![
+            user_msg("first"),
+            assistant_msg("response1"),
+            user_msg("second"),
+            assistant_msg("response2"),
+            user_msg("third"),
+            assistant_msg("response3"),
+        ];
+        let result = truncate_messages_for_context(&messages, Some(4));
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].role, Role::User);
+    }
+
+    #[test]
+    fn test_truncate_does_not_split_tool_chain() {
+        let messages = vec![
+            user_msg("first"),
+            assistant_msg("response1"),
+            user_msg("second"),
+            assistant_tool_use(),
+            tool_result_msg(),
+            assistant_msg("final"),
+        ];
+        // Limit 3 would naively start at index 3 (assistant_tool_use), but that
+        // splits the tool chain. It should walk back to index 2 (user "second").
+        let result = truncate_messages_for_context(&messages, Some(3));
+        assert_eq!(result[0].role, Role::User);
+        assert!(!has_tool_results(&result[0].content));
+        assert!(result.len() >= 3);
+    }
+
+    #[test]
+    fn test_truncate_starts_with_user() {
+        let messages = vec![
+            user_msg("first"),
+            assistant_msg("response1"),
+            assistant_msg("response2"),
+            user_msg("second"),
+            assistant_msg("response3"),
+        ];
+        // Limit 2 would naively start at index 3, which is a user message
+        let result = truncate_messages_for_context(&messages, Some(2));
+        assert_eq!(result[0].role, Role::User);
+    }
+
+    #[test]
+    fn test_truncate_walks_back_past_tool_result() {
+        let messages = vec![
+            user_msg("first"),
+            assistant_tool_use(),
+            tool_result_msg(),
+            assistant_msg("response"),
+            user_msg("second"),
+            assistant_msg("response2"),
+        ];
+        // Limit 4 would naively start at index 2 (tool_result_msg), should walk
+        // back to index 0 (user "first")
+        let result = truncate_messages_for_context(&messages, Some(4));
+        assert_eq!(result[0].role, Role::User);
+        assert!(!has_tool_results(&result[0].content));
     }
 }

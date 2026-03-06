@@ -245,6 +245,79 @@ impl SessionManager {
                 AgshError::Config(format!("failed to check session existence: {}", error))
             })
     }
+
+    pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<u64> {
+        let cutoff = chrono::Utc::now() - chrono::TimeDelta::days(retention_days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM messages WHERE session_id IN (
+                        SELECT id FROM sessions WHERE updated_at < ?1
+                    )",
+                    rusqlite::params![cutoff_str],
+                )?;
+
+                let deleted = connection.execute(
+                    "DELETE FROM sessions WHERE updated_at < ?1",
+                    rusqlite::params![cutoff_str],
+                )?;
+
+                Ok(deleted as u64)
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Config(format!("failed to delete expired sessions: {}", error))
+            })
+    }
+
+    pub async fn enforce_storage_limit(&self, max_bytes: u64) -> Result<u64> {
+        self.connection
+            .call(move |connection| {
+                let mut deleted: u64 = 0;
+
+                loop {
+                    let total_bytes: i64 = connection.query_row(
+                        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages",
+                        [],
+                        |row| row.get(0),
+                    )?;
+
+                    if (total_bytes as u64) <= max_bytes {
+                        break;
+                    }
+
+                    let oldest_id: std::result::Result<String, _> = connection.query_row(
+                        "SELECT id FROM sessions ORDER BY updated_at ASC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    );
+
+                    match oldest_id {
+                        Ok(session_id) => {
+                            connection.execute(
+                                "DELETE FROM messages WHERE session_id = ?1",
+                                rusqlite::params![session_id],
+                            )?;
+                            connection.execute(
+                                "DELETE FROM sessions WHERE id = ?1",
+                                rusqlite::params![session_id],
+                            )?;
+                            deleted += 1;
+                        }
+                        Err(rusqlite::Error::QueryReturnedNoRows) => break,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+
+                Ok(deleted)
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Config(format!("failed to enforce storage limit: {}", error))
+            })
+    }
 }
 
 fn is_process_alive(pid_str: &str) -> bool {
@@ -399,5 +472,136 @@ mod tests {
         assert_eq!(messages1[0].content, "msg1");
         assert_eq!(messages2.len(), 1);
         assert_eq!(messages2[0].content, "msg2");
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_sessions() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session().await.expect("failed");
+        manager
+            .save_message(session_id, "user", "hello")
+            .await
+            .expect("failed");
+
+        // Backdate the session to 100 days ago
+        let old_date = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        manager
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![old_date, session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("failed to backdate");
+
+        let deleted = manager
+            .delete_expired_sessions(30)
+            .await
+            .expect("failed to delete");
+        assert_eq!(deleted, 1);
+        assert!(!manager.session_exists(session_id).await.expect("failed"));
+
+        let messages = manager.load_messages(session_id).await.expect("failed");
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_sessions_keeps_recent() {
+        let manager = test_manager().await;
+        let old_session = manager.create_session().await.expect("failed");
+        let new_session = manager.create_session().await.expect("failed");
+
+        manager
+            .save_message(old_session, "user", "old")
+            .await
+            .expect("failed");
+        manager
+            .save_message(new_session, "user", "new")
+            .await
+            .expect("failed");
+
+        // Backdate only the old session
+        let old_date = (chrono::Utc::now() - chrono::TimeDelta::days(100)).to_rfc3339();
+        manager
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![old_date, old_session.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("failed to backdate");
+
+        let deleted = manager
+            .delete_expired_sessions(30)
+            .await
+            .expect("failed to delete");
+        assert_eq!(deleted, 1);
+        assert!(!manager.session_exists(old_session).await.expect("failed"));
+        assert!(manager.session_exists(new_session).await.expect("failed"));
+    }
+
+    #[tokio::test]
+    async fn test_enforce_storage_limit() {
+        let manager = test_manager().await;
+        let session1 = manager.create_session().await.expect("failed");
+
+        // Add enough content to exceed a small limit
+        let large_content = "x".repeat(1000);
+        manager
+            .save_message(session1, "user", &large_content)
+            .await
+            .expect("failed");
+
+        // Backdate session1 so it's the oldest
+        let old_date = (chrono::Utc::now() - chrono::TimeDelta::days(10)).to_rfc3339();
+        manager
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![old_date, session1.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("failed to backdate");
+
+        let session2 = manager.create_session().await.expect("failed");
+        manager
+            .save_message(session2, "user", "small")
+            .await
+            .expect("failed");
+
+        // Set a limit smaller than the total, but larger than session2 alone
+        let deleted = manager
+            .enforce_storage_limit(500)
+            .await
+            .expect("failed to enforce");
+        assert_eq!(deleted, 1);
+        assert!(!manager.session_exists(session1).await.expect("failed"));
+        assert!(manager.session_exists(session2).await.expect("failed"));
+    }
+
+    #[tokio::test]
+    async fn test_enforce_storage_limit_no_deletion_needed() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session().await.expect("failed");
+        manager
+            .save_message(session_id, "user", "small")
+            .await
+            .expect("failed");
+
+        let deleted = manager
+            .enforce_storage_limit(1_000_000)
+            .await
+            .expect("failed to enforce");
+        assert_eq!(deleted, 0);
+        assert!(manager.session_exists(session_id).await.expect("failed"));
     }
 }

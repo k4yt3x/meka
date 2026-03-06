@@ -48,6 +48,22 @@ fn main() -> anyhow::Result<()> {
 async fn async_main(config: ResolvedConfig) -> anyhow::Result<()> {
     let session_manager = SessionManager::open(None).await?;
 
+    if let Some(retention_days) = config.retention_days {
+        let deleted = session_manager
+            .delete_expired_sessions(retention_days)
+            .await?;
+        if deleted > 0 {
+            tracing::info!("deleted {} expired sessions", deleted);
+        }
+    }
+
+    if let Some(max_bytes) = config.max_storage_bytes {
+        let deleted = session_manager.enforce_storage_limit(max_bytes).await?;
+        if deleted > 0 {
+            tracing::info!("deleted {} sessions to enforce storage limit", deleted);
+        }
+    }
+
     if let Some(prompt) = config.prompt.clone() {
         return run_oneshot(config, session_manager, prompt).await;
     }
@@ -93,6 +109,7 @@ fn create_agent_from_config(
         config.newline_after_prompt,
         config.show_session_id,
         sandboxed_shell,
+        config.context_messages,
     ))
 }
 

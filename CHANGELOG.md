@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Configurable context window limiting via `[session] context_messages` to cap messages sent to the LLM API
+- Automatic session cleanup via `[session] retention_days` (time-based) and `[session] max_storage_bytes` (size-based)
+
 ### Changed
 
 - Switched `reqwest` from `native-tls` (OpenSSL) to `rustls-tls` for pure-Rust TLS, eliminating C compilation dependency

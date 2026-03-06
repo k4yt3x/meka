@@ -129,3 +129,40 @@ sandbox = false  # disable sandboxed shell in read mode
 ```
 
 The sandbox uses Landlock on Linux (kernel 5.13+) and sandbox-exec on macOS. On platforms where sandboxing is unavailable, shell commands always require write mode regardless of this setting.
+
+## `[session]`
+
+Settings for session history retention and context window management.
+
+### `session.context_messages`
+
+Maximum number of messages to send to the LLM API per request. Older messages are truncated from the beginning while preserving tool call chain integrity. The full history remains stored in SQLite -- only the API payload is limited.
+
+Default: `200`
+
+```toml
+[session]
+context_messages = 100
+```
+
+### `session.retention_days`
+
+Automatically delete sessions older than this many days on startup. Uses the session's `updated_at` timestamp, so actively-resumed sessions are preserved even if originally created long ago.
+
+Default: `90`
+
+```toml
+[session]
+retention_days = 30
+```
+
+### `session.max_storage_bytes`
+
+Maximum total byte size of all stored message content across all sessions. When exceeded on startup, the oldest sessions are deleted until the total is under the limit.
+
+Default: `52428800` (50 MB)
+
+```toml
+[session]
+max_storage_bytes = 10485760  # 10 MB
+```

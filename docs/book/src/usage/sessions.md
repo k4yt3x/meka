@@ -68,6 +68,34 @@ The database has two tables:
 | `content` | TEXT | Message content (plain text or JSON) |
 | `created_at` | TEXT (RFC 3339) | When the message was saved |
 
+## History Retention
+
+agsh automatically manages session storage on startup with sensible defaults:
+
+- **`retention_days`** (default: `90`) -- deletes sessions whose `updated_at` is older than this many days.
+- **`max_storage_bytes`** (default: `52428800` / 50 MB) -- when total message content exceeds this limit, the oldest sessions are deleted until the total is under the limit.
+
+You can override these defaults in the config file under `[session]`:
+
+```toml
+[session]
+retention_days = 30          # delete sessions not used in 30 days
+max_storage_bytes = 10485760 # cap total storage at ~10 MB
+```
+
+See [Config File](../configuration/config-file.md#session) for details.
+
+## Context Window Limiting
+
+Long sessions can exceed the LLM's context window or become expensive. The `context_messages` setting (default: `200`) limits how many recent messages are sent to the API:
+
+```toml
+[session]
+context_messages = 100
+```
+
+The full history remains in SQLite for resumption. Only the API payload is truncated. The truncation preserves tool call chains (it never splits a tool use from its result).
+
 ## Managing Sessions
 
 Session management is done directly through the SQLite database. For example, to list all sessions:
