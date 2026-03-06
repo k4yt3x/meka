@@ -76,9 +76,51 @@ fn build_reedline_editor() -> Reedline {
     Reedline::create().with_edit_mode(Box::new(emacs_mode))
 }
 
+pub enum SlashCommand {
+    Exit,
+    Help,
+    Clear,
+    Session,
+    Permission(Option<String>),
+    Compact,
+}
+
 pub enum ShellEvent {
     UserInput(String),
+    Command(SlashCommand),
     Exit,
+}
+
+fn parse_slash_command(input: &str) -> Option<SlashCommand> {
+    let input = input.strip_prefix('/')?;
+    let mut parts = input.splitn(2, char::is_whitespace);
+    let command = parts.next()?;
+    let argument = parts.next().map(|s| s.trim().to_string());
+
+    match command {
+        "exit" | "quit" => Some(SlashCommand::Exit),
+        "help" | "?" => Some(SlashCommand::Help),
+        "clear" => Some(SlashCommand::Clear),
+        "session" => Some(SlashCommand::Session),
+        "permission" => Some(SlashCommand::Permission(argument)),
+        "compact" => Some(SlashCommand::Compact),
+        _ => None,
+    }
+}
+
+fn print_help() {
+    eprintln!("Commands:");
+    eprintln!("  /help                          Show this help message");
+    eprintln!("  /exit                          Exit the shell");
+    eprintln!("  /clear                         Clear the terminal screen");
+    eprintln!("  /session                       Show the current session ID");
+    eprintln!("  /permission [none|read|write]  Show or set the permission level");
+    eprintln!("  /compact                       Summarize and compact the session");
+    eprintln!();
+    eprintln!("Shortcuts:");
+    eprintln!("  !<command>    Execute a shell command directly");
+    eprintln!("  Shift+Tab     Cycle permission level");
+    eprintln!("  Ctrl+D        Exit the shell");
 }
 
 pub fn run_repl(
@@ -103,6 +145,67 @@ pub fn run_repl(
                 let trimmed = buffer.trim();
                 if trimmed.is_empty() {
                     continue;
+                }
+
+                if trimmed.starts_with('/') {
+                    match parse_slash_command(trimmed) {
+                        Some(SlashCommand::Exit) => {
+                            let _ = input_sender.send(ShellEvent::Exit);
+                            break;
+                        }
+                        Some(SlashCommand::Help) => {
+                            print_help();
+                            continue;
+                        }
+                        Some(SlashCommand::Clear) => {
+                            if crossterm::execute!(
+                                std::io::stdout(),
+                                crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                                crossterm::cursor::MoveTo(0, 0),
+                            )
+                            .is_err()
+                            {
+                                eprintln!("Failed to clear terminal");
+                            }
+                            continue;
+                        }
+                        Some(SlashCommand::Permission(argument)) => {
+                            match argument {
+                                None => {
+                                    let current = shared_permission.get();
+                                    eprintln!("Current permission level: {}", current);
+                                }
+                                Some(level) => {
+                                    match level.parse::<crate::permission::Permission>() {
+                                        Ok(permission) => {
+                                            shared_permission.set(permission);
+                                            eprintln!("Permission level set to: {}", permission);
+                                        }
+                                        Err(error) => {
+                                            eprintln!("Error: {}", error);
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Some(command @ (SlashCommand::Session | SlashCommand::Compact)) => {
+                            if input_sender.send(ShellEvent::Command(command)).is_err() {
+                                break;
+                            }
+                            if agent_done_receiver.recv().is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        None => {
+                            eprintln!(
+                                "Unknown command: {}. Type /help for available commands.",
+                                trimmed
+                            );
+                            continue;
+                        }
+                    }
                 }
 
                 if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {

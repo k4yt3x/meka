@@ -272,6 +272,24 @@ impl SessionManager {
             })
     }
 
+    pub async fn clear_messages(&self, session_id: Uuid) -> Result<()> {
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM messages WHERE session_id = ?1",
+                    rusqlite::params![session_id.to_string()],
+                )?;
+
+                connection.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| AgshError::Config(format!("failed to clear messages: {}", error)))
+    }
+
     pub async fn enforce_storage_limit(&self, max_bytes: u64) -> Result<u64> {
         self.connection
             .call(move |connection| {
@@ -586,6 +604,35 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(!manager.session_exists(session1).await.expect("failed"));
         assert!(manager.session_exists(session2).await.expect("failed"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_messages() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session().await.expect("failed");
+
+        manager
+            .save_message(session_id, "user", "hello")
+            .await
+            .expect("failed");
+        manager
+            .save_message(session_id, "assistant", "hi")
+            .await
+            .expect("failed");
+
+        let messages = manager.load_messages(session_id).await.expect("failed");
+        assert_eq!(messages.len(), 2);
+
+        manager
+            .clear_messages(session_id)
+            .await
+            .expect("failed to clear");
+
+        let messages = manager.load_messages(session_id).await.expect("failed");
+        assert!(messages.is_empty());
+
+        // Session itself should still exist
+        assert!(manager.session_exists(session_id).await.expect("failed"));
     }
 
     #[tokio::test]

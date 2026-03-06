@@ -306,6 +306,66 @@ impl Agent {
         results
     }
 
+    pub async fn compact_session(
+        &self,
+        session_id: &mut Option<Uuid>,
+        messages: &mut Vec<Message>,
+    ) -> Result<()> {
+        let Some(sid) = *session_id else {
+            return Err(AgshError::Config(
+                "no active session to compact".to_string(),
+            ));
+        };
+
+        if messages.is_empty() {
+            return Err(AgshError::Config("no messages to compact".to_string()));
+        }
+
+        let system_prompt = "You are a conversation summarizer. The user will ask you to \
+             summarize the conversation so far. Produce a concise summary that preserves \
+             all important information, decisions made, files discussed, and any ongoing \
+             tasks. The summary will be used as the starting context for continuing this \
+             conversation. Be thorough but concise. Write the summary in second person \
+             (e.g., 'You were working on...').";
+
+        // Clone messages and append a user message so the conversation ends with a
+        // user turn. Some providers (e.g., Google) reject requests where the last
+        // message has an assistant role.
+        let mut compact_messages = messages.clone();
+        compact_messages.push(Message::user(
+            "Summarize our conversation so far into a concise context message.",
+        ));
+
+        let (summary_message, _stop_reason) = self
+            .provider
+            .complete(system_prompt, &compact_messages, &[])
+            .await?;
+
+        let summary_text = summary_message.text_content();
+        if summary_text.is_empty() {
+            return Err(AgshError::Provider(
+                "LLM returned an empty summary".to_string(),
+            ));
+        }
+
+        self.session_manager.clear_messages(sid).await?;
+
+        messages.clear();
+
+        let context_message = format!(
+            "[Conversation summary from session compaction]\n\n{}",
+            summary_text
+        );
+        let user_message = Message::user(&context_message);
+        messages.push(user_message);
+
+        self.session_manager
+            .save_message(sid, "user", &context_message)
+            .await?;
+
+        Ok(())
+    }
+
     fn available_tools(&self, permission: crate::permission::Permission) -> Vec<ToolDefinition> {
         self.tool_registry.definitions_for_permission(permission)
     }

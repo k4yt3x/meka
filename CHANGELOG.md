@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Slash commands: `/help`, `/exit`, `/clear`, `/session`, `/permission`, and `/compact` for in-shell control
 - Skills: user-defined Markdown knowledge files in `~/.config/agsh/skills/` that the agent can discover and read on demand
 - Configurable context window limiting via `[session] context_messages` to cap messages sent to the LLM API
 - Automatic session cleanup via `[session] retention_days` (time-based) and `[session] max_storage_bytes` (size-based)

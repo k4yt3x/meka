@@ -85,6 +85,25 @@ agsh [r] > write a python script that
 
 Press **Enter** on the last line to submit the entire multi-line input.
 
+## Slash Commands
+
+agsh supports `/` prefix commands for controlling the shell:
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available commands |
+| `/exit` | Exit the shell |
+| `/clear` | Clear the terminal screen |
+| `/session` | Show the current session ID |
+| `/permission [none\|read\|write]` | Show or set the permission level |
+| `/compact` | Summarize and compact the session history |
+
+### `/compact`
+
+The `/compact` command asks the LLM to summarize the entire conversation, then replaces the message history with a single summary message. This is useful for long sessions that are approaching the context window limit or becoming expensive.
+
+After compacting, the session continues with the summary as context. The previous messages are removed from both memory and the database.
+
 ## Shell Escape
 
 Prefix any input with `!` to execute it directly as a shell command, bypassing the LLM entirely:
@@ -107,6 +126,7 @@ The command runs with inherited stdin/stdout/stderr, so it behaves exactly like 
 
 You can exit agsh in any of these ways:
 
+- Type `/exit`
 - Type `exit` or `quit`
 - Press **Ctrl+D** on an empty line
 

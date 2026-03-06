@@ -242,6 +242,29 @@ async fn run_interactive(
                     break;
                 }
             }
+            ShellEvent::Command(command) => {
+                match command {
+                    shell::SlashCommand::Session => match &session_id {
+                        Some(id) => render::render_session_id("Current session", &id.to_string()),
+                        None => eprintln!("No active session yet."),
+                    },
+                    shell::SlashCommand::Compact => {
+                        match agent.compact_session(&mut session_id, &mut messages).await {
+                            Ok(()) => {
+                                render::render_hint("Session compacted.");
+                            }
+                            Err(error) => {
+                                eprintln!("Error: {}", error);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                if agent_done_sender.send(()).is_err() {
+                    break;
+                }
+            }
             ShellEvent::Exit => {
                 break;
             }

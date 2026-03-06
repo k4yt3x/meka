@@ -96,6 +96,10 @@ context_messages = 100
 
 The full history remains in SQLite for resumption. Only the API payload is truncated. The truncation preserves tool call chains (it never splits a tool use from its result).
 
+### Compacting a Session
+
+If a session becomes too long, you can use the `/compact` command to have the LLM summarize the conversation and replace the full history with a single summary message. See [Interactive Mode](./interactive-mode.md#slash-commands) for details.
+
 ## Managing Sessions
 
 Session management is done directly through the SQLite database. For example, to list all sessions:
