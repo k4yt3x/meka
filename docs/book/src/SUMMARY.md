@@ -20,6 +20,7 @@
 - [One-Shot Mode](./usage/one-shot-mode.md)
 - [Permissions](./usage/permissions.md)
 - [Sessions](./usage/sessions.md)
+- [Skills](./usage/skills.md)
 
 # Providers
 

@@ -30,6 +30,14 @@ agsh [r] > show me lines 10 through 20 of src/main.rs
 
 The agent will call `read_file` with `offset: 10` and `limit: 10`.
 
+Preview a [skill](../usage/skills.md) file's title and summary:
+
+```text
+agsh [r] > what does the deploy-app skill cover?
+```
+
+The agent will call `read_file` with `limit: 3` to read the title and summary without loading the full file.
+
 ---
 
 ## `edit_file`

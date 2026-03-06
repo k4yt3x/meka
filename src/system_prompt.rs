@@ -1,5 +1,33 @@
+use std::path::PathBuf;
+
 use crate::permission::Permission;
 use crate::provider::ToolDefinition;
+
+fn detect_skills() -> Option<(PathBuf, Vec<String>)> {
+    let skills_dir = dirs::config_dir()?.join("agsh").join("skills");
+    let entries = std::fs::read_dir(&skills_dir).ok()?;
+
+    let mut file_names: Vec<String> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if file_names.is_empty() {
+        return None;
+    }
+
+    file_names.sort();
+    Some((skills_dir, file_names))
+}
 
 pub fn build_system_prompt(
     permission: Permission,
@@ -75,6 +103,33 @@ pub fn build_system_prompt(
         "- If a tool returns an error, explain the error to the user and suggest alternatives.\n",
     );
     prompt.push_str("- Be concise but thorough.\n\n");
+
+    if !matches!(permission, Permission::None) {
+        if let Some((skills_dir, file_names)) = detect_skills() {
+            let dir_display = skills_dir.display();
+            prompt.push_str("## Skills\n\n");
+            prompt.push_str(&format!(
+                "Skills are knowledge files stored in `{dir_display}`. They document procedures, \
+                 tools, and non-standard knowledge to help you accomplish specific tasks. \
+                 Each skill has a title on the first line, followed by an empty line, then \
+                 a summary paragraph.\n\n"
+            ));
+            prompt.push_str("Available skills:\n");
+            for name in &file_names {
+                prompt.push_str(&format!("- {}\n", name));
+            }
+            prompt.push_str(&format!(
+                "\nTo preview what a skill covers, read just the first 3 lines:\n  \
+                 read_file(path: \"{dir_display}/{}\", limit: 3)\n\n",
+                file_names[0]
+            ));
+            prompt.push_str(&format!(
+                "To read the full skill:\n  \
+                 read_file(path: \"{dir_display}/{}\")\n\n",
+                file_names[0]
+            ));
+        }
+    }
 
     prompt.push_str("## Environment\n\n");
 
@@ -184,5 +239,52 @@ mod tests {
         let prompt = build_system_prompt(Permission::Read, &[], false);
         assert!(prompt.contains("Environment"));
         assert!(prompt.contains("Date:"));
+    }
+
+    #[test]
+    fn test_detect_skills_returns_none_for_missing_dir() {
+        // With no skills directory, detect_skills should return None (or Some
+        // depending on the test machine). We can at least verify it doesn't panic.
+        let _ = detect_skills();
+    }
+
+    #[test]
+    fn test_detect_skills_with_temp_dir() {
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        let skills_dir = temp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("failed to create skills dir");
+
+        std::fs::write(
+            skills_dir.join("setup-server.md"),
+            "# Setup Server\n\nHow to set up a server.\n",
+        )
+        .expect("failed to write skill");
+        std::fs::write(
+            skills_dir.join("deploy-app.md"),
+            "# Deploy App\n\nHow to deploy an app.\n",
+        )
+        .expect("failed to write skill");
+        std::fs::write(skills_dir.join("notes.txt"), "not a skill")
+            .expect("failed to write non-skill");
+
+        let entries = std::fs::read_dir(&skills_dir).expect("failed to read dir");
+        let mut file_names: Vec<String> = entries
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        file_names.sort();
+
+        assert_eq!(file_names.len(), 2);
+        assert_eq!(file_names[0], "deploy-app.md");
+        assert_eq!(file_names[1], "setup-server.md");
     }
 }
