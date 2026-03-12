@@ -8,7 +8,7 @@ Environment variables override config file values but are overridden by CLI flag
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `AGSH_PROVIDER` | LLM provider name | `openai`, `anthropic` |
+| `AGSH_PROVIDER` | LLM provider name | `openai`, `claude` |
 | `AGSH_MODEL` | Model identifier | `gpt-4o`, `claude-sonnet-4-20250514` |
 | `AGSH_PERMISSION` | Default permission mode | `none`, `read`, `write` |
 
@@ -17,7 +17,17 @@ Environment variables override config file values but are overridden by CLI flag
 | Variable | Used When |
 |----------|-----------|
 | `OPENAI_API_KEY` | Provider is `openai` |
-| `ANTHROPIC_API_KEY` | Provider is `anthropic` |
+| `CLAUDE_API_KEY` | Provider is `claude` |
+
+## OAuth Authentication
+
+| Variable | Description |
+|----------|-------------|
+| `CLAUDE_OAUTH_TOKEN` | OAuth access token for the Claude provider |
+
+OAuth tokens (with `sk-ant-oat01-` prefix) are also auto-detected when passed via `CLAUDE_API_KEY`.
+
+On first use, the OAuth token is saved to the database and loaded automatically on subsequent launches. Setting the env var again replaces the stored token.
 
 ## Provider Base URL
 

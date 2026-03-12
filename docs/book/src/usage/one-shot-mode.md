@@ -30,7 +30,7 @@ All configuration flags work in one-shot mode:
 
 ```bash
 # Use a specific provider and model
-agsh --provider anthropic -m claude-sonnet-4-20250514 "explain this codebase"
+agsh --provider claude -m claude-sonnet-4-20250514 "explain this codebase"
 
 # With write permission
 agsh --permission write "run 'cargo test' and summarize the results"

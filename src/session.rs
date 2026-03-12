@@ -6,6 +6,7 @@ use tokio_rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::error::{AgshError, Result};
+use crate::provider::AuthCredential;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
@@ -70,7 +71,15 @@ impl SessionManager {
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_messages_session_id
-                        ON messages(session_id);",
+                        ON messages(session_id);
+
+                    CREATE TABLE IF NOT EXISTS oauth_tokens (
+                        provider TEXT PRIMARY KEY,
+                        access_token TEXT NOT NULL,
+                        refresh_token TEXT,
+                        expires_at INTEGER,
+                        updated_at TEXT NOT NULL
+                    );",
                 )?;
                 Ok(())
             })
@@ -335,6 +344,92 @@ impl SessionManager {
             .map_err(|error| {
                 AgshError::Config(format!("failed to enforce storage limit: {}", error))
             })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Token store
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct TokenStore {
+    connection: Arc<Connection>,
+}
+
+impl TokenStore {
+    pub async fn load_oauth_token(&self, provider: &str) -> Result<Option<AuthCredential>> {
+        let provider = provider.to_string();
+        self.connection
+            .call(move |connection| {
+                let result = connection.query_row(
+                    "SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE provider = ?1",
+                    rusqlite::params![provider],
+                    |row| {
+                        let access_token: String = row.get(0)?;
+                        let refresh_token: Option<String> = row.get(1)?;
+                        let expires_at: Option<i64> = row.get(2)?;
+                        Ok(AuthCredential::OAuthToken {
+                            access_token,
+                            refresh_token,
+                            expires_at,
+                        })
+                    },
+                );
+
+                match result {
+                    Ok(credential) => Ok(Some(credential)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await
+            .map_err(|error| AgshError::Config(format!("failed to load OAuth token: {}", error)))
+    }
+
+    pub async fn save_oauth_token(
+        &self,
+        provider: &str,
+        credential: &AuthCredential,
+    ) -> Result<()> {
+        let AuthCredential::OAuthToken {
+            access_token,
+            refresh_token,
+            expires_at,
+        } = credential
+        else {
+            return Ok(());
+        };
+
+        let provider = provider.to_string();
+        let access_token = access_token.clone();
+        let refresh_token = refresh_token.clone();
+        let expires_at = *expires_at;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO oauth_tokens (provider, access_token, refresh_token, expires_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(provider) DO UPDATE SET
+                         access_token = excluded.access_token,
+                         refresh_token = excluded.refresh_token,
+                         expires_at = excluded.expires_at,
+                         updated_at = excluded.updated_at",
+                    rusqlite::params![provider, access_token, refresh_token, expires_at, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| AgshError::Config(format!("failed to save OAuth token: {}", error)))
+    }
+}
+
+impl SessionManager {
+    pub fn token_store(&self) -> TokenStore {
+        TokenStore {
+            connection: Arc::clone(&self.connection),
+        }
     }
 }
 

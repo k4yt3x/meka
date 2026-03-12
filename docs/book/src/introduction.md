@@ -12,7 +12,7 @@ Instead of remembering `find . -name '*.rs' | xargs wc -l`, you describe what yo
 
 - **Natural language interface** -- describe what you want instead of memorizing syntax
 - **Built-in tools** -- file read/write/edit, glob search, regex content search (ripgrep), web fetch, web search, shell command execution
-- **Multiple LLM providers** -- OpenAI and Anthropic, with support for any OpenAI-compatible API
+- **Multiple LLM providers** -- OpenAI and Claude, with support for any OpenAI-compatible API
 - **Permission system** -- control what the agent can do (none/read/write), switchable mid-session
 - **Session management** -- conversations are persisted in SQLite; resume any session later
 - **Streaming output** -- responses stream to the terminal in real time, rendered as Markdown

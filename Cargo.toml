@@ -1,6 +1,6 @@
 [package]
 name = "agsh"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "An agentic shell where you speak human, not bash"
@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
@@ -23,12 +24,15 @@ glob = "0.3"
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+open = "5"
+rand = "0.9"
 reedline = "0.38"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "deflate", "brotli"] }
 reqwest-eventsource = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 termimad = "0.30"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

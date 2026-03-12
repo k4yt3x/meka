@@ -19,7 +19,7 @@ agsh requires three settings to function. If any are missing, it prints an error
 |---------|------------|---------|----------|
 | Provider | `provider.name` | `AGSH_PROVIDER` | `--provider` |
 | Model | `provider.model` | `AGSH_MODEL` | `-m`, `--model` |
-| API Key | `provider.api_key` | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` | -- |
+| API Key | `provider.api_key` | `OPENAI_API_KEY` or `CLAUDE_API_KEY` | -- |
 
 ## Override Layers
 
@@ -37,6 +37,6 @@ For example, `--model gpt-4o-mini` on the command line overrides both `AGSH_MODE
 The API key environment variable depends on the configured provider:
 
 - Provider `openai`: reads `OPENAI_API_KEY`
-- Provider `anthropic`: reads `ANTHROPIC_API_KEY`
+- Provider `claude`: reads `CLAUDE_API_KEY` (or `CLAUDE_OAUTH_TOKEN` for OAuth)
 
 If the environment variable is not set, it falls back to `provider.api_key` in the config file.

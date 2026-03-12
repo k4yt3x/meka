@@ -2,7 +2,20 @@
 
 ```text
 agsh [OPTIONS] [PROMPT]
+agsh <COMMAND>
 ```
+
+## Commands
+
+### `setup`
+
+Run the interactive configuration wizard. Prompts for provider, authentication, model, and base URL, then writes the configuration to `~/.config/agsh/config.toml`.
+
+```bash
+agsh setup
+```
+
+This wizard also runs automatically on first launch when no config file exists.
 
 ## Arguments
 
@@ -52,10 +65,10 @@ Default: `read`.
 Set the LLM provider. Overrides `AGSH_PROVIDER` and the config file.
 
 ```bash
-agsh --provider anthropic
+agsh --provider claude
 ```
 
-Supported values: `openai`, `anthropic`.
+Supported values: `openai`, `claude`.
 
 ### `-m`, `--model <MODEL>`
 

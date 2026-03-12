@@ -388,7 +388,7 @@ fn truncate_messages_for_context(
     // Walk backward to find a safe cut point: a user message that is NOT a
     // tool_results message. This avoids splitting assistant(ToolUse) →
     // user(ToolResult) chains and ensures the first message has role User
-    // (required by Anthropic).
+    // (required by Claude API).
     loop {
         if start_index == 0 {
             break;

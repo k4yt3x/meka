@@ -2,9 +2,18 @@ use clap::Parser;
 
 use crate::permission::Permission;
 
+#[derive(clap::Subcommand, Debug)]
+pub enum Command {
+    /// Run the interactive configuration wizard
+    Setup,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "agsh", version, about = "An agentic shell")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Run a one-shot prompt and exit
     pub prompt: Option<String>,
 
@@ -20,7 +29,7 @@ pub struct Cli {
     #[arg(long = "permission", value_parser = parse_permission)]
     pub permission: Option<Permission>,
 
-    /// LLM provider to use (openai, anthropic)
+    /// LLM provider to use (openai, claude)
     #[arg(long = "provider")]
     pub provider: Option<String>,
 

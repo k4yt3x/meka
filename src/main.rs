@@ -7,6 +7,7 @@ mod provider;
 mod render;
 mod sandbox;
 mod session;
+mod setup;
 mod shell;
 mod system_prompt;
 mod tools;
@@ -14,11 +15,13 @@ mod tools;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
+use std::sync::Arc;
+
 use crate::agent::Agent;
 use crate::config::ResolvedConfig;
 use crate::permission::SharedPermission;
-use crate::provider::create_provider;
-use crate::session::SessionManager;
+use crate::provider::{AuthCredential, create_provider};
+use crate::session::{SessionManager, TokenStore};
 use crate::shell::ShellEvent;
 use crate::tools::ToolRegistry;
 
@@ -39,14 +42,33 @@ fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = ResolvedConfig::from_cli(&cli);
-
     let runtime = tokio::runtime::Runtime::new()?;
+
+    // Handle the setup subcommand
+    if let Some(cli::Command::Setup) = cli.command {
+        return runtime.block_on(async {
+            let session_manager = SessionManager::open(None).await?;
+            let token_store = session_manager.token_store();
+            setup::run_setup(&token_store).await
+        });
+    }
+
+    // Auto-detect first launch: no config file and no env-based provider
+    if !config::config_file_exists() && std::env::var("AGSH_PROVIDER").is_err() {
+        runtime.block_on(async {
+            let session_manager = SessionManager::open(None).await?;
+            let token_store = session_manager.token_store();
+            setup::run_setup(&token_store).await
+        })?;
+    }
+
+    let config = ResolvedConfig::from_cli(&cli);
     runtime.block_on(async_main(config))
 }
 
-async fn async_main(config: ResolvedConfig) -> anyhow::Result<()> {
+async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
     let session_manager = SessionManager::open(None).await?;
+    let token_store = session_manager.token_store();
 
     if let Some(retention_days) = config.retention_days {
         let deleted = session_manager
@@ -64,25 +86,69 @@ async fn async_main(config: ResolvedConfig) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(prompt) = config.prompt.clone() {
-        return run_oneshot(config, session_manager, prompt).await;
+    // If no credential from env/config, try loading from database
+    if config.auth_credential.is_none() {
+        if let Some(provider_name) = config.provider_name.as_deref() {
+            if provider_name == "claude" {
+                match token_store.load_oauth_token("claude").await {
+                    Ok(Some(credential)) => {
+                        tracing::info!("loaded OAuth token from database");
+                        config.auth_credential = Some(credential);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!("failed to load OAuth token from database: {}", error);
+                    }
+                }
+            }
+        }
     }
 
-    run_interactive(config, session_manager).await
+    // Save OAuth token from env/config to database for future use
+    if let Some(AuthCredential::OAuthToken { .. }) = &config.auth_credential {
+        if let Some(provider_name) = config.provider_name.as_deref() {
+            if let Err(error) = token_store
+                .save_oauth_token(
+                    provider_name,
+                    config.auth_credential.as_ref().expect("checked above"),
+                )
+                .await
+            {
+                tracing::warn!("failed to save OAuth token to database: {}", error);
+            }
+        }
+    }
+
+    if let Some(prompt) = config.prompt.clone() {
+        return run_oneshot(config, session_manager, token_store, prompt).await;
+    }
+
+    run_interactive(config, session_manager, token_store).await
 }
 
 fn create_agent_from_config(
     config: &ResolvedConfig,
     session_manager: SessionManager,
     shared_permission: SharedPermission,
+    token_store: TokenStore,
+    credential: AuthCredential,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
+    let provider_name = config.provider_name.as_deref().expect("validated");
+    let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
+
     let provider = create_provider(
-        config.provider_name.as_deref().expect("validated"),
-        config.api_key.clone().expect("validated"),
+        provider_name,
+        credential,
         config.model.clone().expect("validated"),
         config.base_url.clone(),
+        config.oauth_token_url.clone(),
+        if needs_token_store {
+            Some(Arc::new(token_store))
+        } else {
+            None
+        },
     )?;
 
     let sandbox_capability = crate::sandbox::detect();
@@ -116,10 +182,18 @@ fn create_agent_from_config(
 async fn run_oneshot(
     config: ResolvedConfig,
     session_manager: SessionManager,
+    token_store: TokenStore,
     prompt: String,
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission);
-    let agent = create_agent_from_config(&config, session_manager, shared_permission)?;
+    let credential = resolve_credential(&config)?;
+    let agent = create_agent_from_config(
+        &config,
+        session_manager,
+        shared_permission,
+        token_store,
+        credential,
+    )?;
 
     let cancellation = CancellationToken::new();
     let cancellation_clone = cancellation.clone();
@@ -159,6 +233,7 @@ async fn run_oneshot(
 async fn run_interactive(
     config: ResolvedConfig,
     session_manager: SessionManager,
+    token_store: TokenStore,
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission);
 
@@ -195,8 +270,27 @@ async fn run_interactive(
     });
 
     // Try to create the agent (may fail if config is incomplete)
-    let agent = match create_agent_from_config(&config, session_manager.clone(), shared_permission)
-    {
+    let credential = match resolve_credential(&config) {
+        Ok(credential) => credential,
+        Err(error) => {
+            eprintln!("Error: {}", error);
+            eprintln!("Configure a provider and model to use agsh.");
+            eprintln!("Example: agsh --provider openai --model gpt-4o \"hello\"");
+            eprintln!(
+                "Or set AGSH_PROVIDER, AGSH_MODEL, and OPENAI_API_KEY environment variables."
+            );
+            drop(agent_done_sender);
+            repl_handle.await?;
+            return Ok(());
+        }
+    };
+    let agent = match create_agent_from_config(
+        &config,
+        session_manager.clone(),
+        shared_permission,
+        token_store,
+        credential,
+    ) {
         Ok(agent) => agent,
         Err(error) => {
             eprintln!("Error: {}", error);
@@ -287,6 +381,17 @@ async fn run_interactive(
     }
 
     Ok(())
+}
+
+fn resolve_credential(config: &ResolvedConfig) -> anyhow::Result<AuthCredential> {
+    match &config.auth_credential {
+        Some(credential) => Ok(credential.clone()),
+        None => Err(anyhow::anyhow!(
+            "no API key or OAuth token configured. Set OPENAI_API_KEY, CLAUDE_API_KEY, \
+             or CLAUDE_OAUTH_TOKEN env var, or provider.api_key / provider.oauth_token \
+             in config file (~/.config/agsh/config.toml)"
+        )),
+    }
 }
 
 async fn load_session_messages(

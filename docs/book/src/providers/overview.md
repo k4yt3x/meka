@@ -5,7 +5,7 @@ Providers are the LLM inference backends that agsh uses to process your instruct
 | Provider | API | Streaming | Tool Calling |
 |----------|-----|-----------|-------------|
 | [OpenAI](./openai.md) | Chat Completions | SSE | Function calling |
-| [Anthropic](./anthropic.md) | Messages API | SSE (named events) | Content blocks |
+| [Claude](./claude.md) | Messages API | SSE (named events) | Content blocks |
 
 ## Selecting a Provider
 
@@ -16,7 +16,7 @@ Set the provider via any configuration layer:
 agsh --provider openai
 
 # Environment variable
-export AGSH_PROVIDER=anthropic
+export AGSH_PROVIDER=claude
 
 # Config file (~/.config/agsh/config.toml)
 [provider]

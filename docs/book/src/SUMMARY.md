@@ -26,7 +26,7 @@
 
 - [Overview](./providers/overview.md)
 - [OpenAI](./providers/openai.md)
-- [Anthropic](./providers/anthropic.md)
+- [Claude](./providers/claude.md)
 
 # Tools
 

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- First-launch setup wizard that guides new users through provider, authentication, and model configuration
+- `agsh setup` subcommand to re-run the configuration wizard
+- OAuth Authorization Code flow with PKCE for Claude provider authentication
+- OAuth token authentication for the Claude provider via `CLAUDE_OAUTH_TOKEN` env var or `provider.oauth_token` config
+- Database-backed OAuth token storage with automatic refresh
+- Configurable OAuth token refresh endpoint via `provider.oauth_token_url`
+
+### Changed
+
+- Renamed `anthropic` provider to `claude` (breaking: `--provider anthropic` no longer works)
+- Renamed `ANTHROPIC_API_KEY` env var to `CLAUDE_API_KEY`
+- API key is no longer required at startup when an OAuth token is stored in the database
+
 ## [0.2.0] - 2026-03-06
 
 ### Added
@@ -50,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Interactive REPL shell with natural language input
 - One-shot mode via positional `[PROMPT]` argument
-- OpenAI and Anthropic LLM provider support with streaming
+- OpenAI and Claude LLM provider support with streaming
 - Three-level permission system (none/read/write) with Shift+Tab cycling
 - Built-in tools: `read_file`, `write_file`, `edit_file`, `find_files`, `search_contents`, `execute_command`, `fetch_url`, `web_search`
 - Session persistence with SQLite (create, resume by UUID with `-s`, continue last with `-c`)

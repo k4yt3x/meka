@@ -1,9 +1,49 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgshError, Result};
+use crate::session::TokenStore;
+
+// ---------------------------------------------------------------------------
+// Authentication credential
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum AuthCredential {
+    ApiKey(String),
+    OAuthToken {
+        access_token: String,
+        refresh_token: Option<String>,
+        expires_at: Option<i64>,
+    },
+}
+
+impl AuthCredential {
+    pub fn auth_header(&self) -> (&'static str, String) {
+        match self {
+            AuthCredential::ApiKey(key) => ("x-api-key", key.clone()),
+            AuthCredential::OAuthToken { access_token, .. } => {
+                ("Authorization", format!("Bearer {}", access_token))
+            }
+        }
+    }
+
+    pub fn from_token_string(token: String) -> Self {
+        if token.starts_with("sk-ant-oat01-") {
+            AuthCredential::OAuthToken {
+                access_token: token,
+                refresh_token: None,
+                expires_at: None,
+            }
+        } else {
+            AuthCredential::ApiKey(token)
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Unified message model
@@ -542,24 +582,170 @@ struct ToolCallAccumulator {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic provider
+// Claude provider
 // ---------------------------------------------------------------------------
 
-pub struct AnthropicProvider {
+pub struct ClaudeProvider {
     client: reqwest::Client,
-    api_key: String,
+    credential: tokio::sync::RwLock<AuthCredential>,
     base_url: String,
     model: String,
+    oauth_token_url: String,
+    token_store: Option<Arc<TokenStore>>,
 }
 
-impl AnthropicProvider {
-    pub fn new(api_key: String, model: String, base_url: Option<String>) -> Self {
+impl ClaudeProvider {
+    pub fn new(
+        credential: AuthCredential,
+        model: String,
+        base_url: Option<String>,
+        oauth_token_url: Option<String>,
+        token_store: Option<Arc<TokenStore>>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key,
+            credential: tokio::sync::RwLock::new(credential),
             base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             model,
+            oauth_token_url: oauth_token_url
+                .unwrap_or_else(|| "https://console.anthropic.com/v1/oauth/token".to_string()),
+            token_store,
         }
+    }
+
+    async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
+        {
+            let credential = self.credential.read().await;
+            match &*credential {
+                AuthCredential::ApiKey(key) => {
+                    return Ok(("x-api-key", key.clone()));
+                }
+                AuthCredential::OAuthToken {
+                    access_token,
+                    expires_at,
+                    ..
+                } => {
+                    let now_millis = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as i64)
+                        .unwrap_or(0);
+
+                    let needs_refresh = if let Some(exp) = expires_at {
+                        now_millis + 300_000 >= *exp
+                    } else {
+                        false
+                    };
+
+                    if !needs_refresh {
+                        return Ok(("Authorization", format!("Bearer {}", access_token)));
+                    }
+                }
+            }
+        }
+
+        // Token expired — attempt refresh
+        let mut credential = self.credential.write().await;
+
+        // Double-check after acquiring write lock
+        if let AuthCredential::OAuthToken {
+            access_token,
+            expires_at,
+            ..
+        } = &*credential
+        {
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+
+            let needs_refresh = if let Some(exp) = expires_at {
+                now_millis + 300_000 >= *exp
+            } else {
+                false
+            };
+
+            if !needs_refresh {
+                return Ok(("Authorization", format!("Bearer {}", access_token)));
+            }
+        }
+
+        let refresh_token = match &*credential {
+            AuthCredential::OAuthToken { refresh_token, .. } => refresh_token.clone(),
+            _ => None,
+        };
+
+        let Some(refresh_token) = refresh_token else {
+            return Err(AgshError::Provider(
+                "OAuth access token expired and no refresh token available".to_string(),
+            ));
+        };
+
+        let new_credential = self.refresh_oauth_token(&refresh_token).await?;
+        let (header_name, header_value) = new_credential.auth_header();
+
+        if let Some(store) = &self.token_store {
+            if let Err(error) = store.save_oauth_token("claude", &new_credential).await {
+                tracing::warn!("failed to persist refreshed OAuth token: {}", error);
+            }
+        }
+
+        *credential = new_credential;
+        Ok((header_name, header_value))
+    }
+
+    async fn refresh_oauth_token(&self, refresh_token: &str) -> Result<AuthCredential> {
+        tracing::info!("refreshing OAuth token");
+
+        let response = self
+            .client
+            .post(&self.oauth_token_url)
+            .header("user-agent", "axios/1.8.4")
+            .header("accept-encoding", "gzip, compress, deflate, br")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ])
+            .send()
+            .await
+            .map_err(|error| {
+                AgshError::Provider(format!("OAuth token refresh request failed: {}", error))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AgshError::Provider(format!(
+                "OAuth token refresh failed ({}): {}",
+                status, body
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct RefreshResponse {
+            access_token: String,
+            refresh_token: Option<String>,
+            expires_in: Option<u64>,
+        }
+
+        let data: RefreshResponse = response.json().await.map_err(|error| {
+            AgshError::Provider(format!("failed to parse refresh response: {}", error))
+        })?;
+
+        let expires_at = data.expires_in.map(|seconds| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+            now + (seconds as i64) * 1000
+        });
+
+        Ok(AuthCredential::OAuthToken {
+            access_token: data.access_token,
+            refresh_token: data
+                .refresh_token
+                .or_else(|| Some(refresh_token.to_string())),
+            expires_at,
+        })
     }
 
     fn build_request_body(
@@ -569,7 +755,7 @@ impl AnthropicProvider {
         tools: &[ToolDefinition],
         stream: bool,
     ) -> serde_json::Value {
-        let anthropic_messages: Vec<serde_json::Value> = messages
+        let claude_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|message| {
                 let role = match message.role {
@@ -619,7 +805,7 @@ impl AnthropicProvider {
 
         let mut body = serde_json::json!({
             "model": self.model,
-            "messages": anthropic_messages,
+            "messages": claude_messages,
             "max_tokens": 8192,
             "stream": stream,
         });
@@ -629,7 +815,7 @@ impl AnthropicProvider {
         }
 
         if !tools.is_empty() {
-            let anthropic_tools: Vec<serde_json::Value> = tools
+            let claude_tools: Vec<serde_json::Value> = tools
                 .iter()
                 .map(|tool| {
                     serde_json::json!({
@@ -639,7 +825,7 @@ impl AnthropicProvider {
                     })
                 })
                 .collect();
-            body["tools"] = serde_json::json!(anthropic_tools);
+            body["tools"] = serde_json::json!(claude_tools);
         }
 
         body
@@ -695,7 +881,7 @@ impl AnthropicProvider {
                     content_blocks.push(ContentBlock::ToolUse { id, name, input });
                 }
                 _ => {
-                    tracing::warn!("unknown Anthropic content block type: {}", block_type);
+                    tracing::warn!("unknown Claude content block type: {}", block_type);
                 }
             }
         }
@@ -711,7 +897,7 @@ impl AnthropicProvider {
 }
 
 #[async_trait]
-impl Provider for AnthropicProvider {
+impl Provider for ClaudeProvider {
     async fn complete(
         &self,
         system_prompt: &str,
@@ -719,13 +905,20 @@ impl Provider for AnthropicProvider {
         tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason)> {
         let body = self.build_request_body(system_prompt, messages, tools, false);
+        let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
-        let response = self
+        let mut request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
+            .header(auth_header_name, &auth_header_value)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+
+        if auth_header_name == "Authorization" {
+            request = request.header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219");
+        }
+
+        let response = request
             .json(&body)
             .send()
             .await
@@ -762,14 +955,20 @@ impl Provider for AnthropicProvider {
         use reqwest_eventsource::{Event, EventSource};
 
         let body = self.build_request_body(system_prompt, messages, tools, true);
+        let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
-        let request = self
+        let mut request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
+            .header(auth_header_name, &auth_header_value)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body);
+            .header("content-type", "application/json");
+
+        if auth_header_name == "Authorization" {
+            request = request.header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219");
+        }
+
+        let request = request.json(&body);
 
         let mut event_source = EventSource::new(request).map_err(|error| {
             AgshError::Provider(format!("failed to create SSE stream: {}", error))
@@ -894,7 +1093,7 @@ impl Provider for AnthropicProvider {
                                 }
                                 "message_start" | "ping" => {}
                                 other => {
-                                    tracing::debug!("unknown Anthropic SSE event: {}", other);
+                                    tracing::debug!("unknown Claude SSE event: {}", other);
                                 }
                             }
                         }
@@ -914,7 +1113,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn name(&self) -> &str {
-        "anthropic"
+        "claude"
     }
 }
 
@@ -924,19 +1123,29 @@ impl Provider for AnthropicProvider {
 
 pub fn create_provider(
     provider_name: &str,
-    api_key: String,
+    credential: AuthCredential,
     model: String,
     base_url: Option<String>,
-) -> Result<std::sync::Arc<dyn Provider>> {
+    oauth_token_url: Option<String>,
+    token_store: Option<Arc<TokenStore>>,
+) -> Result<Arc<dyn Provider>> {
     match provider_name {
-        "openai" => Ok(std::sync::Arc::new(OpenAiProvider::new(
-            api_key, model, base_url,
-        ))),
-        "anthropic" => Ok(std::sync::Arc::new(AnthropicProvider::new(
-            api_key, model, base_url,
+        "openai" => {
+            let api_key = match credential {
+                AuthCredential::ApiKey(key) => key,
+                AuthCredential::OAuthToken { access_token, .. } => access_token,
+            };
+            Ok(Arc::new(OpenAiProvider::new(api_key, model, base_url)))
+        }
+        "claude" => Ok(Arc::new(ClaudeProvider::new(
+            credential,
+            model,
+            base_url,
+            oauth_token_url,
+            token_store,
         ))),
         other => Err(AgshError::Config(format!(
-            "unknown provider: '{}'. Supported providers: openai, anthropic",
+            "unknown provider: '{}'. Supported providers: openai, claude",
             other
         ))),
     }
@@ -1162,10 +1371,12 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_request_body_simple() {
-        let provider = AnthropicProvider::new(
-            "test-key".to_string(),
+    fn test_claude_request_body_simple() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
             None,
         );
 
@@ -1176,13 +1387,13 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["system"], "system prompt");
 
-        let anthropic_messages = body["messages"]
+        let claude_messages = body["messages"]
             .as_array()
             .expect("messages should be array");
-        assert_eq!(anthropic_messages.len(), 1);
-        assert_eq!(anthropic_messages[0]["role"], "user");
+        assert_eq!(claude_messages.len(), 1);
+        assert_eq!(claude_messages[0]["role"], "user");
 
-        let content = anthropic_messages[0]["content"]
+        let content = claude_messages[0]["content"]
             .as_array()
             .expect("content should be array");
         assert_eq!(content[0]["type"], "text");
@@ -1190,10 +1401,12 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_request_body_with_tools() {
-        let provider = AnthropicProvider::new(
-            "test-key".to_string(),
+    fn test_claude_request_body_with_tools() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
             None,
         );
 
@@ -1210,18 +1423,20 @@ mod tests {
         }];
 
         let body = provider.build_request_body("", &[], &tools, false);
-        let anthropic_tools = body["tools"].as_array().expect("tools should be array");
-        assert_eq!(anthropic_tools.len(), 1);
-        assert_eq!(anthropic_tools[0]["name"], "read_file");
-        assert_eq!(anthropic_tools[0]["description"], "Read a file");
-        assert!(anthropic_tools[0].get("input_schema").is_some());
+        let claude_tools = body["tools"].as_array().expect("tools should be array");
+        assert_eq!(claude_tools.len(), 1);
+        assert_eq!(claude_tools[0]["name"], "read_file");
+        assert_eq!(claude_tools[0]["description"], "Read a file");
+        assert!(claude_tools[0].get("input_schema").is_some());
     }
 
     #[test]
-    fn test_anthropic_request_body_with_tool_calls() {
-        let provider = AnthropicProvider::new(
-            "test-key".to_string(),
+    fn test_claude_request_body_with_tool_calls() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
             None,
         );
 
@@ -1246,16 +1461,16 @@ mod tests {
         ];
 
         let body = provider.build_request_body("", &messages, &[], false);
-        let anthropic_messages = body["messages"]
+        let claude_messages = body["messages"]
             .as_array()
             .expect("messages should be array");
 
-        assert_eq!(anthropic_messages.len(), 3);
-        assert_eq!(anthropic_messages[0]["role"], "user");
+        assert_eq!(claude_messages.len(), 3);
+        assert_eq!(claude_messages[0]["role"], "user");
 
         // Assistant message with tool_use block
-        assert_eq!(anthropic_messages[1]["role"], "assistant");
-        let assistant_content = anthropic_messages[1]["content"]
+        assert_eq!(claude_messages[1]["role"], "assistant");
+        let assistant_content = claude_messages[1]["content"]
             .as_array()
             .expect("content should be array");
         assert_eq!(assistant_content[0]["type"], "tool_use");
@@ -1263,8 +1478,8 @@ mod tests {
         assert_eq!(assistant_content[0]["name"], "read_file");
 
         // User message with tool_result block
-        assert_eq!(anthropic_messages[2]["role"], "user");
-        let result_content = anthropic_messages[2]["content"]
+        assert_eq!(claude_messages[2]["role"], "user");
+        let result_content = claude_messages[2]["content"]
             .as_array()
             .expect("content should be array");
         assert_eq!(result_content[0]["type"], "tool_result");
@@ -1272,10 +1487,12 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_parse_non_streaming_text() {
-        let provider = AnthropicProvider::new(
-            "test-key".to_string(),
+    fn test_claude_parse_non_streaming_text() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
             None,
         );
 
@@ -1300,10 +1517,12 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_parse_non_streaming_tool_use() {
-        let provider = AnthropicProvider::new(
-            "test-key".to_string(),
+    fn test_claude_parse_non_streaming_tool_use() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
             None,
         );
 
@@ -1347,10 +1566,12 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_no_system_prompt_when_empty() {
-        let provider = AnthropicProvider::new(
-            "test-key".to_string(),
+    fn test_claude_no_system_prompt_when_empty() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
             None,
         );
 
@@ -1360,16 +1581,25 @@ mod tests {
 
     #[test]
     fn test_create_provider_openai() {
-        let result = create_provider("openai", "key".to_string(), "gpt-4o".to_string(), None);
+        let result = create_provider(
+            "openai",
+            AuthCredential::ApiKey("key".to_string()),
+            "gpt-4o".to_string(),
+            None,
+            None,
+            None,
+        );
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_create_provider_anthropic() {
+    fn test_create_provider_claude() {
         let result = create_provider(
-            "anthropic",
-            "key".to_string(),
+            "claude",
+            AuthCredential::ApiKey("key".to_string()),
             "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -1377,7 +1607,46 @@ mod tests {
 
     #[test]
     fn test_create_provider_unknown() {
-        let result = create_provider("unknown", "key".to_string(), "model".to_string(), None);
+        let result = create_provider(
+            "unknown",
+            AuthCredential::ApiKey("key".to_string()),
+            "model".to_string(),
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_auth_credential_from_token_string_api_key() {
+        let credential = AuthCredential::from_token_string("sk-ant-api03-test".to_string());
+        assert!(matches!(credential, AuthCredential::ApiKey(_)));
+    }
+
+    #[test]
+    fn test_auth_credential_from_token_string_oauth() {
+        let credential = AuthCredential::from_token_string("sk-ant-oat01-test".to_string());
+        assert!(matches!(credential, AuthCredential::OAuthToken { .. }));
+    }
+
+    #[test]
+    fn test_auth_credential_api_key_header() {
+        let credential = AuthCredential::ApiKey("my-key".to_string());
+        let (name, value) = credential.auth_header();
+        assert_eq!(name, "x-api-key");
+        assert_eq!(value, "my-key");
+    }
+
+    #[test]
+    fn test_auth_credential_oauth_header() {
+        let credential = AuthCredential::OAuthToken {
+            access_token: "my-token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+        };
+        let (name, value) = credential.auth_header();
+        assert_eq!(name, "Authorization");
+        assert_eq!(value, "Bearer my-token");
     }
 }

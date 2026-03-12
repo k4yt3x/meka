@@ -9,7 +9,7 @@ An agentic shell where you speak human, not bash. Yeah it's a vibe shell.
 
 ## Overview
 
-agsh (agentic shell) is an interactive shell that replaces traditional command syntax with natural language. Describe what you want, and the agent reads files, searches code, runs commands, and browses the web to get it done. One binary, one config, works with any OpenAI-compatible or Anthropic API.
+agsh (agentic shell) is an interactive shell that replaces traditional command syntax with natural language. Describe what you want, and the agent reads files, searches code, runs commands, and browses the web to get it done. One binary, one config, works with any OpenAI-compatible or Claude API.
 
 ## Installation
 
@@ -21,7 +21,7 @@ cargo install --git https://github.com/k4yt3x/agsh.git
 
 ## Quick Start
 
-1. Create `~/.config/agsh/config.toml` and configure the provider and model you want to use. For example, to use OpenRouter with an Anthropic model:
+1. Create `~/.config/agsh/config.toml` and configure the provider and model you want to use. For example, to use OpenRouter with a Claude model:
 
 ```toml
 [provider]

@@ -31,19 +31,27 @@ The LLM provider to use.
 | Value | Description |
 |-------|-------------|
 | `openai` | OpenAI Chat Completions API (also works with OpenAI-compatible APIs) |
-| `anthropic` | Anthropic Messages API |
+| `claude` | Claude API (Messages endpoint) |
 
 ### `provider.model`
 
 The model identifier to send to the provider. Examples:
 
 - `gpt-4o`, `gpt-4o-mini` (OpenAI)
-- `claude-sonnet-4-20250514`, `claude-haiku-4-5-20251001` (Anthropic)
+- `claude-sonnet-4-20250514`, `claude-haiku-4-5-20251001` (Claude)
 - Any model supported by an OpenAI-compatible endpoint
 
 ### `provider.api_key`
 
-The API key for authentication. It is recommended to use environment variables (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`) instead of storing the key in the config file.
+The API key for authentication. It is recommended to use environment variables (`OPENAI_API_KEY` or `CLAUDE_API_KEY`) instead of storing the key in the config file.
+
+### `provider.oauth_token`
+
+OAuth access token for the Claude provider. Can also be set via `CLAUDE_OAUTH_TOKEN` env var. The token is saved to the database on first use and loaded automatically on subsequent launches.
+
+### `provider.oauth_token_url`
+
+Custom OAuth token refresh endpoint. Defaults to `https://console.anthropic.com/v1/oauth/token`.
 
 ### `provider.base_url`
 
@@ -56,7 +64,7 @@ Custom API base URL. Useful for:
 If not set, defaults to:
 
 - `https://api.openai.com/v1` for the `openai` provider
-- `https://api.anthropic.com` for the `anthropic` provider
+- `https://api.anthropic.com` for the `claude` provider
 
 ## Examples
 
@@ -69,13 +77,14 @@ model = "gpt-4o"
 # API key via env: export OPENAI_API_KEY=sk-...
 ```
 
-### Anthropic
+### Claude
 
 ```toml
 [provider]
-name = "anthropic"
+name = "claude"
 model = "claude-sonnet-4-20250514"
-# API key via env: export ANTHROPIC_API_KEY=sk-ant-...
+# API key via env: export CLAUDE_API_KEY=sk-ant-api03-...
+# Or OAuth token via env: export CLAUDE_OAUTH_TOKEN=sk-ant-oat01-...
 ```
 
 ### Ollama (local)

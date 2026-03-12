@@ -1,36 +1,30 @@
 # Quick Start
 
-## 1. Create a Config File
+## 1. Run the Setup Wizard
 
-Create `~/.config/agsh/config.toml` with your provider settings:
-
-**OpenAI:**
-
-```toml
-[provider]
-name = "openai"
-base_url = "https://openrouter.ai/api/v1"
-api_key = "sk-or-v1-..."
-model = "anthropic/claude-opus-4.6"
-```
-
-**Anthropic:**
-
-```toml
-[provider]
-name = "anthropic"
-model = "claude-opus-4.6"
-api_key = "sk-ant-..."
-```
-
-See [Configuration](../configuration/overview.md) for all options including custom endpoints.
-
-> You can also use environment variables (`OPENAI_API_KEY`, `AGSH_PROVIDER`, etc.) or CLI flags (`--provider`, `-m`) as overrides. See [Environment Variables](../configuration/environment-variables.md) and [CLI Options](../configuration/cli-options.md).
-
-## 2. Start the Shell
+On first launch, agsh automatically starts an interactive setup wizard:
 
 ```bash
 agsh
+```
+
+The wizard will guide you through:
+
+1. **Provider selection** — Choose between `claude` and `openai`
+2. **Authentication** — OAuth login (Claude only) or API key entry
+3. **Model selection** — Enter the model name to use
+4. **Base URL** — Optionally set a custom API endpoint
+
+The wizard writes your configuration to `~/.config/agsh/config.toml`. You can re-run it at any time with `agsh setup`.
+
+> You can also create the config file manually or use environment variables (`OPENAI_API_KEY`, `AGSH_PROVIDER`, etc.) and CLI flags (`--provider`, `-m`) as overrides. See [Configuration](../configuration/overview.md) for all options.
+
+## 2. Start Using agsh
+
+After setup, you will see a prompt:
+
+```text
+agsh [r] >
 ```
 
 You will see a prompt:

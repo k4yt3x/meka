@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::cli::Cli;
 use crate::permission::Permission;
+use crate::provider::AuthCredential;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
@@ -43,6 +44,8 @@ pub struct ProviderConfig {
     pub name: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    pub oauth_token: Option<String>,
+    pub oauth_token_url: Option<String>,
     pub base_url: Option<String>,
 }
 
@@ -50,8 +53,9 @@ pub struct ProviderConfig {
 pub struct ResolvedConfig {
     pub provider_name: Option<String>,
     pub model: Option<String>,
-    pub api_key: Option<String>,
+    pub auth_credential: Option<AuthCredential>,
     pub base_url: Option<String>,
+    pub oauth_token_url: Option<String>,
     pub permission: Permission,
     pub streaming: bool,
     pub session_id: Option<uuid::Uuid>,
@@ -67,8 +71,43 @@ pub struct ResolvedConfig {
     pub max_storage_bytes: Option<u64>,
 }
 
-fn config_file_path() -> Option<PathBuf> {
+pub(crate) fn config_file_path() -> Option<PathBuf> {
     dirs::config_dir().map(|directory| directory.join("agsh").join("config.toml"))
+}
+
+pub(crate) fn config_file_exists() -> bool {
+    config_file_path().is_some_and(|path| path.exists())
+}
+
+pub(crate) fn write_config_file(
+    provider_name: &str,
+    model: &str,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+) -> std::io::Result<()> {
+    let path = config_file_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "could not determine config directory",
+        )
+    })?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut content = String::new();
+    content.push_str("[provider]\n");
+    content.push_str(&format!("name = \"{}\"\n", provider_name));
+    content.push_str(&format!("model = \"{}\"\n", model));
+    if let Some(key) = api_key {
+        content.push_str(&format!("api_key = \"{}\"\n", key));
+    }
+    if let Some(url) = base_url {
+        content.push_str(&format!("base_url = \"{}\"\n", url));
+    }
+
+    std::fs::write(&path, content)
 }
 
 fn load_config_file() -> ConfigFile {
@@ -113,7 +152,7 @@ impl ResolvedConfig {
             .or_else(|| std::env::var("AGSH_MODEL").ok())
             .or_else(|| file_provider.model.clone());
 
-        let api_key = resolve_api_key(provider_name.as_deref(), &file_provider);
+        let auth_credential = resolve_auth_credential(provider_name.as_deref(), &file_provider);
 
         let base_url = cli
             .base_url
@@ -133,8 +172,9 @@ impl ResolvedConfig {
         Self {
             provider_name,
             model,
-            api_key,
+            auth_credential,
             base_url,
+            oauth_token_url: file_provider.oauth_token_url.clone(),
             permission,
             streaming: !cli.no_stream,
             session_id: cli.session_id,
@@ -168,25 +208,49 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
-        if self.api_key.is_none() {
-            return Err(crate::error::AgshError::Config(
-                "no API key configured. Set OPENAI_API_KEY or ANTHROPIC_API_KEY env var, \
-                 or provider.api_key in config file (~/.config/agsh/config.toml)"
-                    .to_string(),
-            ));
-        }
         Ok(())
     }
 }
 
-fn resolve_api_key(provider_name: Option<&str>, file_provider: &ProviderConfig) -> Option<String> {
+fn resolve_auth_credential(
+    provider_name: Option<&str>,
+    file_provider: &ProviderConfig,
+) -> Option<AuthCredential> {
     match provider_name {
-        Some("anthropic") => std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .or_else(|| file_provider.api_key.clone()),
-        Some("openai") | _ => std::env::var("OPENAI_API_KEY")
-            .ok()
-            .or_else(|| file_provider.api_key.clone()),
+        Some("claude") => {
+            // 1. CLAUDE_API_KEY env var (auto-detects OAuth vs API key by prefix)
+            if let Ok(key) = std::env::var("CLAUDE_API_KEY") {
+                return Some(AuthCredential::from_token_string(key));
+            }
+            // 2. CLAUDE_OAUTH_TOKEN env var (always treated as OAuth)
+            if let Ok(token) = std::env::var("CLAUDE_OAUTH_TOKEN") {
+                return Some(AuthCredential::OAuthToken {
+                    access_token: token,
+                    refresh_token: None,
+                    expires_at: None,
+                });
+            }
+            // 3. provider.api_key from config (auto-detects)
+            if let Some(key) = &file_provider.api_key {
+                return Some(AuthCredential::from_token_string(key.clone()));
+            }
+            // 4. provider.oauth_token from config
+            if let Some(token) = &file_provider.oauth_token {
+                return Some(AuthCredential::OAuthToken {
+                    access_token: token.clone(),
+                    refresh_token: None,
+                    expires_at: None,
+                });
+            }
+            // Database fallback happens in main.rs
+            None
+        }
+        Some("openai") | _ => {
+            let key = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .or_else(|| file_provider.api_key.clone())?;
+            Some(AuthCredential::ApiKey(key))
+        }
     }
 }
 
@@ -224,11 +288,11 @@ base_url = "https://api.openai.com/v1"
     fn test_partial_config_file() {
         let toml_str = r#"
 [provider]
-name = "anthropic"
+name = "claude"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let provider = config.provider.expect("provider should be present");
-        assert_eq!(provider.name.as_deref(), Some("anthropic"));
+        assert_eq!(provider.name.as_deref(), Some("claude"));
         assert!(provider.model.is_none());
         assert!(provider.api_key.is_none());
         assert!(provider.base_url.is_none());
