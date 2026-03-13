@@ -8,6 +8,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{AgshError, Result};
 use crate::session::TokenStore;
 
+pub(crate) const DEFAULT_CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
 // ---------------------------------------------------------------------------
 // Authentication credential
 // ---------------------------------------------------------------------------
@@ -590,6 +592,7 @@ pub struct ClaudeProvider {
     credential: tokio::sync::RwLock<AuthCredential>,
     base_url: String,
     model: String,
+    client_id: String,
     oauth_token_url: String,
     token_store: Option<Arc<TokenStore>>,
 }
@@ -599,6 +602,7 @@ impl ClaudeProvider {
         credential: AuthCredential,
         model: String,
         base_url: Option<String>,
+        client_id: Option<String>,
         oauth_token_url: Option<String>,
         token_store: Option<Arc<TokenStore>>,
     ) -> Self {
@@ -607,8 +611,9 @@ impl ClaudeProvider {
             credential: tokio::sync::RwLock::new(credential),
             base_url: base_url.unwrap_or_else(|| "https://api.anthropic.com".to_string()),
             model,
+            client_id: client_id.unwrap_or_else(|| DEFAULT_CLAUDE_CLIENT_ID.to_string()),
             oauth_token_url: oauth_token_url
-                .unwrap_or_else(|| "https://console.anthropic.com/v1/oauth/token".to_string()),
+                .unwrap_or_else(|| "https://api.anthropic.com/v1/oauth/token".to_string()),
             token_store,
         }
     }
@@ -699,12 +704,11 @@ impl ClaudeProvider {
         let response = self
             .client
             .post(&self.oauth_token_url)
-            .header("user-agent", "axios/1.8.4")
-            .header("accept-encoding", "gzip, compress, deflate, br")
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-            ])
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": self.client_id,
+            }))
             .send()
             .await
             .map_err(|error| {
@@ -1126,6 +1130,7 @@ pub fn create_provider(
     credential: AuthCredential,
     model: String,
     base_url: Option<String>,
+    client_id: Option<String>,
     oauth_token_url: Option<String>,
     token_store: Option<Arc<TokenStore>>,
 ) -> Result<Arc<dyn Provider>> {
@@ -1141,6 +1146,7 @@ pub fn create_provider(
             credential,
             model,
             base_url,
+            client_id,
             oauth_token_url,
             token_store,
         ))),

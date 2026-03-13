@@ -143,6 +143,7 @@ fn create_agent_from_config(
         credential,
         config.model.clone().expect("validated"),
         config.base_url.clone(),
+        config.client_id.clone(),
         config.oauth_token_url.clone(),
         if needs_token_store {
             Some(Arc::new(token_store))

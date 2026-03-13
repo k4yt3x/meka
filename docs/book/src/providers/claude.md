@@ -86,7 +86,7 @@ OAuth tokens are automatically detected by their `sk-ant-oat01-` prefix, even wh
 4. If the token expires, agsh refreshes it automatically and updates the database
 5. Setting a new env var or config value replaces the stored token
 
-**Token refresh URL:** Defaults to `https://console.anthropic.com/v1/oauth/token`. Configurable via `provider.oauth_token_url` in the config file.
+**Token refresh URL:** Defaults to `https://api.anthropic.com/v1/oauth/token`. Configurable via `provider.oauth_token_url` in the config file.
 
 ## Supported Models
 

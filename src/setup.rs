@@ -6,10 +6,8 @@ use rand::Rng;
 use sha2::{Digest, Sha256};
 
 use crate::config;
-use crate::provider::AuthCredential;
+use crate::provider::{AuthCredential, DEFAULT_CLAUDE_CLIENT_ID};
 use crate::session::TokenStore;
-
-const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
@@ -17,7 +15,7 @@ const SCOPES: &str =
     "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers";
 
 fn client_id() -> String {
-    std::env::var("CLAUDE_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string())
+    std::env::var("CLAUDE_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLAUDE_CLIENT_ID.to_string())
 }
 
 fn generate_pkce_pair() -> (String, String) {
