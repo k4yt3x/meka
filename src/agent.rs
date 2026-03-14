@@ -14,17 +14,21 @@ use crate::session::SessionManager;
 use crate::system_prompt::build_system_prompt;
 use crate::tools::ToolRegistry;
 
+pub struct AgentOptions {
+    pub streaming: bool,
+    pub newline_before_prompt: bool,
+    pub newline_after_prompt: bool,
+    pub show_session_id: bool,
+    pub sandboxed_shell: bool,
+    pub context_messages: Option<usize>,
+}
+
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tool_registry: ToolRegistry,
     session_manager: SessionManager,
     shared_permission: SharedPermission,
-    streaming: bool,
-    newline_before_prompt: bool,
-    newline_after_prompt: bool,
-    show_session_id: bool,
-    sandboxed_shell: bool,
-    context_messages: Option<usize>,
+    options: AgentOptions,
 }
 
 impl Agent {
@@ -33,24 +37,14 @@ impl Agent {
         tool_registry: ToolRegistry,
         session_manager: SessionManager,
         shared_permission: SharedPermission,
-        streaming: bool,
-        newline_before_prompt: bool,
-        newline_after_prompt: bool,
-        show_session_id: bool,
-        sandboxed_shell: bool,
-        context_messages: Option<usize>,
+        options: AgentOptions,
     ) -> Self {
         Self {
             provider,
             tool_registry,
             session_manager,
             shared_permission,
-            streaming,
-            newline_before_prompt,
-            newline_after_prompt,
-            show_session_id,
-            sandboxed_shell,
-            context_messages,
+            options,
         }
     }
 
@@ -64,16 +58,16 @@ impl Agent {
         if session_id.is_none() {
             let id = self.session_manager.create_session().await?;
             *session_id = Some(id);
-            if self.show_session_id {
+            if self.options.show_session_id {
                 crate::render::render_session_id("Creating new session", &id.to_string());
             }
         }
 
-        if self.newline_after_prompt {
+        if self.options.newline_after_prompt {
             println!();
         }
 
-        let sid = session_id.expect("session_id should be set");
+        let sid = session_id.ok_or(AgshError::Config("session_id not set".into()))?;
 
         let user_message = Message::user(&user_input);
         messages.push(user_message);
@@ -88,11 +82,13 @@ impl Agent {
 
             let permission = self.shared_permission.get();
             let tools = self.available_tools(permission);
-            let system_prompt = build_system_prompt(permission, &tools, self.sandboxed_shell);
+            let system_prompt =
+                build_system_prompt(permission, &tools, self.options.sandboxed_shell);
 
-            let api_messages = truncate_messages_for_context(messages, self.context_messages);
+            let api_messages =
+                truncate_messages_for_context(messages, self.options.context_messages);
 
-            let (assistant_message, stop_reason) = if self.streaming {
+            let (assistant_message, stop_reason) = if self.options.streaming {
                 self.run_streaming(&system_prompt, &api_messages, &tools, cancellation.clone())
                     .await?
             } else {
@@ -102,7 +98,9 @@ impl Agent {
             };
 
             let content_json =
-                serde_json::to_string(&assistant_message.content).unwrap_or_default();
+                serde_json::to_string(&assistant_message.content).map_err(|error| {
+                    AgshError::Provider(format!("failed to serialize message: {}", error))
+                })?;
             self.session_manager
                 .save_message(sid, "assistant", &content_json)
                 .await?;
@@ -121,7 +119,12 @@ impl Agent {
                     };
 
                     let result_json =
-                        serde_json::to_string(&result_message.content).unwrap_or_default();
+                        serde_json::to_string(&result_message.content).map_err(|error| {
+                            AgshError::Provider(format!(
+                                "failed to serialize tool results: {}",
+                                error
+                            ))
+                        })?;
                     self.session_manager
                         .save_message(sid, "tool_results", &result_json)
                         .await?;
@@ -135,7 +138,7 @@ impl Agent {
             }
         }
 
-        if self.newline_before_prompt {
+        if self.options.newline_before_prompt {
             println!();
         }
 
@@ -256,7 +259,7 @@ impl Agent {
 
         for block in &assistant_message.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                if !self.streaming {
+                if !self.options.streaming {
                     render::render_tool_indicator(name, input);
                 }
 

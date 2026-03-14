@@ -34,10 +34,6 @@ pub fn detect() -> SandboxCapability {
     SandboxCapability::Unavailable
 }
 
-// ---------------------------------------------------------------------------
-// Linux Landlock
-// ---------------------------------------------------------------------------
-
 #[cfg(target_os = "linux")]
 fn detect_landlock() -> Option<i32> {
     let version = unsafe {
@@ -87,10 +83,7 @@ pub unsafe fn apply_landlock_readonly(abi_version: i32) -> Result<(), i32> {
         }
 
         // Allow read + execute for the entire filesystem
-        let root_fd = libc::open(
-            b"/\0".as_ptr() as *const libc::c_char,
-            libc::O_PATH | libc::O_CLOEXEC,
-        );
+        let root_fd = libc::open(c"/".as_ptr(), libc::O_PATH | libc::O_CLOEXEC);
         if root_fd < 0 {
             libc::close(ruleset_fd);
             return Err(*libc::__errno_location());
@@ -147,6 +140,7 @@ fn handled_access_for_abi(abi_version: i32) -> u64 {
     if abi_version >= 3 {
         access |= LANDLOCK_ACCESS_FS_TRUNCATE;
     }
+    // ABI v4 added network access flags (BIND_TCP, CONNECT_TCP), not filesystem flags
     if abi_version >= 5 {
         access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }

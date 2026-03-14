@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentOptions};
 use crate::config::ResolvedConfig;
 use crate::permission::SharedPermission;
 use crate::provider::{AuthCredential, create_provider};
@@ -87,36 +87,30 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
     }
 
     // If no credential from env/config, try loading from database
-    if config.auth_credential.is_none() {
-        if let Some(provider_name) = config.provider_name.as_deref() {
-            if provider_name == "claude" {
-                match token_store.load_oauth_token("claude").await {
-                    Ok(Some(credential)) => {
-                        tracing::info!("loaded OAuth token from database");
-                        config.auth_credential = Some(credential);
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!("failed to load OAuth token from database: {}", error);
-                    }
-                }
+    if config.auth_credential.is_none()
+        && let Some(provider_name) = config.provider_name.as_deref()
+        && provider_name == "claude"
+    {
+        match token_store.load_oauth_token("claude").await {
+            Ok(Some(credential)) => {
+                tracing::info!("loaded OAuth token from database");
+                config.auth_credential = Some(credential);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!("failed to load OAuth token from database: {}", error);
             }
         }
     }
 
     // Save OAuth token from env/config to database for future use
-    if let Some(AuthCredential::OAuthToken { .. }) = &config.auth_credential {
-        if let Some(provider_name) = config.provider_name.as_deref() {
-            if let Err(error) = token_store
-                .save_oauth_token(
-                    provider_name,
-                    config.auth_credential.as_ref().expect("checked above"),
-                )
-                .await
-            {
-                tracing::warn!("failed to save OAuth token to database: {}", error);
-            }
-        }
+    if let Some(credential @ AuthCredential::OAuthToken { .. }) = &config.auth_credential
+        && let Some(provider_name) = config.provider_name.as_deref()
+        && let Err(error) = token_store
+            .save_oauth_token(provider_name, credential)
+            .await
+    {
+        tracing::warn!("failed to save OAuth token to database: {}", error);
     }
 
     if let Some(prompt) = config.prompt.clone() {
@@ -135,13 +129,19 @@ fn create_agent_from_config(
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
-    let provider_name = config.provider_name.as_deref().expect("validated");
+    let provider_name = config
+        .provider_name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("provider_name missing after validation"))?;
     let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
 
     let provider = create_provider(
         provider_name,
         credential,
-        config.model.clone().expect("validated"),
+        config
+            .model
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("model missing after validation"))?,
         config.base_url.clone(),
         config.client_id.clone(),
         config.oauth_token_url.clone(),
@@ -171,12 +171,14 @@ fn create_agent_from_config(
         tool_registry,
         session_manager,
         shared_permission,
-        config.streaming,
-        config.newline_before_prompt,
-        config.newline_after_prompt,
-        config.show_session_id,
-        sandboxed_shell,
-        config.context_messages,
+        AgentOptions {
+            streaming: config.streaming,
+            newline_before_prompt: config.newline_before_prompt,
+            newline_after_prompt: config.newline_after_prompt,
+            show_session_id: config.show_session_id,
+            sandboxed_shell,
+            context_messages: config.context_messages,
+        },
     ))
 }
 
@@ -219,13 +221,13 @@ async fn run_oneshot(
         Err(error) => return Err(error.into()),
     }
 
-    if let Some(id) = session_id {
-        if config.show_session_id {
-            render::render_hint(&format!(
-                "Run `agsh -c` or `agsh -s {}` to continue this session.",
-                id
-            ));
-        }
+    if let Some(id) = session_id
+        && config.show_session_id
+    {
+        render::render_hint(&format!(
+            "Run `agsh -c` or `agsh -s {}` to continue this session.",
+            id
+        ));
     }
 
     Ok(())

@@ -90,7 +90,7 @@ pub fn build_system_prompt(
         for tool in tools {
             prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
         }
-        prompt.push_str("\n");
+        prompt.push('\n');
     }
 
     prompt.push_str("## Guidelines\n\n");
@@ -104,31 +104,31 @@ pub fn build_system_prompt(
     );
     prompt.push_str("- Be concise but thorough.\n\n");
 
-    if !matches!(permission, Permission::None) {
-        if let Some((skills_dir, file_names)) = detect_skills() {
-            let dir_display = skills_dir.display();
-            prompt.push_str("## Skills\n\n");
-            prompt.push_str(&format!(
-                "Skills are knowledge files stored in `{dir_display}`. They document procedures, \
+    if !matches!(permission, Permission::None)
+        && let Some((skills_dir, file_names)) = detect_skills()
+    {
+        let dir_display = skills_dir.display();
+        prompt.push_str("## Skills\n\n");
+        prompt.push_str(&format!(
+            "Skills are knowledge files stored in `{dir_display}`. They document procedures, \
                  tools, and non-standard knowledge to help you accomplish specific tasks. \
                  Each skill has a title on the first line, followed by an empty line, then \
                  a summary paragraph.\n\n"
-            ));
-            prompt.push_str("Available skills:\n");
-            for name in &file_names {
-                prompt.push_str(&format!("- {}\n", name));
-            }
-            prompt.push_str(&format!(
-                "\nTo preview what a skill covers, read just the first 3 lines:\n  \
-                 read_file(path: \"{dir_display}/{}\", limit: 3)\n\n",
-                file_names[0]
-            ));
-            prompt.push_str(&format!(
-                "To read the full skill:\n  \
-                 read_file(path: \"{dir_display}/{}\")\n\n",
-                file_names[0]
-            ));
+        ));
+        prompt.push_str("Available skills:\n");
+        for name in &file_names {
+            prompt.push_str(&format!("- {}\n", name));
         }
+        prompt.push_str(&format!(
+            "\nTo preview what a skill covers, read just the first 3 lines:\n  \
+                 read_file(path: \"{dir_display}/{}\", limit: 3)\n\n",
+            file_names[0]
+        ));
+        prompt.push_str(&format!(
+            "To read the full skill:\n  \
+                 read_file(path: \"{dir_display}/{}\")\n\n",
+            file_names[0]
+        ));
     }
 
     prompt.push_str("## Environment\n\n");

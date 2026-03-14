@@ -74,7 +74,7 @@ impl StreamingRenderer {
 
     fn in_code_block(&self) -> bool {
         let fence_count = self.buffer.matches("```").count();
-        fence_count % 2 != 0
+        !fence_count.is_multiple_of(2)
     }
 
     fn in_table(&self) -> bool {
@@ -102,7 +102,7 @@ pub fn render_hint(message: &str) {
     eprintln!("{}", message.with(Color::DarkGrey));
 }
 
-fn tool_display_name<'a>(name: &'a str) -> &'a str {
+fn tool_display_name(name: &str) -> &str {
     match name {
         "execute_command" => "Shell",
         "read_file" => "ReadFile",
@@ -135,5 +135,86 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = value.chars().take(max_chars).collect();
         format!("{}...", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_display_short() {
+        assert_eq!(truncate_display("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_display_exact() {
+        assert_eq!(truncate_display("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_display_long() {
+        assert_eq!(truncate_display("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_display_empty() {
+        assert_eq!(truncate_display("", 5), "");
+    }
+
+    #[test]
+    fn test_tool_display_name_mappings() {
+        assert_eq!(tool_display_name("execute_command"), "Shell");
+        assert_eq!(tool_display_name("read_file"), "ReadFile");
+        assert_eq!(tool_display_name("write_file"), "WriteFile");
+        assert_eq!(tool_display_name("edit_file"), "EditFile");
+        assert_eq!(tool_display_name("find_files"), "FindFiles");
+        assert_eq!(tool_display_name("search_contents"), "SearchContents");
+        assert_eq!(tool_display_name("fetch_url"), "FetchUrl");
+        assert_eq!(tool_display_name("web_search"), "WebSearch");
+        assert_eq!(tool_display_name("custom_tool"), "custom_tool");
+    }
+
+    #[test]
+    fn test_tool_primary_param() {
+        let input = serde_json::json!({"command": "ls", "path": "/tmp"});
+        assert_eq!(tool_primary_param("execute_command", &input), Some("ls"));
+        assert_eq!(tool_primary_param("read_file", &input), Some("/tmp"));
+        assert_eq!(tool_primary_param("unknown_tool", &input), None);
+    }
+
+    #[test]
+    fn test_tool_primary_param_missing() {
+        let input = serde_json::json!({"other": "value"});
+        assert_eq!(tool_primary_param("execute_command", &input), None);
+    }
+
+    #[test]
+    fn test_streaming_renderer_basic() {
+        let mut renderer = StreamingRenderer::new();
+        renderer.push_delta("hello").unwrap();
+        renderer.finish().unwrap();
+    }
+
+    #[test]
+    fn test_streaming_renderer_strips_leading_newlines() {
+        let mut renderer = StreamingRenderer::new();
+        renderer.push_delta("\n\nhello").unwrap();
+        renderer.finish().unwrap();
+    }
+
+    #[test]
+    fn test_in_code_block() {
+        let renderer = StreamingRenderer::new();
+        assert!(!renderer.in_code_block());
+    }
+
+    #[test]
+    fn test_in_table() {
+        let mut renderer = StreamingRenderer::new();
+        renderer.buffer = "| col1 | col2 |".to_string();
+        assert!(renderer.in_table());
+        renderer.buffer = "not a table".to_string();
+        assert!(!renderer.in_table());
     }
 }

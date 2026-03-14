@@ -152,7 +152,9 @@ pub fn run_repl(
                 if trimmed.starts_with('/') {
                     match parse_slash_command(trimmed) {
                         Some(SlashCommand::Exit) => {
-                            let _ = input_sender.send(ShellEvent::Exit);
+                            if input_sender.send(ShellEvent::Exit).is_err() {
+                                tracing::trace!("shell event receiver already dropped");
+                            }
                             break;
                         }
                         Some(SlashCommand::Help) => {
@@ -211,7 +213,9 @@ pub fn run_repl(
                 }
 
                 if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-                    let _ = input_sender.send(ShellEvent::Exit);
+                    if input_sender.send(ShellEvent::Exit).is_err() {
+                        tracing::trace!("shell event receiver already dropped");
+                    }
                     break;
                 }
 
@@ -232,10 +236,10 @@ pub fn run_repl(
                         .status();
                     match status {
                         Ok(exit_status) => {
-                            if !exit_status.success() {
-                                if let Some(code) = exit_status.code() {
-                                    eprintln!("Command exited with status {}", code);
-                                }
+                            if !exit_status.success()
+                                && let Some(code) = exit_status.code()
+                            {
+                                eprintln!("Command exited with status {}", code);
                             }
                         }
                         Err(error) => {
@@ -260,14 +264,98 @@ pub fn run_repl(
                 continue;
             }
             Ok(Signal::CtrlD) => {
-                let _ = input_sender.send(ShellEvent::Exit);
+                if input_sender.send(ShellEvent::Exit).is_err() {
+                    tracing::trace!("shell event receiver already dropped");
+                }
                 break;
             }
             Err(error) => {
                 tracing::error!("readline error: {}", error);
-                let _ = input_sender.send(ShellEvent::Exit);
+                if input_sender.send(ShellEvent::Exit).is_err() {
+                    tracing::trace!("shell event receiver already dropped");
+                }
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_slash_command_exit() {
+        assert!(matches!(
+            parse_slash_command("/exit"),
+            Some(SlashCommand::Exit)
+        ));
+        assert!(matches!(
+            parse_slash_command("/quit"),
+            Some(SlashCommand::Exit)
+        ));
+    }
+
+    #[test]
+    fn test_parse_slash_command_help() {
+        assert!(matches!(
+            parse_slash_command("/help"),
+            Some(SlashCommand::Help)
+        ));
+        assert!(matches!(
+            parse_slash_command("/?"),
+            Some(SlashCommand::Help)
+        ));
+    }
+
+    #[test]
+    fn test_parse_slash_command_clear() {
+        assert!(matches!(
+            parse_slash_command("/clear"),
+            Some(SlashCommand::Clear)
+        ));
+    }
+
+    #[test]
+    fn test_parse_slash_command_session() {
+        assert!(matches!(
+            parse_slash_command("/session"),
+            Some(SlashCommand::Session)
+        ));
+    }
+
+    #[test]
+    fn test_parse_slash_command_permission() {
+        assert!(matches!(
+            parse_slash_command("/permission"),
+            Some(SlashCommand::Permission(None))
+        ));
+        match parse_slash_command("/permission write") {
+            Some(SlashCommand::Permission(Some(arg))) => assert_eq!(arg, "write"),
+            _ => panic!("expected Permission with argument"),
+        }
+    }
+
+    #[test]
+    fn test_parse_slash_command_compact() {
+        assert!(matches!(
+            parse_slash_command("/compact"),
+            Some(SlashCommand::Compact)
+        ));
+    }
+
+    #[test]
+    fn test_parse_slash_command_unknown() {
+        assert!(parse_slash_command("/unknown").is_none());
+    }
+
+    #[test]
+    fn test_parse_slash_command_not_slash() {
+        assert!(parse_slash_command("hello").is_none());
+    }
+
+    #[test]
+    fn test_parse_slash_command_empty() {
+        assert!(parse_slash_command("/").is_none());
     }
 }

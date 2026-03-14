@@ -7,9 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Database` error variant for SQLite-related errors (previously misclassified as `Config` errors)
+- Unit tests for CLI argument parsing, slash command parsing, PKCE/OAuth helpers, and rendering utilities (31 new tests)
+- Unit tests for malformed API response handling (missing tool call `id`, `name`, and `message` fields)
+
+### Changed
+
+- Replaced all `.expect()` calls in production code with proper error propagation via `?`
+- Replaced all `let _ =` on fallible operations with proper error logging
+- Removed organizational section divider comments to comply with coding guidelines
+- Deduplicated stop reason parsing into `parse_openai_stop_reason` and `parse_claude_stop_reason` helpers
+- Deduplicated OpenAI streaming tool call finalization into `finalize_tool_call_accumulators` helper
+- Config file writing now uses proper TOML serialization instead of string formatting
+- Replaced `unwrap_or_default()` in message serialization with error propagation
+- Added `tracing::warn!` for fallback JSON parsing of malformed tool arguments
+- Introduced `AgentOptions` struct to reduce `Agent::new` parameter count
+- Resolved all clippy warnings (collapsible if, wildcard in or-patterns, manual C string literals, needless lifetimes, etc.)
+- Renamed single-letter closure variables in provider parsing to use full descriptive names
+- Replaced `unwrap_or_default()` on required tool call fields (`id`, `name`) with proper error propagation
+- Replaced direct JSON indexing (`&value["key"]`) with `.get()` and proper error handling in provider response parsing
+- Split `provider.rs` (1,840 lines) into a module: `provider.rs` (shared types/trait), `provider/claude.rs`, `provider/openai.rs`
+- Split `tools.rs` (1,531 lines) into a module: `tools.rs` (trait/registry), `tools/file.rs`, `tools/search.rs`, `tools/shell.rs`, `tools/web.rs`, `tools/util.rs`
+
 ### Fixed
 
 - Multi-line paste now inserts all lines into the buffer instead of executing the first line immediately
+- TOML injection vulnerability in `write_config_file` when API keys contain special characters
+- Pre-existing test compilation errors in `ClaudeProvider::new` and `create_provider` calls (missing argument)
 
 ## [0.3.1] - 2026-03-12
 

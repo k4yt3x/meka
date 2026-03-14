@@ -5,6 +5,9 @@ pub enum AgshError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error("database error: {0}")]
+    Database(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

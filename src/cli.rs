@@ -53,3 +53,60 @@ pub struct Cli {
 fn parse_permission(s: &str) -> std::result::Result<Permission, String> {
     s.parse()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_defaults() {
+        let cli = Cli::parse_from(["agsh"]);
+        assert!(cli.command.is_none());
+        assert!(cli.prompt.is_none());
+        assert!(cli.session_id.is_none());
+        assert!(!cli.continue_last);
+        assert!(cli.permission.is_none());
+        assert!(cli.provider.is_none());
+        assert!(cli.model.is_none());
+        assert!(cli.base_url.is_none());
+        assert!(!cli.no_stream);
+        assert_eq!(cli.verbosity, 0);
+    }
+
+    #[test]
+    fn test_cli_oneshot_prompt() {
+        let cli = Cli::parse_from(["agsh", "hello world"]);
+        assert_eq!(cli.prompt.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_cli_flags() {
+        let cli = Cli::parse_from([
+            "agsh",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o",
+            "--no-stream",
+            "-c",
+            "-vv",
+        ]);
+        assert_eq!(cli.provider.as_deref(), Some("openai"));
+        assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
+        assert!(cli.no_stream);
+        assert!(cli.continue_last);
+        assert_eq!(cli.verbosity, 2);
+    }
+
+    #[test]
+    fn test_cli_permission_flag() {
+        let cli = Cli::parse_from(["agsh", "--permission", "write"]);
+        assert_eq!(cli.permission, Some(Permission::Write));
+    }
+
+    #[test]
+    fn test_cli_setup_subcommand() {
+        let cli = Cli::parse_from(["agsh", "setup"]);
+        assert!(matches!(cli.command, Some(Command::Setup)));
+    }
+}

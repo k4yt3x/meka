@@ -97,16 +97,24 @@ pub(crate) fn write_config_file(
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut content = String::new();
-    content.push_str("[provider]\n");
-    content.push_str(&format!("name = \"{}\"\n", provider_name));
-    content.push_str(&format!("model = \"{}\"\n", model));
+    let mut provider_table = toml::map::Map::new();
+    provider_table.insert(
+        "name".to_string(),
+        toml::Value::String(provider_name.to_string()),
+    );
+    provider_table.insert("model".to_string(), toml::Value::String(model.to_string()));
     if let Some(key) = api_key {
-        content.push_str(&format!("api_key = \"{}\"\n", key));
+        provider_table.insert("api_key".to_string(), toml::Value::String(key.to_string()));
     }
     if let Some(url) = base_url {
-        content.push_str(&format!("base_url = \"{}\"\n", url));
+        provider_table.insert("base_url".to_string(), toml::Value::String(url.to_string()));
     }
+
+    let mut root = toml::map::Map::new();
+    root.insert("provider".to_string(), toml::Value::Table(provider_table));
+
+    let content = toml::to_string_pretty(&root)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
 
     std::fs::write(&path, content)
 }
@@ -247,7 +255,7 @@ fn resolve_auth_credential(
             // Database fallback happens in main.rs
             None
         }
-        Some("openai") | _ => {
+        _ => {
             let key = std::env::var("OPENAI_API_KEY")
                 .ok()
                 .or_else(|| file_provider.api_key.clone())?;

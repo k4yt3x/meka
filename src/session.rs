@@ -40,7 +40,7 @@ impl SessionManager {
 
         let connection = Connection::open(&database_path)
             .await
-            .map_err(|error| AgshError::Config(format!("failed to open database: {}", error)))?;
+            .map_err(|error| AgshError::Database(format!("failed to open database: {}", error)))?;
 
         let manager = Self {
             connection: Arc::new(connection),
@@ -84,7 +84,7 @@ impl SessionManager {
                 Ok(())
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to initialize schema: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to initialize schema: {}", error)))
     }
 
     pub async fn create_session(&self) -> Result<Uuid> {
@@ -101,7 +101,7 @@ impl SessionManager {
                 Ok(())
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to create session: {}", error)))?;
+            .map_err(|error| AgshError::Database(format!("failed to create session: {}", error)))?;
 
         Ok(session_id)
     }
@@ -123,12 +123,13 @@ impl SessionManager {
                         )))
                     })?;
 
-                if let Some(locked_pid) = existing_lock {
-                    if locked_pid != pid && is_process_alive(&locked_pid) {
-                        return Err(tokio_rusqlite::Error::Other(Box::new(
-                            AgshError::SessionLocked(session_id),
-                        )));
-                    }
+                if let Some(locked_pid) = existing_lock
+                    && locked_pid != pid
+                    && is_process_alive(&locked_pid)
+                {
+                    return Err(tokio_rusqlite::Error::Other(Box::new(
+                        AgshError::SessionLocked(session_id),
+                    )));
                 }
 
                 connection.execute(
@@ -144,13 +145,13 @@ impl SessionManager {
                         match agsh_error {
                             AgshError::SessionNotFound(id) => AgshError::SessionNotFound(*id),
                             AgshError::SessionLocked(id) => AgshError::SessionLocked(*id),
-                            _ => AgshError::Config(format!("failed to lock session: {}", inner)),
+                            _ => AgshError::Database(format!("failed to lock session: {}", inner)),
                         }
                     } else {
-                        AgshError::Config(format!("failed to lock session: {}", inner))
+                        AgshError::Database(format!("failed to lock session: {}", inner))
                     }
                 }
-                other => AgshError::Config(format!("failed to lock session: {}", other)),
+                other => AgshError::Database(format!("failed to lock session: {}", other)),
             })
     }
 
@@ -164,7 +165,7 @@ impl SessionManager {
                 Ok(())
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to unlock session: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to unlock session: {}", error)))
     }
 
     pub async fn save_message(&self, session_id: Uuid, role: &str, content: &str) -> Result<()> {
@@ -189,7 +190,7 @@ impl SessionManager {
                 Ok(())
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to save message: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to save message: {}", error)))
     }
 
     pub async fn load_messages(&self, session_id: Uuid) -> Result<Vec<StoredMessage>> {
@@ -212,7 +213,7 @@ impl SessionManager {
                 Ok(messages)
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to load messages: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to load messages: {}", error)))
     }
 
     pub async fn last_session_id(&self) -> Result<Option<Uuid>> {
@@ -236,7 +237,7 @@ impl SessionManager {
                 }
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to get last session: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to get last session: {}", error)))
     }
 
     pub async fn session_exists(&self, session_id: Uuid) -> Result<bool> {
@@ -251,7 +252,7 @@ impl SessionManager {
             })
             .await
             .map_err(|error| {
-                AgshError::Config(format!("failed to check session existence: {}", error))
+                AgshError::Database(format!("failed to check session existence: {}", error))
             })
     }
 
@@ -277,7 +278,7 @@ impl SessionManager {
             })
             .await
             .map_err(|error| {
-                AgshError::Config(format!("failed to delete expired sessions: {}", error))
+                AgshError::Database(format!("failed to delete expired sessions: {}", error))
             })
     }
 
@@ -296,7 +297,7 @@ impl SessionManager {
                 Ok(())
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to clear messages: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to clear messages: {}", error)))
     }
 
     pub async fn enforce_storage_limit(&self, max_bytes: u64) -> Result<u64> {
@@ -342,14 +343,10 @@ impl SessionManager {
             })
             .await
             .map_err(|error| {
-                AgshError::Config(format!("failed to enforce storage limit: {}", error))
+                AgshError::Database(format!("failed to enforce storage limit: {}", error))
             })
     }
 }
-
-// ---------------------------------------------------------------------------
-// Token store
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct TokenStore {
@@ -383,7 +380,7 @@ impl TokenStore {
                 }
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to load OAuth token: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to load OAuth token: {}", error)))
     }
 
     pub async fn save_oauth_token(
@@ -421,7 +418,7 @@ impl TokenStore {
                 Ok(())
             })
             .await
-            .map_err(|error| AgshError::Config(format!("failed to save OAuth token: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to save OAuth token: {}", error)))
     }
 }
 

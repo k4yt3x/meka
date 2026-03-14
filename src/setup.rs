@@ -35,8 +35,12 @@ fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn build_authorize_url(client_id: &str, code_challenge: &str, state: &str) -> String {
-    let mut url = reqwest::Url::parse(AUTHORIZE_URL).expect("static URL is valid");
+fn build_authorize_url(
+    client_id: &str,
+    code_challenge: &str,
+    state: &str,
+) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(AUTHORIZE_URL)?;
     url.query_pairs_mut()
         .append_pair("code", "true")
         .append_pair("client_id", client_id)
@@ -46,7 +50,7 @@ fn build_authorize_url(client_id: &str, code_challenge: &str, state: &str) -> St
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", state);
-    url.to_string()
+    Ok(url.to_string())
 }
 
 #[derive(serde::Deserialize)]
@@ -85,13 +89,16 @@ async fn exchange_code(
 
     let token_response: TokenResponse = response.json().await?;
 
-    let expires_at = token_response.expires_in.map(|seconds| {
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is before Unix epoch")
-            .as_millis() as i64;
-        now_millis + (seconds * 1000)
-    });
+    let expires_at = match token_response.expires_in {
+        Some(seconds) => {
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+            Some(now_millis + (seconds * 1000))
+        }
+        None => None,
+    };
 
     Ok(AuthCredential::OAuthToken {
         access_token: token_response.access_token,
@@ -116,10 +123,11 @@ fn prompt_choice(prompt: &str, options: &[&str]) -> io::Result<usize> {
 
     loop {
         let input = prompt_line("> ")?;
-        if let Ok(choice) = input.parse::<usize>() {
-            if choice >= 1 && choice <= options.len() {
-                return Ok(choice - 1);
-            }
+        if let Ok(choice) = input.parse::<usize>()
+            && choice >= 1
+            && choice <= options.len()
+        {
+            return Ok(choice - 1);
         }
         println!("Please enter a number between 1 and {}.", options.len());
     }
@@ -201,7 +209,7 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
     let (code_verifier, code_challenge) = generate_pkce_pair();
     let state = generate_state();
 
-    let url = build_authorize_url(&client_id, &code_challenge, &state);
+    let url = build_authorize_url(&client_id, &code_challenge, &state)?;
 
     println!("Opening browser for authorization...");
     if open::that(&url).is_err() {
@@ -226,4 +234,55 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
     println!("Login successful! OAuth tokens saved.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_pkce_pair_lengths() {
+        let (verifier, challenge) = generate_pkce_pair();
+        assert!(!verifier.is_empty());
+        assert!(!challenge.is_empty());
+        assert_ne!(verifier, challenge);
+    }
+
+    #[test]
+    fn test_generate_pkce_pair_challenge_is_sha256_of_verifier() {
+        let (verifier, challenge) = generate_pkce_pair();
+        let expected_digest = Sha256::digest(verifier.as_bytes());
+        let expected_challenge = URL_SAFE_NO_PAD.encode(expected_digest);
+        assert_eq!(challenge, expected_challenge);
+    }
+
+    #[test]
+    fn test_generate_state_not_empty() {
+        let state = generate_state();
+        assert!(!state.is_empty());
+    }
+
+    #[test]
+    fn test_generate_state_unique() {
+        let state1 = generate_state();
+        let state2 = generate_state();
+        assert_ne!(state1, state2);
+    }
+
+    #[test]
+    fn test_build_authorize_url_contains_params() {
+        let url = build_authorize_url("test-client-id", "test-challenge", "test-state").unwrap();
+        assert!(url.contains("client_id=test-client-id"));
+        assert!(url.contains("code_challenge=test-challenge"));
+        assert!(url.contains("state=test-state"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("redirect_uri="));
+        assert!(url.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn test_build_authorize_url_starts_with_authorize_url() {
+        let url = build_authorize_url("cid", "ch", "st").unwrap();
+        assert!(url.starts_with(AUTHORIZE_URL));
+    }
 }
