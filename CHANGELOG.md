@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Streaming mode now shows full API error body (e.g., rate limit details, reset times) instead of a generic error
 - Multi-line paste now inserts all lines into the buffer instead of executing the first line immediately
 - TOML injection vulnerability in `write_config_file` when API keys contain special characters
 - Pre-existing test compilation errors in `ClaudeProvider::new` and `create_provider` calls (missing argument)

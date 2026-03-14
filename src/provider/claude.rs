@@ -386,8 +386,8 @@ impl Provider for ClaudeProvider {
         event_sender: mpsc::UnboundedSender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
+        use eventsource_stream::Eventsource;
         use futures::StreamExt;
-        use reqwest_eventsource::{Event, EventSource};
 
         let body = self.build_request_body(system_prompt, messages, tools, true);
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
@@ -403,11 +403,22 @@ impl Provider for ClaudeProvider {
             request = request.header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219");
         }
 
-        let request = request.json(&body);
+        let response = request
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| AgshError::Provider(format!("HTTP request failed: {}", error)))?;
 
-        let mut event_source = EventSource::new(request).map_err(|error| {
-            AgshError::Provider(format!("failed to create SSE stream: {}", error))
-        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let response_text = response.text().await.unwrap_or_default();
+            return Err(AgshError::Provider(format!(
+                "API returned status {}: {}",
+                status, response_text
+            )));
+        }
+
+        let mut event_stream = response.bytes_stream().eventsource();
 
         let mut current_tool_input = String::new();
         let mut in_tool_use = false;
@@ -415,18 +426,16 @@ impl Provider for ClaudeProvider {
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    event_source.close();
                     return Err(AgshError::Interrupted);
                 }
-                event = event_source.next() => {
+                event = event_stream.next() => {
                     let Some(event) = event else {
                         break;
                     };
 
                     match event {
-                        Ok(Event::Open) => {}
-                        Ok(Event::Message(message)) => {
-                            let data: serde_json::Value = match serde_json::from_str(&message.data) {
+                        Ok(event) => {
+                            let data: serde_json::Value = match serde_json::from_str(&event.data) {
                                 Ok(data) => data,
                                 Err(error) => {
                                     tracing::warn!("failed to parse SSE data: {}", error);
@@ -434,7 +443,7 @@ impl Provider for ClaudeProvider {
                                 }
                             };
 
-                            match message.event.as_str() {
+                            match event.event.as_str() {
                                 "content_block_start" => {
                                     let Some(content_block) = data.get("content_block") else {
                                         continue;
@@ -563,9 +572,6 @@ impl Provider for ClaudeProvider {
                                     tracing::debug!("unknown Claude SSE event: {}", other);
                                 }
                             }
-                        }
-                        Err(reqwest_eventsource::Error::StreamEnded) => {
-                            break;
                         }
                         Err(error) => {
                             if event_sender.send(StreamEvent::Error(error.to_string())).is_err() {

@@ -18,6 +18,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6"
+eventsource-stream = "0.2"
 fast_html2md = { version = "0.0", features = ["rewriter"] }
 futures = "0.3"
 glob = "0.3"
@@ -28,7 +29,6 @@ open = "5"
 rand = "0.9"
 reedline = "0.38"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "deflate", "brotli"] }
-reqwest-eventsource = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

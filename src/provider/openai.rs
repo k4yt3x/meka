@@ -261,20 +261,30 @@ impl Provider for OpenAiProvider {
         event_sender: mpsc::UnboundedSender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
+        use eventsource_stream::Eventsource;
         use futures::StreamExt;
-        use reqwest_eventsource::{Event, EventSource};
 
         let body = self.build_request_body(system_prompt, messages, tools, true);
 
-        let request = self
+        let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body);
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| AgshError::Provider(format!("HTTP request failed: {}", error)))?;
 
-        let mut event_source = EventSource::new(request).map_err(|error| {
-            AgshError::Provider(format!("failed to create SSE stream: {}", error))
-        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let response_text = response.text().await.unwrap_or_default();
+            return Err(AgshError::Provider(format!(
+                "API returned status {}: {}",
+                status, response_text
+            )));
+        }
+
+        let mut event_stream = response.bytes_stream().eventsource();
 
         let mut tool_call_accumulators: std::collections::HashMap<i64, ToolCallAccumulator> =
             std::collections::HashMap::new();
@@ -282,18 +292,16 @@ impl Provider for OpenAiProvider {
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    event_source.close();
                     return Err(AgshError::Interrupted);
                 }
-                event = event_source.next() => {
+                event = event_stream.next() => {
                     let Some(event) = event else {
                         break;
                     };
 
                     match event {
-                        Ok(Event::Open) => {}
-                        Ok(Event::Message(message)) => {
-                            if message.data == "[DONE]" {
+                        Ok(event) => {
+                            if event.data == "[DONE]" {
                                 let has_tools = finalize_tool_call_accumulators(
                                     &mut tool_call_accumulators,
                                     &event_sender,
@@ -309,7 +317,7 @@ impl Provider for OpenAiProvider {
                                 break;
                             }
 
-                            let data: serde_json::Value = match serde_json::from_str(&message.data) {
+                            let data: serde_json::Value = match serde_json::from_str(&event.data) {
                                 Ok(data) => data,
                                 Err(error) => {
                                     tracing::warn!("failed to parse SSE data: {}", error);
@@ -378,9 +386,6 @@ impl Provider for OpenAiProvider {
                                         }
                                 }
                             }
-                        }
-                        Err(reqwest_eventsource::Error::StreamEnded) => {
-                            break;
                         }
                         Err(error) => {
                             if event_sender.send(StreamEvent::Error(error.to_string())).is_err() {
