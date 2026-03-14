@@ -6,6 +6,28 @@ use crate::permission::Permission;
 pub enum Command {
     /// Run the interactive configuration wizard
     Setup,
+    /// Export a session as Markdown
+    Export {
+        /// Session UUID to export
+        session_id: uuid::Uuid,
+        /// Output file path (default: session-<id>.md). Use "-" for stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Delete one or more sessions
+    Delete {
+        /// Session UUIDs to delete
+        session_ids: Vec<uuid::Uuid>,
+        /// Delete all sessions
+        #[arg(long)]
+        all: bool,
+    },
+    /// List past sessions
+    List {
+        /// Maximum number of sessions to show
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: u32,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -45,12 +67,20 @@ pub struct Cli {
     #[arg(long = "no-stream")]
     pub no_stream: bool,
 
+    /// Output render mode: 'rich' (default) or 'raw' (markdown with ANSI highlighting)
+    #[arg(long = "render-mode", value_parser = parse_render_mode)]
+    pub render_mode: Option<crate::render::RenderMode>,
+
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbosity: u8,
 }
 
 fn parse_permission(s: &str) -> std::result::Result<Permission, String> {
+    s.parse()
+}
+
+fn parse_render_mode(s: &str) -> std::result::Result<crate::render::RenderMode, String> {
     s.parse()
 }
 
@@ -70,6 +100,7 @@ mod tests {
         assert!(cli.model.is_none());
         assert!(cli.base_url.is_none());
         assert!(!cli.no_stream);
+        assert!(cli.render_mode.is_none());
         assert_eq!(cli.verbosity, 0);
     }
 

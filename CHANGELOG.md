@@ -9,11 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `delete` subcommand (`agsh delete <id>...` or `agsh delete --all`) to delete specific or all sessions
+- `list` subcommand (`agsh list [-n <count>]`) to display past sessions with timestamps and preview text
+- `export` subcommand (`agsh export <session-id> [-o <path>]`) to export session history as Markdown (default: `session-<id>.md`, `-o -` for stdout)
+- Raw markdown render mode (`--render-mode raw` CLI flag or `display.render_mode = "raw"` config option) that outputs markdown with ANSI color/style highlighting instead of rich terminal formatting
+- Table column alignment in raw render mode with Unicode-width-aware padding for CJK characters
 - `Database` error variant for SQLite-related errors (previously misclassified as `Config` errors)
 - Unit tests for CLI argument parsing, slash command parsing, PKCE/OAuth helpers, and rendering utilities (31 new tests)
 - Unit tests for malformed API response handling (missing tool call `id`, `name`, and `message` fields)
 
 ### Changed
+
+- Default render mode changed from `rich` to `raw`
+- Split `display.show_session_id` into `display.show_session_id_on_create` (default: false) and `display.show_session_id_on_exit` (default: true) for independent control
 
 - Replaced all `.expect()` calls in production code with proper error propagation via `?`
 - Replaced all `let _ =` on fallible operations with proper error logging

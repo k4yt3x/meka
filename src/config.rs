@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::cli::Cli;
 use crate::permission::Permission;
 use crate::provider::AuthCredential;
+use crate::render::RenderMode;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
@@ -19,7 +20,9 @@ pub struct ConfigFile {
 pub struct DisplayConfig {
     pub newline_before_prompt: Option<bool>,
     pub newline_after_prompt: Option<bool>,
-    pub show_session_id: Option<bool>,
+    pub show_session_id_on_create: Option<bool>,
+    pub show_session_id_on_exit: Option<bool>,
+    pub render_mode: Option<RenderMode>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -64,9 +67,11 @@ pub struct ResolvedConfig {
     pub prompt: Option<String>,
     pub newline_before_prompt: bool,
     pub newline_after_prompt: bool,
-    pub show_session_id: bool,
+    pub show_session_id_on_create: bool,
+    pub show_session_id_on_exit: bool,
     pub user_agent: String,
     pub sandbox: bool,
+    pub render_mode: RenderMode,
     pub context_messages: Option<usize>,
     pub retention_days: Option<u64>,
     pub max_storage_bytes: Option<u64>,
@@ -192,11 +197,16 @@ impl ResolvedConfig {
             prompt: cli.prompt.clone(),
             newline_before_prompt: file_display.newline_before_prompt.unwrap_or(true),
             newline_after_prompt: file_display.newline_after_prompt.unwrap_or(true),
-            show_session_id: file_display.show_session_id.unwrap_or(false),
+            show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
+            show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
             user_agent: file_web
                 .user_agent
                 .unwrap_or_else(|| "Mozilla/5.0 (compatible; agsh/0.1)".to_string()),
             sandbox: file_shell.sandbox.unwrap_or(true),
+            render_mode: cli
+                .render_mode
+                .or(file_display.render_mode)
+                .unwrap_or_default(),
             context_messages: file_session.context_messages.or(Some(200)),
             retention_days: file_session.retention_days.or(Some(90)),
             max_storage_bytes: file_session.max_storage_bytes.or(Some(52_428_800)),

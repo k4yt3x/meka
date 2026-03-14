@@ -94,6 +94,19 @@ Disable streaming mode. The agent waits for the complete response before display
 agsh --no-stream
 ```
 
+### `--render-mode <MODE>`
+
+Set the output render mode. Accepts `rich` (default) or `raw`.
+
+- `rich`: Full terminal formatting via termimad (box-drawn code blocks, reflowed paragraphs, formatted tables).
+- `raw`: Raw markdown with ANSI syntax highlighting (bold, italic, colored code/headings). Outputs the exact markdown the model returns.
+
+```bash
+agsh --render-mode raw
+```
+
+Can also be set permanently via `display.render_mode = "raw"` in the config file.
+
 ### `-v`, `--verbose`
 
 Increase log verbosity. Can be repeated up to three times.

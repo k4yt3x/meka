@@ -15,6 +15,13 @@ pub struct StoredMessage {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub updated_at: String,
+    pub preview: String,
+}
+
 #[derive(Clone)]
 pub struct SessionManager {
     connection: Arc<Connection>,
@@ -256,6 +263,50 @@ impl SessionManager {
             })
     }
 
+    pub async fn list_sessions(&self, limit: u32) -> Result<Vec<SessionSummary>> {
+        self.connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT s.id, s.updated_at,
+                            COALESCE(
+                              (SELECT content FROM messages
+                               WHERE session_id = s.id AND role = 'user'
+                               ORDER BY id ASC LIMIT 1),
+                              ''
+                            ) AS preview
+                     FROM sessions s
+                     ORDER BY s.updated_at DESC
+                     LIMIT ?1",
+                )?;
+
+                let rows = statement.query_map(rusqlite::params![limit], |row| {
+                    let id_str: String = row.get(0)?;
+                    let updated_at: String = row.get(1)?;
+                    let preview: String = row.get(2)?;
+                    Ok((id_str, updated_at, preview))
+                })?;
+
+                let mut summaries = Vec::new();
+                for row in rows {
+                    let (id_str, updated_at, preview) = row?;
+                    let id = Uuid::parse_str(&id_str).map_err(|error| {
+                        rusqlite::Error::InvalidParameterName(error.to_string())
+                    })?;
+
+                    let preview = truncate_preview(&preview, 80);
+
+                    summaries.push(SessionSummary {
+                        id,
+                        updated_at,
+                        preview,
+                    });
+                }
+                Ok(summaries)
+            })
+            .await
+            .map_err(|error| AgshError::Database(format!("failed to list sessions: {}", error)))
+    }
+
     pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<u64> {
         let cutoff = chrono::Utc::now() - chrono::TimeDelta::days(retention_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
@@ -298,6 +349,38 @@ impl SessionManager {
             })
             .await
             .map_err(|error| AgshError::Database(format!("failed to clear messages: {}", error)))
+    }
+
+    pub async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM messages WHERE session_id = ?1",
+                    rusqlite::params![session_id.to_string()],
+                )?;
+
+                let deleted = connection.execute(
+                    "DELETE FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id.to_string()],
+                )?;
+
+                Ok(deleted > 0)
+            })
+            .await
+            .map_err(|error| AgshError::Database(format!("failed to delete session: {}", error)))
+    }
+
+    pub async fn delete_all_sessions(&self) -> Result<u64> {
+        self.connection
+            .call(move |connection| {
+                connection.execute("DELETE FROM messages", [])?;
+                let deleted = connection.execute("DELETE FROM sessions", [])?;
+                Ok(deleted as u64)
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to delete all sessions: {}", error))
+            })
     }
 
     pub async fn enforce_storage_limit(&self, max_bytes: u64) -> Result<u64> {
@@ -450,6 +533,16 @@ fn is_process_alive(pid_str: &str) -> bool {
                 stdout.contains(&pid.to_string())
             })
             .unwrap_or(false)
+    }
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.chars().count() <= max_chars {
+        first_line.to_string()
+    } else {
+        let truncated: String = first_line.chars().take(max_chars).collect();
+        format!("{}…", truncated.trim_end())
     }
 }
 

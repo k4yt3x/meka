@@ -44,12 +44,23 @@ fn main() -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
 
-    // Handle the setup subcommand
-    if let Some(cli::Command::Setup) = cli.command {
+    // Handle subcommands that don't need full config resolution
+    if let Some(command) = cli.command {
         return runtime.block_on(async {
             let session_manager = SessionManager::open(None).await?;
-            let token_store = session_manager.token_store();
-            setup::run_setup(&token_store).await
+            match command {
+                cli::Command::Setup => {
+                    let token_store = session_manager.token_store();
+                    setup::run_setup(&token_store).await
+                }
+                cli::Command::Export { session_id, output } => {
+                    export_session(&session_manager, session_id, output.as_deref()).await
+                }
+                cli::Command::Delete { session_ids, all } => {
+                    delete_sessions(&session_manager, &session_ids, all).await
+                }
+                cli::Command::List { limit } => list_sessions(&session_manager, limit).await,
+            }
         });
     }
 
@@ -175,8 +186,9 @@ fn create_agent_from_config(
             streaming: config.streaming,
             newline_before_prompt: config.newline_before_prompt,
             newline_after_prompt: config.newline_after_prompt,
-            show_session_id: config.show_session_id,
+            show_session_id_on_create: config.show_session_id_on_create,
             sandboxed_shell,
+            render_mode: config.render_mode,
             context_messages: config.context_messages,
         },
     ))
@@ -222,12 +234,9 @@ async fn run_oneshot(
     }
 
     if let Some(id) = session_id
-        && config.show_session_id
+        && config.show_session_id_on_exit
     {
-        render::render_hint(&format!(
-            "Run `agsh -c` or `agsh -s {}` to continue this session.",
-            id
-        ));
+        render::render_session_id("Leaving session", &id.to_string());
     }
 
     Ok(())
@@ -375,15 +384,164 @@ async fn run_interactive(
         if let Err(error) = session_manager.unlock_session(id).await {
             tracing::warn!("failed to unlock session: {}", error);
         }
-        if config.show_session_id {
-            render::render_hint(&format!(
-                "Run `agsh -c` or `agsh -s {}` to continue this session.",
-                id
-            ));
+        if config.show_session_id_on_exit {
+            render::render_session_id("Leaving session", &id.to_string());
         }
     }
 
     Ok(())
+}
+
+async fn export_session(
+    session_manager: &SessionManager,
+    session_id: uuid::Uuid,
+    output: Option<&str>,
+) -> anyhow::Result<()> {
+    if !session_manager.session_exists(session_id).await? {
+        anyhow::bail!("session not found: {}", session_id);
+    }
+
+    let stored_messages = session_manager.load_messages(session_id).await?;
+    let markdown = format_session_as_markdown(session_id, &stored_messages);
+
+    match output {
+        Some("-") => {
+            print!("{}", markdown);
+        }
+        Some(path) => {
+            std::fs::write(path, &markdown)?;
+            eprintln!("Exported to {}", path);
+        }
+        None => {
+            let path = format!("session-{}.md", session_id);
+            std::fs::write(&path, &markdown)?;
+            eprintln!("Exported to {}", path);
+        }
+    }
+
+    Ok(())
+}
+
+async fn list_sessions(session_manager: &SessionManager, limit: u32) -> anyhow::Result<()> {
+    let sessions = session_manager.list_sessions(limit).await?;
+
+    if sessions.is_empty() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+
+    println!("{:<36}  {:<20}  Preview", "ID", "Updated");
+
+    for session in &sessions {
+        let updated = format_timestamp(&session.updated_at);
+        println!("{:<36}  {:<20}  {}", session.id, updated, session.preview);
+    }
+
+    Ok(())
+}
+
+async fn delete_sessions(
+    session_manager: &SessionManager,
+    session_ids: &[uuid::Uuid],
+    all: bool,
+) -> anyhow::Result<()> {
+    if all {
+        let deleted = session_manager.delete_all_sessions().await?;
+        eprintln!("Deleted {} session(s).", deleted);
+        return Ok(());
+    }
+
+    if session_ids.is_empty() {
+        anyhow::bail!("specify one or more session IDs, or use --all to delete all sessions");
+    }
+
+    let mut deleted = 0u64;
+    for session_id in session_ids {
+        if session_manager.delete_session(*session_id).await? {
+            deleted += 1;
+        } else {
+            eprintln!("Session not found: {}", session_id);
+        }
+    }
+
+    eprintln!("Deleted {} session(s).", deleted);
+    Ok(())
+}
+
+fn format_timestamp(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|_| rfc3339.to_string())
+}
+
+fn format_session_as_markdown(
+    session_id: uuid::Uuid,
+    messages: &[session::StoredMessage],
+) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(output, "# Session {}\n", session_id).ok();
+
+    for message in messages {
+        match message.role.as_str() {
+            "user" => {
+                writeln!(output, "## User\n").ok();
+                writeln!(output, "{}\n", message.content).ok();
+            }
+            "assistant" => {
+                if let Ok(blocks) =
+                    serde_json::from_str::<Vec<provider::ContentBlock>>(&message.content)
+                {
+                    writeln!(output, "## Assistant\n").ok();
+                    for block in &blocks {
+                        match block {
+                            provider::ContentBlock::Text { text } => {
+                                writeln!(output, "{}\n", text).ok();
+                            }
+                            provider::ContentBlock::ToolUse { name, input, .. } => {
+                                let input_pretty = serde_json::to_string_pretty(input)
+                                    .unwrap_or_else(|_| input.to_string());
+                                writeln!(output, "<details>").ok();
+                                writeln!(output, "<summary>Tool call: {}</summary>\n", name).ok();
+                                writeln!(output, "```json\n{}\n```\n", input_pretty).ok();
+                                writeln!(output, "</details>\n").ok();
+                            }
+                            provider::ContentBlock::ToolResult { .. } => {}
+                        }
+                    }
+                } else {
+                    writeln!(output, "## Assistant\n").ok();
+                    writeln!(output, "{}\n", message.content).ok();
+                }
+            }
+            "tool_results" => {
+                if let Ok(blocks) =
+                    serde_json::from_str::<Vec<provider::ContentBlock>>(&message.content)
+                {
+                    for block in &blocks {
+                        if let provider::ContentBlock::ToolResult {
+                            content, is_error, ..
+                        } = block
+                        {
+                            let label = if *is_error {
+                                "Tool result (error)"
+                            } else {
+                                "Tool result"
+                            };
+                            writeln!(output, "<details>").ok();
+                            writeln!(output, "<summary>{}</summary>\n", label).ok();
+                            writeln!(output, "```\n{}\n```\n", content).ok();
+                            writeln!(output, "</details>\n").ok();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    output
 }
 
 fn resolve_credential(config: &ResolvedConfig) -> anyhow::Result<AuthCredential> {

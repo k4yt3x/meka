@@ -107,6 +107,44 @@ base_url = "https://openrouter.ai/api/v1"
 # API key via env: export OPENAI_API_KEY=sk-or-...
 ```
 
+## `[display]`
+
+Settings for output formatting.
+
+### `display.render_mode`
+
+Output render mode. Equivalent to the `--render-mode` CLI flag.
+
+| Value | Description |
+|-------|-------------|
+| `rich` | Full terminal formatting (box-drawn code blocks, reflowed paragraphs, formatted tables) |
+| `raw` | Raw markdown with ANSI syntax highlighting (bold, italic, colored code/headings) |
+
+Default: `raw`
+
+```toml
+[display]
+render_mode = "rich"
+```
+
+### `display.show_session_id_on_create`
+
+Whether to display the session ID when a new session is created.
+
+Default: `false`
+
+### `display.show_session_id_on_exit`
+
+Whether to display the session ID when agsh exits.
+
+Default: `true`
+
+```toml
+[display]
+show_session_id_on_create = true
+show_session_id_on_exit = false
+```
+
 ## `[web]`
 
 Settings for web-related tools (fetch_url, web_search).

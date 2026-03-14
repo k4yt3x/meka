@@ -100,19 +100,75 @@ The full history remains in SQLite for resumption. Only the API payload is trunc
 
 If a session becomes too long, you can use the `/compact` command to have the LLM summarize the conversation and replace the full history with a single summary message. See [Interactive Mode](./interactive-mode.md#slash-commands) for details.
 
-## Managing Sessions
+## Listing Sessions
 
-Session management is done directly through the SQLite database. For example, to list all sessions:
+To see past sessions:
+
+```bash
+agsh list
+```
+
+This shows a table with each session's ID, last update time, and a preview of the first message:
+
+```
+ID                                    Updated              Preview
+550e8400-e29b-41d4-a716-446655440000  2026-03-14 12:00:00  How do I implement a binary search tree?
+a1b2c3d4-e5f6-7890-abcd-ef1234567890  2026-03-13 09:30:00  Fix the login page CSS
+```
+
+By default the 20 most recent sessions are shown. Use `-n` to change:
+
+```bash
+agsh list -n 50
+```
+
+## Exporting a Session
+
+You can export any session as a Markdown file:
+
+```bash
+agsh export 550e8400-e29b-41d4-a716-446655440000
+```
+
+This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation history. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks.
+
+To write to a specific file:
+
+```bash
+agsh export 550e8400-e29b-41d4-a716-446655440000 -o conversation.md
+```
+
+To print to stdout (for piping):
+
+```bash
+agsh export 550e8400-e29b-41d4-a716-446655440000 -o -
+```
+
+## Deleting Sessions
+
+Delete specific sessions by UUID:
+
+```bash
+agsh delete 550e8400-e29b-41d4-a716-446655440000
+```
+
+Delete multiple sessions at once:
+
+```bash
+agsh delete 550e8400-e29b-41d4-a716-446655440000 a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+Delete all sessions:
+
+```bash
+agsh delete --all
+```
+
+## Managing Sessions via SQLite
+
+You can also manage sessions directly through the SQLite database. For example, to list all sessions:
 
 ```bash
 sqlite3 ~/.local/share/agsh/sessions.db \
   "SELECT id, created_at, updated_at FROM sessions ORDER BY updated_at DESC;"
-```
-
-To delete a session and its messages:
-
-```bash
-sqlite3 ~/.local/share/agsh/sessions.db \
-  "DELETE FROM messages WHERE session_id = '550e8400-...';
-   DELETE FROM sessions WHERE id = '550e8400-...';"
 ```

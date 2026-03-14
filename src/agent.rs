@@ -18,8 +18,9 @@ pub struct AgentOptions {
     pub streaming: bool,
     pub newline_before_prompt: bool,
     pub newline_after_prompt: bool,
-    pub show_session_id: bool,
+    pub show_session_id_on_create: bool,
     pub sandboxed_shell: bool,
+    pub render_mode: crate::render::RenderMode,
     pub context_messages: Option<usize>,
 }
 
@@ -58,7 +59,7 @@ impl Agent {
         if session_id.is_none() {
             let id = self.session_manager.create_session().await?;
             *session_id = Some(id);
-            if self.options.show_session_id {
+            if self.options.show_session_id_on_create {
                 crate::render::render_session_id("Creating new session", &id.to_string());
             }
         }
@@ -172,7 +173,7 @@ impl Agent {
                 .await
         });
 
-        let mut renderer = StreamingRenderer::new();
+        let mut renderer = StreamingRenderer::new(self.options.render_mode);
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
         let mut current_text = String::new();
         let mut current_tool_id = String::new();
