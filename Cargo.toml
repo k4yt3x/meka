@@ -28,8 +28,8 @@ grep-searcher = "0.1"
 open = "5"
 rand = "0.9"
 reedline = "0.38"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "deflate", "brotli"] }
-rmcp = { version = "1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls", "gzip", "deflate", "brotli"] }
+rmcp = { version = "1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

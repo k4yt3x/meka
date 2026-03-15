@@ -256,10 +256,26 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `env` | No | Environment variables to set for the spawned process (stdio only). |
 | `url` | HTTP only | URL of the MCP server endpoint. |
 | `auth_token` | No | Bearer token for HTTP authentication (sent as `Authorization: Bearer <token>`). |
+| `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with `auth_token`. |
 | `headers` | No | Custom HTTP headers to include with every request (HTTP only). |
 | `permission` | No | Permission level required to use this server's tools: `"none"`, `"read"` (default), or `"write"`. |
 
 MCP tools are registered with namespaced names in the format `servername__toolname` to prevent collisions with built-in tools or between servers.
+
+### `[mcp.servers.auth]`
+
+OAuth authentication for HTTP MCP servers. Set `type` to choose the authentication method. This is mutually exclusive with `auth_token`.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `type` | Yes | Auth method: `"client_credentials"`, `"client_credentials_jwt"`, or `"oauth"` |
+| `client_id` | Varies | OAuth client ID (required for client_credentials/jwt, optional for oauth with dynamic registration) |
+| `client_secret` | Varies | Client secret (required for client_credentials, optional for oauth) |
+| `scopes` | No | OAuth scopes to request |
+| `resource` | No | Resource parameter ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)), client_credentials only |
+| `signing_key_path` | JWT only | Path to PEM private key file |
+| `signing_algorithm` | No | JWT signing algorithm: `RS256` (default), `RS384`, `RS512`, `ES256`, `ES384` |
+| `redirect_port` | No | Local port for OAuth authorization code callback (default: `8400`), oauth only |
 
 ### Examples
 
@@ -329,3 +345,54 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
 permission = "write"
 ```
+
+#### HTTP server with OAuth client credentials
+
+```toml
+[[mcp.servers]]
+name = "api"
+transport = "http"
+url = "https://api.example.com/mcp"
+permission = "write"
+
+[mcp.servers.auth]
+type = "client_credentials"
+client_id = "my-client-id"
+client_secret = "my-client-secret"
+scopes = ["read", "write"]
+```
+
+#### HTTP server with JWT client credentials
+
+```toml
+[[mcp.servers]]
+name = "api"
+transport = "http"
+url = "https://api.example.com/mcp"
+
+[mcp.servers.auth]
+type = "client_credentials_jwt"
+client_id = "my-client-id"
+signing_key_path = "/path/to/private-key.pem"
+signing_algorithm = "RS256"
+scopes = ["admin"]
+```
+
+#### HTTP server with OAuth authorization code flow
+
+On first connection, agsh opens a browser for authorization and stores the token for future use.
+
+```toml
+[[mcp.servers]]
+name = "github-mcp"
+transport = "http"
+url = "https://mcp.example.com"
+
+[mcp.servers.auth]
+type = "oauth"
+client_id = "my-app-id"
+scopes = ["repo", "user"]
+redirect_port = 8400
+```
+
+If `client_id` is omitted, agsh attempts [dynamic client registration](https://datatracker.ietf.org/doc/html/rfc7591) with the server.

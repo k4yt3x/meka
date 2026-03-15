@@ -126,7 +126,7 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
     }
 
     let mcp_manager = if !config.mcp_servers.is_empty() {
-        Some(mcp::McpClientManager::connect_all(&config.mcp_servers).await?)
+        Some(mcp::McpClientManager::connect_all(&config.mcp_servers, Some(&token_store)).await?)
     } else {
         None
     };

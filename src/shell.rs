@@ -22,7 +22,7 @@ impl Prompt for AgshPrompt {
             let cwd = std::env::current_dir()
                 .map(|path| shorten_path_with_tilde(&path))
                 .unwrap_or_else(|_| "?".to_string());
-            Cow::Owned(format!("agsh:{} ", cwd))
+            Cow::Owned(format!("agsh {} ", cwd))
         } else {
             Cow::Borrowed("agsh ")
         }

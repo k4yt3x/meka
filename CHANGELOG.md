@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- OAuth authentication for MCP HTTP servers: client credentials, client credentials with JWT signing, and OAuth 2.1 authorization code flow with PKCE
+- Persistent MCP OAuth credential storage in SQLite with automatic token refresh via rmcp's `AuthorizationManager`
+
+### Changed
+
+- Upgraded `reqwest` from 0.12 to 0.13
+
 ## [0.4.1] - 2026-03-14
 
 ### Added

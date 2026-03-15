@@ -32,6 +32,7 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     pub auth_token: Option<String>,
     pub headers: Option<std::collections::HashMap<String, String>>,
+    pub auth: Option<McpAuthConfig>,
     pub permission: Option<String>,
 }
 
@@ -40,6 +41,31 @@ pub struct McpServerConfig {
 pub enum McpTransport {
     Stdio,
     Http,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpAuthConfig {
+    ClientCredentials {
+        client_id: String,
+        client_secret: String,
+        scopes: Option<Vec<String>>,
+        resource: Option<String>,
+    },
+    ClientCredentialsJwt {
+        client_id: String,
+        signing_key_path: String,
+        signing_algorithm: Option<String>,
+        scopes: Option<Vec<String>>,
+        resource: Option<String>,
+    },
+    #[serde(rename = "oauth")]
+    OAuth {
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        scopes: Option<Vec<String>>,
+        redirect_port: Option<u16>,
+    },
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -454,5 +480,160 @@ max_storage_bytes = 10485760
         assert_eq!(context_messages, Some(50));
         assert_eq!(retention_days, Some(30));
         assert_eq!(max_storage_bytes, Some(10_485_760));
+    }
+
+    #[test]
+    fn test_mcp_auth_client_credentials() {
+        let toml_str = r#"
+[[mcp.servers]]
+name = "api"
+transport = "http"
+url = "https://api.example.com/mcp"
+
+[mcp.servers.auth]
+type = "client_credentials"
+client_id = "my-client"
+client_secret = "my-secret"
+scopes = ["read", "write"]
+resource = "https://api.example.com"
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let servers = config.mcp.unwrap().servers.unwrap();
+        assert_eq!(servers.len(), 1);
+        let auth = servers[0].auth.as_ref().expect("auth should be present");
+        match auth {
+            McpAuthConfig::ClientCredentials {
+                client_id,
+                client_secret,
+                scopes,
+                resource,
+            } => {
+                assert_eq!(client_id, "my-client");
+                assert_eq!(client_secret, "my-secret");
+                assert_eq!(
+                    scopes.as_deref(),
+                    Some(["read".to_string(), "write".to_string()].as_slice())
+                );
+                assert_eq!(resource.as_deref(), Some("https://api.example.com"));
+            }
+            other => panic!("expected ClientCredentials, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mcp_auth_client_credentials_jwt() {
+        let toml_str = r#"
+[[mcp.servers]]
+name = "api"
+transport = "http"
+url = "https://api.example.com/mcp"
+
+[mcp.servers.auth]
+type = "client_credentials_jwt"
+client_id = "my-client"
+signing_key_path = "/path/to/key.pem"
+signing_algorithm = "ES256"
+scopes = ["admin"]
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let servers = config.mcp.unwrap().servers.unwrap();
+        let auth = servers[0].auth.as_ref().expect("auth should be present");
+        match auth {
+            McpAuthConfig::ClientCredentialsJwt {
+                client_id,
+                signing_key_path,
+                signing_algorithm,
+                scopes,
+                resource,
+            } => {
+                assert_eq!(client_id, "my-client");
+                assert_eq!(signing_key_path, "/path/to/key.pem");
+                assert_eq!(signing_algorithm.as_deref(), Some("ES256"));
+                assert_eq!(scopes.as_deref(), Some(["admin".to_string()].as_slice()));
+                assert!(resource.is_none());
+            }
+            other => panic!("expected ClientCredentialsJwt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mcp_auth_oauth() {
+        let toml_str = r#"
+[[mcp.servers]]
+name = "github"
+transport = "http"
+url = "https://mcp.example.com"
+
+[mcp.servers.auth]
+type = "oauth"
+client_id = "my-app"
+scopes = ["repo", "user"]
+redirect_port = 9000
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let servers = config.mcp.unwrap().servers.unwrap();
+        let auth = servers[0].auth.as_ref().expect("auth should be present");
+        match auth {
+            McpAuthConfig::OAuth {
+                client_id,
+                client_secret,
+                scopes,
+                redirect_port,
+            } => {
+                assert_eq!(client_id.as_deref(), Some("my-app"));
+                assert!(client_secret.is_none());
+                assert_eq!(
+                    scopes.as_deref(),
+                    Some(["repo".to_string(), "user".to_string()].as_slice())
+                );
+                assert_eq!(*redirect_port, Some(9000));
+            }
+            other => panic!("expected OAuth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mcp_auth_oauth_minimal() {
+        let toml_str = r#"
+[[mcp.servers]]
+name = "api"
+transport = "http"
+url = "https://api.example.com/mcp"
+
+[mcp.servers.auth]
+type = "oauth"
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let servers = config.mcp.unwrap().servers.unwrap();
+        let auth = servers[0].auth.as_ref().expect("auth should be present");
+        match auth {
+            McpAuthConfig::OAuth {
+                client_id,
+                client_secret,
+                scopes,
+                redirect_port,
+            } => {
+                assert!(client_id.is_none());
+                assert!(client_secret.is_none());
+                assert!(scopes.is_none());
+                assert!(redirect_port.is_none());
+            }
+            other => panic!("expected OAuth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mcp_no_auth() {
+        let toml_str = r#"
+[[mcp.servers]]
+name = "simple"
+transport = "http"
+url = "https://api.example.com/mcp"
+auth_token = "bearer-token"
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let servers = config.mcp.unwrap().servers.unwrap();
+        assert!(servers[0].auth.is_none());
+        assert_eq!(servers[0].auth_token.as_deref(), Some("bearer-token"));
     }
 }

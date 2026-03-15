@@ -86,6 +86,12 @@ impl SessionManager {
                         refresh_token TEXT,
                         expires_at INTEGER,
                         updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS mcp_oauth_credentials (
+                        server_name TEXT PRIMARY KEY,
+                        credentials_json TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
                     );",
                 )?;
                 Ok(())
@@ -464,6 +470,67 @@ impl TokenStore {
             })
             .await
             .map_err(|error| AgshError::Database(format!("failed to load OAuth token: {}", error)))
+    }
+
+    pub async fn load_mcp_credentials(&self, server_name: &str) -> Result<Option<String>> {
+        let server_name = server_name.to_string();
+        self.connection
+            .call(move |connection| {
+                let result = connection.query_row(
+                    "SELECT credentials_json FROM mcp_oauth_credentials WHERE server_name = ?1",
+                    rusqlite::params![server_name],
+                    |row| row.get::<_, String>(0),
+                );
+
+                match result {
+                    Ok(json) => Ok(Some(json)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to load MCP credentials: {}", error))
+            })
+    }
+
+    pub async fn save_mcp_credentials(&self, server_name: &str, json: &str) -> Result<()> {
+        let server_name = server_name.to_string();
+        let json = json.to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO mcp_oauth_credentials (server_name, credentials_json, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(server_name) DO UPDATE SET
+                         credentials_json = excluded.credentials_json,
+                         updated_at = excluded.updated_at",
+                    rusqlite::params![server_name, json, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to save MCP credentials: {}", error))
+            })
+    }
+
+    pub async fn clear_mcp_credentials(&self, server_name: &str) -> Result<()> {
+        let server_name = server_name.to_string();
+        self.connection
+            .call(move |connection| {
+                connection.execute(
+                    "DELETE FROM mcp_oauth_credentials WHERE server_name = ?1",
+                    rusqlite::params![server_name],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to clear MCP credentials: {}", error))
+            })
     }
 
     pub async fn save_oauth_token(

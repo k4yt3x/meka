@@ -41,6 +41,12 @@ pub enum AgshError {
         tool_name: String,
         message: String,
     },
+
+    #[error("MCP authentication error: {server_name}: {message}")]
+    McpAuth {
+        server_name: String,
+        message: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, AgshError>;
