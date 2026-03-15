@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `display.show_path_in_prompt` config option to toggle working directory display in the prompt (default: `true`)
+
 ## [0.4.0] - 2026-03-14
 
 ### Added
@@ -24,8 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Dynamic environment context (working directory, date) moved from system prompt to per-turn user message injection for better KV cache efficiency
-- MCP server connection failures now display a warning instead of aborting startup
 - Default render mode changed from `rich` to `raw`
 - Split `display.show_session_id` into `display.show_session_id_on_create` (default: false) and `display.show_session_id_on_exit` (default: true) for independent control
 

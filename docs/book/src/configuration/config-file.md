@@ -145,6 +145,31 @@ show_session_id_on_create = true
 show_session_id_on_exit = false
 ```
 
+### `display.show_path_in_prompt`
+
+Whether to show the current working directory in the interactive prompt.
+
+Default: `true`
+
+### `display.newline_before_prompt`
+
+Whether to add a blank line before the prompt after each agent response.
+
+Default: `true`
+
+### `display.newline_after_prompt`
+
+Whether to add a blank line after the prompt (before the agent response).
+
+Default: `true`
+
+```toml
+[display]
+show_path_in_prompt = false
+newline_before_prompt = false
+newline_after_prompt = false
+```
+
 ## `[web]`
 
 Settings for web-related tools (fetch_url, web_search).

@@ -13,14 +13,19 @@ const CYCLE_PERMISSION_SENTINEL: &str = "__cycle_permission__";
 
 struct AgshPrompt {
     shared_permission: SharedPermission,
+    show_path: bool,
 }
 
 impl Prompt for AgshPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        let cwd = std::env::current_dir()
-            .map(|path| shorten_path_with_tilde(&path))
-            .unwrap_or_else(|_| "?".to_string());
-        Cow::Owned(format!("agsh:{} ", cwd))
+        if self.show_path {
+            let cwd = std::env::current_dir()
+                .map(|path| shorten_path_with_tilde(&path))
+                .unwrap_or_else(|_| "?".to_string());
+            Cow::Owned(format!("agsh:{} ", cwd))
+        } else {
+            Cow::Borrowed("agsh ")
+        }
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -134,12 +139,14 @@ fn print_help() {
 
 pub fn run_repl(
     shared_permission: SharedPermission,
+    show_path_in_prompt: bool,
     input_sender: tokio::sync::mpsc::UnboundedSender<ShellEvent>,
     agent_done_receiver: std::sync::mpsc::Receiver<()>,
 ) {
     let mut editor = build_reedline_editor();
     let prompt = AgshPrompt {
         shared_permission: shared_permission.clone(),
+        show_path: show_path_in_prompt,
     };
 
     loop {

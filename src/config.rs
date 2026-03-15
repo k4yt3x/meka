@@ -48,6 +48,7 @@ pub struct DisplayConfig {
     pub newline_after_prompt: Option<bool>,
     pub show_session_id_on_create: Option<bool>,
     pub show_session_id_on_exit: Option<bool>,
+    pub show_path_in_prompt: Option<bool>,
     pub render_mode: Option<RenderMode>,
 }
 
@@ -95,6 +96,7 @@ pub struct ResolvedConfig {
     pub newline_after_prompt: bool,
     pub show_session_id_on_create: bool,
     pub show_session_id_on_exit: bool,
+    pub show_path_in_prompt: bool,
     pub user_agent: String,
     pub sandbox: bool,
     pub render_mode: RenderMode,
@@ -230,6 +232,7 @@ impl ResolvedConfig {
             newline_after_prompt: file_display.newline_after_prompt.unwrap_or(true),
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
+            show_path_in_prompt: file_display.show_path_in_prompt.unwrap_or(true),
             user_agent: file_web
                 .user_agent
                 .unwrap_or_else(|| "Mozilla/5.0 (compatible; agsh/0.1)".to_string()),

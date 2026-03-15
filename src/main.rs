@@ -304,8 +304,14 @@ async fn run_interactive(
     let (agent_done_sender, agent_done_receiver) = std::sync::mpsc::channel::<()>();
 
     let repl_permission = shared_permission.clone();
+    let show_path_in_prompt = config.show_path_in_prompt;
     let repl_handle = tokio::task::spawn_blocking(move || {
-        shell::run_repl(repl_permission, input_sender, agent_done_receiver);
+        shell::run_repl(
+            repl_permission,
+            show_path_in_prompt,
+            input_sender,
+            agent_done_receiver,
+        );
     });
 
     // Try to create the agent (may fail if config is incomplete)
