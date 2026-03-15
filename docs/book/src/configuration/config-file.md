@@ -213,3 +213,94 @@ Default: `52428800` (50 MB)
 [session]
 max_storage_bytes = 10485760  # 10 MB
 ```
+
+## `[mcp]`
+
+Settings for MCP (Model Context Protocol) tool servers. MCP allows agsh to discover and use tools provided by external servers.
+
+### `[[mcp.servers]]`
+
+An array of MCP server configurations. Each entry defines a server to connect to at startup.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Unique name for this server. Used as namespace prefix for tools (`name__tool`). Must not contain `__`. |
+| `transport` | Yes | Transport type: `"stdio"` (spawn subprocess) or `"http"` (streamable HTTP). |
+| `command` | Stdio only | Path or name of the executable to spawn. |
+| `args` | No | Arguments to pass to the command. |
+| `env` | No | Environment variables to set for the spawned process (stdio only). |
+| `url` | HTTP only | URL of the MCP server endpoint. |
+| `auth_token` | No | Bearer token for HTTP authentication (sent as `Authorization: Bearer <token>`). |
+| `headers` | No | Custom HTTP headers to include with every request (HTTP only). |
+| `permission` | No | Permission level required to use this server's tools: `"none"`, `"read"` (default), or `"write"`. |
+
+MCP tools are registered with namespaced names in the format `servername__toolname` to prevent collisions with built-in tools or between servers.
+
+### Examples
+
+#### Stdio server
+
+```toml
+[[mcp.servers]]
+name = "postgres"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"]
+permission = "write"
+```
+
+#### HTTP server
+
+```toml
+[[mcp.servers]]
+name = "web-tools"
+transport = "http"
+url = "http://localhost:8080/mcp"
+permission = "read"
+```
+
+#### HTTP server with authentication
+
+```toml
+[[mcp.servers]]
+name = "api"
+transport = "http"
+url = "https://api.example.com/mcp"
+auth_token = "your-bearer-token"
+permission = "write"
+
+[mcp.servers.headers]
+X-Custom-Header = "value"
+```
+
+#### Stdio server with environment variables
+
+```toml
+[[mcp.servers]]
+name = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+permission = "read"
+
+[mcp.servers.env]
+GITHUB_TOKEN = "ghp_..."
+```
+
+#### Multiple servers
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"]
+permission = "read"
+
+[[mcp.servers]]
+name = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+permission = "write"
+```

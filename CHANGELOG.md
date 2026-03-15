@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- MCP (Model Context Protocol) client support: configure external tool servers via `[[mcp.servers]]` in config file with stdio and streamable HTTP transports
+- MCP tools namespaced as `server__tool` and registered alongside built-in tools with per-server permission configuration
 - `delete` subcommand (`agsh delete <id>...` or `agsh delete --all`) to delete specific or all sessions
 - `list` subcommand (`agsh list [-n <count>]`) to display past sessions with timestamps and preview text
 - `export` subcommand (`agsh export <session-id> [-o <path>]`) to export session history as Markdown (default: `session-<id>.md`, `-o -` for stdout)

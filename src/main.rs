@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod config;
 mod error;
+mod mcp;
 mod permission;
 mod provider;
 mod render;
@@ -124,19 +125,26 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
         tracing::warn!("failed to save OAuth token to database: {}", error);
     }
 
+    let mcp_manager = if !config.mcp_servers.is_empty() {
+        Some(mcp::McpClientManager::connect_all(&config.mcp_servers).await?)
+    } else {
+        None
+    };
+
     if let Some(prompt) = config.prompt.clone() {
-        return run_oneshot(config, session_manager, token_store, prompt).await;
+        return run_oneshot(config, session_manager, token_store, prompt, mcp_manager).await;
     }
 
-    run_interactive(config, session_manager, token_store).await
+    run_interactive(config, session_manager, token_store, mcp_manager).await
 }
 
-fn create_agent_from_config(
+async fn create_agent_from_config(
     config: &ResolvedConfig,
     session_manager: SessionManager,
     shared_permission: SharedPermission,
     token_store: TokenStore,
     credential: AuthCredential,
+    mcp_manager: Option<&mcp::McpClientManager>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
@@ -170,12 +178,23 @@ fn create_agent_from_config(
             crate::sandbox::SandboxCapability::Unavailable
         );
 
-    let tool_registry = ToolRegistry::build_default(
+    let mut tool_registry = ToolRegistry::build_default(
         config.user_agent.clone(),
         shared_permission.clone(),
         config.sandbox,
         sandbox_capability,
     );
+
+    if let Some(manager) = mcp_manager {
+        for mcp_config in &config.mcp_servers {
+            let mcp_tools = manager
+                .discover_tools_for_server(&mcp_config.name, mcp_config.permission.as_deref())
+                .await?;
+            for tool in mcp_tools {
+                tool_registry.register(Box::new(tool));
+            }
+        }
+    }
 
     Ok(Agent::new(
         provider,
@@ -199,6 +218,7 @@ async fn run_oneshot(
     session_manager: SessionManager,
     token_store: TokenStore,
     prompt: String,
+    mcp_manager: Option<mcp::McpClientManager>,
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission);
     let credential = resolve_credential(&config)?;
@@ -208,7 +228,9 @@ async fn run_oneshot(
         shared_permission,
         token_store,
         credential,
-    )?;
+        mcp_manager.as_ref(),
+    )
+    .await?;
 
     let cancellation = CancellationToken::new();
     let cancellation_clone = cancellation.clone();
@@ -239,6 +261,10 @@ async fn run_oneshot(
         render::render_session_id("Leaving session", &id.to_string());
     }
 
+    if let Some(manager) = mcp_manager {
+        manager.shutdown().await;
+    }
+
     Ok(())
 }
 
@@ -246,6 +272,7 @@ async fn run_interactive(
     config: ResolvedConfig,
     session_manager: SessionManager,
     token_store: TokenStore,
+    mcp_manager: Option<mcp::McpClientManager>,
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission);
 
@@ -302,7 +329,10 @@ async fn run_interactive(
         shared_permission,
         token_store,
         credential,
-    ) {
+        mcp_manager.as_ref(),
+    )
+    .await
+    {
         Ok(agent) => agent,
         Err(error) => {
             eprintln!("Error: {}", error);
@@ -387,6 +417,10 @@ async fn run_interactive(
         if config.show_session_id_on_exit {
             render::render_session_id("Leaving session", &id.to_string());
         }
+    }
+
+    if let Some(manager) = mcp_manager {
+        manager.shutdown().await;
     }
 
     Ok(())

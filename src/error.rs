@@ -28,6 +28,19 @@ pub enum AgshError {
 
     #[error("SSE stream error: {0}")]
     StreamError(String),
+
+    #[error("MCP connection error: {server_name}: {message}")]
+    McpConnection {
+        server_name: String,
+        message: String,
+    },
+
+    #[error("MCP tool error: {server_name}: {tool_name}: {message}")]
+    McpToolExecution {
+        server_name: String,
+        tool_name: String,
+        message: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, AgshError>;

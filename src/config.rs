@@ -14,6 +14,32 @@ pub struct ConfigFile {
     pub web: Option<WebConfig>,
     pub shell: Option<ShellConfig>,
     pub session: Option<SessionConfig>,
+    pub mcp: Option<McpConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct McpConfig {
+    pub servers: Option<Vec<McpServerConfig>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub transport: McpTransport,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub env: Option<std::collections::HashMap<String, String>>,
+    pub url: Option<String>,
+    pub auth_token: Option<String>,
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    pub permission: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio,
+    Http,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -75,6 +101,7 @@ pub struct ResolvedConfig {
     pub context_messages: Option<usize>,
     pub retention_days: Option<u64>,
     pub max_storage_bytes: Option<u64>,
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 pub(crate) fn config_file_path() -> Option<PathBuf> {
@@ -153,6 +180,10 @@ impl ResolvedConfig {
         let file_web = config_file.web.unwrap_or_default();
         let file_shell = config_file.shell.unwrap_or_default();
         let file_session = config_file.session.unwrap_or_default();
+        let mcp_servers = config_file
+            .mcp
+            .and_then(|mcp| mcp.servers)
+            .unwrap_or_default();
 
         let provider_name = cli
             .provider
@@ -210,6 +241,7 @@ impl ResolvedConfig {
             context_messages: file_session.context_messages.or(Some(200)),
             retention_days: file_session.retention_days.or(Some(90)),
             max_storage_bytes: file_session.max_storage_bytes.or(Some(52_428_800)),
+            mcp_servers,
         }
     }
 
@@ -356,6 +388,50 @@ context_messages = 50
         assert_eq!(context_messages, Some(200));
         assert_eq!(retention_days, Some(90));
         assert_eq!(max_storage_bytes, Some(52_428_800));
+    }
+
+    #[test]
+    fn test_mcp_config_deserialization() {
+        let toml_str = r#"
+[[mcp.servers]]
+name = "postgres"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-postgres"]
+permission = "read"
+
+[[mcp.servers]]
+name = "web-api"
+transport = "http"
+url = "http://localhost:8080/mcp"
+permission = "write"
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let mcp = config.mcp.expect("mcp should be present");
+        let servers = mcp.servers.expect("servers should be present");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "postgres");
+        assert_eq!(servers[0].transport, McpTransport::Stdio);
+        assert_eq!(servers[0].command.as_deref(), Some("npx"));
+        assert_eq!(
+            servers[0].args.as_deref(),
+            Some(
+                ["-y", "@modelcontextprotocol/server-postgres"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        assert_eq!(servers[0].permission.as_deref(), Some("read"));
+        assert_eq!(servers[1].name, "web-api");
+        assert_eq!(servers[1].transport, McpTransport::Http);
+        assert_eq!(servers[1].url.as_deref(), Some("http://localhost:8080/mcp"));
+        assert_eq!(servers[1].permission.as_deref(), Some("write"));
+    }
+
+    #[test]
+    fn test_mcp_config_empty() {
+        let config: ConfigFile = toml::from_str("").expect("failed to parse empty toml");
+        assert!(config.mcp.is_none());
     }
 
     #[test]
