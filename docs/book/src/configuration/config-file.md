@@ -118,13 +118,13 @@ Output render mode. Equivalent to the `--render-mode` CLI flag.
 | Value | Description |
 |-------|-------------|
 | `rich` | Full terminal formatting (box-drawn code blocks, reflowed paragraphs, formatted tables) |
-| `raw` | Raw markdown with ANSI syntax highlighting (bold, italic, colored code/headings) |
+| `raw` | Raw markdown printed verbatim with aligned tables |
 
-Default: `raw`
+Default: `rich`
 
 ```toml
 [display]
-render_mode = "rich"
+render_mode = "raw"
 ```
 
 ### `display.show_session_id_on_create`

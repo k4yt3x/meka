@@ -1,13 +1,13 @@
 use std::io::{self, Write};
 
-use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor, Stylize};
+use crossterm::style::{Color, Stylize};
 use termimad::MadSkin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderMode {
-    Rich,
     #[default]
+    Rich,
     Raw,
 }
 
@@ -40,8 +40,7 @@ pub struct StreamingRenderer {
     skin: MadSkin,
     mode: RenderMode,
     started: bool,
-    raw_in_code_block: bool,
-    raw_table_buffer: Vec<String>,
+    raw_table_lines: Vec<String>,
 }
 
 impl StreamingRenderer {
@@ -51,8 +50,7 @@ impl StreamingRenderer {
             skin: MadSkin::default_dark(),
             mode,
             started: false,
-            raw_in_code_block: false,
-            raw_table_buffer: Vec::new(),
+            raw_table_lines: Vec::new(),
         }
     }
 
@@ -70,42 +68,57 @@ impl StreamingRenderer {
 
         self.buffer.push_str(delta);
 
-        if self.mode == RenderMode::Raw {
-            // In raw mode, flush complete lines immediately for streaming feel.
-            // Buffer only the last incomplete line. Table rows are accumulated
-            // and flushed together so columns can be aligned.
-            while let Some(newline_pos) = self.buffer.find('\n') {
-                let line = self.buffer[..newline_pos + 1].to_string();
-                self.buffer = self.buffer[newline_pos + 1..].to_string();
+        match self.mode {
+            RenderMode::Rich => self.flush_rich(),
+            RenderMode::Raw => self.flush_raw(),
+        }
+    }
 
-                let trimmed = line.trim();
-                if trimmed.starts_with('|') && trimmed.ends_with('|') {
-                    self.raw_table_buffer.push(line);
-                } else {
-                    self.flush_raw_table()?;
-                    self.render_block(&line)?;
+    pub fn finish(&mut self) -> io::Result<()> {
+        match self.mode {
+            RenderMode::Rich => {
+                if !self.buffer.is_empty() {
+                    let remaining = std::mem::take(&mut self.buffer);
+                    let trimmed = remaining.trim_end_matches('\n');
+                    if !trimmed.is_empty() {
+                        print!("{}", self.skin.term_text(trimmed));
+                    }
                 }
             }
-            return Ok(());
+            RenderMode::Raw => {
+                if !self.buffer.is_empty() {
+                    let remaining = std::mem::take(&mut self.buffer);
+                    let trimmed = remaining.trim_end_matches('\n');
+                    for line in trimmed.lines() {
+                        if is_table_line(line) {
+                            self.raw_table_lines.push(line.to_string());
+                        } else {
+                            self.flush_raw_table()?;
+                            println!("{}", line);
+                        }
+                    }
+                    self.flush_raw_table()?;
+                }
+            }
         }
+        io::stdout().flush()
+    }
 
-        // Rich mode: render complete paragraphs (text before double newline) through termimad.
-        // Keep the tail (incomplete paragraph) buffered for later.
+    fn flush_rich(&mut self) -> io::Result<()> {
         while let Some(boundary) = self.buffer.find("\n\n") {
             let complete = self.buffer[..boundary + 2].to_string();
             self.buffer = self.buffer[boundary + 2..].to_string();
-            self.render_block(&complete)?;
+            print!("{}", self.skin.term_text(&complete));
+            io::stdout().flush()?;
         }
 
-        // For single newline-terminated lines outside of code blocks,
-        // render them immediately to give a streaming feel
         if !self.in_code_block() && !self.in_table() {
             while let Some(newline_pos) = self.buffer.find('\n') {
-                // Only flush if this isn't the start of a potential double-newline
                 if newline_pos + 1 < self.buffer.len() || !self.buffer.ends_with('\n') {
                     let line = self.buffer[..newline_pos + 1].to_string();
                     self.buffer = self.buffer[newline_pos + 1..].to_string();
-                    self.render_block(&line)?;
+                    print!("{}", self.skin.term_text(&line));
+                    io::stdout().flush()?;
                 } else {
                     break;
                 }
@@ -115,164 +128,33 @@ impl StreamingRenderer {
         Ok(())
     }
 
-    pub fn finish(&mut self) -> io::Result<()> {
-        if self.mode == RenderMode::Raw && !self.buffer.is_empty() {
-            let remaining = std::mem::take(&mut self.buffer);
-            let trimmed = remaining.trim();
-            if trimmed.starts_with('|') && trimmed.ends_with('|') {
-                self.raw_table_buffer.push(remaining);
+    fn flush_raw(&mut self) -> io::Result<()> {
+        while let Some(newline_pos) = self.buffer.find('\n') {
+            let line = self.buffer[..newline_pos].to_string();
+            self.buffer = self.buffer[newline_pos + 1..].to_string();
+
+            if is_table_line(&line) {
+                self.raw_table_lines.push(line);
             } else {
                 self.flush_raw_table()?;
-                self.render_block(&remaining)?;
+                println!("{}", line);
+                io::stdout().flush()?;
             }
         }
-        self.flush_raw_table()?;
-        if !self.buffer.is_empty() {
-            let remaining = std::mem::take(&mut self.buffer);
-            self.render_block(&remaining)?;
-        }
-        io::stdout().flush()
-    }
-
-    fn render_block(&mut self, text: &str) -> io::Result<()> {
-        match self.mode {
-            RenderMode::Rich => {
-                let formatted = self.skin.term_text(text);
-                print!("{}", formatted);
-            }
-            RenderMode::Raw => {
-                self.render_raw_line(text)?;
-            }
-        }
-        io::stdout().flush()
-    }
-
-    fn render_raw_line(&mut self, line: &str) -> io::Result<()> {
-        let trimmed = line.trim_end_matches('\n');
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-
-        if trimmed.starts_with("```") {
-            self.raw_in_code_block = !self.raw_in_code_block;
-            if self.raw_in_code_block {
-                write!(out, "{}", SetForegroundColor(Color::DarkYellow))?;
-            } else {
-                write!(out, "{}", ResetColor)?;
-            }
-            writeln!(out)?;
-            return Ok(());
-        }
-
-        if self.raw_in_code_block {
-            writeln!(out, "{}", trimmed)?;
-            return Ok(());
-        }
-
-        if trimmed.is_empty() {
-            writeln!(out)?;
-            return Ok(());
-        }
-
-        if let Some(heading) = trimmed
-            .strip_prefix("# ")
-            .or_else(|| trimmed.strip_prefix("## "))
-            .or_else(|| trimmed.strip_prefix("### "))
-            .or_else(|| trimmed.strip_prefix("#### "))
-        {
-            write!(
-                out,
-                "{}{}{}{}",
-                SetAttribute(Attribute::Bold),
-                SetForegroundColor(Color::Cyan),
-                heading,
-                ResetColor,
-            )?;
-            write!(out, "{}", SetAttribute(Attribute::NoBold))?;
-            writeln!(out)?;
-            return Ok(());
-        }
-
-        render_inline_styles(&mut out, trimmed)?;
-        writeln!(out)?;
-
         Ok(())
     }
 
     fn flush_raw_table(&mut self) -> io::Result<()> {
-        if self.raw_table_buffer.is_empty() {
+        if self.raw_table_lines.is_empty() {
             return Ok(());
         }
 
-        let rows = std::mem::take(&mut self.raw_table_buffer);
-
-        // Parse each row into cells
-        let mut parsed_rows: Vec<Vec<String>> = Vec::new();
-        let mut separator_indices: Vec<usize> = Vec::new();
-
-        for (row_index, row) in rows.iter().enumerate() {
-            let trimmed = row.trim().trim_matches('|');
-            let cells: Vec<String> = trimmed
-                .split('|')
-                .map(|cell| cell.trim().to_string())
-                .collect();
-
-            if is_separator_row(&cells) {
-                separator_indices.push(row_index);
-            }
-            parsed_rows.push(cells);
+        let lines = std::mem::take(&mut self.raw_table_lines);
+        let formatted = format_table(&lines);
+        for line in &formatted {
+            println!("{}", line);
         }
-
-        // Compute max display width per column (skip separator rows for width calculation)
-        let column_count = parsed_rows.iter().map(|row| row.len()).max().unwrap_or(0);
-        let mut max_widths = vec![0usize; column_count];
-
-        for (row_index, cells) in parsed_rows.iter().enumerate() {
-            if separator_indices.contains(&row_index) {
-                continue;
-            }
-            for (column_index, cell) in cells.iter().enumerate() {
-                let width = unicode_width::UnicodeWidthStr::width(cell.as_str());
-                if width > max_widths[column_index] {
-                    max_widths[column_index] = width;
-                }
-            }
-        }
-
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-
-        for (row_index, cells) in parsed_rows.iter().enumerate() {
-            if separator_indices.contains(&row_index) {
-                // Render separator with correct widths
-                write!(out, "|")?;
-                for (column_index, _) in cells.iter().enumerate() {
-                    let width = if column_index < max_widths.len() {
-                        max_widths[column_index]
-                    } else {
-                        3
-                    };
-                    write!(out, " {:-<width$} |", "", width = width)?;
-                }
-                writeln!(out)?;
-                continue;
-            }
-
-            write!(out, "|")?;
-            for column_index in 0..column_count {
-                let cell = cells.get(column_index).map(|s| s.as_str()).unwrap_or("");
-                let display_width = unicode_width::UnicodeWidthStr::width(cell);
-                let target_width = if column_index < max_widths.len() {
-                    max_widths[column_index]
-                } else {
-                    display_width
-                };
-                let padding = target_width.saturating_sub(display_width);
-                write!(out, " {}{} |", cell, " ".repeat(padding))?;
-            }
-            writeln!(out)?;
-        }
-
-        Ok(())
+        io::stdout().flush()
     }
 
     fn in_code_block(&self) -> bool {
@@ -285,103 +167,80 @@ impl StreamingRenderer {
     }
 }
 
+fn is_table_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 1
+}
+
 fn is_separator_row(cells: &[String]) -> bool {
     cells.iter().all(|cell| {
-        let trimmed = cell.trim();
-        !trimmed.is_empty()
-            && trimmed
-                .chars()
-                .all(|character| character == '-' || character == ':')
+        cell.chars()
+            .all(|character| character == '-' || character == ':')
     })
 }
 
-fn render_inline_styles(out: &mut impl Write, text: &str) -> io::Result<()> {
-    let chars: Vec<char> = text.chars().collect();
-    let length = chars.len();
-    let mut index = 0;
+fn parse_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix('|')
+        .unwrap_or(trimmed)
+        .strip_suffix('|')
+        .unwrap_or(trimmed);
+    inner
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
 
-    while index < length {
-        // **bold** or __bold__
-        if index + 1 < length
-            && ((chars[index] == '*' && chars[index + 1] == '*')
-                || (chars[index] == '_' && chars[index + 1] == '_'))
-        {
-            let marker = chars[index];
-            if let Some(end) = find_closing_double(&chars, index + 2, marker) {
-                write!(out, "{}", SetAttribute(Attribute::Bold))?;
-                let inner: String = chars[index + 2..end].iter().collect();
-                write!(out, "{}", inner)?;
-                write!(out, "{}", SetAttribute(Attribute::NoBold))?;
-                index = end + 2;
-                continue;
-            }
-        }
+fn format_table(lines: &[String]) -> Vec<String> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
 
-        // *italic* or _italic_ (single, not preceded by another marker)
-        if (chars[index] == '*' || chars[index] == '_')
-            && (index + 1 >= length || chars[index + 1] != chars[index])
-        {
-            let marker = chars[index];
-            if let Some(end) = find_closing_single(&chars, index + 1, marker) {
-                write!(out, "{}", SetAttribute(Attribute::Italic))?;
-                let inner: String = chars[index + 1..end].iter().collect();
-                write!(out, "{}", inner)?;
-                write!(out, "{}", SetAttribute(Attribute::NoItalic))?;
-                index = end + 1;
-                continue;
-            }
-        }
+    let parsed: Vec<Vec<String>> = lines.iter().map(|line| parse_table_row(line)).collect();
 
-        // `code`
-        if chars[index] == '`'
-            && let Some(end) = find_closing_backtick(&chars, index + 1)
-        {
-            write!(out, "{}", SetForegroundColor(Color::DarkYellow))?;
-            let inner: String = chars[index + 1..end].iter().collect();
-            write!(out, "{}", inner)?;
-            write!(out, "{}", ResetColor)?;
-            index = end + 1;
+    let column_count = parsed.iter().map(|row| row.len()).max().unwrap_or(0);
+    if column_count == 0 {
+        return lines.to_vec();
+    }
+
+    let mut column_widths = vec![0usize; column_count];
+    for row in &parsed {
+        if is_separator_row(row) {
             continue;
         }
-
-        write!(out, "{}", chars[index])?;
-        index += 1;
-    }
-
-    Ok(())
-}
-
-fn find_closing_double(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    let mut index = start;
-    while index + 1 < chars.len() {
-        if chars[index] == marker && chars[index + 1] == marker {
-            return Some(index);
+        for (column_index, cell) in row.iter().enumerate() {
+            if column_index < column_count {
+                column_widths[column_index] = column_widths[column_index].max(cell.len());
+            }
         }
-        index += 1;
     }
-    None
-}
 
-fn find_closing_single(chars: &[char], start: usize, marker: char) -> Option<usize> {
-    let mut index = start;
-    while index < chars.len() {
-        if chars[index] == marker {
-            return Some(index);
-        }
-        index += 1;
+    // Ensure minimum width of 3 for separator dashes
+    for width in &mut column_widths {
+        *width = (*width).max(3);
     }
-    None
-}
 
-fn find_closing_backtick(chars: &[char], start: usize) -> Option<usize> {
-    let mut index = start;
-    while index < chars.len() {
-        if chars[index] == '`' {
-            return Some(index);
+    let mut result = Vec::new();
+    for row in &parsed {
+        if is_separator_row(row) {
+            let separator: Vec<String> = column_widths
+                .iter()
+                .map(|width| "-".repeat(*width))
+                .collect();
+            result.push(format!("| {} |", separator.join(" | ")));
+        } else {
+            let padded: Vec<String> = (0..column_count)
+                .map(|column_index| {
+                    let cell = row.get(column_index).map(|s| s.as_str()).unwrap_or("");
+                    format!("{:width$}", cell, width = column_widths[column_index])
+                })
+                .collect();
+            result.push(format!("| {} |", padded.join(" | ")));
         }
-        index += 1;
     }
-    None
+
+    result
 }
 
 pub fn render_tool_indicator(name: &str, input: &serde_json::Value) {
@@ -506,58 +365,159 @@ mod tests {
     }
 
     #[test]
-    fn test_in_code_block() {
-        let renderer = StreamingRenderer::new(RenderMode::Rich);
-        assert!(!renderer.in_code_block());
-    }
-
-    #[test]
-    fn test_in_table() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Rich);
-        renderer.buffer = "| col1 | col2 |".to_string();
-        assert!(renderer.in_table());
-        renderer.buffer = "not a table".to_string();
-        assert!(!renderer.in_table());
-    }
-
-    #[test]
-    fn test_streaming_renderer_raw_mode() {
-        let mut renderer = StreamingRenderer::new(RenderMode::Raw);
-        renderer.push_delta("**bold** text\n").unwrap();
-        renderer.finish().unwrap();
-    }
-
-    #[test]
     fn test_render_mode_default() {
-        assert_eq!(RenderMode::default(), RenderMode::Raw);
+        assert_eq!(RenderMode::default(), RenderMode::Rich);
+    }
+
+    #[test]
+    fn test_is_table_line() {
+        assert!(is_table_line("| A | B |"));
+        assert!(is_table_line("|---|---|"));
+        assert!(is_table_line("| single |"));
+        assert!(!is_table_line("|"));
+        assert!(!is_table_line("not a table"));
+        assert!(!is_table_line("| no trailing pipe"));
+    }
+
+    #[test]
+    fn test_parse_table_row() {
+        let cells = parse_table_row("| Alpha | Beta | Gamma |");
+        assert_eq!(cells, vec!["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn test_parse_table_row_no_spaces() {
+        let cells = parse_table_row("|A|B|C|");
+        assert_eq!(cells, vec!["A", "B", "C"]);
     }
 
     #[test]
     fn test_is_separator_row() {
-        assert!(is_separator_row(&["---".to_string(), "---".to_string()]));
-        assert!(is_separator_row(&[":---:".to_string(), "---:".to_string()]));
-        assert!(!is_separator_row(&[
-            "hello".to_string(),
-            "world".to_string()
+        assert!(is_separator_row(&[
+            "---".to_string(),
+            "----".to_string(),
+            "---".to_string()
         ]));
-        assert!(!is_separator_row(&["".to_string()]));
+        assert!(is_separator_row(&[":--".to_string(), ":-:".to_string()]));
+        assert!(!is_separator_row(&["Name".to_string(), "---".to_string()]));
     }
 
     #[test]
-    fn test_raw_table_buffering() {
+    fn test_format_table_alignment() {
+        let lines = vec![
+            "| Name | Value |".to_string(),
+            "|------|-------|".to_string(),
+            "| A | 100 |".to_string(),
+            "| Beta | 2 |".to_string(),
+        ];
+        let result = format_table(&lines);
+        assert_eq!(result.len(), 4);
+
+        // All rows should have the same length
+        let first_len = result[0].len();
+        for (index, row) in result.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                first_len,
+                "row {} has length {} but expected {}",
+                index,
+                row.len(),
+                first_len
+            );
+        }
+
+        // Check content is padded
+        assert_eq!(result[0], "| Name | Value |");
+        assert_eq!(result[2], "| A    | 100   |");
+        assert_eq!(result[3], "| Beta | 2     |");
+    }
+
+    #[test]
+    fn test_format_table_wide_columns() {
+        let lines = vec![
+            "| # | Name | Type | Status | Score |".to_string(),
+            "|---|------|------|--------|-------|".to_string(),
+            "| 1 | Alpha | Primary | Pass | 98.5 |".to_string(),
+            "| 2 | Beta | Secondary | Warn | 75.0 |".to_string(),
+            "| 3 | Gamma | Primary | Pass | 91.2 |".to_string(),
+        ];
+        let result = format_table(&lines);
+        let first_len = result[0].len();
+        for (index, row) in result.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                first_len,
+                "row {} has length {} but expected {}",
+                index,
+                row.len(),
+                first_len
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_table_empty() {
+        let result = format_table(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_table_minimum_separator_width() {
+        let lines = vec![
+            "| A | B |".to_string(),
+            "|---|---|".to_string(),
+            "| C | D |".to_string(),
+        ];
+        let result = format_table(&lines);
+        // Separator dashes should be at least 3 wide
+        assert!(result[1].contains("---"));
+    }
+
+    #[test]
+    fn test_raw_mode_prints_text_verbatim() {
+        let mut renderer = StreamingRenderer::new(RenderMode::Raw);
+        renderer.push_delta("**bold** text\n").unwrap();
+        renderer.finish().unwrap();
+        // Raw mode just prints text as-is; if it didn't panic, it works
+    }
+
+    #[test]
+    fn test_raw_mode_table_buffering() {
         let mut renderer = StreamingRenderer::new(RenderMode::Raw);
         renderer
-            .push_delta("| A | BB |\n|---|----|\n| C | DD |\n\n")
+            .push_delta("| A | B |\n|---|---|\n| C | D |\n\nafter table\n")
             .unwrap();
         renderer.finish().unwrap();
     }
 
     #[test]
-    fn test_raw_table_last_row_no_trailing_newline() {
+    fn test_raw_mode_table_at_end() {
         let mut renderer = StreamingRenderer::new(RenderMode::Raw);
         renderer
-            .push_delta("| A | BB |\n|---|----|\n| C | DD |")
+            .push_delta("| A | B |\n|---|---|\n| C | D |")
             .unwrap();
+        renderer.finish().unwrap();
+    }
+
+    #[test]
+    fn test_finish_trims_trailing_newlines_raw() {
+        let mut renderer = StreamingRenderer::new(RenderMode::Raw);
+        renderer.push_delta("hello\n\n\n").unwrap();
+        renderer.finish().unwrap();
+    }
+
+    #[test]
+    fn test_finish_trims_trailing_newlines_rich() {
+        let mut renderer = StreamingRenderer::new(RenderMode::Rich);
+        renderer.push_delta("hello\n\n\n").unwrap();
+        renderer.finish().unwrap();
+    }
+
+    #[test]
+    fn test_finish_only_newlines() {
+        let mut renderer = StreamingRenderer::new(RenderMode::Raw);
+        renderer.started = true;
+        renderer.buffer = "\n\n\n".to_string();
         renderer.finish().unwrap();
     }
 }

@@ -14,7 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Default render mode changed from `raw` to `rich`
+- Raw render mode now prints agent output verbatim, only formatting tables with aligned columns
 - Upgraded `reqwest` from 0.12 to 0.13
+
+### Removed
+
+- Custom raw mode ANSI markdown renderer (replaced with passthrough + table alignment)
+- `unicode-width` direct dependency
+
+### Fixed
+
+- Trailing newlines in agent responses causing duplicate blank lines before the next prompt
 
 ## [0.4.1] - 2026-03-14
 
