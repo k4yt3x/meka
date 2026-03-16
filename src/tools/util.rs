@@ -14,17 +14,6 @@ pub(super) fn require_str(
         })
 }
 
-pub(super) fn ceil_char_boundary(string: &str, index: usize) -> usize {
-    if index >= string.len() {
-        return string.len();
-    }
-    let mut boundary = index;
-    while boundary < string.len() && !string.is_char_boundary(boundary) {
-        boundary += 1;
-    }
-    boundary
-}
-
 pub(super) fn truncate_string(string: &str, max_length: usize) -> &str {
     if string.len() <= max_length {
         string

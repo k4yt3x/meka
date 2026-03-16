@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `urldecode` incorrectly handling multi-byte UTF-8 percent-encoded sequences (e.g., `%C3%A9` producing mojibake instead of 'é')
+
+### Changed
+
+- Replaced custom HTML search result parsers with `scraper` crate for CSS selector-based extraction
+- Replaced custom `urldecode` implementation with `percent-encoding` crate (already a transitive dependency)
+- Replaced custom `ceil_char_boundary` utility with stdlib `str::ceil_char_boundary`
+- Reuse a single `reqwest::Client` for web tools instead of constructing one per request
+- Extracted duplicated timestamp calculation in Claude provider into a helper function
+
 ## [0.5.0] - 2026-03-16
 
 ### Added

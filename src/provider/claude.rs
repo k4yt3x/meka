@@ -13,6 +13,13 @@ use super::{
     StreamEvent, ToolDefinition,
 };
 
+fn now_epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub struct ClaudeProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
@@ -56,13 +63,8 @@ impl ClaudeProvider {
                     expires_at,
                     ..
                 } => {
-                    let now_millis = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|duration| duration.as_millis() as i64)
-                        .unwrap_or(0);
-
                     let needs_refresh = if let Some(exp) = expires_at {
-                        now_millis + 300_000 >= *exp
+                        now_epoch_millis() + 300_000 >= *exp
                     } else {
                         false
                     };
@@ -84,13 +86,8 @@ impl ClaudeProvider {
             ..
         } = &*credential
         {
-            let now_millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as i64)
-                .unwrap_or(0);
-
             let needs_refresh = if let Some(exp) = expires_at {
-                now_millis + 300_000 >= *exp
+                now_epoch_millis() + 300_000 >= *exp
             } else {
                 false
             };
@@ -161,13 +158,9 @@ impl ClaudeProvider {
             AgshError::Provider(format!("failed to parse refresh response: {}", error))
         })?;
 
-        let expires_at = data.expires_in.map(|seconds| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as i64)
-                .unwrap_or(0);
-            now + (seconds as i64) * 1000
-        });
+        let expires_at = data
+            .expires_in
+            .map(|seconds| now_epoch_millis() + (seconds as i64) * 1000);
 
         Ok(AuthCredential::OAuthToken {
             access_token: data.access_token,

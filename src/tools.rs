@@ -68,12 +68,15 @@ impl ToolRegistry {
         registry.register(Box::new(file::WriteFileTool));
         registry.register(Box::new(search::FindFilesTool));
         registry.register(Box::new(search::SearchContentsTool));
+        let web_client = reqwest::Client::builder()
+            .user_agent(&user_agent)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         registry.register(Box::new(web::FetchUrlTool {
-            user_agent: user_agent.clone(),
+            client: web_client.clone(),
         }));
-        registry.register(Box::new(web::WebSearchTool {
-            user_agent: user_agent.clone(),
-        }));
+        registry.register(Box::new(web::WebSearchTool { client: web_client }));
         registry.register(Box::new(shell::ExecuteCommandTool {
             sandbox_capability,
             shared_permission,
