@@ -25,6 +25,10 @@ impl Tool for FetchUrlTool {
                     "url": {
                         "type": "string",
                         "description": "The URL to fetch"
+                    },
+                    "max_length": {
+                        "type": "integer",
+                        "description": "Maximum number of characters to return. Default: 50000. Set to 0 for no limit."
                     }
                 },
                 "required": ["url"]
@@ -71,8 +75,12 @@ impl Tool for FetchUrlTool {
 
         let markdown = rewrite_html(&html, false);
 
-        let max_length = 50000;
-        let content = if markdown.len() > max_length {
+        let max_length = input["max_length"]
+            .as_u64()
+            .map(|value| value as usize)
+            .unwrap_or(50000);
+
+        let content = if max_length > 0 && markdown.len() > max_length {
             format!(
                 "{}\n\n... (truncated, showing first {} characters)",
                 &markdown[..markdown.floor_char_boundary(max_length)],
