@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- User prompts are no longer recorded in conversation history when the server returns an error
+- The blank line after the agent's response is now printed even when an error occurs
+- Partial assistant responses are now saved to conversation history when the user interrupts with Ctrl+C
+
+### Changed
+
+- Reduced `fetch_url` default `max_length` from 50000 to 30000
+
 ## [0.5.2] - 2026-03-17
 
 ### Changed

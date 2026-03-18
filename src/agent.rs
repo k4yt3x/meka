@@ -74,78 +74,127 @@ impl Agent {
         let augmented_input = format!("{}\n{}", environment_context, user_input);
         let user_message = Message::user(&augmented_input);
         messages.push(user_message);
-        self.session_manager
-            .save_message(sid, "user", &user_input)
-            .await?;
 
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(AgshError::Interrupted);
-            }
+        let mut user_saved = false;
 
-            let permission = self.shared_permission.get();
-            let tools = self.available_tools(permission);
-            let system_prompt =
-                build_system_prompt(permission, &tools, self.options.sandboxed_shell);
-
-            let api_messages =
-                truncate_messages_for_context(messages, self.options.context_messages);
-
-            let (assistant_message, stop_reason) = if self.options.streaming {
-                self.run_streaming(&system_prompt, &api_messages, &tools, cancellation.clone())
-                    .await?
-            } else {
-                self.provider
-                    .complete(&system_prompt, &api_messages, &tools)
-                    .await?
-            };
-
-            let content_json =
-                serde_json::to_string(&assistant_message.content).map_err(|error| {
-                    AgshError::Provider(format!("failed to serialize message: {}", error))
-                })?;
-            self.session_manager
-                .save_message(sid, "assistant", &content_json)
-                .await?;
-
-            messages.push(assistant_message.clone());
-
-            match stop_reason {
-                StopReason::ToolUse => {
-                    let tool_results = self
-                        .execute_tool_calls(&assistant_message, cancellation.clone())
-                        .await;
-
-                    let result_message = Message {
-                        role: Role::User,
-                        content: tool_results,
-                    };
-
-                    let result_json =
-                        serde_json::to_string(&result_message.content).map_err(|error| {
-                            AgshError::Provider(format!(
-                                "failed to serialize tool results: {}",
-                                error
-                            ))
-                        })?;
-                    self.session_manager
-                        .save_message(sid, "tool_results", &result_json)
-                        .await?;
-
-                    messages.push(result_message);
-                    // Continue the loop to let the model process tool results
+        let result: Result<()> = 'turn: {
+            loop {
+                if cancellation.is_cancelled() {
+                    break 'turn Err(AgshError::Interrupted);
                 }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::Unknown(_) => {
-                    break;
+
+                let permission = self.shared_permission.get();
+                let tools = self.available_tools(permission);
+                let system_prompt =
+                    build_system_prompt(permission, &tools, self.options.sandboxed_shell);
+
+                let api_messages =
+                    truncate_messages_for_context(messages, self.options.context_messages);
+
+                let (assistant_message, stop_reason) = match if self.options.streaming {
+                    self.run_streaming(&system_prompt, &api_messages, &tools, cancellation.clone())
+                        .await
+                } else {
+                    self.provider
+                        .complete(&system_prompt, &api_messages, &tools)
+                        .await
+                } {
+                    Ok(value) => value,
+                    Err(error) => break 'turn Err(error),
+                };
+
+                if !user_saved {
+                    if let Err(error) = self
+                        .session_manager
+                        .save_message(sid, "user", &user_input)
+                        .await
+                    {
+                        break 'turn Err(error);
+                    }
+                    user_saved = true;
+                }
+
+                let content_json = match serde_json::to_string(&assistant_message.content) {
+                    Ok(json) => json,
+                    Err(error) => {
+                        break 'turn Err(AgshError::Provider(format!(
+                            "failed to serialize message: {}",
+                            error
+                        )));
+                    }
+                };
+                if let Err(error) = self
+                    .session_manager
+                    .save_message(sid, "assistant", &content_json)
+                    .await
+                {
+                    break 'turn Err(error);
+                }
+
+                messages.push(assistant_message.clone());
+
+                if cancellation.is_cancelled() {
+                    break 'turn Err(AgshError::Interrupted);
+                }
+
+                match stop_reason {
+                    StopReason::ToolUse => {
+                        let tool_results = self
+                            .execute_tool_calls(&assistant_message, cancellation.clone())
+                            .await;
+
+                        let result_message = Message {
+                            role: Role::User,
+                            content: tool_results,
+                        };
+
+                        let result_json = match serde_json::to_string(&result_message.content) {
+                            Ok(json) => json,
+                            Err(error) => {
+                                break 'turn Err(AgshError::Provider(format!(
+                                    "failed to serialize tool results: {}",
+                                    error
+                                )));
+                            }
+                        };
+                        if let Err(error) = self
+                            .session_manager
+                            .save_message(sid, "tool_results", &result_json)
+                            .await
+                        {
+                            break 'turn Err(error);
+                        }
+
+                        messages.push(result_message);
+                    }
+                    StopReason::EndTurn | StopReason::MaxTokens | StopReason::Unknown(_) => {
+                        break 'turn Ok(());
+                    }
                 }
             }
-        }
+        };
 
-        if self.options.newline_before_prompt {
+        if result.is_ok() && self.options.newline_before_prompt {
             println!();
         }
 
-        Ok(())
+        match &result {
+            Err(AgshError::Interrupted) if !user_saved => {
+                if let Err(error) = self
+                    .session_manager
+                    .save_message(sid, "user", &user_input)
+                    .await
+                {
+                    tracing::error!("failed to save user message on interruption: {}", error);
+                }
+            }
+            Err(error) if !matches!(error, AgshError::Interrupted) && !user_saved => {
+                messages.pop();
+            }
+            _ => {}
+        }
+
+        result
     }
 
     async fn run_streaming(
@@ -234,7 +283,10 @@ impl Agent {
         // Wait for the stream task to complete
         match stream_handle.await {
             Ok(Ok(())) => {}
-            Ok(Err(AgshError::Interrupted)) => return Err(AgshError::Interrupted),
+            Ok(Err(AgshError::Interrupted)) => {
+                // Interrupted — fall through to return partial content.
+                // The caller detects interruption via the cancellation token.
+            }
             Ok(Err(error)) => return Err(error),
             Err(join_error) => {
                 return Err(AgshError::Provider(format!(

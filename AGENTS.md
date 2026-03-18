@@ -33,7 +33,7 @@ This file provides guidance to AI agents when working with code in this reposito
 ## Build & Formatting Commands
 
 - Always run `cargo fmt` and `cargo sort -w` after editing code
-- Always run `cargo build -r` after completing all tasks
+- Always run `cargo build` after completing all tasks
 
 ## Changelog
 

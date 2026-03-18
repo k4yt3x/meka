@@ -372,9 +372,15 @@ async fn run_interactive(
                     Ok(()) => {}
                     Err(error::AgshError::Interrupted) => {
                         eprintln!("\nInterrupted.");
+                        if config.newline_before_prompt {
+                            println!();
+                        }
                     }
                     Err(error) => {
                         eprintln!("Error: {}", error);
+                        if config.newline_before_prompt {
+                            println!();
+                        }
                     }
                 }
 
