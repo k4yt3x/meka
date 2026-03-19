@@ -184,6 +184,7 @@ impl OpenAiProvider {
                     .get("function")
                     .and_then(|function| function.get("name"))
                     .and_then(|name| name.as_str())
+                    .or_else(|| tool_call.get("name").and_then(|name| name.as_str()))
                     .ok_or_else(|| {
                         AgshError::Provider("tool call missing 'function.name' field".to_string())
                     })?
@@ -192,6 +193,11 @@ impl OpenAiProvider {
                     .get("function")
                     .and_then(|function| function.get("arguments"))
                     .and_then(|arguments| arguments.as_str())
+                    .or_else(|| {
+                        tool_call
+                            .get("arguments")
+                            .and_then(|arguments| arguments.as_str())
+                    })
                     .unwrap_or("{}");
                 let input: serde_json::Value = match serde_json::from_str(arguments_str) {
                     Ok(value) => value,
@@ -356,25 +362,38 @@ impl Provider for OpenAiProvider {
                                 for tool_call in tool_calls {
                                     let index = tool_call.get("index").and_then(|index| index.as_i64()).unwrap_or(0);
 
-                                    if let Some(id) = tool_call.get("id").and_then(|id| id.as_str()) {
-                                        let name = tool_call
-                                            .get("function")
-                                            .and_then(|function| function.get("name"))
-                                            .and_then(|name| name.as_str())
-                                            .unwrap_or_default()
-                                            .to_string();
+                                    let name = tool_call
+                                        .get("function")
+                                        .and_then(|function| function.get("name"))
+                                        .and_then(|name| name.as_str())
+                                        .or_else(|| tool_call.get("name").and_then(|name| name.as_str()));
 
-                                        tool_call_accumulators.insert(index, ToolCallAccumulator {
-                                            id: id.to_string(),
-                                            name,
-                                            arguments: String::new(),
-                                        });
+                                    if let Some(id) = tool_call.get("id").and_then(|id| id.as_str()) {
+                                        let accumulator = tool_call_accumulators
+                                            .entry(index)
+                                            .or_insert_with(|| ToolCallAccumulator {
+                                                id: id.to_string(),
+                                                name: String::new(),
+                                                arguments: String::new(),
+                                            });
+                                        if let Some(name) = name {
+                                            if accumulator.name.is_empty() {
+                                                accumulator.name = name.to_string();
+                                            }
+                                        }
+                                    } else if let Some(name) = name {
+                                        if let Some(accumulator) = tool_call_accumulators.get_mut(&index) {
+                                            if accumulator.name.is_empty() {
+                                                accumulator.name = name.to_string();
+                                            }
+                                        }
                                     }
 
                                     if let Some(args) = tool_call
                                         .get("function")
                                         .and_then(|function| function.get("arguments"))
                                         .and_then(|arguments| arguments.as_str())
+                                        .or_else(|| tool_call.get("arguments").and_then(|arguments| arguments.as_str()))
                                         && !args.is_empty() {
                                             if let Some(accumulator) = tool_call_accumulators.get_mut(&index) {
                                                 accumulator.arguments.push_str(args);
@@ -621,5 +640,100 @@ mod tests {
 
         let result = provider.parse_non_streaming_response(&response);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_openai_parse_non_streaming_flattened_tool_call() {
+        let provider = OpenAiProvider::new("test-key".to_string(), "gpt-4o".to_string(), None);
+
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"/tmp/test.txt\"}"
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let (message, stop_reason) = provider
+            .parse_non_streaming_response(&response)
+            .expect("should parse flattened tool call");
+
+        assert_eq!(stop_reason, StopReason::ToolUse);
+        let tool_uses = message.tool_uses();
+        assert_eq!(tool_uses.len(), 1);
+
+        if let ContentBlock::ToolUse { id, name, input } = &tool_uses[0] {
+            assert_eq!(id, "call_abc");
+            assert_eq!(name, "read_file");
+            assert_eq!(input["path"], "/tmp/test.txt");
+        } else {
+            panic!("expected ToolUse block");
+        }
+    }
+
+    #[test]
+    fn test_openai_parse_non_streaming_flattened_missing_name_still_errors() {
+        let provider = OpenAiProvider::new("test-key".to_string(), "gpt-4o".to_string(), None);
+
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "arguments": "{}"
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        let result = provider.parse_non_streaming_response(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_openai_tool_definitions_use_standard_chat_completions_format() {
+        let provider = OpenAiProvider::new("test-key".to_string(), "gpt-4o".to_string(), None);
+
+        let tools = vec![ToolDefinition {
+            name: "write_file".to_string(),
+            description: "Create or overwrite a file".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            }),
+        }];
+
+        let body = provider.build_request_body("", &[], &tools, false);
+        let openai_tools = body["tools"].as_array().expect("tools should be array");
+
+        assert_eq!(openai_tools[0]["type"], "function");
+        assert_eq!(openai_tools[0]["function"]["name"], "write_file");
+        assert_eq!(
+            openai_tools[0]["function"]["description"],
+            "Create or overwrite a file"
+        );
+        assert!(openai_tools[0]["function"].get("parameters").is_some());
+
+        // Top-level name/description/parameters must NOT be present to avoid
+        // triggering Responses API strict validation on OpenAI/OpenRouter
+        assert!(openai_tools[0].get("name").is_none());
+        assert!(openai_tools[0].get("description").is_none());
+        assert!(openai_tools[0].get("parameters").is_none());
     }
 }
