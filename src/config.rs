@@ -259,9 +259,10 @@ impl ResolvedConfig {
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
             show_path_in_prompt: file_display.show_path_in_prompt.unwrap_or(true),
-            user_agent: file_web
-                .user_agent
-                .unwrap_or_else(|| "Mozilla/5.0 (compatible; agsh/0.1)".to_string()),
+            user_agent: file_web.user_agent.unwrap_or_else(|| {
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+                    .to_string()
+            }),
             sandbox: file_shell.sandbox.unwrap_or(true),
             render_mode: cli
                 .render_mode

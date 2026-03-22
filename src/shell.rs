@@ -81,6 +81,12 @@ fn build_reedline_editor() -> Reedline {
         ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
     );
 
+    keybindings.add_binding(
+        KeyModifiers::SHIFT,
+        KeyCode::Enter,
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
+
     let emacs_mode = Emacs::new(keybindings);
     Reedline::create()
         .with_edit_mode(Box::new(emacs_mode))

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use html2md::rewrite_html;
+use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgshError, Result};
@@ -8,6 +9,20 @@ use crate::provider::ToolDefinition;
 
 use super::util::require_str;
 use super::{Tool, ToolOutput};
+
+fn apply_headers(
+    mut builder: reqwest::RequestBuilder,
+    input: &serde_json::Value,
+) -> reqwest::RequestBuilder {
+    if let Some(headers) = input.get("headers").and_then(|h| h.as_object()) {
+        for (key, value) in headers {
+            if let Some(value_str) = value.as_str() {
+                builder = builder.header(key.as_str(), value_str);
+            }
+        }
+    }
+    builder
+}
 
 pub(super) struct FetchUrlTool {
     pub client: reqwest::Client,
@@ -29,6 +44,15 @@ impl Tool for FetchUrlTool {
                     "max_length": {
                         "type": "integer",
                         "description": "Maximum number of characters to return. Default: 30000. Set to 0 for no limit."
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional HTTP headers. Overrides defaults (e.g., User-Agent).",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "regex": {
+                        "type": "string",
+                        "description": "Optional regex pattern. If provided, only matching content is returned (all matches joined by newlines)."
                     }
                 },
                 "required": ["url"]
@@ -47,15 +71,14 @@ impl Tool for FetchUrlTool {
     ) -> Result<ToolOutput> {
         let url = require_str(&input, "url", "fetch_url")?;
 
-        let response =
-            self.client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|error| AgshError::ToolExecution {
-                    tool_name: "fetch_url".to_string(),
-                    message: format!("failed to fetch '{}': {}", url, error),
-                })?;
+        let request = apply_headers(self.client.get(&url), &input);
+        let response = request
+            .send()
+            .await
+            .map_err(|error| AgshError::ToolExecution {
+                tool_name: "fetch_url".to_string(),
+                message: format!("failed to fetch '{}': {}", url, error),
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -90,6 +113,21 @@ impl Tool for FetchUrlTool {
             markdown
         };
 
+        let content = if let Some(pattern) = input.get("regex").and_then(|v| v.as_str()) {
+            let re = Regex::new(pattern).map_err(|error| AgshError::ToolExecution {
+                tool_name: "fetch_url".to_string(),
+                message: format!("invalid regex '{}': {}", pattern, error),
+            })?;
+            let matches: Vec<&str> = re.find_iter(&content).map(|m| m.as_str()).collect();
+            if matches.is_empty() {
+                "No matches found for the given regex pattern.".to_string()
+            } else {
+                matches.join("\n")
+            }
+        } else {
+            content
+        };
+
         Ok(ToolOutput {
             content,
             is_error: false,
@@ -120,6 +158,11 @@ impl Tool for WebSearchTool {
                         "type": "string",
                         "description": "Search engine to use: 'duckduckgo' (default), 'google', or 'bing'",
                         "enum": ["duckduckgo", "google", "bing"]
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Optional HTTP headers. Overrides defaults (e.g., User-Agent).",
+                        "additionalProperties": { "type": "string" }
                     }
                 },
                 "required": ["query"]
@@ -154,10 +197,8 @@ impl Tool for WebSearchTool {
             ),
         };
 
-        let response = self
-            .client
-            .get(url)
-            .query(&query_params)
+        let request = apply_headers(self.client.get(url).query(&query_params), &input);
+        let response = request
             .send()
             .await
             .map_err(|error| AgshError::ToolExecution {
@@ -401,5 +442,105 @@ mod tests {
         assert!(parse_duckduckgo_results("<html><body></body></html>").is_empty());
         assert!(parse_google_results("<html><body></body></html>").is_empty());
         assert!(parse_bing_results("<html><body></body></html>").is_empty());
+    }
+
+    #[test]
+    fn test_apply_headers_adds_headers() {
+        let client = reqwest::Client::new();
+        let input = serde_json::json!({
+            "url": "https://example.com",
+            "headers": {
+                "X-Custom": "test-value",
+                "Accept-Language": "en-US"
+            }
+        });
+        let request = apply_headers(client.get("https://example.com"), &input)
+            .build()
+            .unwrap();
+        assert_eq!(request.headers().get("X-Custom").unwrap(), "test-value");
+        assert_eq!(request.headers().get("Accept-Language").unwrap(), "en-US");
+    }
+
+    #[test]
+    fn test_apply_headers_overrides_user_agent() {
+        let client = reqwest::Client::builder()
+            .user_agent("default-agent")
+            .build()
+            .unwrap();
+        let input = serde_json::json!({
+            "headers": { "User-Agent": "custom-agent" }
+        });
+        let request = apply_headers(client.get("https://example.com"), &input)
+            .build()
+            .unwrap();
+        assert_eq!(request.headers().get("User-Agent").unwrap(), "custom-agent");
+    }
+
+    #[test]
+    fn test_apply_headers_no_headers() {
+        let client = reqwest::Client::new();
+        let input = serde_json::json!({"url": "https://example.com"});
+        let request = apply_headers(client.get("https://example.com"), &input)
+            .build()
+            .unwrap();
+        assert!(request.headers().get("X-Custom").is_none());
+    }
+
+    #[test]
+    fn test_apply_headers_skips_non_string_values() {
+        let client = reqwest::Client::new();
+        let input = serde_json::json!({
+            "headers": {
+                "X-Valid": "good",
+                "X-Invalid": 123
+            }
+        });
+        let request = apply_headers(client.get("https://example.com"), &input)
+            .build()
+            .unwrap();
+        assert_eq!(request.headers().get("X-Valid").unwrap(), "good");
+        assert!(request.headers().get("X-Invalid").is_none());
+    }
+
+    #[test]
+    fn test_regex_filters_content() {
+        let content = "Hello world\nfoo 123 bar\nbaz 456 qux\nend";
+        let re = Regex::new(r"\d+").unwrap();
+        let matches: Vec<&str> = re.find_iter(content).map(|m| m.as_str()).collect();
+        assert_eq!(matches.join("\n"), "123\n456");
+    }
+
+    #[test]
+    fn test_regex_no_matches() {
+        let content = "Hello world";
+        let re = Regex::new(r"\d+").unwrap();
+        let matches: Vec<&str> = re.find_iter(content).map(|m| m.as_str()).collect();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_regex_invalid_pattern() {
+        assert!(Regex::new(r"[invalid").is_err());
+    }
+
+    #[test]
+    fn test_fetch_url_definition_has_headers_and_regex() {
+        let tool = FetchUrlTool {
+            client: reqwest::Client::new(),
+        };
+        let def = tool.definition();
+        let props = &def.parameters["properties"];
+        assert!(props.get("headers").is_some());
+        assert!(props.get("regex").is_some());
+    }
+
+    #[test]
+    fn test_web_search_definition_has_headers() {
+        let tool = WebSearchTool {
+            client: reqwest::Client::new(),
+        };
+        let def = tool.definition();
+        let props = &def.parameters["properties"];
+        assert!(props.get("headers").is_some());
     }
 }
