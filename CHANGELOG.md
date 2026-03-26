@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Changed default web user agent to Googlebot for better content fetching success rates
+- Changed default web user agent to Chrome for better content fetching success rates
 
 ## [0.5.3] - 2026-03-18
 
