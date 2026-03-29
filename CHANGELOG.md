@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Fixed build failure with rmcp 1.3.0 by using `OAuthClientConfig` builder API instead of struct literal construction
+- OpenAI provider now handles flattened tool call responses from API proxies
 
 ## [0.6.0] - 2026-03-25
 
