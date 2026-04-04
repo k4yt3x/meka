@@ -40,6 +40,7 @@ This file provides guidance to AI agents when working with code in this reposito
 - Update `CHANGELOG.md` after every meaningful change (new features, bug fixes, breaking changes, deprecations, removals)
 - Follow the [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) format
 - Add entries under the `[Unreleased]` section
+- Keep each changelog entry to around 100 characters (soft limit)
 
 ## Documentation
 

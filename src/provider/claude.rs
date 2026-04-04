@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::error::{AgshError, Result};
 use crate::session::TokenStore;
@@ -13,6 +15,54 @@ use super::{
     StreamEvent, ToolDefinition,
 };
 
+/// Claude Code version string. Single source of truth defined in `build.rs`.
+const CC_VERSION: &str = env!("CC_VERSION");
+
+/// Claude Code system prompt prefix.
+const CC_SYSTEM_PROMPT_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Fingerprint salt. Must match claude-code `src/utils/fingerprint.ts`.
+const FINGERPRINT_SALT: &str = "59cf53e54c78";
+
+/// SHA256(SALT + msg[4] + msg[7] + msg[20] + version)[:3].
+fn compute_fingerprint(message_text: &str, version: &str) -> String {
+    let indices = [4, 7, 20];
+    let chars: String = indices
+        .iter()
+        .map(|&index| message_text.chars().nth(index).unwrap_or('0'))
+        .collect();
+
+    let input = format!("{}{}{}", FINGERPRINT_SALT, chars, version);
+    let hash = Sha256::digest(input.as_bytes());
+    let hex = format!("{:x}", hash);
+    hex[..3].to_string()
+}
+
+/// Extracts the text content of the first user message.
+#[allow(dead_code)]
+fn extract_first_user_message_text(messages: &[Message]) -> String {
+    for message in messages {
+        if message.role == Role::User {
+            for block in &message.content {
+                if let ContentBlock::Text { text } = block {
+                    return text.clone();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Computes the fingerprint from the first user message.
+#[allow(dead_code)]
+fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
+    let first_message_text = extract_first_user_message_text(messages);
+    compute_fingerprint(&first_message_text, CC_VERSION)
+}
+
+/// Static fingerprint from an empty message for cross-session cache sharing.
+static STATIC_FINGERPRINT: LazyLock<String> = LazyLock::new(|| compute_fingerprint("", CC_VERSION));
+
 fn now_epoch_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -20,42 +70,233 @@ fn now_epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn generate_billing_header(request_body: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-
-    let build_hash = format!("{:03x}", rand::random_range(0u32..0xFFF));
-    let body_str = serde_json::to_string(request_body).unwrap_or_default();
-    let hash = Sha256::digest(body_str.as_bytes());
-    let content_hash = format!(
-        "{:05x}",
-        u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) & 0xFFFFF
-    );
-
+/// Generates the billing header with a `cch=00000` placeholder.
+fn generate_billing_header() -> String {
     format!(
-        "x-anthropic-billing-header: cc_version=2.1.63.{}; cc_entrypoint=cli; cch={};",
-        build_hash, content_hash
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;",
+        CC_VERSION, *STATIC_FINGERPRINT
     )
 }
 
-fn apply_stainless_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    request
-        .header("x-stainless-lang", "js")
-        .header("x-stainless-runtime", "node")
-        .header("x-stainless-runtime-version", "v24.3.0")
-        .header("x-stainless-package-version", "0.74.0")
-        .header("x-stainless-arch", std::env::consts::ARCH)
-        .header(
-            "x-stainless-os",
-            match std::env::consts::OS {
-                "macos" => "MacOS",
-                "windows" => "Windows",
-                "linux" => "Linux",
-                "freebsd" => "FreeBSD",
-                other => other,
-            },
-        )
+// xxHash64 with Claude-specific seed. See ATTESTATION.md for details.
+
+const XXH64_PRIME1: u64 = 0x9e3779b185ebca87;
+const XXH64_PRIME2: u64 = 0xc2b2ae3d27d4eb4f;
+const XXH64_PRIME3: u64 = 0x165667b19e3779f9;
+const XXH64_PRIME4: u64 = 0x85ebca77c2b2ae63;
+const XXH64_PRIME5: u64 = 0x27d4eb2f165667c5;
+
+/// Claude Code attestation seed.
+const CCH_XXH64_SEED: u64 = 0x6e52736ac806831e;
+
+fn xxh64_round(acc: u64, lane: u64) -> u64 {
+    acc.wrapping_add(lane.wrapping_mul(XXH64_PRIME2))
+        .rotate_left(31)
+        .wrapping_mul(XXH64_PRIME1)
+}
+
+fn xxh64_merge_round(acc: u64, val: u64) -> u64 {
+    (acc ^ xxh64_round(0, val))
+        .wrapping_mul(XXH64_PRIME1)
+        .wrapping_add(XXH64_PRIME4)
+}
+
+fn xxh64_avalanche(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(XXH64_PRIME2);
+    h ^= h >> 29;
+    h = h.wrapping_mul(XXH64_PRIME3);
+    h ^= h >> 32;
+    h
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> u64 {
+    u32::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ]) as u64
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
+fn xxh64(input: &[u8], seed: u64) -> u64 {
+    let len = input.len();
+    let mut p = 0usize;
+    let mut h64: u64;
+
+    if len >= 32 {
+        let mut v1 = seed.wrapping_add(XXH64_PRIME1).wrapping_add(XXH64_PRIME2);
+        let mut v2 = seed.wrapping_add(XXH64_PRIME2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(XXH64_PRIME1);
+
+        let limit = len - 32;
+        while p <= limit {
+            v1 = xxh64_round(v1, read_u64_le(input, p));
+            p += 8;
+            v2 = xxh64_round(v2, read_u64_le(input, p));
+            p += 8;
+            v3 = xxh64_round(v3, read_u64_le(input, p));
+            p += 8;
+            v4 = xxh64_round(v4, read_u64_le(input, p));
+            p += 8;
+        }
+
+        h64 = v1
+            .rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18));
+        h64 = xxh64_merge_round(h64, v1);
+        h64 = xxh64_merge_round(h64, v2);
+        h64 = xxh64_merge_round(h64, v3);
+        h64 = xxh64_merge_round(h64, v4);
+    } else {
+        h64 = seed.wrapping_add(XXH64_PRIME5);
+    }
+
+    h64 = h64.wrapping_add(len as u64);
+
+    while p + 8 <= len {
+        let k1 = xxh64_round(0, read_u64_le(input, p));
+        p += 8;
+        h64 ^= k1;
+        h64 = h64
+            .rotate_left(27)
+            .wrapping_mul(XXH64_PRIME1)
+            .wrapping_add(XXH64_PRIME4);
+    }
+
+    if p + 4 <= len {
+        h64 ^= read_u32_le(input, p).wrapping_mul(XXH64_PRIME1);
+        p += 4;
+        h64 = h64
+            .rotate_left(23)
+            .wrapping_mul(XXH64_PRIME2)
+            .wrapping_add(XXH64_PRIME3);
+    }
+
+    while p < len {
+        h64 ^= (input[p] as u64).wrapping_mul(XXH64_PRIME5);
+        p += 1;
+        h64 = h64.rotate_left(11).wrapping_mul(XXH64_PRIME1);
+    }
+
+    xxh64_avalanche(h64)
+}
+
+/// Replaces the `cch=00000` placeholder with xxHash64(body) & 0xFFFFF.
+/// Anchors the search to the billing header to avoid false matches in messages.
+fn patch_request_body(body_json: &str) -> Result<String> {
+    const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+    const PLACEHOLDER: &str = "cch=00000";
+
+    let billing_start = body_json.find(BILLING_PREFIX).ok_or_else(|| {
+        AgshError::Provider("x-anthropic-billing-header not found in request body".into())
+    })?;
+
+    let idx = body_json[billing_start..]
+        .find(PLACEHOLDER)
+        .map(|relative| billing_start + relative)
+        .ok_or_else(|| {
+            AgshError::Provider(
+                "cch=00000 attestation placeholder not found in billing header".into(),
+            )
+        })?;
+
+    let digest = xxh64(body_json.as_bytes(), CCH_XXH64_SEED);
+    let token = format!("{:05x}", digest & 0xfffff);
+
+    let mut patched = String::with_capacity(body_json.len());
+    patched.push_str(&body_json[..idx + 4]); // up to and including "cch="
+    patched.push_str(&token);
+    patched.push_str(&body_json[idx + 9..]); // skip past "00000"
+    Ok(patched)
+}
+
+/// Builds the User-Agent string matching claude-code's format.
+fn claude_user_agent() -> String {
+    format!("claude-cli/{} (external, cli)", CC_VERSION)
+}
+
+/// Stainless SDK versions. Must match the release corresponding to `CC_VERSION`.
+const STAINLESS_BUN_VERSION: &str = "1.2.15";
+const STAINLESS_SDK_VERSION: &str = "0.52.1";
+
+/// Maps `std::env::consts::ARCH` to Node.js/Bun `process.arch` names.
+fn stainless_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        "s390x" => "s390x",
+        "powerpc64" => "ppc64",
+        other => other,
+    }
+}
+
+fn stainless_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "MacOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "freebsd" => "FreeBSD",
+        other => other,
+    }
+}
+
+/// Applies all HTTP headers in the order the Stainless SDK + Claude Code
+/// would produce on the wire. See `buildHeaders` in `@anthropic-ai/sdk`.
+fn apply_headers(
+    request: reqwest::RequestBuilder,
+    auth_header_name: &str,
+    auth_header_value: &str,
+    session_id: &str,
+    betas: Option<&str>,
+) -> reqwest::RequestBuilder {
+    // --- SDK buildDefaultHeaders() ---
+    // Accept, User-Agent, retry/timeout, platform headers, anthropic-version
+    let mut request = request
+        .header("accept", "application/json")
+        .header("User-Agent", claude_user_agent())
         .header("x-stainless-retry-count", "0")
         .header("x-stainless-timeout", "600")
+        .header("x-stainless-lang", "js")
+        .header("x-stainless-package-version", STAINLESS_SDK_VERSION)
+        .header("x-stainless-os", stainless_os())
+        .header("x-stainless-arch", stainless_arch())
+        .header("x-stainless-runtime", "bun")
+        .header("x-stainless-runtime-version", STAINLESS_BUN_VERSION)
+        .header("anthropic-version", "2023-06-01")
+        // --- authHeaders ---
+        .header(auth_header_name, auth_header_value)
+        // --- Claude Code defaultHeaders (x-app, session-id; User-Agent updates in-place above) ---
+        .header("x-app", "cli")
+        .header("X-Claude-Code-Session-Id", session_id)
+        // --- bodyHeaders ---
+        .header("content-type", "application/json")
+        // --- per-request headers ---
+        .header("x-client-request-id", Uuid::new_v4().to_string());
+
+    if let Some(betas) = betas {
+        request = request.header("anthropic-beta", betas);
+    }
+
+    request
 }
 
 pub struct ClaudeProvider {
@@ -66,6 +307,7 @@ pub struct ClaudeProvider {
     client_id: String,
     oauth_token_url: String,
     token_store: Option<Arc<TokenStore>>,
+    session_id: String,
 }
 
 impl ClaudeProvider {
@@ -86,6 +328,7 @@ impl ClaudeProvider {
             oauth_token_url: oauth_token_url
                 .unwrap_or_else(|| "https://api.anthropic.com/v1/oauth/token".to_string()),
             token_store,
+            session_id: Uuid::new_v4().to_string(),
         }
     }
 
@@ -264,30 +507,48 @@ impl ClaudeProvider {
             })
             .collect();
 
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "messages": claude_messages,
-            "max_tokens": 8192,
-            "stream": stream,
-            "metadata": {
-                "user_id": "agsh"
-            },
-        });
+        let metadata_user_id = serde_json::json!({
+            "device_id": "agsh",
+            "account_uuid": "",
+            "session_id": self.session_id,
+        })
+        .to_string();
+
+        // `system` must precede `messages` so the billing header's `cch=00000`
+        // is always the first occurrence in the serialized JSON.
+        let mut body = serde_json::Map::new();
 
         if !system_prompt.is_empty() {
-            let billing_header = generate_billing_header(&body);
-            body["system"] = serde_json::json!([
-                {
-                    "type": "text",
-                    "text": billing_header
-                },
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": { "type": "ephemeral" }
-                }
-            ]);
+            let billing_header = generate_billing_header();
+            body.insert(
+                "system".to_string(),
+                serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": billing_header
+                    },
+                    {
+                        "type": "text",
+                        "text": CC_SYSTEM_PROMPT_PREFIX,
+                        "cache_control": { "type": "ephemeral" }
+                    },
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": { "type": "ephemeral" }
+                    }
+                ]),
+            );
         }
+
+        body.insert("model".to_string(), serde_json::json!(self.model));
+        body.insert("messages".to_string(), serde_json::json!(claude_messages));
+        body.insert("max_tokens".to_string(), serde_json::json!(8192));
+        body.insert("stream".to_string(), serde_json::json!(stream));
+        body.insert(
+            "metadata".to_string(),
+            serde_json::json!({ "user_id": metadata_user_id }),
+        );
 
         if !tools.is_empty() {
             let claude_tools: Vec<serde_json::Value> = tools
@@ -300,10 +561,10 @@ impl ClaudeProvider {
                     })
                 })
                 .collect();
-            body["tools"] = serde_json::json!(claude_tools);
+            body.insert("tools".to_string(), serde_json::json!(claude_tools));
         }
 
-        body
+        serde_json::Value::Object(body)
     }
 
     pub(super) fn parse_non_streaming_response(
@@ -385,23 +646,31 @@ impl Provider for ClaudeProvider {
         tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason)> {
         let body = self.build_request_body(system_prompt, messages, tools, false);
+        let body_json = serde_json::to_string(&body)
+            .map_err(|error| AgshError::Provider(format!("failed to serialize body: {}", error)))?;
+        let body_json = if !system_prompt.is_empty() {
+            patch_request_body(&body_json)?
+        } else {
+            body_json
+        };
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
-        let mut request = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header(auth_header_name, &auth_header_value)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json");
+        let betas = if auth_header_name == "Authorization" {
+            Some("claude-code-20250219,oauth-2025-04-20")
+        } else {
+            None
+        };
 
-        if auth_header_name == "Authorization" {
-            request = request.header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219");
-        }
-
-        request = apply_stainless_headers(request);
+        let request = apply_headers(
+            self.client.post(format!("{}/v1/messages", self.base_url)),
+            auth_header_name,
+            &auth_header_value,
+            &self.session_id,
+            betas,
+        );
 
         let response = request
-            .json(&body)
+            .body(body_json)
             .send()
             .await
             .map_err(|error| AgshError::Provider(format!("HTTP request failed: {}", error)))?;
@@ -437,24 +706,33 @@ impl Provider for ClaudeProvider {
         use futures::StreamExt;
 
         let body = self.build_request_body(system_prompt, messages, tools, true);
+        let body_json = serde_json::to_string(&body)
+            .map_err(|error| AgshError::Provider(format!("failed to serialize body: {}", error)))?;
+        let body_json = if !system_prompt.is_empty() {
+            patch_request_body(&body_json)?
+        } else {
+            body_json
+        };
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
-        let mut request = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header(auth_header_name, &auth_header_value)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .header("accept-encoding", "identity");
+        let betas = if auth_header_name == "Authorization" {
+            Some("claude-code-20250219,oauth-2025-04-20")
+        } else {
+            None
+        };
 
-        if auth_header_name == "Authorization" {
-            request = request.header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219");
-        }
-
-        request = apply_stainless_headers(request);
+        let request = apply_headers(
+            self.client
+                .post(format!("{}/v1/messages", self.base_url))
+                .header("accept-encoding", "identity"),
+            auth_header_name,
+            &auth_header_value,
+            &self.session_id,
+            betas,
+        );
 
         let response = request
-            .json(&body)
+            .body(body_json)
             .send()
             .await
             .map_err(|error| AgshError::Provider(format!("HTTP request failed: {}", error)))?;
@@ -656,6 +934,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_static_fingerprint_matches_empty_message() {
+        assert_eq!(*STATIC_FINGERPRINT, compute_fingerprint("", CC_VERSION));
+    }
+
+    #[test]
+    fn test_compute_fingerprint_from_messages_matches_manual() {
+        let messages = vec![Message::user("hello world, this is a test message!")];
+        let from_messages = compute_fingerprint_from_messages(&messages);
+        let first_text = extract_first_user_message_text(&messages);
+        let manual = compute_fingerprint(&first_text, CC_VERSION);
+        assert_eq!(from_messages, manual);
+    }
+
+    #[test]
+    fn test_fingerprint_known_values() {
+        let fingerprint = compute_fingerprint("hello", CC_VERSION);
+        assert_eq!(fingerprint.len(), 3);
+        assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let fingerprint2 = compute_fingerprint("hello", CC_VERSION);
+        assert_eq!(fingerprint, fingerprint2);
+
+        let fingerprint3 = compute_fingerprint("this is a longer test message!!", CC_VERSION);
+        assert_ne!(fingerprint, fingerprint3);
+    }
+
+    #[test]
+    fn test_fingerprint_empty_message() {
+        let fingerprint = compute_fingerprint("", CC_VERSION);
+        assert_eq!(fingerprint.len(), 3);
+        assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_extract_first_user_message_text() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "assistant text".to_string(),
+                }],
+            },
+            Message::user("user text"),
+        ];
+        assert_eq!(extract_first_user_message_text(&messages), "user text");
+
+        let empty: Vec<Message> = vec![];
+        assert_eq!(extract_first_user_message_text(&empty), "");
+    }
+
+    #[test]
     fn test_claude_request_body_simple() {
         let provider = ClaudeProvider::new(
             AuthCredential::ApiKey("test-key".to_string()),
@@ -673,48 +1002,37 @@ mod tests {
         assert_eq!(body["stream"], false);
 
         let system = body["system"].as_array().expect("system should be array");
-        assert_eq!(system.len(), 2);
+        assert_eq!(system.len(), 3);
+
         assert_eq!(system[0]["type"], "text");
         let billing = system[0]["text"].as_str().unwrap();
-        assert!(
-            billing.starts_with("x-anthropic-billing-header: cc_version=2.1.63."),
-            "billing header should start with version prefix, got: {}",
-            billing
-        );
+        let expected_prefix = format!("x-anthropic-billing-header: cc_version={}.", CC_VERSION);
+        assert!(billing.starts_with(&expected_prefix), "{}", billing);
         assert!(billing.contains("cc_entrypoint=cli"));
-        assert!(billing.contains("cch="));
-        // Verify build hash is 3 hex chars and content hash is 5 hex chars
-        let after_version = billing
-            .strip_prefix("x-anthropic-billing-header: cc_version=2.1.63.")
-            .unwrap();
-        let build_hash = after_version.split(';').next().unwrap().trim();
-        assert_eq!(
-            build_hash.len(),
-            3,
-            "build hash should be 3 chars: {}",
-            build_hash
-        );
-        assert!(
-            build_hash
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-        );
-        let cch_start = billing.find("cch=").unwrap() + 4;
-        let cch_end = billing[cch_start..].find(';').unwrap() + cch_start;
-        let content_hash = &billing[cch_start..cch_end];
-        assert_eq!(
-            content_hash.len(),
-            5,
-            "content hash should be 5 chars: {}",
-            content_hash
-        );
-        assert!(
-            content_hash
-                .chars()
-                .all(|character| character.is_ascii_hexdigit())
-        );
+        assert!(billing.contains("cch=00000"));
+        assert!(system[0].get("cache_control").is_none());
+
+        let after_version = billing.strip_prefix(&expected_prefix).unwrap();
+        let fingerprint = after_version.split(';').next().unwrap().trim();
+        assert_eq!(fingerprint, STATIC_FINGERPRINT.as_str());
+
         assert_eq!(system[1]["type"], "text");
-        assert_eq!(system[1]["text"], "system prompt");
+        assert_eq!(system[1]["text"], CC_SYSTEM_PROMPT_PREFIX);
+        assert!(system[1].get("cache_control").is_some());
+
+        assert_eq!(system[2]["type"], "text");
+        assert_eq!(system[2]["text"], "system prompt");
+        assert!(system[2].get("cache_control").is_some());
+
+        let body_json = serde_json::to_string(&body).unwrap();
+        let system_pos = body_json.find("\"system\"").unwrap();
+        let messages_pos = body_json.find("\"messages\"").unwrap();
+        assert!(system_pos < messages_pos);
+
+        let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
+        let user_id_parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
+        assert!(user_id_parsed.get("device_id").is_some());
+        assert!(user_id_parsed.get("session_id").is_some());
 
         let claude_messages = body["messages"]
             .as_array()
@@ -897,6 +1215,93 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_request_body_replaces_placeholder() {
+        let messages = vec![Message::user("hello")];
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("system prompt", &messages, &[], false);
+        let body_json = serde_json::to_string(&body).unwrap();
+
+        assert!(body_json.contains("cch=00000"));
+
+        let patched = patch_request_body(&body_json).unwrap();
+        assert!(!patched.contains("cch=00000"));
+        let cch_idx = patched.find("cch=").expect("cch= must be present");
+        let token = &patched[cch_idx + 4..cch_idx + 9];
+        assert_eq!(token.len(), 5);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{}", token);
+
+        let patched2 = patch_request_body(&body_json).unwrap();
+        assert_eq!(patched, patched2);
+    }
+
+    #[test]
+    fn test_patch_request_body_ignores_cch_in_messages() {
+        let messages = vec![Message::user(
+            "The billing header contains cch=00000 as a placeholder.",
+        )];
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("system prompt", &messages, &[], false);
+        let body_json = serde_json::to_string(&body).unwrap();
+
+        let count = body_json.matches("cch=00000").count();
+        assert_eq!(count, 2, "expected 2 occurrences of cch=00000 in body");
+
+        let patched = patch_request_body(&body_json).unwrap();
+
+        let billing_start = patched.find("x-anthropic-billing-header:").unwrap();
+        let billing_region = &patched[billing_start..billing_start + 200];
+        assert!(!billing_region.contains("cch=00000"));
+        assert!(patched.contains("cch=00000"));
+    }
+
+    #[test]
+    fn test_xxh64_basic() {
+        assert_eq!(xxh64(b"", 0), 0xef46db3751d8e999);
+        assert_eq!(xxh64(b"abc", 0), 0x44bc2cf5ad770999);
+    }
+
+    #[test]
+    fn test_xxh64_claude_seed_short_body() {
+        let body = r#"{"test":"cch=00000"}"#;
+        let digest = xxh64(body.as_bytes(), CCH_XXH64_SEED);
+        let token = format!("{:05x}", digest & 0xfffff);
+        assert_eq!(token, "14d28");
+    }
+
+    #[test]
+    fn test_xxh64_claude_seed_realistic_body() {
+        let body = concat!(
+            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header:"#,
+            r#" cc_version=2.1.86.123; cc_entrypoint=cli; cch=00000;"},{"type"#,
+            r#":"text","text":"You are Claude Code","cache_control":{"type":"e"#,
+            r#"phemeral"}}],"model":"claude-sonnet-4-20250514","messages":[{"r"#,
+            r#"ole":"user","content":[{"type":"text","text":"hello"}]}],"max_t"#,
+            r#"okens":8192,"stream":false,"metadata":{"user_id":"agsh"}}"#,
+        );
+
+        let digest = xxh64(body.as_bytes(), CCH_XXH64_SEED);
+        let token = format!("{:05x}", digest & 0xfffff);
+
+        let patched = patch_request_body(body).unwrap();
+        assert!(patched.contains(&format!("cch={}", token)));
+        assert!(!patched.contains("cch=00000"));
+    }
+
+    #[test]
     fn test_claude_no_system_prompt_when_empty() {
         let provider = ClaudeProvider::new(
             AuthCredential::ApiKey("test-key".to_string()),
@@ -963,5 +1368,526 @@ mod tests {
 
         let result = provider.parse_non_streaming_response(&response);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fingerprint_boundary_length_messages() {
+        let fp5 = compute_fingerprint("abcde", CC_VERSION);
+        assert_eq!(fp5.len(), 3);
+
+        let fp8 = compute_fingerprint("abcdefgh", CC_VERSION);
+        assert_eq!(fp8.len(), 3);
+
+        let fp21 = compute_fingerprint("abcdefghijklmnopqrstu", CC_VERSION);
+        assert_eq!(fp21.len(), 3);
+
+        assert_ne!(fp5, fp8);
+        assert_ne!(fp8, fp21);
+    }
+
+    #[test]
+    fn test_fingerprint_short_message_all_fallback() {
+        let fp_short = compute_fingerprint("abc", CC_VERSION);
+        let fp_empty = compute_fingerprint("", CC_VERSION);
+        assert_eq!(fp_short, fp_empty);
+    }
+
+    #[test]
+    fn test_fingerprint_multibyte_chars() {
+        let msg = "日本語のテスト文字列を使ったメッセージです！！！";
+        assert!(msg.chars().count() > 20);
+        let fp = compute_fingerprint(msg, CC_VERSION);
+        assert_eq!(fp.len(), 3);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+
+        assert_eq!(msg.chars().nth(4), Some('テ'));
+        assert_eq!(msg.chars().nth(7), Some('文'));
+        assert_eq!(msg.chars().nth(20), Some('す'));
+    }
+
+    #[test]
+    fn test_fingerprint_different_version() {
+        let fp_a = compute_fingerprint("hello", "1.0.0");
+        let fp_b = compute_fingerprint("hello", "2.0.0");
+        assert_eq!(fp_a.len(), 3);
+        assert_eq!(fp_b.len(), 3);
+        assert_ne!(fp_a, fp_b);
+    }
+
+    #[test]
+    fn test_extract_first_user_message_text_no_text_block() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_string(),
+                content: "result".to_string(),
+                is_error: false,
+            }],
+        }];
+        assert_eq!(extract_first_user_message_text(&messages), "");
+    }
+
+    #[test]
+    fn test_extract_first_user_message_text_multiple_users() {
+        let messages = vec![
+            Message::user("first user message"),
+            Message::user("second user message"),
+        ];
+        assert_eq!(
+            extract_first_user_message_text(&messages),
+            "first user message"
+        );
+    }
+
+    #[test]
+    fn test_extract_first_user_message_text_only_assistants() {
+        let messages = vec![
+            Message::assistant_text("hello"),
+            Message::assistant_text("world"),
+        ];
+        assert_eq!(extract_first_user_message_text(&messages), "");
+    }
+
+    #[test]
+    fn test_compute_fingerprint_from_messages_empty() {
+        let empty: Vec<Message> = vec![];
+        assert_eq!(
+            compute_fingerprint_from_messages(&empty),
+            compute_fingerprint("", CC_VERSION)
+        );
+    }
+
+    #[test]
+    fn test_compute_fingerprint_from_messages_no_user() {
+        let messages = vec![Message::assistant_text("I'm an assistant")];
+        assert_eq!(
+            compute_fingerprint_from_messages(&messages),
+            compute_fingerprint("", CC_VERSION)
+        );
+    }
+
+    // All xxHash64 expected values cross-validated against Python xxhash.
+
+    #[test]
+    fn test_xxh64_one_byte() {
+        assert_eq!(xxh64(b"x", 0), 0x5c80c09683041123);
+    }
+
+    #[test]
+    fn test_xxh64_three_bytes() {
+        assert_eq!(xxh64(b"abc", 0), 0x44bc2cf5ad770999);
+    }
+
+    #[test]
+    fn test_xxh64_four_bytes() {
+        assert_eq!(xxh64(b"abcd", 0), 0xde0327b0d25d92cc);
+    }
+
+    #[test]
+    fn test_xxh64_seven_bytes() {
+        assert_eq!(xxh64(b"abcdefg", 0), 0x1860940e2902822d);
+    }
+
+    #[test]
+    fn test_xxh64_eight_bytes() {
+        assert_eq!(xxh64(b"abcdefgh", 0), 0x3ad351775b4634b7);
+    }
+
+    #[test]
+    fn test_xxh64_sixteen_bytes() {
+        assert_eq!(xxh64(b"abcdefghijklmnop", 0), 0x71ce8137ca2dd53d);
+    }
+
+    #[test]
+    fn test_xxh64_thirty_one_bytes() {
+        let input = b"abcdefghijklmnopqrstuvwxyz01234";
+        assert_eq!(input.len(), 31);
+        assert_eq!(xxh64(input, 0), 0x16058c7b947da137);
+    }
+
+    #[test]
+    fn test_xxh64_thirty_two_bytes() {
+        let input = b"abcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(input.len(), 32);
+        assert_eq!(xxh64(input, 0), 0xbf2cd639b4143b80);
+    }
+
+    #[test]
+    fn test_xxh64_with_nonzero_seed() {
+        let input = b"hello world";
+        let h0 = xxh64(input, 0);
+        let h1 = xxh64(input, 1);
+        let h_claude = xxh64(input, CCH_XXH64_SEED);
+        assert_ne!(h0, h1);
+        assert_ne!(h0, h_claude);
+        assert_ne!(h1, h_claude);
+    }
+
+    #[test]
+    fn test_patch_request_body_missing_billing_header() {
+        let body = r#"{"system":[],"messages":[]}"#;
+        let result = patch_request_body(body);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("x-anthropic-billing-header not found"));
+    }
+
+    #[test]
+    fn test_patch_request_body_billing_header_without_placeholder() {
+        let body = r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.86.abc; cc_entrypoint=cli;"}]}"#;
+        let result = patch_request_body(body);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("cch=00000"));
+    }
+
+    #[test]
+    fn test_patch_request_body_preserves_length() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+        let body_json = serde_json::to_string(&body).unwrap();
+        let patched = patch_request_body(&body_json).unwrap();
+        assert_eq!(body_json.len(), patched.len());
+    }
+
+    #[test]
+    fn test_patch_request_body_cch_in_tool_result() {
+        let messages = vec![
+            Message::user("run the tool"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "echo cch=00000"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "output: cch=00000".to_string(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("system prompt", &messages, &[], false);
+        let body_json = serde_json::to_string(&body).unwrap();
+        assert!(body_json.matches("cch=00000").count() >= 2);
+
+        let patched = patch_request_body(&body_json).unwrap();
+
+        let billing_start = patched.find("x-anthropic-billing-header:").unwrap();
+        let billing_end = patched[billing_start..].find(';').unwrap() + billing_start;
+        let billing_region = &patched[billing_start..billing_end + 30];
+        assert!(!billing_region.contains("cch=00000"));
+        assert!(patched.contains("output: cch=00000"));
+    }
+
+    #[test]
+    fn test_claude_request_body_stream_true() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], true);
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_claude_request_body_system_and_tools_together() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let tools = vec![ToolDefinition {
+            name: "bash".to_string(),
+            description: "Run a shell command".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        let body =
+            provider.build_request_body("system prompt", &[Message::user("hi")], &tools, true);
+
+        assert!(body.get("system").is_some());
+        assert!(body.get("tools").is_some());
+        assert_eq!(body["stream"], true);
+
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.find("\"system\"").unwrap() < json.find("\"messages\"").unwrap());
+    }
+
+    #[test]
+    fn test_claude_request_body_metadata_fields() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+
+        let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
+
+        assert_eq!(parsed["device_id"], "agsh");
+        assert_eq!(parsed["account_uuid"], "");
+        let session_id = parsed["session_id"].as_str().unwrap();
+        assert!(Uuid::parse_str(session_id).is_ok(), "{}", session_id);
+    }
+
+    #[test]
+    fn test_claude_request_body_no_tools_key_when_empty() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn test_claude_parse_missing_content_array() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "stop_reason": "end_turn"
+        });
+        let result = provider.parse_non_streaming_response(&response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_claude_parse_missing_stop_reason_defaults_to_end_turn() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}]
+        });
+        let (_, stop_reason) = provider
+            .parse_non_streaming_response(&response)
+            .expect("should parse");
+        assert_eq!(stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn test_claude_parse_max_tokens_stop_reason() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "truncated"}],
+            "stop_reason": "max_tokens"
+        });
+        let (_, stop_reason) = provider
+            .parse_non_streaming_response(&response)
+            .expect("should parse");
+        assert_eq!(stop_reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn test_claude_parse_unknown_stop_reason() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "something_new"
+        });
+        let (_, stop_reason) = provider
+            .parse_non_streaming_response(&response)
+            .expect("should parse");
+        assert_eq!(
+            stop_reason,
+            StopReason::Unknown("something_new".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_parse_empty_content_array() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": "end_turn"
+        });
+        let (message, _) = provider
+            .parse_non_streaming_response(&response)
+            .expect("should parse");
+        assert!(message.content.is_empty());
+        assert_eq!(message.text_content(), "");
+    }
+
+    #[test]
+    fn test_claude_parse_unknown_block_type_skipped() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "hmm..."},
+                {"type": "text", "text": "answer"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        let (message, _) = provider
+            .parse_non_streaming_response(&response)
+            .expect("should parse");
+        assert_eq!(message.content.len(), 1);
+        assert_eq!(message.text_content(), "answer");
+    }
+
+    #[test]
+    fn test_claude_parse_tool_use_missing_input_defaults() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_abc",
+                "name": "list_files"
+            }],
+            "stop_reason": "tool_use"
+        });
+        let (message, _) = provider
+            .parse_non_streaming_response(&response)
+            .expect("should parse");
+        if let ContentBlock::ToolUse { input, .. } = &message.content[0] {
+            assert_eq!(*input, serde_json::json!({}));
+        } else {
+            panic!("expected ToolUse block");
+        }
+    }
+
+    #[test]
+    fn test_parse_claude_stop_reason_all_variants() {
+        assert_eq!(parse_claude_stop_reason("end_turn"), StopReason::EndTurn);
+        assert_eq!(parse_claude_stop_reason("tool_use"), StopReason::ToolUse);
+        assert_eq!(
+            parse_claude_stop_reason("max_tokens"),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            parse_claude_stop_reason("something_else"),
+            StopReason::Unknown("something_else".to_string())
+        );
+    }
+
+    #[test]
+    fn test_claude_user_agent_format() {
+        let ua = claude_user_agent();
+        assert!(ua.starts_with("claude-cli/"));
+        assert!(ua.contains(CC_VERSION));
+        assert!(ua.ends_with("(external, cli)"));
+    }
+
+    #[test]
+    fn test_generate_billing_header_format() {
+        let header = generate_billing_header();
+        assert!(header.starts_with("x-anthropic-billing-header:"));
+        assert!(header.contains(&format!("cc_version={}", CC_VERSION)));
+        assert!(header.contains("cc_entrypoint=cli"));
+        assert!(header.contains("cch=00000"));
+        assert!(header.ends_with("cch=00000;"));
+    }
+
+    #[test]
+    fn test_stainless_arch_returns_nonempty() {
+        assert!(!stainless_arch().is_empty());
+    }
+
+    #[test]
+    fn test_now_epoch_millis_reasonable() {
+        let ms = now_epoch_millis();
+        assert!(ms > 1_577_836_800_000);
+        assert!(ms < 4_102_444_800_000);
     }
 }
