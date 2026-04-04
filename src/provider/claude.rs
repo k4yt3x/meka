@@ -459,44 +459,63 @@ impl ClaudeProvider {
         tools: &[ToolDefinition],
         stream: bool,
     ) -> serde_json::Value {
+        let message_count = messages.len();
         let claude_messages: Vec<serde_json::Value> = messages
             .iter()
-            .map(|message| {
+            .enumerate()
+            .map(|(message_index, message)| {
                 let role = match message.role {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                 };
 
+                let is_last_message = message_index + 1 == message_count;
+                let block_count = message.content.len();
+
                 let content: Vec<serde_json::Value> = message
                     .content
                     .iter()
-                    .map(|block| match block {
-                        ContentBlock::Text { text } => {
-                            serde_json::json!({
-                                "type": "text",
-                                "text": text,
-                            })
+                    .enumerate()
+                    .map(|(block_index, block)| {
+                        let mut value = match block {
+                            ContentBlock::Text { text } => {
+                                serde_json::json!({
+                                    "type": "text",
+                                    "text": text,
+                                })
+                            }
+                            ContentBlock::ToolUse { id, name, input } => {
+                                serde_json::json!({
+                                    "type": "tool_use",
+                                    "id": id,
+                                    "name": name,
+                                    "input": input,
+                                })
+                            }
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => {
+                                serde_json::json!({
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use_id,
+                                    "content": content,
+                                    "is_error": is_error,
+                                })
+                            }
+                        };
+
+                        if is_last_message && block_index + 1 == block_count {
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
+                                    "cache_control".to_string(),
+                                    serde_json::json!({"type": "ephemeral"}),
+                                );
+                            }
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
-                            serde_json::json!({
-                                "type": "tool_use",
-                                "id": id,
-                                "name": name,
-                                "input": input,
-                            })
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                        } => {
-                            serde_json::json!({
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_id,
-                                "content": content,
-                                "is_error": is_error,
-                            })
-                        }
+
+                        value
                     })
                     .collect();
 
@@ -551,14 +570,25 @@ impl ClaudeProvider {
         );
 
         if !tools.is_empty() {
+            let tool_count = tools.len();
             let claude_tools: Vec<serde_json::Value> = tools
                 .iter()
-                .map(|tool| {
-                    serde_json::json!({
+                .enumerate()
+                .map(|(index, tool)| {
+                    let mut schema = serde_json::json!({
                         "name": tool.name,
                         "description": tool.description,
                         "input_schema": tool.parameters,
-                    })
+                    });
+                    if index + 1 == tool_count {
+                        if let Some(obj) = schema.as_object_mut() {
+                            obj.insert(
+                                "cache_control".to_string(),
+                                serde_json::json!({"type": "ephemeral"}),
+                            );
+                        }
+                    }
+                    schema
                 })
                 .collect();
             body.insert("tools".to_string(), serde_json::json!(claude_tools));
@@ -1045,6 +1075,7 @@ mod tests {
             .expect("content should be array");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "hello");
+        assert!(content[0].get("cache_control").is_some());
     }
 
     #[test]
@@ -1076,6 +1107,7 @@ mod tests {
         assert_eq!(claude_tools[0]["name"], "read_file");
         assert_eq!(claude_tools[0]["description"], "Read a file");
         assert!(claude_tools[0].get("input_schema").is_some());
+        assert!(claude_tools[0].get("cache_control").is_some());
     }
 
     #[test]
@@ -1131,6 +1163,13 @@ mod tests {
             .expect("content should be array");
         assert_eq!(result_content[0]["type"], "tool_result");
         assert_eq!(result_content[0]["tool_use_id"], "toolu_1");
+
+        let first_content = claude_messages[0]["content"]
+            .as_array()
+            .expect("content should be array");
+        assert!(first_content[0].get("cache_control").is_none());
+        assert!(assistant_content[0].get("cache_control").is_none());
+        assert!(result_content[0].get("cache_control").is_some());
     }
 
     #[test]
@@ -1637,6 +1676,9 @@ mod tests {
 
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.find("\"system\"").unwrap() < json.find("\"messages\"").unwrap());
+
+        let tools_array = body["tools"].as_array().unwrap();
+        assert!(tools_array.last().unwrap().get("cache_control").is_some());
     }
 
     #[test]
@@ -1889,5 +1931,661 @@ mod tests {
         let ms = now_epoch_millis();
         assert!(ms > 1_577_836_800_000);
         assert!(ms < 4_102_444_800_000);
+    }
+
+    // ---- Cache prefix stability tests ----
+    //
+    // These tests simulate multi-turn conversations and tool-use loops to
+    // verify that the serialized request bodies share a stable prefix across
+    // successive API calls, which is the fundamental requirement for KV cache
+    // reuse. A "prefix" here means: the system prompt, tool schemas, and all
+    // previously-sent messages must serialize identically (ignoring the
+    // `cache_control` marker, which intentionally moves to the newest tail).
+
+    /// Strips every `cache_control` key from every content block in a message
+    /// so two messages can be compared purely on semantic content.
+    fn strip_cache_control(message: &serde_json::Value) -> serde_json::Value {
+        let mut message = message.clone();
+        if let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
+            for block in content.iter_mut() {
+                if let Some(obj) = block.as_object_mut() {
+                    obj.remove("cache_control");
+                }
+            }
+        }
+        message
+    }
+
+    /// Strips `cache_control` from every tool schema in an array.
+    fn strip_tool_cache_control(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        tools
+            .iter()
+            .map(|tool| {
+                let mut tool = tool.clone();
+                if let Some(obj) = tool.as_object_mut() {
+                    obj.remove("cache_control");
+                }
+                tool
+            })
+            .collect()
+    }
+
+    /// Asserts that the first `shared_count` messages in two request bodies
+    /// are semantically identical (ignoring `cache_control` movement), and
+    /// that the system prompt and tool schemas are identical.
+    fn assert_prefix_stable(
+        body_a: &serde_json::Value,
+        body_b: &serde_json::Value,
+        shared_message_count: usize,
+    ) {
+        // System prompt must be byte-identical (before cch patching).
+        assert_eq!(
+            body_a["system"], body_b["system"],
+            "system prompt diverged between requests"
+        );
+
+        // Tool schemas must be identical (content-wise, ignoring cache_control
+        // which is always on the last tool and doesn't affect tokens).
+        let tools_a = body_a["tools"].as_array();
+        let tools_b = body_b["tools"].as_array();
+        match (tools_a, tools_b) {
+            (Some(a), Some(b)) => {
+                assert_eq!(
+                    strip_tool_cache_control(a),
+                    strip_tool_cache_control(b),
+                    "tool schemas diverged between requests"
+                );
+            }
+            (None, None) => {}
+            _ => panic!("tools presence diverged between requests"),
+        }
+
+        let msgs_a = body_a["messages"]
+            .as_array()
+            .expect("messages array in body_a");
+        let msgs_b = body_b["messages"]
+            .as_array()
+            .expect("messages array in body_b");
+
+        assert!(
+            msgs_a.len() >= shared_message_count,
+            "body_a has {} messages, expected at least {}",
+            msgs_a.len(),
+            shared_message_count
+        );
+        assert!(
+            msgs_b.len() >= shared_message_count,
+            "body_b has {} messages, expected at least {}",
+            msgs_b.len(),
+            shared_message_count
+        );
+
+        for i in 0..shared_message_count {
+            let a = strip_cache_control(&msgs_a[i]);
+            let b = strip_cache_control(&msgs_b[i]);
+            assert_eq!(a, b, "message at index {} diverged between requests", i);
+        }
+    }
+
+    /// Counts the total number of `cache_control` markers across all content
+    /// blocks in the messages array.
+    fn count_message_cache_controls(body: &serde_json::Value) -> usize {
+        let mut count = 0;
+        if let Some(messages) = body["messages"].as_array() {
+            for message in messages {
+                if let Some(content) = message["content"].as_array() {
+                    for block in content {
+                        if block.get("cache_control").is_some() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn test_provider() -> ClaudeProvider {
+        ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn test_tools() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            },
+            ToolDefinition {
+                name: "execute_command".to_string(),
+                description: "Run a shell command".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_multi_turn_prefix_is_stable() {
+        let provider = test_provider();
+        let system = "You are a helpful assistant.";
+        let tools = test_tools();
+
+        // Turn 1: single user message
+        let messages_t1 = vec![Message::user("What files are in /tmp?")];
+        let body_t1 = provider.build_request_body(system, &messages_t1, &tools, true);
+
+        // Turn 2: previous turn + assistant response + new user message
+        let messages_t2 = vec![
+            Message::user("What files are in /tmp?"),
+            Message::assistant_text("There are 3 files in /tmp."),
+            Message::user("Show me the first one."),
+        ];
+        let body_t2 = provider.build_request_body(system, &messages_t2, &tools, true);
+
+        // Turn 3: previous turns + another exchange
+        let messages_t3 = vec![
+            Message::user("What files are in /tmp?"),
+            Message::assistant_text("There are 3 files in /tmp."),
+            Message::user("Show me the first one."),
+            Message::assistant_text("Here is the content of file1.txt."),
+            Message::user("Delete it."),
+        ];
+        let body_t3 = provider.build_request_body(system, &messages_t3, &tools, true);
+
+        // The first message is shared across all three requests.
+        assert_prefix_stable(&body_t1, &body_t2, 1);
+        // The first three messages are shared between turn 2 and turn 3.
+        assert_prefix_stable(&body_t2, &body_t3, 3);
+        // The first message is shared across turn 1 and turn 3.
+        assert_prefix_stable(&body_t1, &body_t3, 1);
+    }
+
+    #[test]
+    fn test_tool_loop_prefix_is_stable() {
+        let provider = test_provider();
+        let system = "You are a helpful assistant.";
+        let tools = test_tools();
+
+        // Iteration 1 of tool loop: user asks, model about to respond
+        let messages_iter1 = vec![Message::user("Read /tmp/test.txt")];
+        let body_iter1 = provider.build_request_body(system, &messages_iter1, &tools, true);
+
+        // Iteration 2: model made a tool call, tool result came back
+        let messages_iter2 = vec![
+            Message::user("Read /tmp/test.txt"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test.txt"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "hello world".to_string(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let body_iter2 = provider.build_request_body(system, &messages_iter2, &tools, true);
+
+        // Iteration 3: model made another tool call
+        let messages_iter3 = vec![
+            Message::user("Read /tmp/test.txt"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test.txt"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: "hello world".to_string(),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_2".to_string(),
+                    name: "execute_command".to_string(),
+                    input: serde_json::json!({"command": "wc -l /tmp/test.txt"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_2".to_string(),
+                    content: "1 /tmp/test.txt".to_string(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let body_iter3 = provider.build_request_body(system, &messages_iter3, &tools, true);
+
+        // Prefix from iter1 is stable in iter2 and iter3
+        assert_prefix_stable(&body_iter1, &body_iter2, 1);
+        assert_prefix_stable(&body_iter2, &body_iter3, 3);
+        assert_prefix_stable(&body_iter1, &body_iter3, 1);
+    }
+
+    #[test]
+    fn test_exactly_one_message_cache_control_per_request() {
+        let provider = test_provider();
+        let system = "You are a helpful assistant.";
+        let tools = test_tools();
+
+        // Single message
+        let body1 = provider.build_request_body(system, &[Message::user("hello")], &tools, true);
+        assert_eq!(count_message_cache_controls(&body1), 1);
+
+        // Three messages
+        let body3 = provider.build_request_body(
+            system,
+            &[
+                Message::user("hello"),
+                Message::assistant_text("hi"),
+                Message::user("bye"),
+            ],
+            &tools,
+            true,
+        );
+        assert_eq!(count_message_cache_controls(&body3), 1);
+
+        // Five messages with tool use
+        let body5 = provider.build_request_body(
+            system,
+            &[
+                Message::user("read file"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "t1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "/tmp/x"}),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "t1".to_string(),
+                        content: "data".to_string(),
+                        is_error: false,
+                    }],
+                },
+                Message::assistant_text("Here's the file."),
+                Message::user("thanks"),
+            ],
+            &tools,
+            true,
+        );
+        assert_eq!(count_message_cache_controls(&body5), 1);
+    }
+
+    #[test]
+    fn test_cache_control_shifts_to_new_last_message() {
+        let provider = test_provider();
+        let system = "system";
+
+        // Build with 2 messages — cache_control should be on message[1]
+        let messages_a = vec![Message::user("hello"), Message::assistant_text("hi")];
+        let body_a = provider.build_request_body(system, &messages_a, &[], false);
+        let msgs_a = body_a["messages"].as_array().unwrap();
+
+        // Message 0 should NOT have cache_control
+        let block_0 = &msgs_a[0]["content"].as_array().unwrap()[0];
+        assert!(block_0.get("cache_control").is_none());
+        // Message 1 (last) SHOULD have cache_control
+        let block_1 = &msgs_a[1]["content"].as_array().unwrap()[0];
+        assert!(block_1.get("cache_control").is_some());
+
+        // Now append a third message — cache_control should move to message[2]
+        let messages_b = vec![
+            Message::user("hello"),
+            Message::assistant_text("hi"),
+            Message::user("bye"),
+        ];
+        let body_b = provider.build_request_body(system, &messages_b, &[], false);
+        let msgs_b = body_b["messages"].as_array().unwrap();
+
+        // Messages 0 and 1 should NOT have cache_control
+        assert!(
+            msgs_b[0]["content"].as_array().unwrap()[0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            msgs_b[1]["content"].as_array().unwrap()[0]
+                .get("cache_control")
+                .is_none()
+        );
+        // Message 2 (new last) SHOULD have cache_control
+        assert!(
+            msgs_b[2]["content"].as_array().unwrap()[0]
+                .get("cache_control")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_identical_across_turns() {
+        let provider = test_provider();
+        let system = "You are a helpful assistant.";
+        let tools = test_tools();
+
+        let body1 = provider.build_request_body(system, &[Message::user("turn 1")], &tools, true);
+        let body2 = provider.build_request_body(
+            system,
+            &[
+                Message::user("turn 1"),
+                Message::assistant_text("response 1"),
+                Message::user("turn 2"),
+            ],
+            &tools,
+            true,
+        );
+        let body3 = provider.build_request_body(
+            system,
+            &[
+                Message::user("turn 1"),
+                Message::assistant_text("response 1"),
+                Message::user("turn 2"),
+                Message::assistant_text("response 2"),
+                Message::user("turn 3"),
+            ],
+            &tools,
+            true,
+        );
+
+        // System prompt must be byte-identical across all turns.
+        assert_eq!(body1["system"], body2["system"]);
+        assert_eq!(body2["system"], body3["system"]);
+
+        // Model, max_tokens, metadata must also be identical.
+        assert_eq!(body1["model"], body2["model"]);
+        assert_eq!(body1["max_tokens"], body2["max_tokens"]);
+        assert_eq!(body1["metadata"], body2["metadata"]);
+        assert_eq!(body2["model"], body3["model"]);
+        assert_eq!(body2["max_tokens"], body3["max_tokens"]);
+        assert_eq!(body2["metadata"], body3["metadata"]);
+    }
+
+    #[test]
+    fn test_tool_schemas_stable_across_turns() {
+        let provider = test_provider();
+        let tools = test_tools();
+
+        let body1 = provider.build_request_body("system", &[Message::user("a")], &tools, true);
+        let body2 = provider.build_request_body(
+            "system",
+            &[
+                Message::user("a"),
+                Message::assistant_text("b"),
+                Message::user("c"),
+            ],
+            &tools,
+            true,
+        );
+
+        // Tool schemas (including cache_control on the last tool) must be
+        // identical when the same tools are provided.
+        assert_eq!(body1["tools"], body2["tools"]);
+    }
+
+    #[test]
+    fn test_multi_block_message_cache_control_on_last_block_only() {
+        let provider = test_provider();
+
+        // An assistant message with text + tool_use (multiple blocks)
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "Let me read that file.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                },
+            ],
+        }];
+        let body = provider.build_request_body("system", &messages, &[], false);
+        let msg = &body["messages"].as_array().unwrap()[0];
+        let blocks = msg["content"].as_array().unwrap();
+
+        // First block (text) should NOT have cache_control
+        assert!(blocks[0].get("cache_control").is_none());
+        // Second block (tool_use, the last block of the last message) SHOULD
+        assert!(blocks[1].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn test_long_conversation_prefix_stability() {
+        let provider = test_provider();
+        let system = "You are a helpful assistant.";
+        let tools = test_tools();
+
+        // Build up a 10-turn conversation incrementally and verify each step
+        // preserves the prefix from the previous step.
+        let mut messages: Vec<Message> = Vec::new();
+        let mut previous: Option<(serde_json::Value, usize)> = None;
+
+        for turn in 0..10 {
+            messages.push(Message::user(format!("User message {}", turn)));
+            let body = provider.build_request_body(system, &messages, &tools, true);
+
+            if let Some((prev_body, prev_msg_count)) = &previous {
+                // The shared prefix is exactly the messages that were in the
+                // previous request body.
+                assert_prefix_stable(prev_body, &body, *prev_msg_count);
+            }
+
+            assert_eq!(count_message_cache_controls(&body), 1);
+
+            let msg_count = messages.len();
+            // Simulate assistant response
+            messages.push(Message::assistant_text(format!("Response {}", turn)));
+            previous = Some((body, msg_count));
+        }
+    }
+
+    #[test]
+    fn test_tool_loop_with_multiple_sequential_calls() {
+        let provider = test_provider();
+        let system = "system";
+        let tools = test_tools();
+
+        // Simulate a user request that triggers 4 sequential tool calls.
+        // Each iteration of the loop adds an assistant tool_use + user
+        // tool_result pair. Verify the prefix is stable across all iterations.
+        let mut messages: Vec<Message> = vec![Message::user("do several things")];
+
+        let mut previous_body: Option<serde_json::Value> = None;
+        let mut previous_len = 0;
+
+        for i in 0..4 {
+            let body = provider.build_request_body(system, &messages, &tools, true);
+
+            if let Some(prev) = &previous_body {
+                assert_prefix_stable(prev, &body, previous_len);
+            }
+
+            assert_eq!(
+                count_message_cache_controls(&body),
+                1,
+                "iteration {} should have exactly 1 message cache_control",
+                i
+            );
+
+            previous_len = messages.len();
+            previous_body = Some(body);
+
+            // Simulate tool call and result
+            messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("toolu_{}", i),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": format!("/tmp/file{}", i)}),
+                }],
+            });
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("toolu_{}", i),
+                    content: format!("contents of file{}", i),
+                    is_error: false,
+                }],
+            });
+        }
+
+        // Final body after all tool calls
+        let final_body = provider.build_request_body(system, &messages, &tools, true);
+        assert_prefix_stable(previous_body.as_ref().unwrap(), &final_body, previous_len);
+        assert_eq!(count_message_cache_controls(&final_body), 1);
+    }
+
+    #[test]
+    fn test_empty_messages_produces_no_cache_control() {
+        let provider = test_provider();
+        let body = provider.build_request_body("system", &[], &[], false);
+        assert_eq!(count_message_cache_controls(&body), 0);
+        assert!(body["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_cache_control_on_tool_result_block() {
+        let provider = test_provider();
+
+        // When the last message is a tool_result, cache_control should still
+        // appear on its last content block.
+        let messages = vec![
+            Message::user("read file"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: "file data".to_string(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let body = provider.build_request_body("system", &messages, &[], false);
+        let msgs = body["messages"].as_array().unwrap();
+
+        // Only the tool_result message (last) should have cache_control
+        assert!(
+            msgs[0]["content"].as_array().unwrap()[0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            msgs[1]["content"].as_array().unwrap()[0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            msgs[2]["content"].as_array().unwrap()[0]
+                .get("cache_control")
+                .is_some()
+        );
+        assert_eq!(count_message_cache_controls(&body), 1);
+    }
+
+    #[test]
+    fn test_claude_cache_control_on_last_message_only() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let messages = vec![
+            Message::user("first"),
+            Message::assistant_text("response"),
+            Message::user("second"),
+        ];
+        let body = provider.build_request_body("system", &messages, &[], false);
+        let claude_messages = body["messages"].as_array().unwrap();
+
+        let first_content = claude_messages[0]["content"].as_array().unwrap();
+        assert!(first_content[0].get("cache_control").is_none());
+
+        let second_content = claude_messages[1]["content"].as_array().unwrap();
+        assert!(second_content[0].get("cache_control").is_none());
+
+        let third_content = claude_messages[2]["content"].as_array().unwrap();
+        assert!(third_content[0].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn test_claude_cache_control_on_last_tool() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let tools = vec![
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "write_file".to_string(),
+                description: "Write a file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let body = provider.build_request_body("system", &[Message::user("hi")], &tools, false);
+        let claude_tools = body["tools"].as_array().unwrap();
+
+        assert!(claude_tools[0].get("cache_control").is_none());
+        assert!(claude_tools[1].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn test_claude_no_message_cache_control_when_empty() {
+        let provider = ClaudeProvider::new(
+            AuthCredential::ApiKey("test-key".to_string()),
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("system", &[], &[], false);
+        let claude_messages = body["messages"].as_array().unwrap();
+        assert!(claude_messages.is_empty());
     }
 }

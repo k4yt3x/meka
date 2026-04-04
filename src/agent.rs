@@ -75,6 +75,13 @@ impl Agent {
         let user_message = Message::user(&augmented_input);
         messages.push(user_message);
 
+        let permission = self.shared_permission.get();
+        let tools = self.available_tools(permission);
+        let system_prompt = build_system_prompt(permission, &tools, self.options.sandboxed_shell);
+
+        let base_messages = truncate_messages_for_context(messages, self.options.context_messages);
+        let turn_start_len = messages.len();
+
         let mut user_saved = false;
 
         let result: Result<()> = 'turn: {
@@ -83,13 +90,13 @@ impl Agent {
                     break 'turn Err(AgshError::Interrupted);
                 }
 
-                let permission = self.shared_permission.get();
-                let tools = self.available_tools(permission);
-                let system_prompt =
-                    build_system_prompt(permission, &tools, self.options.sandboxed_shell);
-
-                let api_messages =
-                    truncate_messages_for_context(messages, self.options.context_messages);
+                let api_messages = if messages.len() > turn_start_len {
+                    let mut combined = base_messages.clone();
+                    combined.extend_from_slice(&messages[turn_start_len..]);
+                    combined
+                } else {
+                    base_messages.clone()
+                };
 
                 let (assistant_message, stop_reason) = match if self.options.streaming {
                     self.run_streaming(&system_prompt, &api_messages, &tools, cancellation.clone())
@@ -106,7 +113,7 @@ impl Agent {
                 if !user_saved {
                     if let Err(error) = self
                         .session_manager
-                        .save_message(sid, "user", &user_input)
+                        .save_message(sid, "user", &augmented_input)
                         .await
                     {
                         break 'turn Err(error);
@@ -182,7 +189,7 @@ impl Agent {
             Err(AgshError::Interrupted) if !user_saved => {
                 if let Err(error) = self
                     .session_manager
-                    .save_message(sid, "user", &user_input)
+                    .save_message(sid, "user", &augmented_input)
                     .await
                 {
                     tracing::error!("failed to save user message on interruption: {}", error);
@@ -584,5 +591,311 @@ mod tests {
         let result = truncate_messages_for_context(&messages, Some(4));
         assert_eq!(result[0].role, Role::User);
         assert!(!has_tool_results(&result[0].content));
+    }
+
+    // ---- Cache prefix stability tests ----
+    //
+    // These tests simulate the agent's message-assembly logic (stable base +
+    // appended tool-loop messages) to verify that the prefix sent to the API
+    // remains identical across iterations of the tool-use loop.  This is the
+    // core invariant required for KV cache reuse.
+
+    fn assistant_tool_use_named(id: &str, name: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({"path": "/tmp/test"}),
+            }],
+        }
+    }
+
+    fn tool_result_for(tool_use_id: &str, content: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: content.to_string(),
+                is_error: false,
+            }],
+        }
+    }
+
+    /// Compares two message slices for semantic equality (same role, same
+    /// content blocks).  This is what determines whether the KV cache prefix
+    /// is reusable.
+    fn assert_messages_equal(a: &[Message], b: &[Message], context: &str) {
+        assert_eq!(a.len(), b.len(), "{}: length mismatch", context);
+        for (i, (ma, mb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                ma.role, mb.role,
+                "{}: role mismatch at index {}",
+                context, i
+            );
+            assert_eq!(
+                ma.content.len(),
+                mb.content.len(),
+                "{}: content block count mismatch at index {}",
+                context,
+                i
+            );
+            let json_a = serde_json::to_string(&ma.content).unwrap();
+            let json_b = serde_json::to_string(&mb.content).unwrap();
+            assert_eq!(
+                json_a, json_b,
+                "{}: content mismatch at index {}",
+                context, i
+            );
+        }
+    }
+
+    /// Simulates the tool-loop message assembly logic from `run_turn`:
+    ///   base_messages = truncate(messages, limit)   // computed once
+    ///   turn_start_len = messages.len()
+    ///   loop { api_messages = base + messages[turn_start_len..] }
+    fn build_api_messages(
+        messages: &[Message],
+        base_messages: &[Message],
+        turn_start_len: usize,
+    ) -> Vec<Message> {
+        if messages.len() > turn_start_len {
+            let mut combined = base_messages.to_vec();
+            combined.extend_from_slice(&messages[turn_start_len..]);
+            combined
+        } else {
+            base_messages.to_vec()
+        }
+    }
+
+    #[test]
+    fn test_stable_base_during_tool_loop() {
+        // Simulate a conversation with history, then a tool loop that adds
+        // 3 tool call/result pairs.  The base prefix (everything before the
+        // tool loop) must be identical across all iterations.
+        let mut messages = vec![
+            user_msg("first question"),
+            assistant_msg("first answer"),
+            user_msg("second question"),
+        ];
+
+        let base_messages = truncate_messages_for_context(&messages, None);
+        let turn_start_len = messages.len();
+
+        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_iter0.len(), 3);
+
+        // Iteration 1: model calls a tool
+        messages.push(assistant_tool_use_named("t1", "read_file"));
+        messages.push(tool_result_for("t1", "file contents"));
+
+        let api_iter1 = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_iter1.len(), 5);
+
+        // The first 3 messages (the base) must be identical.
+        assert_messages_equal(&api_iter0[..3], &api_iter1[..3], "iter0→iter1 base");
+
+        // Iteration 2: model calls another tool
+        messages.push(assistant_tool_use_named("t2", "execute_command"));
+        messages.push(tool_result_for("t2", "command output"));
+
+        let api_iter2 = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_iter2.len(), 7);
+
+        // Base is still identical.
+        assert_messages_equal(&api_iter0[..3], &api_iter2[..3], "iter0→iter2 base");
+        // And the first 5 (base + iter1's additions) are identical too.
+        assert_messages_equal(&api_iter1[..5], &api_iter2[..5], "iter1→iter2 prefix");
+
+        // Iteration 3: yet another tool call
+        messages.push(assistant_tool_use_named("t3", "read_file"));
+        messages.push(tool_result_for("t3", "more contents"));
+
+        let api_iter3 = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_iter3.len(), 9);
+
+        assert_messages_equal(&api_iter2[..7], &api_iter3[..7], "iter2→iter3 prefix");
+        assert_messages_equal(&api_iter0[..3], &api_iter3[..3], "iter0→iter3 base");
+    }
+
+    #[test]
+    fn test_truncation_boundary_does_not_shift_during_tool_loop() {
+        // This is the critical test for the fix: when context_messages is set
+        // and we're near the limit, adding tool results within the loop must
+        // NOT cause the truncated prefix to shift.  Before the fix, truncation
+        // was recomputed inside the loop, causing prefix instability.
+        let limit = Some(6);
+
+        // Start with 5 messages (under the limit of 6).
+        let mut messages = vec![
+            user_msg("msg-1"),
+            assistant_msg("resp-1"),
+            user_msg("msg-2"),
+            assistant_msg("resp-2"),
+            user_msg("msg-3"),
+        ];
+
+        // Compute the stable base ONCE before the loop (as run_turn does).
+        let base_messages = truncate_messages_for_context(&messages, limit);
+        let turn_start_len = messages.len();
+
+        // All 5 messages fit within the limit; no truncation yet.
+        assert_eq!(base_messages.len(), 5);
+
+        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_iter0.len(), 5);
+
+        // Iteration 1: add tool call + result → 7 messages total, over limit.
+        // With the old code, truncation would kick in and drop messages from
+        // the front.  With the new code, the base is frozen.
+        messages.push(assistant_tool_use_named("t1", "read_file"));
+        messages.push(tool_result_for("t1", "data"));
+
+        let api_iter1 = build_api_messages(&messages, &base_messages, turn_start_len);
+        // Should be base(5) + new(2) = 7
+        assert_eq!(api_iter1.len(), 7);
+
+        // The first 5 messages must be identical to iter0.
+        assert_messages_equal(&api_iter0[..5], &api_iter1[..5], "iter0→iter1 base");
+
+        // Iteration 2: add another tool call → 9 total, well over limit.
+        messages.push(assistant_tool_use_named("t2", "execute_command"));
+        messages.push(tool_result_for("t2", "output"));
+
+        let api_iter2 = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_iter2.len(), 9);
+
+        // The first 7 messages must match iter1 exactly.
+        assert_messages_equal(&api_iter1[..7], &api_iter2[..7], "iter1→iter2 prefix");
+        // And the base (first 5) is still untouched.
+        assert_messages_equal(&api_iter0[..5], &api_iter2[..5], "iter0→iter2 base");
+    }
+
+    #[test]
+    fn test_truncation_with_tool_chain_near_boundary() {
+        // Verify that when the conversation includes a tool chain right at the
+        // truncation boundary, the base is computed correctly and stays stable.
+        let limit = Some(4);
+
+        let mut messages = vec![
+            user_msg("old-msg"),
+            assistant_msg("old-resp"),
+            user_msg("current question"),
+            assistant_tool_use_named("t0", "read_file"),
+            tool_result_for("t0", "initial data"),
+            assistant_msg("here is the data"),
+            user_msg("follow-up"),
+        ];
+
+        let base_messages = truncate_messages_for_context(&messages, limit);
+        let turn_start_len = messages.len();
+
+        // The truncation should keep a safe cut point; verify it starts with
+        // a user message and doesn't split tool chains.
+        assert_eq!(base_messages[0].role, Role::User);
+        assert!(!has_tool_results(&base_messages[0].content));
+
+        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
+
+        // Add tool loop messages
+        messages.push(assistant_tool_use_named("t1", "read_file"));
+        messages.push(tool_result_for("t1", "more data"));
+
+        let api_iter1 = build_api_messages(&messages, &base_messages, turn_start_len);
+
+        // The base portion must be identical.
+        let base_len = base_messages.len();
+        assert_messages_equal(
+            &api_iter0[..base_len],
+            &api_iter1[..base_len],
+            "base stable after tool loop",
+        );
+    }
+
+    #[test]
+    fn test_no_limit_produces_full_prefix() {
+        // With no context_messages limit, base_messages includes everything,
+        // and tool loop additions are appended without any truncation.
+        let mut messages = vec![user_msg("a"), assistant_msg("b"), user_msg("c")];
+
+        let base_messages = truncate_messages_for_context(&messages, None);
+        let turn_start_len = messages.len();
+
+        assert_eq!(base_messages.len(), 3);
+
+        let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_iter0.len(), 3);
+
+        // Add many tool calls
+        for i in 0..5 {
+            messages.push(assistant_tool_use_named(&format!("t{}", i), "read_file"));
+            messages.push(tool_result_for(
+                &format!("t{}", i),
+                &format!("result {}", i),
+            ));
+        }
+
+        let api_final = build_api_messages(&messages, &base_messages, turn_start_len);
+        assert_eq!(api_final.len(), 13); // 3 base + 10 tool messages
+
+        // Base prefix still matches.
+        assert_messages_equal(&api_iter0[..3], &api_final[..3], "full prefix stable");
+    }
+
+    #[test]
+    fn test_multi_turn_with_truncation_each_turn_gets_stable_base() {
+        // Simulate multiple turns, each computing its own stable base.
+        // Verify that within each turn's tool loop the base stays fixed,
+        // and that across turns the overlapping messages are consistent.
+        let limit = Some(6);
+
+        // -- Turn 1 --
+        let mut messages: Vec<Message> = vec![user_msg("turn-1 question")];
+        let base_t1 = truncate_messages_for_context(&messages, limit);
+        let start_t1 = messages.len();
+
+        // Tool loop: 2 iterations
+        messages.push(assistant_tool_use_named("t1a", "read_file"));
+        messages.push(tool_result_for("t1a", "data-a"));
+        let api_t1_iter1 = build_api_messages(&messages, &base_t1, start_t1);
+
+        messages.push(assistant_msg("here's your answer"));
+        let api_t1_iter2 = build_api_messages(&messages, &base_t1, start_t1);
+
+        // Base is stable within turn 1.
+        assert_messages_equal(
+            &api_t1_iter1[..base_t1.len()],
+            &api_t1_iter2[..base_t1.len()],
+            "turn 1 base stable",
+        );
+
+        // -- Turn 2 --
+        messages.push(user_msg("turn-2 question"));
+
+        let base_t2 = truncate_messages_for_context(&messages, limit);
+        let start_t2 = messages.len();
+
+        messages.push(assistant_tool_use_named("t2a", "execute_command"));
+        messages.push(tool_result_for("t2a", "output"));
+        let api_t2_iter1 = build_api_messages(&messages, &base_t2, start_t2);
+
+        messages.push(assistant_tool_use_named("t2b", "read_file"));
+        messages.push(tool_result_for("t2b", "more"));
+        let api_t2_iter2 = build_api_messages(&messages, &base_t2, start_t2);
+
+        // Base is stable within turn 2.
+        assert_messages_equal(
+            &api_t2_iter1[..base_t2.len()],
+            &api_t2_iter2[..base_t2.len()],
+            "turn 2 base stable",
+        );
+
+        // And the tool-loop prefix from iter1 is preserved in iter2.
+        let shared = api_t2_iter1.len();
+        assert_messages_equal(
+            &api_t2_iter1[..shared],
+            &api_t2_iter2[..shared],
+            "turn 2 iter1→iter2 prefix",
+        );
     }
 }
