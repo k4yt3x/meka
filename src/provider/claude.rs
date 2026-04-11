@@ -1069,23 +1069,6 @@ mod tests {
         )
     }
 
-    fn test_provider_with_oauth() -> ClaudeProvider {
-        ClaudeProvider::new(
-            AuthCredential::OAuthToken {
-                access_token: "test-oauth-token".to_string(),
-                refresh_token: None,
-                expires_at: None,
-            },
-            "claude-sonnet-4-20250514".to_string(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            10000,
-        )
-    }
-
     #[test]
     fn test_static_fingerprint_matches_empty_message() {
         assert_eq!(*STATIC_FINGERPRINT, compute_fingerprint("", CC_VERSION));
