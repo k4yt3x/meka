@@ -385,7 +385,6 @@ pub fn render_todo_list(items: &[crate::tools::todo::TodoItem]) {
             item.description
         );
     }
-    eprintln!();
 }
 
 pub fn tool_display_name_for_approval(name: &str) -> &str {

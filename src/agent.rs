@@ -143,10 +143,6 @@ impl Agent {
                     break 'turn Err(AgshError::Interrupted);
                 }
 
-                if last_response_had_tools {
-                    println!();
-                }
-
                 let api_messages = if messages.len() > turn_start_len {
                     let mut combined = base_messages.clone();
                     combined.extend_from_slice(&messages[turn_start_len..]);
@@ -156,8 +152,14 @@ impl Agent {
                 };
 
                 let (assistant_message, stop_reason, usage) = match if self.options.streaming {
-                    self.run_streaming(&system_prompt, &api_messages, &tools, cancellation.clone())
-                        .await
+                    self.run_streaming(
+                        &system_prompt,
+                        &api_messages,
+                        &tools,
+                        cancellation.clone(),
+                        last_response_had_tools,
+                    )
+                    .await
                 } else {
                     self.provider
                         .complete(&system_prompt, &api_messages, &tools)
@@ -306,6 +308,7 @@ impl Agent {
         messages: &[Message],
         tools: &[ToolDefinition],
         cancellation: CancellationToken,
+        prior_tools: bool,
     ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel::<StreamEvent>();
 
@@ -352,6 +355,9 @@ impl Agent {
                         in_thinking = false;
                         thinking_renderer.finish()?;
                         render::render_thinking_end();
+                    }
+                    if !renderer.started && prior_tools {
+                        println!();
                     }
                     current_text.push_str(&text);
                     renderer.push_delta(&text)?;
