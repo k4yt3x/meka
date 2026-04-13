@@ -6,17 +6,17 @@ use termimad::MadSkin;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderMode {
-    Termimad,
     #[default]
     Bat,
+    Termimad,
     Raw,
 }
 
 impl std::fmt::Display for RenderMode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RenderMode::Termimad => write!(formatter, "termimad"),
             RenderMode::Bat => write!(formatter, "bat"),
+            RenderMode::Termimad => write!(formatter, "termimad"),
             RenderMode::Raw => write!(formatter, "raw"),
         }
     }
@@ -27,11 +27,11 @@ impl std::str::FromStr for RenderMode {
 
     fn from_str(string: &str) -> std::result::Result<Self, Self::Err> {
         match string.to_lowercase().as_str() {
-            "rich" | "termimad" => Ok(RenderMode::Termimad),
             "bat" => Ok(RenderMode::Bat),
+            "rich" | "termimad" => Ok(RenderMode::Termimad),
             "raw" => Ok(RenderMode::Raw),
             other => Err(format!(
-                "unknown render mode '{}' (expected 'termimad', 'bat', or 'raw')",
+                "unknown render mode '{}' (expected 'bat', 'termimad', or 'raw')",
                 other
             )),
         }
@@ -72,23 +72,14 @@ impl StreamingRenderer {
         self.buffer.push_str(delta);
 
         match self.mode {
-            RenderMode::Termimad => self.flush_termimad(),
             RenderMode::Bat => self.flush_bat(),
+            RenderMode::Termimad => self.flush_termimad(),
             RenderMode::Raw => self.flush_raw(),
         }
     }
 
     pub fn finish(&mut self) -> io::Result<()> {
         match self.mode {
-            RenderMode::Termimad => {
-                if !self.buffer.is_empty() {
-                    let remaining = std::mem::take(&mut self.buffer);
-                    let trimmed = remaining.trim_end_matches('\n');
-                    if !trimmed.is_empty() {
-                        print!("{}", self.skin.term_text(trimmed));
-                    }
-                }
-            }
             RenderMode::Bat => {
                 if !self.buffer.is_empty() {
                     let remaining = std::mem::take(&mut self.buffer);
@@ -96,6 +87,15 @@ impl StreamingRenderer {
                     if !trimmed.is_empty() {
                         print_with_bat(trimmed);
                         println!();
+                    }
+                }
+            }
+            RenderMode::Termimad => {
+                if !self.buffer.is_empty() {
+                    let remaining = std::mem::take(&mut self.buffer);
+                    let trimmed = remaining.trim_end_matches('\n');
+                    if !trimmed.is_empty() {
+                        print!("{}", self.skin.term_text(trimmed));
                     }
                 }
             }
@@ -118,32 +118,6 @@ impl StreamingRenderer {
         io::stdout().flush()
     }
 
-    fn flush_termimad(&mut self) -> io::Result<()> {
-        self.buffer = normalize_header_spacing(&self.buffer);
-
-        while let Some(boundary) = self.buffer.find("\n\n") {
-            let complete = self.buffer[..boundary + 2].to_string();
-            self.buffer = self.buffer[boundary + 2..].to_string();
-            print!("{}", self.skin.term_text(&complete));
-            io::stdout().flush()?;
-        }
-
-        if !self.in_code_block() && !self.in_table() {
-            while let Some(newline_pos) = self.buffer.find('\n') {
-                if newline_pos + 1 < self.buffer.len() || !self.buffer.ends_with('\n') {
-                    let line = self.buffer[..newline_pos + 1].to_string();
-                    self.buffer = self.buffer[newline_pos + 1..].to_string();
-                    print!("{}", self.skin.term_text(&line));
-                    io::stdout().flush()?;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     fn flush_bat(&mut self) -> io::Result<()> {
         self.buffer = normalize_header_spacing(&self.buffer);
 
@@ -160,6 +134,32 @@ impl StreamingRenderer {
                     let line = self.buffer[..newline_pos + 1].to_string();
                     self.buffer = self.buffer[newline_pos + 1..].to_string();
                     print_with_bat(&line);
+                    io::stdout().flush()?;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn flush_termimad(&mut self) -> io::Result<()> {
+        self.buffer = normalize_header_spacing(&self.buffer);
+
+        while let Some(boundary) = self.buffer.find("\n\n") {
+            let complete = self.buffer[..boundary + 2].to_string();
+            self.buffer = self.buffer[boundary + 2..].to_string();
+            print!("{}", self.skin.term_text(&complete));
+            io::stdout().flush()?;
+        }
+
+        if !self.in_code_block() && !self.in_table() {
+            while let Some(newline_pos) = self.buffer.find('\n') {
+                if newline_pos + 1 < self.buffer.len() || !self.buffer.ends_with('\n') {
+                    let line = self.buffer[..newline_pos + 1].to_string();
+                    self.buffer = self.buffer[newline_pos + 1..].to_string();
+                    print!("{}", self.skin.term_text(&line));
                     io::stdout().flush()?;
                 } else {
                     break;
@@ -385,6 +385,7 @@ pub fn render_todo_list(items: &[crate::tools::todo::TodoItem]) {
             item.description
         );
     }
+    eprintln!();
 }
 
 pub fn tool_display_name_for_approval(name: &str) -> &str {
