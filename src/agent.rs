@@ -78,8 +78,11 @@ impl Agent {
             }
         }
 
+        let mut spacing = render::OutputSpacing::new();
+
         if self.options.newline_after_prompt {
             println!();
+            spacing.after_prompt();
         }
 
         let sid = session_id.ok_or(AgshError::Config("session_id not set".into()))?;
@@ -135,7 +138,6 @@ impl Agent {
         let turn_start_len = messages.len();
 
         let mut user_saved = false;
-        let mut last_response_had_tools = false;
 
         let result: Result<()> = 'turn: {
             loop {
@@ -157,7 +159,7 @@ impl Agent {
                         &api_messages,
                         &tools,
                         cancellation.clone(),
-                        last_response_had_tools,
+                        &mut spacing,
                     )
                     .await
                 } else {
@@ -221,7 +223,11 @@ impl Agent {
                 match stop_reason {
                     StopReason::ToolUse => {
                         let mut tool_results = self
-                            .execute_tool_calls(&assistant_message, cancellation.clone())
+                            .execute_tool_calls(
+                                &assistant_message,
+                                cancellation.clone(),
+                                &mut spacing,
+                            )
                             .await;
 
                         if let Err(error) =
@@ -270,7 +276,6 @@ impl Agent {
                         }
 
                         messages.push(result_message);
-                        last_response_had_tools = true;
                     }
                     StopReason::EndTurn | StopReason::MaxTokens | StopReason::Unknown(_) => {
                         break 'turn Ok(());
@@ -308,7 +313,7 @@ impl Agent {
         messages: &[Message],
         tools: &[ToolDefinition],
         cancellation: CancellationToken,
-        prior_tools: bool,
+        spacing: &mut render::OutputSpacing,
     ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel::<StreamEvent>();
 
@@ -356,8 +361,10 @@ impl Agent {
                         thinking_renderer.finish()?;
                         render::render_thinking_end();
                     }
-                    if !renderer.started && prior_tools {
-                        println!();
+                    if !renderer.started {
+                        if spacing.before_text() {
+                            println!();
+                        }
                     }
                     current_text.push_str(&text);
                     renderer.push_delta(&text)?;
@@ -383,7 +390,7 @@ impl Agent {
                 }
                 StreamEvent::ToolUseEnd { input } => {
                     renderer.finish()?;
-                    if std::mem::take(&mut renderer.started) {
+                    if spacing.before_tool_indicator() {
                         println!();
                     }
                     render::render_tool_indicator(&current_tool_name, &input);
@@ -447,6 +454,7 @@ impl Agent {
         &self,
         assistant_message: &Message,
         cancellation: CancellationToken,
+        spacing: &mut render::OutputSpacing,
     ) -> Vec<ContentBlock> {
         let mut results = Vec::new();
         let permission = self.shared_permission.get();
@@ -454,6 +462,9 @@ impl Agent {
         for block in &assistant_message.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 if !self.options.streaming {
+                    if spacing.before_tool_indicator() {
+                        println!();
+                    }
                     render::render_tool_indicator(name, input);
                 }
 
@@ -568,6 +579,12 @@ impl Agent {
                         }
                     }
                 };
+
+                // If todo_write was called with a non-empty list, the rendered
+                // todo list has its own trailing blank line on stderr.
+                if name == "todo_write" && !self.todo_list.read().await.is_empty() {
+                    spacing.after_todo_list();
+                }
 
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),

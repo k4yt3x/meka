@@ -3,6 +3,62 @@ use std::io::{self, Write};
 use crossterm::style::{Color, Stylize};
 use termimad::MadSkin;
 
+// ---------------------------------------------------------------------------
+// Output spacing state machine
+// ---------------------------------------------------------------------------
+
+enum LastOutput {
+    Nothing,
+    Prompt,
+    Text,
+    ToolIndicator,
+    TodoList,
+}
+
+/// Tracks what was last printed and decides whether a blank line is needed
+/// before the next output. Replaces ad-hoc spacing flags.
+pub struct OutputSpacing {
+    last: LastOutput,
+}
+
+impl OutputSpacing {
+    pub fn new() -> Self {
+        Self {
+            last: LastOutput::Nothing,
+        }
+    }
+
+    /// Call before printing streamed text. Returns true if a blank line
+    /// should be emitted first.
+    pub fn before_text(&mut self) -> bool {
+        let need_blank = matches!(self.last, LastOutput::ToolIndicator);
+        self.last = LastOutput::Text;
+        need_blank
+    }
+
+    /// Call before printing a tool indicator. Returns true if a blank line
+    /// should be emitted first.
+    pub fn before_tool_indicator(&mut self) -> bool {
+        let need_blank = matches!(self.last, LastOutput::Text);
+        self.last = LastOutput::ToolIndicator;
+        need_blank
+    }
+
+    /// Call after the todo list is rendered (it has its own trailing newline).
+    pub fn after_todo_list(&mut self) {
+        self.last = LastOutput::TodoList;
+    }
+
+    /// Call after newline_after_prompt is printed.
+    pub fn after_prompt(&mut self) {
+        self.last = LastOutput::Prompt;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render mode
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderMode {
@@ -125,7 +181,7 @@ impl StreamingRenderer {
     }
 
     fn flush_bat(&mut self) -> io::Result<()> {
-        self.buffer = normalize_header_spacing(&self.buffer);
+        self.buffer = normalize_spacing(&self.buffer);
 
         while let Some(newline_pos) = self.buffer.find('\n') {
             let line = self.buffer[..newline_pos].to_string();
@@ -157,11 +213,12 @@ impl StreamingRenderer {
         let formatted = format_table(&lines);
         let table_text = formatted.join("\n");
         print_with_bat(&table_text);
+        println!();
         io::stdout().flush()
     }
 
     fn flush_termimad(&mut self) -> io::Result<()> {
-        self.buffer = normalize_header_spacing(&self.buffer);
+        self.buffer = normalize_spacing(&self.buffer);
 
         while let Some(boundary) = self.buffer.find("\n\n") {
             let complete = self.buffer[..boundary + 2].to_string();
@@ -187,7 +244,7 @@ impl StreamingRenderer {
     }
 
     fn flush_raw(&mut self) -> io::Result<()> {
-        self.buffer = normalize_header_spacing(&self.buffer);
+        self.buffer = normalize_spacing(&self.buffer);
 
         while let Some(newline_pos) = self.buffer.find('\n') {
             let line = self.buffer[..newline_pos].to_string();
@@ -227,9 +284,9 @@ impl StreamingRenderer {
     }
 }
 
-/// Ensure a blank line follows each markdown header (e.g., `## Title`)
-/// unless one already exists. Skips headers inside code fences.
-fn normalize_header_spacing(text: &str) -> String {
+/// Ensure blank lines after markdown headers and tables when followed by
+/// non-empty content. Skips content inside code fences.
+fn normalize_spacing(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut result = Vec::with_capacity(lines.len());
     let mut in_fence = false;
@@ -245,17 +302,29 @@ fn normalize_header_spacing(text: &str) -> String {
             continue;
         }
 
+        let next_line = lines.get(index + 1);
+        let next_is_non_empty = next_line.is_some_and(|next| !next.trim().is_empty());
+
+        if !next_is_non_empty {
+            continue;
+        }
+
         let trimmed = line.trim_start();
+
+        // Blank line after headers (e.g., `## Title`)
         let is_header = trimmed.starts_with('#')
             && trimmed
                 .find(|character: char| character != '#')
                 .is_some_and(|position| trimmed.as_bytes().get(position) == Some(&b' '));
 
-        if is_header {
-            let next_line = lines.get(index + 1);
-            if next_line.is_some_and(|next| !next.trim().is_empty()) {
-                result.push("");
-            }
+        // Blank line after table rows when next line is clearly not a table row.
+        // A line starting with `|` might be an incomplete table row from streaming,
+        // so only treat lines NOT starting with `|` as table-ending.
+        let is_table_end = is_table_line(line)
+            && next_line.is_some_and(|next| !next.trim_start().starts_with('|'));
+
+        if is_header || is_table_end {
+            result.push("");
         }
     }
 
@@ -758,51 +827,79 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_header_spacing_adds_blank_line() {
+    fn test_normalize_spacing_adds_blank_line() {
         let input = "## Title\nBody text";
-        let output = normalize_header_spacing(input);
+        let output = normalize_spacing(input);
         assert_eq!(output, "## Title\n\nBody text");
     }
 
     #[test]
-    fn test_normalize_header_spacing_already_has_blank_line() {
+    fn test_normalize_spacing_already_has_blank_line() {
         let input = "## Title\n\nBody text";
-        let output = normalize_header_spacing(input);
+        let output = normalize_spacing(input);
         assert_eq!(output, "## Title\n\nBody text");
     }
 
     #[test]
-    fn test_normalize_header_spacing_header_at_end() {
+    fn test_normalize_spacing_header_at_end() {
         let input = "## Title";
-        let output = normalize_header_spacing(input);
+        let output = normalize_spacing(input);
         assert_eq!(output, "## Title");
     }
 
     #[test]
-    fn test_normalize_header_spacing_inside_code_fence() {
+    fn test_normalize_spacing_inside_code_fence() {
         let input = "```\n## Not a header\ncode\n```";
-        let output = normalize_header_spacing(input);
+        let output = normalize_spacing(input);
         assert_eq!(output, "```\n## Not a header\ncode\n```");
     }
 
     #[test]
-    fn test_normalize_header_spacing_multiple_levels() {
+    fn test_normalize_spacing_multiple_levels() {
         let input = "# H1\ntext\n### H3\nmore text";
-        let output = normalize_header_spacing(input);
+        let output = normalize_spacing(input);
         assert_eq!(output, "# H1\n\ntext\n### H3\n\nmore text");
     }
 
     #[test]
-    fn test_normalize_header_spacing_preserves_trailing_newline() {
+    fn test_normalize_spacing_preserves_trailing_newline() {
         let input = "## Title\nBody\n";
-        let output = normalize_header_spacing(input);
+        let output = normalize_spacing(input);
         assert_eq!(output, "## Title\n\nBody\n");
     }
 
     #[test]
-    fn test_normalize_header_spacing_no_space_after_hash_is_not_header() {
+    fn test_normalize_spacing_no_space_after_hash_is_not_header() {
         let input = "##not a header\ntext";
-        let output = normalize_header_spacing(input);
+        let output = normalize_spacing(input);
         assert_eq!(output, "##not a header\ntext");
+    }
+
+    #[test]
+    fn test_normalize_spacing_table_then_text() {
+        let input = "| A | B |\n|---|---|\n| 1 | 2 |\n> blockquote";
+        let output = normalize_spacing(input);
+        assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote");
+    }
+
+    #[test]
+    fn test_normalize_spacing_table_already_has_blank_line() {
+        let input = "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote";
+        let output = normalize_spacing(input);
+        assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |\n\n> blockquote");
+    }
+
+    #[test]
+    fn test_normalize_spacing_table_inside_code_fence() {
+        let input = "```\n| A | B |\n| 1 | 2 |\ncode\n```";
+        let output = normalize_spacing(input);
+        assert_eq!(output, "```\n| A | B |\n| 1 | 2 |\ncode\n```");
+    }
+
+    #[test]
+    fn test_normalize_spacing_table_at_end() {
+        let input = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let output = normalize_spacing(input);
+        assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |");
     }
 }

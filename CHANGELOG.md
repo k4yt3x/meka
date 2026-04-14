@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] - 2026-04-14
+
+### Added
+
+- Output spacing state machine replacing ad-hoc separator flags.
+- Blank line after tables in buffer via `normalize_spacing`.
+- Validation of tool_use/tool_result chains on session resume.
+- Warnings for unparseable messages during session loading.
+
+### Fixed
+
+- Fix missing blank line between tool batches and following text.
+- Fix double blank line after todo list before text responses.
+- Fix table not followed by blank line in bat render mode.
+- Fix `normalize_spacing` splitting tables on incomplete streaming rows.
+- Orphaned tool_use blocks no longer cause API errors on resume.
+
 ## [0.9.3] - 2026-04-13
 
 ### Added

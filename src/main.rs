@@ -694,17 +694,23 @@ async fn load_session_messages(
                         content,
                     });
                 } else {
+                    tracing::warn!(
+                        "failed to parse assistant message as ContentBlock array, treating as text"
+                    );
                     messages.push(provider::Message::assistant_text(&stored_message.content));
                 }
             }
             "tool_results" => {
-                if let Ok(content) =
-                    serde_json::from_str::<Vec<provider::ContentBlock>>(&stored_message.content)
-                {
-                    messages.push(provider::Message {
-                        role: provider::Role::User,
-                        content,
-                    });
+                match serde_json::from_str::<Vec<provider::ContentBlock>>(&stored_message.content) {
+                    Ok(content) => {
+                        messages.push(provider::Message {
+                            role: provider::Role::User,
+                            content,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!("failed to parse tool_results message, dropping: {}", error,);
+                    }
                 }
             }
             _ => {
@@ -713,5 +719,58 @@ async fn load_session_messages(
         }
     }
 
+    // Validate: every assistant ToolUse must be followed by a matching ToolResult.
+    // Drop orphaned assistant messages to prevent API errors.
+    validate_tool_use_chains(&mut messages);
+
     Ok(messages)
+}
+
+fn validate_tool_use_chains(messages: &mut Vec<provider::Message>) {
+    let mut index = 0;
+    while index < messages.len() {
+        if messages[index].role != provider::Role::Assistant {
+            index += 1;
+            continue;
+        }
+
+        let tool_use_ids: Vec<String> = messages[index]
+            .content
+            .iter()
+            .filter_map(|block| {
+                if let provider::ContentBlock::ToolUse { id, .. } = block {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if tool_use_ids.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // Check if the next message has matching ToolResult blocks
+        let has_results = messages
+            .get(index + 1)
+            .is_some_and(|next| {
+                next.role == provider::Role::User
+                    && tool_use_ids.iter().all(|id| {
+                        next.content.iter().any(|block| {
+                            matches!(block, provider::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                        })
+                    })
+            });
+
+        if has_results {
+            index += 1;
+        } else {
+            tracing::warn!(
+                "dropping assistant message with orphaned tool_use IDs: {:?}",
+                tool_use_ids,
+            );
+            messages.remove(index);
+        }
+    }
 }
