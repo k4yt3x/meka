@@ -350,8 +350,12 @@ fn handle_approval_request(request: &ToolApprovalRequest) {
 
     eprint!(
         "{} ",
-        format!("[ask] {} {}", display_name, summary.unwrap_or_default())
-            .with(crossterm::style::Color::Magenta)
+        format!(
+            "[ask] {} {}",
+            display_name,
+            summary.unwrap_or_default().replace('\n', " ")
+        )
+        .with(crossterm::style::Color::Magenta)
     );
     eprint!("{}", "(Y/n) ".with(crossterm::style::Color::DarkGrey));
 

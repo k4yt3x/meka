@@ -499,7 +499,8 @@ pub fn render_tool_indicator(name: &str, input: &serde_json::Value) {
     let display_name = tool_display_name(name);
     let indicator = match tool_primary_param(name, input) {
         Some(value) => {
-            let truncated = truncate_display(value, 80);
+            let sanitized = value.replace('\n', " ");
+            let truncated = truncate_display(&sanitized, 80);
             format!("[tool {}(`{}`)]", display_name, truncated)
         }
         None => format!("[tool {}]", display_name),
