@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use html2md::rewrite_html;
 use regex::Regex;
@@ -9,6 +11,26 @@ use crate::provider::ToolDefinition;
 
 use super::util::require_str;
 use super::{Tool, ToolOutput};
+
+// Static CSS selectors for search result parsing (parsed once, reused on every call).
+static DDG_RESULT: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(".result").expect("static CSS selector"));
+static DDG_LINK: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("a.result__a").expect("static CSS selector"));
+static DDG_SNIPPET: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(".result__snippet").expect("static CSS selector"));
+static GOOGLE_BLOCK: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("div.g").expect("static CSS selector"));
+static GOOGLE_TITLE: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("h3").expect("static CSS selector"));
+static GOOGLE_LINK: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("a[href]").expect("static CSS selector"));
+static BING_BLOCK: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(".b_algo").expect("static CSS selector"));
+static BING_TITLE: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse("h2 a").expect("static CSS selector"));
+static BING_SNIPPET: LazyLock<scraper::Selector> =
+    LazyLock::new(|| scraper::Selector::parse(".b_caption p").expect("static CSS selector"));
 
 fn apply_headers(
     mut builder: reqwest::RequestBuilder,
@@ -247,13 +269,10 @@ impl Tool for WebSearchTool {
 
 fn parse_duckduckgo_results(html: &str) -> String {
     let document = scraper::Html::parse_document(html);
-    let result_selector = scraper::Selector::parse(".result").unwrap();
-    let link_selector = scraper::Selector::parse("a.result__a").unwrap();
-    let snippet_selector = scraper::Selector::parse(".result__snippet").unwrap();
     let mut results = Vec::new();
 
-    for block in document.select(&result_selector) {
-        let link = match block.select(&link_selector).next() {
+    for block in document.select(&DDG_RESULT) {
+        let link = match block.select(&DDG_LINK).next() {
             Some(link) => link,
             None => continue,
         };
@@ -275,7 +294,7 @@ fn parse_duckduckgo_results(html: &str) -> String {
         });
 
         let snippet: Option<String> = block
-            .select(&snippet_selector)
+            .select(&DDG_SNIPPET)
             .next()
             .map(|element| element.text().collect());
 
@@ -300,13 +319,10 @@ fn parse_duckduckgo_results(html: &str) -> String {
 
 fn parse_google_results(html: &str) -> String {
     let document = scraper::Html::parse_document(html);
-    let block_selector = scraper::Selector::parse("div.g").unwrap();
-    let title_selector = scraper::Selector::parse("h3").unwrap();
-    let link_selector = scraper::Selector::parse("a[href]").unwrap();
     let mut results = Vec::new();
 
-    for block in document.select(&block_selector) {
-        let title: String = match block.select(&title_selector).next() {
+    for block in document.select(&GOOGLE_BLOCK) {
+        let title: String = match block.select(&GOOGLE_TITLE).next() {
             Some(h3) => h3.text().collect(),
             None => continue,
         };
@@ -314,7 +330,7 @@ fn parse_google_results(html: &str) -> String {
             continue;
         }
 
-        let url = block.select(&link_selector).find_map(|a| {
+        let url = block.select(&GOOGLE_LINK).find_map(|a| {
             a.value()
                 .attr("href")
                 .filter(|href| href.starts_with("http"))
@@ -336,13 +352,10 @@ fn parse_google_results(html: &str) -> String {
 
 fn parse_bing_results(html: &str) -> String {
     let document = scraper::Html::parse_document(html);
-    let block_selector = scraper::Selector::parse(".b_algo").unwrap();
-    let title_selector = scraper::Selector::parse("h2 a").unwrap();
-    let snippet_selector = scraper::Selector::parse(".b_caption p").unwrap();
     let mut results = Vec::new();
 
-    for block in document.select(&block_selector) {
-        let title_element = match block.select(&title_selector).next() {
+    for block in document.select(&BING_BLOCK) {
+        let title_element = match block.select(&BING_TITLE).next() {
             Some(a) => a,
             None => continue,
         };
@@ -358,7 +371,7 @@ fn parse_bing_results(html: &str) -> String {
             .map(|href| href.to_string());
 
         let snippet: Option<String> = block
-            .select(&snippet_selector)
+            .select(&BING_SNIPPET)
             .next()
             .map(|p| p.text().collect());
 

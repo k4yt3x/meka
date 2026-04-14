@@ -415,17 +415,16 @@ impl Provider for OpenAiProvider {
                                                 name: String::new(),
                                                 arguments: String::new(),
                                             });
-                                        if let Some(name) = name {
-                                            if accumulator.name.is_empty() {
-                                                accumulator.name = name.to_string();
-                                            }
+                                        if let Some(name) = name
+                                            && accumulator.name.is_empty()
+                                        {
+                                            accumulator.name = name.to_string();
                                         }
-                                    } else if let Some(name) = name {
-                                        if let Some(accumulator) = tool_call_accumulators.get_mut(&index) {
-                                            if accumulator.name.is_empty() {
-                                                accumulator.name = name.to_string();
-                                            }
-                                        }
+                                    } else if let Some(name) = name
+                                        && let Some(accumulator) = tool_call_accumulators.get_mut(&index)
+                                        && accumulator.name.is_empty()
+                                    {
+                                        accumulator.name = name.to_string();
                                     }
 
                                     if let Some(args) = tool_call

@@ -106,7 +106,7 @@ pub async fn save_explicit_scratchpad_results(
     session_manager: &SessionManager,
     session_id: Uuid,
     assistant_message: &Message,
-    results: &mut Vec<ContentBlock>,
+    results: &mut [ContentBlock],
 ) -> Result<()> {
     let tool_use_map = build_tool_use_map(assistant_message);
 
@@ -151,7 +151,7 @@ pub async fn persist_oversized_results(
     session_manager: &SessionManager,
     session_id: Uuid,
     assistant_message: &Message,
-    results: &mut Vec<ContentBlock>,
+    results: &mut [ContentBlock],
 ) -> Result<()> {
     let tool_use_map = build_tool_use_map(assistant_message);
     let mut counter: usize = 0;

@@ -120,9 +120,9 @@ impl ContentBlock {
     pub fn tool_result_text_content(content: &[ToolResultContent]) -> String {
         content
             .iter()
-            .filter_map(|block| match block {
-                ToolResultContent::Text { text } => Some(text.as_str()),
-                ToolResultContent::Image { .. } => Some("[Image]"),
+            .map(|block| match block {
+                ToolResultContent::Text { text } => text.as_str(),
+                ToolResultContent::Image { .. } => "[Image]",
             })
             .collect::<Vec<_>>()
             .join("")
@@ -275,6 +275,7 @@ fn finalize_tool_call_accumulators(
     has_tools
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_provider(
     provider_name: &str,
     credential: AuthCredential,

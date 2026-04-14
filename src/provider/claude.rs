@@ -336,6 +336,7 @@ fn model_supports_adaptive_thinking(model: &str) -> bool {
 }
 
 impl ClaudeProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         credential: AuthCredential,
         model: String,
@@ -530,7 +531,7 @@ impl ClaudeProvider {
                     .content
                     .iter()
                     .enumerate()
-                    .filter_map(|(block_index, block)| {
+                    .map(|(block_index, block)| {
                         let mut value = match block {
                             ContentBlock::Text { text } => {
                                 serde_json::json!({
@@ -573,16 +574,17 @@ impl ClaudeProvider {
                             }
                         };
 
-                        if is_last_message && block_index + 1 == block_count {
-                            if let Some(obj) = value.as_object_mut() {
-                                obj.insert(
-                                    "cache_control".to_string(),
-                                    serde_json::json!({"type": "ephemeral"}),
-                                );
-                            }
+                        if is_last_message
+                            && block_index + 1 == block_count
+                            && let Some(obj) = value.as_object_mut()
+                        {
+                            obj.insert(
+                                "cache_control".to_string(),
+                                serde_json::json!({"type": "ephemeral"}),
+                            );
                         }
 
-                        Some(value)
+                        value
                     })
                     .collect();
 
@@ -599,25 +601,23 @@ impl ClaudeProvider {
             .iter_mut()
             .rev()
             .find(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-        {
-            if let Some(content) = last_assistant
+            && let Some(content) = last_assistant
                 .get_mut("content")
                 .and_then(|c| c.as_array_mut())
+        {
+            while content
+                .last()
+                .and_then(|b| b.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("thinking")
             {
-                while content
-                    .last()
-                    .and_then(|b| b.get("type"))
-                    .and_then(|t| t.as_str())
-                    == Some("thinking")
-                {
-                    content.pop();
-                }
-                if content.is_empty() {
-                    content.push(serde_json::json!({
-                        "type": "text",
-                        "text": "[No message content]"
-                    }));
-                }
+                content.pop();
+            }
+            if content.is_empty() {
+                content.push(serde_json::json!({
+                    "type": "text",
+                    "text": "[No message content]"
+                }));
             }
         }
 
@@ -698,13 +698,13 @@ impl ClaudeProvider {
                         "description": tool.description,
                         "input_schema": tool.parameters,
                     });
-                    if index + 1 == tool_count {
-                        if let Some(obj) = schema.as_object_mut() {
-                            obj.insert(
-                                "cache_control".to_string(),
-                                serde_json::json!({"type": "ephemeral"}),
-                            );
-                        }
+                    if index + 1 == tool_count
+                        && let Some(obj) = schema.as_object_mut()
+                    {
+                        obj.insert(
+                            "cache_control".to_string(),
+                            serde_json::json!({"type": "ephemeral"}),
+                        );
                     }
                     schema
                 })

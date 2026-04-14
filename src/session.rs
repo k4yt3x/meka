@@ -643,6 +643,37 @@ impl SessionManager {
     }
 }
 
+/// RAII guard that unlocks a session when dropped. Ensures the session lock
+/// is released even if the owning scope exits via panic or early return.
+pub struct SessionLockGuard {
+    session_manager: SessionManager,
+    session_id: Uuid,
+}
+
+impl SessionLockGuard {
+    pub fn new(session_manager: SessionManager, session_id: Uuid) -> Self {
+        Self {
+            session_manager,
+            session_id,
+        }
+    }
+}
+
+impl Drop for SessionLockGuard {
+    fn drop(&mut self) {
+        let manager = self.session_manager.clone();
+        let id = self.session_id;
+        // Spawn a blocking task to unlock asynchronously. This is fire-and-forget
+        // because we're in a Drop impl and can't await. The `is_process_alive`
+        // check in `lock_session` provides a secondary safety net if this fails.
+        tokio::task::spawn(async move {
+            if let Err(error) = manager.unlock_session(id).await {
+                tracing::warn!("failed to unlock session on drop: {}", error);
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct TokenStore {
     connection: Arc<Connection>,
@@ -793,6 +824,9 @@ fn is_process_alive(pid_str: &str) -> bool {
 
     #[cfg(unix)]
     {
+        // SAFETY: `kill(pid, 0)` with signal 0 does not send a signal; it only
+        // checks whether the process exists and is reachable. The `u32 → i32`
+        // cast is safe because PIDs on Linux/macOS never exceed `i32::MAX`.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 

@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- CI workflow for `cargo fmt --check`, `cargo clippy`, and `cargo test`.
+- Tests for `validate_tool_use_chains` in session resume.
+- `SessionLockGuard` for panic-safe session unlocking.
+
+### Changed
+
+- Replace `let _ =` silent error discards with explicit handling.
+- Extract CSS selectors to `LazyLock` statics in web search parsing.
+- Deduplicate tool registration via shared `register_core_tools` helper.
+- Replace busy-wait polling with blocking `recv()` in REPL event loop.
+- Flatten `execute_tool_calls` into smaller helper methods.
+- Resolve all clippy warnings (collapsible ifs, ptr_arg, etc.).
+
+### Fixed
+
+- Add `// SAFETY:` comment to `libc::kill` in session locking.
+
 ## [0.10.1] - 2026-04-14
 
 ### Fixed

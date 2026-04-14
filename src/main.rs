@@ -145,7 +145,7 @@ async fn create_agent_from_config(
     token_store: TokenStore,
     credential: AuthCredential,
     mcp_manager: Option<&mcp::McpClientManager>,
-    approval_sender: Option<std::sync::mpsc::SyncSender<shell::ToolApprovalRequest>>,
+    approval_sender: Option<std::sync::mpsc::Sender<shell::AgentToShellEvent>>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
@@ -325,9 +325,9 @@ async fn run_interactive(
     }
 
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ShellEvent>();
-    let (agent_done_sender, agent_done_receiver) = std::sync::mpsc::channel::<()>();
-    let (approval_sender, approval_receiver) =
-        std::sync::mpsc::sync_channel::<shell::ToolApprovalRequest>(1);
+    let (agent_event_sender, agent_event_receiver) =
+        std::sync::mpsc::channel::<shell::AgentToShellEvent>();
+    let approval_sender = agent_event_sender.clone();
 
     let repl_permission = shared_permission.clone();
     let show_path_in_prompt = config.show_path_in_prompt;
@@ -336,8 +336,7 @@ async fn run_interactive(
             repl_permission,
             show_path_in_prompt,
             input_sender,
-            agent_done_receiver,
-            approval_receiver,
+            agent_event_receiver,
         );
     });
 
@@ -351,7 +350,7 @@ async fn run_interactive(
             eprintln!(
                 "Or set AGSH_PROVIDER, AGSH_MODEL, and OPENAI_API_KEY environment variables."
             );
-            drop(agent_done_sender);
+            drop(agent_event_sender);
             repl_handle.await?;
             return Ok(());
         }
@@ -375,7 +374,7 @@ async fn run_interactive(
             eprintln!(
                 "Or set AGSH_PROVIDER, AGSH_MODEL, and OPENAI_API_KEY environment variables."
             );
-            drop(agent_done_sender);
+            drop(agent_event_sender);
             repl_handle.await?;
             return Ok(());
         }
@@ -414,7 +413,10 @@ async fn run_interactive(
 
                 signal_handle.abort();
 
-                if agent_done_sender.send(()).is_err() {
+                if agent_event_sender
+                    .send(shell::AgentToShellEvent::Done)
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -445,7 +447,10 @@ async fn run_interactive(
                     _ => {}
                 }
 
-                if agent_done_sender.send(()).is_err() {
+                if agent_event_sender
+                    .send(shell::AgentToShellEvent::Done)
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -455,17 +460,17 @@ async fn run_interactive(
         }
     }
 
-    drop(agent_done_sender);
+    drop(agent_event_sender);
     repl_handle.await?;
 
-    if let Some(id) = session_id {
-        if let Err(error) = session_manager.unlock_session(id).await {
-            tracing::warn!("failed to unlock session: {}", error);
-        }
+    // Create a lock guard for the session so it gets unlocked even on panic.
+    // The guard's Drop impl spawns an async unlock task.
+    let _lock_guard = session_id.map(|id| {
         if config.show_session_id_on_exit {
             render::render_session_id("Leaving session", &id.to_string());
         }
-    }
+        session::SessionLockGuard::new(session_manager, id)
+    });
 
     if let Some(manager) = mcp_manager {
         manager.shutdown().await;
@@ -691,8 +696,12 @@ fn reprint_last_message(messages: &[provider::Message], render_mode: render::Ren
 
     render::render_hint("Last message:");
     let mut renderer = render::StreamingRenderer::new(render_mode);
-    let _ = renderer.push_delta(&text);
-    let _ = renderer.finish();
+    if let Err(error) = renderer.push_delta(&text) {
+        tracing::debug!("failed to render last message delta: {}", error);
+    }
+    if let Err(error) = renderer.finish() {
+        tracing::debug!("failed to finish rendering last message: {}", error);
+    }
     println!();
 }
 
@@ -828,5 +837,112 @@ fn validate_tool_use_chains(messages: &mut Vec<provider::Message>) {
             );
             messages.remove(index);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_msg(text: &str) -> provider::Message {
+        provider::Message::user(text)
+    }
+
+    fn assistant_text(text: &str) -> provider::Message {
+        provider::Message::assistant_text(text)
+    }
+
+    fn assistant_tool_use(id: &str, name: &str) -> provider::Message {
+        provider::Message {
+            role: provider::Role::Assistant,
+            content: vec![provider::ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: serde_json::json!({}),
+            }],
+        }
+    }
+
+    fn tool_result(tool_use_id: &str) -> provider::Message {
+        provider::Message {
+            role: provider::Role::User,
+            content: vec![provider::ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: vec![provider::ToolResultContent::Text {
+                    text: "ok".to_string(),
+                }],
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_validate_valid_chain() {
+        let mut messages = vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "read_file"),
+            tool_result("c1"),
+            assistant_text("done"),
+        ];
+        validate_tool_use_chains(&mut messages);
+        assert_eq!(messages.len(), 4);
+    }
+
+    #[test]
+    fn test_validate_orphaned_tool_use_dropped() {
+        let mut messages = vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "read_file"),
+            // Missing tool_result for c1
+            assistant_text("done"),
+        ];
+        validate_tool_use_chains(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, provider::Role::User);
+        assert_eq!(messages[1].role, provider::Role::Assistant);
+        assert_eq!(messages[1].text_content(), "done");
+    }
+
+    #[test]
+    fn test_validate_orphaned_at_end() {
+        let mut messages = vec![user_msg("hello"), assistant_tool_use("c1", "read_file")];
+        validate_tool_use_chains(&mut messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text_content(), "hello");
+    }
+
+    #[test]
+    fn test_validate_mismatched_ids() {
+        let mut messages = vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "read_file"),
+            tool_result("c2"), // Wrong ID
+        ];
+        validate_tool_use_chains(&mut messages);
+        // The assistant message should be dropped because c1 has no matching result
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_text_only_preserved() {
+        let mut messages = vec![user_msg("hello"), assistant_text("hi"), user_msg("bye")];
+        validate_tool_use_chains(&mut messages);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn test_validate_multiple_chains() {
+        let mut messages = vec![
+            user_msg("start"),
+            assistant_tool_use("c1", "read_file"),
+            tool_result("c1"),
+            assistant_tool_use("c2", "write_file"),
+            // Missing tool_result for c2
+            assistant_text("done"),
+        ];
+        validate_tool_use_chains(&mut messages);
+        // c2 should be dropped, rest preserved
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[3].text_content(), "done");
     }
 }

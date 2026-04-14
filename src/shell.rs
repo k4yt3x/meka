@@ -118,6 +118,14 @@ pub struct ToolApprovalRequest {
     pub response_sender: std::sync::mpsc::SyncSender<bool>,
 }
 
+/// Messages sent from the agent to the REPL thread. Using a single channel
+/// instead of two separate ones allows the REPL to block on `recv()` rather
+/// than busy-polling with `try_recv()` + `sleep`.
+pub enum AgentToShellEvent {
+    Done,
+    ApprovalRequest(ToolApprovalRequest),
+}
+
 fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     let input = input.strip_prefix('/')?;
     let mut parts = input.splitn(2, char::is_whitespace);
@@ -158,8 +166,7 @@ pub fn run_repl(
     shared_permission: SharedPermission,
     show_path_in_prompt: bool,
     input_sender: tokio::sync::mpsc::UnboundedSender<ShellEvent>,
-    agent_done_receiver: std::sync::mpsc::Receiver<()>,
-    approval_receiver: std::sync::mpsc::Receiver<ToolApprovalRequest>,
+    agent_event_receiver: std::sync::mpsc::Receiver<AgentToShellEvent>,
 ) {
     let mut editor = build_reedline_editor();
     let prompt = AgshPrompt {
@@ -237,7 +244,7 @@ pub fn run_repl(
                             if input_sender.send(ShellEvent::Command(command)).is_err() {
                                 break;
                             }
-                            if !wait_for_agent(&agent_done_receiver, &approval_receiver) {
+                            if !wait_for_agent(&agent_event_receiver) {
                                 break;
                             }
                             continue;
@@ -296,7 +303,7 @@ pub fn run_repl(
                     break;
                 }
 
-                if !wait_for_agent(&agent_done_receiver, &approval_receiver) {
+                if !wait_for_agent(&agent_event_receiver) {
                     break;
                 }
             }
@@ -322,31 +329,15 @@ pub fn run_repl(
 
 /// Wait for the agent to signal it is done, while also handling tool approval
 /// requests that arrive in Ask mode.
-fn wait_for_agent(
-    agent_done_receiver: &std::sync::mpsc::Receiver<()>,
-    approval_receiver: &std::sync::mpsc::Receiver<ToolApprovalRequest>,
-) -> bool {
-    use std::sync::mpsc::TryRecvError;
-    use std::time::Duration;
-
+fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToShellEvent>) -> bool {
     loop {
-        // Check if the agent is done
-        match agent_done_receiver.try_recv() {
-            Ok(()) => return true,
-            Err(TryRecvError::Disconnected) => return false,
-            Err(TryRecvError::Empty) => {}
-        }
-
-        // Check for approval requests
-        match approval_receiver.try_recv() {
-            Ok(request) => {
+        match agent_event_receiver.recv() {
+            Ok(AgentToShellEvent::Done) => return true,
+            Ok(AgentToShellEvent::ApprovalRequest(request)) => {
                 handle_approval_request(&request);
             }
-            Err(TryRecvError::Disconnected) => return false,
-            Err(TryRecvError::Empty) => {}
+            Err(_) => return false,
         }
-
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -364,7 +355,9 @@ fn handle_approval_request(request: &ToolApprovalRequest) {
     );
     eprint!("{}", "(Y/n) ".with(crossterm::style::Color::DarkGrey));
 
-    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if let Err(error) = std::io::Write::flush(&mut std::io::stderr()) {
+        tracing::debug!("failed to flush stderr: {}", error);
+    }
 
     let mut response = String::new();
     let allowed = match std::io::stdin().read_line(&mut response) {
@@ -375,7 +368,12 @@ fn handle_approval_request(request: &ToolApprovalRequest) {
         Err(_) => false,
     };
 
-    let _ = request.response_sender.send(allowed);
+    if let Err(error) = request.response_sender.send(allowed) {
+        tracing::warn!(
+            "failed to send approval response (agent disconnected): {}",
+            error
+        );
+    }
 }
 
 fn shorten_path_with_tilde(path: &Path) -> String {

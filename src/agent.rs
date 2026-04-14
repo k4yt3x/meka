@@ -36,11 +36,12 @@ pub struct Agent {
     options: AgentOptions,
     todo_list: SharedTodoList,
     shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
-    approval_sender: Option<std::sync::mpsc::SyncSender<crate::shell::ToolApprovalRequest>>,
+    approval_sender: Option<std::sync::mpsc::Sender<crate::shell::AgentToShellEvent>>,
     last_input_tokens: std::sync::atomic::AtomicU64,
 }
 
 impl Agent {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<dyn Provider>,
         tool_registry: ToolRegistry,
@@ -49,7 +50,7 @@ impl Agent {
         options: AgentOptions,
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
-        approval_sender: Option<std::sync::mpsc::SyncSender<crate::shell::ToolApprovalRequest>>,
+        approval_sender: Option<std::sync::mpsc::Sender<crate::shell::AgentToShellEvent>>,
     ) -> Self {
         Self {
             provider,
@@ -362,10 +363,8 @@ impl Agent {
                     }
                 }
                 StreamEvent::TextDelta(text) => {
-                    if !renderer.started {
-                        if spacing.before_text() {
-                            println!();
-                        }
+                    if !renderer.started && spacing.before_text() {
+                        println!();
                     }
                     current_text.push_str(&text);
                     renderer.push_delta(&text)?;
@@ -460,117 +459,9 @@ impl Agent {
                     render::render_tool_indicator(name, input);
                 }
 
-                let output = match self.tool_registry.get(name) {
-                    None => {
-                        let error_msg = format!("Unknown tool: '{}'", name);
-                        crate::tools::ToolOutput::text(error_msg, true)
-                    }
-                    // Auto-activate deferred tools on first use so their full
-                    // schema appears in subsequent API calls.
-                    Some(_) if self.tool_registry.is_deferred(name) => {
-                        self.tool_registry.activate(name);
-                        // Fall through to execute below by re-getting
-                        match self.tool_registry.get(name) {
-                            Some(tool) => {
-                                match tool.execute(input.clone(), cancellation.clone()).await {
-                                    Ok(output) => output,
-                                    Err(AgshError::Interrupted) => crate::tools::ToolOutput::text(
-                                        "Tool execution interrupted.".to_string(),
-                                        true,
-                                    ),
-                                    Err(error) => crate::tools::ToolOutput::text(
-                                        format!("Tool error: {}", error),
-                                        true,
-                                    ),
-                                }
-                            }
-                            None => crate::tools::ToolOutput::text(
-                                format!("Unknown tool: '{}'", name),
-                                true,
-                            ),
-                        }
-                    }
-                    Some(tool) => {
-                        let required = tool.required_permission();
-                        if !permission.allows(required) {
-                            let error_msg = format!(
-                                "Permission denied: '{}' requires {} permission, current: {}",
-                                name, required, permission
-                            );
-                            crate::tools::ToolOutput::text(error_msg, true)
-                        } else if permission == crate::permission::Permission::Ask {
-                            // In Ask mode, prompt user for each tool call
-                            match &self.approval_sender {
-                                Some(sender) => {
-                                    let (response_sender, response_receiver) =
-                                        std::sync::mpsc::sync_channel(1);
-                                    let request = crate::shell::ToolApprovalRequest {
-                                        tool_name: name.clone(),
-                                        tool_input: input.clone(),
-                                        response_sender,
-                                    };
-                                    if sender.send(request).is_err() {
-                                        crate::tools::ToolOutput::text(
-                                            "Failed to request approval (shell disconnected)"
-                                                .to_string(),
-                                            true,
-                                        )
-                                    } else {
-                                        match response_receiver.recv() {
-                                            Ok(true) => {
-                                                match tool
-                                                    .execute(input.clone(), cancellation.clone())
-                                                    .await
-                                                {
-                                                    Ok(output) => output,
-                                                    Err(AgshError::Interrupted) => {
-                                                        crate::tools::ToolOutput::text(
-                                                            "Tool execution interrupted."
-                                                                .to_string(),
-                                                            true,
-                                                        )
-                                                    }
-                                                    Err(error) => crate::tools::ToolOutput::text(
-                                                        format!("Tool error: {}", error),
-                                                        true,
-                                                    ),
-                                                }
-                                            }
-                                            Ok(false) => crate::tools::ToolOutput::text(
-                                                "User denied tool execution.".to_string(),
-                                                true,
-                                            ),
-                                            Err(_) => crate::tools::ToolOutput::text(
-                                                "Failed to receive approval response.".to_string(),
-                                                true,
-                                            ),
-                                        }
-                                    }
-                                }
-                                None => {
-                                    // No approval channel (oneshot mode) — deny
-                                    crate::tools::ToolOutput::text(
-                                        "Ask mode requires interactive shell for tool approval."
-                                            .to_string(),
-                                        true,
-                                    )
-                                }
-                            }
-                        } else {
-                            match tool.execute(input.clone(), cancellation.clone()).await {
-                                Ok(output) => output,
-                                Err(AgshError::Interrupted) => crate::tools::ToolOutput::text(
-                                    "Tool execution interrupted.".to_string(),
-                                    true,
-                                ),
-                                Err(error) => crate::tools::ToolOutput::text(
-                                    format!("Tool error: {}", error),
-                                    true,
-                                ),
-                            }
-                        }
-                    }
-                };
+                let output = self
+                    .resolve_and_execute_tool(name, input, permission, cancellation.clone())
+                    .await;
 
                 // If todo_write was called with a non-empty list, the rendered
                 // todo list has its own trailing blank line on stderr.
@@ -587,6 +478,100 @@ impl Agent {
         }
 
         results
+    }
+
+    async fn resolve_and_execute_tool(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        permission: crate::permission::Permission,
+        cancellation: CancellationToken,
+    ) -> crate::tools::ToolOutput {
+        // Auto-activate deferred tools on first use so their full schema
+        // appears in subsequent API calls.
+        if self.tool_registry.is_deferred(name) {
+            self.tool_registry.activate(name);
+        }
+
+        let Some(tool) = self.tool_registry.get(name) else {
+            return crate::tools::ToolOutput::text(format!("Unknown tool: '{}'", name), true);
+        };
+
+        let required = tool.required_permission();
+        if !permission.allows(required) {
+            return crate::tools::ToolOutput::text(
+                format!(
+                    "Permission denied: '{}' requires {} permission, current: {}",
+                    name, required, permission
+                ),
+                true,
+            );
+        }
+
+        if permission == crate::permission::Permission::Ask {
+            return self
+                .execute_with_approval(tool, name, input, cancellation)
+                .await;
+        }
+
+        Self::run_tool(tool, input, cancellation).await
+    }
+
+    async fn execute_with_approval(
+        &self,
+        tool: &dyn crate::tools::Tool,
+        name: &str,
+        input: &serde_json::Value,
+        cancellation: CancellationToken,
+    ) -> crate::tools::ToolOutput {
+        let Some(sender) = &self.approval_sender else {
+            return crate::tools::ToolOutput::text(
+                "Ask mode requires interactive shell for tool approval.".to_string(),
+                true,
+            );
+        };
+
+        let (response_sender, response_receiver) = std::sync::mpsc::sync_channel(1);
+        let request = crate::shell::ToolApprovalRequest {
+            tool_name: name.to_string(),
+            tool_input: input.clone(),
+            response_sender,
+        };
+
+        if sender
+            .send(crate::shell::AgentToShellEvent::ApprovalRequest(request))
+            .is_err()
+        {
+            return crate::tools::ToolOutput::text(
+                "Failed to request approval (shell disconnected)".to_string(),
+                true,
+            );
+        }
+
+        match response_receiver.recv() {
+            Ok(true) => Self::run_tool(tool, input, cancellation).await,
+            Ok(false) => {
+                crate::tools::ToolOutput::text("User denied tool execution.".to_string(), true)
+            }
+            Err(_) => crate::tools::ToolOutput::text(
+                "Failed to receive approval response.".to_string(),
+                true,
+            ),
+        }
+    }
+
+    async fn run_tool(
+        tool: &dyn crate::tools::Tool,
+        input: &serde_json::Value,
+        cancellation: CancellationToken,
+    ) -> crate::tools::ToolOutput {
+        match tool.execute(input.clone(), cancellation).await {
+            Ok(output) => output,
+            Err(AgshError::Interrupted) => {
+                crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
+            }
+            Err(error) => crate::tools::ToolOutput::text(format!("Tool error: {}", error), true),
+        }
     }
 
     pub async fn compact_session(
@@ -725,18 +710,18 @@ impl Agent {
         }
         drop(todos);
 
-        if let Ok(entries) = self.session_manager.list_tool_outputs(session_id).await {
-            if !entries.is_empty() {
-                let mut listing = String::from("[Scratchpad entries]\n");
-                for entry in &entries {
-                    listing.push_str(&format!(
-                        "- \"{}\" ({})\n",
-                        entry.name,
-                        crate::tools::scratchpad::format_size(entry.size),
-                    ));
-                }
-                parts.push(listing);
+        if let Ok(entries) = self.session_manager.list_tool_outputs(session_id).await
+            && !entries.is_empty()
+        {
+            let mut listing = String::from("[Scratchpad entries]\n");
+            for entry in &entries {
+                listing.push_str(&format!(
+                    "- \"{}\" ({})\n",
+                    entry.name,
+                    crate::tools::scratchpad::format_size(entry.size),
+                ));
             }
+            parts.push(listing);
         }
 
         parts.join("\n")
@@ -807,7 +792,7 @@ fn has_tool_results(content: &[ContentBlock]) -> bool {
 
 /// Preprocess message content blocks for the compaction summarizer:
 /// replace images with "[image]" markers and truncate large text blocks.
-fn strip_images_and_truncate(content: &mut Vec<ContentBlock>) {
+fn strip_images_and_truncate(content: &mut [ContentBlock]) {
     use crate::provider::ToolResultContent;
 
     const MAX_TEXT_CHARS: usize = 2000;

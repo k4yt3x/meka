@@ -125,6 +125,39 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Register the core tools shared by the main agent and sub-agents:
+    /// file I/O, search, web, and shell execution.
+    fn register_core_tools(
+        &mut self,
+        user_agent: &str,
+        shared_permission: crate::permission::SharedPermission,
+        sandbox_enabled: bool,
+        sandbox_capability: crate::sandbox::SandboxCapability,
+    ) {
+        let read_tracker: ReadTracker = Arc::new(RwLock::new(HashSet::new()));
+        self.register(Box::new(file::ReadFileTool {
+            read_tracker: read_tracker.clone(),
+        }));
+        self.register(Box::new(file::EditFileTool { read_tracker }));
+        self.register(Box::new(file::WriteFileTool));
+        self.register(Box::new(search::FindFilesTool));
+        self.register(Box::new(search::SearchContentsTool));
+        let web_client = reqwest::Client::builder()
+            .user_agent(user_agent)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        self.register(Box::new(web::FetchUrlTool {
+            client: web_client.clone(),
+        }));
+        self.register(Box::new(web::WebSearchTool { client: web_client }));
+        self.register(Box::new(shell::ExecuteCommandTool {
+            sandbox_capability,
+            shared_permission,
+            sandbox_enabled,
+        }));
+    }
+
     pub fn build_default(
         user_agent: String,
         shared_permission: crate::permission::SharedPermission,
@@ -135,28 +168,12 @@ impl ToolRegistry {
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
     ) -> Self {
         let mut registry = Self::new();
-        let read_tracker: ReadTracker = Arc::new(RwLock::new(HashSet::new()));
-        registry.register(Box::new(file::ReadFileTool {
-            read_tracker: read_tracker.clone(),
-        }));
-        registry.register(Box::new(file::EditFileTool { read_tracker }));
-        registry.register(Box::new(file::WriteFileTool));
-        registry.register(Box::new(search::FindFilesTool));
-        registry.register(Box::new(search::SearchContentsTool));
-        let web_client = reqwest::Client::builder()
-            .user_agent(&user_agent)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        registry.register(Box::new(web::FetchUrlTool {
-            client: web_client.clone(),
-        }));
-        registry.register(Box::new(web::WebSearchTool { client: web_client }));
-        registry.register(Box::new(shell::ExecuteCommandTool {
-            sandbox_capability,
+        registry.register_core_tools(
+            &user_agent,
             shared_permission,
             sandbox_enabled,
-        }));
+            sandbox_capability,
+        );
         registry.register(Box::new(todo::TodoWriteTool { todo_list }));
         registry.register(Box::new(scratchpad::ScratchpadWriteTool {
             session_manager: session_manager.clone(),
@@ -194,28 +211,12 @@ impl ToolRegistry {
         sandbox_capability: crate::sandbox::SandboxCapability,
     ) -> Self {
         let mut registry = Self::new();
-        let read_tracker: ReadTracker = Arc::new(RwLock::new(HashSet::new()));
-        registry.register(Box::new(file::ReadFileTool {
-            read_tracker: read_tracker.clone(),
-        }));
-        registry.register(Box::new(file::EditFileTool { read_tracker }));
-        registry.register(Box::new(file::WriteFileTool));
-        registry.register(Box::new(search::FindFilesTool));
-        registry.register(Box::new(search::SearchContentsTool));
-        let web_client = reqwest::Client::builder()
-            .user_agent(&user_agent)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        registry.register(Box::new(web::FetchUrlTool {
-            client: web_client.clone(),
-        }));
-        registry.register(Box::new(web::WebSearchTool { client: web_client }));
-        registry.register(Box::new(shell::ExecuteCommandTool {
-            sandbox_capability,
+        registry.register_core_tools(
+            &user_agent,
             shared_permission,
             sandbox_enabled,
-        }));
+            sandbox_capability,
+        );
         registry
     }
 }

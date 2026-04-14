@@ -400,7 +400,7 @@ fn normalize_spacing(text: &str) -> String {
 }
 
 fn print_with_bat(text: &str) {
-    let _ = bat::PrettyPrinter::new()
+    if let Err(error) = bat::PrettyPrinter::new()
         .input_from_bytes(text.as_bytes())
         .language("markdown")
         .header(false)
@@ -408,7 +408,10 @@ fn print_with_bat(text: &str) {
         .grid(false)
         .rule(false)
         .wrapping_mode(bat::WrappingMode::NoWrapping(false))
-        .print();
+        .print()
+    {
+        tracing::debug!("bat rendering failed: {}", error);
+    }
 }
 
 fn is_table_line(line: &str) -> bool {

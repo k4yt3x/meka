@@ -327,9 +327,7 @@ pub fn context_window_for_model(model: &str) -> u64 {
         1_047_576
     } else if model.contains("gpt-4o") {
         128_000
-    } else if model.contains("o3") || model.contains("o4-mini") {
-        200_000
-    } else if model.contains("o1") {
+    } else if model.contains("o3") || model.contains("o4-mini") || model.contains("o1") {
         200_000
     } else {
         128_000
