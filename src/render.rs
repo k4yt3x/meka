@@ -109,6 +109,7 @@ pub struct StreamingRenderer {
     mode: RenderMode,
     pub(crate) started: bool,
     raw_table_lines: Vec<String>,
+    code_block_lines: Vec<String>,
 }
 
 impl StreamingRenderer {
@@ -119,6 +120,7 @@ impl StreamingRenderer {
             mode,
             started: false,
             raw_table_lines: Vec::new(),
+            code_block_lines: Vec::new(),
         }
     }
 
@@ -149,16 +151,38 @@ impl StreamingRenderer {
                 if !self.buffer.is_empty() {
                     let remaining = std::mem::take(&mut self.buffer);
                     let trimmed = remaining.trim_end_matches('\n');
+                    let mut needs_newline = false;
                     for line in trimmed.lines() {
-                        if is_table_line(line) {
+                        let is_fence = line.trim_start().starts_with("```");
+
+                        if !self.code_block_lines.is_empty() {
+                            self.code_block_lines.push(line.to_string());
+                            if is_fence {
+                                self.flush_bat_code_block()?;
+                                needs_newline = false;
+                            }
+                        } else if is_fence {
+                            self.flush_bat_table()?;
+                            self.code_block_lines.push(line.to_string());
+                            needs_newline = false;
+                        } else if is_table_line(line) {
                             self.raw_table_lines.push(line.to_string());
+                            needs_newline = false;
+                        } else if line.is_empty() {
+                            self.flush_bat_table()?;
+                            println!();
+                            needs_newline = false;
                         } else {
                             self.flush_bat_table()?;
                             print_with_bat(line);
+                            needs_newline = true;
                         }
                     }
+                    self.flush_bat_code_block()?;
                     self.flush_bat_table()?;
-                    println!();
+                    if needs_newline {
+                        println!();
+                    }
                 }
             }
             RenderMode::Termimad => {
@@ -194,10 +218,24 @@ impl StreamingRenderer {
 
         while let Some(newline_pos) = self.buffer.find('\n') {
             let line = self.buffer[..newline_pos].to_string();
+            let is_fence = line.trim_start().starts_with("```");
 
-            // Don't flush incomplete code blocks or tables from the buffer
-            if self.in_code_block() {
-                break;
+            // If we're inside a code block, accumulate lines
+            if !self.code_block_lines.is_empty() {
+                self.buffer = self.buffer[newline_pos + 1..].to_string();
+                self.code_block_lines.push(line);
+                if is_fence {
+                    self.flush_bat_code_block()?;
+                }
+                continue;
+            }
+
+            // Opening fence starts a new code block
+            if is_fence {
+                self.buffer = self.buffer[newline_pos + 1..].to_string();
+                self.flush_bat_table()?;
+                self.code_block_lines.push(line);
+                continue;
             }
 
             self.buffer = self.buffer[newline_pos + 1..].to_string();
@@ -206,11 +244,27 @@ impl StreamingRenderer {
                 self.raw_table_lines.push(line);
             } else {
                 self.flush_bat_table()?;
-                print_with_bat(&format!("{}\n", line));
+                if line.is_empty() {
+                    println!();
+                } else {
+                    print_with_bat(&format!("{}\n", line));
+                }
                 io::stdout().flush()?;
             }
         }
         Ok(())
+    }
+
+    fn flush_bat_code_block(&mut self) -> io::Result<()> {
+        if self.code_block_lines.is_empty() {
+            return Ok(());
+        }
+
+        let lines = std::mem::take(&mut self.code_block_lines);
+        let block_text = lines.join("\n");
+        print_with_bat(&block_text);
+        println!();
+        io::stdout().flush()
     }
 
     fn flush_bat_table(&mut self) -> io::Result<()> {
