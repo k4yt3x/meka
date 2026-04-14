@@ -100,6 +100,7 @@ pub enum SlashCommand {
     Session,
     Permission(Option<String>),
     Compact,
+    Export,
     Cd(Option<String>),
 }
 
@@ -130,6 +131,7 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "session" => Some(SlashCommand::Session),
         "permission" => Some(SlashCommand::Permission(argument)),
         "compact" => Some(SlashCommand::Compact),
+        "export" => Some(SlashCommand::Export),
         "cd" => Some(SlashCommand::Cd(argument)),
         _ => None,
     }
@@ -143,6 +145,7 @@ fn print_help() {
     eprintln!("  /session                       Show the current session ID");
     eprintln!("  /permission [none|read|ask|write]  Show or set the permission level");
     eprintln!("  /compact                       Summarize and compact the session");
+    eprintln!("  /export                        Export the current session as Markdown");
     eprintln!("  /cd <path>                     Change working directory");
     eprintln!();
     eprintln!("Shortcuts:");
@@ -226,7 +229,11 @@ pub fn run_repl(
                             handle_cd(argument.as_deref().unwrap_or(""));
                             continue;
                         }
-                        Some(command @ (SlashCommand::Session | SlashCommand::Compact)) => {
+                        Some(
+                            command @ (SlashCommand::Session
+                            | SlashCommand::Compact
+                            | SlashCommand::Export),
+                        ) => {
                             if input_sender.send(ShellEvent::Command(command)).is_err() {
                                 break;
                             }
@@ -502,6 +509,14 @@ mod tests {
             Some(SlashCommand::Cd(Some(arg))) => assert_eq!(arg, "/tmp"),
             _ => panic!("expected Cd with argument"),
         }
+    }
+
+    #[test]
+    fn test_parse_slash_command_export() {
+        assert!(matches!(
+            parse_slash_command("/export"),
+            Some(SlashCommand::Export)
+        ));
     }
 
     #[test]

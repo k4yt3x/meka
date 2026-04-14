@@ -809,7 +809,20 @@ fn is_process_alive(pid_str: &str) -> bool {
     }
 }
 
+/// Strip `<context>...</context>` tags from a stored user message,
+/// returning only the actual user input.
+pub fn strip_context_tags(text: &str) -> &str {
+    const CLOSING_TAG: &str = "</context>";
+    if let Some(end) = text.find(CLOSING_TAG) {
+        let after = &text[end + CLOSING_TAG.len()..];
+        after.trim_start_matches('\n')
+    } else {
+        text
+    }
+}
+
 fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let text = strip_context_tags(text);
     let first_line = text.lines().next().unwrap_or("");
     if first_line.chars().count() <= max_chars {
         first_line.to_string()
@@ -1091,6 +1104,50 @@ mod tests {
 
         // Session itself should still exist
         assert!(manager.session_exists(session_id).await.expect("failed"));
+    }
+
+    #[test]
+    fn test_strip_context_tags_with_context() {
+        let input = "<context>\n[Environment context]\nWorking directory: /tmp\nDate: Mon\n</context>\n\nhello world";
+        assert_eq!(strip_context_tags(input), "hello world");
+    }
+
+    #[test]
+    fn test_strip_context_tags_without_context() {
+        let input = "hello world";
+        assert_eq!(strip_context_tags(input), "hello world");
+    }
+
+    #[test]
+    fn test_strip_context_tags_empty_after_context() {
+        let input = "<context>\nstuff\n</context>\n\n";
+        assert_eq!(strip_context_tags(input), "");
+    }
+
+    #[test]
+    fn test_truncate_preview_with_context_tags() {
+        let input = "<context>\n[Environment context]\nWorking directory: /tmp\n</context>\n\nfind all Rust files";
+        assert_eq!(truncate_preview(input, 80), "find all Rust files");
+    }
+
+    #[test]
+    fn test_truncate_preview_without_context_tags() {
+        let input = "find all Rust files";
+        assert_eq!(truncate_preview(input, 80), "find all Rust files");
+    }
+
+    #[test]
+    fn test_truncate_preview_old_format_backward_compat() {
+        let input = "[Environment context]\nWorking directory: /tmp\n\nfind all Rust files";
+        assert_eq!(truncate_preview(input, 80), "[Environment context]");
+    }
+
+    #[test]
+    fn test_truncate_preview_with_context_tags_long_input() {
+        let long_input = format!("<context>\nstuff\n</context>\n\n{}", "x".repeat(100));
+        let preview = truncate_preview(&long_input, 80);
+        assert!(preview.ends_with('…'));
+        assert!(preview.len() <= 84); // 80 chars + "…"
     }
 
     #[tokio::test]

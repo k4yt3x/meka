@@ -316,27 +316,11 @@ async fn run_interactive(
 
     // Resolve session resumption BEFORE spawning the REPL so the
     // "Resuming session" message appears before the first prompt.
-    let (mut session_id, mut messages) = if config.continue_last {
-        match session_manager.last_session_id().await? {
-            Some(id) => {
-                session_manager.lock_session(id).await?;
-                render::render_session_id("Resuming session", &id.to_string());
-                let messages = load_session_messages(&session_manager, id).await?;
-                (Some(id), messages)
-            }
-            None => (None, Vec::new()),
-        }
-    } else if let Some(id) = config.session_id {
-        if !session_manager.session_exists(id).await? {
-            anyhow::bail!("session not found: {}", id);
-        }
-        session_manager.lock_session(id).await?;
-        render::render_session_id("Resuming session", &id.to_string());
-        let messages = load_session_messages(&session_manager, id).await?;
-        (Some(id), messages)
-    } else {
-        (None, Vec::new())
-    };
+    let (mut session_id, mut messages) = resolve_session_resume(&session_manager, &config).await?;
+
+    if !messages.is_empty() {
+        reprint_last_message(&messages, config.render_mode);
+    }
 
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ShellEvent>();
     let (agent_done_sender, agent_done_receiver) = std::sync::mpsc::channel::<()>();
@@ -448,6 +432,14 @@ async fn run_interactive(
                             }
                         }
                     }
+                    shell::SlashCommand::Export => match &session_id {
+                        Some(id) => {
+                            if let Err(error) = export_session(&session_manager, *id, None).await {
+                                eprintln!("Error: {}", error);
+                            }
+                        }
+                        None => eprintln!("No active session to export."),
+                    },
                     _ => {}
                 }
 
@@ -669,6 +661,68 @@ fn resolve_credential(config: &ResolvedConfig) -> anyhow::Result<AuthCredential>
              or CLAUDE_OAUTH_TOKEN env var, or provider.api_key / provider.oauth_token \
              in config file (~/.config/agsh/config.toml)"
         )),
+    }
+}
+
+fn reprint_last_message(messages: &[provider::Message], render_mode: render::RenderMode) {
+    let Some(last) = messages.last() else {
+        return;
+    };
+
+    let text = match last.role {
+        provider::Role::Assistant => {
+            let text = last.text_content();
+            if text.is_empty() {
+                return;
+            }
+            text
+        }
+        provider::Role::User => {
+            let raw = last.text_content();
+            let stripped = session::strip_context_tags(&raw);
+            if stripped.is_empty() {
+                return;
+            }
+            stripped.to_string()
+        }
+    };
+
+    render::render_hint("Last message:");
+    let mut renderer = render::StreamingRenderer::new(render_mode);
+    let _ = renderer.push_delta(&text);
+    let _ = renderer.finish();
+    println!();
+}
+
+async fn resolve_session_resume(
+    session_manager: &SessionManager,
+    config: &ResolvedConfig,
+) -> anyhow::Result<(Option<uuid::Uuid>, Vec<provider::Message>)> {
+    let Some(value) = &config.continue_session else {
+        return Ok((None, Vec::new()));
+    };
+
+    if value == "last" {
+        match session_manager.last_session_id().await? {
+            Some(id) => {
+                session_manager.lock_session(id).await?;
+                render::render_session_id("Resuming session", &id.to_string());
+                let messages = load_session_messages(session_manager, id).await?;
+                Ok((Some(id), messages))
+            }
+            None => Ok((None, Vec::new())),
+        }
+    } else {
+        let id: uuid::Uuid = value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid session ID: {}", value))?;
+        if !session_manager.session_exists(id).await? {
+            anyhow::bail!("session not found: {}", id);
+        }
+        session_manager.lock_session(id).await?;
+        render::render_session_id("Resuming session", &id.to_string());
+        let messages = load_session_messages(session_manager, id).await?;
+        Ok((Some(id), messages))
     }
 }
 

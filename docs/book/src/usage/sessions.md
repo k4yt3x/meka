@@ -11,14 +11,6 @@ Sessions persist your conversation history so you can resume later. Each session
 
 ## Resuming a Session
 
-### By UUID
-
-```bash
-agsh -s 550e8400-e29b-41d4-a716-446655440000
-```
-
-The agent loads the previous conversation history and continues from where you left off.
-
 ### Continue Last Session
 
 ```bash
@@ -26,6 +18,14 @@ agsh -c
 ```
 
 This resumes the most recently updated session.
+
+### By UUID
+
+```bash
+agsh -c 550e8400-e29b-41d4-a716-446655440000
+```
+
+The agent loads the previous conversation history and continues from where you left off.
 
 ## Session Locking
 

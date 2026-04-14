@@ -39,13 +39,10 @@ pub struct Cli {
     /// Run a one-shot prompt and exit
     pub prompt: Option<String>,
 
-    /// Session ID to resume
-    #[arg(short = 's', long = "session")]
-    pub session_id: Option<uuid::Uuid>,
-
-    /// Continue the last session
-    #[arg(short = 'c', long = "continue")]
-    pub continue_last: bool,
+    /// Continue a session. Use -c to resume the last session,
+    /// or -c SESSION_ID to resume a specific session.
+    #[arg(short = 'c', long = "continue", num_args = 0..=1, default_missing_value = "last")]
+    pub continue_session: Option<String>,
 
     /// Initial permission mode (none, read, write)
     #[arg(long = "permission", value_parser = parse_permission)]
@@ -101,8 +98,7 @@ mod tests {
         let cli = Cli::parse_from(["agsh"]);
         assert!(cli.command.is_none());
         assert!(cli.prompt.is_none());
-        assert!(cli.session_id.is_none());
-        assert!(!cli.continue_last);
+        assert!(cli.continue_session.is_none());
         assert!(cli.permission.is_none());
         assert!(cli.provider.is_none());
         assert!(cli.model.is_none());
@@ -116,6 +112,21 @@ mod tests {
     fn test_cli_oneshot_prompt() {
         let cli = Cli::parse_from(["agsh", "hello world"]);
         assert_eq!(cli.prompt.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_cli_continue_last() {
+        let cli = Cli::parse_from(["agsh", "-c"]);
+        assert_eq!(cli.continue_session.as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn test_cli_continue_specific_session() {
+        let cli = Cli::parse_from(["agsh", "-c", "550e8400-e29b-41d4-a716-446655440000"]);
+        assert_eq!(
+            cli.continue_session.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]
@@ -133,7 +144,7 @@ mod tests {
         assert_eq!(cli.provider.as_deref(), Some("openai"));
         assert_eq!(cli.model.as_deref(), Some("gpt-4o"));
         assert!(cli.no_stream);
-        assert!(cli.continue_last);
+        assert_eq!(cli.continue_session.as_deref(), Some("last"));
         assert_eq!(cli.verbosity, 2);
     }
 
@@ -141,6 +152,21 @@ mod tests {
     fn test_cli_permission_flag() {
         let cli = Cli::parse_from(["agsh", "--permission", "write"]);
         assert_eq!(cli.permission, Some(Permission::Write));
+    }
+
+    #[test]
+    fn test_cli_continue_long_form() {
+        let cli = Cli::parse_from(["agsh", "--continue"]);
+        assert_eq!(cli.continue_session.as_deref(), Some("last"));
+    }
+
+    #[test]
+    fn test_cli_continue_long_form_with_id() {
+        let cli = Cli::parse_from(["agsh", "--continue", "550e8400-e29b-41d4-a716-446655440000"]);
+        assert_eq!(
+            cli.continue_session.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]

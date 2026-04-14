@@ -60,27 +60,20 @@ When omitted, agsh starts in interactive mode.
 
 ## Options
 
-### `-s`, `--session <UUID>`
+### `-c`, `--continue [SESSION_ID]`
 
-Resume an existing session by its UUID. The session's message history is loaded and the conversation continues.
+Resume a session. Without a session ID, resumes the most recently updated session. With a session ID, resumes that specific session.
 
 ```bash
-agsh -s 550e8400-e29b-41d4-a716-446655440000
+agsh -c                                          # resume last session
+agsh -c 550e8400-e29b-41d4-a716-446655440000     # resume specific session
 ```
 
 Errors if the session does not exist or is locked by another agsh instance.
 
-### `-c`, `--continue`
-
-Resume the most recently updated session. Equivalent to `-s` with the last session's UUID.
-
-```bash
-agsh -c
-```
-
 ### `--permission <MODE>`
 
-Set the initial permission mode. Accepts `none` (or `n`), `read` (or `r`), `ask` (or `a`), `write` (or `w`). Case-insensitive.
+Set the initial permission mode. Accepts `none` (or `n`), `read` (or `r`), `ask` (or `a`), `write` (or `w`).
 
 ```bash
 agsh --permission write

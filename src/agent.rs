@@ -120,7 +120,12 @@ impl Agent {
             }
         };
         let environment_context = build_environment_context();
-        let augmented_input = format!("{}{}\n{}", todo_context, environment_context, user_input);
+        let context_block = format!("{}{}", todo_context, environment_context);
+        let augmented_input = if context_block.trim().is_empty() {
+            user_input.clone()
+        } else {
+            format!("<context>\n{}</context>\n\n{}", context_block, user_input)
+        };
         let user_message = Message::user(&augmented_input);
         messages.push(user_message);
 
