@@ -87,7 +87,7 @@ impl Tool for SpawnAgentTool {
         let tools = sub_registry.definitions_for_permission(sub_perm);
         let system_prompt = build_subagent_system_prompt(sub_perm, &tools);
 
-        let environment_context = build_environment_context();
+        let environment_context = build_environment_context(sub_perm);
         let augmented_prompt = format!("{}\n{}", environment_context, prompt);
         let mut messages = vec![Message::user(&augmented_prompt)];
 

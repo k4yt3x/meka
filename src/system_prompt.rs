@@ -149,47 +149,53 @@ pub fn build_system_prompt(
         ));
     }
 
-    prompt.push_str("## Environment\n\n");
+    if !matches!(permission, Permission::None) {
+        prompt.push_str("## Environment\n\n");
 
-    if let Ok(shell) = std::env::var("SHELL") {
-        prompt.push_str(&format!("- Shell: {}\n", shell));
-    }
+        if let Ok(shell) = std::env::var("SHELL") {
+            prompt.push_str(&format!("- Shell: {}\n", shell));
+        }
 
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(info) = std::fs::read_to_string("/etc/os-release") {
-            for line in info.lines() {
-                if let Some(name) = line.strip_prefix("PRETTY_NAME=") {
-                    let name = name.trim_matches('"');
-                    prompt.push_str(&format!("- OS: {}\n", name));
-                    break;
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(info) = std::fs::read_to_string("/etc/os-release") {
+                for line in info.lines() {
+                    if let Some(name) = line.strip_prefix("PRETTY_NAME=") {
+                        let name = name.trim_matches('"');
+                        prompt.push_str(&format!("- OS: {}\n", name));
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
+        #[cfg(target_os = "macos")]
         {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !version.is_empty() {
-                prompt.push_str(&format!("- OS: macOS {}\n", version));
+            if let Ok(output) = std::process::Command::new("sw_vers")
+                .arg("-productVersion")
+                .output()
+            {
+                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !version.is_empty() {
+                    prompt.push_str(&format!("- OS: macOS {}\n", version));
+                }
             }
         }
-    }
 
-    #[cfg(target_os = "windows")]
-    {
-        prompt.push_str("- OS: Windows\n");
+        #[cfg(target_os = "windows")]
+        {
+            prompt.push_str("- OS: Windows\n");
+        }
     }
 
     prompt
 }
 
-pub fn build_environment_context() -> String {
+pub fn build_environment_context(permission: Permission) -> String {
+    if permission == Permission::None {
+        return String::new();
+    }
+
     let mut context = String::from("[Environment context]\n");
 
     if let Ok(cwd) = std::env::current_dir() {
@@ -211,6 +217,7 @@ mod tests {
         let prompt = build_system_prompt(Permission::None, &[], false, &[]);
         assert!(prompt.contains("NO tools available"));
         assert!(prompt.contains("Shift+Tab"));
+        assert!(!prompt.contains("## Environment"));
     }
 
     #[test]
@@ -268,10 +275,16 @@ mod tests {
 
     #[test]
     fn test_environment_context() {
-        let context = build_environment_context();
+        let context = build_environment_context(Permission::Read);
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("Working directory:"));
         assert!(context.contains("Date:"));
+    }
+
+    #[test]
+    fn test_environment_context_none_mode() {
+        let context = build_environment_context(Permission::None);
+        assert!(context.is_empty());
     }
 
     #[test]

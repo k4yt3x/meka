@@ -113,6 +113,8 @@ impl Agent {
             }
         }
 
+        let permission = self.shared_permission.get();
+
         let todo_context = {
             let todos = self.todo_list.read().await;
             if todos.is_empty() {
@@ -121,7 +123,7 @@ impl Agent {
                 todo::format_todo_for_context(&todos)
             }
         };
-        let environment_context = build_environment_context();
+        let environment_context = build_environment_context(permission);
         let context_block = format!("{}{}", todo_context, environment_context);
         let augmented_input = if context_block.trim().is_empty() {
             user_input.clone()
@@ -130,8 +132,6 @@ impl Agent {
         };
         let user_message = Message::user(&augmented_input);
         messages.push(user_message);
-
-        let permission = self.shared_permission.get();
         let tools = self.available_tools(permission);
         let deferred_tools = self.deferred_tool_summaries(permission);
         let system_prompt = build_system_prompt(
@@ -699,7 +699,8 @@ impl Agent {
     async fn build_post_compact_context(&self, session_id: Uuid) -> String {
         let mut parts = Vec::new();
 
-        let env = build_environment_context();
+        let permission = self.shared_permission.get();
+        let env = build_environment_context(permission);
         if !env.is_empty() {
             parts.push(env);
         }
