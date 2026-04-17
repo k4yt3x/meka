@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use base64::Engine;
 
 use crate::error::{AgshError, Result};
+use crate::image::{ImageHandling, classify_extension, prepare_image_payload};
 use crate::permission::Permission;
 use crate::provider::{ImageSource, ToolDefinition, ToolResultContent};
 
@@ -21,7 +22,13 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read the contents of a file at the given path.".to_string(),
+            description: "Read the contents of a file at the given path. Supported raster \
+                          image files (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO, HDR, EXR, \
+                          TGA, PNM, QOI, DDS, Farbfeld) are returned as a multimodal \
+                          content block; non-native formats are transparently converted \
+                          to PNG. Only read image files if the current model supports \
+                          vision input."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -68,15 +75,19 @@ impl Tool for ReadFileTool {
             .await
             .unwrap_or_else(|_| PathBuf::from(&path));
 
-        // Detect image files and return multimodal content
+        // Detect image files and return multimodal content, converting
+        // non-native formats (TIFF, ICO, etc.) to PNG along the way.
         let extension = PathBuf::from(&path)
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_lowercase());
 
-        const MAX_IMAGE_RAW_BYTES: usize = 3_750_000;
+        let handling = extension
+            .as_deref()
+            .map(classify_extension)
+            .unwrap_or(ImageHandling::Unsupported);
 
-        if let Some(media_type) = extension.as_deref().and_then(image_media_type) {
+        if !matches!(handling, ImageHandling::Unsupported) {
             let data = tokio::fs::read(&path)
                 .await
                 .map_err(|error| AgshError::ToolExecution {
@@ -84,19 +95,17 @@ impl Tool for ReadFileTool {
                     message: format!("failed to read '{}': {}", path, error),
                 })?;
 
-            if data.len() > MAX_IMAGE_RAW_BYTES {
-                return Ok(ToolOutput::text(
-                    format!(
-                        "Error: image '{}' is too large ({} bytes, max {} bytes / ~5MB base64)",
-                        path,
-                        data.len(),
-                        MAX_IMAGE_RAW_BYTES,
-                    ),
-                    true,
-                ));
-            }
+            let (media_type, payload) = match prepare_image_payload(handling, &data) {
+                Ok(pair) => pair,
+                Err(message) => {
+                    return Ok(ToolOutput::text(
+                        format!("Error: image '{}': {}", path, message),
+                        true,
+                    ));
+                }
+            };
 
-            let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
+            let base64_data = base64::engine::general_purpose::STANDARD.encode(&payload);
 
             self.read_tracker.write().await.insert(canonical);
 
@@ -335,17 +344,6 @@ impl Tool for WriteFileTool {
             format!("Successfully wrote {} bytes to '{}'", content.len(), path),
             false,
         ))
-    }
-}
-
-fn image_media_type(extension: &str) -> Option<&'static str> {
-    match extension {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
     }
 }
 

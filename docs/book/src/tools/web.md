@@ -25,6 +25,24 @@ Fetch a web page and return its content as markdown text.
 - HTTP timeout: 30 seconds.
 - Returns the HTTP status code as an error if the request fails (e.g., 404, 500).
 
+### Image URLs
+
+If the response `Content-Type` is a supported raster image format, `fetch_url` returns a multimodal `Image` content block instead of markdown. No disk is touched — bytes are base64-encoded in memory.
+
+**Provider-native formats** (passed through unchanged):
+- `image/png`, `image/jpeg` (and `image/jpg`), `image/gif`, `image/webp`, `image/bmp` (and `image/x-ms-bmp`)
+
+**Convertible formats** (decoded and re-encoded as PNG transparently):
+- `image/tiff`, `image/vnd.microsoft.icon` / `image/x-icon`, `image/vnd.radiance` (HDR), `image/x-exr`, `image/x-targa`, `image/x-portable-*` (PNM), `image/qoi`, `image/vnd.ms-dds`, `image/x-farbfeld`
+
+**Unsupported formats** (fall through to the text branch): `image/svg+xml`, `image/jxl`, `image/heic`, `image/avif`.
+
+- The `max_length`, `regex`, and `raw` options do **not** apply to image responses.
+- Size cap of ~3.75 MB applies to the **output** bytes (after conversion). Conversion can enlarge an image, so a 1 MB TIFF may produce a larger PNG.
+- Detection uses the response's actual `Content-Type` header, so redirect chains and extension-less URLs are handled correctly.
+
+Only fetch image URLs when the current model supports vision input — text-only models will either error or silently drop the image block.
+
 ---
 
 ## `web_search`

@@ -10,15 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `skill` tool for loading named skills.
-- YAML frontmatter format for skills with `description`, `when_to_use`, `allowed_tools`, `version`, `user_invocable` fields.
+- YAML frontmatter for skills (description, when_to_use, allowed_tools, version, user_invocable).
 - `${AGSH_SKILL_DIR}` and `${AGSH_SESSION_ID}` substitution in skill bodies.
-- `[prompt] instructions` config option for system-wide custom instructions included in every session's system prompt.
+- `[prompt] instructions` config for system-wide instructions injected into every session's prompt.
+- `fetch_url` returns a multimodal Image block for image URLs (sandboxed mode, no disk I/O).
+- `fetch_url` and `read_file` convert TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS, Farbfeld to PNG.
 
 ### Changed
 
-- Skills are now directory-based (`~/.config/agsh/skills/<name>/SKILL.md`) instead of flat `.md` files.
-- Skills section in system prompt lists `description` and `when_to_use` per skill; agent invokes via `skill` tool rather than `read_file`.
-- Expand `find_files` and `search_contents` tool descriptions with guidance to scope searches narrowly and broaden progressively, avoiding slow tree-wide scans and permission-denied noise.
+- Skills are now directory-based (`~/.config/agsh/skills/<name>/SKILL.md`), not flat files.
+- System prompt lists skills by description and when_to_use; agent invokes via `skill` tool.
+- `find_files` and `search_contents` descriptions recommend narrow searches, broadening gradually.
 
 ### Security
 

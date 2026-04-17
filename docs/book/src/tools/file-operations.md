@@ -18,8 +18,19 @@ Read the contents of a file at a given path. Supports text files and images.
 ### Behavior
 
 - When `offset` and `limit` are both omitted, defaults to the first 2000 lines. If the file has more, a truncation notice is appended.
-- Image files (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`) are returned as base64-encoded multimodal content. Images larger than 3.75 MB (~5 MB base64) are rejected.
 - Use `offset`/`limit` to page through large files.
+
+### Image files
+
+Recognized image extensions are returned as base64-encoded multimodal content:
+
+- **Provider-native** (pass-through): `.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`, `.bmp`
+- **Convertible** (decoded and re-encoded as PNG transparently): `.tif`/`.tiff`, `.ico`, `.hdr`, `.exr`, `.tga`, `.pbm`/`.pgm`/`.ppm`/`.pnm`, `.qoi`, `.dds`, `.ff`/`.farbfeld`
+- **Unsupported** (fall through to text read, which will fail on binary): `.svg`, `.jxl`, `.heic`, `.avif`
+
+Images are rejected if the final payload exceeds 3.75 MB (~5 MB base64). Conversion can enlarge an image, so a small TIFF may produce a too-large PNG.
+
+Only read image files when the current model supports vision input — text-only models will either error or silently drop the image block.
 
 ### Examples
 

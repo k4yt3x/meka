@@ -1,13 +1,15 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
+use base64::Engine;
 use html2md::rewrite_html;
 use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgshError, Result};
+use crate::image::{ImageHandling, classify_content_type, prepare_image_payload};
 use crate::permission::Permission;
-use crate::provider::ToolDefinition;
+use crate::provider::{ImageSource, ToolDefinition, ToolResultContent};
 
 use super::util::require_str;
 use super::{Tool, ToolOutput};
@@ -46,6 +48,36 @@ fn apply_headers(
     builder
 }
 
+/// Build the tool output for a fetched image response. Applies size caps
+/// and, if needed, converts the input to PNG before wrapping in the
+/// multimodal Image content block.
+fn build_image_tool_output(url: &str, handling: ImageHandling, bytes: &[u8]) -> ToolOutput {
+    let (media_type, payload) = match prepare_image_payload(handling, bytes) {
+        Ok(pair) => pair,
+        Err(message) => {
+            return ToolOutput::text(format!("Error: image at '{}': {}", url, message), true);
+        }
+    };
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+
+    ToolOutput {
+        content: vec![
+            ToolResultContent::Text {
+                text: format!("[Image fetched from {}]", url),
+            },
+            ToolResultContent::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: media_type.to_string(),
+                    data: encoded,
+                },
+            },
+        ],
+        is_error: false,
+    }
+}
+
 pub(super) struct FetchUrlTool {
     pub client: reqwest::Client,
 }
@@ -55,7 +87,16 @@ impl Tool for FetchUrlTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "fetch_url".to_string(),
-            description: "Fetch a web page and return its content as markdown. Set 'raw' to true to return untreated HTML instead.".to_string(),
+            description: "Fetch a web page and return its content as markdown. Set 'raw' \
+                          to true to return untreated HTML. If the URL resolves to a \
+                          supported raster image (PNG, JPEG, GIF, WebP, BMP, TIFF, \
+                          ICO, HDR, EXR, TGA, PNM, QOI, DDS, or Farbfeld), the image \
+                          is returned as a multimodal content block directly — \
+                          non-native formats are transparently converted to PNG. \
+                          `max_length`, `regex`, and `raw` do not apply to image \
+                          responses. Only fetch image URLs if the current model \
+                          supports vision input."
+                .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -116,6 +157,28 @@ impl Tool for FetchUrlTool {
                 format!("HTTP {} for '{}'", status, url),
                 true,
             ));
+        }
+
+        // If the response is a supported image, return a multimodal Image
+        // block directly rather than running the binary body through html2md.
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let handling = classify_content_type(&content_type);
+        if !matches!(handling, ImageHandling::Unsupported) {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| AgshError::ToolExecution {
+                    tool_name: "fetch_url".to_string(),
+                    message: format!("failed to read image bytes: {}", error),
+                })?;
+
+            return Ok(build_image_tool_output(&url, handling, &bytes));
         }
 
         let html = response
@@ -397,6 +460,9 @@ fn parse_bing_results(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::MAX_IMAGE_RAW_BYTES;
+    use crate::provider::ContentBlock;
+    use image::ImageFormat;
 
     #[test]
     fn test_parse_duckduckgo_results() {
@@ -545,6 +611,63 @@ mod tests {
     #[test]
     fn test_regex_invalid_pattern() {
         assert!(Regex::new(r"[invalid").is_err());
+    }
+
+    #[test]
+    fn test_build_image_tool_output_pass_through_png() {
+        let bytes = b"\x89PNG\r\n\x1a\n".to_vec(); // PNG magic bytes
+        let output = build_image_tool_output(
+            "https://example.com/a.png",
+            ImageHandling::PassThrough(ImageFormat::Png),
+            &bytes,
+        );
+
+        assert!(!output.is_error);
+        assert_eq!(output.content.len(), 2);
+        match &output.content[0] {
+            ToolResultContent::Text { text } => {
+                assert!(text.contains("https://example.com/a.png"));
+            }
+            _ => panic!("first block should be Text"),
+        }
+        match &output.content[1] {
+            ToolResultContent::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&source.data)
+                    .expect("valid base64");
+                assert_eq!(decoded, bytes);
+            }
+            _ => panic!("second block should be Image"),
+        }
+    }
+
+    #[test]
+    fn test_build_image_tool_output_oversized_returns_error() {
+        let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES + 1];
+        let output = build_image_tool_output(
+            "https://example.com/big.png",
+            ImageHandling::PassThrough(ImageFormat::Png),
+            &bytes,
+        );
+
+        assert!(output.is_error);
+        let text = ContentBlock::tool_result_text_content(&output.content);
+        assert!(text.contains("too large"));
+        assert!(text.contains("big.png"));
+    }
+
+    #[test]
+    fn test_build_image_tool_output_at_size_boundary_succeeds() {
+        // Exactly at the cap must not trigger the oversized error.
+        let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES];
+        let output = build_image_tool_output(
+            "https://example.com/edge.jpg",
+            ImageHandling::PassThrough(ImageFormat::Jpeg),
+            &bytes,
+        );
+        assert!(!output.is_error);
     }
 
     #[test]

@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod context;
 mod error;
+mod image;
 mod mcp;
 mod permission;
 mod provider;

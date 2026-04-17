@@ -26,6 +26,7 @@ glob = "0.3"
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 open = "5"
 percent-encoding = "2"
 rand = "0.9"
