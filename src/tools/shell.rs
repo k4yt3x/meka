@@ -271,8 +271,12 @@ mod tests {
         };
         let result = tool
             .execute(
-                // 50 000 "x" characters + newline.
-                serde_json::json!({"command": "printf 'x%.0s' {1..50000}"}),
+                // 50 000 "x" characters. POSIX-portable — uses `head` and `tr`
+                // instead of bash brace expansion so it works under `dash`
+                // (Debian/Ubuntu's default `/bin/sh`) as well as `bash`.
+                serde_json::json!({
+                    "command": "head -c 50000 /dev/zero | tr '\\0' x"
+                }),
                 CancellationToken::new(),
             )
             .await
