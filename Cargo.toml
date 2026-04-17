@@ -37,6 +37,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 scraper = { version = "0.22", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
 sha2 = "0.10"
 termimad = "0.30"
 thiserror = "2"

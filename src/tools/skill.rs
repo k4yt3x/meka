@@ -1,0 +1,168 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::error::{AgshError, Result};
+use crate::permission::Permission;
+use crate::provider::ToolDefinition;
+use crate::skills::{self, Skill};
+
+use super::util::require_str;
+use super::{Tool, ToolOutput};
+
+pub(super) struct SkillTool {
+    pub session_id: Arc<RwLock<Option<Uuid>>>,
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "skill".to_string(),
+            description: "Load the full content of a named skill. Skills are knowledge \
+                          files that document procedures, tools, and non-standard \
+                          knowledge. Call this tool with the skill name (as listed in \
+                          the system prompt) to get its full instructions."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the skill to load"
+                    }
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<ToolOutput> {
+        let name = require_str(&input, "name", "skill")?;
+
+        let skills = skills::discover_skills();
+        let skill = match find_skill(&skills, &name) {
+            Some(skill) => skill,
+            None => {
+                let available: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+                let hint = if available.is_empty() {
+                    "No skills are installed.".to_string()
+                } else {
+                    format!("Available skills: {}", available.join(", "))
+                };
+                return Ok(ToolOutput::text(
+                    format!("Error: skill '{}' not found. {}", name, hint),
+                    true,
+                ));
+            }
+        };
+
+        let session_id = self.session_id.read().await.map(|id| id.to_string());
+
+        let body = skills::load_skill_body(skill, session_id.as_deref()).map_err(|error| {
+            AgshError::ToolExecution {
+                tool_name: "skill".to_string(),
+                message: error,
+            }
+        })?;
+
+        if !skill.allowed_tools.is_empty() {
+            tracing::debug!(
+                "skill '{}' declares allowed_tools: {:?} (not currently enforced)",
+                skill.name,
+                skill.allowed_tools
+            );
+        }
+
+        Ok(ToolOutput::text(body, false))
+    }
+}
+
+fn find_skill<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
+    skills.iter().find(|skill| skill.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn write_skill(root: &Path, name: &str, body: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("SKILL.md"), body).expect("write SKILL.md");
+    }
+
+    #[tokio::test]
+    async fn test_skill_tool_unknown_skill() {
+        let tool = SkillTool {
+            session_id: Arc::new(RwLock::new(None)),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"name": "nonexistent-skill-xyz"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should return Ok with error output");
+
+        assert!(result.is_error);
+        let text = crate::provider::ContentBlock::tool_result_text_content(&result.content);
+        assert!(text.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_tool_missing_name() {
+        let tool = SkillTool {
+            session_id: Arc::new(RwLock::new(None)),
+        };
+        let result = tool
+            .execute(serde_json::json!({}), CancellationToken::new())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_skill() {
+        let skill = Skill {
+            name: "foo".to_string(),
+            source_dir: std::path::PathBuf::from("/tmp"),
+            description: "desc".to_string(),
+            when_to_use: "use".to_string(),
+            allowed_tools: Vec::new(),
+            version: None,
+            user_invocable: true,
+            body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
+        };
+        let skills = vec![skill];
+        assert!(find_skill(&skills, "foo").is_some());
+        assert!(find_skill(&skills, "bar").is_none());
+    }
+
+    // Exercise the happy-path flow by pointing the tool at a temp dir via env
+    // override. Since `discover_skills` uses `dirs::config_dir`, we can't easily
+    // override it without environment trickery; the skills.rs tests already
+    // cover the loading logic end-to-end.
+    #[test]
+    fn test_write_skill_helper() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(
+            temp.path(),
+            "test",
+            "---\ndescription: x\nwhen_to_use: y\n---\nbody\n",
+        );
+        assert!(temp.path().join("test/SKILL.md").exists());
+    }
+}

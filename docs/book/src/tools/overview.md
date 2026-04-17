@@ -21,6 +21,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`scratchpad_edit`](./scratchpad.md#scratchpad_edit) | Read | Edit a scratchpad entry |
 | [`scratchpad_list`](./scratchpad.md#scratchpad_list) | Read | List scratchpad entries |
 | [`scratchpad_delete`](./scratchpad.md#scratchpad_delete) | Read | Delete a scratchpad entry |
+| [`skill`](./overview.md#skill) | Read | Load a named skill's instructions |
 
 ## Permission Requirements
 
@@ -29,7 +30,7 @@ Tools are grouped by the minimum permission level required:
 **Read permission** (available in read, ask, and write modes):
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`
 - `execute_command` (sandboxed, filesystem write-protected)
-- `todo_write`, `spawn_agent`
+- `todo_write`, `spawn_agent`, `skill`
 - All scratchpad tools
 
 **Write permission** (only available in write mode):
@@ -65,3 +66,7 @@ A built-in tool for managing a structured task list during a session. The agent 
 ## `spawn_agent`
 
 Spawns a read-only sub-agent to perform research or analysis tasks. The sub-agent has access to the same tools (except `spawn_agent` and `todo_write`) and returns a report. This is useful for delegating exploration without polluting the main conversation context.
+
+## `skill`
+
+Loads a named skill's instructions. Skills are user-defined knowledge packages stored in `~/.config/agsh/skills/<name>/SKILL.md`. The system prompt lists available skills with their description and when-to-use hint; the agent calls `skill({"name": "<skill-name>"})` to load the full body. See [Skills](../usage/skills.md) for how to author skills.

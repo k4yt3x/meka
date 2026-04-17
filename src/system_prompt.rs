@@ -1,39 +1,13 @@
-use std::path::PathBuf;
-
 use crate::permission::Permission;
 use crate::provider::ToolDefinition;
-
-fn detect_skills() -> Option<(PathBuf, Vec<String>)> {
-    let skills_dir = dirs::config_dir()?.join("agsh").join("skills");
-    let entries = std::fs::read_dir(&skills_dir).ok()?;
-
-    let mut file_names: Vec<String> = entries
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if file_names.is_empty() {
-        return None;
-    }
-
-    file_names.sort();
-    Some((skills_dir, file_names))
-}
+use crate::skills::Skill;
 
 pub fn build_system_prompt(
     permission: Permission,
     tools: &[ToolDefinition],
     sandboxed_shell: bool,
     deferred_tools: &[(String, String)],
+    skills: &[Skill],
 ) -> String {
     let mut prompt = String::new();
 
@@ -122,31 +96,20 @@ pub fn build_system_prompt(
     );
     prompt.push_str("- Be concise but thorough.\n\n");
 
-    if !matches!(permission, Permission::None)
-        && let Some((skills_dir, file_names)) = detect_skills()
-    {
-        let dir_display = skills_dir.display();
+    if !matches!(permission, Permission::None) && !skills.is_empty() {
         prompt.push_str("## Skills\n\n");
-        prompt.push_str(&format!(
-            "Skills are knowledge files stored in `{dir_display}`. They document procedures, \
-                 tools, and non-standard knowledge to help you accomplish specific tasks. \
-                 Each skill has a title on the first line, followed by an empty line, then \
-                 a summary paragraph.\n\n"
-        ));
-        prompt.push_str("Available skills:\n");
-        for name in &file_names {
-            prompt.push_str(&format!("- {}\n", name));
+        prompt.push_str(
+            "The following skills are available. Call the `skill` tool with the \
+             skill name to load its full content. Only invoke a skill when the \
+             user's request matches its stated purpose.\n\n",
+        );
+        for skill in skills {
+            prompt.push_str(&format!(
+                "- **{}**: {} — {}\n",
+                skill.name, skill.description, skill.when_to_use
+            ));
         }
-        prompt.push_str(&format!(
-            "\nTo preview what a skill covers, read just the first 3 lines:\n  \
-                 read_file(path: \"{dir_display}/{}\", limit: 3)\n\n",
-            file_names[0]
-        ));
-        prompt.push_str(&format!(
-            "To read the full skill:\n  \
-                 read_file(path: \"{dir_display}/{}\")\n\n",
-            file_names[0]
-        ));
+        prompt.push('\n');
     }
 
     if !matches!(permission, Permission::None) {
@@ -212,9 +175,22 @@ pub fn build_environment_context(permission: Permission) -> String {
 mod tests {
     use super::*;
 
+    fn sample_skill(name: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            source_dir: std::path::PathBuf::from("/tmp").join(name),
+            description: format!("{} description", name),
+            when_to_use: format!("{} use case", name),
+            allowed_tools: Vec::new(),
+            version: None,
+            user_invocable: true,
+            body_path: std::path::PathBuf::from("/tmp").join(name).join("SKILL.md"),
+        }
+    }
+
     #[test]
     fn test_system_prompt_none_mode() {
-        let prompt = build_system_prompt(Permission::None, &[], false, &[]);
+        let prompt = build_system_prompt(Permission::None, &[], false, &[], &[]);
         assert!(prompt.contains("NO tools available"));
         assert!(prompt.contains("Shift+Tab"));
         assert!(!prompt.contains("## Environment"));
@@ -222,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_read_mode_with_sandbox() {
-        let prompt = build_system_prompt(Permission::Read, &[], true, &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], true, &[], &[]);
         assert!(prompt.contains("READ-ONLY"));
         assert!(prompt.contains("read-only sandboxed"));
         assert!(prompt.contains("CANNOT write"));
@@ -230,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_read_mode_without_sandbox() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[]);
         assert!(prompt.contains("READ-ONLY"));
         assert!(prompt.contains("CANNOT write"));
         assert!(prompt.contains("execute shell commands"));
@@ -239,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_write_mode() {
-        let prompt = build_system_prompt(Permission::Write, &[], false, &[]);
+        let prompt = build_system_prompt(Permission::Write, &[], false, &[], &[]);
         assert!(prompt.contains("FULL access"));
         assert!(prompt.contains("destructive"));
     }
@@ -259,7 +235,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_system_prompt(Permission::Write, &tools, false, &[]);
+        let prompt = build_system_prompt(Permission::Write, &tools, false, &[], &[]);
         assert!(prompt.contains("read_file"));
         assert!(prompt.contains("execute_command"));
         assert!(prompt.contains("Available Tools"));
@@ -267,10 +243,35 @@ mod tests {
 
     #[test]
     fn test_system_prompt_has_environment() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[]);
         assert!(prompt.contains("Environment"));
         assert!(!prompt.contains("Working Directory:"));
         assert!(!prompt.contains("Date:"));
+    }
+
+    #[test]
+    fn test_system_prompt_lists_skills() {
+        let skills = vec![sample_skill("setup-server"), sample_skill("deploy-app")];
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &skills);
+        assert!(prompt.contains("## Skills"));
+        assert!(prompt.contains("**setup-server**"));
+        assert!(prompt.contains("setup-server description"));
+        assert!(prompt.contains("setup-server use case"));
+        assert!(prompt.contains("**deploy-app**"));
+    }
+
+    #[test]
+    fn test_system_prompt_omits_skills_in_none_mode() {
+        let skills = vec![sample_skill("setup-server")];
+        let prompt = build_system_prompt(Permission::None, &[], false, &[], &skills);
+        assert!(!prompt.contains("## Skills"));
+        assert!(!prompt.contains("setup-server"));
+    }
+
+    #[test]
+    fn test_system_prompt_omits_skills_section_when_empty() {
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[]);
+        assert!(!prompt.contains("## Skills"));
     }
 
     #[test]
@@ -285,52 +286,5 @@ mod tests {
     fn test_environment_context_none_mode() {
         let context = build_environment_context(Permission::None);
         assert!(context.is_empty());
-    }
-
-    #[test]
-    fn test_detect_skills_returns_none_for_missing_dir() {
-        // With no skills directory, detect_skills should return None (or Some
-        // depending on the test machine). We can at least verify it doesn't panic.
-        let _ = detect_skills();
-    }
-
-    #[test]
-    fn test_detect_skills_with_temp_dir() {
-        let temp = tempfile::tempdir().expect("failed to create temp dir");
-        let skills_dir = temp.path().join("skills");
-        std::fs::create_dir_all(&skills_dir).expect("failed to create skills dir");
-
-        std::fs::write(
-            skills_dir.join("setup-server.md"),
-            "# Setup Server\n\nHow to set up a server.\n",
-        )
-        .expect("failed to write skill");
-        std::fs::write(
-            skills_dir.join("deploy-app.md"),
-            "# Deploy App\n\nHow to deploy an app.\n",
-        )
-        .expect("failed to write skill");
-        std::fs::write(skills_dir.join("notes.txt"), "not a skill")
-            .expect("failed to write non-skill");
-
-        let entries = std::fs::read_dir(&skills_dir).expect("failed to read dir");
-        let mut file_names: Vec<String> = entries
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| name.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        file_names.sort();
-
-        assert_eq!(file_names.len(), 2);
-        assert_eq!(file_names[0], "deploy-app.md");
-        assert_eq!(file_names[1], "setup-server.md");
     }
 }

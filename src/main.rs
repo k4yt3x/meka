@@ -10,6 +10,7 @@ mod sandbox;
 mod session;
 mod setup;
 mod shell;
+mod skills;
 mod system_prompt;
 mod tools;
 

@@ -134,11 +134,13 @@ impl Agent {
         messages.push(user_message);
         let tools = self.available_tools(permission);
         let deferred_tools = self.deferred_tool_summaries(permission);
+        let skills = crate::skills::discover_skills();
         let system_prompt = build_system_prompt(
             permission,
             &tools,
             self.options.sandboxed_shell,
             &deferred_tools,
+            &skills,
         );
 
         let base_messages = truncate_messages_for_context(messages, self.options.context_messages);
@@ -828,17 +830,14 @@ fn strip_images_and_truncate(content: &mut [ContentBlock]) {
                     }
                 }
             }
-            ContentBlock::Text { text } => {
-                if text.len() > MAX_TEXT_CHARS {
-                    let head_end = text.floor_char_boundary(HEAD_CHARS);
-                    let tail_start =
-                        text.floor_char_boundary(text.len().saturating_sub(TAIL_CHARS));
-                    *text = format!(
-                        "{}\n... (truncated for compaction) ...\n{}",
-                        &text[..head_end],
-                        &text[tail_start..],
-                    );
-                }
+            ContentBlock::Text { text } if text.len() > MAX_TEXT_CHARS => {
+                let head_end = text.floor_char_boundary(HEAD_CHARS);
+                let tail_start = text.floor_char_boundary(text.len().saturating_sub(TAIL_CHARS));
+                *text = format!(
+                    "{}\n... (truncated for compaction) ...\n{}",
+                    &text[..head_end],
+                    &text[tail_start..],
+                );
             }
             _ => {}
         }

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `skill` tool for loading named skills.
+- YAML frontmatter format for skills with `description`, `when_to_use`, `allowed_tools`, `version`, `user_invocable` fields.
+- `${AGSH_SKILL_DIR}` and `${AGSH_SESSION_ID}` substitution in skill bodies.
+
+### Changed
+
+- Skills are now directory-based (`~/.config/agsh/skills/<name>/SKILL.md`) instead of flat `.md` files.
+- Skills section in system prompt lists `description` and `when_to_use` per skill; agent invokes via `skill` tool rather than `read_file`.
+
 ### Security
 
 - Omit environment info (PWD, date, shell, OS) from prompts in `none` permission mode.

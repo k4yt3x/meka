@@ -2,6 +2,7 @@ mod file;
 pub(crate) mod scratchpad;
 mod search;
 mod shell;
+mod skill;
 pub(crate) mod subagent;
 pub(crate) mod todo;
 mod util;
@@ -174,6 +175,9 @@ impl ToolRegistry {
             sandbox_enabled,
             sandbox_capability,
         );
+        registry.register(Box::new(skill::SkillTool {
+            session_id: shared_session_id.clone(),
+        }));
         registry.register(Box::new(todo::TodoWriteTool { todo_list }));
         registry.register(Box::new(scratchpad::ScratchpadWriteTool {
             session_manager: session_manager.clone(),
@@ -217,6 +221,11 @@ impl ToolRegistry {
             sandbox_enabled,
             sandbox_capability,
         );
+        // Sub-agents don't have a session of their own — skills still load but
+        // ${AGSH_SESSION_ID} stays unresolved for their invocations.
+        registry.register(Box::new(skill::SkillTool {
+            session_id: Arc::new(RwLock::new(None)),
+        }));
         registry
     }
 }
@@ -268,6 +277,7 @@ mod tests {
         assert!(registry.get("scratchpad_edit").is_some());
         assert!(registry.get("scratchpad_list").is_some());
         assert!(registry.get("scratchpad_delete").is_some());
+        assert!(registry.get("skill").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
 
