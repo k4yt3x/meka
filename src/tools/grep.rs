@@ -5,7 +5,7 @@ use crate::error::{AgshError, Result};
 use crate::permission::Permission;
 use crate::provider::ToolDefinition;
 
-use super::util::require_str;
+use super::util::{redirects_to_scratchpad, require_str};
 use super::{Tool, ToolOutput};
 
 pub(super) struct SearchContentsTool;
@@ -22,7 +22,9 @@ impl Tool for SearchContentsTool {
                           and a tight `glob` filter that plausibly contains the match; \
                           if that returns nothing, widen the `path` by one level or \
                           loosen the `glob`, and repeat. Only fall back to a tree-wide \
-                          scan if targeted attempts have all failed."
+                          scan if targeted attempts have all failed. Inline results are \
+                          capped at 100 matches; use the `scratchpad` parameter to \
+                          collect an unbounded result set."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -61,9 +63,16 @@ impl Tool for SearchContentsTool {
         let pattern = require_str(&input, "pattern", "search_contents")?;
         let search_path = input["path"].as_str().unwrap_or(".").to_string();
         let file_glob = input["glob"].as_str().map(|s| s.to_string());
+        // Cap match count for inline use; lift it when redirecting output to
+        // the scratchpad so the agent can collect an unbounded result set.
+        let max_results = if redirects_to_scratchpad(&input) {
+            usize::MAX
+        } else {
+            100
+        };
 
         let result = tokio::task::spawn_blocking(move || {
-            search_with_grep(&pattern, &search_path, file_glob.as_deref())
+            search_with_grep(&pattern, &search_path, file_glob.as_deref(), max_results)
         })
         .await
         .map_err(|error| AgshError::ToolExecution {
@@ -79,7 +88,12 @@ impl Tool for SearchContentsTool {
     }
 }
 
-fn search_with_grep(pattern: &str, search_path: &str, file_glob: Option<&str>) -> Result<String> {
+fn search_with_grep(
+    pattern: &str,
+    search_path: &str,
+    file_glob: Option<&str>,
+    max_results: usize,
+) -> Result<String> {
     use grep_regex::RegexMatcher;
 
     let matcher = RegexMatcher::new(pattern).map_err(|error| AgshError::ToolExecution {
@@ -103,7 +117,6 @@ fn search_with_grep(pattern: &str, search_path: &str, file_glob: Option<&str>) -
         });
     }
 
-    let max_results = 100;
     if results.len() > max_results {
         results.truncate(max_results);
         results.push(format!(
@@ -211,5 +224,59 @@ mod tests {
         assert!(!result.is_error);
         assert!(text_content(&result).contains("hello world"));
         assert!(text_content(&result).contains("hello again"));
+    }
+
+    #[tokio::test]
+    async fn test_search_contents_inline_capped_at_100() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        // One file with 150 matching lines.
+        let content = (0..150).map(|_| "match\n").collect::<String>();
+        std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
+
+        let tool = SearchContentsTool;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "match",
+                    "path": temp_dir.path().to_str().expect("path")
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        assert!(text_content(&result).contains("truncated, showing first 100"));
+    }
+
+    #[tokio::test]
+    async fn test_search_contents_scratchpad_lifts_cap() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let content = (0..150).map(|_| "match\n").collect::<String>();
+        std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
+
+        let tool = SearchContentsTool;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "match",
+                    "path": temp_dir.path().to_str().expect("path"),
+                    "scratchpad": "matches"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(
+            !text.contains("truncated"),
+            "expected no truncation marker when scratchpad set"
+        );
+        let match_lines = text.lines().filter(|l| l.contains("match")).count();
+        assert!(
+            match_lines >= 150,
+            "expected >= 150 match lines, got {}",
+            match_lines
+        );
     }
 }

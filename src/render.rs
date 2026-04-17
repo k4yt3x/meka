@@ -583,11 +583,26 @@ fn tool_display_name(name: &str) -> &str {
         "scratchpad_edit" => "ScratchpadEdit",
         "scratchpad_list" => "ScratchpadList",
         "scratchpad_delete" => "ScratchpadDelete",
+        "skill" => "Skill",
+        "render_image" => "RenderImage",
         other => other,
     }
 }
 
 fn tool_primary_param<'a>(name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    // `render_image` accepts either `from_scratchpad` or inline `base64`.
+    // Show the scratchpad name when present; for inline base64 the payload
+    // is opaque so there's nothing useful to display.
+    if name == "render_image" {
+        if let Some(from) = input.get("from_scratchpad").and_then(|v| v.as_str()) {
+            return Some(from);
+        }
+        if input.get("base64").is_some() {
+            return Some("<inline base64>");
+        }
+        return None;
+    }
+
     let key = match name {
         "execute_command" => "command",
         "read_file" | "write_file" | "edit_file" => "path",
@@ -596,6 +611,7 @@ fn tool_primary_param<'a>(name: &str, input: &'a serde_json::Value) -> Option<&'
         "web_search" => "query",
         "spawn_agent" => "prompt",
         "scratchpad_write" | "scratchpad_read" | "scratchpad_edit" | "scratchpad_delete" => "name",
+        "skill" => "name",
         _ => return None,
     };
     input.get(key).and_then(|v| v.as_str())
@@ -645,7 +661,15 @@ mod tests {
         assert_eq!(tool_display_name("search_contents"), "SearchContents");
         assert_eq!(tool_display_name("fetch_url"), "FetchUrl");
         assert_eq!(tool_display_name("web_search"), "WebSearch");
+        assert_eq!(tool_display_name("skill"), "Skill");
+        assert_eq!(tool_display_name("render_image"), "RenderImage");
         assert_eq!(tool_display_name("custom_tool"), "custom_tool");
+    }
+
+    #[test]
+    fn test_tool_primary_param_skill() {
+        let input = serde_json::json!({"name": "setup-postgres"});
+        assert_eq!(tool_primary_param("skill", &input), Some("setup-postgres"));
     }
 
     #[test]
@@ -660,6 +684,33 @@ mod tests {
     fn test_tool_primary_param_missing() {
         let input = serde_json::json!({"other": "value"});
         assert_eq!(tool_primary_param("execute_command", &input), None);
+    }
+
+    #[test]
+    fn test_tool_primary_param_render_image_from_scratchpad() {
+        let input = serde_json::json!({"from_scratchpad": "frame4"});
+        assert_eq!(tool_primary_param("render_image", &input), Some("frame4"));
+    }
+
+    #[test]
+    fn test_tool_primary_param_render_image_inline_base64() {
+        let input = serde_json::json!({"base64": "iVBOR..."});
+        assert_eq!(
+            tool_primary_param("render_image", &input),
+            Some("<inline base64>")
+        );
+    }
+
+    #[test]
+    fn test_tool_primary_param_render_image_from_scratchpad_takes_precedence() {
+        let input = serde_json::json!({"from_scratchpad": "frame4", "base64": "iVBOR..."});
+        assert_eq!(tool_primary_param("render_image", &input), Some("frame4"));
+    }
+
+    #[test]
+    fn test_tool_primary_param_render_image_empty() {
+        let input = serde_json::json!({});
+        assert_eq!(tool_primary_param("render_image", &input), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod file;
 mod find;
 mod grep;
+mod render;
 pub(crate) mod scratchpad;
 mod shell;
 mod skill;
@@ -179,6 +180,10 @@ impl ToolRegistry {
         registry.register(Box::new(skill::SkillTool {
             session_id: shared_session_id.clone(),
         }));
+        registry.register(Box::new(render::RenderImageTool {
+            session_id: shared_session_id.clone(),
+            session_manager: session_manager.clone(),
+        }));
         registry.register(Box::new(todo::TodoWriteTool { todo_list }));
         registry.register(Box::new(scratchpad::ScratchpadWriteTool {
             session_manager: session_manager.clone(),
@@ -279,6 +284,7 @@ mod tests {
         assert!(registry.get("scratchpad_list").is_some());
         assert!(registry.get("scratchpad_delete").is_some());
         assert!(registry.get("skill").is_some());
+        assert!(registry.get("render_image").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
 

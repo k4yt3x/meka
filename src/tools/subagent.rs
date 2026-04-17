@@ -93,9 +93,11 @@ impl Tool for SpawnAgentTool {
         let augmented_prompt = format!("{}\n{}", environment_context, prompt);
         let mut messages = vec![Message::user(&augmented_prompt)];
 
-        const MAX_REPORT_CHARS: usize = 30_000;
-
-        let mut report = run_subagent_loop(
+        // No report-length truncation here: the agent layer's
+        // `persist_oversized_results` auto-persists any oversized report to
+        // the scratchpad losslessly, and `save_explicit_scratchpad_results`
+        // handles explicit redirections.
+        let report = run_subagent_loop(
             &*self.provider,
             &sub_registry,
             &system_prompt,
@@ -105,12 +107,6 @@ impl Tool for SpawnAgentTool {
             cancellation,
         )
         .await?;
-
-        if report.len() > MAX_REPORT_CHARS {
-            let boundary = report.floor_char_boundary(MAX_REPORT_CHARS);
-            report.truncate(boundary);
-            report.push_str("\n\n... (sub-agent report truncated, showing first 30000 characters)");
-        }
 
         Ok(ToolOutput::text(report, false))
     }

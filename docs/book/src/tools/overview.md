@@ -22,6 +22,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`scratchpad_list`](./scratchpad.md#scratchpad_list) | Read | List scratchpad entries |
 | [`scratchpad_delete`](./scratchpad.md#scratchpad_delete) | Read | Delete a scratchpad entry |
 | [`skill`](./overview.md#skill) | Read | Load a named skill's instructions |
+| [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
 
 ## Permission Requirements
 
@@ -30,7 +31,7 @@ Tools are grouped by the minimum permission level required:
 **Read permission** (available in read, ask, and write modes):
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`
 - `execute_command` (sandboxed, filesystem write-protected)
-- `todo_write`, `spawn_agent`, `skill`
+- `todo_write`, `spawn_agent`, `skill`, `render_image`
 - All scratchpad tools
 
 **Write permission** (only available in write mode):
@@ -70,3 +71,31 @@ Spawns a read-only sub-agent to perform research or analysis tasks. The sub-agen
 ## `skill`
 
 Loads a named skill's instructions. Skills are user-defined knowledge packages stored in `~/.config/agsh/skills/<name>/SKILL.md`. The system prompt lists available skills with their description and when-to-use hint; the agent calls `skill({"name": "<skill-name>"})` to load the full body. See [Skills](../usage/skills.md) for how to author skills.
+
+## `render_image`
+
+Displays an image the agent has in memory — as base64 bytes or in a scratchpad entry — as a multimodal content block. Complements `fetch_url` (network) and `read_file` (local file) by covering the third case: image data produced on the fly by a command pipeline.
+
+Typical workflow:
+
+```text
+execute_command({"command": "ffmpeg -i input.mp4 -vframes 1 -f image2pipe pipe: | base64 -w0", "scratchpad": "frame"})
+render_image({"from_scratchpad": "frame"})
+```
+
+Parameters:
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `from_scratchpad` | string | one of two | Name of a scratchpad entry containing base64-encoded image bytes |
+| `base64` | string | one of two | Base64-encoded image bytes, passed inline |
+
+Exactly one of `from_scratchpad` or `base64` must be provided. Prefer `from_scratchpad` for large images — inline base64 inflates tool-call JSON.
+
+The bytes must decode to a supported raster image. PNG, JPEG, GIF, WebP, and BMP pass through unchanged; TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS, and Farbfeld are auto-converted to PNG. Size cap is ~3.75 MB on the final payload.
+
+Only call `render_image` when the current model supports vision input.
+
+## Redirecting output to the scratchpad
+
+Several tools — `execute_command`, `find_files`, `search_contents`, `fetch_url`, `spawn_agent` — accept an optional `scratchpad` parameter that redirects their output to a named scratchpad entry instead of returning it inline. When this parameter is set, the tool produces its **full, untruncated output**: internal result-count caps (`find_files` 200, `search_contents` 100) and length caps (`fetch_url` `max_length`) are lifted for the scratchpad-bound result.

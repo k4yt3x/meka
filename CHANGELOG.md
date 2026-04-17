@@ -15,12 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[prompt] instructions` config for system-wide instructions injected into every session's prompt.
 - `fetch_url` returns a multimodal Image block for image URLs (sandboxed mode, no disk I/O).
 - `fetch_url` and `read_file` convert TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS, Farbfeld to PNG.
+- `render_image` tool views in-memory base64 or scratchpad bytes as a multimodal Image block.
 
 ### Changed
 
 - Skills are now directory-based (`~/.config/agsh/skills/<name>/SKILL.md`), not flat files.
 - System prompt lists skills by description and when_to_use; agent invokes via `skill` tool.
 - `find_files` and `search_contents` descriptions recommend narrow searches, broadening gradually.
+- Tool output redirected to scratchpad is never truncated; internal caps are lifted.
+
+### Fixed
+
+- Rename `render_image` input `scratchpad` to `from_scratchpad` so it no longer clobbers the source.
+- Remove redundant 30 KB caps on `execute_command` and `spawn_agent`; oversize handled upstream.
+- Show primary param in the tool banner for `skill` and `render_image`.
 
 ### Security
 

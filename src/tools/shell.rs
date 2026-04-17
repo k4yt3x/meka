@@ -178,8 +178,11 @@ impl Tool for ExecuteCommandTool {
                     }
                 }
 
-                const MAX_OUTPUT_CHARS: usize = 30_000;
-
+                // No output-length truncation here: the agent layer's
+                // `persist_oversized_results` auto-persists any oversized
+                // result to the scratchpad losslessly. Truncating here would
+                // corrupt binary-in-base64 pipelines (see #1 in the trial
+                // feedback).
                 let mut result_text = String::new();
                 if !stdout_content.is_empty() {
                     result_text.push_str(&stdout_content);
@@ -189,13 +192,6 @@ impl Tool for ExecuteCommandTool {
                         result_text.push_str("\n--- stderr ---\n");
                     }
                     result_text.push_str(&stderr_content);
-                }
-                if result_text.len() > MAX_OUTPUT_CHARS {
-                    let boundary = result_text.floor_char_boundary(MAX_OUTPUT_CHARS);
-                    result_text.truncate(boundary);
-                    result_text.push_str(
-                        "\n\n... (output truncated, showing first 30000 characters)",
-                    );
                 }
                 if exit_code != 0 {
                     result_text.push_str(&format!("\nExit code: {}", exit_code));
@@ -262,5 +258,36 @@ mod tests {
             .expect("should succeed");
 
         assert!(result.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_large_output_not_truncated() {
+        // Output well over the old 30 KB cap — the tool must return it in
+        // full. The agent layer handles oversize downstream.
+        let tool = ExecuteCommandTool {
+            sandbox_capability: crate::sandbox::detect(),
+            shared_permission: test_shared_permission(),
+            sandbox_enabled: true,
+        };
+        let result = tool
+            .execute(
+                // 50 000 "x" characters + newline.
+                serde_json::json!({"command": "printf 'x%.0s' {1..50000}"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(
+            !text.contains("(output truncated"),
+            "no truncation marker expected, got: {:.200}...",
+            text
+        );
+        assert!(
+            text.trim().len() >= 50_000,
+            "expected >= 50 000 chars, got {}",
+            text.trim().len()
+        );
     }
 }

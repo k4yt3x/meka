@@ -1,6 +1,10 @@
 use std::io::Cursor;
 
+use base64::Engine;
 use image::ImageFormat;
+
+use crate::provider::{ImageSource, ToolResultContent};
+use crate::tools::ToolOutput;
 
 /// Maximum raw image bytes before base64 encoding. Keeps the resulting
 /// base64 payload under ~5 MB — a safe ceiling across providers.
@@ -70,6 +74,14 @@ pub(crate) fn classify_extension(extension: &str) -> ImageHandling {
     }
 }
 
+/// Classify an image by sniffing its magic bytes via `image::guess_format`.
+pub(crate) fn classify_bytes(bytes: &[u8]) -> ImageHandling {
+    match image::guess_format(bytes) {
+        Ok(format) => classify_format(format),
+        Err(_) => ImageHandling::Unsupported,
+    }
+}
+
 /// Decode arbitrary supported image bytes and re-encode as PNG.
 pub(crate) fn convert_to_png(bytes: &[u8], source: ImageFormat) -> Result<Vec<u8>, String> {
     let decoded = image::load_from_memory_with_format(bytes, source)
@@ -111,6 +123,41 @@ pub(crate) fn prepare_image_payload(
             Ok((ImageFormat::Png.to_mime_type(), png))
         }
         ImageHandling::Unsupported => Err("unsupported image format".to_string()),
+    }
+}
+
+/// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw
+/// image bytes plus a pre-computed classification. Wraps `prepare_image_payload`
+/// so error paths become a text `ToolOutput` with `is_error: true`. Shared by
+/// `fetch_url`, `read_file`, and `render_image`.
+pub(crate) fn build_image_tool_output(
+    marker: &str,
+    handling: ImageHandling,
+    bytes: &[u8],
+) -> ToolOutput {
+    let (media_type, payload) = match prepare_image_payload(handling, bytes) {
+        Ok(pair) => pair,
+        Err(message) => {
+            return ToolOutput::text(format!("Error: {}: {}", marker, message), true);
+        }
+    };
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+
+    ToolOutput {
+        content: vec![
+            ToolResultContent::Text {
+                text: format!("[{}]", marker),
+            },
+            ToolResultContent::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: media_type.to_string(),
+                    data: encoded,
+                },
+            },
+        ],
+        is_error: false,
     }
 }
 
@@ -323,5 +370,96 @@ mod tests {
         let error =
             prepare_image_payload(ImageHandling::Unsupported, b"anything").expect_err("should err");
         assert!(error.contains("unsupported"));
+    }
+
+    // --- classify_bytes ---------------------------------------------------
+
+    #[test]
+    fn test_classify_bytes_png() {
+        let png = synthesize_image_bytes(ImageFormat::Png);
+        assert_eq!(
+            classify_bytes(&png),
+            ImageHandling::PassThrough(ImageFormat::Png)
+        );
+    }
+
+    #[test]
+    fn test_classify_bytes_tiff() {
+        let tiff = synthesize_image_bytes(ImageFormat::Tiff);
+        assert_eq!(
+            classify_bytes(&tiff),
+            ImageHandling::Convert(ImageFormat::Tiff)
+        );
+    }
+
+    #[test]
+    fn test_classify_bytes_garbage_is_unsupported() {
+        assert_eq!(classify_bytes(b"not an image"), ImageHandling::Unsupported);
+        assert_eq!(classify_bytes(&[]), ImageHandling::Unsupported);
+    }
+
+    // --- build_image_tool_output -----------------------------------------
+
+    #[test]
+    fn test_build_image_tool_output_pass_through_png() {
+        let png = synthesize_image_bytes(ImageFormat::Png);
+        let output = build_image_tool_output(
+            "Image fetched from https://example.com/a.png",
+            ImageHandling::PassThrough(ImageFormat::Png),
+            &png,
+        );
+        assert!(!output.is_error);
+        assert_eq!(output.content.len(), 2);
+        match &output.content[0] {
+            ToolResultContent::Text { text } => {
+                assert!(text.contains("https://example.com/a.png"));
+            }
+            _ => panic!("first block should be Text"),
+        }
+        match &output.content[1] {
+            ToolResultContent::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/png");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&source.data)
+                    .expect("valid base64");
+                assert_eq!(decoded, png);
+            }
+            _ => panic!("second block should be Image"),
+        }
+    }
+
+    #[test]
+    fn test_build_image_tool_output_oversized_returns_error() {
+        let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES + 1];
+        let output = build_image_tool_output(
+            "Image fetched from https://example.com/big.png",
+            ImageHandling::PassThrough(ImageFormat::Png),
+            &bytes,
+        );
+        assert!(output.is_error);
+        let text = match &output.content[0] {
+            ToolResultContent::Text { text } => text.clone(),
+            _ => panic!("expected Text block"),
+        };
+        assert!(text.contains("too large"));
+        assert!(text.contains("big.png"));
+    }
+
+    #[test]
+    fn test_build_image_tool_output_converts_tiff_to_png() {
+        let tiff = synthesize_image_bytes(ImageFormat::Tiff);
+        let output = build_image_tool_output(
+            "rendered image",
+            ImageHandling::Convert(ImageFormat::Tiff),
+            &tiff,
+        );
+        assert!(!output.is_error);
+        match &output.content[1] {
+            ToolResultContent::Image { source } => {
+                assert_eq!(source.media_type, "image/png");
+            }
+            _ => panic!("expected Image block"),
+        }
     }
 }

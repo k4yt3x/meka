@@ -863,6 +863,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_explicit_scratchpad_ignores_non_scratchpad_keys() {
+        // Regression test for the `render_image` clobber bug: when a tool uses
+        // `from_scratchpad` (as an input-source param) instead of `scratchpad`
+        // (the output-destination convention), the agent-layer save must not
+        // touch the pre-existing scratchpad entry.
+        let manager = test_manager().await;
+        let session_id = manager.create_session().await.expect("create");
+
+        manager
+            .save_tool_output(session_id, "img", "original base64 data")
+            .await
+            .expect("seed");
+
+        let assistant_msg = make_assistant_message(vec![(
+            "call-1",
+            "render_image",
+            serde_json::json!({"from_scratchpad": "img"}),
+        )]);
+
+        let mut results = vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".to_string(),
+            content: vec![ToolResultContent::Text {
+                text: "[Image rendered from scratchpad \"img\"]".to_string(),
+            }],
+            is_error: false,
+        }];
+
+        save_explicit_scratchpad_results(&manager, session_id, &assistant_msg, &mut results)
+            .await
+            .expect("save");
+
+        // Pre-existing scratchpad entry should be untouched.
+        let loaded = manager
+            .load_tool_output(session_id, "img")
+            .await
+            .expect("load");
+        assert_eq!(loaded.as_deref(), Some("original base64 data"));
+
+        // Result content should also be unchanged (no rewriting to a reference).
+        if let ContentBlock::ToolResult { content, .. } = &results[0] {
+            assert_eq!(
+                ContentBlock::tool_result_text_content(content),
+                "[Image rendered from scratchpad \"img\"]"
+            );
+        }
+    }
+
     // -- scratchpad_write --
 
     #[tokio::test]

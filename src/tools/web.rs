@@ -1,17 +1,16 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use base64::Engine;
 use html2md::rewrite_html;
 use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AgshError, Result};
-use crate::image::{ImageHandling, classify_content_type, prepare_image_payload};
+use crate::image::{ImageHandling, build_image_tool_output, classify_content_type};
 use crate::permission::Permission;
-use crate::provider::{ImageSource, ToolDefinition, ToolResultContent};
+use crate::provider::ToolDefinition;
 
-use super::util::require_str;
+use super::util::{redirects_to_scratchpad, require_str};
 use super::{Tool, ToolOutput};
 
 // Static CSS selectors for search result parsing (parsed once, reused on every call).
@@ -46,36 +45,6 @@ fn apply_headers(
         }
     }
     builder
-}
-
-/// Build the tool output for a fetched image response. Applies size caps
-/// and, if needed, converts the input to PNG before wrapping in the
-/// multimodal Image content block.
-fn build_image_tool_output(url: &str, handling: ImageHandling, bytes: &[u8]) -> ToolOutput {
-    let (media_type, payload) = match prepare_image_payload(handling, bytes) {
-        Ok(pair) => pair,
-        Err(message) => {
-            return ToolOutput::text(format!("Error: image at '{}': {}", url, message), true);
-        }
-    };
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
-
-    ToolOutput {
-        content: vec![
-            ToolResultContent::Text {
-                text: format!("[Image fetched from {}]", url),
-            },
-            ToolResultContent::Image {
-                source: ImageSource {
-                    source_type: "base64".to_string(),
-                    media_type: media_type.to_string(),
-                    data: encoded,
-                },
-            },
-        ],
-        is_error: false,
-    }
 }
 
 pub(super) struct FetchUrlTool {
@@ -178,7 +147,8 @@ impl Tool for FetchUrlTool {
                     message: format!("failed to read image bytes: {}", error),
                 })?;
 
-            return Ok(build_image_tool_output(&url, handling, &bytes));
+            let marker = format!("Image fetched from {}", url);
+            return Ok(build_image_tool_output(&marker, handling, &bytes));
         }
 
         let html = response
@@ -196,10 +166,16 @@ impl Tool for FetchUrlTool {
             rewrite_html(&html, false)
         };
 
-        let max_length = input["max_length"]
-            .as_u64()
-            .map(|value| value as usize)
-            .unwrap_or(30000);
+        // When the caller redirects to the scratchpad we produce full content
+        // regardless of max_length — the scratchpad is the overflow buffer.
+        let max_length = if redirects_to_scratchpad(&input) {
+            0
+        } else {
+            input["max_length"]
+                .as_u64()
+                .map(|value| value as usize)
+                .unwrap_or(30000)
+        };
 
         let content = if max_length > 0 && body.len() > max_length {
             format!(
@@ -460,9 +436,6 @@ fn parse_bing_results(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::MAX_IMAGE_RAW_BYTES;
-    use crate::provider::ContentBlock;
-    use image::ImageFormat;
 
     #[test]
     fn test_parse_duckduckgo_results() {
@@ -614,63 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_image_tool_output_pass_through_png() {
-        let bytes = b"\x89PNG\r\n\x1a\n".to_vec(); // PNG magic bytes
-        let output = build_image_tool_output(
-            "https://example.com/a.png",
-            ImageHandling::PassThrough(ImageFormat::Png),
-            &bytes,
-        );
-
-        assert!(!output.is_error);
-        assert_eq!(output.content.len(), 2);
-        match &output.content[0] {
-            ToolResultContent::Text { text } => {
-                assert!(text.contains("https://example.com/a.png"));
-            }
-            _ => panic!("first block should be Text"),
-        }
-        match &output.content[1] {
-            ToolResultContent::Image { source } => {
-                assert_eq!(source.source_type, "base64");
-                assert_eq!(source.media_type, "image/png");
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(&source.data)
-                    .expect("valid base64");
-                assert_eq!(decoded, bytes);
-            }
-            _ => panic!("second block should be Image"),
-        }
-    }
-
-    #[test]
-    fn test_build_image_tool_output_oversized_returns_error() {
-        let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES + 1];
-        let output = build_image_tool_output(
-            "https://example.com/big.png",
-            ImageHandling::PassThrough(ImageFormat::Png),
-            &bytes,
-        );
-
-        assert!(output.is_error);
-        let text = ContentBlock::tool_result_text_content(&output.content);
-        assert!(text.contains("too large"));
-        assert!(text.contains("big.png"));
-    }
-
-    #[test]
-    fn test_build_image_tool_output_at_size_boundary_succeeds() {
-        // Exactly at the cap must not trigger the oversized error.
-        let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES];
-        let output = build_image_tool_output(
-            "https://example.com/edge.jpg",
-            ImageHandling::PassThrough(ImageFormat::Jpeg),
-            &bytes,
-        );
-        assert!(!output.is_error);
-    }
-
-    #[test]
     fn test_fetch_url_definition_has_headers_regex_and_raw() {
         let tool = FetchUrlTool {
             client: reqwest::Client::new(),
@@ -680,6 +596,16 @@ mod tests {
         assert!(props.get("headers").is_some());
         assert!(props.get("regex").is_some());
         assert!(props.get("raw").is_some());
+    }
+
+    #[test]
+    fn test_redirects_to_scratchpad_logic() {
+        // Mirrors the branch used in fetch_url::execute. When redirecting,
+        // we force max_length = 0 (unlimited).
+        let with = serde_json::json!({ "scratchpad": "out", "max_length": 100 });
+        let without = serde_json::json!({ "max_length": 100 });
+        assert!(redirects_to_scratchpad(&with));
+        assert!(!redirects_to_scratchpad(&without));
     }
 
     #[test]
