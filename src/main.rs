@@ -698,7 +698,6 @@ fn reprint_last_message(messages: &[provider::Message], render_mode: render::Ren
         }
     };
 
-    render::render_hint("Last message:");
     let mut renderer = render::StreamingRenderer::new(render_mode);
     if let Err(error) = renderer.push_delta(&text) {
         tracing::debug!("failed to render last message delta: {}", error);

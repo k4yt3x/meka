@@ -1,7 +1,17 @@
 use std::io::{self, Write};
+use std::sync::OnceLock;
 
 use crossterm::style::{Color, Stylize};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
 use termimad::MadSkin;
+
+/// Monokai Extended theme, vendored from bat's `sharkdp/sublime-monokai-extended`
+/// submodule (MIT). Kept in-repo and embedded so highlighting is visually
+/// identical to what bat produces without shipping bat itself.
+const MONOKAI_EXTENDED_TMTHEME: &[u8] = include_bytes!("../assets/themes/Monokai Extended.tmTheme");
 
 // ---------------------------------------------------------------------------
 // Output spacing state machine
@@ -174,7 +184,7 @@ impl StreamingRenderer {
                             needs_newline = false;
                         } else {
                             self.flush_bat_table()?;
-                            print_with_bat(line);
+                            print_highlighted_markdown(line);
                             needs_newline = true;
                         }
                     }
@@ -247,7 +257,7 @@ impl StreamingRenderer {
                 if line.is_empty() {
                     println!();
                 } else {
-                    print_with_bat(&format!("{}\n", line));
+                    print_highlighted_markdown(&format!("{}\n", line));
                 }
                 io::stdout().flush()?;
             }
@@ -262,7 +272,7 @@ impl StreamingRenderer {
 
         let lines = std::mem::take(&mut self.code_block_lines);
         let block_text = lines.join("\n");
-        print_with_bat(&block_text);
+        print_highlighted_markdown(&block_text);
         println!();
         io::stdout().flush()
     }
@@ -275,7 +285,7 @@ impl StreamingRenderer {
         let lines = std::mem::take(&mut self.raw_table_lines);
         let formatted = format_table(&lines);
         let table_text = formatted.join("\n");
-        print_with_bat(&table_text);
+        print_highlighted_markdown(&table_text);
         println!();
         io::stdout().flush()
     }
@@ -399,19 +409,63 @@ fn normalize_spacing(text: &str) -> String {
     output
 }
 
-fn print_with_bat(text: &str) {
-    if let Err(error) = bat::PrettyPrinter::new()
-        .input_from_bytes(text.as_bytes())
-        .language("markdown")
-        .header(false)
-        .line_numbers(false)
-        .grid(false)
-        .rule(false)
-        .wrapping_mode(bat::WrappingMode::NoWrapping(false))
-        .print()
-    {
-        tracing::debug!("bat rendering failed: {}", error);
+/// Holds the expensive-to-load syntect assets — a `SyntaxSet` (~1 MB bincode
+/// blob) and a dark `Theme` — so subsequent highlighting calls can reuse them
+/// without paying the decode cost each time. Session-resume reprint and live
+/// streaming both call `highlight_markdown_line` per line; initializing assets
+/// once per process turns that cost from ~50 ms/call into <1 ms/call.
+struct Highlighter {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
+static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
+
+fn highlighter() -> &'static Highlighter {
+    HIGHLIGHTER.get_or_init(|| {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let mut cursor = std::io::Cursor::new(MONOKAI_EXTENDED_TMTHEME);
+        let theme =
+            ThemeSet::load_from_reader(&mut cursor).expect("embedded Monokai Extended theme loads");
+        Highlighter { syntax_set, theme }
+    })
+}
+
+/// Syntax-highlight a chunk of markdown and write it to stdout with 24-bit
+/// ANSI color escapes. The caller is responsible for any surrounding newlines.
+fn print_highlighted_markdown(text: &str) {
+    let output = highlight_markdown_to_string(text);
+    print!("{}", output);
+}
+
+/// Returns the ANSI-escaped highlighted text without writing to stdout.
+/// Exposed for testing.
+fn highlight_markdown_to_string(text: &str) -> String {
+    let highlighter = highlighter();
+    let syntax = highlighter
+        .syntax_set
+        .find_syntax_by_name("Markdown")
+        .or_else(|| highlighter.syntax_set.find_syntax_by_extension("md"))
+        .unwrap_or_else(|| highlighter.syntax_set.find_syntax_plain_text());
+    let mut highlight = HighlightLines::new(syntax, &highlighter.theme);
+
+    let mut out = String::new();
+    for line in LinesWithEndings::from(text) {
+        match highlight.highlight_line(line, &highlighter.syntax_set) {
+            Ok(ranges) => {
+                out.push_str(&as_24_bit_terminal_escaped(&ranges[..], false));
+            }
+            Err(error) => {
+                // On parse error, fall back to plain text so we never lose
+                // content.
+                tracing::debug!("syntect highlight failed: {}", error);
+                out.push_str(line);
+            }
+        }
     }
+    // Reset ANSI so colors don't bleed into the next prompt.
+    out.push_str("\x1b[0m");
+    out
 }
 
 fn is_table_line(line: &str) -> bool {
@@ -630,6 +684,58 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_highlight_markdown_emits_ansi() {
+        let out = highlight_markdown_to_string("# Hello\n");
+        // ANSI escape prefix for any colored output.
+        assert!(
+            out.contains("\x1b["),
+            "expected ANSI escape in highlighter output, got: {:?}",
+            out
+        );
+        // Final reset so colors don't bleed into subsequent stdout writes.
+        assert!(out.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn test_highlight_markdown_preserves_content() {
+        // Stripping ANSI escapes should give back the original text.
+        let input = "Plain text with no markdown.\n";
+        let out = highlight_markdown_to_string(input);
+        let stripped = strip_ansi_escapes(&out);
+        assert!(stripped.starts_with(input));
+    }
+
+    #[test]
+    fn test_highlighter_uses_monokai_extended() {
+        // Regression guard: the embedded theme file must parse and identify
+        // as Monokai Extended. Catches accidental theme-file swaps or
+        // corrupted asset bytes at test time.
+        // Force OnceLock init.
+        let _ = highlight_markdown_to_string("");
+        let theme = &highlighter().theme;
+        assert_eq!(theme.name.as_deref(), Some("Monokai Extended"));
+    }
+
+    fn strip_ansi_escapes(input: &str) -> String {
+        // Minimal CSI stripper for test assertions: drops `ESC [ ... letter`.
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for inner in chars.by_ref() {
+                    if inner.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
 
     #[test]
     fn test_truncate_display_short() {

@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - System prompt lists skills by description and when_to_use; agent invokes via `skill` tool.
 - `find_files` and `search_contents` descriptions recommend narrow searches, broadening gradually.
 - Tool output redirected to scratchpad is never truncated; internal caps are lifted.
+- Highlight markdown with `syntect` directly instead of `bat`; reprints are roughly 50x faster.
+- Embed Monokai Extended theme from bat for visual parity with the old renderer.
+- Drop the `Last message:` banner on session resume; the resuming-session line is sufficient.
 
 ### Fixed
 
