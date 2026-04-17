@@ -1,6 +1,6 @@
 [package]
 name = "agsh"
-version = "0.10.3"
+version = "0.11.0"
 edition = "2024"
 license = "MIT"
 description = "An agentic shell where you speak human, not bash"
