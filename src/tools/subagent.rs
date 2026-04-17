@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use crate::context::build_environment_context;
 use crate::error::{AgshError, Result};
 use crate::permission::{Permission, SharedPermission};
 use crate::provider::{ContentBlock, Message, Provider, StopReason, ToolDefinition};
-use crate::system_prompt::build_environment_context;
 
 use super::{Tool, ToolOutput, ToolRegistry};
 
@@ -22,6 +22,7 @@ pub struct SpawnAgentTool {
     pub provider: Arc<dyn Provider>,
     pub parent_permission: SharedPermission,
     pub tool_builder_params: ToolBuilderParams,
+    pub user_instructions: Option<String>,
 }
 
 #[async_trait]
@@ -85,7 +86,8 @@ impl Tool for SpawnAgentTool {
         );
 
         let tools = sub_registry.definitions_for_permission(sub_perm);
-        let system_prompt = build_subagent_system_prompt(sub_perm, &tools);
+        let system_prompt =
+            build_subagent_system_prompt(sub_perm, &tools, self.user_instructions.as_deref());
 
         let environment_context = build_environment_context(sub_perm);
         let augmented_prompt = format!("{}\n{}", environment_context, prompt);
@@ -114,7 +116,11 @@ impl Tool for SpawnAgentTool {
     }
 }
 
-fn build_subagent_system_prompt(permission: Permission, tools: &[ToolDefinition]) -> String {
+fn build_subagent_system_prompt(
+    permission: Permission,
+    tools: &[ToolDefinition],
+    user_instructions: Option<&str>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str(
         "You are a research sub-agent. Complete the assigned task using the \
@@ -123,6 +129,19 @@ fn build_subagent_system_prompt(permission: Permission, tools: &[ToolDefinition]
     );
 
     prompt.push_str(&format!("## Permission Level: {}\n\n", permission));
+
+    if let Some(instructions) = user_instructions
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        prompt.push_str("## User Instructions\n\n");
+        prompt.push_str(
+            "These are installation-specific rules set by the user. Treat them as \
+             hard constraints unless they conflict with safety requirements.\n\n",
+        );
+        prompt.push_str(instructions);
+        prompt.push_str("\n\n");
+    }
 
     if !tools.is_empty() {
         prompt.push_str("## Available Tools\n\n");

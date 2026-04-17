@@ -16,6 +16,12 @@ pub struct ConfigFile {
     pub session: Option<SessionConfig>,
     pub thinking: Option<ThinkingConfig>,
     pub mcp: Option<McpConfig>,
+    pub prompt: Option<PromptConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PromptConfig {
+    pub instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -146,6 +152,7 @@ pub struct ResolvedConfig {
     pub auto_compact: bool,
     pub context_window: Option<u64>,
     pub mcp_servers: Vec<McpServerConfig>,
+    pub user_instructions: Option<String>,
 }
 
 pub(crate) fn config_file_path() -> Option<PathBuf> {
@@ -225,10 +232,16 @@ impl ResolvedConfig {
         let file_shell = config_file.shell.unwrap_or_default();
         let file_session = config_file.session.unwrap_or_default();
         let file_thinking = config_file.thinking.unwrap_or_default();
+        let file_prompt = config_file.prompt.unwrap_or_default();
         let mcp_servers = config_file
             .mcp
             .and_then(|mcp| mcp.servers)
             .unwrap_or_default();
+
+        let user_instructions = file_prompt
+            .instructions
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         let provider_name = cli
             .provider
@@ -298,6 +311,7 @@ impl ResolvedConfig {
             auto_compact: file_session.auto_compact.unwrap_or(true),
             context_window: file_session.context_window,
             mcp_servers,
+            user_instructions,
         }
     }
 
@@ -676,5 +690,62 @@ auth_token = "bearer-token"
         let servers = config.mcp.unwrap().servers.unwrap();
         assert!(servers[0].auth.is_none());
         assert_eq!(servers[0].auth_token.as_deref(), Some("bearer-token"));
+    }
+
+    #[test]
+    fn test_prompt_config_deserialization() {
+        let toml_str = r#"
+[prompt]
+instructions = "Never use pip."
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let prompt = config.prompt.expect("prompt should be present");
+        assert_eq!(prompt.instructions.as_deref(), Some("Never use pip."));
+    }
+
+    #[test]
+    fn test_prompt_config_missing() {
+        let config: ConfigFile = toml::from_str("").expect("failed to parse empty toml");
+        assert!(config.prompt.is_none());
+    }
+
+    #[test]
+    fn test_prompt_config_multiline() {
+        let toml_str = r#"
+[prompt]
+instructions = """
+Rule 1.
+Rule 2.
+"""
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let prompt = config.prompt.expect("prompt should be present");
+        let instructions = prompt.instructions.expect("instructions should be set");
+        assert!(instructions.contains("Rule 1."));
+        assert!(instructions.contains("Rule 2."));
+    }
+
+    #[test]
+    fn test_user_instructions_whitespace_only_is_none() {
+        let file_prompt = PromptConfig {
+            instructions: Some("   \n\t  ".to_string()),
+        };
+        let resolved = file_prompt
+            .instructions
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_user_instructions_trimmed() {
+        let file_prompt = PromptConfig {
+            instructions: Some("  hello  \n".to_string()),
+        };
+        let resolved = file_prompt
+            .instructions
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        assert_eq!(resolved.as_deref(), Some("hello"));
     }
 }

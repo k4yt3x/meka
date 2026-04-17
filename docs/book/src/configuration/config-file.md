@@ -293,6 +293,38 @@ enabled = true
 budget_tokens = 20000
 ```
 
+## `[prompt]`
+
+Settings for injecting custom instructions into the system prompt. Use this to set installation-specific rules that should apply to every session -- things the agent needs to know about your system, preferred tools, or policies.
+
+### `prompt.instructions`
+
+A string of custom instructions that agsh will include in every system prompt, under a `## User Instructions` section. The model is told to treat them as hard constraints unless they conflict with safety requirements.
+
+Suitable use cases:
+
+- System-specific policies: "Never install Python packages globally with pip -- always use `uv` or a venv."
+- Installed tooling the agent should know about: "Poppler is available on this system -- use `pdftotext` for PDFs."
+- Workflow preferences: "Prefer ripgrep over grep; it's installed and faster."
+- Signing / compliance rules: "Git commits on this system must use gpg signing."
+
+Default: unset (no custom instructions).
+
+```toml
+[prompt]
+instructions = """
+Never install Python packages globally with pip. Always use `uv` or a venv.
+Poppler is available on this system — use `pdftotext` for PDFs.
+Prefer ripgrep over grep.
+"""
+```
+
+Notes:
+
+- Empty or whitespace-only strings are treated as unset.
+- Instructions apply to sub-agents spawned via `spawn_agent` too.
+- Instructions are included at all permission levels (including `none`) because they are authored by you.
+
 ## `[mcp]`
 
 Settings for MCP (Model Context Protocol) tool servers. MCP allows agsh to discover and use tools provided by external servers.

@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::context;
 use crate::error::{AgshError, Result};
 use crate::permission::SharedPermission;
 use crate::provider::{
@@ -11,9 +12,8 @@ use crate::provider::{
 };
 use crate::render::{self, StreamingRenderer};
 use crate::session::SessionManager;
-use crate::system_prompt::{build_environment_context, build_system_prompt};
 use crate::tools::ToolRegistry;
-use crate::tools::todo::{self, SharedTodoList};
+use crate::tools::todo::SharedTodoList;
 
 pub struct AgentOptions {
     pub streaming: bool,
@@ -26,6 +26,7 @@ pub struct AgentOptions {
     pub auto_compact: bool,
     pub context_window: u64,
     pub thinking_show_content: bool,
+    pub user_instructions: Option<String>,
 }
 
 pub struct Agent {
@@ -115,32 +116,25 @@ impl Agent {
 
         let permission = self.shared_permission.get();
 
-        let todo_context = {
+        let augmented_input = {
             let todos = self.todo_list.read().await;
-            if todos.is_empty() {
-                String::new()
-            } else {
-                todo::format_todo_for_context(&todos)
+            match context::build_turn_context(permission, &todos) {
+                Some(block) => format!("{}\n\n{}", block, user_input),
+                None => user_input.clone(),
             }
-        };
-        let environment_context = build_environment_context(permission);
-        let context_block = format!("{}{}", todo_context, environment_context);
-        let augmented_input = if context_block.trim().is_empty() {
-            user_input.clone()
-        } else {
-            format!("<context>\n{}</context>\n\n{}", context_block, user_input)
         };
         let user_message = Message::user(&augmented_input);
         messages.push(user_message);
         let tools = self.available_tools(permission);
         let deferred_tools = self.deferred_tool_summaries(permission);
         let skills = crate::skills::discover_skills();
-        let system_prompt = build_system_prompt(
+        let system_prompt = context::build_system_prompt(
             permission,
             &tools,
             self.options.sandboxed_shell,
             &deferred_tools,
             &skills,
+            self.options.user_instructions.as_deref(),
         );
 
         let base_messages = truncate_messages_for_context(messages, self.options.context_messages);
@@ -699,35 +693,14 @@ impl Agent {
     }
 
     async fn build_post_compact_context(&self, session_id: Uuid) -> String {
-        let mut parts = Vec::new();
-
         let permission = self.shared_permission.get();
-        let env = build_environment_context(permission);
-        if !env.is_empty() {
-            parts.push(env);
-        }
-
-        let todos = self.todo_list.read().await;
-        if !todos.is_empty() {
-            parts.push(todo::format_todo_for_context(&todos));
-        }
-        drop(todos);
-
-        if let Ok(entries) = self.session_manager.list_tool_outputs(session_id).await
-            && !entries.is_empty()
-        {
-            let mut listing = String::from("[Scratchpad entries]\n");
-            for entry in &entries {
-                listing.push_str(&format!(
-                    "- \"{}\" ({})\n",
-                    entry.name,
-                    crate::tools::scratchpad::format_size(entry.size),
-                ));
-            }
-            parts.push(listing);
-        }
-
-        parts.join("\n")
+        let todos = self.todo_list.read().await.clone();
+        let entries = self
+            .session_manager
+            .list_tool_outputs(session_id)
+            .await
+            .unwrap_or_default();
+        context::build_post_compact_context(permission, &todos, &entries)
     }
 
     fn available_tools(&self, permission: crate::permission::Permission) -> Vec<ToolDefinition> {

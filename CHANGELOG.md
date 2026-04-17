@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `skill` tool for loading named skills.
 - YAML frontmatter format for skills with `description`, `when_to_use`, `allowed_tools`, `version`, `user_invocable` fields.
 - `${AGSH_SKILL_DIR}` and `${AGSH_SESSION_ID}` substitution in skill bodies.
+- `[prompt] instructions` config option for system-wide custom instructions included in every session's system prompt.
 
 ### Changed
 

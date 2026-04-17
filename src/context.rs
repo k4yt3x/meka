@@ -1,13 +1,18 @@
 use crate::permission::Permission;
 use crate::provider::ToolDefinition;
+use crate::session::ToolOutputSummary;
 use crate::skills::Skill;
+use crate::tools::todo::{self, TodoItem};
 
+/// Build the static, session-level system prompt: role, permission description,
+/// user instructions, tools, skills, guidelines, and environment info.
 pub fn build_system_prompt(
     permission: Permission,
     tools: &[ToolDefinition],
     sandboxed_shell: bool,
     deferred_tools: &[(String, String)],
     skills: &[Skill],
+    user_instructions: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -65,6 +70,19 @@ pub fn build_system_prompt(
                  briefly explain what you will do before proceeding.\n\n",
             );
         }
+    }
+
+    if let Some(instructions) = user_instructions
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        prompt.push_str("## User Instructions\n\n");
+        prompt.push_str(
+            "These are installation-specific rules set by the user. Treat them as \
+             hard constraints unless they conflict with safety requirements.\n\n",
+        );
+        prompt.push_str(instructions);
+        prompt.push_str("\n\n");
     }
 
     if !tools.is_empty() {
@@ -154,6 +172,8 @@ pub fn build_system_prompt(
     prompt
 }
 
+/// Build the per-turn environment context block (pwd, date).
+/// Returns an empty string in `None` permission mode so system info isn't leaked.
 pub fn build_environment_context(permission: Permission) -> String {
     if permission == Permission::None {
         return String::new();
@@ -169,6 +189,58 @@ pub fn build_environment_context(permission: Permission) -> String {
     context.push_str(&format!("Date: {}\n", now));
 
     context
+}
+
+/// Build the `<context>...</context>` block that wraps per-turn user input with
+/// the active todo list and environment info. Returns `None` when neither
+/// contributes anything (empty todos in `None` mode).
+pub fn build_turn_context(permission: Permission, todos: &[TodoItem]) -> Option<String> {
+    let todo_context = if todos.is_empty() {
+        String::new()
+    } else {
+        todo::format_todo_for_context(todos)
+    };
+    let environment_context = build_environment_context(permission);
+    let body = format!("{}{}", todo_context, environment_context);
+    if body.trim().is_empty() {
+        None
+    } else {
+        Some(format!("<context>\n{}</context>", body))
+    }
+}
+
+/// Build the post-compaction context block summarizing live session state
+/// (environment, todos, scratchpad inventory) that must persist across the
+/// compacted message window.
+pub fn build_post_compact_context(
+    permission: Permission,
+    todos: &[TodoItem],
+    scratchpad_entries: &[ToolOutputSummary],
+) -> String {
+    let mut parts = Vec::new();
+
+    let env = build_environment_context(permission);
+    if !env.is_empty() {
+        parts.push(env);
+    }
+
+    if !todos.is_empty() {
+        parts.push(todo::format_todo_for_context(todos));
+    }
+
+    if !scratchpad_entries.is_empty() {
+        let mut listing = String::from("[Scratchpad entries]\n");
+        for entry in scratchpad_entries {
+            listing.push_str(&format!(
+                "- \"{}\" ({})\n",
+                entry.name,
+                crate::tools::scratchpad::format_size(entry.size),
+            ));
+        }
+        parts.push(listing);
+    }
+
+    parts.join("\n")
 }
 
 #[cfg(test)]
@@ -188,9 +260,25 @@ mod tests {
         }
     }
 
+    fn sample_todo(id: &str, description: &str, status: &str) -> TodoItem {
+        TodoItem {
+            id: id.to_string(),
+            description: description.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    fn sample_scratchpad_entry(name: &str, size: usize) -> ToolOutputSummary {
+        ToolOutputSummary {
+            name: name.to_string(),
+            size,
+            created_at: "2026-04-17T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn test_system_prompt_none_mode() {
-        let prompt = build_system_prompt(Permission::None, &[], false, &[], &[]);
+        let prompt = build_system_prompt(Permission::None, &[], false, &[], &[], None);
         assert!(prompt.contains("NO tools available"));
         assert!(prompt.contains("Shift+Tab"));
         assert!(!prompt.contains("## Environment"));
@@ -198,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_read_mode_with_sandbox() {
-        let prompt = build_system_prompt(Permission::Read, &[], true, &[], &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], true, &[], &[], None);
         assert!(prompt.contains("READ-ONLY"));
         assert!(prompt.contains("read-only sandboxed"));
         assert!(prompt.contains("CANNOT write"));
@@ -206,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_read_mode_without_sandbox() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None);
         assert!(prompt.contains("READ-ONLY"));
         assert!(prompt.contains("CANNOT write"));
         assert!(prompt.contains("execute shell commands"));
@@ -215,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_write_mode() {
-        let prompt = build_system_prompt(Permission::Write, &[], false, &[], &[]);
+        let prompt = build_system_prompt(Permission::Write, &[], false, &[], &[], None);
         assert!(prompt.contains("FULL access"));
         assert!(prompt.contains("destructive"));
     }
@@ -235,7 +323,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_system_prompt(Permission::Write, &tools, false, &[], &[]);
+        let prompt = build_system_prompt(Permission::Write, &tools, false, &[], &[], None);
         assert!(prompt.contains("read_file"));
         assert!(prompt.contains("execute_command"));
         assert!(prompt.contains("Available Tools"));
@@ -243,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_has_environment() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None);
         assert!(prompt.contains("Environment"));
         assert!(!prompt.contains("Working Directory:"));
         assert!(!prompt.contains("Date:"));
@@ -252,7 +340,7 @@ mod tests {
     #[test]
     fn test_system_prompt_lists_skills() {
         let skills = vec![sample_skill("setup-server"), sample_skill("deploy-app")];
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &skills);
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &skills, None);
         assert!(prompt.contains("## Skills"));
         assert!(prompt.contains("**setup-server**"));
         assert!(prompt.contains("setup-server description"));
@@ -263,15 +351,49 @@ mod tests {
     #[test]
     fn test_system_prompt_omits_skills_in_none_mode() {
         let skills = vec![sample_skill("setup-server")];
-        let prompt = build_system_prompt(Permission::None, &[], false, &[], &skills);
+        let prompt = build_system_prompt(Permission::None, &[], false, &[], &skills, None);
         assert!(!prompt.contains("## Skills"));
         assert!(!prompt.contains("setup-server"));
     }
 
     #[test]
     fn test_system_prompt_omits_skills_section_when_empty() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[]);
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None);
         assert!(!prompt.contains("## Skills"));
+    }
+
+    #[test]
+    fn test_system_prompt_includes_user_instructions() {
+        let prompt = build_system_prompt(
+            Permission::Read,
+            &[],
+            false,
+            &[],
+            &[],
+            Some("Never use pip. Always prefer uv."),
+        );
+        assert!(prompt.contains("## User Instructions"));
+        assert!(prompt.contains("Never use pip. Always prefer uv."));
+        assert!(prompt.contains("installation-specific rules"));
+    }
+
+    #[test]
+    fn test_system_prompt_includes_user_instructions_in_none_mode() {
+        let prompt = build_system_prompt(Permission::None, &[], false, &[], &[], Some("Rule X"));
+        assert!(prompt.contains("## User Instructions"));
+        assert!(prompt.contains("Rule X"));
+    }
+
+    #[test]
+    fn test_system_prompt_omits_user_instructions_when_none() {
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None);
+        assert!(!prompt.contains("## User Instructions"));
+    }
+
+    #[test]
+    fn test_system_prompt_omits_user_instructions_when_whitespace() {
+        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], Some("   \n"));
+        assert!(!prompt.contains("## User Instructions"));
     }
 
     #[test]
@@ -286,5 +408,60 @@ mod tests {
     fn test_environment_context_none_mode() {
         let context = build_environment_context(Permission::None);
         assert!(context.is_empty());
+    }
+
+    #[test]
+    fn test_turn_context_empty_in_none_mode_with_no_todos() {
+        assert!(build_turn_context(Permission::None, &[]).is_none());
+    }
+
+    #[test]
+    fn test_turn_context_has_environment_in_read_mode() {
+        let context = build_turn_context(Permission::Read, &[]).expect("should have content");
+        assert!(context.starts_with("<context>\n"));
+        assert!(context.ends_with("</context>"));
+        assert!(context.contains("[Environment context]"));
+    }
+
+    #[test]
+    fn test_turn_context_includes_todos() {
+        let todos = vec![sample_todo("1", "write tests", "in_progress")];
+        let context = build_turn_context(Permission::Read, &todos).expect("should have content");
+        assert!(context.contains("write tests"));
+        assert!(context.contains("[Environment context]"));
+    }
+
+    #[test]
+    fn test_turn_context_none_mode_with_todos_still_includes_todos() {
+        let todos = vec![sample_todo("1", "do a thing", "pending")];
+        let context = build_turn_context(Permission::None, &todos).expect("should have content");
+        assert!(context.contains("do a thing"));
+        assert!(!context.contains("[Environment context]"));
+    }
+
+    #[test]
+    fn test_post_compact_context_empty_in_none_mode_no_state() {
+        let result = build_post_compact_context(Permission::None, &[], &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_post_compact_context_includes_env_todos_scratchpad() {
+        let todos = vec![sample_todo("1", "keep working", "pending")];
+        let entries = vec![sample_scratchpad_entry("notes", 1024)];
+        let result = build_post_compact_context(Permission::Read, &todos, &entries);
+        assert!(result.contains("[Environment context]"));
+        assert!(result.contains("keep working"));
+        assert!(result.contains("[Scratchpad entries]"));
+        assert!(result.contains("\"notes\""));
+    }
+
+    #[test]
+    fn test_post_compact_context_scratchpad_only() {
+        let entries = vec![sample_scratchpad_entry("log", 500)];
+        let result = build_post_compact_context(Permission::None, &[], &entries);
+        assert!(result.contains("[Scratchpad entries]"));
+        assert!(result.contains("\"log\""));
+        assert!(!result.contains("[Environment context]"));
     }
 }

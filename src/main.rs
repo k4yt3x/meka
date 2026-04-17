@@ -1,6 +1,7 @@
 mod agent;
 mod cli;
 mod config;
+mod context;
 mod error;
 mod mcp;
 mod permission;
@@ -11,7 +12,6 @@ mod session;
 mod setup;
 mod shell;
 mod skills;
-mod system_prompt;
 mod tools;
 
 use clap::Parser;
@@ -208,6 +208,7 @@ async fn create_agent_from_config(
             sandbox_enabled: config.sandbox,
             sandbox_capability,
         },
+        user_instructions: config.user_instructions.clone(),
     }));
 
     if let Some(manager) = mcp_manager {
@@ -246,6 +247,7 @@ async fn create_agent_from_config(
                     .unwrap_or(128_000)
             }),
             thinking_show_content: config.thinking_show_content,
+            user_instructions: config.user_instructions.clone(),
         },
         todo_list,
         shared_session_id,
