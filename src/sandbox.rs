@@ -224,6 +224,30 @@ pub const SANDBOX_PROFILE_READONLY: &str =
     "(version 1)(allow default)(deny file-write*)(deny file-write-setugid)";
 
 // --------------------------------------------------------------------------
+// Windows PowerShell output encoding
+// --------------------------------------------------------------------------
+
+/// PowerShell prelude that switches `$OutputEncoding` and
+/// `[Console]::OutputEncoding` to UTF-8. See
+/// [`wrap_command_with_utf8_output`] for why this is necessary.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const POWERSHELL_UTF8_PRELUDE: &str = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
+     $OutputEncoding=[System.Text.Encoding]::UTF8;";
+
+/// Prepend the UTF-8 encoding prelude to a PowerShell command. Used by
+/// both the sandboxed and non-sandboxed Windows `execute_command` paths
+/// so pipe output is always decoded as UTF-8 on the Rust side regardless
+/// of the console's legacy code page.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn wrap_command_with_utf8_output(command: &str) -> String {
+    let mut wrapped = String::with_capacity(POWERSHELL_UTF8_PRELUDE.len() + command.len() + 1);
+    wrapped.push_str(POWERSHELL_UTF8_PRELUDE);
+    wrapped.push(' ');
+    wrapped.push_str(command);
+    wrapped
+}
+
+// --------------------------------------------------------------------------
 // Windows argv quoting (cross-platform — the rules are Windows-specific but
 // the implementation is pure string manipulation, so it compiles and tests
 // on every platform)
@@ -445,8 +469,18 @@ mod windows_impl {
             ));
         }
 
+        // Force UTF-8 output before running the user's command. PowerShell
+        // 5.1 (the inbox version we invoke as `powershell.exe`) defaults
+        // `[Console]::OutputEncoding` to the system's legacy OEM code
+        // page — CP 437 / 1252 on most English installs — which mangles
+        // non-ASCII output (日本語 → `???`) when the process writes to a
+        // redirected pipe like ours. Prefixing every script with a UTF-8
+        // encoding switch makes output round-trip losslessly regardless
+        // of the host's console configuration.
+        let wrapped_command = super::wrap_command_with_utf8_output(command);
+
         let mut cmd_line = String::from(r#""powershell.exe" -NoProfile -NonInteractive -Command "#);
-        cmd_line.push_str(&super::quote_command_arg(command));
+        cmd_line.push_str(&super::quote_command_arg(&wrapped_command));
 
         // SAFETY: All Win32 calls below are documented and we check return
         // values. Handles are wrapped in `OwnedHandle` to close on drop.
@@ -795,54 +829,87 @@ mod windows_impl {
         Ok(())
     }
 
-    /// Build a minimal UTF-16 `NAME=VALUE\0NAME=VALUE\0\0` environment
-    /// block containing only variables the sandboxed PowerShell instance
-    /// strictly needs. All provider API keys, OAuth tokens, and generic
-    /// `*_TOKEN`/`*_SECRET` style variables are dropped so a Low-integrity
-    /// child cannot read them via `$env:FOO` and exfiltrate over the
-    /// network (Low-integrity does not restrict outbound sockets).
+    /// Build a UTF-16 `NAME=VALUE\0NAME=VALUE\0\0` environment block for
+    /// the sandboxed child. Starts from the parent environment and drops
+    /// names that look sensitive — anything containing `TOKEN`, `SECRET`,
+    /// `PASSWORD`, or `API_KEY`, plus names prefixed with known provider
+    /// namespaces. Everything else passes through so PowerShell can load
+    /// its built-in modules (it needs `PSModulePath`, `APPDATA`,
+    /// `ProgramFiles`, and friends) without a brittle allowlist that
+    /// breaks whenever Windows adds a new required variable.
+    ///
+    /// A Low-integrity child can still open outbound sockets, so a stray
+    /// `ANTHROPIC_API_KEY` in the parent env is a live exfil vector —
+    /// hence the denylist. An allowlist version was tried first but
+    /// couldn't keep core cmdlets like `Write-Output` / `Measure-Object`
+    /// working without enumerating half of the Windows environment.
     fn build_scrubbed_env_block_utf16() -> Vec<u16> {
-        // Minimal set required for the Windows API loader and PowerShell
-        // startup. `SystemRoot` in particular is load-bearing — without
-        // it, `kernel32.dll` refuses to initialize and the child exits
-        // immediately with a cryptic error.
-        const ALLOWED_NAMES: &[&str] = &[
-            "SystemRoot",
-            "SystemDrive",
-            "USERPROFILE",
-            "TEMP",
-            "TMP",
-            "ComSpec",
-            "PATHEXT",
-            "OS",
-            "PROCESSOR_ARCHITECTURE",
-            "PROCESSOR_IDENTIFIER",
-            "NUMBER_OF_PROCESSORS",
-            "WINDIR",
-        ];
-
         let mut block: Vec<u16> = Vec::new();
-        for name in ALLOWED_NAMES {
-            if let Ok(value) = std::env::var(name) {
-                append_env_entry(&mut block, name, &value);
+        for (name_os, value_os) in std::env::vars_os() {
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+            let Some(value) = value_os.to_str() else {
+                continue;
+            };
+            if is_sensitive_env_name(name) {
+                continue;
             }
+            append_env_entry(&mut block, name, value);
         }
-
-        // Rebuild `PATH` from system directories only — any user-appended
-        // entries (language SDKs, dev tooling) are dropped. Sandboxed
-        // commands that need more should be promoted out of read mode.
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-        let safe_path = format!(
-            "{root}\\System32;{root};{root}\\System32\\Wbem;\
-             {root}\\System32\\WindowsPowerShell\\v1.0\\",
-            root = system_root
-        );
-        append_env_entry(&mut block, "PATH", &safe_path);
-
         // Double-NUL terminator (each entry already ends with one NUL; we
         // need another to close the block).
         block.push(0);
         block
+    }
+
+    /// Heuristic match for variable names that commonly carry credentials.
+    /// Case-insensitive substring match on a short list of markers plus
+    /// a prefix match on known provider namespaces. Tuned to be
+    /// aggressive on false positives (a legitimate `GITHUB_ACTOR` is
+    /// dropped alongside `GITHUB_TOKEN`) because the downside of a
+    /// missing env var is a confusing tool error; the downside of a
+    /// leaked key is a live exfil channel.
+    pub(super) fn is_sensitive_env_name(name: &str) -> bool {
+        const SENSITIVE_SUBSTRINGS: &[&str] = &[
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "API_KEY",
+            "APIKEY",
+            "PRIVATE_KEY",
+            "BEARER",
+            "CREDENTIAL",
+            "SESSION_KEY",
+            "ACCESS_KEY",
+        ];
+        const SENSITIVE_PREFIXES: &[&str] = &[
+            "ANTHROPIC_",
+            "OPENAI_",
+            "CLAUDE_",
+            "AGSH_",
+            "AWS_",
+            "GCP_",
+            "GOOGLE_",
+            "AZURE_",
+            "GITHUB_",
+            "GITLAB_",
+            "HF_",
+            "HUGGINGFACE_",
+            "NPM_",
+            "PYPI_",
+            "CARGO_REGISTRY_",
+            "DOCKER_",
+        ];
+
+        let upper = name.to_ascii_uppercase();
+        SENSITIVE_SUBSTRINGS
+            .iter()
+            .any(|needle| upper.contains(needle))
+            || SENSITIVE_PREFIXES
+                .iter()
+                .any(|prefix| upper.starts_with(prefix))
     }
 
     fn append_env_entry(block: &mut Vec<u16>, name: &str, value: &str) {
@@ -961,6 +1028,33 @@ mod windows_impl {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_is_sensitive_env_name_matches_known_secret_patterns() {
+        use windows_impl::is_sensitive_env_name;
+        assert!(is_sensitive_env_name("ANTHROPIC_API_KEY"));
+        assert!(is_sensitive_env_name("OPENAI_API_KEY"));
+        assert!(is_sensitive_env_name("GITHUB_TOKEN"));
+        assert!(is_sensitive_env_name("AWS_SECRET_ACCESS_KEY"));
+        assert!(is_sensitive_env_name("my_bearer_auth"));
+        assert!(is_sensitive_env_name("DATABASE_PASSWORD"));
+        assert!(is_sensitive_env_name("anthropic_api_key"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_is_sensitive_env_name_allows_system_vars() {
+        use windows_impl::is_sensitive_env_name;
+        assert!(!is_sensitive_env_name("SystemRoot"));
+        assert!(!is_sensitive_env_name("PATH"));
+        assert!(!is_sensitive_env_name("PSModulePath"));
+        assert!(!is_sensitive_env_name("APPDATA"));
+        assert!(!is_sensitive_env_name("LOCALAPPDATA"));
+        assert!(!is_sensitive_env_name("ProgramFiles"));
+        assert!(!is_sensitive_env_name("USERPROFILE"));
+        assert!(!is_sensitive_env_name("TEMP"));
+    }
+
     #[test]
     fn test_detect_sandbox_capability() {
         let capability = detect();
@@ -978,6 +1072,17 @@ mod tests {
             #[allow(unreachable_patterns)]
             _ => {}
         }
+    }
+
+    #[test]
+    fn test_wrap_command_with_utf8_output_prepends_prelude() {
+        let wrapped = wrap_command_with_utf8_output("Write-Output '日本語'");
+        assert!(wrapped.starts_with("[Console]::OutputEncoding="));
+        assert!(wrapped.contains("$OutputEncoding=[System.Text.Encoding]::UTF8"));
+        assert!(wrapped.ends_with("Write-Output '日本語'"));
+        // A space must separate the prelude from the user command so
+        // PowerShell doesn't glue them into one malformed statement.
+        assert!(wrapped.contains("UTF8; Write-Output"));
     }
 
     /// Reference table covering the corners of the `CommandLineToArgvW`

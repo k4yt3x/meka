@@ -100,11 +100,17 @@ impl Tool for ExecuteCommandTool {
 
         #[cfg(windows)]
         let mut command_builder = {
+            // Wrap with the UTF-8 output prelude so pipe output matches
+            // what the sandboxed path produces — both on Rust's side this
+            // is decoded as UTF-8. Without the wrap, PowerShell 5.1
+            // defaults to the legacy console code page and mangles
+            // non-ASCII characters into `?`.
+            let wrapped = crate::sandbox::wrap_command_with_utf8_output(&command);
             let mut cmd = tokio::process::Command::new("powershell.exe");
             cmd.arg("-NoProfile")
                 .arg("-NonInteractive")
                 .arg("-Command")
-                .arg(&command);
+                .arg(&wrapped);
             cmd
         };
 

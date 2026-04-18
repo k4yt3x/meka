@@ -390,7 +390,12 @@ fn shorten_path_with_tilde(path: &Path) -> String {
             return "~".to_string();
         }
         if let Ok(relative) = path.strip_prefix(&home) {
-            return format!("~/{}", relative.display());
+            // Normalize to forward slashes so the tilde form reads the
+            // same way on every platform (Windows' native `\` looks
+            // jarring next to the `~/` prefix and breaks tests that
+            // compare against a hard-coded literal).
+            let relative_str = relative.display().to_string().replace('\\', "/");
+            return format!("~/{}", relative_str);
         }
     }
     path.display().to_string()
