@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] - 2026-04-18
 
 ### Security
 
@@ -22,41 +22,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `tests/cli.rs` end-to-end smoke tests for `--version`, `--help`, unknown flags.
-- `render::render_error` and `render::render_provider_setup_hint` helpers for consistent CLI output.
-- Module-level `//!` doc comments across the codebase; CI now runs `cargo doc -D warnings`.
-- CI test job runs on Linux, macOS, and Windows so platform-specific sandbox code is exercised.
-- Windows `execute_command` sandbox via Low-integrity token (spawned via `CreateProcessAsUserW`
-  running `powershell.exe -NoProfile -NonInteractive -Command`); blocks writes to user data,
-  drains stdout/stderr concurrently so large outputs don't deadlock on the Windows pipe buffer.
-  Sandbox token has all privileges disabled (defense-in-depth). Handle inheritance is restricted
-  to the three child-bound handles via `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, eliminating the
-  classic `CreatePipe`→`SetHandleInformation`→`CreateProcess` leak window.
-- Windows sandbox falls back to `CreateProcessWithTokenW` when `CreateProcessAsUserW` is denied
-  for missing `SE_INCREASE_QUOTA_NAME` privilege (common on locked-down accounts).
+- `render::render_error` and `render::render_provider_setup_hint` helpers for CLI output.
+- Module-level `//!` doc comments across the codebase; CI runs `cargo doc -D warnings`.
+- CI test job runs on Linux, macOS, and Windows to cover platform-specific sandbox code.
+- Windows `execute_command` sandbox via Low-integrity token with handle-list inheritance filter.
+- Windows sandbox falls back to `CreateProcessWithTokenW` when `SE_INCREASE_QUOTA_NAME` is missing.
 
 ### Changed
 
-- Session locking now uses an OS file lock (`flock`/`LockFileEx` via `fd-lock`) instead of a
-  PID stored in `sessions.locked_by`. The kernel releases the lock when the holder dies for
-  any reason, so a hard kill can no longer leave a session permanently stuck.
-- `SessionManager::lock_session` is now sync and returns a `SessionLock` RAII handle;
-  `unlock_session` and `SessionLockGuard` are removed (drop the handle to release).
-- Schema migration drops the legacy `sessions.locked_by` column, automatically unsticking
-  any session left locked by an earlier crashed process.
-- `execute_command` on Windows now invokes PowerShell with `-NoProfile -NonInteractive` in
-  both sandboxed and unsandboxed mode; no more per-user profile scripts or hangs on prompts.
-- `execute_command` no longer inherits the agent's stdin on any platform; children that read
-  stdin now see immediate EOF instead of racing the agent's own input loop.
+- Session locking uses OS file locks via `fd-lock` so kernel-released locks survive hard kills.
+- `SessionManager::lock_session` is now sync and returns a `SessionLock` RAII handle.
+- Schema migration drops the legacy `sessions.locked_by` column to unstick old sessions.
+- `execute_command` on Windows invokes PowerShell with `-NoProfile -NonInteractive` always.
+- `execute_command` children no longer inherit the agent's stdin; they see immediate EOF.
 
 ### Fixed
 
-- `default_database_path` fallback no longer returns a literal `~/.local/share`; falls back to
-  `$HOME/.local/share` and surfaces a configuration error when neither is available.
-- Stuck sessions caused by PID-based locking surviving a hard kill (closed terminal, OOM,
-  `SIGKILL`, etc.). Resolved by switching to OS-managed file locks.
-- Windows sandbox normal-exit path no longer hangs indefinitely when the child leaves a
-  grandchild process holding the stdout/stderr pipes open; drain is now bounded by a
-  5-second timeout and truncated output is flagged in the tool result.
+- `default_database_path` falls back to `$HOME/.local/share` and errors cleanly when unset.
+- Stuck sessions from PID-based locking surviving hard kills (resolved via OS file locks).
+- Windows sandbox normal-exit drain now times out after 5s instead of hanging on a grandchild.
 
 ## [0.11.0] - 2026-04-17
 
