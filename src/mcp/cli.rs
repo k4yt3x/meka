@@ -17,10 +17,7 @@ pub async fn run_list(servers: &[McpServerConfig]) -> Result<()> {
         println!("(no MCP servers configured)");
         return Ok(());
     }
-    println!(
-        "{:<24} {:<8} {:<8} {}",
-        "name", "transport", "perm", "target"
-    );
+    println!("{:<24} {:<8} {:<8} target", "name", "transport", "perm");
     println!("{}", "-".repeat(72));
     for config in servers {
         let target = match config.transport {
@@ -141,16 +138,16 @@ pub async fn run_logout(
     name: &str,
 ) -> Result<()> {
     // Best-effort revocation — cleared from stored creds regardless.
-    if let Some(config) = servers.iter().find(|c| c.name == name) {
-        if matches!(config.transport, McpTransport::Http) {
-            if let Err(error) = crate::mcp::revoke_stored_token(token_store, &config.name).await {
-                tracing::warn!(
-                    "failed to revoke token at server '{}': {} (continuing)",
-                    config.name,
-                    error
-                );
-            }
-        }
+    if let Some(config) = servers
+        .iter()
+        .find(|c| c.name == name && matches!(c.transport, McpTransport::Http))
+        && let Err(error) = crate::mcp::revoke_stored_token(token_store, &config.name).await
+    {
+        tracing::warn!(
+            "failed to revoke token at server '{}': {} (continuing)",
+            config.name,
+            error
+        );
     }
 
     token_store.clear_mcp_credentials(name).await?;

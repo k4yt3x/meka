@@ -482,10 +482,10 @@ impl McpClientManager {
     pub fn server_instructions(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for (name, entry) in &self.servers {
-            if let Some(text) = entry.instructions() {
-                if !text.trim().is_empty() {
-                    out.push((name.clone(), text.to_string()));
-                }
+            if let Some(text) = entry.instructions()
+                && !text.trim().is_empty()
+            {
+                out.push((name.clone(), text.to_string()));
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -732,23 +732,23 @@ async fn connect_server(
             // recently and we have no stored creds, skip the unauthenticated
             // probe and drive straight into the OAuth flow. The cache entry
             // is cleared on a successful connect below.
-            if config.auth.is_some() {
-                if let Some(store) = token_store {
-                    match store.load_auth_probe(server_name, MCP_AUTH_CACHE_TTL).await {
-                        Ok(Some(true)) => {
-                            tracing::info!(
-                                "MCP server '{}': cached 'needs-auth' verdict (<{:?} old), going straight to OAuth",
-                                server_name,
-                                MCP_AUTH_CACHE_TTL
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(error) => tracing::debug!(
-                            "auth probe cache lookup for '{}' failed: {}",
+            if config.auth.is_some()
+                && let Some(store) = token_store
+            {
+                match store.load_auth_probe(server_name, MCP_AUTH_CACHE_TTL).await {
+                    Ok(Some(true)) => {
+                        tracing::info!(
+                            "MCP server '{}': cached 'needs-auth' verdict (<{:?} old), going straight to OAuth",
                             server_name,
-                            error
-                        ),
+                            MCP_AUTH_CACHE_TTL
+                        );
                     }
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!(
+                        "auth probe cache lookup for '{}' failed: {}",
+                        server_name,
+                        error
+                    ),
                 }
             }
 
@@ -1800,6 +1800,12 @@ impl ClientHandler for AgshClientHandler {
         }
     }
 
+    // Keep the explicit `impl Future` return type: other handlers in this
+    // trait impl have non-trivial captures (`Arc<str>` clones, server name
+    // in logging, etc.) and use the same signature shape. Staying uniform
+    // makes the module easier to read than mixing `async fn` and the
+    // manual-future form.
+    #[allow(clippy::manual_async_fn)]
     fn on_progress(
         &self,
         params: ProgressNotificationParam,
@@ -1826,6 +1832,7 @@ impl ClientHandler for AgshClientHandler {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn list_roots(
         &self,
         _context: RequestContext<RoleClient>,
@@ -2075,14 +2082,12 @@ fn convert_sampling_params(
 /// ellipsis marker if truncation occurred. Operates on `char` boundaries so
 /// the result is always valid UTF-8.
 pub fn truncate(text: &str, max_chars: usize) -> String {
-    let mut count = 0usize;
     let mut byte_end = text.len();
-    for (idx, _) in text.char_indices() {
+    for (count, (idx, _)) in text.char_indices().enumerate() {
         if count == max_chars {
             byte_end = idx;
             break;
         }
-        count += 1;
     }
     if byte_end < text.len() {
         let mut truncated = String::with_capacity(byte_end + 3);
@@ -2397,23 +2402,23 @@ impl Tool for McpToolAdapter {
                 // unauthenticated probe and goes straight to OAuth. The user
                 // must re-authenticate via `agsh mcp login <name>`.
                 let text = error.to_string().to_ascii_lowercase();
-                if text.contains("401") || text.contains("unauthorized") {
-                    if let Some(store) = &self.entry.token_store {
-                        if let Err(cache_err) =
-                            store.save_auth_probe(&self.entry.server_name, true).await
-                        {
-                            tracing::debug!(
-                                "failed to save auth probe cache for '{}': {}",
-                                self.entry.server_name,
-                                cache_err
-                            );
-                        } else {
-                            tracing::warn!(
-                                "MCP server '{}' returned 401 — marked as needing auth. Run 'agsh mcp login {}' to re-authenticate.",
-                                self.entry.server_name,
-                                self.entry.server_name
-                            );
-                        }
+                if (text.contains("401") || text.contains("unauthorized"))
+                    && let Some(store) = &self.entry.token_store
+                {
+                    if let Err(cache_err) =
+                        store.save_auth_probe(&self.entry.server_name, true).await
+                    {
+                        tracing::debug!(
+                            "failed to save auth probe cache for '{}': {}",
+                            self.entry.server_name,
+                            cache_err
+                        );
+                    } else {
+                        tracing::warn!(
+                            "MCP server '{}' returned 401 — marked as needing auth. Run 'agsh mcp login {}' to re-authenticate.",
+                            self.entry.server_name,
+                            self.entry.server_name
+                        );
                     }
                 }
                 return Err(AgshError::McpToolExecution {

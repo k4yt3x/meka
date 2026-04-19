@@ -178,6 +178,11 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
     .await
 }
 
+// Top-level entry point for assembling the agent; splitting its inputs
+// further would force callers to pre-bundle unrelated collaborators
+// (config, session manager, permission mode, credential, MCP plumbing,
+// approval channel) just to appease the arg-count lint.
+#[allow(clippy::too_many_arguments)]
 async fn create_agent_from_config(
     config: &ResolvedConfig,
     session_manager: SessionManager,
@@ -610,8 +615,8 @@ async fn run_interactive(
                                         }
                                     }
                                     let user_input = body.trim().to_string();
-                                    if !user_input.is_empty() {
-                                        if let Err(error) = agent
+                                    if !user_input.is_empty()
+                                        && let Err(error) = agent
                                             .run_turn(
                                                 &mut session_id,
                                                 &mut messages,
@@ -619,9 +624,8 @@ async fn run_interactive(
                                                 CancellationToken::new(),
                                             )
                                             .await
-                                        {
-                                            render::render_error(&error);
-                                        }
+                                    {
+                                        render::render_error(&error);
                                     }
                                 }
                                 Err(error) => {

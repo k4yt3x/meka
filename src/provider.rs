@@ -194,11 +194,12 @@ pub struct ToolDefinition {
     pub meta: Option<serde_json::Value>,
 }
 
+#[cfg(test)]
 impl ToolDefinition {
-    /// Convenience constructor for builtin tools that don't need the
-    /// MCP-specific annotations/meta/title fields. These stay `None` so
-    /// existing call sites don't need to thread default placeholders
-    /// through their definitions.
+    /// Test-only convenience constructor. Production code builds
+    /// `ToolDefinition` as a struct literal and explicitly sets the
+    /// MCP-specific `title`/`annotations`/`meta` fields; this helper just
+    /// keeps test fixtures terse.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,

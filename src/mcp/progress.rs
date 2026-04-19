@@ -97,10 +97,10 @@ pub struct ProgressGuard {
 
 impl Drop for ProgressGuard {
     fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            if let Ok(mut entries) = registry().entries.lock() {
-                entries.remove(&key);
-            }
+        if let Some(key) = self.key.take()
+            && let Ok(mut entries) = registry().entries.lock()
+        {
+            entries.remove(&key);
         }
     }
 }
