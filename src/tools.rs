@@ -162,6 +162,10 @@ impl ToolRegistry {
     }
 
     /// Returns tool definitions for the API call, excluding deferred tools.
+    /// Permission-filtered view — used by sub-agents which run at a fixed
+    /// permission. The main agent uses [`definitions_active`] so the tools
+    /// array remains byte-identical across mid-session `/permission` toggles,
+    /// keeping the Anthropic prompt cache warm on subsequent turns.
     pub fn definitions_for_permission(&self, permission: Permission) -> Vec<ToolDefinition> {
         let deferred = self.deferred.read().expect("deferred lock poisoned");
         self.tools
@@ -176,18 +180,46 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Returns name+description summaries for ALL tools including deferred ones.
-    pub fn all_tool_summaries(&self, permission: Permission) -> Vec<(String, String)> {
+    /// Returns every active (non-deferred) tool definition regardless of the
+    /// caller's current permission. Blocked calls are rejected at dispatch;
+    /// keeping the tools array permission-independent is what preserves the
+    /// prompt cache prefix across `/permission` toggles (breakpoint 3 in the
+    /// Claude provider's cache layout).
+    pub fn definitions_active(&self) -> Vec<ToolDefinition> {
+        let deferred = self.deferred.read().expect("deferred lock poisoned");
         self.tools
             .read()
             .expect("tools lock poisoned")
             .iter()
-            .filter(|tool| permission.allows(tool.required_permission()))
+            .filter(|tool| !deferred.contains(&tool.definition().name))
+            .map(|tool| tool.definition())
+            .collect()
+    }
+
+    /// Returns (name, description, required_permission, is_deferred) for every
+    /// registered tool. Drives the permission-independent system-prompt tool
+    /// catalogue plus the per-turn `[Permission context]` block that names
+    /// currently-blocked tools. Sorted by (name) for deterministic output.
+    pub fn tool_catalogue(&self) -> Vec<(String, String, Permission, bool)> {
+        let deferred = self.deferred.read().expect("deferred lock poisoned");
+        let mut entries: Vec<(String, String, Permission, bool)> = self
+            .tools
+            .read()
+            .expect("tools lock poisoned")
+            .iter()
             .map(|tool| {
                 let def = tool.definition();
-                (def.name, def.description)
+                let is_deferred = deferred.contains(&def.name);
+                (
+                    def.name,
+                    def.description,
+                    tool.required_permission(),
+                    is_deferred,
+                )
             })
-            .collect()
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
     }
 
     /// Register the core tools shared by the main agent and sub-agents:
@@ -373,6 +405,61 @@ mod tests {
         assert!(write_tools.iter().any(|t| t.name == "read_file"));
         assert!(write_tools.iter().any(|t| t.name == "write_file"));
         assert!(write_tools.iter().any(|t| t.name == "execute_command"));
+    }
+
+    #[tokio::test]
+    async fn test_definitions_active_includes_write_tools() {
+        let registry = test_registry().await;
+        let active = registry.definitions_active();
+        assert!(active.iter().any(|t| t.name == "read_file"));
+        assert!(active.iter().any(|t| t.name == "write_file"));
+        assert!(active.iter().any(|t| t.name == "edit_file"));
+        assert!(active.iter().any(|t| t.name == "execute_command"));
+        assert!(!active.iter().any(|t| t.name == "scratchpad_read"));
+    }
+
+    #[tokio::test]
+    async fn test_definitions_active_stable_across_permissions() {
+        let registry = test_registry().await;
+        let a = registry.definitions_active();
+        let b = registry.definitions_active();
+        assert_eq!(a.len(), b.len());
+        let a_names: Vec<_> = a.iter().map(|t| t.name.clone()).collect();
+        let b_names: Vec<_> = b.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(a_names, b_names);
+    }
+
+    #[tokio::test]
+    async fn test_tool_catalogue_covers_active_and_deferred() {
+        let registry = test_registry().await;
+        let entries = registry.tool_catalogue();
+        let names: std::collections::HashSet<_> =
+            entries.iter().map(|(n, _, _, _)| n.clone()).collect();
+        assert!(names.contains("write_file"));
+        assert!(names.contains("scratchpad_read"));
+        assert!(names.contains("scratchpad_edit"));
+
+        let deferred_names: Vec<_> = entries
+            .iter()
+            .filter(|(_, _, _, d)| *d)
+            .map(|(n, _, _, _)| n.clone())
+            .collect();
+        assert!(deferred_names.iter().any(|n| n == "scratchpad_read"));
+
+        let required: std::collections::HashMap<_, _> =
+            entries.iter().map(|(n, _, p, _)| (n.clone(), *p)).collect();
+        assert_eq!(required["read_file"], Permission::Read);
+        assert_eq!(required["write_file"], Permission::Write);
+    }
+
+    #[tokio::test]
+    async fn test_tool_catalogue_is_sorted() {
+        let registry = test_registry().await;
+        let entries = registry.tool_catalogue();
+        let names: Vec<_> = entries.iter().map(|(n, _, _, _)| n.clone()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "tool_catalogue must return sorted entries");
     }
 
     #[tokio::test]

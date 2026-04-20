@@ -194,6 +194,7 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
         let manager = Arc::new(
             mcp::McpClientManager::connect_all(
                 &config.mcp_servers,
+                config.mcp_default_permission,
                 Some(&token_store),
                 Arc::clone(&mcp_context),
             )
@@ -309,9 +310,7 @@ async fn create_agent_from_config(
 
     if let Some(manager) = mcp_manager {
         for mcp_config in &config.mcp_servers {
-            let mcp_tools = manager
-                .discover_tools_for_server(&mcp_config.name, mcp_config.permission.as_deref())
-                .await?;
+            let mcp_tools = manager.discover_tools_for_server(&mcp_config.name).await?;
             for tool in mcp_tools {
                 use crate::tools::Tool as _;
                 let name = tool.definition().name.clone();
@@ -797,6 +796,15 @@ async fn run_mcp_subcommand(
         cli::McpAction::Reconnect { name } => {
             mcp::cli::run_reconnect(&config.mcp_servers, &token_store, name).await?
         }
+        cli::McpAction::Tools { name } => {
+            mcp::cli::run_tools(
+                &config.mcp_servers,
+                config.mcp_default_permission,
+                &token_store,
+                name,
+            )
+            .await?
+        }
         cli::McpAction::Login { name } => {
             mcp::cli::run_login(&config.mcp_servers, &token_store, name).await?
         }
@@ -822,6 +830,9 @@ async fn run_mcp_subcommand(
             sampling,
             sampling_limit,
             no_login,
+            allow_tool,
+            disable_tool,
+            tool_permission,
         } => {
             mcp::cli::run_add(
                 mcp::cli::AddArgs {
@@ -843,6 +854,9 @@ async fn run_mcp_subcommand(
                     sampling: *sampling,
                     sampling_limit: *sampling_limit,
                     no_login: *no_login,
+                    allow_tool: allow_tool.clone(),
+                    disable_tool: disable_tool.clone(),
+                    tool_permission: tool_permission.clone(),
                 },
                 &token_store,
             )

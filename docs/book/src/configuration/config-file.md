@@ -345,9 +345,87 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `auth` | No | OAuth authentication configuration (see below). Mutually exclusive with `auth_token`. |
 | `headers` | No | Custom HTTP headers to include with every request (HTTP only). |
 | `headers_helper` | No | Path to an executable whose stdout (`Name: Value\n` lines) is merged over `headers` at connect-time (HTTP only). Executed with `AGSH_MCP_SERVER_NAME` / `AGSH_MCP_SERVER_URL` in env; 15 s timeout. |
-| `permission` | No | Permission level required to use this server's tools: `"none"`, `"read"` (default), or `"write"`. |
+| `permission` | No | Server-wide permission override. Applies to every tool on this server, beating the `readOnlyHint` the server advertises and the `[mcp].default_permission` global fallback. See *Permission resolution* below. |
+| `allowed_tools` | No | Optional allow-list of raw tool names (the form the server advertises, not the `server__tool` namespaced form). When set and non-empty, only these tools are registered; all others from this server are ignored. |
+| `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools` — tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
+| `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. |
 | `sampling` | No | Allow this server to call `sampling/createMessage` against your configured LLM provider. Default `false` (reject). Enabling this lets a compromised server inject arbitrary messages into your LLM context and burn your provider quota — opt in per-server, deliberately. |
 | `sampling_limit` | No | Cap on sampling calls per agsh session from this server when `sampling = true`. Default `10`. Requests beyond the limit return an `INTERNAL_ERROR` to the server. |
+
+### `[mcp]` top-level table
+
+| Field | Purpose |
+|-------|---------|
+| `default_permission` | Fallback permission for MCP tools whose server didn't advertise `readOnlyHint` and doesn't have a `permission` override. Accepts `"none"`, `"read"`, `"ask"`, or `"write"`. If unset the hardcoded fallback is `"write"` (strict). |
+
+### Permission resolution
+
+Every MCP tool's required permission is resolved through a five-step chain; the first match wins:
+
+1. **`server.tool_permissions[<raw-tool>]`** — explicit per-tool override.
+2. **`server.permission`** — explicit server-level override. Applies to every tool on that server regardless of what the server advertises.
+3. **`tool.annotations.readOnlyHint`** from the server: `true` → `Read`, `false` → `Write`.
+4. **`[mcp].default_permission`** — global fallback.
+5. **Hardcoded `Write`** — strict ultimate fallback.
+
+User-supplied config (1, 2, 4) always beats the server's self-classification — if a server lies about a tool, you can override. But when no user config says anything, the server's hint is trusted for that specific tool so `readOnlyHint = false` destructive tools don't silently become Read-accessible just because the user opted into a lenient global default.
+
+**Hint spoofing**: a compromised server could claim `readOnlyHint = true` on a destructive tool. Defend by setting `server.permission = "write"` on suspect servers (step 2 wins) or by listing the destructive tools explicitly in `tool_permissions` / `disabled_tools`.
+
+**Stale config**: entries in `allowed_tools` / `disabled_tools` / `tool_permissions` that don't match any advertised tool get a `warn!` line at connect time. The server still connects; you just see a heads-up so you can clean up after the server renames a tool.
+
+**Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the system prompt with its required level noted inline, and a per-turn `[Permission context]` block names the current level plus any tools it blocks. The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalogue visible across levels is also what lets the Anthropic prompt cache survive mid-session permission toggles.
+
+#### Examples
+
+Well-annotated server — no config needed. Every tool is classified by its own `readOnlyHint` (read tools Read, write tools Write):
+```toml
+[[mcp.servers]]
+name = "notion"
+transport = "http"
+url = "https://mcp.notion.com/mcp"
+```
+
+User-declared trust on an unannotated server — all tools accessible in Read:
+```toml
+[[mcp.servers]]
+name       = "internal"
+transport  = "http"
+url        = "https://mcp.internal/…"
+permission = "read"
+```
+
+Overriding a mis-annotated or distrusted tool — one specific tool requires Write:
+```toml
+[[mcp.servers]]
+name      = "notion"
+transport = "http"
+url       = "https://mcp.notion.com/mcp"
+
+[mcp.servers.tool_permissions]
+"notion-do-something-scary" = "write"
+```
+
+Subset of a server's tools — only `query` registers, all others are ignored:
+```toml
+[[mcp.servers]]
+name          = "pg"
+transport     = "stdio"
+command       = "npx"
+args          = ["-y", "@modelcontextprotocol/server-postgres"]
+allowed_tools = ["query"]
+```
+
+Block-list with a narrow exception — all fs tools are Read-accessible except the two destructive ones, which are never registered:
+```toml
+[[mcp.servers]]
+name           = "filesystem"
+transport      = "stdio"
+command        = "npx"
+args           = ["-y", "@modelcontextprotocol/server-filesystem"]
+permission     = "read"
+disabled_tools = ["delete_file", "move_file"]
+```
 
 MCP tools are registered with namespaced names in the format `servername__toolname` to prevent collisions with built-in tools or between servers.
 
@@ -382,6 +460,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `agsh mcp add <name> <url-or-command> [args...] [flags]` | Persist a server. Transport is auto-detected: a URL starting with `http[s]://` means HTTP, anything else means stdio. Preserves existing formatting/comments via `toml_edit`. |
 | `agsh mcp remove <name>` | Best-effort revoke stored OAuth tokens (RFC 7009) at the provider, then delete the server entry, clear stored credentials, and drop any resource-update ledger entries. |
 | `agsh mcp reconnect <name>` | Smoke-test a connect; prints `ok` or the error. |
+| `agsh mcp tools <name>` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. |
 | `agsh mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. |
 | `agsh mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear stored credentials + auth-probe cache. |
 
@@ -398,7 +477,10 @@ Manage configured servers without editing `config.toml` by hand:
 | `--signing-key <PATH>`, `--signing-algorithm <ALG>` | JWT signing material (`client-credentials-jwt` only). |
 | `--scope <SCOPE>` | OAuth scope (repeatable). |
 | `--redirect-port <PORT>` | Fixed OAuth redirect port (default: ephemeral). |
-| `--permission <none\|read\|ask\|write>` | Per-server permission cap. |
+| `--permission <none\|read\|ask\|write>` | Per-server permission cap (applies to all tools on the server). |
+| `--allow-tool <NAME>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
+| `--disable-tool <NAME>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
+| `--tool-permission <NAME=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`/`read`/`ask`/`write`. |
 | `--sampling`, `--sampling-limit <N>` | Opt into server-initiated `sampling/createMessage`. |
 
 #### Example: Notion

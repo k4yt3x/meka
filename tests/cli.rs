@@ -316,6 +316,91 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
 }
 
 #[test]
+fn mcp_add_tool_filter_and_permission_flags_round_trip() {
+    // --allow-tool, --disable-tool, and --tool-permission should land
+    // as allowed_tools, disabled_tools, and a [tool_permissions] sub-
+    // table on the server entry in config.toml. We also validate one
+    // parse error so the flag is actually enforced at add time.
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Rejection path: missing '=' in --tool-permission.
+    let bad = run_isolated(
+        dir.path(),
+        &[
+            "mcp",
+            "add",
+            "broken",
+            "https://mcp.example.com/mcp",
+            "--no-login",
+            "--tool-permission",
+            "just-a-name",
+        ],
+    );
+    assert!(
+        !bad.status.success(),
+        "bad --tool-permission should reject: {}",
+        String::from_utf8_lossy(&bad.stdout)
+    );
+
+    // Happy path: all three fields populate correctly.
+    let output = run_isolated(
+        dir.path(),
+        &[
+            "mcp",
+            "add",
+            "notion",
+            "https://mcp.notion.com/mcp",
+            "--no-login",
+            "--allow-tool",
+            "notion-search",
+            "--allow-tool",
+            "notion-fetch",
+            "--disable-tool",
+            "notion-delete-pages",
+            "--tool-permission",
+            "notion-create-pages=write",
+            "--tool-permission",
+            "notion-update-page=write",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "mcp add should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config_path = dir.path().join("agsh").join("config.toml");
+    let contents = std::fs::read_to_string(&config_path).expect("read config");
+    // Check the allow/block arrays and the nested permissions table.
+    assert!(
+        contents.contains("allowed_tools"),
+        "config missing allowed_tools:\n{}",
+        contents
+    );
+    assert!(
+        contents.contains("notion-search") && contents.contains("notion-fetch"),
+        "allowed_tools entries missing:\n{}",
+        contents
+    );
+    assert!(
+        contents.contains("disabled_tools") && contents.contains("notion-delete-pages"),
+        "disabled_tools missing:\n{}",
+        contents
+    );
+    assert!(
+        contents.contains("tool_permissions"),
+        "config missing [tool_permissions]:\n{}",
+        contents
+    );
+    assert!(
+        contents.contains("notion-create-pages")
+            && contents.contains("notion-update-page")
+            && contents.contains("write"),
+        "tool_permissions entries missing:\n{}",
+        contents
+    );
+}
+
+#[test]
 fn mcp_add_oauth_writes_auth_block() {
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_isolated(

@@ -2182,6 +2182,168 @@ mod tests {
         assert_prefix_stable(&body_t1, &body_t3, 1);
     }
 
+    /// Simulates a two-turn conversation where the user toggles the
+    /// permission level between turns and verifies that the cacheable
+    /// prefix (system prompt + tools array + historical messages) is
+    /// byte-identical across the toggle. This is the regression guard for
+    /// Option 1 of the higher-permission-visibility work — it proves that
+    /// `/permission <level>` mid-session does not invalidate the Anthropic
+    /// prompt cache.
+    ///
+    /// Covers the full agent request-body assembly:
+    ///   - [`ToolRegistry::tool_catalogue`] / [`ToolRegistry::definitions_active`]
+    ///   - [`crate::context::build_system_prompt`]
+    ///   - [`crate::context::build_turn_context`]
+    ///   - [`ClaudeProvider::build_request_body`]
+    #[tokio::test]
+    async fn test_permission_toggle_preserves_cache_prefix() {
+        use std::path::Path;
+
+        use crate::context::{build_system_prompt, build_turn_context};
+        use crate::permission::{Permission, SharedPermission};
+        use crate::session::SessionManager;
+        use crate::tools::ToolRegistry;
+
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory session manager");
+        let shared_permission = SharedPermission::new(Permission::Read);
+        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let registry = ToolRegistry::build_default(
+            "test/0.1".to_string(),
+            shared_permission,
+            true,
+            crate::sandbox::detect(),
+            todo_list,
+            session_manager,
+            shared_session_id,
+        );
+
+        let provider = test_provider();
+
+        // ---- Turn 1 @ Read ---------------------------------------------
+        // The agent fetches these once per turn. None of them take the
+        // current permission — that's the invariant we're testing.
+        let catalogue = registry.tool_catalogue();
+        let system = build_system_prompt(&catalogue, true, &[], None, &[]);
+        let tools = registry.definitions_active();
+
+        let u1_text = {
+            let block = build_turn_context(Permission::Read, &[]);
+            format!("{}\n\n{}", block, "list files under /tmp")
+        };
+        let messages_t1 = vec![Message::user(&u1_text)];
+        let body_t1 = provider.build_request_body(&system, &messages_t1, &tools, true);
+
+        // ---- /permission write toggle ---------------------------------
+        // (In real code this happens on a different thread via
+        // `SharedPermission::set`. Here we just re-read the catalogue and
+        // rebuild everything to prove the outputs don't depend on it.)
+
+        // ---- Turn 2 @ Write -------------------------------------------
+        let catalogue_t2 = registry.tool_catalogue();
+        let system_t2 = build_system_prompt(&catalogue_t2, true, &[], None, &[]);
+        let tools_t2 = registry.definitions_active();
+
+        let u2_text = {
+            let block = build_turn_context(Permission::Write, &[]);
+            format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
+        };
+        let messages_t2 = vec![
+            Message::user(&u1_text),
+            Message::assistant_text("There are three files in /tmp."),
+            Message::user(&u2_text),
+        ];
+        let body_t2 = provider.build_request_body(&system_t2, &messages_t2, &tools_t2, true);
+
+        // 1. The system prompt is identical. (Breakpoint 2 cache-hit.)
+        assert_eq!(
+            body_t1["system"], body_t2["system"],
+            "system prompt diverged across /permission toggle — cache prefix invalidated"
+        );
+
+        // 2. The tools array is identical. (Breakpoint 3 cache-hit.)
+        //    Reuse the existing helper which tolerates cache_control
+        //    movement between the last-tool position across requests.
+        assert_prefix_stable(&body_t1, &body_t2, 1);
+
+        // 3. The turn-1 user message is preserved verbatim in turn-2's
+        //    history — historical messages must never mutate on toggle,
+        //    otherwise breakpoint 4 (messages cache) cascades.
+        let t1_msg = strip_cache_control(&body_t1["messages"][0]);
+        let t2_msg0 = strip_cache_control(&body_t2["messages"][0]);
+        assert_eq!(
+            t1_msg, t2_msg0,
+            "turn-1 user message changed after permission toggle"
+        );
+
+        // 4. Sanity: the two user messages do differ in their permission
+        //    context (fresh content on each turn, not cached yet).
+        assert!(u1_text.contains("Current permission level: read"));
+        assert!(u2_text.contains("Current permission level: write"));
+        assert_ne!(u1_text, u2_text);
+    }
+
+    /// Same invariant, but exercises every pairwise permission toggle
+    /// (16 combinations). Catches any permission state that sneaks back
+    /// into the cacheable prefix.
+    #[tokio::test]
+    async fn test_permission_independence_all_levels() {
+        use std::path::Path;
+
+        use crate::context::build_system_prompt;
+        use crate::permission::{Permission, SharedPermission};
+        use crate::session::SessionManager;
+        use crate::tools::ToolRegistry;
+
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory session manager");
+        let shared_permission = SharedPermission::new(Permission::Read);
+        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let registry = ToolRegistry::build_default(
+            "test/0.1".to_string(),
+            shared_permission.clone(),
+            true,
+            crate::sandbox::detect(),
+            todo_list,
+            session_manager,
+            shared_session_id,
+        );
+
+        let provider = test_provider();
+        let levels = [
+            Permission::None,
+            Permission::Read,
+            Permission::Ask,
+            Permission::Write,
+        ];
+
+        let mut bodies = Vec::with_capacity(levels.len());
+        for &level in &levels {
+            shared_permission.set(level);
+            let catalogue = registry.tool_catalogue();
+            let system = build_system_prompt(&catalogue, true, &[], None, &[]);
+            let tools = registry.definitions_active();
+            let messages = vec![Message::user("hello")];
+            bodies.push(provider.build_request_body(&system, &messages, &tools, true));
+        }
+
+        // Every pair must agree on the cacheable prefix.
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                assert_eq!(
+                    bodies[i]["system"], bodies[j]["system"],
+                    "system prompt differs between {:?} and {:?}",
+                    levels[i], levels[j]
+                );
+                assert_prefix_stable(&bodies[i], &bodies[j], 1);
+            }
+        }
+    }
+
     #[test]
     fn test_tool_loop_prefix_is_stable() {
         let provider = test_provider();

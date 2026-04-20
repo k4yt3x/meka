@@ -138,17 +138,15 @@ impl Agent {
 
         let permission = self.shared_permission.get();
 
+        let catalogue = self.tool_registry.tool_catalogue();
         let augmented_input = {
             let todos = self.todo_list.read().await;
-            match context::build_turn_context(permission, &todos) {
-                Some(block) => format!("{}\n\n{}", block, user_input),
-                None => user_input.clone(),
-            }
+            let block = context::build_turn_context(permission, &todos);
+            format!("{}\n\n{}", block, user_input)
         };
         let user_message = Message::user(&augmented_input);
         messages.push(user_message);
-        let tools = self.available_tools(permission);
-        let deferred_tools = self.deferred_tool_summaries(permission);
+        let tools = self.tool_registry.definitions_active();
         let skills = crate::skills::discover_skills();
         let mcp_instructions = self
             .mcp_manager
@@ -156,10 +154,8 @@ impl Agent {
             .map(|manager| manager.server_instructions())
             .unwrap_or_default();
         let system_prompt = context::build_system_prompt(
-            permission,
-            &tools,
+            &catalogue,
             self.options.sandboxed_shell,
-            &deferred_tools,
             &skills,
             self.options.user_instructions.as_deref(),
             &mcp_instructions,
@@ -579,8 +575,9 @@ impl Agent {
         if !permission.allows(required) {
             return crate::tools::ToolOutput::text(
                 format!(
-                    "Permission denied: '{}' requires {} permission, current: {}",
-                    name, required, permission
+                    "Permission denied: '{}' requires `{}` permission, current level is `{}`. \
+                     Ask the user to run `/permission {}` (or press Shift+Tab) to enable it.",
+                    name, required, permission, required
                 ),
                 true,
             );
@@ -783,28 +780,6 @@ impl Agent {
             .await
             .unwrap_or_default();
         context::build_post_compact_context(permission, &todos, &entries)
-    }
-
-    fn available_tools(&self, permission: crate::permission::Permission) -> Vec<ToolDefinition> {
-        self.tool_registry.definitions_for_permission(permission)
-    }
-
-    /// Returns summaries of deferred tools (tools registered but not in the
-    /// active API definitions) for listing in the system prompt.
-    fn deferred_tool_summaries(
-        &self,
-        permission: crate::permission::Permission,
-    ) -> Vec<(String, String)> {
-        let all = self.tool_registry.all_tool_summaries(permission);
-        let active: std::collections::HashSet<String> = self
-            .tool_registry
-            .definitions_for_permission(permission)
-            .into_iter()
-            .map(|def| def.name)
-            .collect();
-        all.into_iter()
-            .filter(|(name, _)| !active.contains(name))
-            .collect()
     }
 }
 

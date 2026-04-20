@@ -57,6 +57,10 @@ pub enum McpAction {
     Get { name: String },
     /// Connect once and print `ok` if the handshake succeeds
     Reconnect { name: String },
+    /// List tools advertised by a server, with resolved permission per
+    /// tool — use this to pick names for `--allow-tool`,
+    /// `--disable-tool`, or `--tool-permission` overrides.
+    Tools { name: String },
     /// Authenticate a server interactively (OAuth assumed for HTTP)
     Login { name: String },
     /// Revoke cached credentials for a server
@@ -133,6 +137,20 @@ pub enum McpAction {
         /// Max sampling calls per agsh session (default 10)
         #[arg(long)]
         sampling_limit: Option<u32>,
+
+        /// Raw tool name to allow (repeatable). When set, only listed
+        /// tools from this server are registered.
+        #[arg(long = "allow-tool", value_name = "TOOL")]
+        allow_tool: Vec<String>,
+
+        /// Raw tool name to block (repeatable). Applied after --allow-tool.
+        #[arg(long = "disable-tool", value_name = "TOOL")]
+        disable_tool: Vec<String>,
+
+        /// Per-tool permission override (repeatable).
+        /// Format: `TOOL=LEVEL`, where LEVEL is none/read/ask/write.
+        #[arg(long = "tool-permission", value_name = "TOOL=LEVEL")]
+        tool_permission: Vec<String>,
 
         /// Skip the post-add auto-login even if the server requires auth.
         /// The server is still persisted; run `agsh mcp login <name>`

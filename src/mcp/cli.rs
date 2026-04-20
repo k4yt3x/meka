@@ -93,14 +93,36 @@ pub async fn run_get(servers: &[McpServerConfig], name: &str) -> Result<()> {
     if let Some(auth) = &config.auth {
         println!("auth:        {:?}", std::mem::discriminant(auth));
     }
+    if let Some(allowed) = config.allowed_tools.as_deref() {
+        println!("allowed_tools: {}", allowed.join(", "));
+    }
+    if let Some(disabled) = config.disabled_tools.as_deref() {
+        println!("disabled_tools: {}", disabled.join(", "));
+    }
+    if let Some(perms) = config.tool_permissions.as_ref()
+        && !perms.is_empty()
+    {
+        println!("tool_permissions:");
+        let mut keys: Vec<&String> = perms.keys().collect();
+        keys.sort();
+        for key in keys {
+            println!("  - {} = {}", key, perms[key]);
+        }
+    }
     println!("sampling:    {}", config.sampling);
     Ok(())
 }
 
 /// Run `agsh mcp reconnect <name>` — connect once as a smoke test, print
 /// `ok` on success and the error otherwise. Does not mutate config.
-pub async fn run_reconnect(
+/// Run `agsh mcp tools <name>` — connect to the server, list every
+/// advertised tool, resolve permissions, and print a column-aligned
+/// table. Disabled-by-allow/block tools are still shown (marked
+/// `blocked`) so users can edit their config without leaving the
+/// CLI to discover names.
+pub async fn run_tools(
     servers: &[McpServerConfig],
+    mcp_default: Option<crate::permission::Permission>,
     token_store: &TokenStore,
     name: &str,
 ) -> Result<()> {
@@ -113,6 +135,128 @@ pub async fn run_reconnect(
     let context = McpClientContext::new();
     let manager = McpClientManager::connect_all(
         std::slice::from_ref(&config),
+        mcp_default,
+        Some(token_store),
+        Arc::clone(&context),
+    )
+    .await?;
+
+    if !manager.server_names().contains(&config.name) {
+        return Err(config_err(format!(
+            "failed to connect to '{}' — see logs above",
+            config.name
+        )));
+    }
+
+    let tools = manager.list_advertised_tools(&config.name).await?;
+    manager.shutdown().await;
+
+    if tools.is_empty() {
+        println!("(server '{}' advertises no tools)", config.name);
+        return Ok(());
+    }
+
+    let name_width = tools
+        .iter()
+        .map(|t| t.raw_name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let source_width = tools
+        .iter()
+        .map(|t| t.permission_source.as_str().len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    println!(
+        "{:<name_w$}  {:<5}  {:<src_w$}  {:<7}  description",
+        "name",
+        "perm",
+        "source",
+        "status",
+        name_w = name_width,
+        src_w = source_width,
+    );
+    for tool in &tools {
+        let status = if tool.allowed { "allowed" } else { "blocked" };
+        let description = describe_one_line(&tool.description);
+        println!(
+            "{:<name_w$}  {:<5}  {:<src_w$}  {:<7}  {}",
+            tool.raw_name,
+            tool.resolved_permission.to_string(),
+            tool.permission_source.as_str(),
+            status,
+            description,
+            name_w = name_width,
+            src_w = source_width,
+        );
+    }
+
+    let total = tools.len();
+    let allowed = tools.iter().filter(|t| t.allowed).count();
+    println!();
+    println!(
+        "{} tool{} total, {} allowed, {} blocked",
+        total,
+        if total == 1 { "" } else { "s" },
+        allowed,
+        total - allowed
+    );
+    Ok(())
+}
+
+/// Collapse a (possibly multi-line) description into one short line so
+/// the table stays legible. MCP descriptions can be kilobytes; the
+/// first sentence or ~80 chars is enough for a listing.
+fn describe_one_line(description: &str) -> String {
+    const MAX: usize = 80;
+    let mut collapsed = String::with_capacity(description.len().min(MAX + 8));
+    let mut prev_space = false;
+    for ch in description.chars() {
+        if ch.is_whitespace() {
+            if !prev_space && !collapsed.is_empty() {
+                collapsed.push(' ');
+            }
+            prev_space = true;
+        } else {
+            collapsed.push(ch);
+            prev_space = false;
+        }
+        if collapsed.chars().count() > MAX {
+            break;
+        }
+    }
+    let trimmed = collapsed.trim_end();
+    if trimmed.chars().count() > MAX {
+        let clipped: String = trimmed.chars().take(MAX).collect();
+        format!("{}…", clipped.trim_end())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub async fn run_reconnect(
+    servers: &[McpServerConfig],
+    token_store: &TokenStore,
+    name: &str,
+) -> Result<()> {
+    let config = servers
+        .iter()
+        .find(|c| c.name == name)
+        .ok_or_else(|| config_err(format!("no MCP server named '{}'", name)))?
+        .clone();
+
+    let context = McpClientContext::new();
+    // Per-tool permission resolution uses `[mcp].default_permission`
+    // as its global fallback. `reconnect` is a smoke-test command run
+    // from outside the main agent loop, so we don't have a
+    // `ResolvedConfig` in scope — pass `None` and let resolution fall
+    // through to the hardcoded strict default. Any user-specific
+    // per-server / per-tool config still applies.
+    let manager = McpClientManager::connect_all(
+        std::slice::from_ref(&config),
+        None,
         Some(token_store),
         Arc::clone(&context),
     )
@@ -206,9 +350,15 @@ pub async fn run_login(
     token_store.clear_auth_probe(name).await?;
 
     let context = McpClientContext::new();
-    let manager =
-        McpClientManager::connect_all(std::slice::from_ref(&config), Some(token_store), context)
-            .await?;
+    // `login` is also out-of-band from the main agent loop; see the
+    // note in `run_reconnect` for why we pass `None` here.
+    let manager = McpClientManager::connect_all(
+        std::slice::from_ref(&config),
+        None,
+        Some(token_store),
+        context,
+    )
+    .await?;
 
     if !manager.server_names().contains(&config.name) {
         return Err(config_err(format!(
@@ -312,6 +462,12 @@ pub struct AddArgs {
     /// Skip the auto-login that runs when the probe reports
     /// auth-required or when `--auth oauth` was explicitly set.
     pub no_login: bool,
+    /// Raw tool names to allow-list (only these register).
+    pub allow_tool: Vec<String>,
+    /// Raw tool names to block-list (never register).
+    pub disable_tool: Vec<String>,
+    /// Raw `NAME=LEVEL` pairs for per-tool permission overrides.
+    pub tool_permission: Vec<String>,
 }
 
 /// What `add` looks like after validation: transport is chosen,
@@ -335,6 +491,9 @@ struct ResolvedAddArgs {
     auth_token: Option<String>,
     auth: Option<McpAuthConfig>,
     permission: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    disabled_tools: Option<Vec<String>>,
+    tool_permissions: Option<std::collections::HashMap<String, String>>,
     sampling: bool,
     sampling_limit: Option<u32>,
     no_login: bool,
@@ -587,6 +746,9 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         sampling,
         sampling_limit,
         no_login,
+        allow_tool,
+        disable_tool,
+        tool_permission,
     } = args;
 
     let looks_like_url = location
@@ -611,6 +773,52 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
             }
         }
     }
+
+    // Per-tool permission overrides arrive as `NAME=LEVEL` strings. Parse
+    // + validate here so bad input never lands in config.toml.
+    let tool_permissions = if tool_permission.is_empty() {
+        None
+    } else {
+        let mut map = std::collections::HashMap::with_capacity(tool_permission.len());
+        for entry in &tool_permission {
+            let (tool, level) = entry.split_once('=').ok_or_else(|| {
+                config_err(format!(
+                    "--tool-permission expects NAME=LEVEL, got '{}'",
+                    entry
+                ))
+            })?;
+            let tool = tool.trim();
+            let level = level.trim();
+            if tool.is_empty() {
+                return Err(config_err(format!(
+                    "--tool-permission '{}' has an empty tool name",
+                    entry
+                )));
+            }
+            match level {
+                "none" | "read" | "ask" | "write" => {}
+                other => {
+                    return Err(config_err(format!(
+                        "--tool-permission '{}' has unknown level '{}' \
+                         (expected none, read, ask, or write)",
+                        entry, other
+                    )));
+                }
+            }
+            map.insert(tool.to_string(), level.to_string());
+        }
+        Some(map)
+    };
+    let allowed_tools = if allow_tool.is_empty() {
+        None
+    } else {
+        Some(allow_tool)
+    };
+    let disabled_tools = if disable_tool.is_empty() {
+        None
+    } else {
+        Some(disable_tool)
+    };
 
     let auth_flags_present = client_id.is_some()
         || client_secret.is_some()
@@ -650,6 +858,9 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 auth_token: None,
                 auth: None,
                 permission,
+                allowed_tools,
+                disabled_tools,
+                tool_permissions,
                 sampling,
                 sampling_limit,
                 no_login,
@@ -692,6 +903,9 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 auth_token,
                 auth: auth_config,
                 permission,
+                allowed_tools,
+                disabled_tools,
+                tool_permissions,
                 sampling,
                 sampling_limit,
                 no_login,
@@ -854,6 +1068,9 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
         headers_helper: None,
         auth: resolved.auth.clone(),
         permission: resolved.permission.clone(),
+        allowed_tools: resolved.allowed_tools.clone(),
+        disabled_tools: resolved.disabled_tools.clone(),
+        tool_permissions: resolved.tool_permissions.clone(),
         sampling: resolved.sampling,
         sampling_limit: resolved.sampling_limit,
     }
@@ -920,6 +1137,38 @@ fn build_server_table(resolved: &ResolvedAddArgs) -> toml_edit::Table {
     }
     if let Some(auth) = &resolved.auth {
         table.insert("auth", toml_edit::Item::Table(auth_to_toml(auth)));
+    }
+    if let Some(allowed) = resolved.allowed_tools.as_deref() {
+        let mut arr = toml_edit::Array::new();
+        for name in allowed {
+            arr.push(name.as_str());
+        }
+        table.insert(
+            "allowed_tools",
+            toml_edit::Item::Value(toml_edit::Value::Array(arr)),
+        );
+    }
+    if let Some(disabled) = resolved.disabled_tools.as_deref() {
+        let mut arr = toml_edit::Array::new();
+        for name in disabled {
+            arr.push(name.as_str());
+        }
+        table.insert(
+            "disabled_tools",
+            toml_edit::Item::Value(toml_edit::Value::Array(arr)),
+        );
+    }
+    if let Some(perms) = resolved.tool_permissions.as_ref()
+        && !perms.is_empty()
+    {
+        let mut tpt = toml_edit::Table::new();
+        // Stable key order so the TOML diff is review-friendly.
+        let mut keys: Vec<&String> = perms.keys().collect();
+        keys.sort();
+        for key in keys {
+            tpt.insert(key, toml_edit::value(perms[key].clone()));
+        }
+        table.insert("tool_permissions", toml_edit::Item::Table(tpt));
     }
     table
 }
@@ -1085,6 +1334,9 @@ mod tests {
             sampling: false,
             sampling_limit: None,
             no_login: false,
+            allow_tool: Vec::new(),
+            disable_tool: Vec::new(),
+            tool_permission: Vec::new(),
         }
     }
 
@@ -1260,5 +1512,28 @@ mod tests {
             Some(crate::config::McpAuthConfig::OAuth { redirect_port: Some(8400), scopes: Some(s), .. })
             if s == &vec!["read".to_string(), "write".to_string()]
         ));
+    }
+
+    #[test]
+    fn describe_one_line_collapses_whitespace() {
+        assert_eq!(describe_one_line("one\n\ntwo  three"), "one two three");
+    }
+
+    #[test]
+    fn describe_one_line_short_input_passes_through() {
+        assert_eq!(describe_one_line("Read a file."), "Read a file.");
+    }
+
+    #[test]
+    fn describe_one_line_caps_at_80_chars_with_ellipsis() {
+        let long = "a".repeat(200);
+        let out = describe_one_line(&long);
+        assert!(out.ends_with('…'));
+        assert!(out.chars().count() <= 81);
+    }
+
+    #[test]
+    fn describe_one_line_empty_passes_through() {
+        assert_eq!(describe_one_line(""), "");
     }
 }

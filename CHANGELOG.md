@@ -9,14 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- System prompt now lists every registered tool with its required permission level inline.
+- Per-turn user message carries a `[Permission context]` block naming the current level.
+- Per-tool MCP permission chain: `tool_permissions` > `permission` > `readOnlyHint` > `default_permission`.
+- `[mcp] default_permission` config key: global fallback when no server/tool/hint applies.
+- `[[mcp.servers]]` supports `allowed_tools` / `disabled_tools` / `tool_permissions` overrides.
+- `agsh mcp add` flags: `--allow-tool`, `--disable-tool`, `--tool-permission NAME=LEVEL` (repeatable).
+- `agsh mcp get <name>` now lists allow/block lists and per-tool permission overrides.
+- Stale entries in `allowed_tools`/`disabled_tools`/`tool_permissions` emit a `warn!` at connect time.
+- `agsh mcp tools <name>` lists every advertised tool with resolved permission and which chain step won.
 - `agsh mcp` CLI: `list`, `get`, `add`, `remove`, `reconnect`, `login`, `logout` subcommands.
 - `agsh mcp add <name> <url-or-command> [args]` auto-detects transport (URL → http, else stdio).
 - `agsh mcp add` flags for env/headers, permission, auth (oauth, client-credentials, -jwt, token).
 - `agsh mcp add` probes HTTP servers post-persist (RFC 6750 / RFC 9728): 3 s redirects-off GET.
 - `agsh mcp add` auto-runs OAuth on auth-required / `--auth oauth`; `--no-login` skips.
 - `agsh mcp add` auto-login failure or Ctrl-C rolls the entry back (config + creds + probe cache).
-- `agsh mcp login <name>` assumes OAuth authorization_code on HTTP servers with no `[auth]` block,
-  and persists the synthesised `[auth] = "oauth"` back to `config.toml` on success.
+- `agsh mcp login <name>` assumes OAuth authorization_code on HTTP servers without an `[auth]` block.
 - OAuth callback races the bound TCP listener against a stdin paste so logins work over SSH.
 - `/mcp login <server>` and `/mcp logout <server>` REPL commands mirror the CLI subcommands.
 - Server `InitializeResult.instructions` spliced into the system prompt each turn.
@@ -37,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OAuth callback listener binds to an ephemeral port when `redirect_port` is omitted.
 - Ctrl-C now sends `notifications/cancelled` to the server with the in-flight request id.
 - Dynamic tool list refresh on `tools/list_changed` — new tools picked up without restart.
+
+### Changed
+
+- Per-turn `[Permission context]` is a constant two-line block; no longer enumerates blocked tools.
+- System prompt tool catalogue is leaner: name + permission for active tools, short summaries for deferred.
+- System prompt and `body["tools"]` no longer depend on permission level; toggles keep the cache warm.
+- **Breaking**: MCP tools with no `readOnlyHint` and no `[mcp].default_permission` now require `Write`.
 
 ### Security
 

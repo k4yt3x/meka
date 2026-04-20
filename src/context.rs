@@ -1,20 +1,108 @@
 //! Builds the system prompt and per-turn context: tool catalog, environment
-//! info (PWD, date, shell, OS), todo list, and skill summaries. Permission
-//! mode gates whether environment info is included.
+//! info (PWD, date, shell, OS), todo list, and skill summaries.
+//!
+//! The system prompt is intentionally permission-independent: every tool is
+//! listed with its required permission level noted inline, so the cached
+//! prefix (system prompt + tools array) stays byte-identical across
+//! mid-session `/permission` toggles. The agent's current level and the
+//! subset of tools it can't currently invoke are carried in the per-turn
+//! `<context>` block instead, which keeps the expensive message-history
+//! cache (Claude breakpoint 4) warm across toggles.
 
 use crate::permission::Permission;
-use crate::provider::ToolDefinition;
 use crate::session::ToolOutputSummary;
 use crate::skills::Skill;
 use crate::tools::todo::{self, TodoItem};
 
-/// Build the static, session-level system prompt: role, permission description,
-/// user instructions, tools, skills, guidelines, and environment info.
+/// A tool's entry in the catalogue rendered into the system prompt. Tuple:
+/// `(name, description, required_permission, is_deferred)`. Produced by
+/// [`crate::tools::ToolRegistry::tool_catalogue`].
+pub type ToolCatalogueEntry = (String, String, Permission, bool);
+
+/// Max chars rendered into the `## Additional Tools` catalogue per-tool
+/// summary. Large MCP descriptions (Notion advertises 2 KB blobs) would
+/// otherwise bloat the cached system prompt by multiple KB. The full
+/// description still lives in the tool schema that ships once the
+/// deferred tool activates.
+const TOOL_SUMMARY_MAX_CHARS: usize = 160;
+
+/// Return a short one-line summary of a tool description for rendering
+/// into the system-prompt catalogue. Collapses internal whitespace,
+/// keeps the first sentence, and clamps the result to
+/// [`TOOL_SUMMARY_MAX_CHARS`] characters. Appends a single Unicode
+/// ellipsis (`…`) when clipped — distinct from the upstream
+/// `MAX_MCP_DESCRIPTION_LENGTH` "..." truncation in `src/mcp.rs`.
+fn short_description(description: &str) -> String {
+    let collapsed: String = {
+        let mut out = String::with_capacity(description.len());
+        let mut prev_space = false;
+        for ch in description.chars() {
+            if ch.is_whitespace() {
+                if !prev_space && !out.is_empty() {
+                    out.push(' ');
+                }
+                prev_space = true;
+            } else {
+                out.push(ch);
+                prev_space = false;
+            }
+        }
+        out.trim_end().to_string()
+    };
+
+    if collapsed.is_empty() {
+        return collapsed;
+    }
+
+    // Find the first sentence terminator followed by whitespace or EOS.
+    // Walks by char to avoid slicing a multi-byte UTF-8 scalar, and
+    // recognises CJK fullwidth punctuation (。！？) alongside ASCII
+    // so descriptions in non-Western scripts get the same treatment.
+    let mut sentence_end_byte: Option<usize> = None;
+    let mut prev_term: Option<(char, usize)> = None;
+    for (byte_idx, ch) in collapsed.char_indices() {
+        if let Some((_, term_end)) = prev_term {
+            if ch.is_whitespace() {
+                sentence_end_byte = Some(term_end);
+                break;
+            }
+            prev_term = None;
+        }
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
+            prev_term = Some((ch, byte_idx + ch.len_utf8()));
+        }
+    }
+    // Terminator at end-of-string counts as a sentence boundary.
+    if sentence_end_byte.is_none()
+        && let Some((_, term_end)) = prev_term
+        && term_end == collapsed.len()
+    {
+        sentence_end_byte = Some(term_end);
+    }
+
+    let candidate = match sentence_end_byte {
+        Some(end) => collapsed[..end].to_string(),
+        None => collapsed.clone(),
+    };
+
+    if candidate.chars().count() <= TOOL_SUMMARY_MAX_CHARS {
+        return candidate;
+    }
+
+    // Char-cap fallback. Walking by char preserves UTF-8 boundaries
+    // without relying on the unstable `floor_char_boundary`.
+    let clipped: String = candidate.chars().take(TOOL_SUMMARY_MAX_CHARS).collect();
+    format!("{}…", clipped.trim_end())
+}
+
+/// Build the static, session-level system prompt: role, permission model,
+/// user instructions, full tool catalogue, skills, guidelines, and
+/// environment info. The output does NOT depend on `permission`, so callers
+/// can reuse it across `/permission` toggles without busting the prompt
+/// cache.
 pub fn build_system_prompt(
-    permission: Permission,
-    tools: &[ToolDefinition],
+    catalogue: &[ToolCatalogueEntry],
     sandboxed_shell: bool,
-    deferred_tools: &[(String, String)],
     skills: &[Skill],
     user_instructions: Option<&str>,
     mcp_server_instructions: &[(String, String)],
@@ -26,56 +114,37 @@ pub fn build_system_prompt(
          in natural language, and you execute their requests using the available tools.\n\n",
     );
 
-    prompt.push_str(&format!("## Current Permission Level: {}\n\n", permission));
-
-    match permission {
-        Permission::None => {
-            prompt.push_str(
-                "You have NO tools available. You can only respond with text. \
-                 If the user asks you to perform an action, inform them that the current \
-                 permission mode does not allow it and suggest they press Shift+Tab \
-                 to cycle to a higher permission level.\n\n",
-            );
-        }
-        Permission::Read => {
-            if sandboxed_shell {
-                prompt.push_str(
-                    "You can use READ-ONLY tools: reading files, searching files and contents, \
-                     fetching web pages, searching the web, and executing shell commands in a \
-                     read-only sandboxed environment. Shell commands run with the filesystem \
-                     mounted read-only — you can run commands like `ls`, `cat`, `df`, `ps`, \
-                     `uname`, `grep`, `find`, `git log`, `git diff`, etc., but any command \
-                     that writes to the filesystem will fail. You CANNOT write files or edit \
-                     files directly. If the user asks you to perform a write operation, inform \
-                     them that the current permission mode does not allow it and suggest they \
-                     press Shift+Tab to cycle to 'write' mode.\n\n",
-                );
-            } else {
-                prompt.push_str(
-                    "You can use READ-ONLY tools: reading files, searching files and contents, \
-                     fetching web pages, and searching the web. You CANNOT write files, \
-                     edit files, or execute shell commands. If the user asks you to perform \
-                     a write operation, inform them that the current permission mode does not \
-                     allow it and suggest they press Shift+Tab to cycle to 'write' mode.\n\n",
-                );
-            }
-        }
-        Permission::Ask => {
-            prompt.push_str(
-                "You have access to all tools, but the user will be prompted to approve \
-                 or deny each tool call before it executes. Proceed normally — the user \
-                 will see each tool invocation and decide whether to allow it.\n\n",
-            );
-        }
-        Permission::Write => {
-            prompt.push_str(
-                "You have FULL access to all tools, including file writing, editing, \
-                 and shell command execution. For potentially destructive operations \
-                 (e.g., deleting files, overwriting data, running dangerous commands), \
-                 briefly explain what you will do before proceeding.\n\n",
-            );
-        }
+    prompt.push_str("## Permission Model\n\n");
+    prompt.push_str(
+        "agsh runs at a graduated permission level that the user can change mid-session \
+         by pressing Shift+Tab or typing `/permission <level>`. Levels, from least to \
+         most powerful:\n\n",
+    );
+    prompt.push_str("- `none`: text-only, no tools may execute.\n");
+    if sandboxed_shell {
+        prompt.push_str(
+            "- `read`: read-only tools (file reads, search, web fetch). `execute_command` \
+             runs with the filesystem mounted read-only — commands that write to disk fail.\n",
+        );
+    } else {
+        prompt.push_str(
+            "- `read`: read-only tools (file reads, search, web fetch). `execute_command` \
+             is blocked at this level.\n",
+        );
     }
+    prompt.push_str(
+        "- `ask`: full tool access; each tool call is presented to the user for \
+         approval before execution.\n",
+    );
+    prompt.push_str("- `write`: full tool access, no approval required.\n\n");
+    prompt.push_str(
+        "The current level — and the set of tools it does NOT allow — is delivered in \
+         the per-turn `[Permission context]` block of each user message. If the user \
+         asks for an operation their current level blocks, name the required tool and \
+         suggest they run `/permission <level>` (or Shift+Tab) to enable it. For \
+         potentially destructive operations at `write`, briefly explain what you will \
+         do before proceeding.\n\n",
+    );
 
     if let Some(instructions) = user_instructions
         .map(str::trim)
@@ -90,10 +159,19 @@ pub fn build_system_prompt(
         prompt.push_str("\n\n");
     }
 
-    if !tools.is_empty() {
+    let active: Vec<&ToolCatalogueEntry> = catalogue.iter().filter(|(_, _, _, d)| !d).collect();
+    let deferred: Vec<&ToolCatalogueEntry> = catalogue.iter().filter(|(_, _, _, d)| *d).collect();
+
+    if !active.is_empty() {
         prompt.push_str("## Available Tools\n\n");
-        for tool in tools {
-            prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
+        prompt.push_str(
+            "Each entry notes the minimum permission level required; full \
+             descriptions and parameter schemas are in the API tools catalogue \
+             delivered alongside this prompt. Calls that exceed the current \
+             level are rejected at dispatch.\n\n",
+        );
+        for (name, _description, required, _) in &active {
+            prompt.push_str(&format!("- **{}** (requires `{}`)\n", name, required));
         }
         prompt.push('\n');
     }
@@ -113,12 +191,23 @@ pub fn build_system_prompt(
         }
     }
 
-    if !deferred_tools.is_empty() {
+    if !deferred.is_empty() {
         prompt.push_str("## Additional Tools (loaded on first use)\n\n");
-        prompt.push_str("These tools are available but their schemas are loaded on demand. ");
-        prompt.push_str("Call them by name and they will be activated.\n\n");
-        for (name, description) in deferred_tools {
-            prompt.push_str(&format!("- **{}**: {}\n", name, description));
+        prompt.push_str(
+            "These tools are registered but their full schemas are not sent \
+             until first use. Summaries below are one-line; full descriptions \
+             load with the schema when you call the tool by name.\n\n",
+        );
+        for (name, description, required, _) in &deferred {
+            let summary = short_description(description);
+            if summary.is_empty() {
+                prompt.push_str(&format!("- **{}** (requires `{}`)\n", name, required));
+            } else {
+                prompt.push_str(&format!(
+                    "- **{}** (requires `{}`): {}\n",
+                    name, required, summary
+                ));
+            }
         }
         prompt.push('\n');
     }
@@ -134,7 +223,7 @@ pub fn build_system_prompt(
     );
     prompt.push_str("- Be concise but thorough.\n\n");
 
-    if !matches!(permission, Permission::None) && !skills.is_empty() {
+    if !skills.is_empty() {
         prompt.push_str("## Skills\n\n");
         prompt.push_str(
             "The following skills are available. Call the `skill` tool with the \
@@ -150,46 +239,64 @@ pub fn build_system_prompt(
         prompt.push('\n');
     }
 
-    if !matches!(permission, Permission::None) {
-        prompt.push_str("## Environment\n\n");
+    prompt.push_str("## Environment\n\n");
 
-        if let Ok(shell) = std::env::var("SHELL") {
-            prompt.push_str(&format!("- Shell: {}\n", shell));
-        }
+    if let Ok(shell) = std::env::var("SHELL") {
+        prompt.push_str(&format!("- Shell: {}\n", shell));
+    }
 
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(info) = std::fs::read_to_string("/etc/os-release") {
-                for line in info.lines() {
-                    if let Some(name) = line.strip_prefix("PRETTY_NAME=") {
-                        let name = name.trim_matches('"');
-                        prompt.push_str(&format!("- OS: {}\n", name));
-                        break;
-                    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(info) = std::fs::read_to_string("/etc/os-release") {
+            for line in info.lines() {
+                if let Some(name) = line.strip_prefix("PRETTY_NAME=") {
+                    let name = name.trim_matches('"');
+                    prompt.push_str(&format!("- OS: {}\n", name));
+                    break;
                 }
             }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            if let Ok(output) = std::process::Command::new("sw_vers")
-                .arg("-productVersion")
-                .output()
-            {
-                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !version.is_empty() {
-                    prompt.push_str(&format!("- OS: macOS {}\n", version));
-                }
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            prompt.push_str("- OS: Windows\n");
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+        {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                prompt.push_str(&format!("- OS: macOS {}\n", version));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        prompt.push_str("- OS: Windows\n");
+    }
+
     prompt
+}
+
+/// Build the per-turn `[Permission context]` block. Names the current
+/// permission level plus a one-line statement of what tools can execute
+/// at that level. The static system-prompt catalogue already lists every
+/// tool's required level, so the per-turn block stays short and bounded
+/// regardless of how many tools are registered. Permission-dependent
+/// content lives here — NOT in the system prompt — so `/permission`
+/// toggles don't invalidate the cached prefix.
+pub fn build_permission_context(permission: Permission) -> String {
+    let summary = match permission {
+        Permission::None => "No tools are executable.",
+        Permission::Read => "Only read-only tools are executable.",
+        Permission::Ask => "All tools are executable, but each call requires user approval.",
+        Permission::Write => "All tools are executable.",
+    };
+    format!(
+        "[Permission context]\nCurrent permission level: {}\n{}\n",
+        permission, summary
+    )
 }
 
 /// Build the per-turn environment context block (pwd, date).
@@ -211,22 +318,25 @@ pub fn build_environment_context(permission: Permission) -> String {
     context
 }
 
-/// Build the `<context>...</context>` block that wraps per-turn user input with
-/// the active todo list and environment info. Returns `None` when neither
-/// contributes anything (empty todos in `None` mode).
-pub fn build_turn_context(permission: Permission, todos: &[TodoItem]) -> Option<String> {
-    let todo_context = if todos.is_empty() {
-        String::new()
-    } else {
-        todo::format_todo_for_context(todos)
-    };
-    let environment_context = build_environment_context(permission);
-    let body = format!("{}{}", todo_context, environment_context);
-    if body.trim().is_empty() {
-        None
-    } else {
-        Some(format!("<context>\n{}</context>", body))
+/// Build the `<context>...</context>` block that wraps per-turn user input
+/// with permission state, the active todo list, and environment info. The
+/// `[Permission context]` section is always included so the model sees the
+/// current level on every turn.
+pub fn build_turn_context(permission: Permission, todos: &[TodoItem]) -> String {
+    let mut sections = Vec::new();
+
+    sections.push(build_permission_context(permission));
+
+    if !todos.is_empty() {
+        sections.push(todo::format_todo_for_context(todos));
     }
+
+    let environment_context = build_environment_context(permission);
+    if !environment_context.is_empty() {
+        sections.push(environment_context);
+    }
+
+    format!("<context>\n{}</context>", sections.join("\n"))
 }
 
 /// Build the post-compaction context block summarizing live session state
@@ -296,71 +406,218 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_system_prompt_none_mode() {
-        let prompt = build_system_prompt(Permission::None, &[], false, &[], &[], None, &[]);
-        assert!(prompt.contains("NO tools available"));
-        assert!(prompt.contains("Shift+Tab"));
-        assert!(!prompt.contains("## Environment"));
-    }
-
-    #[test]
-    fn test_system_prompt_read_mode_with_sandbox() {
-        let prompt = build_system_prompt(Permission::Read, &[], true, &[], &[], None, &[]);
-        assert!(prompt.contains("READ-ONLY"));
-        assert!(prompt.contains("read-only sandboxed"));
-        assert!(prompt.contains("CANNOT write"));
-    }
-
-    #[test]
-    fn test_system_prompt_read_mode_without_sandbox() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None, &[]);
-        assert!(prompt.contains("READ-ONLY"));
-        assert!(prompt.contains("CANNOT write"));
-        assert!(prompt.contains("execute shell commands"));
-        assert!(!prompt.contains("sandboxed"));
-    }
-
-    #[test]
-    fn test_system_prompt_write_mode() {
-        let prompt = build_system_prompt(Permission::Write, &[], false, &[], &[], None, &[]);
-        assert!(prompt.contains("FULL access"));
-        assert!(prompt.contains("destructive"));
-    }
-
-    #[test]
-    fn test_system_prompt_with_tools() {
-        let tools = vec![
-            ToolDefinition::new(
+    fn sample_catalogue() -> Vec<ToolCatalogueEntry> {
+        vec![
+            (
                 "read_file".to_string(),
                 "Read file contents".to_string(),
-                serde_json::json!({}),
+                Permission::Read,
+                false,
             ),
-            ToolDefinition::new(
+            (
+                "write_file".to_string(),
+                "Write text content to a file".to_string(),
+                Permission::Write,
+                false,
+            ),
+            (
                 "execute_command".to_string(),
                 "Run a shell command".to_string(),
-                serde_json::json!({}),
+                Permission::Read,
+                false,
             ),
-        ];
-
-        let prompt = build_system_prompt(Permission::Write, &tools, false, &[], &[], None, &[]);
-        assert!(prompt.contains("read_file"));
-        assert!(prompt.contains("execute_command"));
-        assert!(prompt.contains("Available Tools"));
+            (
+                "scratchpad_read".to_string(),
+                "Read a scratchpad entry".to_string(),
+                Permission::Read,
+                true,
+            ),
+        ]
     }
 
     #[test]
-    fn test_system_prompt_has_environment() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None, &[]);
-        assert!(prompt.contains("Environment"));
-        assert!(!prompt.contains("Working Directory:"));
-        assert!(!prompt.contains("Date:"));
+    fn test_system_prompt_describes_permission_model() {
+        let prompt = build_system_prompt(&[], false, &[], None, &[]);
+        assert!(prompt.contains("## Permission Model"));
+        assert!(prompt.contains("`none`"));
+        assert!(prompt.contains("`read`"));
+        assert!(prompt.contains("`ask`"));
+        assert!(prompt.contains("`write`"));
+        assert!(prompt.contains("`[Permission context]`"));
+        assert!(prompt.contains("Shift+Tab"));
+    }
+
+    #[test]
+    fn test_system_prompt_sandbox_note_read_mode() {
+        let prompt = build_system_prompt(&[], true, &[], None, &[]);
+        assert!(prompt.contains("filesystem mounted read-only"));
+    }
+
+    #[test]
+    fn test_system_prompt_no_sandbox_note_without_flag() {
+        let prompt = build_system_prompt(&[], false, &[], None, &[]);
+        assert!(!prompt.contains("filesystem mounted read-only"));
+        assert!(prompt.contains("`execute_command` is blocked"));
+    }
+
+    #[test]
+    fn test_system_prompt_lists_active_tools_with_required_level() {
+        let catalogue = sample_catalogue();
+        let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
+        assert!(prompt.contains("## Available Tools"));
+        assert!(prompt.contains("**read_file** (requires `read`)"));
+        assert!(prompt.contains("**write_file** (requires `write`)"));
+        assert!(prompt.contains("**execute_command** (requires `read`)"));
+    }
+
+    #[test]
+    fn test_system_prompt_omits_active_tool_descriptions() {
+        // Active tools' descriptions already live in the API tools array —
+        // the system prompt catalogue is now name + permission only, so
+        // the description string must not appear in the `## Available
+        // Tools` section.
+        let catalogue = sample_catalogue();
+        let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
+        let active_header = prompt.find("## Available Tools").unwrap();
+        let next_section = prompt[active_header..]
+            .find("\n## ")
+            .map(|idx| active_header + idx)
+            .unwrap_or(prompt.len());
+        let active_section = &prompt[active_header..next_section];
+        assert!(!active_section.contains("Read file contents"));
+        assert!(!active_section.contains("Write text content to a file"));
+    }
+
+    #[test]
+    fn test_system_prompt_separates_deferred_tools() {
+        let catalogue = sample_catalogue();
+        let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
+        assert!(prompt.contains("## Additional Tools (loaded on first use)"));
+        assert!(prompt.contains("**scratchpad_read** (requires `read`)"));
+        // The deferred tool must NOT appear in the active "Available Tools"
+        // section.
+        let active_header = prompt.find("## Available Tools").unwrap();
+        let deferred_header = prompt
+            .find("## Additional Tools (loaded on first use)")
+            .unwrap();
+        let active_section = &prompt[active_header..deferred_header];
+        assert!(!active_section.contains("scratchpad_read"));
+    }
+
+    #[test]
+    fn test_system_prompt_truncates_deferred_tool_descriptions() {
+        // A 2 KB MCP description must collapse to a one-liner; the
+        // full description still flows through the tool schema on
+        // activation, so the only loss is the prose repeat in the
+        // system prompt.
+        let big_desc = "x".repeat(2048);
+        let catalogue: Vec<ToolCatalogueEntry> = vec![(
+            "notion-search".to_string(),
+            big_desc,
+            Permission::Read,
+            true,
+        )];
+        let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
+        let deferred_header = prompt
+            .find("## Additional Tools (loaded on first use)")
+            .unwrap();
+        let section_end = prompt[deferred_header..]
+            .find("\n## ")
+            .map(|idx| deferred_header + idx)
+            .unwrap_or(prompt.len());
+        let section = &prompt[deferred_header..section_end];
+        let entry_line = section
+            .lines()
+            .find(|line| line.starts_with("- **notion-search**"))
+            .expect("notion-search entry present");
+        // Summary char cap + one-line prose scaffolding; well under the
+        // 2048 char full description that used to ship here.
+        let line_len = entry_line.chars().count();
+        assert!(
+            line_len <= TOOL_SUMMARY_MAX_CHARS + 60,
+            "deferred entry line too long: {} chars",
+            line_len
+        );
+        assert!(entry_line.ends_with('…'));
+    }
+
+    #[test]
+    fn test_short_description_first_sentence() {
+        let s = "Read a scratchpad entry. Extra info follows that we drop.";
+        assert_eq!(short_description(s), "Read a scratchpad entry.");
+    }
+
+    #[test]
+    fn test_short_description_passes_through_short_text() {
+        let s = "Read a scratchpad entry.";
+        assert_eq!(short_description(s), "Read a scratchpad entry.");
+    }
+
+    #[test]
+    fn test_short_description_char_cap() {
+        let long = "a".repeat(300);
+        let out = short_description(&long);
+        assert!(out.chars().count() <= TOOL_SUMMARY_MAX_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn test_short_description_collapses_whitespace() {
+        let s = "Line one.\n\n  Line   two.  ";
+        assert_eq!(short_description(s), "Line one.");
+    }
+
+    #[test]
+    fn test_short_description_no_sentence_terminator_short() {
+        // A short description without an ASCII/CJK sentence terminator
+        // is the complete description — no ellipsis suffix, since the
+        // model is seeing the whole text already.
+        let s = "no terminator at all here just words";
+        assert_eq!(short_description(s), "no terminator at all here just words");
+    }
+
+    #[test]
+    fn test_short_description_no_sentence_terminator_long_gets_ellipsis() {
+        let s = "word ".repeat(200);
+        let out = short_description(&s);
+        assert!(out.ends_with('…'));
+        assert!(out.chars().count() <= TOOL_SUMMARY_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn test_short_description_empty_input() {
+        assert_eq!(short_description(""), "");
+        assert_eq!(short_description("   \n  "), "");
+    }
+
+    #[test]
+    fn test_short_description_utf8_safe() {
+        let s = "读取一个文件。附加内容在这里。";
+        let out = short_description(s);
+        assert_eq!(out, "读取一个文件。附加内容在这里。");
+    }
+
+    #[test]
+    fn test_system_prompt_is_permission_independent() {
+        // The system prompt signature no longer takes a permission; callers
+        // that previously toggled permission had their prompts cached
+        // differently. This test simply pins the current signature.
+        let catalogue = sample_catalogue();
+        let a = build_system_prompt(&catalogue, true, &[], None, &[]);
+        let b = build_system_prompt(&catalogue, true, &[], None, &[]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_system_prompt_always_has_environment() {
+        let prompt = build_system_prompt(&[], false, &[], None, &[]);
+        assert!(prompt.contains("## Environment"));
     }
 
     #[test]
     fn test_system_prompt_lists_skills() {
         let skills = vec![sample_skill("setup-server"), sample_skill("deploy-app")];
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &skills, None, &[]);
+        let prompt = build_system_prompt(&[], false, &skills, None, &[]);
         assert!(prompt.contains("## Skills"));
         assert!(prompt.contains("**setup-server**"));
         assert!(prompt.contains("setup-server description"));
@@ -369,26 +626,16 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_omits_skills_in_none_mode() {
-        let skills = vec![sample_skill("setup-server")];
-        let prompt = build_system_prompt(Permission::None, &[], false, &[], &skills, None, &[]);
-        assert!(!prompt.contains("## Skills"));
-        assert!(!prompt.contains("setup-server"));
-    }
-
-    #[test]
     fn test_system_prompt_omits_skills_section_when_empty() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None, &[]);
+        let prompt = build_system_prompt(&[], false, &[], None, &[]);
         assert!(!prompt.contains("## Skills"));
     }
 
     #[test]
     fn test_system_prompt_includes_user_instructions() {
         let prompt = build_system_prompt(
-            Permission::Read,
             &[],
             false,
-            &[],
             &[],
             Some("Never use pip. Always prefer uv."),
             &[],
@@ -399,24 +646,70 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_includes_user_instructions_in_none_mode() {
-        let prompt =
-            build_system_prompt(Permission::None, &[], false, &[], &[], Some("Rule X"), &[]);
-        assert!(prompt.contains("## User Instructions"));
-        assert!(prompt.contains("Rule X"));
-    }
-
-    #[test]
     fn test_system_prompt_omits_user_instructions_when_none() {
-        let prompt = build_system_prompt(Permission::Read, &[], false, &[], &[], None, &[]);
+        let prompt = build_system_prompt(&[], false, &[], None, &[]);
         assert!(!prompt.contains("## User Instructions"));
     }
 
     #[test]
     fn test_system_prompt_omits_user_instructions_when_whitespace() {
-        let prompt =
-            build_system_prompt(Permission::Read, &[], false, &[], &[], Some("   \n"), &[]);
+        let prompt = build_system_prompt(&[], false, &[], Some("   \n"), &[]);
         assert!(!prompt.contains("## User Instructions"));
+    }
+
+    #[test]
+    fn test_permission_context_read_is_terse() {
+        let context = build_permission_context(Permission::Read);
+        assert!(context.contains("[Permission context]"));
+        assert!(context.contains("Current permission level: read"));
+        assert!(context.contains("Only read-only tools are executable."));
+        // The per-turn block must NOT enumerate individual tools — that
+        // duplicates the static system-prompt catalogue and balloons with
+        // MCP-tool count. Regression-guards the O(1) size invariant.
+        assert!(!context.contains("write_file"));
+        assert!(!context.contains("requires `"));
+    }
+
+    #[test]
+    fn test_permission_context_write_shows_all_accessible() {
+        let context = build_permission_context(Permission::Write);
+        assert!(context.contains("Current permission level: write"));
+        assert!(context.contains("All tools are executable."));
+    }
+
+    #[test]
+    fn test_permission_context_ask_mentions_approval() {
+        let context = build_permission_context(Permission::Ask);
+        assert!(context.contains("Current permission level: ask"));
+        assert!(context.contains("user approval"));
+    }
+
+    #[test]
+    fn test_permission_context_none_is_terse() {
+        let context = build_permission_context(Permission::None);
+        assert!(context.contains("Current permission level: none"));
+        assert!(context.contains("No tools are executable."));
+        assert!(!context.contains("read_file"));
+    }
+
+    #[test]
+    fn test_permission_context_size_bounded_regardless_of_catalogue() {
+        // Whatever the registered tool count, the block's token cost
+        // stays constant — this is the whole point of the trim.
+        for level in [
+            Permission::None,
+            Permission::Read,
+            Permission::Ask,
+            Permission::Write,
+        ] {
+            let ctx = build_permission_context(level);
+            assert!(
+                ctx.len() < 200,
+                "permission context for {:?} grew past 200 bytes: {}",
+                level,
+                ctx.len()
+            );
+        }
     }
 
     #[test]
@@ -434,31 +727,35 @@ mod tests {
     }
 
     #[test]
-    fn test_turn_context_empty_in_none_mode_with_no_todos() {
-        assert!(build_turn_context(Permission::None, &[]).is_none());
+    fn test_turn_context_always_has_permission_context() {
+        let context = build_turn_context(Permission::None, &[]);
+        assert!(context.starts_with("<context>\n"));
+        assert!(context.ends_with("</context>"));
+        assert!(context.contains("[Permission context]"));
     }
 
     #[test]
     fn test_turn_context_has_environment_in_read_mode() {
-        let context = build_turn_context(Permission::Read, &[]).expect("should have content");
-        assert!(context.starts_with("<context>\n"));
-        assert!(context.ends_with("</context>"));
+        let context = build_turn_context(Permission::Read, &[]);
+        assert!(context.contains("[Permission context]"));
         assert!(context.contains("[Environment context]"));
     }
 
     #[test]
     fn test_turn_context_includes_todos() {
         let todos = vec![sample_todo("1", "write tests", "in_progress")];
-        let context = build_turn_context(Permission::Read, &todos).expect("should have content");
+        let context = build_turn_context(Permission::Read, &todos);
         assert!(context.contains("write tests"));
         assert!(context.contains("[Environment context]"));
+        assert!(context.contains("[Permission context]"));
     }
 
     #[test]
-    fn test_turn_context_none_mode_with_todos_still_includes_todos() {
+    fn test_turn_context_none_mode_omits_environment() {
         let todos = vec![sample_todo("1", "do a thing", "pending")];
-        let context = build_turn_context(Permission::None, &todos).expect("should have content");
+        let context = build_turn_context(Permission::None, &todos);
         assert!(context.contains("do a thing"));
+        assert!(context.contains("[Permission context]"));
         assert!(!context.contains("[Environment context]"));
     }
 
@@ -500,8 +797,7 @@ mod tests {
                 "All queries run in read-only mode.".to_string(),
             ),
         ];
-        let prompt =
-            build_system_prompt(Permission::Write, &[], false, &[], &[], None, &instructions);
+        let prompt = build_system_prompt(&[], false, &[], None, &instructions);
         assert!(prompt.contains("## MCP Server Instructions"));
         assert!(prompt.contains("### fs"));
         assert!(prompt.contains("Call `fs__read` before `fs__write`."));
@@ -511,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_system_prompt_omits_mcp_server_instructions_when_empty() {
-        let prompt = build_system_prompt(Permission::Write, &[], false, &[], &[], None, &[]);
+        let prompt = build_system_prompt(&[], false, &[], None, &[]);
         assert!(!prompt.contains("## MCP Server Instructions"));
     }
 }

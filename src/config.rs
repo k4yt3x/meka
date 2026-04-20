@@ -37,6 +37,11 @@ pub struct ThinkingConfig {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct McpConfig {
+    /// Fallback permission for MCP tools when nothing more specific
+    /// applies (no `tool_permissions` override, no server-level
+    /// `permission`, no `readOnlyHint` from the server). If this is
+    /// also unset the hardcoded fallback is `Write` — i.e. strict.
+    pub default_permission: Option<String>,
     pub servers: Option<Vec<McpServerConfig>>,
 }
 
@@ -59,6 +64,18 @@ pub struct McpServerConfig {
     pub headers_helper: Option<String>,
     pub auth: Option<McpAuthConfig>,
     pub permission: Option<String>,
+    /// Optional allow-list of raw tool names (the server-advertised
+    /// form, not the `<server>__<tool>` namespaced form). When set and
+    /// non-empty, only these tools from this server are registered.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Optional block-list of raw tool names. Applied after
+    /// [`allowed_tools`] — tools listed here are never registered.
+    pub disabled_tools: Option<Vec<String>>,
+    /// Optional per-tool permission overrides keyed by raw tool name.
+    /// Beats the server-level `permission` and the server's
+    /// `readOnlyHint` annotation when resolving a tool's required
+    /// permission at registration time.
+    pub tool_permissions: Option<std::collections::HashMap<String, String>>,
     /// Allow this server to issue `sampling/createMessage` requests. When
     /// false (default), any such request is rejected with `METHOD_NOT_FOUND`.
     /// Use with caution: sampling lets the server inject arbitrary messages
@@ -172,6 +189,11 @@ pub struct ResolvedConfig {
     pub auto_compact: bool,
     pub context_window: Option<u64>,
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Parsed [`Permission`] from `[mcp].default_permission`, carried so
+    /// per-turn tool-permission resolution in `src/mcp.rs` doesn't have
+    /// to re-read the config file. `None` means "no `[mcp]` default
+    /// configured" — resolution falls through to the hardcoded Write.
+    pub mcp_default_permission: Option<Permission>,
     pub user_instructions: Option<String>,
 }
 
@@ -303,10 +325,26 @@ impl ResolvedConfig {
         let file_session = config_file.session.unwrap_or_default();
         let file_thinking = config_file.thinking.unwrap_or_default();
         let file_prompt = config_file.prompt.unwrap_or_default();
-        let mcp_servers = config_file
-            .mcp
-            .and_then(|mcp| mcp.servers)
-            .unwrap_or_default();
+        // Destructure the [mcp] table into its two independent fields so
+        // we don't have to re-open the config file later for resolution.
+        let (mcp_default_permission_str, mcp_servers) = match config_file.mcp {
+            Some(mcp) => (mcp.default_permission, mcp.servers.unwrap_or_default()),
+            None => (None, Vec::new()),
+        };
+        let mcp_default_permission = match mcp_default_permission_str.as_deref() {
+            Some(raw) => match raw.parse::<Permission>() {
+                Ok(permission) => Some(permission),
+                Err(_) => {
+                    tracing::warn!(
+                        "ignoring invalid [mcp].default_permission '{}' (expected \
+                         none, read, ask, or write)",
+                        raw
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         let user_instructions = file_prompt
             .instructions
@@ -381,6 +419,7 @@ impl ResolvedConfig {
             auto_compact: file_session.auto_compact.unwrap_or(true),
             context_window: file_session.context_window,
             mcp_servers,
+            mcp_default_permission,
             user_instructions,
         }
     }

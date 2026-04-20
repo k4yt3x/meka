@@ -352,6 +352,13 @@ type McpRunningService = rmcp::service::RunningService<RoleClient, AgshClientHan
 
 pub struct McpClientManager {
     servers: HashMap<String, Arc<ServerEntry>>,
+    /// Global fallback permission from `[mcp].default_permission`.
+    /// Consulted by `resolve_tool_permission` at tool-registration time
+    /// when neither the server nor the user has configured a more
+    /// specific permission and the server didn't advertise a
+    /// `readOnlyHint`. `None` means "no user default" — resolution
+    /// falls through to the hardcoded strict `Write`.
+    mcp_default_permission: Option<Permission>,
 }
 
 /// Holds the live service for a single MCP server plus reconnection state.
@@ -480,6 +487,7 @@ impl ServerEntry {
 impl McpClientManager {
     pub async fn connect_all(
         configs: &[McpServerConfig],
+        mcp_default_permission: Option<Permission>,
         token_store: Option<&TokenStore>,
         client_context: Arc<McpClientContext>,
     ) -> Result<Self> {
@@ -578,7 +586,10 @@ impl McpClientManager {
             servers.insert(config.name.clone(), entry);
         }
 
-        Ok(Self { servers })
+        Ok(Self {
+            servers,
+            mcp_default_permission,
+        })
     }
 
     pub fn server_entry(&self, server_name: &str) -> Option<Arc<ServerEntry>> {
@@ -610,13 +621,12 @@ impl McpClientManager {
     pub async fn discover_tools_for_server(
         &self,
         server_name: &str,
-        permission_str: Option<&str>,
     ) -> Result<Vec<McpToolAdapter>> {
         let Some(entry) = self.servers.get(server_name) else {
             return Ok(Vec::new());
         };
 
-        let permission = parse_server_permission(server_name, permission_str)?;
+        let server_config = &entry.config;
 
         let peer = entry.current_peer().await;
         let tools = peer
@@ -627,13 +637,25 @@ impl McpClientManager {
                 message: format!("list_tools failed: {}", error),
             })?;
 
+        // Collect advertised raw names up-front so we can flag stale
+        // `allowed_tools` / `disabled_tools` / `tool_permissions` entries
+        // that no longer match anything the server returns.
+        let advertised: std::collections::HashSet<&str> =
+            tools.iter().map(|t| t.name.as_ref()).collect();
+        warn_on_stale_tool_config(server_name, server_config, &advertised);
+
         let mut adapters = Vec::new();
         for tool in tools {
+            let raw_tool_name = tool.name.as_ref().to_string();
+
+            if !tool_is_allowed(server_config, &raw_tool_name) {
+                continue;
+            }
+
             // Sanitise the tool's advertised name defensively — rare in the
             // wild, but a server returning `my.tool` or anything with
             // Unicode would cause the provider to reject the schema.
-            let sanitised_tool_name =
-                crate::mcp::sanitize::normalize_server_name(tool.name.as_ref());
+            let sanitised_tool_name = crate::mcp::sanitize::normalize_server_name(&raw_tool_name);
             let namespaced_name = format!("{}__{}", server_name, sanitised_tool_name);
 
             let raw_description = tool
@@ -653,12 +675,23 @@ impl McpClientManager {
                         "MCP server '{}' tool '{}' has unserializable input schema ({}); \
                          skipping registration",
                         server_name,
-                        tool.name,
+                        raw_tool_name,
                         error
                     );
                     continue;
                 }
             };
+
+            // Per-tool permission via the layered resolution. Hints come
+            // from `tool.annotations.readOnlyHint` as published by the
+            // server; the function handles all the precedence rules.
+            let permission = resolve_tool_permission(
+                server_name,
+                &raw_tool_name,
+                tool.annotations.as_ref(),
+                server_config,
+                self.mcp_default_permission,
+            )?;
 
             let annotations = tool
                 .annotations
@@ -675,7 +708,7 @@ impl McpClientManager {
 
             adapters.push(McpToolAdapter {
                 namespaced_name,
-                remote_tool_name: tool.name.into_owned(),
+                remote_tool_name: raw_tool_name,
                 description,
                 parameters,
                 permission,
@@ -687,6 +720,66 @@ impl McpClientManager {
         }
 
         Ok(adapters)
+    }
+
+    /// Connect to the named server and list EVERY advertised tool —
+    /// including ones currently filtered out by `allowed_tools` /
+    /// `disabled_tools` so users editing those lists can see what
+    /// names are available. Permission is resolved through the normal
+    /// 5-step chain with the winning step recorded on each entry.
+    ///
+    /// Differs from [`discover_tools_for_server`] by (a) not filtering
+    /// by allow/block lists, (b) not registering adapters, and
+    /// (c) capturing the resolution source for display.
+    pub async fn list_advertised_tools(&self, server_name: &str) -> Result<Vec<AdvertisedTool>> {
+        let Some(entry) = self.servers.get(server_name) else {
+            return Err(AgshError::McpConnection {
+                server_name: server_name.to_string(),
+                message: format!("no MCP server named '{}'", server_name),
+            });
+        };
+
+        let server_config = &entry.config;
+        let peer = entry.current_peer().await;
+        let tools = peer
+            .list_all_tools()
+            .await
+            .map_err(|error| AgshError::McpConnection {
+                server_name: server_name.to_string(),
+                message: format!("list_tools failed: {}", error),
+            })?;
+
+        let mut out = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let raw_name = tool.name.as_ref().to_string();
+            let raw_description = tool
+                .description
+                .as_ref()
+                .map(|d| d.as_ref().to_string())
+                .unwrap_or_default();
+            let description = truncate(
+                &crate::mcp::sanitize::sanitize_text(&raw_description),
+                MAX_MCP_DESCRIPTION_LENGTH,
+            );
+            let (resolved_permission, permission_source) = resolve_tool_permission_with_source(
+                server_name,
+                &raw_name,
+                tool.annotations.as_ref(),
+                server_config,
+                self.mcp_default_permission,
+            )?;
+            let allowed = tool_is_allowed(server_config, &raw_name);
+            out.push(AdvertisedTool {
+                raw_name,
+                description,
+                resolved_permission,
+                permission_source,
+                allowed,
+            });
+        }
+
+        out.sort_by(|a, b| a.raw_name.cmp(&b.raw_name));
+        Ok(out)
     }
 
     pub async fn shutdown(self) {
@@ -1856,17 +1949,208 @@ impl CredentialStore for SqliteCredentialStore {
     }
 }
 
-fn parse_server_permission(server_name: &str, permission_str: Option<&str>) -> Result<Permission> {
-    let permission_str = permission_str.unwrap_or("read");
-    permission_str
-        .parse::<Permission>()
-        .map_err(|_| AgshError::McpConnection {
-            server_name: server_name.to_string(),
-            message: format!(
-                "invalid permission '{}': expected 'none', 'read', or 'write'",
-                permission_str
-            ),
-        })
+/// Decide whether a tool advertised by a server should be registered.
+/// Applies `allowed_tools` (restrict-in, when set and non-empty) then
+/// `disabled_tools` (always-remove). Both fields can coexist — the
+/// allow-list acts as a restriction, and the block-list subtracts from
+/// whatever remains. A tool passes iff it survives both checks.
+fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
+    if let Some(allow) = server_config.allowed_tools.as_deref()
+        && !allow.is_empty()
+        && !allow.iter().any(|t| t == tool_raw_name)
+    {
+        return false;
+    }
+    if let Some(deny) = server_config.disabled_tools.as_deref()
+        && deny.iter().any(|t| t == tool_raw_name)
+    {
+        return false;
+    }
+    true
+}
+
+/// Emit a `warn!` once per entry in `allowed_tools` / `disabled_tools`
+/// / `tool_permissions` that doesn't match anything the server
+/// currently advertises. Users get a visible heads-up without failing
+/// the connect — tool lists can change between server releases, and
+/// forcing a hard error on every rename would be hostile.
+fn warn_on_stale_tool_config(
+    server_name: &str,
+    server_config: &McpServerConfig,
+    advertised: &std::collections::HashSet<&str>,
+) {
+    if let Some(allow) = server_config.allowed_tools.as_deref() {
+        for name in allow {
+            if !advertised.contains(name.as_str()) {
+                tracing::warn!(
+                    "MCP server '{}': allowed_tools entry '{}' doesn't match any advertised tool",
+                    server_name,
+                    name
+                );
+            }
+        }
+    }
+    if let Some(deny) = server_config.disabled_tools.as_deref() {
+        for name in deny {
+            if !advertised.contains(name.as_str()) {
+                tracing::warn!(
+                    "MCP server '{}': disabled_tools entry '{}' doesn't match any advertised tool",
+                    server_name,
+                    name
+                );
+            }
+        }
+    }
+    if let Some(perms) = server_config.tool_permissions.as_ref() {
+        for key in perms.keys() {
+            if !advertised.contains(key.as_str()) {
+                tracing::warn!(
+                    "MCP server '{}': tool_permissions key '{}' doesn't match any advertised tool",
+                    server_name,
+                    key
+                );
+            }
+        }
+    }
+}
+
+/// Resolve the required permission for a single MCP tool. Applies the
+/// layered policy documented in `docs/book/src/configuration/config-file.md`:
+///
+/// 1. `server.tool_permissions[tool]` — per-tool user override.
+/// 2. `server.permission` — server-level user override.
+/// 3. `tool.annotations.readOnlyHint` advertised by the server:
+///    `true` → Read, `false` → Write.
+/// 4. `mcp.default_permission` — global fallback when no hint exists.
+/// 5. Hardcoded `Write` — ultimate strict fallback.
+///
+/// User config at steps 1/2 always beats the server's hints. Hints
+/// beat the global fallback so a `readOnlyHint = false` destructive
+/// tool isn't silently promoted to Read just because the user opted
+/// into a lenient global default.
+fn resolve_tool_permission(
+    server_name: &str,
+    tool_raw_name: &str,
+    tool_annotations: Option<&rmcp::model::ToolAnnotations>,
+    server_config: &McpServerConfig,
+    mcp_default: Option<Permission>,
+) -> Result<Permission> {
+    resolve_tool_permission_with_source(
+        server_name,
+        tool_raw_name,
+        tool_annotations,
+        server_config,
+        mcp_default,
+    )
+    .map(|(permission, _)| permission)
+}
+
+/// Identifies which step of the 5-step resolution chain produced a
+/// tool's permission. Used by `agsh mcp tools <name>` so users can see
+/// which knob is driving each tool's classification when editing
+/// allow/block lists or per-tool overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionSource {
+    ToolOverride,
+    ServerOverride,
+    ReadOnlyHint,
+    GlobalDefault,
+    Fallback,
+}
+
+impl PermissionSource {
+    /// Short human label matching the config keys users would edit.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolOverride => "tool_permission",
+            Self::ServerOverride => "server_permission",
+            Self::ReadOnlyHint => "readOnlyHint",
+            Self::GlobalDefault => "default_permission",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// A tool advertised by an MCP server, paired with the resolved
+/// permission and the source step of the resolution chain. Returned
+/// by [`McpClientManager::list_advertised_tools`] and printed by
+/// `agsh mcp tools <server>`. The raw `readOnlyHint` value isn't
+/// carried here because [`PermissionSource::ReadOnlyHint`] already
+/// signals when the hint drove the decision; downstream renderers
+/// that want the raw value can re-query.
+pub struct AdvertisedTool {
+    /// Raw name as advertised by the server — use this value in
+    /// `allowed_tools` / `disabled_tools` / `tool_permissions` config.
+    pub raw_name: String,
+    /// Sanitised + truncated description (same pipeline as registered
+    /// tools).
+    pub description: String,
+    /// Output of the 5-step permission resolution.
+    pub resolved_permission: Permission,
+    /// Which step of the chain won.
+    pub permission_source: PermissionSource,
+    /// `false` if currently filtered out by `allowed_tools` /
+    /// `disabled_tools` — i.e. the agent would never see this tool.
+    pub allowed: bool,
+}
+
+/// Same resolution as [`resolve_tool_permission`] but also returns which
+/// step of the chain fired, so `agsh mcp tools` can show the user
+/// exactly why a given tool has its current permission.
+fn resolve_tool_permission_with_source(
+    server_name: &str,
+    tool_raw_name: &str,
+    tool_annotations: Option<&rmcp::model::ToolAnnotations>,
+    server_config: &McpServerConfig,
+    mcp_default: Option<Permission>,
+) -> Result<(Permission, PermissionSource)> {
+    // 1. Per-tool override.
+    if let Some(map) = &server_config.tool_permissions
+        && let Some(raw) = map.get(tool_raw_name)
+    {
+        let permission = raw
+            .parse::<Permission>()
+            .map_err(|_| AgshError::McpConnection {
+                server_name: server_name.to_string(),
+                message: format!(
+                    "invalid tool_permissions['{}'] = '{}': expected \
+                     'none', 'read', 'ask', or 'write'",
+                    tool_raw_name, raw
+                ),
+            })?;
+        return Ok((permission, PermissionSource::ToolOverride));
+    }
+    // 2. Server-level override.
+    if let Some(raw) = server_config.permission.as_deref() {
+        let permission = raw
+            .parse::<Permission>()
+            .map_err(|_| AgshError::McpConnection {
+                server_name: server_name.to_string(),
+                message: format!(
+                    "invalid permission '{}': expected 'none', 'read', \
+                     'ask', or 'write'",
+                    raw
+                ),
+            })?;
+        return Ok((permission, PermissionSource::ServerOverride));
+    }
+    // 3. Server-advertised readOnlyHint.
+    if let Some(annotations) = tool_annotations
+        && let Some(hint) = annotations.read_only_hint
+    {
+        let permission = if hint {
+            Permission::Read
+        } else {
+            Permission::Write
+        };
+        return Ok((permission, PermissionSource::ReadOnlyHint));
+    }
+    // 4. Global [mcp].default_permission.
+    if let Some(permission) = mcp_default {
+        return Ok((permission, PermissionSource::GlobalDefault));
+    }
+    // 5. Hardcoded strict fallback.
+    Ok((Permission::Write, PermissionSource::Fallback))
 }
 
 /// Shared context threaded into every [`AgshClientHandler`] so notification
@@ -1973,18 +2257,10 @@ impl ClientHandler for AgshClientHandler {
                 return;
             };
 
-            // The permission override from config.toml is the same one used at
-            // startup; re-read it from the original server config so we don't
-            // accidentally elevate or demote on refresh.
-            let permission_str = manager
-                .servers
-                .get(&server_name)
-                .and_then(|e| e.config.permission.clone());
-
-            match manager
-                .discover_tools_for_server(&server_name, permission_str.as_deref())
-                .await
-            {
+            // Tool-permission resolution reads the server config and
+            // `mcp_default_permission` from the manager itself — no
+            // explicit permission needs to be threaded here.
+            match manager.discover_tools_for_server(&server_name).await {
                 Ok(adapters) => {
                     let new_tools: Vec<Arc<dyn Tool>> = adapters
                         .into_iter()
@@ -2827,31 +3103,257 @@ fn convert_tool_result_content(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_server_permission_defaults_to_read() {
-        let permission = parse_server_permission("test", None).expect("should parse");
-        assert_eq!(permission, Permission::Read);
+    fn bare_server_config(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Http,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://example".to_string()),
+            auth_token: None,
+            headers: None,
+            headers_helper: None,
+            auth: None,
+            permission: None,
+            allowed_tools: None,
+            disabled_tools: None,
+            tool_permissions: None,
+            sampling: false,
+            sampling_limit: None,
+        }
+    }
+
+    fn annotations_with_read_only_hint(hint: Option<bool>) -> rmcp::model::ToolAnnotations {
+        // `ToolAnnotations` is `#[non_exhaustive]`; use the builder.
+        let mut ann = rmcp::model::ToolAnnotations::new();
+        ann.read_only_hint = hint;
+        ann
     }
 
     #[test]
-    fn test_parse_server_permission_valid_values() {
-        assert_eq!(
-            parse_server_permission("test", Some("read")).expect("should parse"),
-            Permission::Read
-        );
-        assert_eq!(
-            parse_server_permission("test", Some("write")).expect("should parse"),
-            Permission::Write
-        );
-        assert_eq!(
-            parse_server_permission("test", Some("none")).expect("should parse"),
-            Permission::None
-        );
+    fn resolve_tool_permission_prefers_per_tool_override() {
+        let mut server = bare_server_config("s");
+        server.permission = Some("write".into());
+        let mut per_tool = std::collections::HashMap::new();
+        per_tool.insert("search".to_string(), "read".to_string());
+        server.tool_permissions = Some(per_tool);
+
+        // Per-tool override wins even when both the server default AND
+        // the server's hint disagree.
+        let annotations = annotations_with_read_only_hint(Some(false));
+        let resolved = resolve_tool_permission(
+            "s",
+            "search",
+            Some(&annotations),
+            &server,
+            Some(Permission::Write),
+        )
+        .expect("should resolve");
+        assert_eq!(resolved, Permission::Read);
     }
 
     #[test]
-    fn test_parse_server_permission_invalid() {
-        assert!(parse_server_permission("test", Some("invalid")).is_err());
+    fn resolve_tool_permission_falls_through_to_server_level() {
+        let mut server = bare_server_config("s");
+        server.permission = Some("read".into());
+        // Server level beats the hint.
+        let annotations = annotations_with_read_only_hint(Some(false));
+        let resolved = resolve_tool_permission(
+            "s",
+            "any",
+            Some(&annotations),
+            &server,
+            Some(Permission::Write),
+        )
+        .expect("should resolve");
+        assert_eq!(resolved, Permission::Read);
+    }
+
+    #[test]
+    fn resolve_tool_permission_honours_read_only_hint() {
+        let server = bare_server_config("s");
+        // readOnlyHint = true → Read, even though the global default
+        // would otherwise be Write.
+        let annotations = annotations_with_read_only_hint(Some(true));
+        let resolved = resolve_tool_permission(
+            "s",
+            "search",
+            Some(&annotations),
+            &server,
+            Some(Permission::Write),
+        )
+        .expect("should resolve");
+        assert_eq!(resolved, Permission::Read);
+
+        // readOnlyHint = false → Write, even though the global default
+        // is the lenient Read.
+        let annotations = annotations_with_read_only_hint(Some(false));
+        let resolved = resolve_tool_permission(
+            "s",
+            "write-page",
+            Some(&annotations),
+            &server,
+            Some(Permission::Read),
+        )
+        .expect("should resolve");
+        assert_eq!(resolved, Permission::Write);
+    }
+
+    #[test]
+    fn resolve_tool_permission_falls_through_to_mcp_default() {
+        let server = bare_server_config("s");
+        // No user overrides, no hint → fall through to `[mcp].default`.
+        let resolved = resolve_tool_permission("s", "any", None, &server, Some(Permission::Read))
+            .expect("should resolve");
+        assert_eq!(resolved, Permission::Read);
+    }
+
+    #[test]
+    fn resolve_tool_permission_hardcoded_write_fallback() {
+        let server = bare_server_config("s");
+        // Nothing configured anywhere, no hint → hardcoded strict Write.
+        let resolved =
+            resolve_tool_permission("s", "any", None, &server, None).expect("should resolve");
+        assert_eq!(resolved, Permission::Write);
+    }
+
+    #[test]
+    fn resolve_tool_permission_rejects_invalid_tool_override() {
+        let mut server = bare_server_config("s");
+        let mut per_tool = std::collections::HashMap::new();
+        per_tool.insert("search".to_string(), "typo".to_string());
+        server.tool_permissions = Some(per_tool);
+        let err = resolve_tool_permission("s", "search", None, &server, None)
+            .expect_err("invalid level should error");
+        assert!(format!("{}", err).contains("tool_permissions['search']"));
+    }
+
+    #[test]
+    fn resolve_tool_permission_with_source_attributes_each_step() {
+        // 1. Per-tool override.
+        let mut server = bare_server_config("s");
+        let mut per_tool = std::collections::HashMap::new();
+        per_tool.insert("a".to_string(), "ask".to_string());
+        server.tool_permissions = Some(per_tool);
+        let (perm, source) =
+            resolve_tool_permission_with_source("s", "a", None, &server, None).unwrap();
+        assert_eq!(perm, Permission::Ask);
+        assert_eq!(source, PermissionSource::ToolOverride);
+
+        // 2. Server-level override.
+        let mut server = bare_server_config("s");
+        server.permission = Some("read".into());
+        let (perm, source) =
+            resolve_tool_permission_with_source("s", "b", None, &server, None).unwrap();
+        assert_eq!(perm, Permission::Read);
+        assert_eq!(source, PermissionSource::ServerOverride);
+
+        // 3. readOnlyHint fires when no user override is set.
+        let server = bare_server_config("s");
+        let ann = annotations_with_read_only_hint(Some(true));
+        let (perm, source) =
+            resolve_tool_permission_with_source("s", "c", Some(&ann), &server, None).unwrap();
+        assert_eq!(perm, Permission::Read);
+        assert_eq!(source, PermissionSource::ReadOnlyHint);
+
+        // 4. Global default when no hint.
+        let server = bare_server_config("s");
+        let (perm, source) =
+            resolve_tool_permission_with_source("s", "d", None, &server, Some(Permission::Read))
+                .unwrap();
+        assert_eq!(perm, Permission::Read);
+        assert_eq!(source, PermissionSource::GlobalDefault);
+
+        // 5. Hardcoded fallback.
+        let server = bare_server_config("s");
+        let (perm, source) =
+            resolve_tool_permission_with_source("s", "e", None, &server, None).unwrap();
+        assert_eq!(perm, Permission::Write);
+        assert_eq!(source, PermissionSource::Fallback);
+    }
+
+    #[test]
+    fn permission_source_labels_match_config_keys() {
+        // The labels printed by `agsh mcp tools` must match the config
+        // keys users would edit to change a classification.
+        assert_eq!(PermissionSource::ToolOverride.as_str(), "tool_permission");
+        assert_eq!(
+            PermissionSource::ServerOverride.as_str(),
+            "server_permission"
+        );
+        assert_eq!(PermissionSource::ReadOnlyHint.as_str(), "readOnlyHint");
+        assert_eq!(
+            PermissionSource::GlobalDefault.as_str(),
+            "default_permission"
+        );
+        assert_eq!(PermissionSource::Fallback.as_str(), "fallback");
+    }
+
+    #[test]
+    fn tool_is_allowed_default_passes_everything() {
+        let server = bare_server_config("s");
+        assert!(tool_is_allowed(&server, "search"));
+        assert!(tool_is_allowed(&server, "create-page"));
+    }
+
+    #[test]
+    fn tool_is_allowed_allowlist_restricts() {
+        let mut server = bare_server_config("s");
+        server.allowed_tools = Some(vec!["search".into(), "fetch".into()]);
+        assert!(tool_is_allowed(&server, "search"));
+        assert!(tool_is_allowed(&server, "fetch"));
+        assert!(!tool_is_allowed(&server, "create-page"));
+    }
+
+    #[test]
+    fn tool_is_allowed_empty_allowlist_means_all() {
+        // An empty `allowed_tools` array is treated as "unset" — i.e.
+        // no restriction. A totally absent field behaves the same way.
+        let mut server = bare_server_config("s");
+        server.allowed_tools = Some(Vec::new());
+        assert!(tool_is_allowed(&server, "anything"));
+    }
+
+    #[test]
+    fn tool_is_allowed_blocklist_removes() {
+        let mut server = bare_server_config("s");
+        server.disabled_tools = Some(vec!["delete-page".into()]);
+        assert!(tool_is_allowed(&server, "search"));
+        assert!(!tool_is_allowed(&server, "delete-page"));
+    }
+
+    #[test]
+    fn tool_is_allowed_both_lists_compose() {
+        // allow restricts to {search, fetch, write-page}, then block
+        // subtracts {write-page}. Net effect: only search + fetch.
+        let mut server = bare_server_config("s");
+        server.allowed_tools = Some(vec!["search".into(), "fetch".into(), "write-page".into()]);
+        server.disabled_tools = Some(vec!["write-page".into()]);
+        assert!(tool_is_allowed(&server, "search"));
+        assert!(tool_is_allowed(&server, "fetch"));
+        assert!(!tool_is_allowed(&server, "write-page"));
+        assert!(!tool_is_allowed(&server, "delete-page")); // not in allow
+    }
+
+    #[test]
+    fn warn_on_stale_tool_config_smoke() {
+        // The function just emits `warn!` lines; we can't easily
+        // assert on tracing output from a unit test. Smoke-test that
+        // the happy path (empty config) doesn't panic and that it
+        // accepts a server_config with all three fields populated.
+        let mut server = bare_server_config("s");
+        server.allowed_tools = Some(vec!["a".into(), "unknown".into()]);
+        server.disabled_tools = Some(vec!["b".into(), "gone".into()]);
+        let mut perms = std::collections::HashMap::new();
+        perms.insert("a".to_string(), "read".to_string());
+        perms.insert("missing".to_string(), "write".to_string());
+        server.tool_permissions = Some(perms);
+
+        let advertised: std::collections::HashSet<&str> =
+            ["a", "b", "search"].into_iter().collect();
+        // Just confirm the call doesn't panic.
+        warn_on_stale_tool_config("s", &server, &advertised);
     }
 
     #[test]
