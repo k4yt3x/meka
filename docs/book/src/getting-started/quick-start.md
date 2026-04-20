@@ -78,7 +78,7 @@ agsh -c
 Or resume a specific session by its UUID:
 
 ```bash
-agsh -s 550e8400-e29b-41d4-a716-446655440000
+agsh -c 550e8400-e29b-41d4-a716-446655440000
 ```
 
 See [Sessions](../usage/sessions.md) for more details.

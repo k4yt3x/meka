@@ -41,6 +41,22 @@ In **ask** mode, all tools are available but each call requires user confirmatio
 
 In **none** mode, no tools are available. The agent can only respond with text.
 
+## MCP Tools
+
+When [MCP servers](../configuration/config-file.md#mcp-servers-mcp) are configured, their tools are registered under a namespaced name of the form `<server>__<tool>` (e.g. `notion__notion-search`). They appear in the system prompt catalogue alongside the built-ins — with their resolved permission level annotated inline — and are called the same way.
+
+agsh also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default (loaded on first use):
+
+| Tool | Permission | Description |
+|------|-----------|-------------|
+| `list_mcp_resources` | Read | List resources a server exposes |
+| `read_mcp_resource` | Read | Read a server resource by URI |
+| `list_mcp_prompts` | Read | List server-defined prompts |
+| `get_mcp_prompt` | Read | Render a server prompt with arguments |
+| `subscribe_mcp_resource` | Read | Receive change notifications for a resource |
+| `unsubscribe_mcp_resource` | Read | Stop receiving change notifications |
+| `list_mcp_resource_updates` | Read | Inspect pending resource-change notifications |
+
 ## Scratchpad Parameter
 
 All tools support an optional `scratchpad` string parameter. When provided, the tool's output is saved to the scratchpad under that name instead of being returned inline. This lets the agent store large outputs for later processing without consuming conversation context.

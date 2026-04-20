@@ -5,21 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- `AGSH_CONFIG_DIR` env var overrides the default config location; the only isolation knob that works on macOS/Windows too.
-
-### Fixed
-
-- macOS/Windows CI tests no longer read the host user's real `config.toml` — they now isolate via `AGSH_CONFIG_DIR`.
-- `cargo doc -D warnings` cleared of broken intra-doc links and bare-URL lints.
-
 ## [0.13.0] - 2026-04-19
 
 ### Added
 
+- `AGSH_CONFIG_DIR` env var overrides the default config directory on every platform.
 - System prompt now lists every registered tool with its required permission level inline.
 - Per-turn user message carries a `[Permission context]` block naming the current level.
 - Per-tool MCP permission chain: `tool_permissions` > `permission` > `readOnlyHint` > `default_permission`.
@@ -152,6 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- macOS/Windows CI tests no longer read the host user's real `config.toml` — they now isolate via `AGSH_CONFIG_DIR`.
+- `cargo doc -D warnings` cleared of broken intra-doc links and bare-URL lints.
 - Rename `render_image` input `scratchpad` to `from_scratchpad` so it no longer clobbers the source.
 - Remove redundant 30 KB caps on `execute_command` and `spawn_agent`; oversize handled upstream.
 - Show primary param in the tool banner for `skill` and `render_image`.

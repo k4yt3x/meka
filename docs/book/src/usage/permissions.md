@@ -35,7 +35,7 @@ Or use the `/permission` slash command:
 /permission ask
 ```
 
-The prompt indicator updates immediately to reflect the new level. The agent is informed of the current permission level in its system prompt, so it knows which tools are available.
+The prompt indicator updates immediately to reflect the new level. The agent learns the current level via a per-turn `[Permission context]` block prepended to your message (see *How Permissions Work* below).
 
 ## Ask Mode
 
@@ -55,9 +55,26 @@ When the agent attempts to use a tool, agsh checks whether the current permissio
 
 - If allowed, the tool executes normally.
 - In ask mode, you are prompted to approve or deny.
-- If denied, agsh returns an error message to the agent explaining that the tool requires a higher permission level.
+- If denied, agsh returns an error message to the agent explaining which level is required and suggests running `/permission <level>`.
 
-The agent is also instructed (via the system prompt) to inform you if it cannot perform a requested action due to permission restrictions and to suggest pressing Shift+Tab to change the level.
+### Telling the agent the current level
+
+agsh lists **every registered tool** in the system prompt with its required permission level inline — nothing is filtered out — and each user message carries a compact `[Permission context]` block:
+
+```text
+<context>
+[Permission context]
+Current permission level: read
+Only read-only tools are executable.
+...
+</context>
+```
+
+That two-line block is the only permission-dependent content in the request. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Anthropic prompt cache — the entire message history stays warm.
+
+### MCP tool permissions
+
+MCP tools are classified through a 5-step resolution chain: per-tool override → server-level override → the server's own `readOnlyHint` → `[mcp].default_permission` → hardcoded `Write` fallback. See the *Permission resolution* section of the [Config File](../configuration/config-file.md) docs for the full rules and how to override a misclassified tool.
 
 ## Examples
 

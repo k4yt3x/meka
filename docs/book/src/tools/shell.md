@@ -19,9 +19,14 @@ Execute a shell command and return its output.
 - Executes the command via `sh -c "<command>"` on Unix, or `powershell.exe -NoProfile -NonInteractive -Command "<command>"` on Windows (same shell in both sandboxed and unsandboxed mode).
 - Captures both stdout and stderr.
 - Returns the exit code along with the output if non-zero.
-- Output is truncated to 30,000 characters. Oversized output is automatically saved to the scratchpad.
-- Default timeout is 30 seconds. If the command exceeds the timeout, it is killed.
+- Oversized output is losslessly persisted to the scratchpad by the agent layer — the tool itself never truncates.
+- Default timeout is 30 seconds. If the command exceeds the timeout, it is killed (on Unix, via the process group so backgrounded grandchildren are caught too).
 - Supports cancellation: pressing Ctrl+C while a command is running kills the child process.
+
+### Shell-specific semantics
+
+- **Unix (`sh -c`)**: POSIX `$VAR` expansion applies. Pass a literal `$` with single quotes (`'$foo'`) or backslash escape (`\$foo`).
+- **Windows (`powershell.exe -Command`)**: The script body reaches PowerShell directly. Use PowerShell syntax (`$var = ...`, `$env:PATH`) — and crucially, **do not** wrap your command in another `powershell -Command "..."`. The outer PowerShell will expand your inner `$var` references to empty strings before the inner shell runs, producing a parser error on mangled syntax. If you need to invoke a nested script, drop it into a `.ps1` file and run it by path, use `-EncodedCommand <base64>`, or escape each `$` as `` `$ ``.
 
 ### Read-Only Sandbox
 

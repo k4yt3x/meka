@@ -11,6 +11,13 @@ Environment variables override config file values but are overridden by CLI flag
 | `AGSH_PROVIDER` | LLM provider name | `openai`, `claude` |
 | `AGSH_MODEL` | Model identifier | `gpt-4o`, `claude-sonnet-4-20250514` |
 | `AGSH_PERMISSION` | Default permission mode | `none`, `read`, `write` |
+| `AGSH_CONFIG_DIR` | Override the default config directory. Points at the `agsh` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform — `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. | `/tmp/agsh-test/agsh` |
+
+## MCP Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `AGSH_MCP_TOOL_TIMEOUT` | Per-call timeout for MCP tools, in milliseconds. Applies to every remote tool invocation; on timeout agsh cancels the request and returns an error to the model. | `600000` (600s) |
 
 ## Provider API Keys
 
