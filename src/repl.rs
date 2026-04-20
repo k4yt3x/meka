@@ -129,13 +129,13 @@ pub enum SlashCommand {
     },
 }
 
-pub enum ShellEvent {
+pub enum ReplEvent {
     UserInput(String),
     Command(SlashCommand),
     Exit,
 }
 
-/// Sent from the agent to the shell when a tool call needs user approval in
+/// Sent from the agent to the REPL when a tool call needs user approval in
 /// Ask mode.
 pub struct ToolApprovalRequest {
     pub tool_name: String,
@@ -146,10 +146,10 @@ pub struct ToolApprovalRequest {
 /// Messages sent from the agent to the REPL thread. Using a single channel
 /// instead of two separate ones allows the REPL to block on `recv()` rather
 /// than busy-polling with `try_recv()` + `sleep`.
-pub enum AgentToShellEvent {
+pub enum AgentToReplEvent {
     Done,
     ApprovalRequest(ToolApprovalRequest),
-    /// Server-driven elicitation — the shell prompts the user and replies
+    /// Server-driven elicitation — the REPL prompts the user and replies
     /// via the embedded responder channel.
     McpElicitation(crate::mcp::elicitation::ElicitationPrompt),
     /// Incremental progress update for a running MCP tool.
@@ -247,8 +247,8 @@ fn print_help() {
 pub fn run_repl(
     shared_permission: SharedPermission,
     show_path_in_prompt: bool,
-    input_sender: tokio::sync::mpsc::UnboundedSender<ShellEvent>,
-    agent_event_receiver: std::sync::mpsc::Receiver<AgentToShellEvent>,
+    input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
+    agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
 ) {
     let mut editor = build_reedline_editor();
     let prompt = AgshPrompt {
@@ -273,8 +273,8 @@ pub fn run_repl(
                 if trimmed.starts_with('/') {
                     match parse_slash_command(trimmed) {
                         Some(SlashCommand::Exit) => {
-                            if input_sender.send(ShellEvent::Exit).is_err() {
-                                tracing::trace!("shell event receiver already dropped");
+                            if input_sender.send(ReplEvent::Exit).is_err() {
+                                tracing::trace!("REPL event receiver already dropped");
                             }
                             break;
                         }
@@ -328,7 +328,7 @@ pub fn run_repl(
                             | SlashCommand::McpLogin { .. }
                             | SlashCommand::McpLogout { .. }),
                         ) => {
-                            if input_sender.send(ShellEvent::Command(command)).is_err() {
+                            if input_sender.send(ReplEvent::Command(command)).is_err() {
                                 break;
                             }
                             if !wait_for_agent(&agent_event_receiver) {
@@ -347,8 +347,8 @@ pub fn run_repl(
                 }
 
                 if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-                    if input_sender.send(ShellEvent::Exit).is_err() {
-                        tracing::trace!("shell event receiver already dropped");
+                    if input_sender.send(ReplEvent::Exit).is_err() {
+                        tracing::trace!("REPL event receiver already dropped");
                     }
                     break;
                 }
@@ -384,7 +384,7 @@ pub fn run_repl(
                 }
 
                 if input_sender
-                    .send(ShellEvent::UserInput(trimmed.to_string()))
+                    .send(ReplEvent::UserInput(trimmed.to_string()))
                     .is_err()
                 {
                     break;
@@ -398,15 +398,15 @@ pub fn run_repl(
                 continue;
             }
             Ok(Signal::CtrlD) => {
-                if input_sender.send(ShellEvent::Exit).is_err() {
-                    tracing::trace!("shell event receiver already dropped");
+                if input_sender.send(ReplEvent::Exit).is_err() {
+                    tracing::trace!("REPL event receiver already dropped");
                 }
                 break;
             }
             Err(error) => {
                 tracing::error!("readline error: {}", error);
-                if input_sender.send(ShellEvent::Exit).is_err() {
-                    tracing::trace!("shell event receiver already dropped");
+                if input_sender.send(ReplEvent::Exit).is_err() {
+                    tracing::trace!("REPL event receiver already dropped");
                 }
                 break;
             }
@@ -416,17 +416,17 @@ pub fn run_repl(
 
 /// Wait for the agent to signal it is done, while also handling tool approval
 /// requests that arrive in Ask mode.
-fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToShellEvent>) -> bool {
+fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEvent>) -> bool {
     loop {
         match agent_event_receiver.recv() {
-            Ok(AgentToShellEvent::Done) => return true,
-            Ok(AgentToShellEvent::ApprovalRequest(request)) => {
+            Ok(AgentToReplEvent::Done) => return true,
+            Ok(AgentToReplEvent::ApprovalRequest(request)) => {
                 handle_approval_request(&request);
             }
-            Ok(AgentToShellEvent::McpElicitation(prompt)) => {
+            Ok(AgentToReplEvent::McpElicitation(prompt)) => {
                 handle_elicitation_prompt(prompt);
             }
-            Ok(AgentToShellEvent::McpProgress(update)) => {
+            Ok(AgentToReplEvent::McpProgress(update)) => {
                 render_progress_update(&update);
             }
             Err(_) => return false,

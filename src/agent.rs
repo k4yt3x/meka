@@ -41,7 +41,7 @@ pub struct Agent {
     options: AgentOptions,
     todo_list: SharedTodoList,
     shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
-    approval_sender: Option<std::sync::mpsc::Sender<crate::shell::AgentToShellEvent>>,
+    approval_sender: Option<std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>>,
     last_input_tokens: std::sync::atomic::AtomicU64,
     /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by
     /// MCP tool adapters so oversized-output persistence uses
@@ -63,7 +63,7 @@ impl Agent {
         options: AgentOptions,
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
-        approval_sender: Option<std::sync::mpsc::Sender<crate::shell::AgentToShellEvent>>,
+        approval_sender: Option<std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>>,
     ) -> Self {
         Self {
             provider,
@@ -607,14 +607,14 @@ impl Agent {
         };
 
         let (response_sender, response_receiver) = std::sync::mpsc::sync_channel(1);
-        let request = crate::shell::ToolApprovalRequest {
+        let request = crate::repl::ToolApprovalRequest {
             tool_name: name.to_string(),
             tool_input: input.clone(),
             response_sender,
         };
 
         if sender
-            .send(crate::shell::AgentToShellEvent::ApprovalRequest(request))
+            .send(crate::repl::AgentToReplEvent::ApprovalRequest(request))
             .is_err()
         {
             return crate::tools::ToolOutput::text(

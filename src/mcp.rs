@@ -5,7 +5,7 @@
 
 pub mod cli;
 pub mod elicitation;
-pub mod env;
+pub mod expand;
 pub mod progress;
 pub mod resource_updates;
 pub mod sanitize;
@@ -497,7 +497,7 @@ impl McpClientManager {
             // Apply env-var substitution (`${VAR}` / `${VAR:-default}`) once,
             // up-front, so the rest of the pipeline sees only resolved values.
             let mut config = original_config.clone();
-            let missing = crate::mcp::env::expand_server_config(&mut config);
+            let missing = crate::mcp::expand::expand_server_config(&mut config);
             if !missing.is_empty() {
                 tracing::warn!(
                     "MCP server '{}': unresolved env vars {:?} left literal in config",

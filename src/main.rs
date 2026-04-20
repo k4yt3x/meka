@@ -3,7 +3,7 @@
 //!
 //! The binary wires together: a [`provider`] (Claude or OpenAI), a [`session`]
 //! store backed by SQLite, a [`tools`] registry, an MCP client manager, and a
-//! [`shell`] REPL. The [`agent`] module owns the per-turn loop that streams
+//! [`repl`] input loop. The [`agent`] module owns the per-turn loop that streams
 //! provider output and dispatches tool calls.
 
 mod agent;
@@ -16,10 +16,10 @@ mod mcp;
 mod permission;
 mod provider;
 mod render;
+mod repl;
 mod sandbox;
 mod session;
 mod setup;
-mod shell;
 mod skills;
 mod tools;
 
@@ -32,8 +32,8 @@ use crate::agent::{Agent, AgentOptions};
 use crate::config::ResolvedConfig;
 use crate::permission::SharedPermission;
 use crate::provider::{AuthCredential, create_provider};
+use crate::repl::ReplEvent;
 use crate::session::{SessionManager, TokenStore};
-use crate::shell::ShellEvent;
 use crate::tools::ToolRegistry;
 
 fn main() -> anyhow::Result<()> {
@@ -241,7 +241,7 @@ async fn create_agent_from_config(
     credential: AuthCredential,
     mcp_manager: Option<&Arc<mcp::McpClientManager>>,
     mcp_context: Option<&Arc<mcp::McpClientContext>>,
-    approval_sender: Option<std::sync::mpsc::Sender<shell::AgentToShellEvent>>,
+    approval_sender: Option<std::sync::mpsc::Sender<repl::AgentToReplEvent>>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
@@ -447,9 +447,9 @@ async fn run_interactive(
         reprint_last_message(&messages, config.render_mode);
     }
 
-    let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ShellEvent>();
+    let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ReplEvent>();
     let (agent_event_sender, agent_event_receiver) =
-        std::sync::mpsc::channel::<shell::AgentToShellEvent>();
+        std::sync::mpsc::channel::<repl::AgentToReplEvent>();
     let approval_sender = agent_event_sender.clone();
 
     // Wire progress/elicitation notifications from MCP handlers through the
@@ -457,18 +457,18 @@ async fn run_interactive(
     {
         let sender_for_progress = agent_event_sender.clone();
         mcp::progress::set_ui_sink(Box::new(move |update| {
-            let _ = sender_for_progress.send(shell::AgentToShellEvent::McpProgress(update));
+            let _ = sender_for_progress.send(repl::AgentToReplEvent::McpProgress(update));
         }));
         let sender_for_elicitation = agent_event_sender.clone();
         mcp::elicitation::set_shell_sink(Some(Box::new(move |prompt| {
-            let _ = sender_for_elicitation.send(shell::AgentToShellEvent::McpElicitation(prompt));
+            let _ = sender_for_elicitation.send(repl::AgentToReplEvent::McpElicitation(prompt));
         })));
     }
 
     let repl_permission = shared_permission.clone();
     let show_path_in_prompt = config.show_path_in_prompt;
     let repl_handle = tokio::task::spawn_blocking(move || {
-        shell::run_repl(
+        repl::run_repl(
             repl_permission,
             show_path_in_prompt,
             input_sender,
@@ -511,7 +511,7 @@ async fn run_interactive(
 
     while let Some(event) = input_receiver.recv().await {
         match event {
-            ShellEvent::UserInput(input) => {
+            ReplEvent::UserInput(input) => {
                 let cancellation = CancellationToken::new();
 
                 let cancellation_for_signal = cancellation.clone();
@@ -555,19 +555,19 @@ async fn run_interactive(
                 signal_handle.abort();
 
                 if agent_event_sender
-                    .send(shell::AgentToShellEvent::Done)
+                    .send(repl::AgentToReplEvent::Done)
                     .is_err()
                 {
                     break;
                 }
             }
-            ShellEvent::Command(command) => {
+            ReplEvent::Command(command) => {
                 match command {
-                    shell::SlashCommand::Session => match &session_id {
+                    repl::SlashCommand::Session => match &session_id {
                         Some(id) => render::render_session_id("Current session", &id.to_string()),
                         None => eprintln!("No active session yet."),
                     },
-                    shell::SlashCommand::Compact => {
+                    repl::SlashCommand::Compact => {
                         match agent.compact_session(&mut session_id, &mut messages).await {
                             Ok(()) => {
                                 render::render_hint("Session compacted.");
@@ -577,7 +577,7 @@ async fn run_interactive(
                             }
                         }
                     }
-                    shell::SlashCommand::Export => match &session_id {
+                    repl::SlashCommand::Export => match &session_id {
                         Some(id) => {
                             if let Err(error) = export_session(&session_manager, *id, None).await {
                                 render::render_error(&error);
@@ -585,12 +585,12 @@ async fn run_interactive(
                         }
                         None => eprintln!("No active session to export."),
                     },
-                    shell::SlashCommand::McpList => {
+                    repl::SlashCommand::McpList => {
                         if let Err(error) = mcp::cli::run_list(&config.mcp_servers).await {
                             render::render_error(&error);
                         }
                     }
-                    shell::SlashCommand::McpReconnect { server } => {
+                    repl::SlashCommand::McpReconnect { server } => {
                         if let Err(error) =
                             mcp::cli::run_reconnect(&config.mcp_servers, &token_store, &server)
                                 .await
@@ -598,21 +598,21 @@ async fn run_interactive(
                             render::render_error(&error);
                         }
                     }
-                    shell::SlashCommand::McpLogin { server } => {
+                    repl::SlashCommand::McpLogin { server } => {
                         if let Err(error) =
                             mcp::cli::run_login(&config.mcp_servers, &token_store, &server).await
                         {
                             render::render_error(&error);
                         }
                     }
-                    shell::SlashCommand::McpLogout { server } => {
+                    repl::SlashCommand::McpLogout { server } => {
                         if let Err(error) =
                             mcp::cli::run_logout(&config.mcp_servers, &token_store, &server).await
                         {
                             render::render_error(&error);
                         }
                     }
-                    shell::SlashCommand::McpPrompt {
+                    repl::SlashCommand::McpPrompt {
                         server,
                         prompt: prompt_name,
                         args,
@@ -703,13 +703,13 @@ async fn run_interactive(
                 }
 
                 if agent_event_sender
-                    .send(shell::AgentToShellEvent::Done)
+                    .send(repl::AgentToReplEvent::Done)
                     .is_err()
                 {
                     break;
                 }
             }
-            ShellEvent::Exit => {
+            ReplEvent::Exit => {
                 break;
             }
         }
