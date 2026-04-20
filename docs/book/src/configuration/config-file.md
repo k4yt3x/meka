@@ -177,11 +177,26 @@ Whether to add a blank line after the prompt (before the agent response).
 
 Default: `true`
 
+### `display.input_style`
+
+Visual style applied to text typed into the REPL prompt. Makes submitted prompts easy to spot when scrolling back through a long session — reedline paints the buffer with this style on every repaint, including the final paint before the newline, so the styling lands in the terminal's scrollback alongside the literal text.
+
+Accepted values:
+- `default` (or unset): bold white-ish foreground on a slate-blue background, rendered in truecolor RGB so it looks the same across terminal themes.
+- `none`: disable styling entirely.
+- `bold`, `dim`, `italic`, `underline`: single attribute, no colour change.
+- A colour name (`black`, `red`, `green`, `yellow`, `blue`, `magenta` / `purple`, `cyan`, `white`): set only the foreground, mapped to the terminal's palette.
+
+Unknown values warn at startup and fall back to `default`.
+
+Default: the banner preset described above.
+
 ```toml
 [display]
 show_path_in_prompt = false
 newline_before_prompt = false
 newline_after_prompt = false
+input_style = "none"    # or "cyan", "bold", "dim", etc.
 ```
 
 ## `[web]`

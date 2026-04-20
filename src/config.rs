@@ -139,6 +139,10 @@ pub struct DisplayConfig {
     pub show_session_id_on_exit: Option<bool>,
     pub show_path_in_prompt: Option<bool>,
     pub render_mode: Option<RenderMode>,
+    /// Style applied to the REPL input buffer so submitted prompts stand
+    /// out in scrollback. Parsed by [`parse_input_style`]. Accepts
+    /// `bold`, `dim`, `none`, or a colour name (`cyan`, `yellow`, …).
+    pub input_style: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -210,6 +214,51 @@ pub struct ResolvedConfig {
     pub builtin_allowed_tools: Option<Vec<String>>,
     pub builtin_disabled_tools: Vec<String>,
     pub builtin_tool_permissions: HashMap<String, Permission>,
+    pub input_style: nu_ansi_term::Style,
+}
+
+/// Default input style: bold, white-ish foreground, slate-blue background.
+/// Uses truecolor RGB (not palette indices or named colours) so the visual
+/// is consistent across terminals that remap the standard 16 colours to
+/// match their theme.
+pub fn default_input_style() -> nu_ansi_term::Style {
+    use nu_ansi_term::{Color, Style};
+    Style::new()
+        .bold()
+        .fg(Color::Rgb(240, 240, 240))
+        .on(Color::Rgb(55, 75, 110))
+}
+
+/// Parse a `[display].input_style` value. `"default"` (or unset) yields
+/// [`default_input_style`]; `"none"` yields no styling; simple keywords
+/// pick a single colour or attribute. Unknown keywords warn and fall
+/// back to the default so a typo doesn't lose the session to a panic.
+pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
+    use nu_ansi_term::{Color, Style};
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "default" => default_input_style(),
+        "none" => Style::default(),
+        "bold" => Style::new().bold(),
+        "dim" => Style::new().dimmed(),
+        "italic" => Style::new().italic(),
+        "underline" => Style::new().underline(),
+        "black" => Style::new().fg(Color::Black),
+        "red" => Style::new().fg(Color::Red),
+        "green" => Style::new().fg(Color::Green),
+        "yellow" => Style::new().fg(Color::Yellow),
+        "blue" => Style::new().fg(Color::Blue),
+        "magenta" | "purple" => Style::new().fg(Color::Magenta),
+        "cyan" => Style::new().fg(Color::Cyan),
+        "white" => Style::new().fg(Color::White),
+        other => {
+            tracing::warn!(
+                "ignoring unknown [display].input_style '{}' (expected \
+                 default, none, bold, dim, italic, underline, or a colour name)",
+                other
+            );
+            default_input_style()
+        }
+    }
 }
 
 /// Returns the agsh config directory (the directory that contains
@@ -489,6 +538,11 @@ impl ResolvedConfig {
             builtin_allowed_tools,
             builtin_disabled_tools,
             builtin_tool_permissions,
+            input_style: file_display
+                .input_style
+                .as_deref()
+                .map(parse_input_style)
+                .unwrap_or_else(default_input_style),
         }
     }
 
@@ -867,6 +921,39 @@ auth_token = "bearer-token"
         let servers = config.mcp.unwrap().servers.unwrap();
         assert!(servers[0].auth.is_none());
         assert_eq!(servers[0].auth_token.as_deref(), Some("bearer-token"));
+    }
+
+    #[test]
+    fn test_parse_input_style_known_values() {
+        use nu_ansi_term::{Color, Style};
+        assert_eq!(parse_input_style("bold"), Style::new().bold());
+        assert_eq!(parse_input_style("BOLD"), Style::new().bold());
+        assert_eq!(parse_input_style("dim"), Style::new().dimmed());
+        assert_eq!(parse_input_style("cyan"), Style::new().fg(Color::Cyan));
+        assert_eq!(parse_input_style("purple"), Style::new().fg(Color::Magenta));
+    }
+
+    #[test]
+    fn test_parse_input_style_none_is_plain() {
+        use nu_ansi_term::Style;
+        assert_eq!(parse_input_style("none"), Style::default());
+    }
+
+    #[test]
+    fn test_parse_input_style_default_and_empty_yield_preset() {
+        let preset = default_input_style();
+        assert_eq!(parse_input_style(""), preset);
+        assert_eq!(parse_input_style("default"), preset);
+        assert!(preset.is_bold);
+        assert!(preset.foreground.is_some(), "default must set foreground");
+        assert!(preset.background.is_some(), "default must set background");
+    }
+
+    #[test]
+    fn test_parse_input_style_unknown_falls_back_to_default() {
+        // Invalid keywords warn but must not panic — fall back to the
+        // same preset used when the key is unset.
+        assert_eq!(parse_input_style("superbold"), default_input_style());
     }
 
     #[test]

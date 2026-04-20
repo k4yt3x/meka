@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `[tools]` config: `allowed_tools`, `disabled_tools`, and `tool_permissions` filters for built-in tools.
 - `agsh tools list` prints every built-in tool with its effective permission and enabled state.
+- `[display].input_style` styles REPL input so submitted prompts stand out in scrollback.
 
 ## [0.13.1] - 2026-04-20
 

@@ -480,10 +480,12 @@ async fn run_interactive(
 
     let repl_permission = shared_permission.clone();
     let show_path_in_prompt = config.show_path_in_prompt;
+    let input_style = config.input_style;
     let repl_handle = tokio::task::spawn_blocking(move || {
         repl::run_repl(
             repl_permission,
             show_path_in_prompt,
+            input_style,
             input_sender,
             agent_event_receiver,
         );

@@ -7,11 +7,28 @@ use std::path::{Path, PathBuf};
 
 use crossterm::style::{Color, Stylize};
 use reedline::{
-    EditCommand, Emacs, KeyCode, KeyModifiers, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal, default_emacs_keybindings,
+    EditCommand, Emacs, Highlighter, KeyCode, KeyModifiers, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal, StyledText,
+    default_emacs_keybindings,
 };
 
 use crate::permission::SharedPermission;
+
+/// Reedline highlighter that paints the entire input buffer with a single
+/// style. The final paint reedline emits on submit is what lands in
+/// scrollback, so this is what visually separates user prompts from
+/// assistant output.
+struct UserInputHighlighter {
+    style: nu_ansi_term::Style,
+}
+
+impl Highlighter for UserInputHighlighter {
+    fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
+        let mut text = StyledText::new();
+        text.push((self.style, line.to_string()));
+        text
+    }
+}
 
 const CYCLE_PERMISSION_SENTINEL: &str = "__cycle_permission__";
 
@@ -70,7 +87,7 @@ impl Prompt for AgshPrompt {
     }
 }
 
-fn build_reedline_editor() -> Reedline {
+fn build_reedline_editor(input_style: nu_ansi_term::Style) -> Reedline {
     let mut keybindings = default_emacs_keybindings();
 
     keybindings.add_binding(
@@ -94,6 +111,7 @@ fn build_reedline_editor() -> Reedline {
     let emacs_mode = Emacs::new(keybindings);
     Reedline::create()
         .with_edit_mode(Box::new(emacs_mode))
+        .with_highlighter(Box::new(UserInputHighlighter { style: input_style }))
         .use_bracketed_paste(true)
 }
 
@@ -242,10 +260,11 @@ fn print_help() {
 pub fn run_repl(
     shared_permission: SharedPermission,
     show_path_in_prompt: bool,
+    input_style: nu_ansi_term::Style,
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
 ) {
-    let mut editor = build_reedline_editor();
+    let mut editor = build_reedline_editor(input_style);
     let prompt = AgshPrompt {
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
@@ -650,6 +669,31 @@ fn handle_cd(target: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_user_input_highlighter_default_preset_preserves_literal() {
+        let highlighter = UserInputHighlighter {
+            style: crate::config::default_input_style(),
+        };
+        let rendered = highlighter.highlight("hello world", 5).render_simple();
+        assert!(
+            rendered.contains("hello world"),
+            "literal input must survive: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[") && rendered.contains('m'),
+            "at least one SGR escape must be emitted: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_user_input_highlighter_none_emits_no_escape() {
+        let highlighter = UserInputHighlighter {
+            style: nu_ansi_term::Style::default(),
+        };
+        let rendered = highlighter.highlight("hello", 0).render_simple();
+        assert_eq!(rendered, "hello");
+    }
 
     #[test]
     fn test_parse_slash_command_exit() {
