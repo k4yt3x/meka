@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `AGSH_CONFIG_DIR` env var overrides the default config location; the only isolation knob that works on macOS/Windows too.
+
+### Fixed
+
+- macOS/Windows CI tests no longer read the host user's real `config.toml` — they now isolate via `AGSH_CONFIG_DIR`.
+- `cargo doc -D warnings` cleared of broken intra-doc links and bare-URL lints.
+
+## [0.13.0] - 2026-04-19
+
+### Added
+
 - System prompt now lists every registered tool with its required permission level inline.
 - Per-turn user message carries a `[Permission context]` block naming the current level.
 - Per-tool MCP permission chain: `tool_permissions` > `permission` > `readOnlyHint` > `default_permission`.
@@ -48,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `execute_command` description names the shell per platform and warns against double-PowerShell wrapping.
 - Per-turn `[Permission context]` is a constant two-line block; no longer enumerates blocked tools.
 - System prompt tool catalogue is leaner: name + permission for active tools, short summaries for deferred.
 - System prompt and `body["tools"]` no longer depend on permission level; toggles keep the cache warm.

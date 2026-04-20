@@ -23,8 +23,15 @@ impl Tool for ExecuteCommandTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "execute_command".to_string(),
-            description: "Execute a shell command and return its output. In read mode, \
-                the command runs in a read-only sandbox where filesystem writes are blocked."
+            description: "Execute a shell command and return its output. On Unix the \
+                command runs via `sh -c <command>` — POSIX `$VAR` expansion applies; \
+                quote with single quotes or `\\$` to pass a literal `$`. On Windows \
+                the command runs via `powershell.exe -Command <command>` — use \
+                PowerShell syntax directly (e.g. `$var = ...`, `$env:PATH`); do NOT \
+                wrap with another `powershell -Command` or the outer PowerShell will \
+                expand your inner `$var` references to empty strings. In read mode \
+                the command runs in a read-only sandbox where filesystem writes are \
+                blocked."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

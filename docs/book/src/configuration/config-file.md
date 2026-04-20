@@ -10,6 +10,8 @@ agsh looks for a TOML configuration file at a platform-specific location:
 
 The config file is optional. If it does not exist, agsh silently skips it.
 
+Set the `AGSH_CONFIG_DIR` environment variable to override the default location entirely — the value points at the `agsh` directory itself (contains `config.toml` and `skills/`). Useful for tests, portable installs, and isolating a per-project config from your global one.
+
 ## Format
 
 ```toml

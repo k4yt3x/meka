@@ -69,7 +69,7 @@ pub struct McpServerConfig {
     /// non-empty, only these tools from this server are registered.
     pub allowed_tools: Option<Vec<String>>,
     /// Optional block-list of raw tool names. Applied after
-    /// [`allowed_tools`] — tools listed here are never registered.
+    /// [`Self::allowed_tools`] — tools listed here are never registered.
     pub disabled_tools: Option<Vec<String>>,
     /// Optional per-tool permission overrides keyed by raw tool name.
     /// Beats the server-level `permission` and the server's
@@ -197,8 +197,22 @@ pub struct ResolvedConfig {
     pub user_instructions: Option<String>,
 }
 
+/// Returns the agsh config directory (the directory that contains
+/// `config.toml` and `skills/`). Honours the `AGSH_CONFIG_DIR` env var
+/// — used by tests for per-run isolation and by power users who want
+/// a non-standard location — before falling back to the platform-native
+/// `dirs::config_dir().join("agsh")`. The env-var route is the only
+/// reliable way to isolate state on macOS and Windows, where
+/// `dirs::config_dir()` doesn't honour `XDG_CONFIG_HOME`.
+pub fn agsh_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("AGSH_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    dirs::config_dir().map(|directory| directory.join("agsh"))
+}
+
 pub(crate) fn config_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("agsh").join("config.toml"))
+    agsh_config_dir().map(|dir| dir.join("config.toml"))
 }
 
 pub(crate) fn config_file_exists() -> bool {

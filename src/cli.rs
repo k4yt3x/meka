@@ -72,6 +72,11 @@ pub enum McpAction {
     ///   agsh mcp add notion https://mcp.notion.com/mcp
     ///   agsh mcp add api https://api.example.com/mcp --auth-token $API_TOKEN
     ///   agsh mcp add notion https://mcp.notion.com/mcp --auth oauth
+    // `rustdoc::bare_urls` normally turns URLs like https://example into
+    // auto-links, but these doc lines are ALSO the text clap prints for
+    // `agsh mcp add --help`. Angle-brackets would leak into the CLI
+    // help. Allow bare URLs just on this variant.
+    #[allow(rustdoc::bare_urls)]
     Add {
         /// Unique server name (alphanumerics, `-`, `_` only)
         name: String,

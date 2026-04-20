@@ -728,8 +728,8 @@ impl McpClientManager {
     /// names are available. Permission is resolved through the normal
     /// 5-step chain with the winning step recorded on each entry.
     ///
-    /// Differs from [`discover_tools_for_server`] by (a) not filtering
-    /// by allow/block lists, (b) not registering adapters, and
+    /// Differs from [`Self::discover_tools_for_server`] by (a) not
+    /// filtering by allow/block lists, (b) not registering adapters, and
     /// (c) capturing the resolution source for display.
     pub async fn list_advertised_tools(&self, server_name: &str) -> Result<Vec<AdvertisedTool>> {
         let Some(entry) = self.servers.get(server_name) else {
@@ -1066,8 +1066,8 @@ fn run_headers_helper(
     let script_path = std::path::Path::new(script);
     let resolved: std::path::PathBuf = if script_path.is_absolute() || script_path.exists() {
         script_path.to_path_buf()
-    } else if let Some(config_dir) = dirs::config_dir() {
-        let candidate = config_dir.join("agsh").join(script);
+    } else if let Some(config_dir) = crate::config::agsh_config_dir() {
+        let candidate = config_dir.join(script);
         if candidate.exists() {
             candidate
         } else {

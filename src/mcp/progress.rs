@@ -105,9 +105,9 @@ impl Drop for ProgressGuard {
     }
 }
 
-/// Called from [`crate::mcp::AgshClientHandler::on_progress`]. Looks up the
-/// registered context and forwards an update to the UI sink (if any) plus a
-/// tracing log at info level.
+/// Called from `AgshClientHandler::on_progress` (the `ClientHandler` trait
+/// impl in `src/mcp.rs`). Looks up the registered context and forwards an
+/// update to the UI sink (if any) plus a tracing log at info level.
 pub fn dispatch(params: ProgressNotificationParam) {
     let key = match &params.progress_token.0 {
         NumberOrString::String(s) => s.to_string(),

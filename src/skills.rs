@@ -62,7 +62,7 @@ where
 }
 
 pub fn skills_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|directory| directory.join("agsh").join("skills"))
+    crate::config::agsh_config_dir().map(|dir| dir.join("skills"))
 }
 
 /// Discover all valid skills in the user's skills directory. Returns an empty

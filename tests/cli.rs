@@ -56,15 +56,19 @@ fn unknown_subcommand_exits_nonzero() {
     );
 }
 
-/// Run `agsh` with an isolated config + data directory, so host state
-/// (e.g. `~/.config/agsh/config.toml`) doesn't leak into the test and
-/// the test's writes don't spill out. All four env vars (`XDG_CONFIG_HOME`,
-/// `HOME`, `XDG_DATA_HOME`, `AGSH_CONFIG_DIR`-equivalent on future builds)
-/// are pointed at the provided tempdir so `dirs::{config,data}_dir()` resolve
-/// deterministically on every OS.
+/// Run `agsh` with an isolated config + data directory so host state
+/// (e.g. `~/.config/agsh/config.toml`) doesn't leak in, and the test's
+/// writes don't spill out. Sets `AGSH_CONFIG_DIR` (the only env var that
+/// works on every platform — `dirs::config_dir()` ignores
+/// `XDG_CONFIG_HOME` on macOS/Windows). The XDG + HOME env vars are
+/// also set so the session DB lands under the tempdir on Linux; the
+/// session code uses `dirs::data_dir()` which still can't be isolated
+/// on macOS/Windows from the test harness, but none of the CLI tests
+/// currently exercise the session DB end-to-end.
 fn run_isolated(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     agsh()
         .args(args)
+        .env("AGSH_CONFIG_DIR", dir.join("agsh"))
         .env("XDG_CONFIG_HOME", dir)
         .env("HOME", dir)
         .env("XDG_DATA_HOME", dir.join("data"))
@@ -75,17 +79,10 @@ fn run_isolated(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
 #[test]
 fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
     // Isolate the config dir so the host's real `~/.config/agsh` doesn't
-    // leak into the test. Both XDG_CONFIG_HOME and HOME are pointed at
-    // the tempdir so `dirs::config_dir()` resolves to it on every OS.
+    // leak into the test. `AGSH_CONFIG_DIR` is the only env var that
+    // works on every platform (see `run_isolated` for details).
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = agsh()
-        .args(["mcp", "list"])
-        .env("XDG_CONFIG_HOME", dir.path())
-        .env("HOME", dir.path())
-        // Session DB path also defaults to $HOME; keep it under the tempdir.
-        .env("XDG_DATA_HOME", dir.path().join("data"))
-        .output()
-        .expect("failed to spawn agsh mcp list");
+    let output = run_isolated(dir.path(), &["mcp", "list"]);
     assert!(
         output.status.success(),
         "agsh mcp list exited non-zero: {:?}\nstderr: {}",
@@ -236,6 +233,7 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
         // visible — we use it as the "auto-login has started" signal
         // before sending SIGINT.
         .args(["-v", "mcp", "add", "notion", "https://mcp.notion.com/mcp"])
+        .env("AGSH_CONFIG_DIR", dir.path().join("agsh"))
         .env("XDG_CONFIG_HOME", dir.path())
         .env("HOME", dir.path())
         .env("XDG_DATA_HOME", dir.path().join("data"))
