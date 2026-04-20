@@ -119,7 +119,7 @@ pub async fn run_reconnect(
     .await?;
 
     if manager.server_names().contains(&config.name) {
-        println!("ok: connected to '{}'", config.name);
+        tracing::info!("connected to '{}'", config.name);
         manager.shutdown().await;
         Ok(())
     } else {
@@ -152,7 +152,7 @@ pub async fn run_logout(
 
     token_store.clear_mcp_credentials(name).await?;
     token_store.clear_auth_probe(name).await?;
-    println!("ok: cleared credentials for '{}'", name);
+    tracing::info!("cleared credentials for '{}'", name);
     Ok(())
 }
 
@@ -187,7 +187,7 @@ pub async fn run_login(
                     scopes: None,
                     redirect_port: None,
                 });
-                eprintln!(
+                tracing::info!(
                     "no [auth] block for '{}' — assuming OAuth authorization_code.",
                     name
                 );
@@ -223,17 +223,13 @@ pub async fn run_login(
         // the config back, just surface the issue so the user can decide
         // whether to hand-edit.
         tracing::warn!(
-            "authorised '{}' but failed to persist [auth] block: {}",
+            "'{}' is authorised, but failed to write 'auth = oauth' back to config.toml: {}",
             name,
             error
         );
-        eprintln!(
-            "note: '{}' is authorised, but failed to write 'auth = oauth' back to config.toml: {}",
-            name, error
-        );
     }
 
-    println!("ok: authorized '{}'", config.name);
+    tracing::info!("authorized '{}'", config.name);
     Ok(())
 }
 
@@ -424,7 +420,7 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
 
     crate::config::write_config_atomic(&path, &document.to_string())
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
-    println!("ok: added '{}' to {}", resolved.name, path.display());
+    tracing::info!("added '{}' to {}", resolved.name, path.display());
 
     // Decide whether to probe and/or auto-login. Stdio has no auth
     // surface; HTTP servers with a pre-configured static bearer don't
@@ -452,17 +448,20 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
 
     if let Err(error) = result {
         match &error {
-            AgshError::Interrupted => eprintln!("interrupted — rolling back '{}'.", resolved.name),
-            other => eprintln!(
+            AgshError::Interrupted => {
+                tracing::warn!("interrupted — rolling back '{}'.", resolved.name);
+            }
+            other => tracing::warn!(
                 "authorisation failed for '{}': {} — rolling back the config entry.",
-                resolved.name, other
+                resolved.name,
+                other
             ),
         }
         if let Err(purge_err) = purge_server(&resolved.name, token_store).await {
-            tracing::warn!("rollback of '{}' also failed: {}", resolved.name, purge_err);
-            eprintln!(
+            tracing::warn!(
                 "rollback of '{}' also failed: {} — you may need to edit config.toml by hand.",
-                resolved.name, purge_err
+                resolved.name,
+                purge_err
             );
         }
         return Err(error);
@@ -495,7 +494,7 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
         return Ok(());
     }
     if resolved.no_login {
-        println!(
+        tracing::info!(
             "skipping auto-login (--no-login). Run `agsh mcp login {}` when ready.",
             resolved.name
         );
@@ -505,7 +504,7 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
     // Synthesised server config for the login — equivalent to parsing
     // the entry we just wrote but without round-tripping through disk.
     let server_config = resolved_to_server_config(resolved);
-    println!(
+    tracing::info!(
         "running OAuth authorisation for '{}' (use --no-login to skip).",
         resolved.name
     );
@@ -535,25 +534,26 @@ async fn probe_and_announce(name: &str, url: &str) -> ProbeOutcome {
 
     match crate::mcp::probe_http_auth(url).await {
         McpAuthProbe::Open => {
-            println!("probe: server reachable and does not require auth.");
+            tracing::info!("probe: '{}' reachable and does not require auth.", name);
             ProbeOutcome::Open
         }
         McpAuthProbe::AuthRequired { resource_metadata } => {
-            println!("probe: server requires OAuth.");
+            tracing::info!("probe: '{}' requires OAuth.", name);
             if let Some(meta) = resource_metadata {
                 tracing::debug!("resource_metadata advertised by '{}': {}", name, meta);
             }
             ProbeOutcome::AuthRequired
         }
         McpAuthProbe::Unexpected { status } => {
-            println!(
-                "probe: server answered HTTP {} — couldn't infer auth state.",
+            tracing::warn!(
+                "probe: '{}' answered HTTP {} — couldn't infer auth state.",
+                name,
                 status
             );
             ProbeOutcome::Inconclusive
         }
         McpAuthProbe::Unreachable { message } => {
-            println!("probe: couldn't reach '{}' ({}).", url, message);
+            tracing::warn!("probe: couldn't reach '{}' ({}).", url, message);
             ProbeOutcome::Inconclusive
         }
     }
@@ -1057,7 +1057,7 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path:
 /// best-effort revoke OAuth tokens at the provider, clear local state.
 pub async fn run_remove(name: &str, token_store: &TokenStore) -> Result<()> {
     let path = purge_server(name, token_store).await?;
-    println!("ok: removed '{}' from {}", name, path.display());
+    tracing::info!("removed '{}' from {}", name, path.display());
     Ok(())
 }
 

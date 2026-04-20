@@ -51,8 +51,32 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let runtime = tokio::runtime::Runtime::new()?;
+    let result = run_on_runtime(&runtime, cli);
+    // Detach any lingering blocking threads instead of joining them on
+    // drop. `tokio::io::stdin()` (used by the OAuth paste fallback)
+    // spawns a blocking worker that sits on a `read()` syscall until
+    // stdin has bytes or EOF; when the user Ctrl-Cs during the wait,
+    // the future is dropped but that worker can't be cancelled from
+    // the outside. Without this the default `Runtime::drop` joins that
+    // thread and hangs the process after a clean rollback.
+    runtime.shutdown_background();
 
-    // Handle subcommands that don't need full config resolution
+    // User-initiated interrupts are already acknowledged by the rollback
+    // warn log ("interrupted — rolling back …") and the shell typically
+    // echoes `^C` itself; anyhow's default "Error: agent interrupted by
+    // user" on top of that is just noise. Exit with the conventional
+    // SIGINT code (128 + 2) silently instead.
+    if let Err(error) = &result
+        && let Some(crate::error::AgshError::Interrupted) =
+            error.downcast_ref::<crate::error::AgshError>()
+    {
+        std::process::exit(130);
+    }
+    result
+}
+
+fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::Result<()> {
+    // Handle subcommands that don't need full config resolution.
     if cli.command.is_some() {
         let cli_ref = &cli;
         return runtime.block_on(async move {
@@ -77,7 +101,7 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Auto-detect first launch: no config file and no env-based provider
+    // Auto-detect first launch: no config file and no env-based provider.
     if !config::config_file_exists() && std::env::var("AGSH_PROVIDER").is_err() {
         runtime.block_on(async {
             let session_manager = SessionManager::open(None).await?;
@@ -748,12 +772,12 @@ async fn export_session(
         }
         Some(path) => {
             std::fs::write(path, &markdown)?;
-            eprintln!("Exported to {}", path);
+            tracing::info!("exported session to {}", path);
         }
         None => {
             let path = format!("session-{}.md", session_id);
             std::fs::write(&path, &markdown)?;
-            eprintln!("Exported to {}", path);
+            tracing::info!("exported session to {}", path);
         }
     }
 
@@ -854,7 +878,7 @@ async fn delete_sessions(
 ) -> anyhow::Result<()> {
     if all {
         let deleted = session_manager.delete_all_sessions().await?;
-        eprintln!("Deleted {} session(s).", deleted);
+        tracing::info!("deleted {} session(s)", deleted);
         return Ok(());
     }
 
@@ -867,11 +891,13 @@ async fn delete_sessions(
         if session_manager.delete_session(*session_id).await? {
             deleted += 1;
         } else {
+            // User-facing error: they asked to delete a specific ID and
+            // we couldn't find it, so stderr (not silent) is right.
             eprintln!("Session not found: {}", session_id);
         }
     }
 
-    eprintln!("Deleted {} session(s).", deleted);
+    tracing::info!("deleted {} session(s)", deleted);
     Ok(())
 }
 
@@ -1035,7 +1061,7 @@ async fn resolve_session_resume(
         match session_manager.last_session_id().await? {
             Some(id) => {
                 let lock = session_manager.lock_session(id)?;
-                render::render_session_id("Resuming session", &id.to_string());
+                tracing::info!("resuming session: {}", id);
                 let messages = load_session_messages(session_manager, id).await?;
                 Ok((Some(id), messages, Some(lock)))
             }
@@ -1049,7 +1075,7 @@ async fn resolve_session_resume(
             anyhow::bail!("session not found: {}", id);
         }
         let lock = session_manager.lock_session(id)?;
-        render::render_session_id("Resuming session", &id.to_string());
+        tracing::info!("resuming session: {}", id);
         let messages = load_session_messages(session_manager, id).await?;
         Ok((Some(id), messages, Some(lock)))
     }

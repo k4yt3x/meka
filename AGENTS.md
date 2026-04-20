@@ -30,6 +30,41 @@ This file provides guidance to AI agents when working with code in this reposito
     });
     ```
 
+## Logging and output
+
+`agsh` maintains a strict split between *CLI output* and *tracing logs*. The test is simple: **if the user doesn't have to see this to use the command, it belongs in `tracing`**. Default log level is `warn`, so `info!` / `debug!` are silent unless the user passes `-v`, `-vv`, or `RUST_LOG`. Aim for "quiet on success" — the Unix convention.
+
+**Use `println!` / `eprintln!` only when the output is unavoidable:**
+
+- **Requested data** — what the user literally ran the command to get: the `agsh mcp list` table, `agsh mcp get` details, `agsh list` session rows, `agsh export` markdown on stdout, `print_help`.
+- **Actionable content the user must copy/type/visit** — OAuth authorisation URLs, callback paste prompts, elicitation form fields, setup-wizard prompts.
+- **REPL command output** — `/permission`, `/session`, `/cd` errors, `!cmd` status, tool-use indicators, streaming assistant markdown, thinking blocks, `Unknown command` feedback.
+- **Hard errors** propagated back to the user with context (`render::render_error`, clap-side validation errors).
+- Use `stdout` (`println!`) for parseable command output a script might consume; `stderr` (`eprintln!`) for prompts, live UI, and contract errors.
+
+**Use `tracing` for everything else:**
+
+- `error!` — unrecoverable failure about to propagate up as an `AgshError`. Rare; the `?` operator usually already carries the info.
+- `warn!` — recoverable fallback the user should know about by default: "failed to revoke token, continuing", "authorisation failed — rolling back", "probe: couldn't reach X". Also the right level for rollback and cleanup messages.
+- `info!` — lifecycle signposts users *can* see with `-v`: "added X to config.toml", "authorized X", "connected to MCP server Y", "resuming session UUID", "auto-compacting", "exported session to path", `probe:` hints. This is the "quiet success" level — no output at default verbosity.
+- `debug!` — diagnostics for module-level troubleshooting: "browser launch failed" (expected on headless), "reconnect attempt 2", raw callback parse details, `resource_metadata` URLs.
+
+**Specifically, these informational CLI signposts are logs, not prints:**
+
+- `ok:` confirmations (`added`, `removed`, `connected`, `authorized`, `cleared credentials`, `configuration saved`). Exit code carries success; don't reprint the command the user just ran.
+- Probe results, running-OAuth banners, auto-compact hints, "resuming session: UUID", "exported to path".
+- Rollback explanations ("interrupted — rolling back X", "authorisation failed — rolling back") — these are `warn!`, not print, because they are recoverable diagnostic information.
+
+**Never mix the two:**
+
+- Don't `eprintln!` "failed to open browser" on a fallback path when the URL is already printed — users can copy it; the warning is noise. Use `tracing::debug!`.
+- Don't `tracing::info!` a command's primary output — users would need `-v` to see what they asked for.
+- Don't `tracing::warn!` something that isn't a warning. Lifecycle signposts are `info!`.
+
+**Drop redundant preambles.** If you're about to print a progress line immediately followed by the actionable info, cut the preamble. "Opening browser..." then the URL is noise; just print the URL.
+
+**Opt-in visibility.** When a config flag like `show_session_id_on_create` explicitly requests visible output, honour it via `println!` / `eprintln!` — don't silently demote it to `info!` and force `-v`.
+
 ## Build & Formatting Commands
 
 - Always run `cargo fmt` and `cargo sort -w` after editing code

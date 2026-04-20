@@ -1456,7 +1456,7 @@ async fn authenticate_oauth_authorization_code(
     // Browser-launch failures are expected on headless hosts (SSH, CI,
     // containers), so they stay at `debug` — the user has the URL and
     // can copy it either way.
-    eprintln!("\nopen this URL in your browser to authorize:\n\n{auth_url}\n");
+    eprintln!("open this URL in your browser to authorize:\n\n{auth_url}\n");
     if let Err(error) = open::that(&auth_url) {
         tracing::debug!("open::that failed to launch browser: {}", error);
     }

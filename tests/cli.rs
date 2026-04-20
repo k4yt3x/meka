@@ -186,11 +186,14 @@ fn mcp_add_http_without_url_fails() {
 fn mcp_add_no_login_prints_skip_hint_when_probe_says_auth_required() {
     // Probing the real Notion endpoint classifies as AuthRequired;
     // `--no-login` must surface the "run `agsh mcp login` later" hint
-    // rather than entering the OAuth flow.
+    // rather than entering the OAuth flow. The hint goes to tracing at
+    // info level — default filter is `warn`, so we pass `-v` to lift
+    // the floor and read the message from stderr.
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_isolated(
         dir.path(),
         &[
+            "-v",
             "mcp",
             "add",
             "notion",
@@ -203,16 +206,16 @@ fn mcp_add_no_login_prints_skip_hint_when_probe_says_auth_required() {
         "mcp add should succeed even when probe says auth required: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("skipping auto-login"),
-        "expected skip hint in stdout, got: {}",
-        stdout
+        stderr.contains("skipping auto-login"),
+        "expected skip hint in stderr, got: {}",
+        stderr
     );
     assert!(
-        stdout.contains("agsh mcp login notion"),
-        "expected follow-up command in stdout, got: {}",
-        stdout
+        stderr.contains("agsh mcp login notion"),
+        "expected follow-up command in stderr, got: {}",
+        stderr
     );
 }
 
@@ -229,7 +232,10 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut child = agsh()
-        .args(["mcp", "add", "notion", "https://mcp.notion.com/mcp"])
+        // `-v` so the `running OAuth authorisation` info log is
+        // visible — we use it as the "auto-login has started" signal
+        // before sending SIGINT.
+        .args(["-v", "mcp", "add", "notion", "https://mcp.notion.com/mcp"])
         .env("XDG_CONFIG_HOME", dir.path())
         .env("HOME", dir.path())
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -243,25 +249,33 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
 
     // Wait until we've seen the "running OAuth authorisation" line so
     // we know the child is past the write + probe and is inside the
-    // SIGINT-covered post-persist section.
-    let stdout = child.stdout.take().expect("child stdout");
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    // SIGINT-covered post-persist section. The signpost now lives on
+    // stderr (via tracing), not stdout. We drain into `captured` so
+    // the subsequent rollback log lines are preserved across the
+    // SIGINT for the final assertion.
+    let stderr = child.stderr.take().expect("child stderr");
+    let mut reader = BufReader::new(stderr);
+    let mut captured = String::new();
     let mut saw_running_line = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
-        line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if line.contains("running OAuth authorisation") {
-            saw_running_line = true;
-            break;
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                captured.push_str(&line);
+                if line.contains("running OAuth authorisation") {
+                    saw_running_line = true;
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
     assert!(
         saw_running_line,
-        "child never reached the auto-login stage within 15s"
+        "child never reached the auto-login stage within 15s; stderr so far:\n{}",
+        captured
     );
 
     // Send SIGINT to the child — same signal a user gets from Ctrl-C.
@@ -269,16 +283,26 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
     }
 
-    let output = child.wait_with_output().expect("wait on agsh");
+    // Drain the rest of stderr until the child exits so we can assert
+    // on the rollback log lines.
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => captured.push_str(&line),
+            Err(_) => break,
+        }
+    }
+
+    let status = child.wait().expect("wait on agsh");
     assert!(
-        !output.status.success(),
+        !status.success(),
         "agsh should exit non-zero after SIGINT during auto-login"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("interrupted") && stderr.contains("rolling back"),
-        "expected interrupted/rollback message on stderr, got: {}",
-        stderr
+        captured.contains("interrupted") && captured.contains("rolling back"),
+        "expected interrupted/rollback message in stderr, got:\n{}",
+        captured
     );
 
     // Verify the entry was rolled out of config.toml.

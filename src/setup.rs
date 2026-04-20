@@ -198,11 +198,10 @@ pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
         base_url.as_deref(),
     )?;
 
-    println!();
     if let Some(path) = config::config_file_path() {
-        println!("Configuration saved to {}", path.display());
+        tracing::info!("configuration saved to {}", path.display());
     } else {
-        println!("Configuration saved.");
+        tracing::info!("configuration saved");
     }
 
     Ok(())
@@ -215,13 +214,15 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
 
     let url = build_authorize_url(&client_id, &code_challenge, &state)?;
 
-    println!("Opening browser for authorization...");
-    if open::that(&url).is_err() {
-        tracing::debug!("failed to open browser automatically");
+    // The URL is printed unconditionally below; silently try to open
+    // it as a convenience on desktop, and keep the failure at debug
+    // since headless hosts will hit this path every time.
+    if let Err(error) = open::that(&url) {
+        tracing::debug!("failed to open browser for setup: {}", error);
     }
     println!();
-    println!("If the browser doesn't open, visit this URL:");
-    println!("{}", url);
+    println!("To authorize, open this URL in your browser:");
+    println!("    {}", url);
     println!();
 
     let code_input = prompt_line("After authorizing, paste the authorization code here:\n> ")?;
@@ -235,7 +236,7 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
     let credential = exchange_code(code, &code_verifier, &client_id, &state).await?;
     token_store.save_oauth_token("claude", &credential).await?;
 
-    println!("Login successful! OAuth tokens saved.");
+    tracing::info!("login successful; OAuth tokens saved");
 
     Ok(())
 }

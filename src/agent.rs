@@ -127,7 +127,9 @@ impl Agent {
                     last_tokens,
                     self.options.context_window
                 );
-                render::render_hint("Auto-compacting conversation...");
+                // Automatic lifecycle signpost — hidden at default
+                // verbosity, surface with `-v` / `RUST_LOG`.
+                tracing::info!("auto-compacting conversation");
                 if let Err(error) = self.compact_session(session_id, messages).await {
                     tracing::warn!("auto-compact failed: {}", error);
                 }

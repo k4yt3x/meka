@@ -501,7 +501,13 @@ fn handle_elicitation_prompt(prompt: crate::mcp::elicitation::ElicitationPrompt)
                 match line.trim().to_ascii_lowercase().as_str() {
                     "" | "y" | "yes" => {
                         if let Err(error) = open::that(url) {
-                            eprintln!("failed to open browser: {}", error);
+                            // URL was printed right above; launch
+                            // failure on headless hosts is expected
+                            // noise — diagnostic only.
+                            tracing::debug!(
+                                "failed to open browser for URL elicitation: {}",
+                                error
+                            );
                         }
                         ElicitationResponse::Accept { content: None }
                     }
