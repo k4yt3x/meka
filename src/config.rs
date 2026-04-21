@@ -238,6 +238,7 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "default" => default_input_style(),
         "none" => Style::default(),
+        "reverse" => Style::new().reverse(),
         "bold" => Style::new().bold(),
         "dim" => Style::new().dimmed(),
         "italic" => Style::new().italic(),
@@ -253,7 +254,7 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
         other => {
             tracing::warn!(
                 "ignoring unknown [display].input_style '{}' (expected \
-                 default, none, bold, dim, italic, underline, or a colour name)",
+                 default, none, reverse, bold, dim, italic, underline, or a colour name)",
                 other
             );
             default_input_style()
@@ -947,6 +948,11 @@ auth_token = "bearer-token"
         assert!(preset.is_bold);
         assert!(preset.foreground.is_some(), "default must set foreground");
         assert!(preset.background.is_some(), "default must set background");
+    }
+
+    #[test]
+    fn test_parse_input_style_reverse() {
+        assert!(parse_input_style("reverse").is_reverse);
     }
 
     #[test]

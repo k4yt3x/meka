@@ -184,6 +184,7 @@ Visual style applied to text typed into the REPL prompt. Makes submitted prompts
 Accepted values:
 - `default` (or unset): bold white-ish foreground on a slate-blue background, rendered in truecolor RGB so it looks the same across terminal themes.
 - `none`: disable styling entirely.
+- `reverse`: reverse video (swaps the terminal's current foreground and background).
 - `bold`, `dim`, `italic`, `underline`: single attribute, no colour change.
 - A colour name (`black`, `red`, `green`, `yellow`, `blue`, `magenta` / `purple`, `cyan`, `white`): set only the foreground, mapped to the terminal's palette.
 
