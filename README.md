@@ -98,6 +98,10 @@ agsh [r] > !docker ps
 
 Type `exit`, `quit`, or press **Ctrl+D** to leave the shell.
 
+## AI Use Declaration
+
+AI tools were used to assist the design and implementation of this project. All design decisions were made by humans, and every change was reviewed and approved by a human maintainer.
+
 ## License
 
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).\
