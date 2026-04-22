@@ -9,6 +9,7 @@ use futures::StreamExt;
 use html2md::rewrite_html;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::{MinTlsVersion, WebClientConfig};
 use crate::error::{AgshError, Result};
 use crate::image::{ImageHandling, build_image_tool_output, classify_content_type};
 use crate::permission::Permission;
@@ -16,6 +17,132 @@ use crate::provider::ToolDefinition;
 
 use super::util::{compile_user_regex, redirects_to_scratchpad, require_str};
 use super::{Tool, ToolOutput};
+
+/// Build the shared `reqwest::Client` for `fetch_url` + `web_search`
+/// from the resolved [`WebClientConfig`]. Errors propagate so startup
+/// fails cleanly on a bad proxy URL or unreadable CA file — safer than
+/// silently falling back to an unconfigured client that ignores user
+/// intent.
+pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(&cfg.user_agent)
+        .timeout(cfg.request_timeout);
+
+    if let Some(t) = cfg.connect_timeout {
+        builder = builder.connect_timeout(t);
+    }
+    if let Some(t) = cfg.read_timeout {
+        builder = builder.read_timeout(t);
+    }
+
+    // `0` → no redirects at all (Policy::none). Any non-zero cap maps
+    // to Policy::limited(n).
+    let policy = if cfg.max_redirects == 0 {
+        reqwest::redirect::Policy::none()
+    } else {
+        reqwest::redirect::Policy::limited(cfg.max_redirects)
+    };
+    builder = builder.redirect(policy);
+
+    match cfg.proxy.as_deref() {
+        None => {}
+        Some("") | Some("none") => {
+            // Explicit opt-out of reqwest's env-proxy auto-detection.
+            // Useful to override a host-level `HTTP_PROXY` env var
+            // without unsetting it.
+            builder = builder.no_proxy();
+        }
+        Some(url) => {
+            // Pre-validate the scheme before handing off — `reqwest::Proxy::all`
+            // is lenient (it'll accept `"not-a-url"` as `http://not-a-url/`),
+            // which silently routes traffic through a non-existent host.
+            // A typo in the config should fail loudly.
+            const ALLOWED_SCHEMES: &[&str] = &[
+                "http://",
+                "https://",
+                "socks5://",
+                "socks5h://",
+                "socks4://",
+            ];
+            if !ALLOWED_SCHEMES.iter().any(|s| url.starts_with(s)) {
+                return Err(AgshError::Config(format!(
+                    "[web].proxy: invalid URL '{}': expected one of {}",
+                    url,
+                    ALLOWED_SCHEMES.join(", ")
+                )));
+            }
+            let proxy = reqwest::Proxy::all(url).map_err(|error| {
+                AgshError::Config(format!("[web].proxy: invalid URL '{}': {}", url, error))
+            })?;
+            builder = builder.proxy(proxy);
+        }
+    }
+
+    if let Some(path) = &cfg.ca_cert_file {
+        let bytes = std::fs::read(path).map_err(|error| {
+            AgshError::Config(format!(
+                "[web].ca_cert_file '{}': {}",
+                path.display(),
+                error
+            ))
+        })?;
+        // Handles both single-cert and bundle PEM files (multiple
+        // concatenated `-----BEGIN/END CERTIFICATE-----` blocks).
+        let certs = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|error| {
+            AgshError::Config(format!(
+                "[web].ca_cert_file '{}': not a valid PEM: {}",
+                path.display(),
+                error
+            ))
+        })?;
+        // `from_pem_bundle` silently returns an empty Vec when the
+        // file contains no PEM blocks — that's not what the user
+        // asked for. Reject explicitly so typos don't ship a client
+        // with zero added CAs.
+        if certs.is_empty() {
+            return Err(AgshError::Config(format!(
+                "[web].ca_cert_file '{}': no PEM certificates found in file",
+                path.display()
+            )));
+        }
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    if cfg.https_only {
+        builder = builder.https_only(true);
+    }
+
+    if let Some(v) = cfg.min_tls_version {
+        let ver = match v {
+            MinTlsVersion::V1_0 => reqwest::tls::Version::TLS_1_0,
+            MinTlsVersion::V1_1 => reqwest::tls::Version::TLS_1_1,
+            MinTlsVersion::V1_2 => reqwest::tls::Version::TLS_1_2,
+            MinTlsVersion::V1_3 => reqwest::tls::Version::TLS_1_3,
+        };
+        builder = builder.min_tls_version(ver);
+    }
+
+    if cfg.danger_accept_invalid_certs {
+        tracing::warn!(
+            "[web].danger_accept_invalid_certs is enabled — TLS certificate \
+             validation is OFF; any HTTPS response could be spoofed"
+        );
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if cfg.danger_accept_invalid_hostnames {
+        tracing::warn!(
+            "[web].danger_accept_invalid_hostnames is enabled — TLS hostname \
+             verification is OFF; any HTTPS response could be spoofed"
+        );
+        builder = builder.danger_accept_invalid_hostnames(true);
+    }
+
+    builder
+        .build()
+        .map_err(|error| AgshError::Config(format!("failed to build web client: {}", error)))
+}
 
 // Static CSS selectors for search result parsing (parsed once, reused on every call).
 static DDG_RESULT: LazyLock<scraper::Selector> =
@@ -816,6 +943,136 @@ mod tests {
             resolve_result_href("https://example.com/page"),
             "https://example.com/page"
         );
+    }
+
+    #[test]
+    fn test_build_web_client_defaults_succeeds() {
+        let cfg = WebClientConfig::default();
+        assert!(build_web_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_build_web_client_with_socks_proxy_succeeds() {
+        let cfg = WebClientConfig {
+            proxy: Some("socks5h://127.0.0.1:1080".to_string()),
+            ..WebClientConfig::default()
+        };
+        // We don't actually connect — just verify reqwest accepts
+        // the proxy URL shape.
+        assert!(build_web_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_build_web_client_with_http_proxy_succeeds() {
+        let cfg = WebClientConfig {
+            proxy: Some("http://proxy.local:8080".to_string()),
+            ..WebClientConfig::default()
+        };
+        assert!(build_web_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_build_web_client_explicit_none_proxy_succeeds() {
+        // `"none"` → `.no_proxy()`, suppresses env-var auto-detection.
+        let cfg = WebClientConfig {
+            proxy: Some("none".to_string()),
+            ..WebClientConfig::default()
+        };
+        assert!(build_web_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_build_web_client_rejects_bad_proxy() {
+        let cfg = WebClientConfig {
+            proxy: Some("not-a-url".to_string()),
+            ..WebClientConfig::default()
+        };
+        let err = build_web_client(&cfg).expect_err("bad proxy URL should fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("[web].proxy") && msg.contains("not-a-url"),
+            "expected proxy error naming the bad value, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_build_web_client_missing_ca_cert_errors() {
+        let cfg = WebClientConfig {
+            ca_cert_file: Some(std::path::PathBuf::from(
+                "/definitely/does/not/exist/ca.pem",
+            )),
+            ..WebClientConfig::default()
+        };
+        let err = build_web_client(&cfg).expect_err("missing CA file should fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("[web].ca_cert_file") && msg.contains("/definitely/does/not/exist"),
+            "expected CA error naming the path, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_build_web_client_non_pem_ca_cert_errors() {
+        // An existing but non-PEM file produces a clear parse error
+        // rather than a silent failure.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-a-cert.bin");
+        std::fs::write(&path, b"this is definitely not a PEM").expect("write");
+        let cfg = WebClientConfig {
+            ca_cert_file: Some(path),
+            ..WebClientConfig::default()
+        };
+        let err = build_web_client(&cfg).expect_err("non-PEM CA file should fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("[web].ca_cert_file"),
+            "expected CA error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_build_web_client_zero_redirects_builds() {
+        // max_redirects = 0 → Policy::none(); reqwest accepts it.
+        let cfg = WebClientConfig {
+            max_redirects: 0,
+            ..WebClientConfig::default()
+        };
+        assert!(build_web_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_build_web_client_https_only_builds() {
+        let cfg = WebClientConfig {
+            https_only: true,
+            ..WebClientConfig::default()
+        };
+        assert!(build_web_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_build_web_client_with_min_tls_1_2_succeeds() {
+        let cfg = WebClientConfig {
+            min_tls_version: Some(MinTlsVersion::V1_2),
+            ..WebClientConfig::default()
+        };
+        // rustls (our pinned backend) supports TLS 1.2; must build.
+        assert!(build_web_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_build_web_client_with_danger_flags_builds() {
+        // Builds successfully; the function also logs a warn! per
+        // flag, which we don't assert here (tracing capture would
+        // add plumbing for negligible test value).
+        let cfg = WebClientConfig {
+            danger_accept_invalid_certs: true,
+            danger_accept_invalid_hostnames: true,
+            ..WebClientConfig::default()
+        };
+        assert!(build_web_client(&cfg).is_ok());
     }
 
     #[test]

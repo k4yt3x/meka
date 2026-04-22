@@ -202,17 +202,49 @@ input_style = "none"    # or "cyan", "bold", "dim", etc.
 
 ## `[web]`
 
-Settings for web-related tools (fetch_url, web_search).
+Settings for the HTTP client shared by `fetch_url` and `web_search`. All keys are optional; unset fields use the defaults shown below.
 
-### `web.user_agent`
+| Key | Type | Default | Purpose |
+|---|---|---|---|
+| `user_agent` | string | Real Chrome UA | Some search engines block non-browser UAs. Override if you need a specific identifier. |
+| `request_timeout_seconds` | int | `30` | Total request budget (connect + TLS + read). `0` falls back to the default. |
+| `connect_timeout_seconds` | int | unset | Separate cap on TCP + TLS handshake. Fail fast on unreachable hosts without shortening the whole request budget. |
+| `read_timeout_seconds` | int | unset | Per-chunk idle timeout. Catches bodies that stall mid-stream. |
+| `max_redirects` | int | `10` | Cap on 3xx hops. `0` disables redirects entirely. |
+| `proxy` | string | unset (honours `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` env) | Proxy URL. Schemes: `http://`, `https://`, `socks5://`, `socks5h://`, `socks4://`. The literal string `"none"` explicitly disables env-var auto-detection. |
+| `ca_cert_file` | path | unset | Extra PEM bundle to trust on top of the system store. Useful for corporate MITM proxies or self-signed internal services. Accepts single-cert and multi-cert files. |
+| `https_only` | bool | `false` | Refuse plain `http://` URLs. |
+| `min_tls_version` | string | unset (reqwest default) | Minimum TLS version. Accepts `"1.0"`, `"1.1"`, `"1.2"`, `"1.3"`. Unknown values log a warn and fall through. Note: the bundled rustls backend supports only TLS 1.2 and 1.3 — `"1.0"` / `"1.1"` will surface a build error. |
+| `danger_accept_invalid_certs` | bool | `false` | **DANGEROUS.** Disable TLS certificate validation entirely. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
+| `danger_accept_invalid_hostnames` | bool | `false` | **DANGEROUS.** Accept certificates whose hostname doesn't match. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
 
-Custom User-Agent string for HTTP requests. Some search engines may block requests with non-browser User-Agent strings.
-
-Default: `Mozilla/5.0 (compatible; agsh/0.1)`
+### Example: corporate proxy with a private CA
 
 ```toml
 [web]
-user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+proxy = "http://corp-proxy.internal:3128"
+ca_cert_file = "/etc/ssl/corp-root-ca.pem"
+min_tls_version = "1.2"
+request_timeout_seconds = 60
+```
+
+### Example: local testing against self-signed certs
+
+```toml
+[web]
+# Route everything through a local SOCKS proxy you control.
+proxy = "socks5h://127.0.0.1:1080"
+# Accept self-signed certs on dev.local — KEEP THIS OFF IN PROD.
+danger_accept_invalid_certs = true
+```
+
+### Example: fail-fast timeouts
+
+```toml
+[web]
+request_timeout_seconds = 5
+connect_timeout_seconds = 2
+max_redirects = 0
 ```
 
 ## `[shell]`

@@ -290,7 +290,7 @@ async fn create_agent_from_config(
     );
 
     let tool_registry = ToolRegistry::build_default(
-        config.user_agent.clone(),
+        config.web_client.clone(),
         shared_permission.clone(),
         config.sandbox,
         sandbox_capability,
@@ -298,7 +298,7 @@ async fn create_agent_from_config(
         session_manager.clone(),
         shared_session_id.clone(),
         builtin_filter.clone(),
-    );
+    )?;
 
     // Register the sub-agent tool with access to the provider
     if builtin_filter.admits("spawn_agent") {
@@ -307,7 +307,7 @@ async fn create_agent_from_config(
                 provider: Arc::clone(&provider),
                 parent_permission: shared_permission.clone(),
                 tool_builder_params: crate::tools::subagent::ToolBuilderParams {
-                    user_agent: config.user_agent.clone(),
+                    web_client: config.web_client.clone(),
                     sandbox_enabled: config.sandbox,
                     sandbox_capability,
                     builtin_filter: builtin_filter.clone(),
@@ -907,7 +907,7 @@ async fn run_tools_subcommand(
             let shared_session_id: std::sync::Arc<tokio::sync::RwLock<Option<uuid::Uuid>>> =
                 std::sync::Arc::new(tokio::sync::RwLock::new(None));
             let reference = ToolRegistry::build_default(
-                config.user_agent.clone(),
+                config.web_client.clone(),
                 shared_permission,
                 config.sandbox,
                 sandbox_capability,
@@ -915,7 +915,7 @@ async fn run_tools_subcommand(
                 session_manager,
                 shared_session_id,
                 crate::tools::BuiltinToolFilter::default(),
-            );
+            )?;
 
             let catalogue = reference.tool_catalogue();
             println!(

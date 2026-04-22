@@ -164,7 +164,153 @@ pub struct DisplayConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct WebConfig {
     pub user_agent: Option<String>,
+    pub request_timeout_seconds: Option<u64>,
+    pub connect_timeout_seconds: Option<u64>,
+    pub read_timeout_seconds: Option<u64>,
+    /// Max number of redirects reqwest will follow. `0` disables
+    /// redirects entirely. Default: `10`.
+    pub max_redirects: Option<u64>,
+    /// Proxy URL. Accepts `http://…`, `https://…`, `socks5://…`,
+    /// `socks5h://…`. The literal string `"none"` explicitly
+    /// disables env-var auto-detection (overriding `HTTP_PROXY` etc.).
+    /// Unset honours the env vars.
+    pub proxy: Option<String>,
+    /// Path to a PEM file containing one or more root CAs to trust
+    /// on top of the system trust store. Used for corporate MITM
+    /// proxies or self-signed internal services.
+    pub ca_cert_file: Option<String>,
+    /// Reject plain `http://` URLs — only `https://` allowed.
+    pub https_only: Option<bool>,
+    /// Minimum TLS version: `"1.0"`, `"1.1"`, `"1.2"`, or `"1.3"`.
+    /// Anything else logs a warn and falls back to reqwest's default.
+    pub min_tls_version: Option<String>,
+    /// DANGER: disable TLS certificate validation entirely.
+    /// Allows MITM; only use against trusted local dev servers.
+    pub danger_accept_invalid_certs: Option<bool>,
+    /// DANGER: accept certificates whose hostname doesn't match.
+    /// Allows MITM; only use against trusted local dev servers.
+    pub danger_accept_invalid_hostnames: Option<bool>,
 }
+
+/// Minimum TLS version accepted by the web-tools client. Normalised
+/// from `[web].min_tls_version` so the rest of the crate doesn't
+/// pass free-form strings around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinTlsVersion {
+    V1_0,
+    V1_1,
+    V1_2,
+    V1_3,
+}
+
+impl MinTlsVersion {
+    /// Parse the config-file string form. Returns `None` on unknown
+    /// input; callers are expected to log and fall through to the
+    /// reqwest backend default.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "1.0" => Some(Self::V1_0),
+            "1.1" => Some(Self::V1_1),
+            "1.2" => Some(Self::V1_2),
+            "1.3" => Some(Self::V1_3),
+            _ => None,
+        }
+    }
+}
+
+/// Fully-resolved web-tools HTTP client configuration. Carried on
+/// [`ResolvedConfig`] and consumed by `crate::tools::web::build_web_client`
+/// at registry-build time.
+#[derive(Debug, Clone)]
+pub struct WebClientConfig {
+    pub user_agent: String,
+    pub request_timeout: std::time::Duration,
+    pub connect_timeout: Option<std::time::Duration>,
+    pub read_timeout: Option<std::time::Duration>,
+    /// `0` means "no redirects" (`Policy::none`); any other value
+    /// becomes `Policy::limited(n)`.
+    pub max_redirects: usize,
+    pub proxy: Option<String>,
+    pub ca_cert_file: Option<std::path::PathBuf>,
+    pub https_only: bool,
+    pub min_tls_version: Option<MinTlsVersion>,
+    pub danger_accept_invalid_certs: bool,
+    pub danger_accept_invalid_hostnames: bool,
+}
+
+impl Default for WebClientConfig {
+    fn default() -> Self {
+        Self {
+            user_agent: DEFAULT_WEB_USER_AGENT.to_string(),
+            request_timeout: std::time::Duration::from_secs(30),
+            connect_timeout: None,
+            read_timeout: None,
+            max_redirects: 10,
+            proxy: None,
+            ca_cert_file: None,
+            https_only: false,
+            min_tls_version: None,
+            danger_accept_invalid_certs: false,
+            danger_accept_invalid_hostnames: false,
+        }
+    }
+}
+
+impl WebClientConfig {
+    /// Build a resolved config from the TOML section. Invalid
+    /// `min_tls_version` strings log a warn and fall through to
+    /// reqwest's default rather than aborting startup.
+    pub fn from_file(file: &WebConfig) -> Self {
+        let user_agent = file
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WEB_USER_AGENT.to_string());
+
+        let min_tls_version =
+            file.min_tls_version
+                .as_deref()
+                .and_then(|raw| match MinTlsVersion::parse(raw) {
+                    Some(v) => Some(v),
+                    None => {
+                        tracing::warn!(
+                            "ignoring unknown [web].min_tls_version '{}' \
+                         (expected '1.0', '1.1', '1.2', or '1.3')",
+                            raw
+                        );
+                        None
+                    }
+                });
+
+        Self {
+            user_agent,
+            request_timeout: file
+                .request_timeout_seconds
+                .filter(|n| *n > 0)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or_else(|| std::time::Duration::from_secs(30)),
+            connect_timeout: file
+                .connect_timeout_seconds
+                .filter(|n| *n > 0)
+                .map(std::time::Duration::from_secs),
+            read_timeout: file
+                .read_timeout_seconds
+                .filter(|n| *n > 0)
+                .map(std::time::Duration::from_secs),
+            max_redirects: file.max_redirects.map(|n| n as usize).unwrap_or(10),
+            proxy: file.proxy.clone(),
+            ca_cert_file: file.ca_cert_file.clone().map(std::path::PathBuf::from),
+            https_only: file.https_only.unwrap_or(false),
+            min_tls_version,
+            danger_accept_invalid_certs: file.danger_accept_invalid_certs.unwrap_or(false),
+            danger_accept_invalid_hostnames: file.danger_accept_invalid_hostnames.unwrap_or(false),
+        }
+    }
+}
+
+/// Default UA for the web tools when `[web].user_agent` is unset.
+/// Kept in sync with what real Chrome emits so anti-bot filters don't
+/// single out agsh by default.
+pub const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ShellConfig {
@@ -208,7 +354,7 @@ pub struct ResolvedConfig {
     pub show_session_id_on_create: bool,
     pub show_session_id_on_exit: bool,
     pub show_path_in_prompt: bool,
-    pub user_agent: String,
+    pub web_client: WebClientConfig,
     pub sandbox: bool,
     pub render_mode: RenderMode,
     pub context_messages: Option<usize>,
@@ -547,10 +693,7 @@ impl ResolvedConfig {
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
             show_path_in_prompt: file_display.show_path_in_prompt.unwrap_or(true),
-            user_agent: file_web.user_agent.unwrap_or_else(|| {
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-                    .to_string()
-            }),
+            web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
             render_mode: cli
                 .render_mode
@@ -664,6 +807,134 @@ fn resolve_auth_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_web_config_all_fields_parse() {
+        let toml_str = r#"
+[web]
+user_agent = "agsh-test"
+request_timeout_seconds = 60
+connect_timeout_seconds = 5
+read_timeout_seconds = 10
+max_redirects = 3
+proxy = "socks5h://127.0.0.1:1080"
+ca_cert_file = "/etc/ssl/corp.pem"
+https_only = true
+min_tls_version = "1.3"
+danger_accept_invalid_certs = true
+danger_accept_invalid_hostnames = true
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
+        let web = config.web.expect("web present");
+        assert_eq!(web.user_agent.as_deref(), Some("agsh-test"));
+        assert_eq!(web.request_timeout_seconds, Some(60));
+        assert_eq!(web.connect_timeout_seconds, Some(5));
+        assert_eq!(web.read_timeout_seconds, Some(10));
+        assert_eq!(web.max_redirects, Some(3));
+        assert_eq!(web.proxy.as_deref(), Some("socks5h://127.0.0.1:1080"));
+        assert_eq!(web.ca_cert_file.as_deref(), Some("/etc/ssl/corp.pem"));
+        assert_eq!(web.https_only, Some(true));
+        assert_eq!(web.min_tls_version.as_deref(), Some("1.3"));
+        assert_eq!(web.danger_accept_invalid_certs, Some(true));
+        assert_eq!(web.danger_accept_invalid_hostnames, Some(true));
+    }
+
+    #[test]
+    fn test_web_client_config_defaults_from_empty_file() {
+        // Empty [web] → sensible defaults; no user-surprising failures.
+        let file = WebConfig::default();
+        let cfg = WebClientConfig::from_file(&file);
+        assert_eq!(cfg.user_agent, DEFAULT_WEB_USER_AGENT);
+        assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(30));
+        assert!(cfg.connect_timeout.is_none());
+        assert!(cfg.read_timeout.is_none());
+        assert_eq!(cfg.max_redirects, 10);
+        assert!(cfg.proxy.is_none());
+        assert!(cfg.ca_cert_file.is_none());
+        assert!(!cfg.https_only);
+        assert!(cfg.min_tls_version.is_none());
+        assert!(!cfg.danger_accept_invalid_certs);
+        assert!(!cfg.danger_accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn test_web_client_config_resolves_full_file() {
+        let file = WebConfig {
+            user_agent: Some("ua".to_string()),
+            request_timeout_seconds: Some(60),
+            connect_timeout_seconds: Some(5),
+            read_timeout_seconds: Some(10),
+            max_redirects: Some(0),
+            proxy: Some("http://proxy.local:8080".to_string()),
+            ca_cert_file: Some("/tmp/ca.pem".to_string()),
+            https_only: Some(true),
+            min_tls_version: Some("1.3".to_string()),
+            danger_accept_invalid_certs: Some(true),
+            danger_accept_invalid_hostnames: Some(true),
+        };
+        let cfg = WebClientConfig::from_file(&file);
+        assert_eq!(cfg.user_agent, "ua");
+        assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(60));
+        assert_eq!(cfg.connect_timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(cfg.read_timeout, Some(std::time::Duration::from_secs(10)));
+        assert_eq!(cfg.max_redirects, 0);
+        assert_eq!(cfg.proxy.as_deref(), Some("http://proxy.local:8080"));
+        assert_eq!(
+            cfg.ca_cert_file.as_deref(),
+            Some(std::path::Path::new("/tmp/ca.pem"))
+        );
+        assert!(cfg.https_only);
+        assert_eq!(cfg.min_tls_version, Some(MinTlsVersion::V1_3));
+        assert!(cfg.danger_accept_invalid_certs);
+        assert!(cfg.danger_accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn test_min_tls_version_parse_accepts_all_valid() {
+        assert_eq!(MinTlsVersion::parse("1.0"), Some(MinTlsVersion::V1_0));
+        assert_eq!(MinTlsVersion::parse("1.1"), Some(MinTlsVersion::V1_1));
+        assert_eq!(MinTlsVersion::parse("1.2"), Some(MinTlsVersion::V1_2));
+        assert_eq!(MinTlsVersion::parse("1.3"), Some(MinTlsVersion::V1_3));
+        // Whitespace trimming.
+        assert_eq!(MinTlsVersion::parse("  1.2  "), Some(MinTlsVersion::V1_2));
+    }
+
+    #[test]
+    fn test_min_tls_version_parse_rejects_invalid() {
+        assert!(MinTlsVersion::parse("1.5").is_none());
+        assert!(MinTlsVersion::parse("tls1.3").is_none());
+        assert!(MinTlsVersion::parse("").is_none());
+    }
+
+    #[test]
+    fn test_web_client_config_rejects_bad_min_tls_falls_back() {
+        // Invalid min_tls_version string logs a warn but doesn't
+        // abort — we fall through to reqwest's default rather than
+        // failing startup on a typo.
+        let file = WebConfig {
+            min_tls_version: Some("1.5".to_string()),
+            ..WebConfig::default()
+        };
+        let cfg = WebClientConfig::from_file(&file);
+        assert!(cfg.min_tls_version.is_none());
+    }
+
+    #[test]
+    fn test_web_client_config_zero_timeout_uses_default() {
+        // `0` in the config is treated as "fall through to default"
+        // so users can't accidentally set request_timeout = 0 and
+        // disable timeouts entirely.
+        let file = WebConfig {
+            request_timeout_seconds: Some(0),
+            connect_timeout_seconds: Some(0),
+            read_timeout_seconds: Some(0),
+            ..WebConfig::default()
+        };
+        let cfg = WebClientConfig::from_file(&file);
+        assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(30));
+        assert!(cfg.connect_timeout.is_none());
+        assert!(cfg.read_timeout.is_none());
+    }
 
     #[test]
     fn test_mcp_runtime_fields_parse() {

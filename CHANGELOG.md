@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `agsh mcp disable <name>` / `agsh mcp enable <name>` toggle the disabled flag in config.toml.
 - `agsh mcp add --disabled` stages a server without connecting to it on the next start.
 - `web_search` detects DuckDuckGo CAPTCHA pages and returns a clear error instead of silent empty.
+- `[web]` gains reqwest knobs: request/connect/read timeouts, max redirects, proxy, CA bundle, TLS.
 
 ### Changed
 

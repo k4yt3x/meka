@@ -353,11 +353,11 @@ impl ToolRegistry {
     /// file I/O, search, web, and shell execution.
     fn register_core_tools(
         &self,
-        user_agent: &str,
+        web_client_config: &crate::config::WebClientConfig,
         shared_permission: crate::permission::SharedPermission,
         sandbox_enabled: bool,
         sandbox_capability: crate::sandbox::SandboxCapability,
-    ) {
+    ) -> Result<()> {
         let read_tracker: ReadTracker = Arc::new(RwLock::new(HashSet::new()));
         self.register_builtin(Arc::new(file::ReadFileTool {
             read_tracker: read_tracker.clone(),
@@ -366,11 +366,10 @@ impl ToolRegistry {
         self.register_builtin(Arc::new(file::WriteFileTool));
         self.register_builtin(Arc::new(find::FindFilesTool));
         self.register_builtin(Arc::new(grep::SearchContentsTool));
-        let web_client = reqwest::Client::builder()
-            .user_agent(user_agent)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        // A malformed proxy URL or unreadable CA file surfaces as a
+        // startup error rather than silently falling back to an
+        // unconfigured client (which would ignore the user's intent).
+        let web_client = web::build_web_client(web_client_config)?;
         self.register_builtin(Arc::new(web::FetchUrlTool {
             client: web_client.clone(),
         }));
@@ -380,6 +379,7 @@ impl ToolRegistry {
             shared_permission,
             sandbox_enabled,
         }));
+        Ok(())
     }
 
     /// Register a builtin. Collisions panic (programmer error). Tools
@@ -398,7 +398,7 @@ impl ToolRegistry {
 
     #[allow(clippy::too_many_arguments)]
     pub fn build_default(
-        user_agent: String,
+        web_client_config: crate::config::WebClientConfig,
         shared_permission: crate::permission::SharedPermission,
         sandbox_enabled: bool,
         sandbox_capability: crate::sandbox::SandboxCapability,
@@ -406,14 +406,14 @@ impl ToolRegistry {
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         builtin_filter: BuiltinToolFilter,
-    ) -> Self {
+    ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
         registry.register_core_tools(
-            &user_agent,
+            &web_client_config,
             shared_permission,
             sandbox_enabled,
             sandbox_capability,
-        );
+        )?;
         registry.register_builtin(Arc::new(skill::SkillTool {
             session_id: shared_session_id.clone(),
         }));
@@ -446,31 +446,31 @@ impl ToolRegistry {
             session_id: shared_session_id,
         }));
         registry.mark_deferred("scratchpad_delete");
-        registry
+        Ok(registry)
     }
 
     /// Build a tool registry for sub-agents. Excludes `todo_write` (parent
     /// owns task tracking) and `spawn_agent` (no recursive spawning).
     pub fn build_for_subagent(
-        user_agent: String,
+        web_client_config: crate::config::WebClientConfig,
         shared_permission: crate::permission::SharedPermission,
         sandbox_enabled: bool,
         sandbox_capability: crate::sandbox::SandboxCapability,
         builtin_filter: BuiltinToolFilter,
-    ) -> Self {
+    ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
         registry.register_core_tools(
-            &user_agent,
+            &web_client_config,
             shared_permission,
             sandbox_enabled,
             sandbox_capability,
-        );
+        )?;
         // Sub-agents don't have a session of their own — skills still load but
         // ${AGSH_SESSION_ID} stays unresolved for their invocations.
         registry.register_builtin(Arc::new(skill::SkillTool {
             session_id: Arc::new(RwLock::new(None)),
         }));
-        registry
+        Ok(registry)
     }
 }
 
@@ -498,7 +498,7 @@ mod tests {
             .expect("failed to open in-memory database");
         let shared_session_id = Arc::new(RwLock::new(None));
         ToolRegistry::build_default(
-            "test-agent/0.1".to_string(),
+            crate::config::WebClientConfig::default(),
             test_shared_permission(),
             true,
             crate::sandbox::detect(),
@@ -507,6 +507,7 @@ mod tests {
             shared_session_id,
             filter,
         )
+        .expect("default web client config should build cleanly")
     }
 
     #[tokio::test]
@@ -778,12 +779,13 @@ mod tests {
         let filter =
             BuiltinToolFilter::from_config(None, vec!["web_search".to_string()], HashMap::new());
         let registry = ToolRegistry::build_for_subagent(
-            "sub-test/0.1".to_string(),
+            crate::config::WebClientConfig::default(),
             crate::permission::SharedPermission::new(Permission::Read),
             true,
             crate::sandbox::detect(),
             filter,
-        );
+        )
+        .expect("default web client config should build cleanly");
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("web_search").is_none());
     }

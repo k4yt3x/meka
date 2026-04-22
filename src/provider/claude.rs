@@ -2211,7 +2211,7 @@ mod tests {
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let registry = ToolRegistry::build_default(
-            "test/0.1".to_string(),
+            crate::config::WebClientConfig::default(),
             shared_permission,
             true,
             crate::sandbox::detect(),
@@ -2219,7 +2219,8 @@ mod tests {
             session_manager,
             shared_session_id,
             crate::tools::BuiltinToolFilter::default(),
-        );
+        )
+        .expect("default web client config should build cleanly");
 
         let provider = test_provider();
 
@@ -2305,7 +2306,7 @@ mod tests {
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let registry = ToolRegistry::build_default(
-            "test/0.1".to_string(),
+            crate::config::WebClientConfig::default(),
             shared_permission.clone(),
             true,
             crate::sandbox::detect(),
@@ -2313,7 +2314,8 @@ mod tests {
             session_manager,
             shared_session_id,
             crate::tools::BuiltinToolFilter::default(),
-        );
+        )
+        .expect("default web client config should build cleanly");
 
         let provider = test_provider();
         let levels = [

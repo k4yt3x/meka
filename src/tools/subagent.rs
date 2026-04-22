@@ -17,7 +17,7 @@ use super::{BuiltinToolFilter, Tool, ToolOutput, ToolRegistry};
 /// Parameters needed to build a fresh ToolRegistry for sub-agents.
 #[derive(Clone)]
 pub struct ToolBuilderParams {
-    pub user_agent: String,
+    pub web_client: crate::config::WebClientConfig,
     pub sandbox_enabled: bool,
     pub sandbox_capability: crate::sandbox::SandboxCapability,
     /// Parent's `[tools]` filter — sub-agents inherit it.
@@ -86,12 +86,16 @@ impl Tool for SpawnAgentTool {
         // and no todo_write (parent owns task tracking).
         let sub_shared_perm = SharedPermission::new(sub_perm);
         let sub_registry = ToolRegistry::build_for_subagent(
-            self.tool_builder_params.user_agent.clone(),
+            self.tool_builder_params.web_client.clone(),
             sub_shared_perm,
             self.tool_builder_params.sandbox_enabled,
             self.tool_builder_params.sandbox_capability,
             self.tool_builder_params.builtin_filter.clone(),
-        );
+        )
+        .map_err(|error| AgshError::ToolExecution {
+            tool_name: "spawn_agent".to_string(),
+            message: format!("failed to build sub-agent tool registry: {}", error),
+        })?;
 
         let tools = sub_registry.definitions_for_permission(sub_perm);
         let system_prompt =
