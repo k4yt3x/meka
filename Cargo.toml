@@ -6,10 +6,6 @@ license = "MIT"
 description = "An agentic shell where you speak human, not bash"
 repository = "https://github.com/k4yt3x/agsh"
 
-[[bin]]
-name = "agsh"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -19,7 +15,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
 eventsource-stream = "0.2"
-fast_html2md = { version = "0.0", features = ["rewriter"] }
+fast_html2md = "0.0"
 fd-lock = "4"
 futures = "0.3"
 glob = "0.3"
@@ -33,7 +29,7 @@ percent-encoding = "2"
 rand = "0.10"
 reedline = "0.47"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls", "gzip", "deflate", "brotli", "cookies"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
 rmcp = { version = "1.5", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 scraper = { version = "0.26", default-features = false }
