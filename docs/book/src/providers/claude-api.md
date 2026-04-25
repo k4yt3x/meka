@@ -16,7 +16,7 @@ The `claude-api` provider talks to the [Claude Messages API](https://docs.anthro
 
 ```bash
 export AGSH_PROVIDER=claude-api
-export AGSH_MODEL=claude-sonnet-4-20250514
+export AGSH_MODEL=claude-opus-4-6
 export CLAUDE_API_KEY=sk-ant-api03-...
 agsh
 ```
@@ -26,23 +26,27 @@ agsh
 ```toml
 [provider]
 name = "claude-api"
-model = "claude-sonnet-4-20250514"
+model = "claude-opus-4-6"
 ```
 
 ## Supported Models
 
-Any model available through the Claude Messages API:
+Any model available through the Claude Messages API. Current line-up (per [Anthropic's models overview](https://docs.claude.com/en/docs/about-claude/models/overview)):
 
-- `claude-opus-4-20250514`
-- `claude-sonnet-4-20250514`
-- `claude-haiku-4-5-20251001`
+| Family | Alias | Notes |
+|--------|-------|-------|
+| Opus 4.7 | `claude-opus-4-7` | Latest Opus — most capable, adaptive thinking |
+| Sonnet 4.6 | `claude-sonnet-4-6` | Latest Sonnet — speed + intelligence balance |
+| Haiku 4.5 | `claude-haiku-4-5` | Latest Haiku — fastest |
+
+Older but still available: `claude-opus-4-6`, `claude-sonnet-4-5`, `claude-opus-4-5`, `claude-opus-4-1`. Deprecated and retiring 2026-06-15: `claude-opus-4-20250514`, `claude-sonnet-4-20250514`.
 
 ## Custom Base URL
 
 To use a Claude-API-compatible proxy or gateway:
 
 ```bash
-agsh --provider claude-api --model claude-sonnet-4-20250514 --base-url https://my-proxy.example.com
+agsh --provider claude-api --model claude-opus-4-6 --base-url https://my-proxy.example.com
 ```
 
 ## API Details
