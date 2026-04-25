@@ -10,7 +10,7 @@ use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 use crate::config;
-use crate::provider::{AuthCredential, DEFAULT_CLAUDE_CLIENT_ID};
+use crate::provider::{AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, DEFAULT_OPENAI_CODEX_CLIENT_ID};
 use crate::session::TokenStore;
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -18,8 +18,23 @@ const TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
 const SCOPES: &str =
     "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers";
 
+/// `openai-codex` OAuth flow constants. Mirror Codex's first-party CLI:
+/// the authorization server lives at `auth.openai.com`, the redirect
+/// listener binds on `localhost:1455` (matching `temp/codex/codex-rs/login/src/server.rs:51`).
+const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_REDIRECT_PORT: u16 = 1455;
+const CODEX_SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+/// Wall-clock budget for the user to complete the in-browser authorization.
+const CODEX_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 fn client_id() -> String {
     std::env::var("CLAUDE_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLAUDE_CLIENT_ID.to_string())
+}
+
+fn codex_client_id() -> String {
+    std::env::var("CODEX_CLIENT_ID").unwrap_or_else(|_| DEFAULT_OPENAI_CODEX_CLIENT_ID.to_string())
 }
 
 fn generate_pkce_pair() -> (String, String) {
@@ -108,6 +123,7 @@ async fn exchange_code(
         access_token: token_response.access_token,
         refresh_token: token_response.refresh_token,
         expires_at,
+        account_id: None,
     })
 }
 
@@ -145,12 +161,14 @@ pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
         &[
             "claude-oauth (Claude Code OAuth login)",
             "claude-api (Claude API key)",
+            "openai-codex (ChatGPT subscription login)",
             "openai-api (OpenAI API key)",
         ],
     )?;
     let provider_name = match provider_index {
         0 => "claude-oauth",
         1 => "claude-api",
+        2 => "openai-codex",
         _ => "openai-api",
     };
 
@@ -168,6 +186,9 @@ pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
                 anyhow::bail!("API key cannot be empty");
             }
             api_key = Some(key);
+        }
+        "openai-codex" => {
+            run_codex_oauth_login(token_store).await?;
         }
         _ => {
             let key = prompt_line("Enter your OpenAI API key: ")?;
@@ -242,6 +263,305 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Driver for the `openai-codex` PKCE + authorization-code flow against
+/// `auth.openai.com`. Differs from `run_oauth_login` (Claude) in that:
+/// 1. The redirect URI is `http://localhost:1455/auth/callback` — a real
+///    localhost listener, not a paste-the-code-back-in flow. Matches the
+///    first-party Codex CLI.
+/// 2. The token exchange is form-urlencoded (Claude uses JSON).
+/// 3. The id_token JWT is decoded post-exchange to pull
+///    `chatgpt_account_id`, which is sent on every Codex request as the
+///    `ChatGPT-Account-ID` header.
+async fn run_codex_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
+    let client_id = codex_client_id();
+    let (code_verifier, code_challenge) = generate_pkce_pair();
+    let state = generate_state();
+
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", CODEX_REDIRECT_PORT))
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to bind callback listener on 127.0.0.1:{}: {}. \
+                 Is another agsh / codex login already running?",
+                CODEX_REDIRECT_PORT,
+                error
+            )
+        })?;
+    let redirect_uri = format!("http://localhost:{}/auth/callback", CODEX_REDIRECT_PORT);
+
+    let url = build_codex_authorize_url(&client_id, &code_challenge, &state, &redirect_uri)?;
+
+    if let Err(error) = open::that(&url) {
+        tracing::debug!("failed to open browser for Codex login: {}", error);
+    }
+    println!();
+    println!("To authorize, open this URL in your browser:");
+    println!("    {}", url);
+    println!();
+    println!(
+        "Waiting up to {}s for the callback on 127.0.0.1:{}...",
+        CODEX_CALLBACK_TIMEOUT.as_secs(),
+        CODEX_REDIRECT_PORT
+    );
+
+    let (received_code, received_state) =
+        accept_codex_callback(listener, CODEX_CALLBACK_TIMEOUT).await?;
+
+    if received_state != state {
+        anyhow::bail!("OAuth state mismatch — possible CSRF; aborting");
+    }
+
+    let credential =
+        exchange_codex_code(&received_code, &code_verifier, &client_id, &redirect_uri).await?;
+    token_store
+        .save_oauth_token(crate::provider::openai::codex::STORAGE_KEY, &credential)
+        .await?;
+
+    tracing::info!("Codex login successful; OAuth tokens saved");
+
+    Ok(())
+}
+
+fn build_codex_authorize_url(
+    client_id: &str,
+    code_challenge: &str,
+    state: &str,
+    redirect_uri: &str,
+) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(CODEX_AUTHORIZE_URL)?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", CODEX_SCOPES)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("state", state)
+        .append_pair("originator", "agsh_cli");
+    Ok(url.to_string())
+}
+
+/// Accept one HTTP request on the bound listener, parse the OAuth callback
+/// path, and return `(code, state)`. Loops past unrelated requests
+/// (favicons, browser preflights) until the deadline elapses.
+async fn accept_codex_callback(
+    listener: tokio::net::TcpListener,
+    timeout: std::time::Duration,
+) -> anyhow::Result<(String, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("authorization timed out after {}s", timeout.as_secs());
+        }
+        let accept = match tokio::time::timeout(remaining, listener.accept()).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => anyhow::bail!("accept failed: {}", error),
+            Err(_) => anyhow::bail!("authorization timed out after {}s", timeout.as_secs()),
+        };
+        let (mut stream, _) = accept;
+
+        // Read until end-of-headers or 64 KiB cap; same approach as MCP's
+        // OAuth callback handler.
+        const MAX_BYTES: usize = 64 * 1024;
+        let mut buffer = Vec::with_capacity(4096);
+        let mut temp = [0u8; 4096];
+        let headers_complete = loop {
+            if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break true;
+            }
+            if buffer.len() >= MAX_BYTES {
+                break false;
+            }
+            let read_remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if read_remaining.is_zero() {
+                anyhow::bail!("authorization timed out after {}s", timeout.as_secs());
+            }
+            match tokio::time::timeout(read_remaining, stream.read(&mut temp)).await {
+                Ok(Ok(0)) => break buffer.windows(4).any(|window| window == b"\r\n\r\n"),
+                Ok(Ok(n)) => buffer.extend_from_slice(&temp[..n]),
+                Ok(Err(error)) => anyhow::bail!("read failed: {}", error),
+                Err(_) => anyhow::bail!("authorization timed out after {}s", timeout.as_secs()),
+            }
+        };
+
+        if !headers_complete {
+            let _ = stream
+                .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            continue;
+        }
+
+        let request = String::from_utf8_lossy(&buffer);
+        match parse_codex_callback_query(&request) {
+            CodexCallback::Match { code, state } => {
+                let body = b"<!DOCTYPE html><html><body>\
+                    <h1>Codex authorization successful</h1>\
+                    <p>You can close this tab and return to agsh.</p>\
+                    </body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                return Ok((code, state));
+            }
+            CodexCallback::NotCallback => {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                continue;
+            }
+            CodexCallback::Malformed(message) => {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                anyhow::bail!(message);
+            }
+            CodexCallback::AuthError(message) => {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                anyhow::bail!("authorization server returned error: {}", message);
+            }
+        }
+    }
+}
+
+enum CodexCallback {
+    Match { code: String, state: String },
+    NotCallback,
+    Malformed(String),
+    AuthError(String),
+}
+
+fn parse_codex_callback_query(request: &str) -> CodexCallback {
+    let Some(first_line) = request.lines().next() else {
+        return CodexCallback::Malformed("empty HTTP request".to_string());
+    };
+    let Some(path) = first_line.split_whitespace().nth(1) else {
+        return CodexCallback::Malformed("malformed HTTP request line".to_string());
+    };
+    let (path_component, query_string) = match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path, ""),
+    };
+    if !path_component.eq_ignore_ascii_case("/auth/callback") {
+        return CodexCallback::NotCallback;
+    }
+    if query_string.is_empty() {
+        return CodexCallback::Malformed("no query parameters in callback URL".to_string());
+    }
+
+    let mut code = None;
+    let mut state = None;
+    let mut error_param: Option<String> = None;
+    for pair in query_string.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let decoded = percent_encoding::percent_decode_str(value)
+            .decode_utf8_lossy()
+            .into_owned();
+        match key {
+            "code" => code = Some(decoded),
+            "state" => state = Some(decoded),
+            "error" => error_param = Some(decoded),
+            _ => {}
+        }
+    }
+
+    if let Some(message) = error_param {
+        return CodexCallback::AuthError(message);
+    }
+    match (code, state) {
+        (Some(code), Some(state)) => CodexCallback::Match { code, state },
+        _ => CodexCallback::Malformed("callback missing 'code' or 'state' parameter".to_string()),
+    }
+}
+
+async fn exchange_codex_code(
+    code: &str,
+    code_verifier: &str,
+    client_id: &str,
+    redirect_uri: &str,
+) -> anyhow::Result<AuthCredential> {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+    let encode = |value: &str| utf8_percent_encode(value, NON_ALPHANUMERIC).to_string();
+    let body = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        encode(code),
+        encode(redirect_uri),
+        encode(client_id),
+        encode(code_verifier),
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(CODEX_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("Codex token exchange failed ({}): {}", status, body);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CodexTokenResponse {
+        id_token: Option<String>,
+        access_token: String,
+        refresh_token: Option<String>,
+    }
+
+    let token: CodexTokenResponse = response.json().await?;
+
+    let account_id = token.id_token.as_deref().and_then(extract_codex_account_id);
+
+    let expires_at = extract_jwt_expiration_millis(&token.access_token);
+
+    Ok(AuthCredential::OAuthToken {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_at,
+        account_id,
+    })
+}
+
+/// Decode an OpenAI id_token JWT and extract `chatgpt_account_id` from the
+/// nested `https://api.openai.com/auth` claim. Returns `None` on any
+/// failure — the absence of an account_id isn't fatal at login time.
+fn extract_codex_account_id(jwt: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|id| id.as_str())
+        .map(|id| id.to_string())
+}
+
+/// Decode the `exp` claim of a JWT (in seconds) and return millis. Returns
+/// `None` if the claim is missing or the JWT is malformed.
+fn extract_jwt_expiration_millis(jwt: &str) -> Option<i64> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = value.get("exp")?.as_i64()?;
+    Some(exp * 1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +610,112 @@ mod tests {
     fn test_build_authorize_url_starts_with_authorize_url() {
         let url = build_authorize_url("cid", "ch", "st").unwrap();
         assert!(url.starts_with(AUTHORIZE_URL));
+    }
+
+    #[test]
+    fn test_build_codex_authorize_url_contains_required_params() {
+        let url = build_codex_authorize_url(
+            "app_test",
+            "challenge_x",
+            "state_y",
+            "http://localhost:1455/auth/callback",
+        )
+        .unwrap();
+        assert!(url.starts_with(CODEX_AUTHORIZE_URL));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("client_id=app_test"));
+        assert!(url.contains("code_challenge=challenge_x"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=state_y"));
+        // Codex-specific knobs that distinguish this from Claude's flow.
+        assert!(url.contains("id_token_add_organizations=true"));
+        assert!(url.contains("codex_cli_simplified_flow=true"));
+        assert!(url.contains("originator=agsh_cli"));
+        // Scope is space-separated and percent-encoded with `+` for spaces.
+        assert!(url.contains("openid"));
+        assert!(url.contains("offline_access"));
+    }
+
+    #[test]
+    fn test_parse_codex_callback_query_match() {
+        let request =
+            "GET /auth/callback?code=abc123&state=xyz HTTP/1.1\r\nHost: localhost:1455\r\n\r\n";
+        match parse_codex_callback_query(request) {
+            CodexCallback::Match { code, state } => {
+                assert_eq!(code, "abc123");
+                assert_eq!(state, "xyz");
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_parse_codex_callback_query_decodes_percent_encoding() {
+        let request = "GET /auth/callback?code=hello%20world&state=s%23t HTTP/1.1\r\n\r\n";
+        match parse_codex_callback_query(request) {
+            CodexCallback::Match { code, state } => {
+                assert_eq!(code, "hello world");
+                assert_eq!(state, "s#t");
+            }
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn test_parse_codex_callback_query_non_callback_path() {
+        let request = "GET /favicon.ico HTTP/1.1\r\n\r\n";
+        assert!(matches!(
+            parse_codex_callback_query(request),
+            CodexCallback::NotCallback
+        ));
+    }
+
+    #[test]
+    fn test_parse_codex_callback_query_missing_params() {
+        let request = "GET /auth/callback HTTP/1.1\r\n\r\n";
+        assert!(matches!(
+            parse_codex_callback_query(request),
+            CodexCallback::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_codex_callback_query_auth_error() {
+        let request = "GET /auth/callback?error=access_denied HTTP/1.1\r\n\r\n";
+        match parse_codex_callback_query(request) {
+            CodexCallback::AuthError(message) => assert_eq!(message, "access_denied"),
+            _ => panic!("expected AuthError"),
+        }
+    }
+
+    #[test]
+    fn test_extract_codex_account_id_from_namespaced_claim() {
+        let payload = serde_json::json!({
+            "sub": "u",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "ws-1"
+            }
+        });
+        let header = URL_SAFE_NO_PAD.encode(b"{}");
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(b"sig");
+        let jwt = format!("{}.{}.{}", header, body, signature);
+        assert_eq!(extract_codex_account_id(&jwt).as_deref(), Some("ws-1"));
+    }
+
+    #[test]
+    fn test_extract_codex_account_id_missing_returns_none() {
+        let payload = serde_json::json!({"sub": "u"});
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let jwt = format!("{}.{}.{}", "h", body, "s");
+        assert!(extract_codex_account_id(&jwt).is_none());
+    }
+
+    #[test]
+    fn test_extract_jwt_expiration_millis() {
+        let payload = serde_json::json!({"exp": 1_700_000_000});
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let jwt = format!("{}.{}.{}", "h", body, "s");
+        assert_eq!(extract_jwt_expiration_millis(&jwt), Some(1_700_000_000_000));
     }
 }

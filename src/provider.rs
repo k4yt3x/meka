@@ -3,7 +3,7 @@
 //! a concrete Claude or OpenAI-compatible implementation.
 
 mod claude;
-mod openai;
+pub(crate) mod openai;
 
 use std::sync::Arc;
 
@@ -16,11 +16,16 @@ use crate::error::{AgshError, Result};
 use crate::session::TokenStore;
 
 pub use claude::{ClaudeApiProvider, ClaudeOAuthProvider};
-pub use openai::OpenAiProvider;
+pub use openai::{OpenAiCodexProvider, OpenAiProvider};
 
 pub(crate) const DEFAULT_CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-pub const SUPPORTED_PROVIDERS: &[&str] = &["openai-api", "claude-api", "claude-oauth"];
+/// Codex's hardcoded OpenAI OAuth client ID. Mirrors the value used by the
+/// first-party CLI at `temp/codex/codex-rs/login/src/auth/manager.rs:869`.
+pub(crate) const DEFAULT_OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+pub const SUPPORTED_PROVIDERS: &[&str] =
+    &["openai-api", "openai-codex", "claude-api", "claude-oauth"];
 
 #[derive(Debug, Clone)]
 pub enum AuthCredential {
@@ -29,6 +34,12 @@ pub enum AuthCredential {
         access_token: String,
         refresh_token: Option<String>,
         expires_at: Option<i64>,
+        /// Provider-flavoured identity carried alongside the bearer token.
+        /// Currently only `openai-codex` populates this — the
+        /// `chatgpt_account_id` extracted from the id_token JWT, sent on
+        /// every request as `ChatGPT-Account-ID`. Claude OAuth leaves it
+        /// `None`.
+        account_id: Option<String>,
     },
 }
 
@@ -503,9 +514,28 @@ impl ProviderBuilder {
                     self.redact_thinking,
                 )))
             }
+            "openai-codex" => {
+                if matches!(self.credential, AuthCredential::ApiKey(_)) {
+                    return Err(AgshError::Config(
+                        "provider 'openai-codex' requires an OAuth token, not an API key. \
+                         Use 'openai-api' for direct API access."
+                            .to_string(),
+                    ));
+                }
+                Ok(Arc::new(OpenAiCodexProvider::new(
+                    self.credential,
+                    self.model,
+                    self.base_url,
+                    self.client_id,
+                    self.oauth_token_url,
+                    self.token_store,
+                    self.reasoning_effort,
+                )?))
+            }
             other => Err(AgshError::Config(format!(
-                "unknown provider: '{}'. Supported providers: openai-api, claude-api, claude-oauth",
-                other
+                "unknown provider: '{}'. Supported providers: {}",
+                other,
+                SUPPORTED_PROVIDERS.join(", ")
             ))),
         }
     }
@@ -688,6 +718,7 @@ mod tests {
                 access_token: "sk-ant-oat01-test".to_string(),
                 refresh_token: None,
                 expires_at: None,
+                account_id: None,
             },
             "claude-sonnet-4-20250514",
         )
@@ -704,6 +735,7 @@ mod tests {
                 access_token: "sk-ant-oat01-test".to_string(),
                 refresh_token: None,
                 expires_at: None,
+                account_id: None,
             },
             "claude-sonnet-4-20250514",
         )
@@ -720,6 +752,41 @@ mod tests {
         )
         .build();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_provider_openai_codex() {
+        let result = ProviderBuilder::new(
+            "openai-codex",
+            AuthCredential::OAuthToken {
+                access_token: "codex-access".to_string(),
+                refresh_token: Some("codex-refresh".to_string()),
+                expires_at: Some(now_ms_in_far_future()),
+                account_id: Some("workspace-1".to_string()),
+            },
+            "gpt-5",
+        )
+        .reasoning_effort(Some("high".to_string()))
+        .build();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_provider_openai_codex_rejects_api_key() {
+        let result = ProviderBuilder::new(
+            "openai-codex",
+            AuthCredential::ApiKey("sk-...".to_string()),
+            "gpt-5",
+        )
+        .build();
+        assert!(result.is_err());
+    }
+
+    fn now_ms_in_far_future() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64 + 86_400_000)
+            .unwrap_or(0)
     }
 
     #[test]
@@ -747,6 +814,7 @@ mod tests {
             access_token: "my-token".to_string(),
             refresh_token: None,
             expires_at: None,
+            account_id: None,
         };
         let (name, value) = credential.auth_header();
         assert_eq!(name, "Authorization");

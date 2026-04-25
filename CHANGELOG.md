@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `openai-codex` provider: ChatGPT subscription auth via OpenAI Responses API.
+- `OPENAI_CODEX_TOKEN` env var and `CODEX_CLIENT_ID` override for the Codex login flow.
+- `agsh setup` wizard now offers a "ChatGPT subscription login" option.
 - `[provider].effort` (claude-oauth): `output_config.effort` low/medium/high. Default high.
 - `[provider].redact_thinking` (claude-oauth): send `redact-thinking-2026-02-12`. Default false.
 - `[provider].device_id` (claude-oauth): override the persistent `metadata.user_id` device ID.
@@ -23,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `claude-oauth` wire format matches recent Claude Code (betas, context, fingerprint, cache, effort).
 - `device_id` is generated/persisted only when the active provider is `claude-oauth`.
 - `device_id` seeds from `~/.claude.json`'s `userID` when unset before generating a random one.
+- `AuthCredential::OAuthToken` gains optional `account_id` for `openai-codex`'s account header.
+- `oauth_tokens` table gains an `account_id` column; existing rows migrate with `NULL`.
+- `openai-codex` reqwest client enables cookie jar so chatgpt.com bot-clearance cookies persist.
 - `src/mcp.rs` (4754 lines) split into `mcp::{auth, transport, connector, handler}` submodules.
 - `src/provider/claude/oauth.rs` (3286 lines) split into `oauth::attestation` + `claude::shared`.
 - `src/config.rs` device_id / effort / credential helpers grouped into private inline submodules.

@@ -31,6 +31,8 @@ Environment variables override config file values but are overridden by CLI flag
 | Variable | Description |
 |----------|-------------|
 | `CLAUDE_OAUTH_TOKEN` | OAuth access token for the `claude-oauth` provider |
+| `OPENAI_CODEX_TOKEN` | OAuth access token for the `openai-codex` provider |
+| `CODEX_CLIENT_ID` | Override the default OpenAI OAuth client ID for the `openai-codex` setup wizard (rarely needed) |
 
 On first use, the OAuth token is saved to the database and loaded automatically on subsequent launches. Setting the env var again replaces the stored token.
 

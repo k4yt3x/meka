@@ -26,6 +26,7 @@
 
 - [Overview](./providers/overview.md)
 - [OpenAI API](./providers/openai-api.md)
+- [OpenAI Codex](./providers/openai-codex.md)
 - [Claude API](./providers/claude-api.md)
 - [Claude OAuth](./providers/claude-oauth.md)
 

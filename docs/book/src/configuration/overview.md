@@ -37,7 +37,8 @@ For example, `--model gpt-4o-mini` on the command line overrides both `AGSH_MODE
 The API key environment variable depends on the configured provider:
 
 - Provider `openai-api`: reads `OPENAI_API_KEY`
+- Provider `openai-codex`: reads `OPENAI_CODEX_TOKEN`, otherwise loads the OAuth token saved by `agsh setup`
 - Provider `claude-api`: reads `CLAUDE_API_KEY`
 - Provider `claude-oauth`: reads `CLAUDE_OAUTH_TOKEN`, otherwise loads the OAuth token saved by `agsh setup`
 
-If the environment variable is not set, it falls back to `provider.api_key` (or `provider.oauth_token` for `claude-oauth`) in the config file.
+If the environment variable is not set, it falls back to `provider.api_key` (or `provider.oauth_token` for OAuth providers) in the config file.

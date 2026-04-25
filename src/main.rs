@@ -170,12 +170,16 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
 
     // If no credential from env/config, try loading from database.
     // Storage key stays "claude" across the rename to "claude-oauth" so existing
-    // users keep their tokens.
+    // users keep their tokens; "openai-codex" matches the provider name.
+    let oauth_storage_key = match config.provider_name.as_deref() {
+        Some("claude-oauth") => Some("claude"),
+        Some("openai-codex") => Some(crate::provider::openai::codex::STORAGE_KEY),
+        _ => None,
+    };
     if config.auth_credential.is_none()
-        && let Some(provider_name) = config.provider_name.as_deref()
-        && provider_name == "claude-oauth"
+        && let Some(storage_key) = oauth_storage_key
     {
-        match token_store.load_oauth_token("claude").await {
+        match token_store.load_oauth_token(storage_key).await {
             Ok(Some(credential)) => {
                 tracing::info!("loaded OAuth token from database");
                 config.auth_credential = Some(credential);
@@ -187,12 +191,11 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Save OAuth token from env/config to database for future use.
-    // Storage key stays "claude" across the rename to "claude-oauth".
+    // Save OAuth token from env/config to database for future use, so the
+    // refresh path has a place to land updated tokens.
     if let Some(credential @ AuthCredential::OAuthToken { .. }) = &config.auth_credential
-        && let Some(provider_name) = config.provider_name.as_deref()
-        && provider_name == "claude-oauth"
-        && let Err(error) = token_store.save_oauth_token("claude", credential).await
+        && let Some(storage_key) = oauth_storage_key
+        && let Err(error) = token_store.save_oauth_token(storage_key, credential).await
     {
         tracing::warn!("failed to save OAuth token to database: {}", error);
     }

@@ -190,6 +190,7 @@ impl SessionManager {
                         access_token TEXT NOT NULL,
                         refresh_token TEXT,
                         expires_at INTEGER,
+                        account_id TEXT,
                         updated_at TEXT NOT NULL
                     );
 
@@ -229,6 +230,21 @@ impl SessionManager {
                     > 0;
                 if has_locked_by {
                     connection.execute_batch("ALTER TABLE sessions DROP COLUMN locked_by")?;
+                }
+
+                // Migration: add `oauth_tokens.account_id` for openai-codex's
+                // ChatGPT-Account-ID header. Existing rows get NULL, which is
+                // fine for providers that don't use it (Claude OAuth).
+                let has_account_id: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('oauth_tokens') WHERE name = 'account_id'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_account_id {
+                    connection.execute_batch("ALTER TABLE oauth_tokens ADD COLUMN account_id TEXT")?;
                 }
 
                 connection.execute_batch(
@@ -761,16 +777,19 @@ impl TokenStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
-                    "SELECT access_token, refresh_token, expires_at FROM oauth_tokens WHERE provider = ?1",
+                    "SELECT access_token, refresh_token, expires_at, account_id \
+                     FROM oauth_tokens WHERE provider = ?1",
                     rusqlite::params![provider],
                     |row| {
                         let access_token: String = row.get(0)?;
                         let refresh_token: Option<String> = row.get(1)?;
                         let expires_at: Option<i64> = row.get(2)?;
+                        let account_id: Option<String> = row.get(3)?;
                         Ok(AuthCredential::OAuthToken {
                             access_token,
                             refresh_token,
                             expires_at,
+                            account_id,
                         })
                     },
                 );
@@ -933,6 +952,7 @@ impl TokenStore {
             access_token,
             refresh_token,
             expires_at,
+            account_id,
         } = credential
         else {
             return Ok(());
@@ -942,19 +962,29 @@ impl TokenStore {
         let access_token = access_token.clone();
         let refresh_token = refresh_token.clone();
         let expires_at = *expires_at;
+        let account_id = account_id.clone();
         let now = chrono::Utc::now().to_rfc3339();
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO oauth_tokens (provider, access_token, refresh_token, expires_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(provider) DO UPDATE SET
-                         access_token = excluded.access_token,
-                         refresh_token = excluded.refresh_token,
-                         expires_at = excluded.expires_at,
+                    "INSERT INTO oauth_tokens \
+                         (provider, access_token, refresh_token, expires_at, account_id, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(provider) DO UPDATE SET \
+                         access_token = excluded.access_token, \
+                         refresh_token = excluded.refresh_token, \
+                         expires_at = excluded.expires_at, \
+                         account_id = excluded.account_id, \
                          updated_at = excluded.updated_at",
-                    rusqlite::params![provider, access_token, refresh_token, expires_at, now],
+                    rusqlite::params![
+                        provider,
+                        access_token,
+                        refresh_token,
+                        expires_at,
+                        account_id,
+                        now
+                    ],
                 )?;
                 Ok(())
             })
@@ -1774,5 +1804,137 @@ mod tests {
                 .unwrap(),
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn test_oauth_token_round_trip_preserves_all_fields() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        let credential = AuthCredential::OAuthToken {
+            access_token: "access-1".to_string(),
+            refresh_token: Some("refresh-1".to_string()),
+            expires_at: Some(1_700_000_000_000),
+            account_id: Some("account-abc".to_string()),
+        };
+
+        store
+            .save_oauth_token("openai-codex", &credential)
+            .await
+            .expect("save");
+
+        let loaded = store
+            .load_oauth_token("openai-codex")
+            .await
+            .expect("load")
+            .expect("present");
+
+        match loaded {
+            AuthCredential::OAuthToken {
+                access_token,
+                refresh_token,
+                expires_at,
+                account_id,
+            } => {
+                assert_eq!(access_token, "access-1");
+                assert_eq!(refresh_token.as_deref(), Some("refresh-1"));
+                assert_eq!(expires_at, Some(1_700_000_000_000));
+                assert_eq!(account_id.as_deref(), Some("account-abc"));
+            }
+            _ => panic!("expected OAuthToken"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oauth_token_round_trip_account_id_optional() {
+        // Claude OAuth doesn't populate `account_id` — make sure round-tripping
+        // a `None` value works without losing other fields.
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        let credential = AuthCredential::OAuthToken {
+            access_token: "claude-token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            account_id: None,
+        };
+
+        store
+            .save_oauth_token("claude", &credential)
+            .await
+            .expect("save");
+
+        let loaded = store.load_oauth_token("claude").await.expect("load");
+
+        match loaded {
+            Some(AuthCredential::OAuthToken {
+                access_token,
+                account_id,
+                ..
+            }) => {
+                assert_eq!(access_token, "claude-token");
+                assert!(account_id.is_none());
+            }
+            _ => panic!("expected OAuthToken with account_id=None"),
+        }
+    }
+
+    /// Two providers can persist independently with different `account_id`
+    /// values — verifies the provider PK keeps openai-codex and a hypothetical
+    /// future OAuth provider isolated.
+    #[tokio::test]
+    async fn test_oauth_token_two_providers_independent() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        let codex_credential = AuthCredential::OAuthToken {
+            access_token: "codex-access".to_string(),
+            refresh_token: Some("codex-refresh".to_string()),
+            expires_at: Some(2_000_000_000_000),
+            account_id: Some("workspace-1".to_string()),
+        };
+        let claude_credential = AuthCredential::OAuthToken {
+            access_token: "claude-access".to_string(),
+            refresh_token: Some("claude-refresh".to_string()),
+            expires_at: Some(3_000_000_000_000),
+            account_id: None,
+        };
+
+        store
+            .save_oauth_token("openai-codex", &codex_credential)
+            .await
+            .expect("save codex");
+        store
+            .save_oauth_token("claude", &claude_credential)
+            .await
+            .expect("save claude");
+
+        let codex_loaded = store
+            .load_oauth_token("openai-codex")
+            .await
+            .expect("load codex")
+            .expect("present");
+        let claude_loaded = store
+            .load_oauth_token("claude")
+            .await
+            .expect("load claude")
+            .expect("present");
+
+        if let AuthCredential::OAuthToken { account_id, .. } = codex_loaded {
+            assert_eq!(account_id.as_deref(), Some("workspace-1"));
+        } else {
+            panic!("expected OAuthToken");
+        }
+        if let AuthCredential::OAuthToken { account_id, .. } = claude_loaded {
+            assert!(account_id.is_none());
+        } else {
+            panic!("expected OAuthToken");
+        }
     }
 }

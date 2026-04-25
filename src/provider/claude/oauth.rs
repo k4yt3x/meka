@@ -262,6 +262,7 @@ impl ClaudeOAuthProvider {
                 .refresh_token
                 .or_else(|| Some(refresh_token.to_string())),
             expires_at,
+            account_id: None,
         })
     }
 

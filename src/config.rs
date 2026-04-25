@@ -941,6 +941,7 @@ mod credential {
                         access_token: token,
                         refresh_token: None,
                         expires_at: None,
+                        account_id: None,
                     });
                 }
                 if let Some(token) = &file_provider.oauth_token {
@@ -948,6 +949,27 @@ mod credential {
                         access_token: token.clone(),
                         refresh_token: None,
                         expires_at: None,
+                        account_id: None,
+                    });
+                }
+                // Database fallback happens in main.rs
+                None
+            }
+            Some("openai-codex") => {
+                if let Ok(token) = std::env::var("OPENAI_CODEX_TOKEN") {
+                    return Some(AuthCredential::OAuthToken {
+                        access_token: token,
+                        refresh_token: None,
+                        expires_at: None,
+                        account_id: None,
+                    });
+                }
+                if let Some(token) = &file_provider.oauth_token {
+                    return Some(AuthCredential::OAuthToken {
+                        access_token: token.clone(),
+                        refresh_token: None,
+                        expires_at: None,
+                        account_id: None,
                     });
                 }
                 // Database fallback happens in main.rs

@@ -238,7 +238,7 @@ pub struct Cli {
     #[arg(long = "permission", value_parser = parse_permission)]
     pub permission: Option<Permission>,
 
-    /// LLM provider to use (openai-api, claude-api, claude-oauth)
+    /// LLM provider to use (openai-api, openai-codex, claude-api, claude-oauth)
     #[arg(long = "provider")]
     pub provider: Option<String>,
 
