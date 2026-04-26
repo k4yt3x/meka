@@ -8,7 +8,7 @@ A general-purpose AI agent runtime.
 > [!WARNING]
 > Agents can consume a large number of tokens on complex tasks. If you're on a subscription, be prepared for quota exhaustion; if you are billed per token, it is recommended that you set a spending limit on the API key.
 
-![agsh Screenshot](https://github.com/user-attachments/assets/26d8cb43-234d-45dd-aca6-67ce86fff91a)
+![agsh Screenshot](https://github.com/user-attachments/assets/e94c40ee-76ae-4b00-bcfe-1c1d9d075a2b)
 
 ## Overview
 
@@ -16,7 +16,7 @@ agsh is a general-purpose AI agent runtime that provides LLMs with a rich set of
 
 Supported providers:
 
-- **OpenAI API** — bring your own API key. Also works with any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter, …).
+- **OpenAI API** — bring your own API key. Also works with any OpenAI-compatible endpoint.
 - **OpenAI Codex** — authenticate with a ChatGPT subscription.
 - **Claude API** — bring your own API key.
 - **Claude OAuth** — authenticate with a Claude subscription.
