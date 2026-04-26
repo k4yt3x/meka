@@ -1,6 +1,6 @@
 # Introduction
 
-**agsh** (agentic shell) is a shell where you type natural language instead of commands. An LLM interprets your instructions and executes them using built-in tools like file operations, search, web access, and shell command execution.
+**agsh** is a general-purpose AI agent runtime that provides LLMs with a rich set of tools — web search, shell execution, file editing, and more — to accomplish complex tasks. Use it as a natural-language shell, a system diagnostic helper, a research or data-analysis assistant, for general Q&A, or to add agentic capabilities to other applications.
 
 ```text
 agsh [r] > find all Rust files in this project and count the lines of code
@@ -14,7 +14,7 @@ Instead of remembering `find . -name '*.rs' | xargs wc -l`, you describe what yo
 - **Built-in tools** -- file read/write/edit, glob search, regex content search (ripgrep), web fetch, web search, shell command execution
 - **Scratchpad** -- session-scoped working memory for the agent to store and retrieve intermediate results
 - **Sub-agents** -- delegate research tasks to read-only sub-agents
-- **Multiple LLM providers** -- OpenAI API, Claude API, and Claude OAuth (Claude Code subscription), with support for any OpenAI-compatible endpoint
+- **Multiple LLM providers** -- OpenAI API, OpenAI Codex (ChatGPT subscription), Claude API, and Claude OAuth (Claude subscription), with support for any OpenAI-compatible endpoint
 - **MCP support** -- extend the agent with tools from external MCP servers
 - **Permission system** -- control what the agent can do (none/read/ask/write), switchable mid-session
 - **Session management** -- conversations are persisted in SQLite; resume, export, or compact any session

@@ -1,6 +1,6 @@
 # agsh
 
-An agentic shell where you speak human, not bash. Yeah it's a vibe shell.
+A general-purpose AI agent runtime.
 
 > [!CAUTION]
 > Agents can perform potentially destructive actions. Exercise caution when granting write permissions. It is not recommended to run agsh on important systems with write permissions enabled.
@@ -12,7 +12,14 @@ An agentic shell where you speak human, not bash. Yeah it's a vibe shell.
 
 ## Overview
 
-agsh (agentic shell) is an interactive shell that replaces traditional command syntax with natural language. Describe what you want, and the agent reads files, searches code, runs commands, and browses the web to get it done. One binary, one config, works with any OpenAI-compatible or Claude API.
+agsh is a general-purpose AI agent runtime that provides LLMs with a rich set of tools — web search, shell execution, file editing, and more — to accomplish complex tasks. Use it as a natural-language shell, a system diagnostic helper, a research or data-analysis assistant, for general Q&A, or to add agentic capabilities to other applications.
+
+Supported providers:
+
+- **OpenAI API** — bring your own API key. Also works with any OpenAI-compatible endpoint (Ollama, vLLM, OpenRouter, …).
+- **OpenAI Codex** — authenticate with a ChatGPT subscription.
+- **Claude API** — bring your own API key.
+- **Claude OAuth** — authenticate with a Claude subscription.
 
 ## Installation
 
@@ -24,7 +31,9 @@ cargo install --locked --git https://github.com/k4yt3x/agsh.git
 
 ## Quick Start
 
-1. Create `~/.config/agsh/config.toml` and configure the provider and model you want to use. For example, to use OpenRouter with a Claude model:
+Run `agsh setup` for an interactive wizard that picks a provider, runs the OAuth login if applicable, and writes the config for you.
+
+To configure manually, create `~/.config/agsh/config.toml`. For example, to use OpenRouter with a Claude model:
 
 ```toml
 [provider]
@@ -34,7 +43,7 @@ api_key = "sk-or-v1-..."
 model = "anthropic/claude-opus-4.6"
 ```
 
-2. Run `agsh` and start typing. Press Shift+Tab to cycle permissions (none, read, ask, write):
+Run `agsh` and start typing. Press Shift+Tab to cycle permissions (none, read, ask, write):
 
 ```
 agsh [r] > find all TODO comments in this project
@@ -56,8 +65,11 @@ The agent has access to the following built-in tools:
 - **Scratchpad**: session-scoped working memory (write, read, edit, list, delete)
 - **TodoWrite**: structured task tracking for multi-step work
 - **SpawnAgent**: delegate research tasks to a read-only sub-agent
+- **Skill**: load reusable prompt templates on demand
+- **RenderImage**: render an image into the conversation for vision-capable models
+- **MCP resources / prompts**: read or render content from configured MCP servers
 
-All tools support an optional `scratchpad` parameter to save output directly to the scratchpad.
+Long-output tools support an optional `scratchpad` parameter to save output directly to the scratchpad.
 
 ## Permissions
 
@@ -81,7 +93,7 @@ Conversations are persisted in a local SQLite database and can be resumed:
 
 ## Features
 
-- **Extended thinking**: Claude models use extended thinking by default (adaptive for 4.6+)
+- **Extended/adaptive thinking**: enabled by default for Claude models that support it
 - **Syntax-highlighted output**: bat-powered markdown rendering with code block highlighting
 - **Auto-compact**: automatically compacts the conversation when approaching the context limit
 - **MCP support**: extend the agent with tools from external MCP servers

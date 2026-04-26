@@ -6,7 +6,7 @@ mod file;
 mod find;
 mod grep;
 pub(crate) mod mcp_resources;
-mod render;
+mod render_image;
 pub(crate) mod scratchpad;
 mod shell;
 mod skill;
@@ -417,7 +417,7 @@ impl ToolRegistry {
         registry.register_builtin(Arc::new(skill::SkillTool {
             session_id: shared_session_id.clone(),
         }));
-        registry.register_builtin(Arc::new(render::RenderImageTool {
+        registry.register_builtin(Arc::new(render_image::RenderImageTool {
             session_id: shared_session_id.clone(),
             session_manager: session_manager.clone(),
         }));

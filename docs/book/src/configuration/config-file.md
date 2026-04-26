@@ -33,6 +33,7 @@ The LLM provider to use.
 | Value | Description |
 |-------|-------------|
 | `openai-api` | OpenAI Chat Completions API (also works with OpenAI-compatible APIs) |
+| `openai-codex` | OpenAI Responses API via ChatGPT subscription OAuth, against `chatgpt.com/backend-api/codex` |
 | `claude-api` | Claude Messages API with `x-api-key` auth |
 | `claude-oauth` | Claude Messages API via Claude Code OAuth (fingerprinting + attestation) |
 
@@ -40,8 +41,8 @@ The LLM provider to use.
 
 The model identifier to send to the provider. Examples:
 
-- `gpt-4o`, `gpt-4o-mini` (OpenAI)
-- `claude-sonnet-4-20250514`, `claude-haiku-4-5-20251001` (Claude)
+- `gpt-4o`, `gpt-4o-mini`, `gpt-5` (OpenAI)
+- `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5` (Claude)
 - Any model supported by an OpenAI-compatible endpoint
 
 ### `provider.api_key`
@@ -50,11 +51,14 @@ The API key for authentication. It is recommended to use environment variables (
 
 ### `provider.oauth_token`
 
-OAuth access token for the `claude-oauth` provider. Can also be set via `CLAUDE_OAUTH_TOKEN` env var. The token is saved to the database on first use and loaded automatically on subsequent launches.
+OAuth access token for the `claude-oauth` and `openai-codex` providers. Equivalent env vars: `CLAUDE_OAUTH_TOKEN` (claude-oauth) or `OPENAI_CODEX_TOKEN` (openai-codex). Run `agsh setup` to obtain one interactively. The token is saved to the database on first use and loaded automatically on subsequent launches.
 
 ### `provider.oauth_token_url`
 
-Custom OAuth token refresh endpoint. Defaults to `https://console.anthropic.com/v1/oauth/token`.
+Custom OAuth token refresh endpoint. Defaults:
+
+- `https://api.anthropic.com/v1/oauth/token` for `claude-oauth`
+- `https://auth.openai.com/oauth/token` for `openai-codex`
 
 ### `provider.base_url`
 
@@ -67,6 +71,7 @@ Custom API base URL. Useful for:
 If not set, defaults to:
 
 - `https://api.openai.com/v1` for the `openai-api` provider
+- `https://chatgpt.com` for the `openai-codex` provider (request path is `/backend-api/codex/responses`)
 - `https://api.anthropic.com` for the `claude-api` and `claude-oauth` providers
 
 ### `provider.reasoning_effort`
@@ -131,7 +136,7 @@ model = "gpt-4o"
 ```toml
 [provider]
 name = "claude-api"
-model = "claude-sonnet-4-20250514"
+model = "claude-opus-4-6"
 # API key via env: export CLAUDE_API_KEY=sk-ant-api03-...
 ```
 
@@ -140,9 +145,19 @@ model = "claude-sonnet-4-20250514"
 ```toml
 [provider]
 name = "claude-oauth"
-model = "claude-sonnet-4-20250514"
+model = "claude-opus-4-6"
 # Run `agsh setup` to perform the OAuth login, or:
 # export CLAUDE_OAUTH_TOKEN=sk-ant-oat01-...
+```
+
+### OpenAI Codex (ChatGPT subscription)
+
+```toml
+[provider]
+name = "openai-codex"
+model = "gpt-5"
+# Run `agsh setup` to perform the OAuth login, or:
+# export OPENAI_CODEX_TOKEN=...
 ```
 
 ### Ollama (local)
@@ -160,7 +175,7 @@ base_url = "http://localhost:11434/v1"
 ```toml
 [provider]
 name = "openai-api"
-model = "anthropic/claude-sonnet-4-20250514"
+model = "anthropic/claude-sonnet-4.6"
 base_url = "https://openrouter.ai/api/v1"
 # API key via env: export OPENAI_API_KEY=sk-or-...
 ```
@@ -382,10 +397,17 @@ Maximum number of tokens the model can use for thinking (for non-adaptive models
 
 Default: `16000`
 
+### `thinking.show_content`
+
+Whether to render thinking blocks inline in the terminal as the model produces them. When `false`, thinking is silently consumed (still sent on subsequent turns for cache continuity, just not displayed). When `true`, thinking deltas are streamed under a dimmed header.
+
+Default: `false`
+
 ```toml
 [thinking]
 enabled = true
 budget_tokens = 20000
+show_content = true
 ```
 
 ## `[prompt]`
@@ -548,38 +570,6 @@ disabled_tools = ["delete_file", "move_file"]
 MCP tools are registered with namespaced names in the format `servername__toolname` to prevent collisions with built-in tools or between servers.
 
 Tool and resource descriptions returned from MCP servers are truncated at 2048 characters to keep the system prompt bounded.
-
-### `[tools]` — built-in tool filters
-
-The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to agsh's built-in tools (`read_file`, `write_file`, `execute_command`, `web_search`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces — this block only affects the built-ins.
-
-| Key | Purpose |
-|---|---|
-| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register. Use `agsh tools list` to see the canonical names. |
-| `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
-| `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `ask`, `write`. |
-
-Stale entries (a name that doesn't match any built-in) emit a `warn!` at startup. agsh still starts — the warning just flags a likely typo or a tool the binary renamed.
-
-Restrict a session to read-only inspection:
-```toml
-[tools]
-allowed_tools = ["read_file", "find_files", "search_contents", "fetch_url"]
-```
-
-Force `execute_command` to need `write` so `ask` mode prompts for every shell call:
-```toml
-[tools.tool_permissions]
-execute_command = "write"
-```
-
-Disable web access entirely in a locked-down environment:
-```toml
-[tools]
-disabled_tools = ["web_search", "fetch_url"]
-```
-
-Sub-agents spawned via `spawn_agent` inherit the same filter — a disabled built-in is disabled everywhere. Run `agsh tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
 
 ### Environment variable substitution
 
@@ -861,3 +851,35 @@ redirect_port = 8400
 ```
 
 If `client_id` is omitted, agsh attempts [dynamic client registration](https://datatracker.ietf.org/doc/html/rfc7591) with the server.
+
+## `[tools]` — built-in tool filters
+
+The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to agsh's built-in tools (`read_file`, `write_file`, `execute_command`, `web_search`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces — this block only affects the built-ins.
+
+| Key | Purpose |
+|---|---|
+| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register. Use `agsh tools list` to see the canonical names. |
+| `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
+| `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `ask`, `write`. |
+
+Stale entries (a name that doesn't match any built-in) emit a `warn!` at startup. agsh still starts — the warning just flags a likely typo or a tool the binary renamed.
+
+Restrict a session to read-only inspection:
+```toml
+[tools]
+allowed_tools = ["read_file", "find_files", "search_contents", "fetch_url"]
+```
+
+Force `execute_command` to need `write` so `ask` mode prompts for every shell call:
+```toml
+[tools.tool_permissions]
+execute_command = "write"
+```
+
+Disable web access entirely in a locked-down environment:
+```toml
+[tools]
+disabled_tools = ["web_search", "fetch_url"]
+```
+
+Sub-agents spawned via `spawn_agent` inherit the same filter — a disabled built-in is disabled everywhere. Run `agsh tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
