@@ -12,6 +12,7 @@ Environment variables override config file values but are overridden by CLI flag
 | `AGSH_MODEL` | Model identifier | `gpt-4o`, `claude-sonnet-4-20250514` |
 | `AGSH_PERMISSION` | Default permission mode | `none`, `read`, `write` |
 | `AGSH_CONFIG_DIR` | Override the default config directory. Points at the `agsh` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform — `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. | `/tmp/agsh-test/agsh` |
+| `AGSH_DATA_DIR` | Override the default data directory (where `sessions.db` lives). Same cross-platform escape hatch — `dirs::data_dir()` ignores `$XDG_DATA_HOME` on macOS/Windows. Useful for tests, portable installs, and per-project session isolation. | `/tmp/agsh-test/data/agsh` |
 
 ## MCP Variables
 

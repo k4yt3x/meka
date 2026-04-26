@@ -58,17 +58,16 @@ fn unknown_subcommand_exits_nonzero() {
 
 /// Run `agsh` with an isolated config + data directory so host state
 /// (e.g. `~/.config/agsh/config.toml`) doesn't leak in, and the test's
-/// writes don't spill out. Sets `AGSH_CONFIG_DIR` (the only env var that
-/// works on every platform — `dirs::config_dir()` ignores
-/// `XDG_CONFIG_HOME` on macOS/Windows). The XDG + HOME env vars are
-/// also set so the session DB lands under the tempdir on Linux; the
-/// session code uses `dirs::data_dir()` which still can't be isolated
-/// on macOS/Windows from the test harness, but none of the CLI tests
-/// currently exercise the session DB end-to-end.
+/// writes don't spill out. Sets `AGSH_CONFIG_DIR` and `AGSH_DATA_DIR` —
+/// the only env vars that work on every platform (`dirs::config_dir()`
+/// and `dirs::data_dir()` ignore `XDG_*` on macOS/Windows). Without the
+/// data-dir override, parallel CLI tests collide on a shared
+/// `%APPDATA%/agsh/sessions.db` on Windows and hit SQLite lock contention.
 fn run_isolated(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     agsh()
         .args(args)
         .env("AGSH_CONFIG_DIR", dir.join("agsh"))
+        .env("AGSH_DATA_DIR", dir.join("data").join("agsh"))
         .env("XDG_CONFIG_HOME", dir)
         .env("HOME", dir)
         .env("XDG_DATA_HOME", dir.join("data"))

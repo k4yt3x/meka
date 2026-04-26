@@ -64,6 +64,17 @@ pub struct SessionLock {
 }
 
 fn default_database_path() -> Result<PathBuf> {
+    // `AGSH_DATA_DIR` is the cross-platform override — the only env var that
+    // works on every OS, mirroring how `AGSH_CONFIG_DIR` overrides the config
+    // directory. The value points at the `agsh` data dir itself (the parent
+    // that contains `sessions.db`). Useful for tests, portable installs, and
+    // isolating per-project session state from the global one.
+    if let Ok(value) = std::env::var("AGSH_DATA_DIR")
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value).join("sessions.db"));
+    }
+
     // `dirs::data_dir()` honors XDG_DATA_HOME on Linux and the platform's
     // standard data directory elsewhere. Fall back to `$HOME/.local/share`
     // so a tilde never reaches the filesystem (which doesn't expand it).
@@ -71,8 +82,9 @@ fn default_database_path() -> Result<PathBuf> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
         .ok_or_else(|| {
             AgshError::Config(
-                "could not determine a data directory; set XDG_DATA_HOME or HOME, \
-                 or pass an explicit session database path"
+                "could not determine a data directory; set AGSH_DATA_DIR, \
+                 XDG_DATA_HOME, or HOME, or pass an explicit session database \
+                 path"
                     .into(),
             )
         })?;
