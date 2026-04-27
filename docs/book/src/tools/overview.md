@@ -49,7 +49,7 @@ Any built-in can be allow-listed, blocked, or have its required permission overr
 
 When [MCP servers](../configuration/config-file.md#mcp-servers-mcp) are configured, their tools are registered under a namespaced name of the form `mcp__<server>__<tool>` (e.g. `mcp__notion__notion-search`). The `mcp__` prefix matches [Claude Code](https://github.com/anthropics/claude-code)'s convention and keeps MCP tools from colliding with built-in names. They appear in the system prompt catalogue alongside the built-ins — with their resolved permission level annotated inline — and are called the same way.
 
-agsh also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default (loaded on first use):
+agsh also exposes seven built-in **MCP meta-tools** for browsing server-side resources and prompts. All are deferred by default — call `load_tool` with the exact name to make the schema available on the next turn:
 
 | Tool | Permission | Description |
 |------|-----------|-------------|

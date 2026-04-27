@@ -23,6 +23,71 @@ pub type ToolCatalogueEntry = (String, String, Permission, bool);
 /// cached system prompt bounded when MCP servers advertise 2 KB blobs.
 const TOOL_SUMMARY_MAX_CHARS: usize = 160;
 
+/// Names of the seven built-in MCP-resource helper tools (defined in
+/// `src/tools/mcp_resources.rs`). They share no common simple prefix, so
+/// they're enumerated explicitly. Used to group deferred entries into the
+/// `### MCP resource tools` subsection of `## Tool Discovery`.
+const MCP_RESOURCE_TOOLS: &[&str] = &[
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "list_mcp_prompts",
+    "get_mcp_prompt",
+    "subscribe_mcp_resource",
+    "unsubscribe_mcp_resource",
+    "list_mcp_resource_updates",
+];
+
+/// Bucket deferred catalogue entries by source for the `## Tool Discovery`
+/// section. Returns `(heading, entries)` pairs in a deterministic order:
+/// scratchpad operations, MCP resource tools, then per-MCP-server groups
+/// alphabetically, then a catch-all bucket for any deferred tool that
+/// matches none of those classifiers.
+fn group_deferred_entries<'a>(
+    deferred: &[&'a ToolCatalogueEntry],
+) -> Vec<(String, Vec<&'a ToolCatalogueEntry>)> {
+    let mcp_resource_set: std::collections::HashSet<&str> =
+        MCP_RESOURCE_TOOLS.iter().copied().collect();
+
+    let mut scratchpad: Vec<&ToolCatalogueEntry> = Vec::new();
+    let mut mcp_resource: Vec<&ToolCatalogueEntry> = Vec::new();
+    let mut mcp_servers: std::collections::BTreeMap<String, Vec<&ToolCatalogueEntry>> =
+        std::collections::BTreeMap::new();
+    let mut other: Vec<&ToolCatalogueEntry> = Vec::new();
+
+    for entry in deferred {
+        let name = entry.0.as_str();
+        if name.starts_with("scratchpad_") {
+            scratchpad.push(entry);
+        } else if mcp_resource_set.contains(name) {
+            mcp_resource.push(entry);
+        } else if let Some(rest) = name.strip_prefix("mcp__") {
+            // Format: `mcp__<server>__<tool>`. Split on the first `__` to
+            // isolate the server name; tools without the second separator
+            // are unexpected but bucketed under the literal first segment
+            // so we don't lose them.
+            let server = rest.split("__").next().unwrap_or(rest).to_string();
+            mcp_servers.entry(server).or_default().push(entry);
+        } else {
+            other.push(entry);
+        }
+    }
+
+    let mut groups: Vec<(String, Vec<&ToolCatalogueEntry>)> = Vec::new();
+    if !scratchpad.is_empty() {
+        groups.push(("Scratchpad operations".to_string(), scratchpad));
+    }
+    if !mcp_resource.is_empty() {
+        groups.push(("MCP resource tools".to_string(), mcp_resource));
+    }
+    for (server, entries) in mcp_servers {
+        groups.push((format!("MCP server: {}", server), entries));
+    }
+    if !other.is_empty() {
+        groups.push(("Other".to_string(), other));
+    }
+    groups
+}
+
 /// Collapse whitespace, keep the first sentence, clamp to
 /// [`TOOL_SUMMARY_MAX_CHARS`], append `…` if clipped.
 fn short_description(description: &str) -> String {
@@ -185,24 +250,28 @@ pub fn build_system_prompt(
     }
 
     if !deferred.is_empty() {
-        prompt.push_str("## Additional Tools (loaded on first use)\n\n");
+        prompt.push_str("## Tool Discovery\n\n");
         prompt.push_str(
-            "These tools are registered but their full schemas are not sent \
-             until first use. Summaries below are one-line; full descriptions \
-             load with the schema when you call the tool by name.\n\n",
+            "These tools are registered but their full schemas are not sent by \
+             default to keep the prompt small. Call `load_tool` with a tool's \
+             exact `name` to fetch its schema; the tool becomes available on \
+             your next turn, then call it directly. Summaries below are one-line.\n\n",
         );
-        for (name, description, required, _) in &deferred {
-            let summary = short_description(description);
-            if summary.is_empty() {
-                prompt.push_str(&format!("- **{}** (requires `{}`)\n", name, required));
-            } else {
-                prompt.push_str(&format!(
-                    "- **{}** (requires `{}`): {}\n",
-                    name, required, summary
-                ));
+        for (heading, group) in group_deferred_entries(&deferred) {
+            prompt.push_str(&format!("### {}\n\n", heading));
+            for (name, description, required, _) in &group {
+                let summary = short_description(description);
+                if summary.is_empty() {
+                    prompt.push_str(&format!("- **{}** (requires `{}`)\n", name, required));
+                } else {
+                    prompt.push_str(&format!(
+                        "- **{}** (requires `{}`): {}\n",
+                        name, required, summary
+                    ));
+                }
             }
+            prompt.push('\n');
         }
-        prompt.push('\n');
     }
 
     prompt.push_str("## Guidelines\n\n");
@@ -485,14 +554,13 @@ mod tests {
     fn test_system_prompt_separates_deferred_tools() {
         let catalogue = sample_catalogue();
         let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
-        assert!(prompt.contains("## Additional Tools (loaded on first use)"));
+        assert!(prompt.contains("## Tool Discovery"));
+        assert!(prompt.contains("### Scratchpad operations"));
         assert!(prompt.contains("**scratchpad_read** (requires `read`)"));
         // The deferred tool must NOT appear in the active "Available Tools"
         // section.
         let active_header = prompt.find("## Available Tools").unwrap();
-        let deferred_header = prompt
-            .find("## Additional Tools (loaded on first use)")
-            .unwrap();
+        let deferred_header = prompt.find("## Tool Discovery").unwrap();
         let active_section = &prompt[active_header..deferred_header];
         assert!(!active_section.contains("scratchpad_read"));
     }
@@ -500,20 +568,18 @@ mod tests {
     #[test]
     fn test_system_prompt_truncates_deferred_tool_descriptions() {
         // A 2 KB MCP description must collapse to a one-liner; the
-        // full description still flows through the tool schema on
-        // activation, so the only loss is the prose repeat in the
-        // system prompt.
+        // full description still flows through the tool schema once
+        // `load_tool` exposes it, so the only loss is the prose repeat
+        // in the system prompt.
         let big_desc = "x".repeat(2048);
         let catalogue: Vec<ToolCatalogueEntry> = vec![(
-            "notion-search".to_string(),
+            "mcp__notion__search".to_string(),
             big_desc,
             Permission::Read,
             true,
         )];
         let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
-        let deferred_header = prompt
-            .find("## Additional Tools (loaded on first use)")
-            .unwrap();
+        let deferred_header = prompt.find("## Tool Discovery").unwrap();
         let section_end = prompt[deferred_header..]
             .find("\n## ")
             .map(|idx| deferred_header + idx)
@@ -521,8 +587,8 @@ mod tests {
         let section = &prompt[deferred_header..section_end];
         let entry_line = section
             .lines()
-            .find(|line| line.starts_with("- **notion-search**"))
-            .expect("notion-search entry present");
+            .find(|line| line.starts_with("- **mcp__notion__search**"))
+            .expect("mcp__notion__search entry present");
         // Summary char cap + one-line prose scaffolding; well under the
         // 2048 char full description that used to ship here.
         let line_len = entry_line.chars().count();
@@ -532,6 +598,87 @@ mod tests {
             line_len
         );
         assert!(entry_line.ends_with('…'));
+    }
+
+    #[test]
+    fn test_system_prompt_load_tool_itself_is_active_not_deferred() {
+        // load_tool is the bootstrap meta-tool — listing it under
+        // `## Tool Discovery` would create a chicken-and-egg problem,
+        // so it must always be in the active `## Available Tools`
+        // section, never in the deferred catalogue.
+        let catalogue: Vec<ToolCatalogueEntry> = vec![
+            (
+                "load_tool".to_string(),
+                "Load a deferred tool's schema.".to_string(),
+                Permission::Read,
+                false,
+            ),
+            (
+                "scratchpad_read".to_string(),
+                "Read a scratchpad entry".to_string(),
+                Permission::Read,
+                true,
+            ),
+        ];
+        let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
+        let active_header = prompt.find("## Available Tools").unwrap();
+        let discovery_header = prompt.find("## Tool Discovery").unwrap();
+        let active_section = &prompt[active_header..discovery_header];
+        let discovery_section = &prompt[discovery_header..];
+        assert!(active_section.contains("**load_tool**"));
+        assert!(!discovery_section.contains("**load_tool**"));
+    }
+
+    #[test]
+    fn test_system_prompt_groups_mcp_servers() {
+        let catalogue: Vec<ToolCatalogueEntry> = vec![
+            (
+                "mcp__notion__search".to_string(),
+                "Search Notion".to_string(),
+                Permission::Read,
+                true,
+            ),
+            (
+                "mcp__notion__fetch".to_string(),
+                "Fetch a Notion page".to_string(),
+                Permission::Read,
+                true,
+            ),
+            (
+                "mcp__github__create_issue".to_string(),
+                "Open a GitHub issue".to_string(),
+                Permission::Write,
+                true,
+            ),
+            (
+                "scratchpad_read".to_string(),
+                "Read scratchpad entry".to_string(),
+                Permission::Read,
+                true,
+            ),
+            (
+                "list_mcp_resources".to_string(),
+                "List MCP resources".to_string(),
+                Permission::Read,
+                true,
+            ),
+        ];
+        let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
+        assert!(prompt.contains("### Scratchpad operations"));
+        assert!(prompt.contains("### MCP resource tools"));
+        assert!(prompt.contains("### MCP server: github"));
+        assert!(prompt.contains("### MCP server: notion"));
+        // notion subsection lists both notion tools.
+        let notion_header = prompt.find("### MCP server: notion").unwrap();
+        let notion_section_end = prompt[notion_header..]
+            .find("\n### ")
+            .or_else(|| prompt[notion_header..].find("\n## "))
+            .map(|idx| notion_header + idx)
+            .unwrap_or(prompt.len());
+        let notion_section = &prompt[notion_header..notion_section_end];
+        assert!(notion_section.contains("mcp__notion__search"));
+        assert!(notion_section.contains("mcp__notion__fetch"));
+        assert!(!notion_section.contains("mcp__github__"));
     }
 
     #[test]

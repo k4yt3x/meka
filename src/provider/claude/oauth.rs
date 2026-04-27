@@ -1542,7 +1542,7 @@ mod tests {
         // current permission — that's the invariant we're testing.
         let catalogue = registry.tool_catalogue();
         let system = build_system_prompt(&catalogue, true, &[], None, &[]);
-        let tools = registry.definitions_active();
+        let tools = registry.definitions_active(&[]);
 
         let u1_text = {
             let block = build_turn_context(Permission::Read, &[]);
@@ -1559,7 +1559,7 @@ mod tests {
         // ---- Turn 2 @ Write -------------------------------------------
         let catalogue_t2 = registry.tool_catalogue();
         let system_t2 = build_system_prompt(&catalogue_t2, true, &[], None, &[]);
-        let tools_t2 = registry.definitions_active();
+        let tools_t2 = registry.definitions_active(&[]);
 
         let u2_text = {
             let block = build_turn_context(Permission::Write, &[]);
@@ -1598,6 +1598,122 @@ mod tests {
         assert!(u1_text.contains("Current permission level: read"));
         assert!(u2_text.contains("Current permission level: write"));
         assert_ne!(u1_text, u2_text);
+    }
+
+    /// `load_tool` activation must NOT mutate the cacheable system prompt.
+    /// This is the regression guard for the deferred-tool refactor: when the
+    /// model invokes `load_tool` to expose a deferred tool's schema, the
+    /// system prompt block stays byte-identical (so breakpoint 2 cache
+    /// hits) — the tools array is what grows, append-only, so its prior
+    /// entries also cache (breakpoint 3).
+    ///
+    /// Mirrors [`test_permission_toggle_preserves_cache_prefix`] structurally.
+    #[tokio::test]
+    async fn test_load_tool_preserves_system_prompt_cache() {
+        use std::path::Path;
+
+        use crate::context::{build_system_prompt, build_turn_context};
+        use crate::permission::{Permission, SharedPermission};
+        use crate::session::SessionManager;
+        use crate::tools::ToolRegistry;
+
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory session manager");
+        let shared_permission = SharedPermission::new(Permission::Write);
+        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let registry = ToolRegistry::build_default(
+            crate::config::WebClientConfig::default(),
+            shared_permission,
+            true,
+            crate::sandbox::detect(),
+            todo_list,
+            session_manager,
+            shared_session_id,
+            crate::tools::BuiltinToolFilter::default(),
+        )
+        .expect("default web client config should build cleanly");
+
+        let provider = test_provider();
+        let catalogue = registry.tool_catalogue();
+        let system = build_system_prompt(&catalogue, true, &[], None, &[]);
+
+        // ---- Turn 1: empty history, scratchpad_read is deferred --------
+        let u1_text = {
+            let block = build_turn_context(Permission::Write, &[]);
+            format!("{}\n\n{}", block, "investigate scratchpad")
+        };
+        let messages_t1 = vec![Message::user(&u1_text)];
+        let tools_t1 = registry.definitions_active(&messages_t1);
+        let body_t1 = provider.build_request_body(&system, &messages_t1, &tools_t1, true);
+
+        assert!(
+            !tools_t1.iter().any(|t| t.name == "scratchpad_read"),
+            "scratchpad_read should be deferred in turn 1"
+        );
+
+        // ---- Turn 2: model invoked load_tool for scratchpad_read -------
+        let messages_t2 = vec![
+            Message::user(&u1_text),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "load_tool".to_string(),
+                    input: serde_json::json!({"name": "scratchpad_read"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "schema available".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            },
+        ];
+        // System prompt is rebuilt the same way every turn — its content is
+        // a function of the catalogue, not the messages, so it must not
+        // shift when load_tool is invoked.
+        let catalogue_t2 = registry.tool_catalogue();
+        let system_t2 = build_system_prompt(&catalogue_t2, true, &[], None, &[]);
+        let tools_t2 = registry.definitions_active(&messages_t2);
+        let body_t2 = provider.build_request_body(&system_t2, &messages_t2, &tools_t2, true);
+
+        // 1. The system prompt is byte-identical. (Breakpoint 2 cache-hit.)
+        assert_eq!(
+            body_t1["system"], body_t2["system"],
+            "system prompt diverged across load_tool invocation — cache prefix invalidated"
+        );
+
+        // 2. The tools array gained scratchpad_read (append-only growth).
+        assert!(
+            tools_t2.iter().any(|t| t.name == "scratchpad_read"),
+            "scratchpad_read should be active in turn 2 after load_tool"
+        );
+        assert_eq!(
+            tools_t2.len(),
+            tools_t1.len() + 1,
+            "tools array should grow by exactly one entry after load_tool"
+        );
+
+        // 3. The prior tools (turn-1 set) are present in turn-2 in the same
+        //    relative order — i.e., the prefix is preserved. Stripping
+        //    cache_control because the marker moves to the new last tool.
+        let tools_arr_t1 =
+            strip_tool_cache_control(body_t1["tools"].as_array().expect("tools array in body_t1"));
+        let tools_arr_t2 =
+            strip_tool_cache_control(body_t2["tools"].as_array().expect("tools array in body_t2"));
+        for (idx, tool) in tools_arr_t1.iter().enumerate() {
+            assert_eq!(
+                &tools_arr_t2[idx], tool,
+                "tool at index {} mutated between turns — cache prefix invalidated",
+                idx
+            );
+        }
     }
 
     /// Same invariant, but exercises every pairwise permission toggle
@@ -1643,7 +1759,7 @@ mod tests {
             shared_permission.set(level);
             let catalogue = registry.tool_catalogue();
             let system = build_system_prompt(&catalogue, true, &[], None, &[]);
-            let tools = registry.definitions_active();
+            let tools = registry.definitions_active(&[]);
             let messages = vec![Message::user("hello")];
             bodies.push(provider.build_request_body(&system, &messages, &tools, true));
         }

@@ -939,8 +939,8 @@ async fn run_tools_subcommand(
 
             let catalogue = reference.tool_catalogue();
             println!(
-                "{:<20} {:<9} {:<9} {:<8} description",
-                "NAME", "REQUIRED", "SOURCE", "STATUS"
+                "{:<20} {:<9} {:<9} {:<10} description",
+                "NAME", "REQUIRED", "SOURCE", "VISIBILITY"
             );
             println!("{}", "-".repeat(78));
             for (name, description, required, is_deferred) in &catalogue {
@@ -951,7 +951,7 @@ async fn run_tools_subcommand(
                 } else {
                     "builtin"
                 };
-                let status = if filter.admits(name) {
+                let visibility = if filter.admits(name) {
                     if *is_deferred { "deferred" } else { "enabled" }
                 } else {
                     "disabled"
@@ -964,11 +964,11 @@ async fn run_tools_subcommand(
                     .take(40)
                     .collect::<String>();
                 println!(
-                    "{:<20} {:<9} {:<9} {:<8} {}",
+                    "{:<20} {:<9} {:<9} {:<10} {}",
                     name,
                     effective.to_string(),
                     source,
-                    status,
+                    visibility,
                     short
                 );
             }

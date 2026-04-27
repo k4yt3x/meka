@@ -685,7 +685,7 @@ Inside the REPL:
 
 ### Resources and prompts
 
-In addition to tools, agsh exposes MCP resources and prompts through four builtin tools (deferred — the agent activates them when needed):
+In addition to tools, agsh exposes MCP resources and prompts through several builtin tools (deferred — the agent calls `load_tool` first to fetch the schema, then invokes them):
 
 | Builtin | Purpose |
 |---------|---------|

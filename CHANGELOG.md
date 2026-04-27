@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `load_tool` built-in: meta-tool that exposes a deferred tool's schema for use on the next turn.
+- `## Tool Discovery` system-prompt section: deferred tools grouped by source (scratchpad / MCP).
+
+### Changed
+
+- Deferred tools are now activated by `load_tool` calls in message history (no in-memory state).
+- System prompt is byte-stable across deferred-tool activation (Claude cache breakpoint 2 stays warm).
+- Resumed sessions reconstruct the active tool set from message history — no out-of-band state.
+- REPL `agsh mcp tools` STATUS column renamed to VISIBILITY (`enabled` | `deferred` | `disabled`).
+
+### Removed
+
+- `ToolRegistry::activate()` and the dispatch-side auto-promotion of deferred tools.
+
 ## [0.16.1] - 2026-04-26
 
 ### Fixed

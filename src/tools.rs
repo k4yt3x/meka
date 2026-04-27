@@ -5,6 +5,7 @@
 mod file;
 mod find;
 mod grep;
+mod load_tool;
 pub(crate) mod mcp_resources;
 mod render_image;
 pub(crate) mod scratchpad;
@@ -26,10 +27,54 @@ use uuid::Uuid;
 
 type DeferredSet = Arc<std::sync::RwLock<HashSet<String>>>;
 
+/// Name of the meta-tool that loads a deferred tool's schema. Calls to this
+/// tool are scanned out of message history to compute the per-turn active
+/// tool set; see [`extract_loaded_tool_names`].
+pub const LOAD_TOOL_NAME: &str = "load_tool";
+
 use crate::error::Result;
 use crate::permission::Permission;
-use crate::provider::{ToolDefinition, ToolResultContent};
+use crate::provider::{ContentBlock, Message, ToolDefinition, ToolResultContent};
 use crate::session::SessionManager;
+
+/// Walk the message history and collect the names of tools that have been
+/// loaded via successful `load_tool` calls. A `load_tool` `tool_use` block
+/// counts only when paired with a non-error `tool_result` whose
+/// `tool_use_id` matches; this excludes errored loads (unknown name,
+/// malformed args) and orphan `tool_use` blocks awaiting their result.
+///
+/// The active set is a pure function of the message slice, so the tools
+/// array sent to the Claude API is deterministic given the conversation
+/// state. Resumed sessions reconstruct the exact active set their suspend
+/// time had, with no out-of-band state.
+pub fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String> {
+    let mut pending: HashMap<String, String> = HashMap::new();
+    let mut loaded: HashSet<String> = HashSet::new();
+    for message in messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, name, input } if name == LOAD_TOOL_NAME => {
+                    if let Some(loaded_name) = input.get("name").and_then(|v| v.as_str()) {
+                        pending.insert(id.clone(), loaded_name.to_string());
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => {
+                    if let Some(loaded_name) = pending.remove(tool_use_id)
+                        && !is_error
+                    {
+                        loaded.insert(loaded_name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    loaded
+}
 
 /// Built-in tool policy from `[tools]` in `config.toml`. Mirrors the three
 /// knobs [`crate::config::McpServerConfig`] exposes for MCP tools.
@@ -79,6 +124,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "execute_command",
     "fetch_url",
     "find_files",
+    "load_tool",
     "read_file",
     "render_image",
     "scratchpad_delete",
@@ -240,21 +286,17 @@ impl ToolRegistry {
         }
     }
 
-    /// Mark a tool as deferred. Deferred tools are available for execution but
-    /// not included in the API tool definitions until auto-activated.
+    /// Mark a tool as deferred. Deferred tools live in the registry but are
+    /// hidden from the per-turn tools array until the model explicitly
+    /// loads them via the `load_tool` meta-tool. Discoverability is
+    /// preserved by the `## Tool Discovery` section of the system prompt
+    /// (built from `tool_catalogue()`), and the active set is recomputed
+    /// per turn from message history, not from registry state.
     pub fn mark_deferred(&self, name: &str) {
         self.deferred
             .write()
             .expect("deferred lock poisoned")
             .insert(name.to_string());
-    }
-
-    /// Activate a deferred tool so it appears in subsequent API calls.
-    pub fn activate(&self, name: &str) {
-        self.deferred
-            .write()
-            .expect("deferred lock poisoned")
-            .remove(name);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -273,14 +315,6 @@ impl ToolRegistry {
             return Some(*permission);
         }
         self.get(name).map(|tool| tool.required_permission())
-    }
-
-    /// Check if a tool is registered but currently deferred.
-    pub fn is_deferred(&self, name: &str) -> bool {
-        self.deferred
-            .read()
-            .expect("deferred lock poisoned")
-            .contains(name)
     }
 
     /// Returns tool definitions for the API call, excluding deferred tools.
@@ -307,18 +341,26 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Returns every active (non-deferred) tool definition regardless of the
-    /// caller's current permission. Blocked calls are rejected at dispatch;
-    /// keeping the tools array permission-independent is what preserves the
-    /// prompt cache prefix across `/permission` toggles (breakpoint 3 in the
-    /// Claude provider's cache layout).
-    pub fn definitions_active(&self) -> Vec<ToolDefinition> {
+    /// Returns every active tool definition regardless of the caller's
+    /// current permission. The active set is the union of non-deferred
+    /// tools and deferred tools whose schema has been loaded via the
+    /// `load_tool` meta-tool — derived by scanning `messages` for
+    /// successful `load_tool` calls (see [`extract_loaded_tool_names`]).
+    /// Blocked calls are rejected at dispatch; keeping the tools array
+    /// permission-independent is what preserves the prompt cache prefix
+    /// across `/permission` toggles (breakpoint 3 in the Claude provider's
+    /// cache layout).
+    pub fn definitions_active(&self, messages: &[Message]) -> Vec<ToolDefinition> {
+        let loaded = extract_loaded_tool_names(messages);
         let deferred = self.deferred.read().expect("deferred lock poisoned");
         self.tools
             .read()
             .expect("tools lock poisoned")
             .iter()
-            .filter(|tool| !deferred.contains(&tool.definition().name))
+            .filter(|tool| {
+                let name = tool.definition().name;
+                !deferred.contains(&name) || loaded.contains(&name)
+            })
             .map(|tool| tool.definition())
             .collect()
     }
@@ -414,6 +456,10 @@ impl ToolRegistry {
             sandbox_enabled,
             sandbox_capability,
         )?;
+        registry.register_builtin(Arc::new(load_tool::LoadToolTool {
+            tools: Arc::downgrade(&registry.tools),
+            deferred: Arc::downgrade(&registry.deferred),
+        }));
         registry.register_builtin(Arc::new(skill::SkillTool {
             session_id: shared_session_id.clone(),
         }));
@@ -510,6 +556,216 @@ mod tests {
         .expect("default web client config should build cleanly")
     }
 
+    use crate::provider::Role;
+
+    fn load_tool_use(id: &str, target: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: LOAD_TOOL_NAME.to_string(),
+                input: serde_json::json!({ "name": target }),
+            }],
+        }
+    }
+
+    fn tool_result(use_id: &str, body: &str, is_error: bool) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: use_id.to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: body.to_string(),
+                }],
+                is_error,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_empty() {
+        assert!(extract_loaded_tool_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_single_success() {
+        let messages = vec![
+            load_tool_use("u1", "scratchpad_read"),
+            tool_result("u1", "loaded", false),
+        ];
+        let loaded = extract_loaded_tool_names(&messages);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains("scratchpad_read"));
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_error_excluded() {
+        let messages = vec![
+            load_tool_use("u1", "missing_tool"),
+            tool_result("u1", "Error: not registered", true),
+        ];
+        assert!(extract_loaded_tool_names(&messages).is_empty());
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_orphan_use() {
+        // load_tool was issued but the tool_result hasn't arrived yet.
+        let messages = vec![load_tool_use("u1", "scratchpad_read")];
+        assert!(extract_loaded_tool_names(&messages).is_empty());
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_ignores_other_tools() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "u1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({ "name": "anything" }),
+                }],
+            },
+            tool_result("u1", "ok", false),
+        ];
+        assert!(extract_loaded_tool_names(&messages).is_empty());
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_malformed_input() {
+        // load_tool called with no `name` field — must not panic, must not
+        // pollute the active set.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "u1".to_string(),
+                    name: LOAD_TOOL_NAME.to_string(),
+                    input: serde_json::json!({}),
+                }],
+            },
+            tool_result("u1", "Error", true),
+        ];
+        assert!(extract_loaded_tool_names(&messages).is_empty());
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_multiple_loads_dedup() {
+        let messages = vec![
+            load_tool_use("u1", "scratchpad_read"),
+            tool_result("u1", "ok", false),
+            load_tool_use("u2", "scratchpad_edit"),
+            tool_result("u2", "ok", false),
+            load_tool_use("u3", "scratchpad_read"),
+            tool_result("u3", "already available", false),
+        ];
+        let loaded = extract_loaded_tool_names(&messages);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains("scratchpad_read"));
+        assert!(loaded.contains("scratchpad_edit"));
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_multi_block_message() {
+        // The model can emit several `tool_use` blocks in one assistant
+        // message — the matching `tool_result`s come back as separate
+        // blocks of one user message. Both must be processed.
+        let assistant = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "u1".to_string(),
+                    name: LOAD_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"name": "scratchpad_read"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "u2".to_string(),
+                    name: LOAD_TOOL_NAME.to_string(),
+                    input: serde_json::json!({"name": "scratchpad_edit"}),
+                },
+            ],
+        };
+        let user_results = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "u1".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "ok".to_string(),
+                    }],
+                    is_error: false,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "u2".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "ok".to_string(),
+                    }],
+                    is_error: false,
+                },
+            ],
+        };
+        let loaded = extract_loaded_tool_names(&[assistant, user_results]);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains("scratchpad_read"));
+        assert!(loaded.contains("scratchpad_edit"));
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_mismatched_id() {
+        // tool_result references an id that no `load_tool` use claimed.
+        // The result is dropped; the orphan use stays unmatched and is
+        // not added to the active set.
+        let messages = vec![
+            load_tool_use("u1", "scratchpad_read"),
+            tool_result("u_other", "ok", false),
+        ];
+        assert!(extract_loaded_tool_names(&messages).is_empty());
+    }
+
+    #[test]
+    fn test_extract_loaded_tool_names_interleaved_with_other_tool_calls() {
+        // load_tool calls share the message stream with regular tool calls;
+        // the scanner must pair on tool_use_id, not on positional adjacency.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "u1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "/tmp/x"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "u2".to_string(),
+                        name: LOAD_TOOL_NAME.to_string(),
+                        input: serde_json::json!({"name": "scratchpad_read"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "u1".to_string(),
+                        content: vec![ToolResultContent::Text {
+                            text: "x contents".to_string(),
+                        }],
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "u2".to_string(),
+                        content: vec![ToolResultContent::Text {
+                            text: "loaded".to_string(),
+                        }],
+                        is_error: false,
+                    },
+                ],
+            },
+        ];
+        let loaded = extract_loaded_tool_names(&messages);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains("scratchpad_read"));
+    }
+
     #[tokio::test]
     async fn test_tool_registry() {
         let registry = test_registry().await;
@@ -529,6 +785,7 @@ mod tests {
         assert!(registry.get("scratchpad_delete").is_some());
         assert!(registry.get("skill").is_some());
         assert!(registry.get("render_image").is_some());
+        assert!(registry.get("load_tool").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
 
@@ -554,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn test_definitions_active_includes_write_tools() {
         let registry = test_registry().await;
-        let active = registry.definitions_active();
+        let active = registry.definitions_active(&[]);
         assert!(active.iter().any(|t| t.name == "read_file"));
         assert!(active.iter().any(|t| t.name == "write_file"));
         assert!(active.iter().any(|t| t.name == "edit_file"));
@@ -565,12 +822,71 @@ mod tests {
     #[tokio::test]
     async fn test_definitions_active_stable_across_permissions() {
         let registry = test_registry().await;
-        let a = registry.definitions_active();
-        let b = registry.definitions_active();
+        let a = registry.definitions_active(&[]);
+        let b = registry.definitions_active(&[]);
         assert_eq!(a.len(), b.len());
         let a_names: Vec<_> = a.iter().map(|t| t.name.clone()).collect();
         let b_names: Vec<_> = b.iter().map(|t| t.name.clone()).collect();
         assert_eq!(a_names, b_names);
+    }
+
+    #[tokio::test]
+    async fn test_definitions_active_exposes_loaded_deferred_tool() {
+        // End-to-end: a successful load_tool call in message history
+        // promotes the named tool into the active set on the next call.
+        let registry = test_registry().await;
+        let baseline = registry.definitions_active(&[]);
+        assert!(!baseline.iter().any(|t| t.name == "scratchpad_read"));
+
+        let messages = vec![
+            load_tool_use("u1", "scratchpad_read"),
+            tool_result("u1", "ok", false),
+        ];
+        let after_load = registry.definitions_active(&messages);
+        assert!(after_load.iter().any(|t| t.name == "scratchpad_read"));
+        // Append-only: the tools array gains exactly one entry.
+        assert_eq!(after_load.len(), baseline.len() + 1);
+        // Other deferred scratchpad tools are unaffected.
+        assert!(!after_load.iter().any(|t| t.name == "scratchpad_edit"));
+    }
+
+    #[tokio::test]
+    async fn test_definitions_active_errored_load_stays_hidden() {
+        // A load_tool call that ended in an error tool_result must NOT
+        // expose the deferred tool — the model's parameter shape was
+        // wrong, the schema was not delivered.
+        let registry = test_registry().await;
+        let messages = vec![
+            load_tool_use("u1", "scratchpad_read"),
+            tool_result("u1", "Error", true),
+        ];
+        let active = registry.definitions_active(&messages);
+        assert!(!active.iter().any(|t| t.name == "scratchpad_read"));
+    }
+
+    #[tokio::test]
+    async fn test_definitions_active_load_tool_itself_always_visible() {
+        // load_tool is the bootstrap meta-tool — it must appear in the
+        // active set for an empty conversation, otherwise the model has
+        // no way to discover deferred tools.
+        let registry = test_registry().await;
+        let active = registry.definitions_active(&[]);
+        assert!(active.iter().any(|t| t.name == "load_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_definitions_active_unknown_load_silently_dropped() {
+        // load_tool was called for a tool that isn't registered. The
+        // scanner records the (errored) result as not loaded, and even
+        // if it were loaded, the registry just doesn't contain a tool
+        // by that name — no crash, no spurious entry.
+        let registry = test_registry().await;
+        let messages = vec![
+            load_tool_use("u1", "no_such_tool"),
+            tool_result("u1", "Error: not registered", true),
+        ];
+        let active = registry.definitions_active(&messages);
+        assert!(!active.iter().any(|t| t.name == "no_such_tool"));
     }
 
     #[tokio::test]
@@ -814,6 +1130,7 @@ mod tests {
             "skill",
             "render_image",
             "spawn_agent",
+            "load_tool",
         ] {
             assert!(
                 names.contains(expected),

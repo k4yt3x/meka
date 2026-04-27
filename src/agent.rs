@@ -207,7 +207,6 @@ impl Agent {
         };
         let user_message = Message::user(&augmented_input);
         messages.push(user_message);
-        let tools = self.tool_registry.definitions_active();
         let skills = crate::skills::discover_skills();
         let mcp_instructions = self
             .mcp_manager
@@ -240,6 +239,13 @@ impl Agent {
                 } else {
                     base_messages.clone()
                 };
+
+                // Recompute the active tool set every iteration so a
+                // `load_tool` call earlier in this turn becomes visible to
+                // the model on the very next request — without mutating
+                // any registry state. Append-only growth keeps the tools
+                // array's cache prefix stable.
+                let tools = self.tool_registry.definitions_active(&api_messages);
 
                 let (assistant_message, stop_reason, usage) = match if self.options.streaming {
                     self.run_streaming(
@@ -628,12 +634,6 @@ impl Agent {
             .and_then(|v| v.as_str())
         {
             return crate::tools::ToolOutput::text(format!("Tool call rejected: {}", reason), true);
-        }
-
-        // Auto-activate deferred tools on first use so their full schema
-        // appears in subsequent API calls.
-        if self.tool_registry.is_deferred(name) {
-            self.tool_registry.activate(name);
         }
 
         let Some(tool) = self.tool_registry.get(name) else {
