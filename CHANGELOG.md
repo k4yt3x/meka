@@ -5,23 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.0] - 2026-04-28
 
 ### Added
 
-- `load_tool` built-in: meta-tool that exposes a deferred tool's schema for use on the next turn.
-- `## Tool Discovery` system-prompt section: deferred tools grouped by source (scratchpad / MCP).
+- `load_tool` meta-tool: exposes a deferred tool's schema for use on the next turn.
+- `## Tool Discovery` system-prompt section: deferred tools grouped by source.
+- `Conversation` newtype wraps the message log; only `append` plus three named methods mutate it.
+- Event-sourced conversation persistence: `Vec<Event>` (`Append` + `CompactBoundary`).
+- `CompactBoundary::loaded_tools_snapshot` carries the active deferred-tool set across compaction.
 
 ### Changed
 
-- Deferred tools are now activated by `load_tool` calls in message history (no in-memory state).
-- System prompt is byte-stable across deferred-tool activation (Claude cache breakpoint 2 stays warm).
-- Resumed sessions reconstruct the active tool set from message history — no out-of-band state.
-- REPL `agsh mcp tools` STATUS column renamed to VISIBILITY (`enabled` | `deferred` | `disabled`).
+- Deferred tools are activated by `load_tool` calls in the conversation (no in-memory state).
+- System prompt is byte-stable across deferred-tool activation (cache breakpoint 2 stays warm).
+- Resumed sessions reconstruct the active tool set from the conversation — no out-of-band state.
+- REPL `agsh mcp tools` STATUS column renamed to VISIBILITY.
+- `compact_session` appends a `compact_boundary` row instead of DELETEing — log stays append-only.
+- All conversation persistence flows through `save_event` / `load_events`.
+- Terminology unified: `Conversation` (type), `Event` (storage atom), `Message` (API atom).
 
 ### Removed
 
-- `ToolRegistry::activate()` and the dispatch-side auto-promotion of deferred tools.
+- `ToolRegistry::activate()` and dispatch-side auto-promotion of deferred tools.
+- `SessionManager::clear_messages_only` — no caller after the event-log refactor.
+- `pub` visibility on `save_message` / `load_messages` / `StoredMessage` — internal helpers now.
 
 ## [0.16.1] - 2026-04-26
 

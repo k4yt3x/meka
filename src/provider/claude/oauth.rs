@@ -1716,6 +1716,101 @@ mod tests {
         }
     }
 
+    /// Compaction must not silently drop the deferred-tool active set.
+    /// Pre-compaction, the model loads `scratchpad_read` via `load_tool`;
+    /// post-compaction, the `Event::CompactBoundary::loaded_tools_snapshot`
+    /// must keep `scratchpad_read` in the API tools array even though the
+    /// pre-compaction `load_tool` rows have moved below the materialized
+    /// view's logical start.
+    #[tokio::test]
+    async fn test_compaction_preserves_loaded_tools_active_set() {
+        use std::path::Path;
+
+        use crate::conversation::{Conversation, Event, extract_loaded_tool_names_from_events};
+        use crate::permission::{Permission, SharedPermission};
+        use crate::session::SessionManager;
+        use crate::tools::ToolRegistry;
+
+        let session_manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("in-memory session manager");
+        let shared_permission = SharedPermission::new(Permission::Write);
+        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        let registry = ToolRegistry::build_default(
+            crate::config::WebClientConfig::default(),
+            shared_permission,
+            true,
+            crate::sandbox::detect(),
+            todo_list,
+            session_manager,
+            shared_session_id,
+            crate::tools::BuiltinToolFilter::default(),
+        )
+        .expect("default web client config should build cleanly");
+
+        // ---- Pre-compaction: load scratchpad_read via load_tool. ----
+        let mut log = Conversation::new();
+        log.append(Message::user("question 1"));
+        log.append(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "u1".to_string(),
+                name: "load_tool".to_string(),
+                input: serde_json::json!({"name": "scratchpad_read"}),
+            }],
+        });
+        log.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "u1".to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: "loaded".to_string(),
+                }],
+                is_error: false,
+            }],
+        });
+
+        let pre_loaded = extract_loaded_tool_names_from_events(log.events());
+        assert!(pre_loaded.contains("scratchpad_read"));
+        let pre_tools = registry.definitions_active_with_loaded(&pre_loaded);
+        assert!(pre_tools.iter().any(|t| t.name == "scratchpad_read"));
+
+        // ---- Compact: the snapshot carries the loaded set forward. ----
+        log.replace_for_compaction(
+            Message::user("[summary]"),
+            vec![Message::user("question 2")],
+            pre_loaded.clone(),
+        );
+
+        // The materialized view shrank — but events are append-only.
+        let post_loaded = extract_loaded_tool_names_from_events(log.events());
+        assert!(
+            post_loaded.contains("scratchpad_read"),
+            "compaction must preserve the loaded-tools active set via the snapshot"
+        );
+
+        // The active tool set the agent sends to the API still includes
+        // scratchpad_read post-compaction.
+        let post_tools = registry.definitions_active_with_loaded(&post_loaded);
+        assert!(post_tools.iter().any(|t| t.name == "scratchpad_read"));
+
+        // The post-compaction event log must have grown, never shrunk.
+        let boundary_count = log
+            .events()
+            .iter()
+            .filter(|e| matches!(e, Event::CompactBoundary { .. }))
+            .count();
+        assert_eq!(boundary_count, 1);
+        let append_count = log
+            .events()
+            .iter()
+            .filter(|e| matches!(e, Event::Append(_)))
+            .count();
+        // 3 pre-compaction Appends + 1 tail Append = 4.
+        assert_eq!(append_count, 4);
+    }
+
     /// Same invariant, but exercises every pairwise permission toggle
     /// (16 combinations). Catches any permission state that sneaks back
     /// into the cacheable prefix.

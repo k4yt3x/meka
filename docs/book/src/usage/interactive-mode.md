@@ -109,9 +109,9 @@ agsh supports `/` prefix commands for controlling the shell:
 
 ### `/compact`
 
-The `/compact` command asks the LLM to summarize the entire conversation, then replaces the message history with a single summary message. This is useful for long sessions that are approaching the context window limit or becoming expensive.
+The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with a single summary message followed by the recent tail. This is useful for long sessions that are approaching the context window limit or becoming expensive.
 
-After compacting, the session continues with the summary as context. The previous messages are removed from both memory and the database.
+After compacting, the session continues with the summary as context. The pre-compaction messages stay in the underlying event log on disk — the model just no longer sees them — so `agsh export` and resume continue to work exactly as if the compaction had wiped them.
 
 ## Shell Escape
 

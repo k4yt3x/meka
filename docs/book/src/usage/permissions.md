@@ -70,7 +70,7 @@ Only read-only tools are executable.
 </context>
 ```
 
-That two-line block is the only permission-dependent content in the request. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache — the entire message history stays warm.
+That two-line block is the only permission-dependent content in the request. The system prompt and the tools-array schemas stay byte-identical across `/permission` toggles, so mid-session level changes don't invalidate the Claude prompt cache — the entire conversation stays warm.
 
 ### MCP tool permissions
 

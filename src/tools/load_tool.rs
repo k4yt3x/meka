@@ -1,6 +1,6 @@
 //! `load_tool` meta-tool: makes a deferred tool's full schema visible to the
 //! model on subsequent turns. The active tool set is derived by scanning
-//! message history for successful `load_tool` calls
+//! the conversation for successful `load_tool` calls
 //! ([`super::extract_loaded_tool_names`]); this tool's `execute` only renders
 //! the description and schema as `tool_result` text — it never mutates the
 //! registry.

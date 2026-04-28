@@ -10,6 +10,7 @@ mod agent;
 mod cli;
 mod config;
 mod context;
+mod conversation;
 mod error;
 mod image;
 mod mcp;
@@ -420,7 +421,7 @@ async fn run_oneshot(
     });
 
     let mut session_id = None;
-    let mut messages = Vec::new();
+    let mut messages = conversation::Conversation::new();
 
     match agent
         .run_turn(&mut session_id, &mut messages, prompt, cancellation)
@@ -461,7 +462,7 @@ async fn run_interactive(
         resolve_session_resume(&session_manager, &config).await?;
 
     if !messages.is_empty() {
-        reprint_last_message(&messages, config.render_mode);
+        reprint_last_message(messages.as_slice(), config.render_mode);
     }
 
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ReplEvent>();
@@ -788,13 +789,18 @@ async fn export_session(
         anyhow::bail!("session not found: {}", session_id);
     }
 
-    let stored_messages = session_manager.load_messages(session_id).await?;
+    // Export the materialized conversation view, not the raw event log:
+    // post-compaction users expect to see the summary + tail (which is what
+    // the agent saw the last time it ran), not the pre-compaction
+    // messages the boundary replaced. The events are still on disk.
+    let events = session_manager.load_events(session_id).await?;
+    let conversation = conversation::Conversation::from_events(events);
     let tool_outputs: std::collections::HashMap<String, String> = session_manager
         .load_all_tool_outputs(session_id)
         .await?
         .into_iter()
         .collect();
-    let markdown = format_session_as_markdown(session_id, &stored_messages, &tool_outputs);
+    let markdown = format_session_as_markdown(session_id, conversation.as_slice(), &tool_outputs);
 
     match output {
         Some("-") => {
@@ -1033,7 +1039,7 @@ fn format_timestamp(rfc3339: &str) -> String {
 
 fn format_session_as_markdown(
     session_id: uuid::Uuid,
-    messages: &[session::StoredMessage],
+    messages: &[provider::Message],
     tool_outputs: &std::collections::HashMap<String, String>,
 ) -> String {
     use std::fmt::Write;
@@ -1042,43 +1048,17 @@ fn format_session_as_markdown(
     writeln!(output, "# Session {}\n", session_id).ok();
 
     for message in messages {
-        match message.role.as_str() {
-            "user" => {
-                writeln!(output, "## User\n").ok();
-                writeln!(output, "{}\n", message.content).ok();
-            }
-            "assistant" => {
-                if let Ok(blocks) =
-                    serde_json::from_str::<Vec<provider::ContentBlock>>(&message.content)
-                {
-                    writeln!(output, "## Assistant\n").ok();
-                    for block in &blocks {
-                        match block {
-                            provider::ContentBlock::Text { text } => {
-                                writeln!(output, "{}\n", text).ok();
-                            }
-                            provider::ContentBlock::ToolUse { name, input, .. } => {
-                                let input_pretty = serde_json::to_string_pretty(input)
-                                    .unwrap_or_else(|_| input.to_string());
-                                writeln!(output, "<details>").ok();
-                                writeln!(output, "<summary>Tool call: {}</summary>\n", name).ok();
-                                writeln!(output, "```json\n{}\n```\n", input_pretty).ok();
-                                writeln!(output, "</details>\n").ok();
-                            }
-                            provider::ContentBlock::ToolResult { .. }
-                            | provider::ContentBlock::Thinking { .. } => {}
-                        }
-                    }
-                } else {
-                    writeln!(output, "## Assistant\n").ok();
-                    writeln!(output, "{}\n", message.content).ok();
-                }
-            }
-            "tool_results" => {
-                if let Ok(blocks) =
-                    serde_json::from_str::<Vec<provider::ContentBlock>>(&message.content)
-                {
-                    for block in &blocks {
+        match message.role {
+            provider::Role::User => {
+                // A "user" message can be either a plain user turn or a
+                // tool_results envelope. Inspect content blocks rather
+                // than role to decide.
+                let has_tool_results = message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, provider::ContentBlock::ToolResult { .. }));
+                if has_tool_results {
+                    for block in &message.content {
                         if let provider::ContentBlock::ToolResult {
                             content, is_error, ..
                         } = block
@@ -1096,9 +1076,31 @@ fn format_session_as_markdown(
                             writeln!(output, "</details>\n").ok();
                         }
                     }
+                } else {
+                    writeln!(output, "## User\n").ok();
+                    writeln!(output, "{}\n", message.text_content()).ok();
                 }
             }
-            _ => {}
+            provider::Role::Assistant => {
+                writeln!(output, "## Assistant\n").ok();
+                for block in &message.content {
+                    match block {
+                        provider::ContentBlock::Text { text } => {
+                            writeln!(output, "{}\n", text).ok();
+                        }
+                        provider::ContentBlock::ToolUse { name, input, .. } => {
+                            let input_pretty = serde_json::to_string_pretty(input)
+                                .unwrap_or_else(|_| input.to_string());
+                            writeln!(output, "<details>").ok();
+                            writeln!(output, "<summary>Tool call: {}</summary>\n", name).ok();
+                            writeln!(output, "```json\n{}\n```\n", input_pretty).ok();
+                            writeln!(output, "</details>\n").ok();
+                        }
+                        provider::ContentBlock::ToolResult { .. }
+                        | provider::ContentBlock::Thinking { .. } => {}
+                    }
+                }
+            }
         }
     }
 
@@ -1174,11 +1176,11 @@ async fn resolve_session_resume(
     config: &ResolvedConfig,
 ) -> anyhow::Result<(
     Option<uuid::Uuid>,
-    Vec<provider::Message>,
+    conversation::Conversation,
     Option<session::SessionLock>,
 )> {
     let Some(value) = &config.continue_session else {
-        return Ok((None, Vec::new(), None));
+        return Ok((None, conversation::Conversation::new(), None));
     };
 
     if value == "last" {
@@ -1192,7 +1194,7 @@ async fn resolve_session_resume(
                 let messages = load_session_messages(session_manager, id).await?;
                 Ok((Some(id), messages, Some(lock)))
             }
-            None => Ok((None, Vec::new(), None)),
+            None => Ok((None, conversation::Conversation::new(), None)),
         }
     } else {
         let id: uuid::Uuid = value
@@ -1214,66 +1216,20 @@ async fn resolve_session_resume(
 async fn load_session_messages(
     session_manager: &SessionManager,
     session_id: uuid::Uuid,
-) -> anyhow::Result<Vec<provider::Message>> {
-    let stored = session_manager.load_messages(session_id).await?;
-    let mut messages = Vec::new();
+) -> anyhow::Result<conversation::Conversation> {
+    // Hydrate the event log directly. Legacy databases (rows predating
+    // the event-log refactor) decode their `user`/`assistant`/`tool_results`
+    // rows as `Event::Append` so resume is forward- and backward-
+    // compatible without a schema migration.
+    let events = session_manager.load_events(session_id).await?;
+    let mut log = conversation::Conversation::from_events(events);
 
-    for stored_message in stored {
-        match stored_message.role.as_str() {
-            "user" => {
-                messages.push(provider::Message::user(&stored_message.content));
-            }
-            "assistant" => {
-                // Content is stored as JSON array of ContentBlock
-                if let Ok(content) =
-                    serde_json::from_str::<Vec<provider::ContentBlock>>(&stored_message.content)
-                {
-                    messages.push(provider::Message {
-                        role: provider::Role::Assistant,
-                        content,
-                    });
-                } else {
-                    tracing::warn!(
-                        "failed to parse assistant message as ContentBlock array, treating as text"
-                    );
-                    messages.push(provider::Message::assistant_text(&stored_message.content));
-                }
-            }
-            "tool_results" => {
-                match serde_json::from_str::<Vec<provider::ContentBlock>>(&stored_message.content) {
-                    Ok(content) => {
-                        messages.push(provider::Message {
-                            role: provider::Role::User,
-                            content,
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!("failed to parse tool_results message, dropping: {}", error,);
-                    }
-                }
-            }
-            _ => {
-                tracing::warn!("unknown message role: {}", stored_message.role);
-            }
-        }
-    }
-
-    // Validate: every assistant ToolUse must be followed by a matching ToolResult.
-    // Drop orphaned assistant messages to prevent API errors.
-    validate_tool_use_chains(&mut messages);
-
-    Ok(messages)
-}
-
-fn validate_tool_use_chains(messages: &mut Vec<provider::Message>) {
-    let mut index = 0;
-    while index < messages.len() {
-        if messages[index].role != provider::Role::Assistant {
-            index += 1;
-            continue;
-        }
-
-        let tool_use_ids: Vec<String> = messages[index]
+    // Drop assistant messages whose tool_use blocks lack matching
+    // tool_result blocks in the next message. Anthropic's API rejects
+    // orphans; this sanitizes the log after a crash mid-tool-call.
+    let dropped = log.sanitize_orphans();
+    for message in &dropped {
+        let tool_use_ids: Vec<String> = message
             .content
             .iter()
             .filter_map(|block| {
@@ -1284,34 +1240,13 @@ fn validate_tool_use_chains(messages: &mut Vec<provider::Message>) {
                 }
             })
             .collect();
-
-        if tool_use_ids.is_empty() {
-            index += 1;
-            continue;
-        }
-
-        // Check if the next message has matching ToolResult blocks
-        let has_results = messages
-            .get(index + 1)
-            .is_some_and(|next| {
-                next.role == provider::Role::User
-                    && tool_use_ids.iter().all(|id| {
-                        next.content.iter().any(|block| {
-                            matches!(block, provider::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
-                        })
-                    })
-            });
-
-        if has_results {
-            index += 1;
-        } else {
-            tracing::warn!(
-                "dropping assistant message with orphaned tool_use IDs: {:?}",
-                tool_use_ids,
-            );
-            messages.remove(index);
-        }
+        tracing::warn!(
+            "dropping assistant message with orphaned tool_use IDs: {:?}",
+            tool_use_ids,
+        );
     }
+
+    Ok(log)
 }
 
 #[cfg(test)]
@@ -1350,74 +1285,88 @@ mod tests {
         }
     }
 
+    fn build_log(messages: Vec<provider::Message>) -> conversation::Conversation {
+        conversation::Conversation::from_vec(messages)
+    }
+
     #[test]
     fn test_validate_valid_chain() {
-        let mut messages = vec![
+        let mut log = build_log(vec![
             user_msg("hello"),
             assistant_tool_use("c1", "read_file"),
             tool_result("c1"),
             assistant_text("done"),
-        ];
-        validate_tool_use_chains(&mut messages);
-        assert_eq!(messages.len(), 4);
+        ]);
+        let dropped = log.sanitize_orphans();
+        assert!(dropped.is_empty());
+        assert_eq!(log.len(), 4);
     }
 
     #[test]
     fn test_validate_orphaned_tool_use_dropped() {
-        let mut messages = vec![
+        let mut log = build_log(vec![
             user_msg("hello"),
             assistant_tool_use("c1", "read_file"),
             // Missing tool_result for c1
             assistant_text("done"),
-        ];
-        validate_tool_use_chains(&mut messages);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, provider::Role::User);
-        assert_eq!(messages[1].role, provider::Role::Assistant);
-        assert_eq!(messages[1].text_content(), "done");
+        ]);
+        let dropped = log.sanitize_orphans();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(log.len(), 2);
+        let view = log.as_slice();
+        assert_eq!(view[0].role, provider::Role::User);
+        assert_eq!(view[1].role, provider::Role::Assistant);
+        assert_eq!(view[1].text_content(), "done");
     }
 
     #[test]
     fn test_validate_orphaned_at_end() {
-        let mut messages = vec![user_msg("hello"), assistant_tool_use("c1", "read_file")];
-        validate_tool_use_chains(&mut messages);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].text_content(), "hello");
+        let mut log = build_log(vec![
+            user_msg("hello"),
+            assistant_tool_use("c1", "read_file"),
+        ]);
+        log.sanitize_orphans();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.as_slice()[0].text_content(), "hello");
     }
 
     #[test]
     fn test_validate_mismatched_ids() {
-        let mut messages = vec![
+        let mut log = build_log(vec![
             user_msg("hello"),
             assistant_tool_use("c1", "read_file"),
             tool_result("c2"), // Wrong ID
-        ];
-        validate_tool_use_chains(&mut messages);
-        // The assistant message should be dropped because c1 has no matching result
-        assert_eq!(messages.len(), 2);
+        ]);
+        log.sanitize_orphans();
+        // The assistant message is dropped because c1 has no matching result.
+        assert_eq!(log.len(), 2);
     }
 
     #[test]
     fn test_validate_text_only_preserved() {
-        let mut messages = vec![user_msg("hello"), assistant_text("hi"), user_msg("bye")];
-        validate_tool_use_chains(&mut messages);
-        assert_eq!(messages.len(), 3);
+        let mut log = build_log(vec![
+            user_msg("hello"),
+            assistant_text("hi"),
+            user_msg("bye"),
+        ]);
+        log.sanitize_orphans();
+        assert_eq!(log.len(), 3);
     }
 
     #[test]
     fn test_validate_multiple_chains() {
-        let mut messages = vec![
+        let mut log = build_log(vec![
             user_msg("start"),
             assistant_tool_use("c1", "read_file"),
             tool_result("c1"),
             assistant_tool_use("c2", "write_file"),
             // Missing tool_result for c2
             assistant_text("done"),
-        ];
-        validate_tool_use_chains(&mut messages);
-        // c2 should be dropped, rest preserved
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[3].text_content(), "done");
+        ]);
+        log.sanitize_orphans();
+        // c2 should be dropped, rest preserved.
+        assert_eq!(log.len(), 4);
+        assert_eq!(log.as_slice()[3].text_content(), "done");
     }
 
     // -- log filter --

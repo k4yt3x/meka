@@ -21,11 +21,16 @@ use uuid::Uuid;
 use crate::error::{AgshError, Result};
 use crate::provider::AuthCredential;
 
+/// Raw row from the `messages` table — the on-disk shape of a single
+/// [`crate::conversation::Event`]. Internal to the session module: only
+/// the encoder and decoder helpers handle these directly. External
+/// consumers go through [`SessionManager::save_event`] /
+/// [`SessionManager::load_events`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredMessage {
-    pub role: String,
-    pub content: String,
-    pub created_at: String,
+struct StoredMessage {
+    role: String,
+    content: String,
+    created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -350,7 +355,63 @@ impl SessionManager {
         })
     }
 
-    pub async fn save_message(&self, session_id: Uuid, role: &str, content: &str) -> Result<()> {
+    /// Persist a single event from the conversation log. Events are
+    /// encoded into the existing `messages(role, content, …)` table:
+    ///
+    /// - `Event::Append(message)` writes one row with the message's
+    ///   role (`user` / `assistant` / `tool_results`).
+    /// - `Event::CompactBoundary { … }` writes one row with the
+    ///   pseudo-role `compact_boundary` and a JSON-serialized envelope
+    ///   in `content`.
+    ///
+    /// No schema migration: legacy databases (predating this commit) only
+    /// contain `Event::Append` rows; loading them via [`Self::load_events`]
+    /// yields the same events the in-memory log produced before.
+    pub async fn save_event(
+        &self,
+        session_id: Uuid,
+        event: &crate::conversation::Event,
+    ) -> Result<()> {
+        let (role, content) = encode_event_for_db(event)
+            .map_err(|error| AgshError::Database(format!("failed to encode event: {}", error)))?;
+        self.save_message(session_id, &role, &content).await
+    }
+
+    /// Load every event for a session in chronological order. Legacy
+    /// rows (role ∈ {`user`, `assistant`, `tool_results`}) are
+    /// reconstructed as `Event::Append`; rows with role
+    /// `compact_boundary` are deserialized from the JSON envelope.
+    /// Unknown roles are skipped with a warning.
+    pub async fn load_events(&self, session_id: Uuid) -> Result<Vec<crate::conversation::Event>> {
+        let stored = self.load_messages(session_id).await?;
+        let mut events = Vec::with_capacity(stored.len());
+        for row in stored {
+            match decode_event_from_row(&row) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {
+                    tracing::warn!("dropping unparseable session row (role={})", row.role);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to decode session row (role={}): {}",
+                        row.role,
+                        error
+                    );
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    /// Persist a single row into the `messages` table. Internal helper
+    /// for [`Self::save_event`]; external consumers go through the event
+    /// API. Tests still call this directly to populate fixtures.
+    pub(super) async fn save_message(
+        &self,
+        session_id: Uuid,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
         let role = role.to_string();
         let content = content.to_string();
         let now = chrono::Utc::now().to_rfc3339();
@@ -375,7 +436,9 @@ impl SessionManager {
             .map_err(|error| AgshError::Database(format!("failed to save message: {}", error)))
     }
 
-    pub async fn load_messages(&self, session_id: Uuid) -> Result<Vec<StoredMessage>> {
+    /// Fetch raw rows for a session. Internal helper for
+    /// [`Self::load_events`]; external consumers go through the event API.
+    async fn load_messages(&self, session_id: Uuid) -> Result<Vec<StoredMessage>> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
@@ -524,25 +587,6 @@ impl SessionManager {
                     rusqlite::params![session_id.to_string()],
                 )?;
 
-                connection.execute(
-                    "DELETE FROM messages WHERE session_id = ?1",
-                    rusqlite::params![session_id.to_string()],
-                )?;
-
-                connection.execute(
-                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
-                    rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id.to_string()],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| AgshError::Database(format!("failed to clear messages: {}", error)))
-    }
-
-    /// Clear messages but preserve scratchpad (tool_outputs). Used by compaction.
-    pub async fn clear_messages_only(&self, session_id: Uuid) -> Result<()> {
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "DELETE FROM messages WHERE session_id = ?1",
                     rusqlite::params![session_id.to_string()],
@@ -1025,6 +1069,82 @@ pub fn strip_context_tags(text: &str) -> &str {
     }
 }
 
+/// Pseudo-role used in the `messages` table for `Event::CompactBoundary`
+/// rows. Coexists with the legacy `user`/`assistant`/`tool_results` roles
+/// without a schema migration.
+const COMPACT_BOUNDARY_ROLE: &str = "compact_boundary";
+
+/// Encode an [`crate::conversation::Event`] into the `(role, content)`
+/// columns of the `messages` table. `Event::Append` writes the message's
+/// natural role; `Event::CompactBoundary` writes a JSON envelope under
+/// the [`COMPACT_BOUNDARY_ROLE`] pseudo-role.
+fn encode_event_for_db(
+    event: &crate::conversation::Event,
+) -> std::result::Result<(String, String), serde_json::Error> {
+    use crate::conversation::Event;
+    use crate::provider::{ContentBlock, Role};
+
+    match event {
+        Event::Append(message) => {
+            let (role, content) = match message.role {
+                Role::User => {
+                    if message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+                    {
+                        ("tool_results", serde_json::to_string(&message.content)?)
+                    } else {
+                        ("user", message.text_content())
+                    }
+                }
+                Role::Assistant => ("assistant", serde_json::to_string(&message.content)?),
+            };
+            Ok((role.to_string(), content))
+        }
+        Event::CompactBoundary { .. } => {
+            let content = serde_json::to_string(event)?;
+            Ok((COMPACT_BOUNDARY_ROLE.to_string(), content))
+        }
+    }
+}
+
+/// Decode one persisted row back into an [`crate::conversation::Event`].
+/// Returns `Ok(None)` when the row's role is unrecognised (forward-
+/// compat for new variants).
+fn decode_event_from_row(
+    row: &StoredMessage,
+) -> std::result::Result<Option<crate::conversation::Event>, serde_json::Error> {
+    use crate::conversation::Event;
+    use crate::provider::{ContentBlock, Message, Role};
+
+    match row.role.as_str() {
+        "user" => Ok(Some(Event::Append(Message::user(&row.content)))),
+        "assistant" => match serde_json::from_str::<Vec<ContentBlock>>(&row.content) {
+            Ok(content) => Ok(Some(Event::Append(Message {
+                role: Role::Assistant,
+                content,
+            }))),
+            Err(_) => {
+                // Legacy or malformed JSON: fall back to text.
+                Ok(Some(Event::Append(Message::assistant_text(&row.content))))
+            }
+        },
+        "tool_results" => match serde_json::from_str::<Vec<ContentBlock>>(&row.content) {
+            Ok(content) => Ok(Some(Event::Append(Message {
+                role: Role::User,
+                content,
+            }))),
+            Err(error) => Err(error),
+        },
+        role if role == COMPACT_BOUNDARY_ROLE => {
+            let event: Event = serde_json::from_str(&row.content)?;
+            Ok(Some(event))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn truncate_preview(text: &str, max_chars: usize) -> String {
     let text = strip_context_tags(text);
     let first_line = text.lines().next().unwrap_or("");
@@ -1044,6 +1164,148 @@ mod tests {
         SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("failed to open in-memory database")
+    }
+
+    /// Persist one of every event variant via `save_event` and read it
+    /// back through `load_events`. Verifies the encoding/decoding round
+    /// trip — including the JSON envelope used for `CompactBoundary` —
+    /// matches the in-memory shape.
+    #[tokio::test]
+    async fn test_save_and_load_events_round_trip() {
+        use std::collections::HashSet;
+
+        use crate::conversation::Event;
+        use crate::provider::{ContentBlock, Message, Role, ToolResultContent};
+
+        let manager = test_manager().await;
+        let sid = manager.create_session().await.expect("create session");
+
+        let user_event = Event::Append(Message::user("hello"));
+        let assistant_event = Event::Append(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "thinking aloud".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "u1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                },
+            ],
+        });
+        let tool_result_event = Event::Append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "u1".to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: "ok".to_string(),
+                }],
+                is_error: false,
+            }],
+        });
+        let snapshot: HashSet<String> = ["mcp__notion__fetch".to_string()].into_iter().collect();
+        let boundary_event = Event::CompactBoundary {
+            summary: Message::user("[summary]"),
+            replaced_count: 3,
+            loaded_tools_snapshot: snapshot,
+        };
+
+        for event in [
+            &user_event,
+            &assistant_event,
+            &tool_result_event,
+            &boundary_event,
+        ] {
+            manager.save_event(sid, event).await.expect("save event");
+        }
+
+        let loaded = manager.load_events(sid).await.expect("load events");
+        assert_eq!(loaded.len(), 4);
+
+        match &loaded[0] {
+            Event::Append(m) => assert_eq!(m.text_content(), "hello"),
+            _ => panic!("expected user Append"),
+        }
+        match &loaded[1] {
+            Event::Append(m) => {
+                assert_eq!(m.role, Role::Assistant);
+                assert_eq!(m.content.len(), 2);
+                assert!(matches!(&m.content[1], ContentBlock::ToolUse { id, .. } if id == "u1"));
+            }
+            _ => panic!("expected assistant Append"),
+        }
+        match &loaded[2] {
+            Event::Append(m) => {
+                assert_eq!(m.role, Role::User);
+                assert!(matches!(
+                    &m.content[0],
+                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "u1"
+                ));
+            }
+            _ => panic!("expected tool_results Append"),
+        }
+        match &loaded[3] {
+            Event::CompactBoundary {
+                replaced_count,
+                loaded_tools_snapshot,
+                summary,
+            } => {
+                assert_eq!(*replaced_count, 3);
+                assert!(loaded_tools_snapshot.contains("mcp__notion__fetch"));
+                assert_eq!(summary.text_content(), "[summary]");
+            }
+            _ => panic!("expected CompactBoundary"),
+        }
+    }
+
+    /// Legacy databases (predating PR 2) only contain rows with the
+    /// `user` / `assistant` / `tool_results` roles — no `compact_boundary`.
+    /// `load_events` must hydrate every legacy row as an `Event::Append`
+    /// so resume works without a schema migration.
+    #[tokio::test]
+    async fn test_load_events_legacy_rows_as_append() {
+        use crate::conversation::Event;
+
+        let manager = test_manager().await;
+        let sid = manager.create_session().await.expect("create session");
+
+        // Simulate a pre-PR-2 session by writing rows the legacy way.
+        manager
+            .save_message(sid, "user", "first")
+            .await
+            .expect("save user");
+        let assistant_blocks = serde_json::json!([
+            {"type": "text", "text": "answer"}
+        ])
+        .to_string();
+        manager
+            .save_message(sid, "assistant", &assistant_blocks)
+            .await
+            .expect("save assistant");
+
+        let events = manager.load_events(sid).await.expect("load events");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| matches!(e, Event::Append(_))));
+    }
+
+    /// A row with an unknown role should be skipped (with a warning) so
+    /// a future schema bump that adds new event variants doesn't crash
+    /// older binaries reading newer DBs.
+    #[tokio::test]
+    async fn test_load_events_skips_unknown_role() {
+        let manager = test_manager().await;
+        let sid = manager.create_session().await.expect("create session");
+        manager
+            .save_message(sid, "user", "real")
+            .await
+            .expect("save real row");
+        manager
+            .save_message(sid, "future_event_kind", "{}")
+            .await
+            .expect("save unknown row");
+        let events = manager.load_events(sid).await.expect("load events");
+        assert_eq!(events.len(), 1);
     }
 
     /// Regression test for the umask-dependent permission bug: the session

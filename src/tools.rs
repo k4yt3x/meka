@@ -28,7 +28,7 @@ use uuid::Uuid;
 type DeferredSet = Arc<std::sync::RwLock<HashSet<String>>>;
 
 /// Name of the meta-tool that loads a deferred tool's schema. Calls to this
-/// tool are scanned out of message history to compute the per-turn active
+/// tool are scanned out of the conversation to compute the per-turn active
 /// tool set; see [`extract_loaded_tool_names`].
 pub const LOAD_TOOL_NAME: &str = "load_tool";
 
@@ -37,7 +37,7 @@ use crate::permission::Permission;
 use crate::provider::{ContentBlock, Message, ToolDefinition, ToolResultContent};
 use crate::session::SessionManager;
 
-/// Walk the message history and collect the names of tools that have been
+/// Walk the conversation and collect the names of tools that have been
 /// loaded via successful `load_tool` calls. A `load_tool` `tool_use` block
 /// counts only when paired with a non-error `tool_result` whose
 /// `tool_use_id` matches; this excludes errored loads (unknown name,
@@ -291,7 +291,7 @@ impl ToolRegistry {
     /// loads them via the `load_tool` meta-tool. Discoverability is
     /// preserved by the `## Tool Discovery` section of the system prompt
     /// (built from `tool_catalogue()`), and the active set is recomputed
-    /// per turn from message history, not from registry state.
+    /// per turn from the conversation, not from registry state.
     pub fn mark_deferred(&self, name: &str) {
         self.deferred
             .write()
@@ -341,17 +341,30 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Slice-based convenience wrapper for tests: composes
+    /// [`extract_loaded_tool_names`] with [`Self::definitions_active_with_loaded`].
+    /// Production code goes through the events-aware path (see
+    /// [`crate::conversation::extract_loaded_tool_names_from_events`]) so
+    /// `Event::CompactBoundary::loaded_tools_snapshot` survives across
+    /// compaction; a slice-only scan loses the snapshot.
+    #[cfg(test)]
+    pub fn definitions_active(&self, messages: &[Message]) -> Vec<ToolDefinition> {
+        let loaded = extract_loaded_tool_names(messages);
+        self.definitions_active_with_loaded(&loaded)
+    }
+
     /// Returns every active tool definition regardless of the caller's
     /// current permission. The active set is the union of non-deferred
     /// tools and deferred tools whose schema has been loaded via the
-    /// `load_tool` meta-tool — derived by scanning `messages` for
-    /// successful `load_tool` calls (see [`extract_loaded_tool_names`]).
+    /// `load_tool` meta-tool — `loaded` is computed by the caller (via
+    /// [`crate::conversation::extract_loaded_tool_names_from_events`]
+    /// for the agent loop, [`extract_loaded_tool_names`] for tests).
+    ///
     /// Blocked calls are rejected at dispatch; keeping the tools array
     /// permission-independent is what preserves the prompt cache prefix
     /// across `/permission` toggles (breakpoint 3 in the Claude provider's
     /// cache layout).
-    pub fn definitions_active(&self, messages: &[Message]) -> Vec<ToolDefinition> {
-        let loaded = extract_loaded_tool_names(messages);
+    pub fn definitions_active_with_loaded(&self, loaded: &HashSet<String>) -> Vec<ToolDefinition> {
         let deferred = self.deferred.read().expect("deferred lock poisoned");
         self.tools
             .read()
@@ -832,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_definitions_active_exposes_loaded_deferred_tool() {
-        // End-to-end: a successful load_tool call in message history
+        // End-to-end: a successful load_tool call in the conversation
         // promotes the named tool into the active set on the next call.
         let registry = test_registry().await;
         let baseline = registry.definitions_active(&[]);

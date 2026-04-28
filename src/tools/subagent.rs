@@ -1,5 +1,5 @@
 //! `spawn_agent` tool: delegates a self-contained research/exploration task
-//! to a fresh sub-agent with its own conversation history, returning the
+//! to a fresh sub-agent with its own conversation, returning the
 //! sub-agent's final report as a single tool result.
 
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::context::build_environment_context;
+use crate::conversation::Conversation;
 use crate::error::{AgshError, Result};
 use crate::permission::{Permission, SharedPermission};
 use crate::provider::{ContentBlock, Message, Provider, StopReason, ToolDefinition};
@@ -103,7 +104,8 @@ impl Tool for SpawnAgentTool {
 
         let environment_context = build_environment_context(sub_perm);
         let augmented_prompt = format!("{}\n{}", environment_context, prompt);
-        let mut messages = vec![Message::user(&augmented_prompt)];
+        let mut messages = Conversation::new();
+        messages.append(Message::user(&augmented_prompt));
 
         // No report-length truncation here: the agent layer's
         // `persist_oversized_results` auto-persists any oversized report to
@@ -166,7 +168,7 @@ async fn run_subagent_loop(
     provider: &dyn Provider,
     tool_registry: &ToolRegistry,
     system_prompt: &str,
-    messages: &mut Vec<Message>,
+    messages: &mut Conversation,
     permission: Permission,
     tools: &[ToolDefinition],
     cancellation: CancellationToken,
@@ -178,8 +180,9 @@ async fn run_subagent_loop(
             return Err(AgshError::Interrupted);
         }
 
-        let (assistant_message, stop_reason, _usage) =
-            provider.complete(system_prompt, messages, tools).await?;
+        let (assistant_message, stop_reason, _usage) = provider
+            .complete(system_prompt, messages.as_slice(), tools)
+            .await?;
 
         // Strip thinking blocks
         let cleaned = Message {
@@ -191,7 +194,7 @@ async fn run_subagent_loop(
                 .cloned()
                 .collect(),
         };
-        messages.push(cleaned.clone());
+        messages.append(cleaned.clone());
 
         match stop_reason {
             StopReason::ToolUse => {
@@ -234,7 +237,7 @@ async fn run_subagent_loop(
                     }
                 }
 
-                messages.push(Message {
+                messages.append(Message {
                     role: crate::provider::Role::User,
                     content: results,
                 });

@@ -1,13 +1,13 @@
 # Sessions
 
-Sessions persist your conversation history so you can resume later. Each session is identified by a UUID and stored in a SQLite database.
+Sessions persist your conversation so you can resume later. Each session is identified by a UUID and stored in a SQLite database.
 
 ## How Sessions Work
 
 - A session is **not** created when agsh starts. It is created lazily when you send the first message.
 - When a session is created, its UUID is printed to stderr.
 - When you exit agsh (Ctrl+D), the session UUID is printed again so you can note it for later.
-- Sessions include the full message history: your inputs, the agent's responses, and tool call results.
+- Sessions include the full conversation: your inputs, the agent's responses, and tool call results.
 
 ## Resuming a Session
 
@@ -25,7 +25,7 @@ This resumes the most recently updated session.
 agsh -c 550e8400-e29b-41d4-a716-446655440000
 ```
 
-The agent loads the previous conversation history and continues from where you left off.
+The agent loads the previous conversation and continues from where you left off.
 
 ## Session Locking
 
@@ -111,7 +111,9 @@ The full history remains in SQLite for resumption. Only the API payload is trunc
 
 If a session becomes too long, you can use the `/compact` command to have the LLM summarize the conversation and replace older messages with a structured summary. Recent messages are preserved verbatim. The summary includes key files, decisions, errors, and user preferences.
 
-Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented after compaction.
+Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented after compaction. Tools that the model loaded via `load_tool` before compaction stay loaded after — the deferred-tool active set is snapshotted into the compaction boundary, so resumed sessions don't re-issue `load_tool` for tools they already used.
+
+Internally, compaction does not delete pre-compaction rows from the database. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only.
 
 ### Auto-Compact
 
@@ -153,7 +155,7 @@ You can export any session as a Markdown file:
 agsh export 550e8400-e29b-41d4-a716-446655440000
 ```
 
-This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation history. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks.
+This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks.
 
 To write to a specific file:
 

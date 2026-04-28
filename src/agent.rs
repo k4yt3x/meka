@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::context;
+use crate::conversation::Conversation;
 use crate::error::{AgshError, Result};
 use crate::permission::SharedPermission;
 use crate::provider::{
@@ -146,7 +147,7 @@ impl Agent {
     pub async fn run_turn(
         &self,
         session_id: &mut Option<Uuid>,
-        messages: &mut Vec<Message>,
+        messages: &mut Conversation,
         user_input: String,
         cancellation: CancellationToken,
     ) -> Result<()> {
@@ -206,7 +207,7 @@ impl Agent {
             format!("{}\n\n{}", block, user_input)
         };
         let user_message = Message::user(&augmented_input);
-        messages.push(user_message);
+        messages.append(user_message);
         let skills = crate::skills::discover_skills();
         let mcp_instructions = self
             .mcp_manager
@@ -221,7 +222,8 @@ impl Agent {
             &mcp_instructions,
         );
 
-        let base_messages = truncate_messages_for_context(messages, self.options.context_messages);
+        let base_messages =
+            truncate_messages_for_context(messages.as_slice(), self.options.context_messages);
         let turn_start_len = messages.len();
 
         let mut user_saved = false;
@@ -234,7 +236,7 @@ impl Agent {
 
                 let api_messages = if messages.len() > turn_start_len {
                     let mut combined = base_messages.clone();
-                    combined.extend_from_slice(&messages[turn_start_len..]);
+                    combined.extend_from_slice(&messages.as_slice()[turn_start_len..]);
                     combined
                 } else {
                     base_messages.clone()
@@ -245,7 +247,15 @@ impl Agent {
                 // the model on the very next request — without mutating
                 // any registry state. Append-only growth keeps the tools
                 // array's cache prefix stable.
-                let tools = self.tool_registry.definitions_active(&api_messages);
+                //
+                // Read from events (not the materialized slice) so the
+                // deferred-tool snapshot stored on `Event::CompactBoundary`
+                // survives across compaction; otherwise tools the model
+                // loaded pre-compaction would silently drop out of the
+                // active set on the next turn.
+                let loaded =
+                    crate::conversation::extract_loaded_tool_names_from_events(messages.events());
+                let tools = self.tool_registry.definitions_active_with_loaded(&loaded);
 
                 let (assistant_message, stop_reason, usage) = match if self.options.streaming {
                     self.run_streaming(
@@ -269,38 +279,24 @@ impl Agent {
                     .store(usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
 
                 if !user_saved {
-                    if let Err(error) = self
-                        .session_manager
-                        .save_message(sid, "user", &augmented_input)
-                        .await
-                    {
+                    let user_event =
+                        crate::conversation::Event::Append(Message::user(augmented_input.as_str()));
+                    if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
                         break 'turn Err(error);
                     }
                     user_saved = true;
                 }
 
-                let content_json = match serde_json::to_string(&assistant_message.content) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        break 'turn Err(AgshError::Provider(format!(
-                            "failed to serialize message: {}",
-                            error
-                        )));
-                    }
-                };
-                if let Err(error) = self
-                    .session_manager
-                    .save_message(sid, "assistant", &content_json)
-                    .await
-                {
+                let assistant_event = crate::conversation::Event::Append(assistant_message.clone());
+                if let Err(error) = self.session_manager.save_event(sid, &assistant_event).await {
                     break 'turn Err(error);
                 }
 
-                // Thinking blocks are preserved in the message history
+                // Thinking blocks are preserved in the conversation
                 // for the Claude API (interleaved-thinking beta). The provider's
                 // build_messages handles stripping trailing thinking from the last
                 // assistant message.
-                messages.push(assistant_message.clone());
+                messages.append(assistant_message.clone());
 
                 if cancellation.is_cancelled() {
                     break 'turn Err(AgshError::Interrupted);
@@ -352,24 +348,15 @@ impl Agent {
                             content: tool_results,
                         };
 
-                        let result_json = match serde_json::to_string(&result_message.content) {
-                            Ok(json) => json,
-                            Err(error) => {
-                                break 'turn Err(AgshError::Provider(format!(
-                                    "failed to serialize tool results: {}",
-                                    error
-                                )));
-                            }
-                        };
-                        if let Err(error) = self
-                            .session_manager
-                            .save_message(sid, "tool_results", &result_json)
-                            .await
+                        let result_event =
+                            crate::conversation::Event::Append(result_message.clone());
+                        if let Err(error) =
+                            self.session_manager.save_event(sid, &result_event).await
                         {
                             break 'turn Err(error);
                         }
 
-                        messages.push(result_message);
+                        messages.append(result_message);
                     }
                     StopReason::EndTurn | StopReason::MaxTokens | StopReason::Unknown(_) => {
                         break 'turn Ok(());
@@ -384,16 +371,14 @@ impl Agent {
 
         match &result {
             Err(AgshError::Interrupted) if !user_saved => {
-                if let Err(error) = self
-                    .session_manager
-                    .save_message(sid, "user", &augmented_input)
-                    .await
-                {
+                let user_event =
+                    crate::conversation::Event::Append(Message::user(augmented_input.as_str()));
+                if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
                     tracing::error!("failed to save user message on interruption: {}", error);
                 }
             }
             Err(error) if !matches!(error, AgshError::Interrupted) && !user_saved => {
-                messages.pop();
+                messages.pop_unsaved();
             }
             _ => {}
         }
@@ -730,7 +715,7 @@ impl Agent {
     pub async fn compact_session(
         &self,
         session_id: &mut Option<Uuid>,
-        messages: &mut Vec<Message>,
+        messages: &mut Conversation,
     ) -> Result<()> {
         let Some(sid) = *session_id else {
             return Err(AgshError::Config(
@@ -743,7 +728,7 @@ impl Agent {
         }
 
         let system_prompt = "You are a conversation summarizer. Produce a structured summary \
-             that will replace the conversation history. Write in second person \
+             that will replace the conversation. Write in second person \
              (\"You were working on...\").\n\n\
              Cover these sections (skip any that don't apply):\n\n\
              1. **Primary task**: What the user asked for and the overall goal.\n\
@@ -756,25 +741,26 @@ impl Agent {
         // Split into messages to summarize vs. recent messages to keep verbatim.
         // Walk backward from the target split point to find a safe cut that
         // doesn't orphan tool_use blocks from their tool_result responses.
-        let (to_summarize, to_keep) = if messages.len() > 6 {
-            let mut split = messages.len() - 2;
+        let view = messages.as_slice();
+        let (to_summarize, to_keep) = if view.len() > 6 {
+            let mut split = view.len() - 2;
             loop {
                 if split == 0 {
                     break;
                 }
-                let message = &messages[split];
+                let message = &view[split];
                 if message.role == Role::User && !has_tool_results(&message.content) {
                     break;
                 }
                 split -= 1;
             }
             if split >= 4 {
-                (messages[..split].to_vec(), messages[split..].to_vec())
+                (view[..split].to_vec(), view[split..].to_vec())
             } else {
-                (messages.clone(), Vec::new())
+                (view.to_vec(), Vec::new())
             }
         } else {
-            (messages.clone(), Vec::new())
+            (view.to_vec(), Vec::new())
         };
 
         // Clone and preprocess messages for the summarizer: strip images and
@@ -820,29 +806,35 @@ impl Agent {
             )
         };
 
-        // Clear messages but preserve scratchpad entries.
-        self.session_manager.clear_messages_only(sid).await?;
+        // Snapshot the deferred-tool active set BEFORE compaction so the
+        // `CompactBoundary` event carries it forward; otherwise tools the
+        // model loaded pre-compaction would silently drop out of the
+        // active set on the next turn.
+        let loaded_tools_snapshot = crate::tools::extract_loaded_tool_names(messages.as_slice());
 
-        messages.clear();
+        let summary_user_message = Message::user(&context_message);
+        messages.replace_for_compaction(
+            summary_user_message,
+            to_keep.clone(),
+            loaded_tools_snapshot,
+        );
 
-        let user_message = Message::user(&context_message);
-        messages.push(user_message);
+        // Persist the new compaction-boundary event and the re-appended
+        // tail. Pre-compaction rows stay in the DB unchanged; the
+        // event log on disk grows append-only.
+        let boundary_event = messages
+            .events()
+            .iter()
+            .rev()
+            .find(|e| matches!(e, crate::conversation::Event::CompactBoundary { .. }))
+            .cloned()
+            .expect("just appended a CompactBoundary");
         self.session_manager
-            .save_message(sid, "user", &context_message)
+            .save_event(sid, &boundary_event)
             .await?;
-
-        // Re-append preserved tail messages.
         for message in &to_keep {
-            messages.push(message.clone());
-            let (role, content) = match message.role {
-                Role::User => ("user", message.text_content()),
-                Role::Assistant => {
-                    let json = serde_json::to_string(&message.content).unwrap_or_default();
-                    ("assistant", json)
-                }
-            };
             self.session_manager
-                .save_message(sid, role, &content)
+                .save_event(sid, &crate::conversation::Event::Append(message.clone()))
                 .await?;
         }
 
