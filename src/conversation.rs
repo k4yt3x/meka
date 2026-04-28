@@ -9,8 +9,10 @@
 //! remain explicit, named methods — the compiler refuses casual mutation.
 //!
 //! On disk, events are stored row-per-event in the existing `messages`
-//! table (no schema migration); see [`Event::role_label`] and
-//! [`Event::serialize_content`] for the encoding.
+//! table (no schema migration); the encoding lives in `session.rs`'s
+//! `encode_event_for_db` / `decode_event_from_row` helpers, behind the
+//! [`crate::session::SessionManager::save_event`] /
+//! [`crate::session::SessionManager::load_events`] API.
 
 use std::collections::HashSet;
 

@@ -319,9 +319,10 @@ impl ToolRegistry {
 
     /// Returns tool definitions for the API call, excluding deferred tools.
     /// Permission-filtered view — used by sub-agents which run at a fixed
-    /// permission. The main agent uses [`Self::definitions_active`] so the
-    /// tools array remains byte-identical across mid-session `/permission`
-    /// toggles, keeping the Claude prompt cache warm on subsequent turns.
+    /// permission. The main agent uses
+    /// [`Self::definitions_active_with_loaded`] so the tools array remains
+    /// byte-identical across mid-session `/permission` toggles, keeping
+    /// the Claude prompt cache warm on subsequent turns.
     pub fn definitions_for_permission(&self, permission: Permission) -> Vec<ToolDefinition> {
         let deferred = self.deferred.read().expect("deferred lock poisoned");
         self.tools
