@@ -743,7 +743,7 @@ async fn run_interactive(
                             render::render_error(&error);
                         }
                     }
-                    repl::SlashCommand::SkillInvoke { name, args: _ } => {
+                    repl::SlashCommand::SkillInvoke { name, extra } => {
                         let installed = skills::discover_skills();
                         let Some(skill) = installed.iter().find(|s| s.name == name) else {
                             let available: Vec<&str> =
@@ -771,6 +771,17 @@ async fn run_interactive(
                                 ));
                                 continue;
                             }
+                        };
+                        // Prepend the user's free-form directive to the
+                        // skill body when present. The blank-line
+                        // separator gives the model a visual cue that
+                        // the first paragraph is the user's "do this
+                        // skill, but with this twist" and the rest is
+                        // the skill's static body.
+                        let body = if extra.is_empty() {
+                            body
+                        } else {
+                            format!("{}\n\n{}", extra, body)
                         };
                         if let Err(error) = agent
                             .run_turn(

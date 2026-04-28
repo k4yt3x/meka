@@ -152,14 +152,15 @@ pub enum SlashCommand {
     },
     /// `/skill` (no argument) — list installed skills.
     SkillList,
-    /// `/skill <name> [args]` — invoke a user-invocable skill directly.
-    /// `args` is captured for forward compatibility with positional
-    /// substitution into the skill body (`${ARG_1}`, etc.); v1 ignores
-    /// everything past `name`.
+    /// `/skill <name> [extra...]` — invoke a user-invocable skill directly.
+    /// Anything the user types after the skill name is captured verbatim
+    /// in `extra` and prepended to the rendered skill body before the
+    /// agent turn, so the model reads the user's directive first and
+    /// the skill body as the method. Empty when the user just typed
+    /// `/skill <name>`.
     SkillInvoke {
         name: String,
-        #[allow(dead_code)]
-        args: Vec<String>,
+        extra: String,
     },
 }
 
@@ -218,18 +219,20 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 /// - Empty argument (bare `/skill`) → list installed skills. There is
 ///   no `list` keyword: that token would be treated as a skill name to
 ///   invoke.
-/// - Otherwise: first whitespace token is the skill name, remaining
-///   tokens are positional args (currently unused; v1 ignores them but
-///   the parse keeps them for forward compatibility).
+/// - Otherwise: first whitespace-separated token is the skill name;
+///   the remainder (if any) is free-form extra context that gets
+///   prepended to the skill body before the agent turn. The remainder
+///   is trimmed so trailing whitespace doesn't bloat the body.
 fn parse_skill_slash(rest: &str) -> SlashCommand {
     let rest = rest.trim();
     if rest.is_empty() {
         return SlashCommand::SkillList;
     }
-    let mut tokens = rest.split_whitespace();
-    let name = tokens.next().expect("non-empty after trim").to_string();
-    let args = tokens.map(|s| s.to_string()).collect();
-    SlashCommand::SkillInvoke { name, args }
+    let (name, extra) = match rest.split_once(char::is_whitespace) {
+        Some((name, extra)) => (name.to_string(), extra.trim().to_string()),
+        None => (rest.to_string(), String::new()),
+    };
+    SlashCommand::SkillInvoke { name, extra }
 }
 
 /// Parse the argument to `/mcp …`.
@@ -291,7 +294,7 @@ fn print_help() {
     eprintln!("  /export                        Export the current session as Markdown");
     eprintln!("  /cd <path>                     Change working directory");
     eprintln!("  /skill                         List installed skills");
-    eprintln!("  /skill <name>                  Invoke a skill directly");
+    eprintln!("  /skill <name> [extra...]       Invoke a skill, optionally with extra context");
     eprintln!("  /mcp                           List configured MCP servers");
     eprintln!("  /mcp reconnect <server>        Reconnect smoke-test for one server");
     eprintln!("  /mcp login <server>            Run the OAuth flow for a server");
@@ -1040,20 +1043,38 @@ mod tests {
     #[test]
     fn test_parse_skill_slash_invokes_named_skill() {
         match parse_slash_command("/skill demo") {
-            Some(SlashCommand::SkillInvoke { name, args }) => {
+            Some(SlashCommand::SkillInvoke { name, extra }) => {
                 assert_eq!(name, "demo");
-                assert!(args.is_empty());
+                assert!(extra.is_empty());
             }
             other => panic!("expected SkillInvoke, got {:?}", option_label(&other)),
         }
     }
 
     #[test]
-    fn test_parse_skill_slash_collects_positional_args() {
-        match parse_slash_command("/skill demo arg1 arg2") {
-            Some(SlashCommand::SkillInvoke { name, args }) => {
+    fn test_parse_skill_slash_captures_free_form_extra() {
+        // The whole remainder after the skill name is captured verbatim
+        // (preserving inner whitespace) and trimmed at the edges. This is
+        // free-form text the user wants prepended to the skill body — no
+        // positional argument parsing.
+        match parse_slash_command("/skill demo only fetch UK news") {
+            Some(SlashCommand::SkillInvoke { name, extra }) => {
                 assert_eq!(name, "demo");
-                assert_eq!(args, vec!["arg1".to_string(), "arg2".to_string()]);
+                assert_eq!(extra, "only fetch UK news");
+            }
+            other => panic!("expected SkillInvoke, got {:?}", option_label(&other)),
+        }
+    }
+
+    #[test]
+    fn test_parse_skill_slash_trims_trailing_whitespace() {
+        // Trailing whitespace after the skill name should produce an
+        // empty extra, not a whitespace-padded one — equivalent to the
+        // bare-name invocation.
+        match parse_slash_command("/skill demo   ") {
+            Some(SlashCommand::SkillInvoke { name, extra }) => {
+                assert_eq!(name, "demo");
+                assert!(extra.is_empty());
             }
             other => panic!("expected SkillInvoke, got {:?}", option_label(&other)),
         }
@@ -1065,9 +1086,9 @@ mod tests {
         // (Bare `/skill` is the listing form; `/skill list` would error
         // at dispatch with "unknown skill 'list'" if no such skill exists.)
         match parse_slash_command("/skill list") {
-            Some(SlashCommand::SkillInvoke { name, args }) => {
+            Some(SlashCommand::SkillInvoke { name, extra }) => {
                 assert_eq!(name, "list");
-                assert!(args.is_empty());
+                assert!(extra.is_empty());
             }
             other => panic!("expected SkillInvoke, got {:?}", option_label(&other)),
         }

@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `agsh skill list | get | show | add | remove` CLI subcommands for managing user skills.
-- `/skill` REPL command: bare form lists installed skills; `/skill <name>` invokes one directly.
+- `/skill` REPL command: bare form lists skills; `/skill <name> [extra...]` invokes one,
+  prepending any free-form extra text as the user's directive above the skill body.
 - `--edit` flag on `agsh skill add` opens the new `SKILL.md` in `$EDITOR` after scaffolding.
 - `--from-file` on `agsh skill add` copies an existing template instead of scaffolding from flags.
 
