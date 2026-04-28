@@ -434,10 +434,13 @@ pub fn run_repl(
                 }
                 break;
             }
+            // The pinned reedline fork (wtfbbqhax/reedline @ 3a457ff) has
+            // a slimmer `Signal` enum than upstream — no `ExternalBreak`
+            // variant — so this catch-all is currently unreachable. When
+            // we switch back to upstream after #1005 lands in a release,
+            // it'll fire on the unhandled `ExternalBreak`.
+            #[allow(unreachable_patterns)]
             Ok(other) => {
-                // `Signal` is `#[non_exhaustive]` (reedline 0.47+); future
-                // variants we don't recognise fall through to the same
-                // teardown as a read error.
                 tracing::warn!("unexpected reedline signal: {:?}", other);
                 if input_sender.send(ReplEvent::Exit).is_err() {
                     tracing::trace!("REPL event receiver already dropped");

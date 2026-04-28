@@ -1,6 +1,6 @@
 [package]
 name = "agsh"
-version = "0.17.1"
+version = "0.17.2"
 edition = "2024"
 license = "MIT"
 description = "An agentic shell where you speak human, not bash"
@@ -27,7 +27,7 @@ nu-ansi-term = "0.50"
 open = "5"
 percent-encoding = "2"
 rand = "0.10"
-reedline = { version = "0.47", features = ["external_printer"] }
+reedline = { git = "https://github.com/wtfbbqhax/reedline", rev = "3a457ff1dab28c9021db116f2575eed5116bed88", features = ["external_printer"] }
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
 rmcp = { version = "1.5", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
