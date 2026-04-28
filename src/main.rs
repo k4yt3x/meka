@@ -16,6 +16,7 @@ mod image;
 mod mcp;
 mod permission;
 mod provider;
+mod relay;
 mod render;
 mod repl;
 mod sandbox;
@@ -46,9 +47,14 @@ fn main() -> anyhow::Result<()> {
         2 => "debug",
         _ => "trace",
     };
+    // Route tracing through `relay::RELAY` so the REPL can later install
+    // a reedline `ExternalPrinter` and have warnings printed *above* the
+    // live prompt instead of racing reedline's redraw. Without a printer
+    // installed (non-interactive subcommands, pre-REPL startup window)
+    // the relay falls back to plain stderr.
     tracing_subscriber::fmt()
         .with_env_filter(build_log_filter(log_level))
-        .with_writer(std::io::stderr)
+        .with_writer(relay::RELAY.clone())
         .init();
 
     let runtime = tokio::runtime::Runtime::new()?;

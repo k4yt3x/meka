@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 
 use crossterm::style::{Color, Stylize};
 use reedline::{
-    EditCommand, Emacs, Highlighter, KeyCode, KeyModifiers, Prompt, PromptEditMode,
-    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal, StyledText,
-    default_emacs_keybindings,
+    EditCommand, Emacs, ExternalPrinter, Highlighter, KeyCode, KeyModifiers, Prompt,
+    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent,
+    Signal, StyledText, default_emacs_keybindings,
 };
 
 use crate::permission::SharedPermission;
+use crate::relay::RELAY;
 
 /// Reedline highlighter that paints the entire input buffer with a single
 /// style. The final paint reedline emits on submit is what lands in
@@ -87,7 +88,10 @@ impl Prompt for AgshPrompt {
     }
 }
 
-fn build_reedline_editor(input_style: nu_ansi_term::Style) -> Reedline {
+fn build_reedline_editor(
+    input_style: nu_ansi_term::Style,
+    printer: ExternalPrinter<String>,
+) -> Reedline {
     let mut keybindings = default_emacs_keybindings();
 
     keybindings.add_binding(
@@ -113,6 +117,7 @@ fn build_reedline_editor(input_style: nu_ansi_term::Style) -> Reedline {
         .with_edit_mode(Box::new(emacs_mode))
         .with_highlighter(Box::new(UserInputHighlighter { style: input_style }))
         .use_bracketed_paste(true)
+        .with_external_printer(printer)
 }
 
 pub enum SlashCommand {
@@ -268,7 +273,15 @@ pub fn run_repl(
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
 ) {
-    let mut editor = build_reedline_editor(input_style);
+    // Install reedline's `ExternalPrinter` on the process-global tracing
+    // writer BEFORE the first `read_line()`. From this point on, log
+    // lines (including async MCP-connect warnings that fire while the
+    // REPL is starting) print *above* the live prompt instead of being
+    // overwritten by reedline's redraw.
+    let printer = ExternalPrinter::default();
+    RELAY.install(printer.clone());
+
+    let mut editor = build_reedline_editor(input_style, printer);
     let prompt = AgshPrompt {
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
