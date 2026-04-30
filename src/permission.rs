@@ -87,16 +87,86 @@ impl FromStr for Permission {
     }
 }
 
+/// Set of permission modes the user is allowed to switch into at runtime.
+/// Backed by a `u8` bitmask indexed by [`Permission`]'s `repr(u8)` discriminant.
+/// Constructed via [`EnabledPermissions::from_modes`] (or the constants); the
+/// constructor guarantees the set is non-empty so [`Self::lowest`] is always
+/// well-defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnabledPermissions {
+    bits: u8,
+}
+
+impl EnabledPermissions {
+    /// Every mode enabled. Used by test fixtures that don't care about
+    /// the runtime gate; production code constructs the set from config.
+    #[cfg(test)]
+    pub const ALL: Self = Self { bits: 0b1111 };
+
+    /// `none / read / write` — `ask` is opt-in.
+    pub const DEFAULT: Self = Self {
+        bits: (1 << Permission::None as u8)
+            | (1 << Permission::Read as u8)
+            | (1 << Permission::Write as u8),
+    };
+
+    /// Build an `EnabledPermissions` from any iterable of [`Permission`]s.
+    /// Returns `None` if the iterator yields no items — an empty enabled
+    /// set is meaningless (agsh would have no level to start in), so the
+    /// caller has to handle that case explicitly (typically by falling
+    /// back to [`Self::DEFAULT`]).
+    pub fn from_modes<I: IntoIterator<Item = Permission>>(iter: I) -> Option<Self> {
+        let mut bits: u8 = 0;
+        for mode in iter {
+            bits |= 1 << (mode as u8);
+        }
+        if bits == 0 { None } else { Some(Self { bits }) }
+    }
+
+    pub fn is_enabled(self, mode: Permission) -> bool {
+        self.bits & (1 << (mode as u8)) != 0
+    }
+
+    /// Iterate enabled modes in `none → read → ask → write` order.
+    pub fn iter(self) -> impl Iterator<Item = Permission> {
+        const ORDER: [Permission; 4] = [
+            Permission::None,
+            Permission::Read,
+            Permission::Ask,
+            Permission::Write,
+        ];
+        ORDER.into_iter().filter(move |&p| self.is_enabled(p))
+    }
+
+    /// Lowest-discriminant enabled mode. The constructor guarantees the
+    /// set is non-empty, so this never panics in practice.
+    pub fn lowest(self) -> Permission {
+        self.iter()
+            .next()
+            .expect("EnabledPermissions invariant: set is non-empty")
+    }
+}
+
+/// The caller asked to switch to a mode that isn't in the enabled set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisabledMode(pub Permission);
+
 #[derive(Clone)]
 pub struct SharedPermission {
     inner: Arc<AtomicU8>,
+    enabled: EnabledPermissions,
 }
 
 impl SharedPermission {
-    pub fn new(initial: Permission) -> Self {
+    pub fn new(initial: Permission, enabled: EnabledPermissions) -> Self {
         Self {
             inner: Arc::new(AtomicU8::new(initial as u8)),
+            enabled,
         }
+    }
+
+    pub fn enabled(&self) -> EnabledPermissions {
+        self.enabled
     }
 
     pub fn get(&self) -> Permission {
@@ -109,15 +179,43 @@ impl SharedPermission {
         }
     }
 
-    pub fn set(&self, permission: Permission) {
-        self.inner.store(permission as u8, Ordering::Relaxed);
+    /// Switch to `mode`. Returns `Err(DisabledMode(mode))` if the caller
+    /// requested a mode that isn't in [`Self::enabled`]; the current level
+    /// is left unchanged in that case.
+    pub fn try_set(&self, mode: Permission) -> Result<(), DisabledMode> {
+        if !self.enabled.is_enabled(mode) {
+            return Err(DisabledMode(mode));
+        }
+        self.set_unchecked(mode);
+        Ok(())
     }
 
+    /// Low-level setter that bypasses the enabled-set check. Used by
+    /// [`Self::try_set`] and [`Self::cycle`] internally, and by tests
+    /// that need to construct edge cases (e.g. verifying the system
+    /// prompt is identical across all four modes regardless of which
+    /// are enabled at runtime).
+    pub(crate) fn set_unchecked(&self, mode: Permission) {
+        self.inner.store(mode as u8, Ordering::Relaxed);
+    }
+
+    /// Advance to the next enabled mode in `none → read → ask → write → ...`
+    /// order, skipping any disabled modes. If only one mode is enabled the
+    /// cycle is a visual no-op (returns the current mode without changing
+    /// it). Bounded to 4 iterations so it can never spin forever.
     pub fn cycle(&self) -> Permission {
-        let current = self.get();
-        let next = current.cycle_next();
-        self.set(next);
-        next
+        let mut next = self.get();
+        for _ in 0..4 {
+            next = next.cycle_next();
+            if self.enabled.is_enabled(next) {
+                self.set_unchecked(next);
+                return next;
+            }
+        }
+        // Unreachable when the constructor invariant holds (set non-empty),
+        // because the loop walks through all four variants. Return current
+        // for safety instead of panicking.
+        self.get()
     }
 }
 
@@ -178,31 +276,137 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_permission() {
-        let shared = SharedPermission::new(Permission::Read);
+    fn test_enabled_permissions_default() {
+        let default = EnabledPermissions::DEFAULT;
+        assert!(default.is_enabled(Permission::None));
+        assert!(default.is_enabled(Permission::Read));
+        assert!(!default.is_enabled(Permission::Ask));
+        assert!(default.is_enabled(Permission::Write));
+        assert_eq!(default.iter().count(), 3);
+    }
+
+    #[test]
+    fn test_enabled_permissions_all() {
+        let all = EnabledPermissions::ALL;
+        assert!(all.is_enabled(Permission::None));
+        assert!(all.is_enabled(Permission::Read));
+        assert!(all.is_enabled(Permission::Ask));
+        assert!(all.is_enabled(Permission::Write));
+        assert_eq!(all.iter().count(), 4);
+    }
+
+    #[test]
+    fn test_enabled_permissions_from_modes() {
+        let single = EnabledPermissions::from_modes([Permission::Read]).unwrap();
+        assert!(single.is_enabled(Permission::Read));
+        assert_eq!(single.iter().count(), 1);
+
+        let dups =
+            EnabledPermissions::from_modes([Permission::Read, Permission::Read, Permission::Write])
+                .unwrap();
+        assert_eq!(dups.iter().count(), 2);
+        assert!(dups.is_enabled(Permission::Read));
+        assert!(dups.is_enabled(Permission::Write));
+
+        assert_eq!(EnabledPermissions::from_modes(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn test_enabled_permissions_iter_order() {
+        let all = EnabledPermissions::ALL;
+        let order: Vec<Permission> = all.iter().collect();
+        assert_eq!(
+            order,
+            vec![
+                Permission::None,
+                Permission::Read,
+                Permission::Ask,
+                Permission::Write,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_enabled_permissions_lowest() {
+        assert_eq!(EnabledPermissions::ALL.lowest(), Permission::None);
+        assert_eq!(EnabledPermissions::DEFAULT.lowest(), Permission::None);
+        assert_eq!(
+            EnabledPermissions::from_modes([Permission::Ask, Permission::Write])
+                .unwrap()
+                .lowest(),
+            Permission::Ask
+        );
+        assert_eq!(
+            EnabledPermissions::from_modes([Permission::Write])
+                .unwrap()
+                .lowest(),
+            Permission::Write
+        );
+    }
+
+    #[test]
+    fn test_shared_permission_basic() {
+        let shared = SharedPermission::new(Permission::Read, EnabledPermissions::ALL);
         assert_eq!(shared.get(), Permission::Read);
 
-        shared.set(Permission::Write);
+        shared.try_set(Permission::Write).unwrap();
         assert_eq!(shared.get(), Permission::Write);
-
-        let next = shared.cycle();
-        assert_eq!(next, Permission::None);
-        assert_eq!(shared.get(), Permission::None);
     }
 
     #[test]
     fn test_shared_permission_clone() {
-        let shared = SharedPermission::new(Permission::Read);
+        let shared = SharedPermission::new(Permission::Read, EnabledPermissions::ALL);
         let cloned = shared.clone();
 
-        shared.set(Permission::Write);
+        shared.try_set(Permission::Write).unwrap();
         assert_eq!(cloned.get(), Permission::Write);
     }
 
     #[test]
-    fn test_shared_permission_ask() {
-        let shared = SharedPermission::new(Permission::Ask);
+    fn test_shared_permission_try_set_disabled() {
+        let shared = SharedPermission::new(Permission::Read, EnabledPermissions::DEFAULT);
+        let err = shared.try_set(Permission::Ask).unwrap_err();
+        assert_eq!(err.0, Permission::Ask);
+        // Current mode unchanged.
+        assert_eq!(shared.get(), Permission::Read);
+    }
+
+    #[test]
+    fn test_shared_permission_cycle_skips_disabled() {
+        let shared = SharedPermission::new(Permission::Read, EnabledPermissions::DEFAULT);
+        // DEFAULT is none/read/write, so Read → Write (skips Ask).
+        assert_eq!(shared.cycle(), Permission::Write);
+        assert_eq!(shared.get(), Permission::Write);
+        // Write → None.
+        assert_eq!(shared.cycle(), Permission::None);
+        // None → Read.
+        assert_eq!(shared.cycle(), Permission::Read);
+    }
+
+    #[test]
+    fn test_shared_permission_cycle_all_enabled() {
+        let shared = SharedPermission::new(Permission::None, EnabledPermissions::ALL);
+        assert_eq!(shared.cycle(), Permission::Read);
+        assert_eq!(shared.cycle(), Permission::Ask);
+        assert_eq!(shared.cycle(), Permission::Write);
+        assert_eq!(shared.cycle(), Permission::None);
+    }
+
+    #[test]
+    fn test_shared_permission_cycle_single_mode() {
+        let only_read = EnabledPermissions::from_modes([Permission::Read]).unwrap();
+        let shared = SharedPermission::new(Permission::Read, only_read);
+        // Cycle returns the same mode and doesn't loop forever.
+        assert_eq!(shared.cycle(), Permission::Read);
+        assert_eq!(shared.get(), Permission::Read);
+    }
+
+    #[test]
+    fn test_shared_permission_set_unchecked_bypasses_enabled() {
+        // Used by tests that need to construct edge cases regardless of
+        // the configured enabled set (e.g. prompt-cache invariance tests).
+        let shared = SharedPermission::new(Permission::Read, EnabledPermissions::DEFAULT);
+        shared.set_unchecked(Permission::Ask);
         assert_eq!(shared.get(), Permission::Ask);
-        assert_eq!(shared.get().indicator(), "a");
     }
 }

@@ -12,7 +12,7 @@ use reedline::{
     Signal, StyledText, default_emacs_keybindings,
 };
 
-use crate::permission::SharedPermission;
+use crate::permission::{EnabledPermissions, SharedPermission};
 use crate::relay::RELAY;
 
 /// Reedline highlighter that paints the entire input buffer with a single
@@ -283,6 +283,14 @@ fn parse_mcp_slash(rest: &str) -> Option<SlashCommand> {
     })
 }
 
+fn format_enabled(enabled: EnabledPermissions) -> String {
+    enabled
+        .iter()
+        .map(|mode| mode.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn print_help() {
     eprintln!("Commands:");
     eprintln!("  /help                          Show this help message");
@@ -375,8 +383,21 @@ pub fn run_repl(
                                 Some(level) => {
                                     match level.parse::<crate::permission::Permission>() {
                                         Ok(permission) => {
-                                            shared_permission.set(permission);
-                                            eprintln!("Permission level set to: {}", permission);
+                                            match shared_permission.try_set(permission) {
+                                                Ok(()) => {
+                                                    eprintln!(
+                                                        "Permission level set to: {}",
+                                                        permission
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    eprintln!(
+                                                        "Error: '{}' is disabled in this config (enabled: {})",
+                                                        permission,
+                                                        format_enabled(shared_permission.enabled()),
+                                                    );
+                                                }
+                                            }
                                         }
                                         Err(error) => {
                                             eprintln!("Error: {}", error);

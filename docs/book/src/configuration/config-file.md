@@ -324,6 +324,23 @@ sandbox = false  # disable sandboxed shell in read mode
 
 The sandbox uses Landlock on Linux (kernel 5.13+) and sandbox-exec on macOS. On platforms where sandboxing is unavailable, shell commands always require write mode regardless of this setting.
 
+## `[permissions]`
+
+Controls which permission modes are reachable at runtime and which mode the session starts in. See the [Permissions](../usage/permissions.md) page for what each mode does.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `default` | No | Mode the session starts in. One of `"none"`, `"read"`, `"ask"`, `"write"`. Default `"read"`. Overridden by `--permission` and `AGSH_PERMISSION`. |
+| `enabled` | No | List of modes that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "write"]` — `"ask"` is opt-in. Disabled modes are skipped during Shift+Tab cycling and rejected by `/permission` with an error. |
+
+If `default` is not in `enabled`, agsh logs a warning and falls back to `read` if it's enabled, otherwise the lowest-discriminant enabled mode (in `none → read → ask → write` order). Same behavior if `--permission` or `AGSH_PERMISSION` selects a disabled mode — agsh warns and starts in the configured default rather than refusing to launch.
+
+```toml
+[permissions]
+default = "read"
+enabled = ["none", "read", "ask", "write"]  # opt back into ask
+```
+
 ## `[session]`
 
 Settings for session history retention and context window management.

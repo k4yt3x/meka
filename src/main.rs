@@ -404,7 +404,7 @@ async fn run_oneshot(
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
-    let shared_permission = SharedPermission::new(config.permission);
+    let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
     let credential = resolve_credential(&config)?;
     let agent = create_agent_from_config(
         &config,
@@ -461,7 +461,7 @@ async fn run_interactive(
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
-    let shared_permission = SharedPermission::new(config.permission);
+    let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
 
     // Resolve session resumption BEFORE spawning the REPL so the
     // "Resuming session" message appears before the first prompt.
@@ -990,7 +990,8 @@ async fn run_tools_subcommand(
             // Build with no filter so the catalogue carries every tool's
             // hardcoded level; overlay the real filter for status/source.
             let session_manager = SessionManager::open(None).await?;
-            let shared_permission = SharedPermission::new(config.permission);
+            let shared_permission =
+                SharedPermission::new(config.permission, config.enabled_permissions);
             let sandbox_capability = crate::sandbox::detect();
             let todo_list: crate::tools::todo::SharedTodoList =
                 std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));

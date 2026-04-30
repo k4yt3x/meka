@@ -85,7 +85,7 @@ impl Tool for SpawnAgentTool {
 
         // Build a sub-agent tool registry: no spawn_agent (prevents recursion)
         // and no todo_write (parent owns task tracking).
-        let sub_shared_perm = SharedPermission::new(sub_perm);
+        let sub_shared_perm = SharedPermission::new(sub_perm, self.parent_permission.enabled());
         let sub_registry = ToolRegistry::build_for_subagent(
             self.tool_builder_params.web_client.clone(),
             sub_shared_perm,

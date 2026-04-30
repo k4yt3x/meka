@@ -541,7 +541,10 @@ mod tests {
     use super::*;
 
     fn test_shared_permission() -> crate::permission::SharedPermission {
-        crate::permission::SharedPermission::new(Permission::Write)
+        crate::permission::SharedPermission::new(
+            Permission::Write,
+            crate::permission::EnabledPermissions::ALL,
+        )
     }
 
     fn test_todo_list() -> todo::SharedTodoList {
@@ -1110,7 +1113,10 @@ mod tests {
             BuiltinToolFilter::from_config(None, vec!["web_search".to_string()], HashMap::new());
         let registry = ToolRegistry::build_for_subagent(
             crate::config::WebClientConfig::default(),
-            crate::permission::SharedPermission::new(Permission::Read),
+            crate::permission::SharedPermission::new(
+                Permission::Read,
+                crate::permission::EnabledPermissions::ALL,
+            ),
             true,
             crate::sandbox::detect(),
             filter,

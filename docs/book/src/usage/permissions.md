@@ -15,10 +15,15 @@ Each level includes all tools from the levels below it. Write mode includes all 
 
 ## Default Permission
 
-The default permission is **read**. You can change it with:
+The default permission is **read**. The default *enabled* set is `none / read / write` — **`ask` is opt-in**: enable it under `[permissions]` in your config if you want approval prompts.
+
+You can change the start mode with:
 
 - CLI flag: `agsh --permission write`
 - Environment variable: `export AGSH_PERMISSION=write`
+- Config file: `[permissions] default = "write"` — see [Config File](../configuration/config-file.md#permissions)
+
+If `--permission` or `AGSH_PERMISSION` selects a mode that isn't in `[permissions].enabled`, agsh logs a warning and starts in the configured default instead of refusing to launch.
 
 ## Changing Permissions at Runtime
 
@@ -28,12 +33,16 @@ Press **Shift+Tab** to cycle through permission levels:
 none → read → ask → write → none → ...
 ```
 
+Disabled modes are skipped during cycling. With the default enabled set, Shift+Tab cycles `none → read → write → none`.
+
 Or use the `/permission` slash command:
 
 ```text
 /permission write
 /permission ask
 ```
+
+`/permission <mode>` against a disabled mode prints an error naming the currently enabled set.
 
 The prompt indicator updates immediately to reflect the new level. The agent learns the current level via a per-turn `[Permission context]` block prepended to your message (see *How Permissions Work* below).
 

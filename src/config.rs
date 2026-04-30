@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::cli::Cli;
-use crate::permission::Permission;
+use crate::permission::{EnabledPermissions, Permission};
 use crate::provider::AuthCredential;
 use crate::render::RenderMode;
 
@@ -23,6 +23,15 @@ pub struct ConfigFile {
     pub mcp: Option<McpConfig>,
     pub prompt: Option<PromptConfig>,
     pub tools: Option<ToolsConfig>,
+    pub permissions: Option<PermissionsConfig>,
+}
+
+/// `[permissions]` table: choose which modes are reachable at runtime
+/// and which mode the session starts in. See `docs/book/src/usage/permissions.md`.
+#[derive(Debug, Deserialize, Default)]
+pub struct PermissionsConfig {
+    pub default: Option<String>,
+    pub enabled: Option<Vec<String>>,
 }
 
 /// Built-in tool filters, mirroring the per-server knobs on
@@ -357,6 +366,7 @@ pub struct ResolvedConfig {
     pub client_id: Option<String>,
     pub oauth_token_url: Option<String>,
     pub permission: Permission,
+    pub enabled_permissions: EnabledPermissions,
     pub streaming: bool,
     pub continue_session: Option<String>,
     pub prompt: Option<String>,
@@ -584,6 +594,112 @@ fn load_config_file() -> ConfigFile {
     }
 }
 
+/// Resolve the runtime permission level and the set of enabled modes
+/// from the layered config sources. CLI > env > config file > built-in
+/// defaults. Invalid entries warn and are dropped; out-of-set overrides
+/// (e.g. `--permission ask` when `ask` is disabled) warn and clamp to
+/// the configured default rather than refusing to start, mirroring the
+/// `[tools.tool_permissions]` warn-and-skip pattern.
+fn resolve_permission(
+    cli_permission: Option<Permission>,
+    env_permission: Option<&str>,
+    file_default: Option<&str>,
+    file_enabled: Option<&[String]>,
+) -> (Permission, EnabledPermissions) {
+    let enabled = match file_enabled {
+        Some(list) => {
+            let parsed: Vec<Permission> = list
+                .iter()
+                .filter_map(|raw| match raw.parse::<Permission>() {
+                    Ok(mode) => Some(mode),
+                    Err(_) => {
+                        tracing::warn!(
+                            "ignoring invalid [permissions].enabled entry '{}' \
+                             (expected none, read, ask, or write)",
+                            raw
+                        );
+                        None
+                    }
+                })
+                .collect();
+            match EnabledPermissions::from_modes(parsed) {
+                Some(set) => set,
+                None => {
+                    tracing::warn!(
+                        "[permissions].enabled was empty after filtering; falling back \
+                         to defaults (none, read, write)"
+                    );
+                    EnabledPermissions::DEFAULT
+                }
+            }
+        }
+        None => EnabledPermissions::DEFAULT,
+    };
+
+    let configured_default = file_default.and_then(|raw| match raw.parse::<Permission>() {
+        Ok(mode) => Some(mode),
+        Err(_) => {
+            tracing::warn!(
+                "ignoring invalid [permissions].default '{}' (expected none, read, \
+                 ask, or write)",
+                raw
+            );
+            None
+        }
+    });
+
+    let resolved_default = match configured_default {
+        Some(mode) if enabled.is_enabled(mode) => mode,
+        Some(mode) => {
+            tracing::warn!(
+                "[permissions].default = '{}' is not in [permissions].enabled; \
+                 falling back",
+                mode
+            );
+            if enabled.is_enabled(Permission::Read) {
+                Permission::Read
+            } else {
+                enabled.lowest()
+            }
+        }
+        None => {
+            if enabled.is_enabled(Permission::Read) {
+                Permission::Read
+            } else {
+                enabled.lowest()
+            }
+        }
+    };
+
+    let env_override = env_permission.and_then(|raw| match raw.parse::<Permission>() {
+        Ok(mode) => Some(mode),
+        Err(_) => {
+            tracing::warn!(
+                "ignoring invalid AGSH_PERMISSION='{}' (expected none, read, ask, or \
+                 write)",
+                raw
+            );
+            None
+        }
+    });
+
+    let raw_choice = cli_permission.or(env_override);
+    let permission = match raw_choice {
+        Some(mode) if enabled.is_enabled(mode) => mode,
+        Some(mode) => {
+            tracing::warn!(
+                "requested start mode '{}' is not in [permissions].enabled; using '{}'",
+                mode,
+                resolved_default
+            );
+            resolved_default
+        }
+        None => resolved_default,
+    };
+
+    (permission, enabled)
+}
+
 impl ResolvedConfig {
     pub fn from_cli(cli: &Cli) -> Self {
         let config_file = load_config_file();
@@ -689,14 +805,13 @@ impl ResolvedConfig {
             .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
             .or_else(|| file_provider.base_url.clone());
 
-        let permission = cli
-            .permission
-            .or_else(|| {
-                std::env::var("AGSH_PERMISSION")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(Permission::Read);
+        let file_permissions = config_file.permissions.unwrap_or_default();
+        let (permission, enabled_permissions) = resolve_permission(
+            cli.permission,
+            std::env::var("AGSH_PERMISSION").ok().as_deref(),
+            file_permissions.default.as_deref(),
+            file_permissions.enabled.as_deref(),
+        );
 
         // Compute device_id before the struct literal so we can borrow
         // `provider_name` here without conflicting with the `provider_name`
@@ -714,6 +829,7 @@ impl ResolvedConfig {
             client_id: std::env::var("CLAUDE_CLIENT_ID").ok(),
             oauth_token_url: file_provider.oauth_token_url.clone(),
             permission,
+            enabled_permissions,
             streaming: !cli.no_stream,
             continue_session: cli.continue_session.clone(),
             prompt: cli.prompt.clone(),
@@ -1801,6 +1917,124 @@ Rule 2.
             dir_mode, 0o700,
             "config dir should be 0700, got {:o}",
             dir_mode
+        );
+    }
+
+    fn enabled_set(modes: &[Permission]) -> EnabledPermissions {
+        EnabledPermissions::from_modes(modes.iter().copied()).unwrap()
+    }
+
+    fn enabled_strings(modes: &[&str]) -> Vec<String> {
+        modes.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_resolve_permission_no_config() {
+        let (perm, enabled) = resolve_permission(None, None, None, None);
+        assert_eq!(perm, Permission::Read);
+        assert_eq!(enabled, EnabledPermissions::DEFAULT);
+    }
+
+    #[test]
+    fn test_resolve_permission_explicit_enabled_all() {
+        let list = enabled_strings(&["none", "read", "ask", "write"]);
+        let (_perm, enabled) = resolve_permission(None, None, None, Some(&list));
+        assert!(enabled.is_enabled(Permission::Ask));
+        assert_eq!(enabled.iter().count(), 4);
+    }
+
+    #[test]
+    fn test_resolve_permission_invalid_entry_warns_and_drops() {
+        let list = enabled_strings(&["read", "lol", "write"]);
+        let (perm, enabled) = resolve_permission(None, None, None, Some(&list));
+        assert_eq!(enabled, enabled_set(&[Permission::Read, Permission::Write]));
+        assert_eq!(perm, Permission::Read);
+    }
+
+    #[test]
+    fn test_resolve_permission_empty_enabled_falls_back_to_default() {
+        let list: Vec<String> = vec![];
+        let (perm, enabled) = resolve_permission(None, None, None, Some(&list));
+        assert_eq!(enabled, EnabledPermissions::DEFAULT);
+        assert_eq!(perm, Permission::Read);
+    }
+
+    #[test]
+    fn test_resolve_permission_default_not_in_enabled_clamps() {
+        let list = enabled_strings(&["read", "write"]);
+        let (perm, _enabled) = resolve_permission(None, None, Some("ask"), Some(&list));
+        // `ask` is filtered out → fall back to Read because it's enabled.
+        assert_eq!(perm, Permission::Read);
+    }
+
+    #[test]
+    fn test_resolve_permission_default_not_in_enabled_no_read_falls_to_lowest() {
+        let list = enabled_strings(&["ask", "write"]);
+        let (perm, _enabled) = resolve_permission(None, None, Some("none"), Some(&list));
+        // none isn't enabled, Read isn't either → lowest enabled is Ask.
+        assert_eq!(perm, Permission::Ask);
+    }
+
+    #[test]
+    fn test_resolve_permission_invalid_default_falls_back() {
+        let (perm, _enabled) = resolve_permission(None, None, Some("weird"), None);
+        assert_eq!(perm, Permission::Read);
+    }
+
+    #[test]
+    fn test_resolve_permission_explicit_default_used() {
+        let (perm, _enabled) = resolve_permission(None, None, Some("write"), None);
+        assert_eq!(perm, Permission::Write);
+    }
+
+    #[test]
+    fn test_resolve_permission_cli_override_disabled_clamps_to_default() {
+        // `ask` not enabled → CLI request for ask warns and clamps to the
+        // configured default (Read).
+        let (perm, _enabled) = resolve_permission(Some(Permission::Ask), None, None, None);
+        assert_eq!(perm, Permission::Read);
+    }
+
+    #[test]
+    fn test_resolve_permission_cli_override_enabled_wins() {
+        let list = enabled_strings(&["none", "read", "ask", "write"]);
+        let (perm, _enabled) = resolve_permission(Some(Permission::Ask), None, None, Some(&list));
+        assert_eq!(perm, Permission::Ask);
+    }
+
+    #[test]
+    fn test_resolve_permission_env_override_used() {
+        let (perm, _enabled) = resolve_permission(None, Some("write"), None, None);
+        assert_eq!(perm, Permission::Write);
+    }
+
+    #[test]
+    fn test_resolve_permission_env_override_disabled_clamps() {
+        // env asks for ask, but ask isn't in DEFAULT enabled set.
+        let (perm, _enabled) = resolve_permission(None, Some("ask"), None, None);
+        assert_eq!(perm, Permission::Read);
+    }
+
+    #[test]
+    fn test_resolve_permission_cli_beats_env() {
+        let (perm, _enabled) =
+            resolve_permission(Some(Permission::None), Some("write"), None, None);
+        assert_eq!(perm, Permission::None);
+    }
+
+    #[test]
+    fn test_permissions_config_deserialization() {
+        let toml_str = r#"
+[permissions]
+default = "write"
+enabled = ["read", "write"]
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
+        let perms = config.permissions.expect("permissions present");
+        assert_eq!(perms.default.as_deref(), Some("write"));
+        assert_eq!(
+            perms.enabled.as_deref(),
+            Some(&[String::from("read"), String::from("write")][..])
         );
     }
 }

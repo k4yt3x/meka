@@ -1520,7 +1520,8 @@ mod tests {
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("in-memory session manager");
-        let shared_permission = SharedPermission::new(Permission::Read);
+        let shared_permission =
+            SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let registry = ToolRegistry::build_default(
@@ -1620,7 +1621,10 @@ mod tests {
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("in-memory session manager");
-        let shared_permission = SharedPermission::new(Permission::Write);
+        let shared_permission = SharedPermission::new(
+            Permission::Write,
+            crate::permission::EnabledPermissions::ALL,
+        );
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let registry = ToolRegistry::build_default(
@@ -1734,7 +1738,10 @@ mod tests {
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("in-memory session manager");
-        let shared_permission = SharedPermission::new(Permission::Write);
+        let shared_permission = SharedPermission::new(
+            Permission::Write,
+            crate::permission::EnabledPermissions::ALL,
+        );
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let registry = ToolRegistry::build_default(
@@ -1826,7 +1833,8 @@ mod tests {
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("in-memory session manager");
-        let shared_permission = SharedPermission::new(Permission::Read);
+        let shared_permission =
+            SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
         let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
         let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let registry = ToolRegistry::build_default(
@@ -1851,7 +1859,7 @@ mod tests {
 
         let mut bodies = Vec::with_capacity(levels.len());
         for &level in &levels {
-            shared_permission.set(level);
+            shared_permission.set_unchecked(level);
             let catalogue = registry.tool_catalogue();
             let system = build_system_prompt(&catalogue, true, &[], None, &[]);
             let tools = registry.definitions_active(&[]);

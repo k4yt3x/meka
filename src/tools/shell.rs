@@ -513,7 +513,10 @@ mod tests {
     }
 
     fn test_shared_permission() -> crate::permission::SharedPermission {
-        crate::permission::SharedPermission::new(Permission::Write)
+        crate::permission::SharedPermission::new(
+            Permission::Write,
+            crate::permission::EnabledPermissions::ALL,
+        )
     }
 
     #[tokio::test]
@@ -641,7 +644,10 @@ mod tests {
         use super::*;
 
         fn read_permission() -> crate::permission::SharedPermission {
-            crate::permission::SharedPermission::new(Permission::Read)
+            crate::permission::SharedPermission::new(
+                Permission::Read,
+                crate::permission::EnabledPermissions::ALL,
+            )
         }
 
         /// Under Low integrity, writing to the user's profile directory

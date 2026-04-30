@@ -295,7 +295,7 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue", num_args = 0..=1, default_missing_value = "last")]
     pub continue_session: Option<String>,
 
-    /// Initial permission mode (none, read, write)
+    /// Initial permission mode (none, read, ask, write)
     #[arg(long = "permission", value_parser = parse_permission)]
     pub permission: Option<Permission>,
 
