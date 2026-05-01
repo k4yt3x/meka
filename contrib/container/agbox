@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+
+# A wrapper script that runs agsh inside a container.
+
+set -euo pipefail
+
+for dir in "$HOME/.config/agsh" "$HOME/.local/share/agsh"; do
+    if [[ ! -d "$dir" ]]; then
+        echo "$(basename "$0"): missing $dir; setup agsh on the host first" >&2
+        exit 1
+    fi
+done
+
+# Default to `--permission write` if no arguments are provided
+if [[ $# -eq 0 ]]; then
+    set -- --permission write
+fi
+
+exec sudo docker run --rm -it \
+    -v "$HOME/.config/agsh:/root/.config/agsh:ro" \
+    -v "$HOME/.local/share/agsh:/root/.local/share/agsh:rw" \
+    agsh:latest \
+    "$@"
