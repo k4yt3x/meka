@@ -39,5 +39,5 @@ fi
 exec "${sudo_prefix[@]}" "$runtime" run --rm -it \
     -v "$HOME/.config/agsh:/root/.config/agsh:ro" \
     -v "$HOME/.local/share/agsh:/root/.local/share/agsh:rw" \
-    agsh:latest \
+    ghcr.io/k4yt3x/agsh:latest \
     "$@"
