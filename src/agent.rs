@@ -166,7 +166,7 @@ impl Agent {
         let mut spacing = render::OutputSpacing::new();
 
         if self.options.newline_after_prompt {
-            println!();
+            eprintln!();
             spacing.after_prompt();
         }
 
@@ -366,7 +366,7 @@ impl Agent {
         };
 
         if result.is_ok() && self.options.newline_before_prompt {
-            println!();
+            eprintln!();
         }
 
         match &result {
@@ -433,7 +433,7 @@ impl Agent {
                 StreamEvent::ThinkingComplete { signature } => {
                     if !current_thinking.is_empty() {
                         if spacing.before_thinking() {
-                            println!();
+                            eprintln!();
                         }
                         render::render_thinking_block(&current_thinking, show_thinking);
                         content_blocks.push(ContentBlock::Thinking {
@@ -444,7 +444,7 @@ impl Agent {
                 }
                 StreamEvent::TextDelta(text) => {
                     if !renderer.started && spacing.before_text() {
-                        println!();
+                        eprintln!();
                     }
                     current_text.push_str(&text);
                     renderer.push_delta(&text)?;
@@ -466,7 +466,7 @@ impl Agent {
                 StreamEvent::ToolUseEnd { input } => {
                     renderer.finish()?;
                     if spacing.before_tool_indicator() {
-                        println!();
+                        eprintln!();
                     }
                     let schema = self
                         .tool_registry
@@ -491,7 +491,7 @@ impl Agent {
                     // argument object.
                     renderer.finish()?;
                     if spacing.before_tool_indicator() {
-                        println!();
+                        eprintln!();
                     }
                     let marker_input = serde_json::json!({
                         crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
@@ -566,7 +566,7 @@ impl Agent {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 if !self.options.streaming {
                     if spacing.before_tool_indicator() {
-                        println!();
+                        eprintln!();
                     }
                     let schema = self
                         .tool_registry

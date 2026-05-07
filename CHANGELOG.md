@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `--skill <NAME>` invokes a user-invocable skill as the first turn; `[PROMPT]` is prepended.
+- `--oneshot` flag exits after the first turn finishes; requires `[PROMPT]` or `--skill`.
+
+### Changed
+
+- Bare `[PROMPT]` / `--skill` now drop into the REPL after the first turn; pass `--oneshot` to exit instead.
+- Tool indicators, thinking, todos, spacing newlines, setup prompts, OAuth URLs all move to stderr.
+
 ## [0.18.4] - 2026-05-04
 
 ### Added

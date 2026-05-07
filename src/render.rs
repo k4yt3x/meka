@@ -570,7 +570,7 @@ pub fn render_tool_indicator(
         }
         None => format!("[tool {}]", display_name),
     };
-    println!("{}", indicator.with(Color::DarkCyan));
+    eprintln!("{}", indicator.with(Color::DarkCyan));
 }
 
 /// Match ANSI CSI (Control Sequence Introducer) escapes: `ESC [` followed by

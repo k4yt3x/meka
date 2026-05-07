@@ -196,7 +196,7 @@ pub async fn run_remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_skill(name: &str) -> Result<skills::Skill> {
+pub(crate) fn require_skill(name: &str) -> Result<skills::Skill> {
     let skills = skills::discover_skills();
     skills
         .into_iter()

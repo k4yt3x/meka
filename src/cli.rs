@@ -331,6 +331,14 @@ pub struct Cli {
     #[arg(long = "instructions", value_name = "STRING")]
     pub instructions: Option<String>,
 
+    /// Invoke a user-invocable skill on the first turn.
+    #[arg(long = "skill", value_name = "NAME")]
+    pub skill: Option<String>,
+
+    /// Exit after the first turn finishes (requires a prompt or `--skill`).
+    #[arg(long = "oneshot")]
+    pub oneshot: bool,
+
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbosity: u8,
@@ -360,13 +368,36 @@ mod tests {
         assert!(cli.base_url.is_none());
         assert!(!cli.no_stream);
         assert!(cli.render_mode.is_none());
+        assert!(cli.skill.is_none());
+        assert!(!cli.oneshot);
         assert_eq!(cli.verbosity, 0);
+    }
+
+    #[test]
+    fn test_cli_oneshot_flag() {
+        let cli = Cli::parse_from(["agsh", "--oneshot", "do thing"]);
+        assert!(cli.oneshot);
+        assert_eq!(cli.prompt.as_deref(), Some("do thing"));
     }
 
     #[test]
     fn test_cli_oneshot_prompt() {
         let cli = Cli::parse_from(["agsh", "hello world"]);
         assert_eq!(cli.prompt.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_cli_skill_flag_alone() {
+        let cli = Cli::parse_from(["agsh", "--skill", "demo"]);
+        assert_eq!(cli.skill.as_deref(), Some("demo"));
+        assert!(cli.prompt.is_none());
+    }
+
+    #[test]
+    fn test_cli_skill_flag_with_extra_prompt() {
+        let cli = Cli::parse_from(["agsh", "--skill", "demo", "extra context"]);
+        assert_eq!(cli.skill.as_deref(), Some("demo"));
+        assert_eq!(cli.prompt.as_deref(), Some("extra context"));
     }
 
     #[test]

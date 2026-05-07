@@ -42,6 +42,17 @@ This file provides guidance to AI agents when working with code in this reposito
 - **Hard errors** propagated back to the user with context (`render::render_error`, clap-side validation errors).
 - Use `stdout` (`println!`) for parseable command output a script might consume; `stderr` (`eprintln!`) for prompts, live UI, and contract errors.
 
+### `stdout` vs `stderr`
+
+When `println!` / `eprintln!` *is* the right call (the output is unavoidable per the list above), the choice of stream is not a style decision — it's a contract:
+
+- **`stdout` (`println!`, `print!`)** — only the data the user invoked the command to obtain. Examples: the agent's streamed assistant response, an `agsh list` table, an `agsh export -` markdown body, an `agsh skill show` body, `agsh mcp list` / `mcp get` / `mcp tools` rows.
+- **`stderr` (`eprintln!`, `eprint!`)** — everything else: tool-call indicators, thinking blocks, todo lists, spacing newlines, status confirmations, hints, errors, interrupt notices, setup-wizard prompts, OAuth URLs, REPL UI feedback (`/permission`, `/cd`, `Unknown command`, approval prompts, `!cmd` exit-code messages).
+
+**Litmus test:** `agsh ... 2>/dev/null | next-tool` should leave only the requested data on stdout. If a user can't usefully pipe the output, your `println!()` is probably an `eprintln!()`.
+
+The streaming markdown renderer (`render::StreamingRenderer`) writes to stdout because the assistant response *is* the requested output for an agent turn. Every other helper in `render.rs` (`render_session_id`, `render_hint`, `render_error`, `render_thinking_block`, `render_todo_list`, `render_tool_indicator`) and every spacing-blank-line emitted around them goes to stderr.
+
 **Use `tracing` for everything else:**
 
 - `error!` — unrecoverable failure about to propagate up as an `AgshError`. Rare; the `?` operator usually already carries the info.

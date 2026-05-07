@@ -103,6 +103,29 @@ skill(name: "download-videos")
 
 The tool returns the full body of `SKILL.md` (with variables expanded) as its output. The agent then follows the instructions.
 
+## Invoking a Skill from the CLI
+
+Skills marked `user_invocable: true` (the default) can also be triggered directly from the command line with `--skill <name>`. The rendered body becomes the first user turn, and agsh drops into the interactive REPL after the turn finishes:
+
+```bash
+agsh --skill download-videos "https://example.com/video"
+```
+
+The positional `[PROMPT]` argument, if given, is prepended to the skill body as extra context — equivalent to typing `/skill download-videos https://example.com/video` in the REPL.
+
+To run the skill and exit immediately (useful for scripts), pair with `--oneshot`:
+
+```bash
+agsh --oneshot --skill download-videos "https://example.com/video"
+```
+
+To invoke a skill mid-session inside the REPL, use the slash command instead:
+
+```
+/skill download-videos
+/skill download-videos this URL specifically
+```
+
 ## Tips
 
 - Use short, unambiguous skill names (e.g. `setup-postgres`, not `pg`). The name is what the agent sees and calls.

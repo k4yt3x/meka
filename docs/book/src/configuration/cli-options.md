@@ -50,13 +50,14 @@ Default limit: 20.
 
 ### `[PROMPT]`
 
-Run a one-shot prompt and exit. The agent processes the prompt, prints its response, and the process terminates.
+Run the agent's first turn immediately with this text as the user message, then drop into the interactive REPL for follow-up. Pair with [`--oneshot`](#oneshot) to exit after the first turn instead of opening the REPL.
 
 ```bash
-agsh "list all files larger than 1MB in the current directory"
+agsh "list all files larger than 1MB in the current directory"   # first turn, then REPL
+agsh --oneshot "list all files larger than 1MB"                  # first turn, then exit
 ```
 
-When omitted, agsh starts in interactive mode.
+When omitted, agsh starts the REPL with no initial input.
 
 ## Options
 
@@ -152,6 +153,26 @@ Override [`prompt.instructions`](./config-file.md#promptinstructions) for this r
 
 ```bash
 agsh --instructions "Be terse. No code fences in answers."
+```
+
+### `--skill <NAME>`
+
+Invoke a [user-invocable skill](../usage/skills.md) as the first turn. Mirrors the REPL slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli) — the positional `[PROMPT]` arg, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#oneshot) to exit after the turn instead of opening the REPL.
+
+```bash
+agsh --skill download-videos "https://example.com/video"             # first turn, then REPL
+agsh --skill download-videos --oneshot "https://example.com/video"   # first turn, then exit
+```
+
+Errors out with a clean message if the skill name is unknown or the skill's frontmatter sets `user_invocable: false`.
+
+### `--oneshot`
+
+Exit after the first turn finishes. Requires either the positional `[PROMPT]` or `--skill <NAME>` — without one of those, agsh has nothing to do. Useful for scripts and CI invocations.
+
+```bash
+agsh --oneshot "summarize the last commit"
+agsh --oneshot --skill deploy "to staging"
 ```
 
 ### `-v`, `--verbose`

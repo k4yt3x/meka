@@ -128,7 +128,7 @@ async fn exchange_code(
 }
 
 fn prompt_line(prompt: &str) -> io::Result<String> {
-    print!("{}", prompt);
+    eprint!("{}", prompt);
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -136,9 +136,9 @@ fn prompt_line(prompt: &str) -> io::Result<String> {
 }
 
 fn prompt_choice(prompt: &str, options: &[&str]) -> io::Result<usize> {
-    println!("{}", prompt);
+    eprintln!("{}", prompt);
     for (index, option) in options.iter().enumerate() {
-        println!("  {}. {}", index + 1, option);
+        eprintln!("  {}. {}", index + 1, option);
     }
 
     loop {
@@ -149,12 +149,12 @@ fn prompt_choice(prompt: &str, options: &[&str]) -> io::Result<usize> {
         {
             return Ok(choice - 1);
         }
-        println!("Please enter a number between 1 and {}.", options.len());
+        eprintln!("Please enter a number between 1 and {}.", options.len());
     }
 }
 
 pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
-    println!("Welcome to agsh! Let's set up your configuration.\n");
+    eprintln!("Welcome to agsh! Let's set up your configuration.\n");
 
     let provider_index = prompt_choice(
         "Select a provider:",
@@ -172,7 +172,7 @@ pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
         _ => "openai-api",
     };
 
-    println!();
+    eprintln!();
 
     let mut api_key: Option<String> = None;
 
@@ -199,13 +199,13 @@ pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
         }
     }
 
-    println!();
+    eprintln!();
     let model = prompt_line("Model name: ")?;
     if model.is_empty() {
         anyhow::bail!("model name cannot be empty");
     }
 
-    println!();
+    eprintln!();
     let base_url_input = prompt_line("API base URL (leave empty for default): ")?;
     let base_url = if base_url_input.is_empty() {
         None
@@ -242,10 +242,10 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
     if let Err(error) = open::that(&url) {
         tracing::debug!("failed to open browser for setup: {}", error);
     }
-    println!();
-    println!("To authorize, open this URL in your browser:");
-    println!("    {}", url);
-    println!();
+    eprintln!();
+    eprintln!("To authorize, open this URL in your browser:");
+    eprintln!("    {}", url);
+    eprintln!();
 
     let code_input = prompt_line("After authorizing, paste the authorization code here:\n> ")?;
     if code_input.is_empty() {
@@ -294,11 +294,11 @@ async fn run_codex_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
     if let Err(error) = open::that(&url) {
         tracing::debug!("failed to open browser for Codex login: {}", error);
     }
-    println!();
-    println!("To authorize, open this URL in your browser:");
-    println!("    {}", url);
-    println!();
-    println!(
+    eprintln!();
+    eprintln!("To authorize, open this URL in your browser:");
+    eprintln!("    {}", url);
+    eprintln!();
+    eprintln!(
         "Waiting up to {}s for the callback on 127.0.0.1:{}...",
         CODEX_CALLBACK_TIMEOUT.as_secs(),
         CODEX_REDIRECT_PORT

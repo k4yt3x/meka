@@ -120,8 +120,55 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         })?;
     }
 
-    let config = ResolvedConfig::from_cli(&cli);
+    // --oneshot needs something to do; reject early before any setup.
+    if cli.oneshot && cli.prompt.is_none() && cli.skill.is_none() {
+        return Err(anyhow::anyhow!(
+            "--oneshot requires a prompt argument or --skill"
+        ));
+    }
+
+    // If --skill is set, validate and render the body upfront so an invalid
+    // name fails fast — before any session/MCP setup. The combined string
+    // (extra + body, mirroring the REPL's `/skill <name> [extra...]`) then
+    // takes the place of cli.prompt as the first-turn input.
+    let skill_prompt = build_skill_prompt(&cli)?;
+
+    let mut config = ResolvedConfig::from_cli(&cli);
+    if let Some(prompt) = skill_prompt {
+        config.prompt = Some(prompt);
+    }
     runtime.block_on(async_main(config))
+}
+
+/// Render a `--skill <name>` invocation into the user-message string that
+/// drives the first turn. Returns `Ok(None)` when `--skill` is not set so
+/// callers can leave `cli.prompt` untouched.
+///
+/// Mirrors the REPL handler at `SlashCommand::SkillInvoke` — same lookup,
+/// same `user_invocable` gate, same `format!("{extra}\n\n{body}")` order
+/// when the positional `[PROMPT]` is supplied.
+fn build_skill_prompt(cli: &cli::Cli) -> anyhow::Result<Option<String>> {
+    let Some(name) = cli.skill.as_deref() else {
+        return Ok(None);
+    };
+    let skill = skills::cli::require_skill(name)?;
+    if !skill.user_invocable {
+        return Err(anyhow::anyhow!(
+            "skill '{}' is not user-invocable; remove `user_invocable: false` from its frontmatter to allow direct invocation",
+            name
+        ));
+    }
+    // Pass `None` for session_id: the session is created lazily on the
+    // first turn, so `${AGSH_SESSION_ID}` would be unresolvable here.
+    // This matches the REPL's first-turn `/skill` behaviour, where
+    // session_id is also None until run_turn populates it.
+    let body = skills::load_skill_body(&skill, None)
+        .map_err(|error| anyhow::anyhow!("failed to load skill '{}': {}", name, error))?;
+    let combined = match cli.prompt.as_deref() {
+        Some(extra) if !extra.is_empty() => format!("{}\n\n{}", extra, body),
+        _ => body,
+    };
+    Ok(Some(combined))
 }
 
 /// Build the `tracing` filter for agsh.
@@ -226,7 +273,14 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
         None
     };
 
-    if let Some(prompt) = config.prompt.clone() {
+    // `--oneshot` runs a single turn and exits; the prompt is required (validated
+    // at startup). Without `--oneshot`, any provided prompt/skill becomes the
+    // first-turn input but the REPL stays open afterwards.
+    if config.oneshot {
+        let prompt = config
+            .prompt
+            .clone()
+            .expect("validated at startup: --oneshot requires a prompt argument or --skill");
         return run_oneshot(
             config,
             session_manager,
@@ -238,10 +292,12 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
         .await;
     }
 
+    let initial_prompt = config.prompt.clone();
     run_interactive(
         config,
         session_manager,
         token_store,
+        initial_prompt,
         mcp_manager,
         mcp_context,
     )
@@ -459,6 +515,7 @@ async fn run_interactive(
     config: ResolvedConfig,
     session_manager: SessionManager,
     token_store: TokenStore,
+    initial_prompt: Option<String>,
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
@@ -474,6 +531,16 @@ async fn run_interactive(
     }
 
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ReplEvent>();
+
+    // If a prompt or skill was given without `--oneshot`, queue it as a
+    // synthetic user input so the first turn runs immediately. The REPL
+    // takes over afterwards for follow-up turns. The send cannot fail —
+    // the receiver was just constructed above.
+    if let Some(prompt) = initial_prompt {
+        input_sender
+            .send(ReplEvent::UserInput(prompt))
+            .expect("freshly created input channel must accept first send");
+    }
     let (agent_event_sender, agent_event_receiver) =
         std::sync::mpsc::channel::<repl::AgentToReplEvent>();
     let approval_sender = agent_event_sender.clone();
@@ -567,13 +634,13 @@ async fn run_interactive(
                     Err(error::AgshError::Interrupted) => {
                         eprintln!("\nInterrupted.");
                         if config.newline_before_prompt {
-                            println!();
+                            eprintln!();
                         }
                     }
                     Err(error) => {
                         render::render_error(&error);
                         if config.newline_before_prompt {
-                            println!();
+                            eprintln!();
                         }
                     }
                 }
@@ -1268,7 +1335,7 @@ fn reprint_last_message(messages: &[provider::Message], render_mode: render::Ren
     if let Err(error) = renderer.finish() {
         tracing::debug!("failed to finish rendering last message: {}", error);
     }
-    println!();
+    eprintln!();
 }
 
 async fn resolve_session_resume(
@@ -1289,7 +1356,7 @@ async fn resolve_session_resume(
                 let lock = session_manager.lock_session(id)?;
                 render::render_session_id("Continuing session", &id.to_string());
                 if config.newline_after_prompt {
-                    println!();
+                    eprintln!();
                 }
                 let messages = load_session_messages(session_manager, id).await?;
                 Ok((Some(id), messages, Some(lock)))
@@ -1306,7 +1373,7 @@ async fn resolve_session_resume(
         let lock = session_manager.lock_session(id)?;
         render::render_session_id("Continuing session", &id.to_string());
         if config.newline_after_prompt {
-            println!();
+            eprintln!();
         }
         let messages = load_session_messages(session_manager, id).await?;
         Ok((Some(id), messages, Some(lock)))
