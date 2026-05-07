@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] - 2026-05-07
 
 ### Added
 
@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Bare `[PROMPT]` / `--skill` now drop into the REPL after the first turn; pass `--oneshot` to exit instead.
-- Tool indicators, thinking, todos, spacing newlines, setup prompts, OAuth URLs all move to stderr.
+- Bare `[PROMPT]` / `--skill` now drop into the REPL after the first turn.
+- Tool indicators, thinking, todos, spacing newlines, setup prompts, OAuth URLs output to stderr.
 
 ### Fixed
 
