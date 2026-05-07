@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bare `[PROMPT]` / `--skill` now drop into the REPL after the first turn; pass `--oneshot` to exit instead.
 - Tool indicators, thinking, todos, spacing newlines, setup prompts, OAuth URLs all move to stderr.
 
+### Fixed
+
+- OAuth refresh re-reads the latest token from the DB, fixing `invalid_grant` between concurrent instances.
+
 ## [0.18.4] - 2026-05-04
 
 ### Added

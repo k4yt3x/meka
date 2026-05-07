@@ -143,8 +143,27 @@ impl OpenAiCodexProvider {
 
         let mut credential = self.credential.write().await;
 
-        // Double-check after acquiring write lock — another caller may
-        // have refreshed under us.
+        // Re-read the latest credential from the DB. Refresh tokens rotate on
+        // each successful refresh, and a sibling agsh process may have
+        // rotated ours since startup. Without this re-read we'd POST a stale
+        // refresh_token and the OAuth provider would reject it with
+        // `invalid_grant`.
+        if let Some(store) = &self.token_store {
+            match store.load_oauth_token(STORAGE_KEY).await {
+                Ok(Some(latest)) => *credential = latest,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to re-read Codex OAuth token before refresh: {}",
+                        error
+                    );
+                }
+            }
+        }
+
+        // Double-check after the DB re-read: another caller (in this process
+        // or a sibling agsh) may already have rotated to a still-valid
+        // access token.
         if let AuthCredential::OAuthToken {
             access_token,
             expires_at,

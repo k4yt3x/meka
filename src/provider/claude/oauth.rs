@@ -168,7 +168,23 @@ impl ClaudeOAuthProvider {
         // Token expired — attempt refresh
         let mut credential = self.credential.write().await;
 
-        // Double-check after acquiring write lock
+        // Re-read the latest credential from the DB. Refresh tokens rotate on
+        // each successful refresh, and a sibling agsh process (or `agsh mcp
+        // login` flow) may have rotated ours since startup. Without this
+        // re-read we'd POST a stale refresh_token and the OAuth provider
+        // would reject it with `invalid_grant`.
+        if let Some(store) = &self.token_store {
+            match store.load_oauth_token("claude").await {
+                Ok(Some(latest)) => *credential = latest,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!("failed to re-read OAuth token before refresh: {}", error);
+                }
+            }
+        }
+
+        // Double-check after the DB re-read: another process may have already
+        // rotated and persisted a new access token that's still valid.
         if let AuthCredential::OAuthToken {
             access_token,
             expires_at,
