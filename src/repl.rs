@@ -319,6 +319,7 @@ pub fn run_repl(
     shared_permission: SharedPermission,
     show_path_in_prompt: bool,
     input_style: nu_ansi_term::Style,
+    initial_turn_pending: bool,
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
 ) {
@@ -335,6 +336,14 @@ pub fn run_repl(
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
     };
+
+    // If the caller queued a synthetic first turn (e.g. `--skill` or a bare
+    // positional `[PROMPT]` in interactive mode), drain agent events for
+    // that turn before drawing the first reedline prompt. Otherwise the
+    // prompt indicator and the agent's stdout output collide on screen.
+    if initial_turn_pending && !wait_for_agent(&agent_event_receiver) {
+        return;
+    }
 
     loop {
         match editor.read_line(&prompt) {

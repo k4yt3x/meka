@@ -535,7 +535,11 @@ async fn run_interactive(
     // If a prompt or skill was given without `--oneshot`, queue it as a
     // synthetic user input so the first turn runs immediately. The REPL
     // takes over afterwards for follow-up turns. The send cannot fail —
-    // the receiver was just constructed above.
+    // the receiver was just constructed above. Tracking the flag separately
+    // tells the REPL to wait for the synthetic turn's events before drawing
+    // its first prompt — otherwise reedline's prompt collides with the
+    // agent's output.
+    let initial_turn_pending = initial_prompt.is_some();
     if let Some(prompt) = initial_prompt {
         input_sender
             .send(ReplEvent::UserInput(prompt))
@@ -576,6 +580,7 @@ async fn run_interactive(
             repl_permission,
             show_path_in_prompt,
             input_style,
+            initial_turn_pending,
             input_sender,
             agent_event_receiver,
         );
