@@ -63,14 +63,15 @@ When omitted, agsh starts the REPL with no initial input.
 
 ### `-c`, `--continue [SESSION_ID]`
 
-Resume a session. Without a session ID, resumes the most recently updated session. With a session ID, resumes that specific session.
+Resume a session. Without a session ID, resumes the most recently updated session. With a session ID, resumes that specific session — accepts either the full UUID or any unique leading prefix (most-recent-first if the prefix matches more than one).
 
 ```bash
 agsh -c                                          # resume last session
-agsh -c 550e8400-e29b-41d4-a716-446655440000     # resume specific session
+agsh -c 550e8400-e29b-41d4-a716-446655440000     # full UUID
+agsh -c 550e                                     # prefix; works if unique
 ```
 
-Errors if the session does not exist or is locked by another agsh instance.
+Errors if the session does not exist, the prefix matches multiple sessions (with the matching IDs listed for disambiguation), or the session is locked by another agsh instance.
 
 ### `--permission <MODE>`
 

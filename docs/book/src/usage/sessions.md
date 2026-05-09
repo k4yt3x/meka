@@ -27,6 +27,17 @@ agsh -c 550e8400-e29b-41d4-a716-446655440000
 
 The agent loads the previous conversation and continues from where you left off.
 
+### By UUID Prefix
+
+If the value isn't a valid UUID, agsh treats it as a leading prefix and looks up sessions whose ID starts with it. This avoids having to copy the entire UUID:
+
+```bash
+agsh -c 550e            # works if exactly one session starts with `550e`
+agsh -c 5               # likely ambiguous; agsh lists matching IDs and exits
+```
+
+When a prefix matches multiple sessions, agsh prints the matching IDs (most-recent first) so you can disambiguate. Type a few more characters until the prefix is unique.
+
 ## Session Locking
 
 Only one agsh instance can be attached to a session at a time. This prevents race conditions from concurrent writes.

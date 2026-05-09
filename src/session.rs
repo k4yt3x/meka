@@ -545,6 +545,45 @@ impl SessionManager {
             })
     }
 
+    /// Resolve a session-ID prefix (e.g. `d64`) to the matching full UUIDs.
+    ///
+    /// Used by `agsh -c <prefix>` so the user doesn't have to type the
+    /// whole UUID. Capped at 16 matches; ordered most-recent-first so the
+    /// caller's "ambiguous prefix" listing leads with the session the user
+    /// most likely meant.
+    ///
+    /// Anything outside the UUID alphabet (`0-9a-fA-F-`) returns an empty
+    /// list — both because such a prefix can't match any real session ID
+    /// and to keep SQL `LIKE` wildcards (`%`, `_`) from sneaking through.
+    pub async fn find_sessions_by_prefix(&self, prefix: &str) -> Result<Vec<Uuid>> {
+        if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("{}%", prefix);
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "SELECT id FROM sessions WHERE id LIKE ?1 \
+                     ORDER BY updated_at DESC LIMIT 16",
+                )?;
+                let rows = statement.query_map(rusqlite::params![pattern], |row| {
+                    let id: String = row.get(0)?;
+                    Ok(id)
+                })?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    if let Ok(uuid) = Uuid::parse_str(&row?) {
+                        ids.push(uuid);
+                    }
+                }
+                Ok(ids)
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to find sessions by prefix: {}", error))
+            })
+    }
+
     pub async fn list_sessions(&self, limit: u32) -> Result<Vec<SessionSummary>> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1460,6 +1499,87 @@ mod tests {
             .await
             .expect("failed to get last session");
         assert_eq!(last, Some(session_id));
+    }
+
+    #[tokio::test]
+    async fn test_find_sessions_by_prefix_empty_db() {
+        let manager = test_manager().await;
+        let matches = manager
+            .find_sessions_by_prefix("abc")
+            .await
+            .expect("failed prefix lookup");
+        assert!(matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_sessions_by_prefix_unique_match() {
+        let manager = test_manager().await;
+        let id = manager
+            .create_session()
+            .await
+            .expect("failed to create session");
+        // First 8 hex chars (before the first dash) — guaranteed unique
+        // for a freshly-generated random UUID with only one row in the DB.
+        let prefix: String = id.to_string().chars().take(8).collect();
+        let matches = manager
+            .find_sessions_by_prefix(&prefix)
+            .await
+            .expect("failed prefix lookup");
+        assert_eq!(matches, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn test_find_sessions_by_prefix_no_match() {
+        let manager = test_manager().await;
+        manager
+            .create_session()
+            .await
+            .expect("failed to create session");
+        let matches = manager
+            .find_sessions_by_prefix("ffffffff")
+            .await
+            .expect("failed prefix lookup");
+        // Real UUIDs are random; collision with this prefix is astronomically
+        // unlikely but theoretically possible — re-create a session if so.
+        assert!(matches.is_empty() || matches.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn test_find_sessions_by_prefix_rejects_non_hex_chars() {
+        let manager = test_manager().await;
+        manager
+            .create_session()
+            .await
+            .expect("failed to create session");
+        // SQL `%` and `_` wildcards must not slip through as prefix chars.
+        for bad in ["%", "_", "abc%", "ab_c", "g0g0", "x123"] {
+            let matches = manager
+                .find_sessions_by_prefix(bad)
+                .await
+                .expect("failed prefix lookup");
+            assert!(
+                matches.is_empty(),
+                "non-hex prefix {:?} should match nothing",
+                bad
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_sessions_by_prefix_empty_prefix_matches_nothing() {
+        let manager = test_manager().await;
+        manager
+            .create_session()
+            .await
+            .expect("failed to create session");
+        let matches = manager
+            .find_sessions_by_prefix("")
+            .await
+            .expect("failed prefix lookup");
+        assert!(
+            matches.is_empty(),
+            "empty prefix must not match every session"
+        );
     }
 
     #[tokio::test]

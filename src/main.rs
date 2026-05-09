@@ -1382,12 +1382,7 @@ async fn resolve_session_resume(
             None => Ok((None, conversation::Conversation::new(), None)),
         }
     } else {
-        let id: uuid::Uuid = value
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid session ID: {}", value))?;
-        if !session_manager.session_exists(id).await? {
-            anyhow::bail!("session not found: {}", id);
-        }
+        let id = resolve_session_id(session_manager, value).await?;
         let lock = session_manager.lock_session(id)?;
         render::render_session_id("Continuing session", &id.to_string());
         if config.newline_after_prompt {
@@ -1395,6 +1390,38 @@ async fn resolve_session_resume(
         }
         let messages = load_session_messages(session_manager, id).await?;
         Ok((Some(id), messages, Some(lock)))
+    }
+}
+
+/// Resolve `agsh -c <value>` (where `value` is not "last") to a single
+/// session UUID. Tries a full-UUID parse first; if that fails, falls back
+/// to a prefix lookup so users can type just the leading hex chars.
+///
+/// Errors out cleanly when the prefix matches zero or multiple sessions.
+async fn resolve_session_id(
+    session_manager: &SessionManager,
+    value: &str,
+) -> anyhow::Result<uuid::Uuid> {
+    if let Ok(id) = value.parse::<uuid::Uuid>() {
+        if !session_manager.session_exists(id).await? {
+            anyhow::bail!("session not found: {}", id);
+        }
+        return Ok(id);
+    }
+
+    let matches = session_manager.find_sessions_by_prefix(value).await?;
+    match matches.len() {
+        0 => anyhow::bail!("no session matches prefix '{}'", value),
+        1 => Ok(matches[0]),
+        _ => {
+            let listing: Vec<String> = matches.iter().map(|id| id.to_string()).collect();
+            anyhow::bail!(
+                "ambiguous prefix '{}' matches {} sessions: {}",
+                value,
+                matches.len(),
+                listing.join(", "),
+            )
+        }
     }
 }
 
