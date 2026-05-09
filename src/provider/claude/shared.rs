@@ -25,9 +25,32 @@ use crate::provider::{
 /// before they're posted.
 pub(super) const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
 
+/// When redaction fires, drop the body to roughly this size — leaves a
+/// ~6 MiB buffer below [`MAX_REQUEST_BYTES`] so the next several turns
+/// don't re-trigger redaction. Mirrors Claude Code's `apiMicrocompact`
+/// watermark (180k → 140k = ~78% of trigger). Stable cache prefix between
+/// redactions matters more than minimum-impact redaction per event.
+pub(super) const REDACTION_TARGET_BYTES: usize = 24 * 1024 * 1024;
+
 /// Placeholder text that replaces a `ToolResultContent::Image` payload when
 /// the request body would otherwise exceed [`MAX_REQUEST_BYTES`].
 pub(super) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
+
+/// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both
+/// the non-streaming response parser and the SSE driver — Anthropic emits
+/// the same shape (`input_tokens`, `output_tokens`,
+/// `cache_creation_input_tokens`, `cache_read_input_tokens`) in both
+/// places. Missing fields default to 0 (older API responses, or providers
+/// that don't surface cache stats).
+pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
+    let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    TokenUsage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        cache_creation_input_tokens: field("cache_creation_input_tokens"),
+        cache_read_input_tokens: field("cache_read_input_tokens"),
+    }
+}
 
 /// Resolves the effective thinking state given the override atomic's raw
 /// value (`-1` = unset, `0` = forced off, `1` = forced on) and the configured
@@ -246,18 +269,10 @@ pub(super) fn parse_non_streaming_response(
 
     let stop_reason = parse_claude_stop_reason(stop_reason_str);
 
-    let token_usage = TokenUsage {
-        input_tokens: response
-            .get("usage")
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-        output_tokens: response
-            .get("usage")
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0),
-    };
+    let token_usage = response
+        .get("usage")
+        .map(parse_usage_object)
+        .unwrap_or_default();
 
     let content_array = response
         .get("content")
@@ -535,10 +550,7 @@ pub(super) async fn drive_claude_sse_stream(
                                     continue;
                                 };
                                 if let Some(usage) = data.get("usage") {
-                                    let token_usage = TokenUsage {
-                                        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    };
+                                    let token_usage = parse_usage_object(usage);
                                     if event_sender.send(StreamEvent::Usage(token_usage)).is_err() {
                                         tracing::trace!("stream event receiver dropped");
                                         break;
@@ -561,11 +573,10 @@ pub(super) async fn drive_claude_sse_stream(
                                 break;
                             }
                             "message_start" => {
-                                if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
-                                    let token_usage = TokenUsage {
-                                        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    };
+                                if let Some(usage) =
+                                    data.get("message").and_then(|m| m.get("usage"))
+                                {
+                                    let token_usage = parse_usage_object(usage);
                                     if event_sender.send(StreamEvent::Usage(token_usage)).is_err() {
                                         tracing::trace!("stream event receiver dropped");
                                         break;
@@ -592,6 +603,15 @@ pub(super) async fn drive_claude_sse_stream(
     Ok(())
 }
 
+/// Stats from a single [`redact_oldest_images`] invocation. Returned to
+/// callers so they can surface a user-visible advisory and increment a
+/// per-session redaction counter.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct RedactionStats {
+    pub images_redacted: usize,
+    pub bytes_freed: usize,
+}
+
 /// Walk `messages` oldest-first and replace `ToolResultContent::Image`
 /// payloads with [`IMAGE_REDACTION_PLACEHOLDER`] until at least
 /// `bytes_to_drop` base64 bytes have been removed. The LAST message is never
@@ -607,25 +627,26 @@ pub(super) async fn drive_claude_sse_stream(
 pub(super) fn redact_oldest_images(
     messages: &[Message],
     bytes_to_drop: usize,
-) -> Cow<'_, [Message]> {
+) -> (Cow<'_, [Message]>, RedactionStats) {
     if bytes_to_drop == 0 || messages.len() <= 1 {
-        return Cow::Borrowed(messages);
+        return (Cow::Borrowed(messages), RedactionStats::default());
     }
 
     let mut redacted: Vec<Message> = messages.to_vec();
     let last = redacted.len() - 1;
-    let mut bytes_dropped: usize = 0;
+    let mut stats = RedactionStats::default();
 
     'outer: for message in &mut redacted[..last] {
         for block in &mut message.content {
             if let ContentBlock::ToolResult { content, .. } = block {
                 for item in content.iter_mut() {
                     if let ToolResultContent::Image { source } = item {
-                        bytes_dropped = bytes_dropped.saturating_add(source.data.len());
+                        stats.bytes_freed = stats.bytes_freed.saturating_add(source.data.len());
+                        stats.images_redacted = stats.images_redacted.saturating_add(1);
                         *item = ToolResultContent::Text {
                             text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
                         };
-                        if bytes_dropped >= bytes_to_drop {
+                        if stats.bytes_freed >= bytes_to_drop {
                             break 'outer;
                         }
                     }
@@ -634,7 +655,7 @@ pub(super) fn redact_oldest_images(
         }
     }
 
-    Cow::Owned(redacted)
+    (Cow::Owned(redacted), stats)
 }
 
 #[cfg(test)]
@@ -746,8 +767,10 @@ mod tests {
             user_with_block(image_block("call_a", "AAAA")),
             assistant_text("ack"),
         ];
-        let result = redact_oldest_images(&messages, 0);
+        let (result, stats) = redact_oldest_images(&messages, 0);
         assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(stats.images_redacted, 0);
+        assert_eq!(stats.bytes_freed, 0);
     }
 
     #[test]
@@ -761,7 +784,9 @@ mod tests {
             user_with_block(image_block("call_a", &payload_a)),
             user_with_block(image_block("call_b", &payload_b)),
         ];
-        let result = redact_oldest_images(&messages, 1);
+        let (result, stats) = redact_oldest_images(&messages, 1);
+        assert_eq!(stats.images_redacted, 1);
+        assert_eq!(stats.bytes_freed, 1024);
         let owned = match result {
             Cow::Owned(v) => v,
             Cow::Borrowed(_) => panic!("expected owned redacted vec"),
@@ -803,7 +828,9 @@ mod tests {
             user_with_block(image_block("call_b", &payload)),
             assistant_text("end"),
         ];
-        let result = redact_oldest_images(&messages, 1024);
+        let (result, stats) = redact_oldest_images(&messages, 1024);
+        assert_eq!(stats.images_redacted, 1);
+        assert_eq!(stats.bytes_freed, 1024);
         let owned = match result {
             Cow::Owned(v) => v,
             Cow::Borrowed(_) => panic!("expected owned"),
@@ -837,7 +864,10 @@ mod tests {
             assistant_text("setup"),
             user_with_block(image_block("call_only", &payload)),
         ];
-        let result = redact_oldest_images(&messages, usize::MAX);
+        let (result, stats) = redact_oldest_images(&messages, usize::MAX);
+        // No redactable images outside the last message → 0 redactions.
+        assert_eq!(stats.images_redacted, 0);
+        assert_eq!(stats.bytes_freed, 0);
         let owned = match result {
             Cow::Owned(v) => v,
             Cow::Borrowed(_) => panic!("expected owned (cloned even when no redaction)"),
@@ -858,7 +888,9 @@ mod tests {
             assistant_text("world"),
             assistant_text("end"),
         ];
-        let result = redact_oldest_images(&messages, 1024);
+        let (result, stats) = redact_oldest_images(&messages, 1024);
+        assert_eq!(stats.images_redacted, 0);
+        assert_eq!(stats.bytes_freed, 0);
         let owned = match result {
             Cow::Owned(v) => v,
             Cow::Borrowed(_) => panic!("expected owned (cloned even when no images)"),

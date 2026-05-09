@@ -23,6 +23,7 @@ mod sandbox;
 mod session;
 mod setup;
 mod skills;
+mod stats;
 mod tools;
 
 use clap::Parser;
@@ -318,6 +319,7 @@ async fn create_agent_from_config(
     mcp_manager: Option<&Arc<mcp::McpClientManager>>,
     mcp_context: Option<&Arc<mcp::McpClientContext>>,
     approval_sender: Option<std::sync::mpsc::Sender<repl::AgentToReplEvent>>,
+    session_stats: Arc<stats::SessionStats>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
 
@@ -345,6 +347,7 @@ async fn create_agent_from_config(
         .device_id(config.device_id.clone())
         .effort(config.effort.clone())
         .redact_thinking(config.redact_thinking)
+        .session_stats(Some(Arc::clone(&session_stats)))
         .build()?;
 
     let sandbox_capability = crate::sandbox::detect();
@@ -427,6 +430,7 @@ async fn create_agent_from_config(
             newline_before_prompt: config.newline_before_prompt,
             newline_after_prompt: config.newline_after_prompt,
             show_session_id_on_create: config.show_session_id_on_create,
+            show_token_usage: config.show_token_usage,
             sandboxed_shell,
             render_mode: config.render_mode,
             context_messages: config.context_messages,
@@ -446,6 +450,7 @@ async fn create_agent_from_config(
         todo_list,
         shared_session_id,
         approval_sender,
+        session_stats,
     );
     if let Some(manager) = mcp_manager {
         agent.set_mcp_manager(Arc::clone(manager));
@@ -463,6 +468,7 @@ async fn run_oneshot(
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
     let credential = resolve_credential(&config)?;
+    let session_stats = Arc::new(stats::SessionStats::default());
     let agent = create_agent_from_config(
         &config,
         session_manager,
@@ -472,6 +478,7 @@ async fn run_oneshot(
         mcp_manager.as_ref(),
         Some(&mcp_context),
         None,
+        Arc::clone(&session_stats),
     )
     .await?;
 
@@ -597,6 +604,7 @@ async fn run_interactive(
             return Ok(());
         }
     };
+    let session_stats = Arc::new(stats::SessionStats::default());
     let agent = match create_agent_from_config(
         &config,
         session_manager.clone(),
@@ -606,6 +614,7 @@ async fn run_interactive(
         mcp_manager.as_ref(),
         Some(&mcp_context),
         Some(approval_sender),
+        Arc::clone(&session_stats),
     )
     .await
     {
@@ -867,6 +876,10 @@ async fn run_interactive(
                         {
                             render::render_error(&error);
                         }
+                    }
+                    repl::SlashCommand::Status => {
+                        let snap = agent.session_stats_snapshot();
+                        render::render_session_status(&snap, messages.len());
                     }
                     _ => {}
                 }

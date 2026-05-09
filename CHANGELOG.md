@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.20.0] - 2026-05-09
+
+### Added
+
+- `/status` slash command shows turns, tokens, cache hit ratio, redactions, and message count.
+- `[display].show_token_usage` toggles a per-turn `[in / cache hit % / out]` line on stderr.
+- `TokenUsage` now carries `cache_creation_input_tokens` and `cache_read_input_tokens` from Anthropic.
+
+### Changed
+
+- Image redaction now drops to a watermark (~24 MiB) instead of the minimum, amortizing cache invalidation.
+- Image redaction now prints a stderr advisory when it fires; was previously invisible at default verbosity.
 
 ### Fixed
 

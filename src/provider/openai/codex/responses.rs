@@ -274,6 +274,7 @@ pub(super) fn process_event(
                             .get("output_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0),
+                        ..TokenUsage::default()
                     }));
                 }
                 let stop_reason = response

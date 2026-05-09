@@ -605,6 +605,73 @@ pub fn render_hint(message: &str) {
     eprintln!("{}", message.with(Color::DarkGrey));
 }
 
+fn format_token_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else {
+        format!("{:.1}k", (n as f64) / 1_000.0)
+    }
+}
+
+/// Print a one-line per-turn token-usage summary to stderr in dark grey,
+/// preceded by a blank line so it visually separates from the agent's
+/// response. Format: `[in 12.3k / cache hit 96% / out 1.2k]`. The "in"
+/// column is the total of all three input-token tiers (live, cache-write,
+/// cache-read); the cache-hit % is `cache_read / total_in`. Numbers below
+/// 1k show as raw counts; otherwise as `Nk` with one decimal.
+pub fn render_token_usage(usage: &crate::provider::TokenUsage) {
+    let total_in = usage
+        .input_tokens
+        .saturating_add(usage.cache_creation_input_tokens)
+        .saturating_add(usage.cache_read_input_tokens);
+    let cache_hit_pct = if total_in == 0 {
+        0
+    } else {
+        ((usage.cache_read_input_tokens as f64) / (total_in as f64) * 100.0).round() as u64
+    };
+    eprintln!();
+    eprintln!(
+        "{}",
+        format!(
+            "[in {} / cache hit {}% / out {}]",
+            format_token_count(total_in),
+            cache_hit_pct,
+            format_token_count(usage.output_tokens),
+        )
+        .with(Color::DarkGrey)
+    );
+}
+
+/// Multi-line cumulative session report shown by the `/status` slash
+/// command. Goes to stderr (matches the rest of REPL UI feedback).
+pub fn render_session_status(snap: &crate::stats::SessionStatsSnapshot, message_count: usize) {
+    let total_in = snap.total_input_tokens();
+    let header = "Session status".with(Color::Cyan);
+    eprintln!("{}", header);
+    eprintln!("  Turns:           {}", snap.turns);
+    eprintln!(
+        "  Input tokens:    {}  (cache hit: {}%)",
+        format_token_count(total_in),
+        snap.cache_hit_pct()
+    );
+    eprintln!(
+        "  Output tokens:   {}",
+        format_token_count(snap.output_tokens)
+    );
+    if snap.redactions > 0 {
+        eprintln!(
+            "  Redactions:      {} ({} image{}, ~{} MiB freed)",
+            snap.redactions,
+            snap.redacted_images,
+            if snap.redacted_images == 1 { "" } else { "s" },
+            snap.redacted_bytes / 1_048_576,
+        );
+    } else {
+        eprintln!("  Redactions:      0");
+    }
+    eprintln!("  Messages:        {}", message_count);
+}
+
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub fn render_error(error: &dyn std::fmt::Display) {
     eprintln!("{} {}", "Error:".with(Color::Red), error);

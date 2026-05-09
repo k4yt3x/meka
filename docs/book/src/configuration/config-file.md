@@ -237,6 +237,18 @@ Whether to add a blank line after the prompt (before the agent response).
 
 Default: `true`
 
+### `display.show_token_usage`
+
+When `true`, agsh prints a one-line per-turn token-usage summary to stderr after each turn:
+
+```
+[in 12.3k / cache hit 96% / out 1.2k]
+```
+
+The `in` column is the total of all three Anthropic input tiers (live, cache-write, cache-read); `cache hit %` is `cache_read / total_in`. Useful for monitoring caching effectiveness during long sessions. The `/status` slash command surfaces cumulative session stats in the same vein.
+
+Default: `false`
+
 ### `display.input_style`
 
 Visual style applied to text typed into the REPL prompt. Makes submitted prompts easy to spot when scrolling back through a long session — reedline paints the buffer with this style on every repaint, including the final paint before the newline, so the styling lands in the terminal's scrollback alongside the literal text.

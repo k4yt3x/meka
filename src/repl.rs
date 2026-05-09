@@ -162,6 +162,9 @@ pub enum SlashCommand {
         name: String,
         extra: String,
     },
+    /// `/status` — print cumulative session stats (turns, tokens, cache
+    /// hit ratio, image redactions).
+    Status,
 }
 
 pub enum ReplEvent {
@@ -210,6 +213,7 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "cd" => Some(SlashCommand::Cd(argument)),
         "mcp" => parse_mcp_slash(argument.as_deref().unwrap_or("")),
         "skill" => Some(parse_skill_slash(argument.as_deref().unwrap_or(""))),
+        "status" => Some(SlashCommand::Status),
         _ => None,
     }
 }
@@ -308,6 +312,9 @@ fn print_help() {
     eprintln!("  /mcp login <server>            Run the OAuth flow for a server");
     eprintln!("  /mcp logout <server>           Clear stored credentials for a server");
     eprintln!("  /mcp <server>:<prompt> [args]  Render an MCP prompt as the next turn");
+    eprintln!(
+        "  /status                        Show session stats (turns, tokens, cache, redactions)"
+    );
     eprintln!();
     eprintln!("Shortcuts:");
     eprintln!("  !<command>    Execute a shell command directly");
@@ -430,7 +437,8 @@ pub fn run_repl(
                             | SlashCommand::McpLogin { .. }
                             | SlashCommand::McpLogout { .. }
                             | SlashCommand::SkillList
-                            | SlashCommand::SkillInvoke { .. }),
+                            | SlashCommand::SkillInvoke { .. }
+                            | SlashCommand::Status),
                         ) => {
                             if input_sender.send(ReplEvent::Command(command)).is_err() {
                                 break;
@@ -1145,6 +1153,7 @@ mod tests {
             Some(SlashCommand::McpPrompt { .. }) => "McpPrompt",
             Some(SlashCommand::SkillList) => "SkillList",
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",
+            Some(SlashCommand::Status) => "Status",
         }
     }
 

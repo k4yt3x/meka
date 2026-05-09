@@ -259,6 +259,13 @@ pub(crate) const INVALID_TOOL_ARGS_MARKER: &str = "_agsh_invalid_arguments";
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens billed at the cache-write tier (content newly cached this
+    /// turn). Anthropic-only; OpenAI providers leave this at 0.
+    pub cache_creation_input_tokens: u64,
+    /// Tokens served from the prompt cache (cache-read tier). Anthropic
+    /// returns this in `usage.cache_read_input_tokens`; OpenAI providers
+    /// leave it at 0 today.
+    pub cache_read_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -374,6 +381,7 @@ pub struct ProviderBuilder {
     device_id: String,
     effort: String,
     redact_thinking: bool,
+    session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
 
 impl ProviderBuilder {
@@ -396,6 +404,7 @@ impl ProviderBuilder {
             device_id: String::new(),
             effort: "high".to_string(),
             redact_thinking: false,
+            session_stats: None,
         }
     }
 
@@ -459,6 +468,13 @@ impl ProviderBuilder {
         self
     }
 
+    /// Per-session counters incremented when image-redaction events fire.
+    /// Currently consumed only by `claude-oauth` and `claude-api`.
+    pub fn session_stats(mut self, value: Option<Arc<crate::stats::SessionStats>>) -> Self {
+        self.session_stats = value;
+        self
+    }
+
     pub fn build(self) -> Result<Arc<dyn Provider>> {
         match self.provider_name.as_str() {
             "openai-api" => {
@@ -490,6 +506,7 @@ impl ProviderBuilder {
                     self.base_url,
                     self.thinking_enabled,
                     self.thinking_budget_tokens,
+                    self.session_stats,
                 )))
             }
             "claude-oauth" => {
@@ -512,6 +529,7 @@ impl ProviderBuilder {
                     self.device_id,
                     self.effort,
                     self.redact_thinking,
+                    self.session_stats,
                 )))
             }
             "openai-codex" => {

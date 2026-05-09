@@ -56,6 +56,8 @@ pub struct ClaudeOAuthProvider {
     /// When true, request `redacted_thinking` blocks via the
     /// `redact-thinking-2026-02-12` beta header.
     redact_thinking: bool,
+    /// Per-session counters incremented when image-redaction events fire.
+    session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
 
 impl ClaudeOAuthProvider {
@@ -72,6 +74,7 @@ impl ClaudeOAuthProvider {
         device_id: String,
         effort: String,
         redact_thinking: bool,
+        session_stats: Option<Arc<crate::stats::SessionStats>>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -89,6 +92,7 @@ impl ClaudeOAuthProvider {
             thinking_override: AtomicI8::new(-1),
             effort,
             redact_thinking,
+            session_stats,
         }
     }
 
@@ -408,6 +412,9 @@ impl ClaudeOAuthProvider {
     /// [`shared::MAX_REQUEST_BYTES`]). The cached prefix is preserved as
     /// long as possible: redaction is oldest-first and never touches the
     /// final message that carries the moving `cache_control` breakpoint.
+    /// When redaction fires, the body is shrunk past the threshold to
+    /// [`shared::REDACTION_TARGET_BYTES`] so the next several turns don't
+    /// re-trigger redaction (one bigger cache miss vs. many small ones).
     fn build_body_within_budget(
         &self,
         system_prompt: &str,
@@ -425,8 +432,10 @@ impl ClaudeOAuthProvider {
             return Ok(body_json);
         }
 
-        let bytes_to_drop = body_json.len() - shared::MAX_REQUEST_BYTES;
-        let redacted = shared::redact_oldest_images(messages, bytes_to_drop);
+        // Redact aggressively to the target watermark, not just under the
+        // hard ceiling — keeps the cache prefix stable across many turns.
+        let bytes_to_drop = body_json.len() - shared::REDACTION_TARGET_BYTES;
+        let (redacted, stats) = shared::redact_oldest_images(messages, bytes_to_drop);
         let body_json = serde_json::to_string(&self.build_request_body(
             system_prompt,
             redacted.as_ref(),
@@ -444,8 +453,18 @@ impl ClaudeOAuthProvider {
             )));
         }
 
-        tracing::info!(
-            "redacted oldest tool-result images to fit request budget (body now {} MiB)",
+        if let Some(session_stats) = &self.session_stats {
+            session_stats.record_redaction(stats.images_redacted as u64, stats.bytes_freed as u64);
+        }
+        crate::render::render_hint(&format!(
+            "Redacted {} old image{} (~{} MiB freed). Cache prefix invalidated for those messages.",
+            stats.images_redacted,
+            if stats.images_redacted == 1 { "" } else { "s" },
+            stats.bytes_freed / 1_048_576,
+        ));
+        tracing::warn!(
+            "redacted {} old tool-result image(s); body now {} MiB",
+            stats.images_redacted,
             body_json.len() / 1_048_576,
         );
         Ok(body_json)
@@ -578,6 +597,7 @@ mod tests {
             "a".repeat(64),
             "high".to_string(),
             false,
+            None,
         )
     }
 
@@ -1143,6 +1163,7 @@ mod tests {
             "a".repeat(64),
             effort.to_string(),
             redact_thinking,
+            None,
         )
     }
 

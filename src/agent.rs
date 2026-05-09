@@ -25,6 +25,7 @@ pub struct AgentOptions {
     pub newline_before_prompt: bool,
     pub newline_after_prompt: bool,
     pub show_session_id_on_create: bool,
+    pub show_token_usage: bool,
     pub sandboxed_shell: bool,
     pub render_mode: crate::render::RenderMode,
     pub context_messages: Option<usize>,
@@ -59,6 +60,10 @@ pub struct Agent {
     /// Optional MCP client manager; used to read server-supplied
     /// `InitializeResult.instructions` for inclusion in the system prompt.
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    /// Counters surfaced by `/status`. Shared with the Claude providers,
+    /// which increment the redaction-related fields when oversized
+    /// request bodies trigger image-block redaction.
+    session_stats: Arc<crate::stats::SessionStats>,
 }
 
 impl Agent {
@@ -72,6 +77,7 @@ impl Agent {
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         approval_sender: Option<std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>>,
+        session_stats: Arc<crate::stats::SessionStats>,
     ) -> Self {
         Self {
             provider,
@@ -85,7 +91,14 @@ impl Agent {
             last_input_tokens: std::sync::atomic::AtomicU64::new(0),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             mcp_manager: None,
+            session_stats,
         }
+    }
+
+    /// Snapshot of the per-session counters used by `/status`. Called
+    /// from the REPL on demand.
+    pub fn session_stats_snapshot(&self) -> crate::stats::SessionStatsSnapshot {
+        self.session_stats.snapshot()
     }
 
     /// Attach the MCP client manager so server-supplied `initialize`
@@ -227,6 +240,10 @@ impl Agent {
         let turn_start_len = messages.len();
 
         let mut user_saved = false;
+        // Accumulate token usage across every provider call within this
+        // turn so the per-turn display reflects the whole turn (including
+        // tool-execution loops), not just the final round-trip.
+        let mut turn_usage = crate::provider::TokenUsage::default();
 
         let result: Result<()> = 'turn: {
             loop {
@@ -277,6 +294,16 @@ impl Agent {
 
                 self.last_input_tokens
                     .store(usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
+                turn_usage.input_tokens =
+                    turn_usage.input_tokens.saturating_add(usage.input_tokens);
+                turn_usage.output_tokens =
+                    turn_usage.output_tokens.saturating_add(usage.output_tokens);
+                turn_usage.cache_creation_input_tokens = turn_usage
+                    .cache_creation_input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens);
+                turn_usage.cache_read_input_tokens = turn_usage
+                    .cache_read_input_tokens
+                    .saturating_add(usage.cache_read_input_tokens);
 
                 if !user_saved {
                     let user_event =
@@ -364,6 +391,16 @@ impl Agent {
                 }
             }
         };
+
+        if result.is_ok() {
+            // Roll the turn into the session-level counters surfaced by
+            // `/status`. Done here (not inside the inner loop) so a single
+            // `/status` reading reflects whole turns, not partial state.
+            self.session_stats.record_turn(&turn_usage);
+            if self.options.show_token_usage {
+                crate::render::render_token_usage(&turn_usage);
+            }
+        }
 
         if result.is_ok() && self.options.newline_before_prompt {
             eprintln!();

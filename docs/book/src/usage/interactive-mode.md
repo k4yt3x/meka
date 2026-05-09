@@ -106,6 +106,22 @@ agsh supports `/` prefix commands for controlling the shell:
 | `/mcp login <server>` | Run the OAuth flow from the REPL |
 | `/mcp logout <server>` | Revoke cached credentials for a server |
 | `/mcp <server>:<prompt> [args...]` | Render a server-defined prompt and send it to the agent |
+| `/status` | Show cumulative session stats (turns, tokens, cache hit ratio, redactions, message count) |
+
+### `/status`
+
+Print a snapshot of the current session's counters:
+
+```
+Session status
+  Turns:           23
+  Input tokens:    234.5k  (cache hit: 92%)
+  Output tokens:   12.1k
+  Redactions:      2 (12 images, ~38 MiB freed)
+  Messages:        47
+```
+
+`Redactions` reports any times the Claude provider had to drop oldest tool-result image blocks because the request body would have exceeded Anthropic's 32 MiB ceiling. A non-zero count indicates the cache prefix was invalidated for the redacted messages. See [`display.show_token_usage`](../configuration/config-file.md#displayshow_token_usage) for a per-turn variant of the same data.
 
 ### `/compact`
 

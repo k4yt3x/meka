@@ -240,6 +240,7 @@ impl OpenAiProvider {
                 .and_then(|u| u.get("completion_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            ..TokenUsage::default()
         };
 
         Ok((
@@ -365,8 +366,15 @@ impl Provider for OpenAiProvider {
 
                             if let Some(usage) = data.get("usage") {
                                 let token_usage = TokenUsage {
-                                    input_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    output_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    input_tokens: usage
+                                        .get("prompt_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0),
+                                    output_tokens: usage
+                                        .get("completion_tokens")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0),
+                                    ..TokenUsage::default()
                                 };
                                 if event_sender.send(StreamEvent::Usage(token_usage)).is_err() {
                                     tracing::trace!("stream event receiver dropped");

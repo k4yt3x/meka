@@ -2,6 +2,7 @@
 //! Claude Code fingerprinting / attestation machinery that `claude-oauth`
 //! requires. Intended for users bringing their own `CLAUDE_API_KEY`.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI8, Ordering};
 
 use async_trait::async_trait;
@@ -24,6 +25,8 @@ pub struct ClaudeApiProvider {
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
     thinking_override: AtomicI8,
+    /// Per-session counters incremented when image-redaction events fire.
+    session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
 
 impl ClaudeApiProvider {
@@ -33,6 +36,7 @@ impl ClaudeApiProvider {
         base_url: Option<String>,
         thinking_enabled: bool,
         thinking_budget_tokens: u64,
+        session_stats: Option<Arc<crate::stats::SessionStats>>,
     ) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -42,6 +46,7 @@ impl ClaudeApiProvider {
             thinking_enabled,
             thinking_budget_tokens,
             thinking_override: AtomicI8::new(-1),
+            session_stats,
         }
     }
 
@@ -111,8 +116,9 @@ impl ClaudeApiProvider {
     /// Mirror of `ClaudeOAuthProvider::build_body_within_budget`: serialize
     /// the request body and, if it exceeds [`shared::MAX_REQUEST_BYTES`],
     /// reactively redact the oldest tool-result image blocks (preserving the
-    /// final message's cache breakpoint) until the body fits or no more
-    /// redactable images remain.
+    /// final message's cache breakpoint) and shrink past
+    /// [`shared::REDACTION_TARGET_BYTES`] so subsequent turns don't
+    /// re-trigger.
     fn build_body_within_budget(
         &self,
         system_prompt: &str,
@@ -130,8 +136,8 @@ impl ClaudeApiProvider {
             return Ok(body_json);
         }
 
-        let bytes_to_drop = body_json.len() - shared::MAX_REQUEST_BYTES;
-        let redacted = shared::redact_oldest_images(messages, bytes_to_drop);
+        let bytes_to_drop = body_json.len() - shared::REDACTION_TARGET_BYTES;
+        let (redacted, stats) = shared::redact_oldest_images(messages, bytes_to_drop);
         let body_json = serde_json::to_string(&self.build_request_body(
             system_prompt,
             redacted.as_ref(),
@@ -149,8 +155,18 @@ impl ClaudeApiProvider {
             )));
         }
 
-        tracing::info!(
-            "redacted oldest tool-result images to fit request budget (body now {} MiB)",
+        if let Some(session_stats) = &self.session_stats {
+            session_stats.record_redaction(stats.images_redacted as u64, stats.bytes_freed as u64);
+        }
+        crate::render::render_hint(&format!(
+            "Redacted {} old image{} (~{} MiB freed). Cache prefix invalidated for those messages.",
+            stats.images_redacted,
+            if stats.images_redacted == 1 { "" } else { "s" },
+            stats.bytes_freed / 1_048_576,
+        ));
+        tracing::warn!(
+            "redacted {} old tool-result image(s); body now {} MiB",
+            stats.images_redacted,
             body_json.len() / 1_048_576,
         );
         Ok(body_json)
@@ -264,6 +280,7 @@ mod tests {
             None,
             false,
             10000,
+            None,
         )
     }
 
