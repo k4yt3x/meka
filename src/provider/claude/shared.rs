@@ -11,10 +11,23 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use std::borrow::Cow;
+
 use crate::error::{AgshError, Result};
 use crate::provider::{
     ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+    ToolResultContent,
 };
+
+/// Anthropic's hard request-body cap is 32 MiB; we reserve ~2 MiB headroom
+/// for headers, URL, attestation patches, and serialization slack. Bodies
+/// above this threshold are reactively shrunk by [`redact_oldest_images`]
+/// before they're posted.
+pub(super) const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
+
+/// Placeholder text that replaces a `ToolResultContent::Image` payload when
+/// the request body would otherwise exceed [`MAX_REQUEST_BYTES`].
+pub(super) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
 
 /// Resolves the effective thinking state given the override atomic's raw
 /// value (`-1` = unset, `0` = forced off, `1` = forced on) and the configured
@@ -579,9 +592,55 @@ pub(super) async fn drive_claude_sse_stream(
     Ok(())
 }
 
+/// Walk `messages` oldest-first and replace `ToolResultContent::Image`
+/// payloads with [`IMAGE_REDACTION_PLACEHOLDER`] until at least
+/// `bytes_to_drop` base64 bytes have been removed. The LAST message is never
+/// touched — it carries the moving `cache_control` breakpoint set in
+/// [`convert_messages_to_claude_content`] and disturbing it would
+/// invalidate the cache for the new turn unnecessarily.
+///
+/// Returns `Cow::Borrowed` if no work was needed (`bytes_to_drop == 0`).
+/// Otherwise returns `Cow::Owned` with whatever redaction was possible —
+/// even when the budget couldn't be met, the cloned messages are still
+/// returned so the caller can re-serialize and decide whether the body
+/// fits.
+pub(super) fn redact_oldest_images(
+    messages: &[Message],
+    bytes_to_drop: usize,
+) -> Cow<'_, [Message]> {
+    if bytes_to_drop == 0 || messages.len() <= 1 {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut redacted: Vec<Message> = messages.to_vec();
+    let last = redacted.len() - 1;
+    let mut bytes_dropped: usize = 0;
+
+    'outer: for message in &mut redacted[..last] {
+        for block in &mut message.content {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                for item in content.iter_mut() {
+                    if let ToolResultContent::Image { source } = item {
+                        bytes_dropped = bytes_dropped.saturating_add(source.data.len());
+                        *item = ToolResultContent::Text {
+                            text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                        };
+                        if bytes_dropped >= bytes_to_drop {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Cow::Owned(redacted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ImageSource;
 
     #[test]
     fn test_is_thinking_enabled_override_off() {
@@ -649,5 +708,164 @@ mod tests {
             parse_claude_stop_reason("something_else"),
             StopReason::Unknown("something_else".to_string())
         );
+    }
+
+    fn image_block(tool_use_id: &str, payload: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: vec![ToolResultContent::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: payload.to_string(),
+                },
+            }],
+            is_error: false,
+        }
+    }
+
+    fn user_with_block(block: ContentBlock) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![block],
+        }
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_redact_no_op_when_under_threshold() {
+        let messages = vec![
+            user_with_block(image_block("call_a", "AAAA")),
+            assistant_text("ack"),
+        ];
+        let result = redact_oldest_images(&messages, 0);
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_redact_drops_oldest_image_first() {
+        // Two images: one in msg[0] (older), one in msg[1] (last). The
+        // helper must only touch the older one — the last message carries
+        // the moving cache_control marker.
+        let payload_a = "A".repeat(1024);
+        let payload_b = "B".repeat(1024);
+        let messages = vec![
+            user_with_block(image_block("call_a", &payload_a)),
+            user_with_block(image_block("call_b", &payload_b)),
+        ];
+        let result = redact_oldest_images(&messages, 1);
+        let owned = match result {
+            Cow::Owned(v) => v,
+            Cow::Borrowed(_) => panic!("expected owned redacted vec"),
+        };
+        // msg[0] image redacted to placeholder text.
+        match &owned[0].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolResultContent::Text { text } => {
+                    assert_eq!(text, IMAGE_REDACTION_PLACEHOLDER);
+                }
+                other => panic!("expected text placeholder, got {:?}", other),
+            },
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+        // msg[1] (last) image untouched.
+        match &owned[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolResultContent::Image { source } => {
+                    assert_eq!(source.data, payload_b);
+                }
+                other => panic!("expected untouched image, got {:?}", other),
+            },
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_redact_stops_when_target_reached() {
+        // Three images each 1 KiB. Target = 1500 bytes. Only the FIRST
+        // image should be redacted; the second remains because we hit the
+        // budget after one (1024 >= 1500 is false, but saturating_add gets
+        // us past after the first redaction since we then loop-check
+        // before the second image is considered? — no: the check is
+        // `bytes_dropped >= bytes_to_drop`, so 1024 < 1500 means we
+        // redact the second too). Clarify by setting target = 1024.
+        let payload = "X".repeat(1024);
+        let messages = vec![
+            user_with_block(image_block("call_a", &payload)),
+            user_with_block(image_block("call_b", &payload)),
+            assistant_text("end"),
+        ];
+        let result = redact_oldest_images(&messages, 1024);
+        let owned = match result {
+            Cow::Owned(v) => v,
+            Cow::Borrowed(_) => panic!("expected owned"),
+        };
+        // First image redacted.
+        match &owned[0].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolResultContent::Text { text } => {
+                    assert_eq!(text, IMAGE_REDACTION_PLACEHOLDER);
+                }
+                _ => panic!("first should be redacted"),
+            },
+            _ => unreachable!(),
+        }
+        // Second image preserved (budget already met).
+        match &owned[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolResultContent::Image { .. } => {}
+                _ => panic!("second image should still be intact"),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_redact_preserves_last_message() {
+        // Single image, in the LAST message. Helper must not touch it even
+        // when the budget is huge.
+        let payload = "P".repeat(8 * 1024);
+        let messages = vec![
+            assistant_text("setup"),
+            user_with_block(image_block("call_only", &payload)),
+        ];
+        let result = redact_oldest_images(&messages, usize::MAX);
+        let owned = match result {
+            Cow::Owned(v) => v,
+            Cow::Borrowed(_) => panic!("expected owned (cloned even when no redaction)"),
+        };
+        match &owned[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolResultContent::Image { source } => assert_eq!(source.data, payload),
+                _ => panic!("last-message image must survive"),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_redact_handles_no_images() {
+        let messages = vec![
+            assistant_text("hello"),
+            assistant_text("world"),
+            assistant_text("end"),
+        ];
+        let result = redact_oldest_images(&messages, 1024);
+        let owned = match result {
+            Cow::Owned(v) => v,
+            Cow::Borrowed(_) => panic!("expected owned (cloned even when no images)"),
+        };
+        assert_eq!(owned.len(), 3);
+        for (orig, copy) in messages.iter().zip(owned.iter()) {
+            assert_eq!(orig.content.len(), copy.content.len());
+        }
     }
 }

@@ -401,6 +401,55 @@ impl ClaudeOAuthProvider {
     ) -> Result<(Message, StopReason, TokenUsage)> {
         parse_non_streaming_response(response)
     }
+
+    /// Build and serialize the request body, reactively redacting old
+    /// tool-result image blocks if the serialized JSON exceeds Anthropic's
+    /// 32 MiB request-body limit (with 2 MiB headroom — see
+    /// [`shared::MAX_REQUEST_BYTES`]). The cached prefix is preserved as
+    /// long as possible: redaction is oldest-first and never touches the
+    /// final message that carries the moving `cache_control` breakpoint.
+    fn build_body_within_budget(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        stream: bool,
+    ) -> Result<String> {
+        let body_json =
+            serde_json::to_string(&self.build_request_body(system_prompt, messages, tools, stream))
+                .map_err(|error| {
+                    AgshError::Provider(format!("failed to serialize body: {}", error))
+                })?;
+
+        if body_json.len() <= shared::MAX_REQUEST_BYTES {
+            return Ok(body_json);
+        }
+
+        let bytes_to_drop = body_json.len() - shared::MAX_REQUEST_BYTES;
+        let redacted = shared::redact_oldest_images(messages, bytes_to_drop);
+        let body_json = serde_json::to_string(&self.build_request_body(
+            system_prompt,
+            redacted.as_ref(),
+            tools,
+            stream,
+        ))
+        .map_err(|error| AgshError::Provider(format!("failed to serialize body: {}", error)))?;
+
+        if body_json.len() > shared::MAX_REQUEST_BYTES {
+            return Err(AgshError::Provider(format!(
+                "request body is {} MiB after redacting old tool-result images; \
+                 Anthropic's limit is 32 MiB. Run /compact, remove large attachments \
+                 from the most recent turn, or split the work across smaller turns.",
+                body_json.len() / 1_048_576,
+            )));
+        }
+
+        tracing::info!(
+            "redacted oldest tool-result images to fit request budget (body now {} MiB)",
+            body_json.len() / 1_048_576,
+        );
+        Ok(body_json)
+    }
 }
 
 #[async_trait]
@@ -411,14 +460,13 @@ impl Provider for ClaudeOAuthProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason, TokenUsage)> {
-        let body = self.build_request_body(system_prompt, messages, tools, false);
-        let body_json = serde_json::to_string(&body)
-            .map_err(|error| AgshError::Provider(format!("failed to serialize body: {}", error)))?;
+        let body_json = self.build_body_within_budget(system_prompt, messages, tools, false)?;
         let body_json = if !system_prompt.is_empty() {
             attestation::patch_request_body(&body_json)?
         } else {
             body_json
         };
+        let body_size_mib = body_json.len() / 1_048_576;
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
         let betas = self.compute_betas();
@@ -432,11 +480,12 @@ impl Provider for ClaudeOAuthProvider {
             betas.as_deref(),
         );
 
-        let response = request
-            .body(body_json)
-            .send()
-            .await
-            .map_err(|error| AgshError::Provider(format!("HTTP request failed: {}", error)))?;
+        let response = request.body(body_json).send().await.map_err(|error| {
+            AgshError::Provider(format!(
+                "HTTP request failed (body {} MiB): {}",
+                body_size_mib, error
+            ))
+        })?;
 
         let status = response.status();
         let response_text = response
@@ -465,14 +514,13 @@ impl Provider for ClaudeOAuthProvider {
         event_sender: mpsc::UnboundedSender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let body = self.build_request_body(system_prompt, messages, tools, true);
-        let body_json = serde_json::to_string(&body)
-            .map_err(|error| AgshError::Provider(format!("failed to serialize body: {}", error)))?;
+        let body_json = self.build_body_within_budget(system_prompt, messages, tools, true)?;
         let body_json = if !system_prompt.is_empty() {
             attestation::patch_request_body(&body_json)?
         } else {
             body_json
         };
+        let body_size_mib = body_json.len() / 1_048_576;
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
         let betas = self.compute_betas();
@@ -487,11 +535,12 @@ impl Provider for ClaudeOAuthProvider {
             betas.as_deref(),
         );
 
-        let response = request
-            .body(body_json)
-            .send()
-            .await
-            .map_err(|error| AgshError::Provider(format!("HTTP request failed: {}", error)))?;
+        let response = request.body(body_json).send().await.map_err(|error| {
+            AgshError::Provider(format!(
+                "HTTP request failed (body {} MiB): {}",
+                body_size_mib, error
+            ))
+        })?;
 
         drive_claude_sse_stream(response, event_sender, cancellation).await
     }
