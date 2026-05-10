@@ -99,8 +99,48 @@ pub(crate) fn convert_to_png(bytes: &[u8], source: ImageFormat) -> Result<Vec<u8
     Ok(out)
 }
 
+/// Read just the image dimensions without materializing pixel data. Cheap
+/// for native formats that carry W×H in the header (PNG/JPEG/GIF/WebP/BMP).
+/// Used by the Claude provider's per-request downscale path.
+pub(crate) fn read_image_dimensions(
+    bytes: &[u8],
+    format: ImageFormat,
+) -> Result<(u32, u32), String> {
+    let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader
+        .into_dimensions()
+        .map_err(|error| format!("failed to read {:?} image dimensions: {}", format, error))
+}
+
+/// Decode `bytes`, downscale (preserving aspect ratio) if either dimension
+/// exceeds `max_dim`, and re-encode as PNG. Provider-agnostic plumbing —
+/// called by the Claude provider, where Anthropic enforces a 2000 px cap
+/// on multi-image requests. Other providers shouldn't need this.
+pub(crate) fn downscale_to_dim_cap(
+    bytes: &[u8],
+    source: ImageFormat,
+    max_dim: u32,
+) -> Result<Vec<u8>, String> {
+    let decoded = image::load_from_memory_with_format(bytes, source)
+        .map_err(|error| format!("failed to decode {:?} image: {}", source, error))?;
+    let scaled = if decoded.width() > max_dim || decoded.height() > max_dim {
+        decoded.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+    let mut out = Vec::new();
+    scaled
+        .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+        .map_err(|error| format!("failed to re-encode image as PNG: {}", error))?;
+    Ok(out)
+}
+
 /// Run the classification pipeline end-to-end: pass-through native formats,
-/// convert others to PNG, enforce the size cap. Returns `(media_type, bytes)`.
+/// convert others to PNG, enforce the byte cap. Provider-agnostic — does
+/// NOT enforce per-axis pixel limits (Anthropic's 2000 px multi-image cap
+/// is enforced separately at the Claude provider layer in
+/// `src/provider/claude/shared.rs`, so OpenAI providers don't pay for it).
+/// Returns `(media_type, bytes)`.
 pub(crate) fn prepare_image_payload(
     handling: ImageHandling,
     bytes: &[u8],
@@ -174,6 +214,14 @@ mod tests {
 
     fn synthesize_image_bytes(format: ImageFormat) -> Vec<u8> {
         let img = RgbaImage::from_pixel(4, 4, image::Rgba([128, 64, 200, 255]));
+        let mut out = Vec::new();
+        img.write_to(&mut Cursor::new(&mut out), format)
+            .expect("encode");
+        out
+    }
+
+    fn synthesize_image_bytes_sized(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
+        let img = RgbaImage::from_pixel(width, height, image::Rgba([128, 64, 200, 255]));
         let mut out = Vec::new();
         img.write_to(&mut Cursor::new(&mut out), format)
             .expect("encode");
@@ -376,6 +424,43 @@ mod tests {
         let error =
             prepare_image_payload(ImageHandling::Unsupported, b"anything").expect_err("should err");
         assert!(error.contains("unsupported"));
+    }
+
+    // --- dimension helpers (called by Claude provider) -------------------
+
+    #[test]
+    fn test_read_image_dimensions_png() {
+        let png = synthesize_image_bytes_sized(ImageFormat::Png, 1234, 567);
+        let (width, height) = read_image_dimensions(&png, ImageFormat::Png).expect("ok");
+        assert_eq!((width, height), (1234, 567));
+    }
+
+    #[test]
+    fn test_downscale_to_dim_cap_resizes_oversized() {
+        let png = synthesize_image_bytes_sized(ImageFormat::Png, 2400, 1200);
+        let out = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
+        let decoded = image::load_from_memory_with_format(&out, ImageFormat::Png).expect("decode");
+        assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
+        // Aspect ratio preserved (2:1).
+        assert_eq!(decoded.width() / decoded.height(), 2);
+    }
+
+    #[test]
+    fn test_downscale_to_dim_cap_passes_through_dimensions_when_within_cap() {
+        // Always re-encodes as PNG, but dimensions match the input when
+        // already within cap.
+        let png = synthesize_image_bytes_sized(ImageFormat::Png, 800, 400);
+        let out = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
+        let decoded = image::load_from_memory_with_format(&out, ImageFormat::Png).expect("decode");
+        assert_eq!((decoded.width(), decoded.height()), (800, 400));
+    }
+
+    #[test]
+    fn test_downscale_to_dim_cap_handles_non_native_format() {
+        let bmp = synthesize_image_bytes_sized(ImageFormat::Bmp, 2400, 600);
+        let png = downscale_to_dim_cap(&bmp, ImageFormat::Bmp, 2000).expect("ok");
+        let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png).expect("decode");
+        assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
     }
 
     // --- classify_bytes ---------------------------------------------------

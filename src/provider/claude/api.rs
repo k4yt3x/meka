@@ -126,6 +126,12 @@ impl ClaudeApiProvider {
         tools: &[ToolDefinition],
         stream: bool,
     ) -> Result<String> {
+        // Anthropic rejects images >2000 px on either axis in multi-image
+        // requests. Downscale before serialization. See
+        // `shared::downscale_oversized_images` for the rationale.
+        let prepared = shared::downscale_oversized_images(messages);
+        let messages = prepared.as_ref();
+
         let body_json =
             serde_json::to_string(&self.build_request_body(system_prompt, messages, tools, stream))
                 .map_err(|error| {

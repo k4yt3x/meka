@@ -9,7 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `agsh -c <prefix>` resumes a session by leading UUID prefix when unique; ambiguous prefixes list matches.
+- `agsh -c <prefix>` resumes a session by UUID prefix; ambiguous prefixes list matches.
+- `openai-codex` provider sends tool-result images as `input_image` blocks (Responses API).
+
+### Fixed
+
+- Images >2000 px on either axis are downscaled in the Claude request path (Anthropic multi-image cap).
 
 ## [0.20.0] - 2026-05-09
 

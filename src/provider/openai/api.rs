@@ -69,6 +69,21 @@ impl OpenAiProvider {
                                 is_error,
                             } = block
                             {
+                                // Chat Completions deliberately restricts the
+                                // `tool` role's content to text-only — the
+                                // Chat reference defines
+                                // `ChatCompletionToolMessageParam.content`
+                                // as `string | array of
+                                // ChatCompletionContentPartText` and notes
+                                // "for tool messages, only type `text` is
+                                // supported." Vision is on `user`-role
+                                // messages only. So we collapse any image
+                                // blocks to the literal "[Image]" via
+                                // `tool_result_text_content` here. The
+                                // Responses API (used by `openai-codex`)
+                                // does accept `input_image` content blocks
+                                // in `function_call_output.output`, and
+                                // we emit those there.
                                 let text = ContentBlock::tool_result_text_content(content);
                                 let mut tool_msg = serde_json::json!({
                                     "role": "tool",

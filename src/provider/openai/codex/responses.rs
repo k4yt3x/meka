@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{AgshError, Result};
 use crate::provider::{
     ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+    ToolResultContent,
 };
 
 /// Build the JSON body POSTed to `/responses`. Translates the agsh internal
@@ -65,6 +66,43 @@ pub(super) fn build_request_body(
     body
 }
 
+/// Build the `output` field of a `function_call_output` item from a slice of
+/// `ToolResultContent`. The Responses API accepts either a plain string OR
+/// an array of `input_text` / `input_image` / `input_file` content items
+/// (per OpenAI's docs: "For functions that return images or files, you can
+/// pass an array of image or file objects instead of a string."). We emit
+/// the array form when at least one image is present to preserve image
+/// data; otherwise we collapse to a string for the simpler wire shape.
+///
+/// Sent unconditionally — non-vision models will return a clear API error
+/// rather than us trying to detect model capabilities client-side. Mirrors
+/// our Claude path, which also sends images without a model gate.
+fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value {
+    let has_image = content
+        .iter()
+        .any(|block| matches!(block, ToolResultContent::Image { .. }));
+
+    if !has_image {
+        return serde_json::Value::String(ContentBlock::tool_result_text_content(content));
+    }
+
+    let parts: Vec<serde_json::Value> = content
+        .iter()
+        .map(|block| match block {
+            ToolResultContent::Text { text } => serde_json::json!({
+                "type": "input_text",
+                "text": text,
+            }),
+            ToolResultContent::Image { source } => serde_json::json!({
+                "type": "input_image",
+                "image_url": format!("data:{};base64,{}", source.media_type, source.data),
+                "detail": "auto",
+            }),
+        })
+        .collect();
+    serde_json::Value::Array(parts)
+}
+
 fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
     let mut text_parts: Vec<&str> = Vec::new();
 
@@ -79,7 +117,7 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
                 input.push(serde_json::json!({
                     "type": "function_call_output",
                     "call_id": tool_use_id,
-                    "output": ContentBlock::tool_result_text_content(content),
+                    "output": build_tool_result_output(content),
                 }));
             }
             // ToolUse / Thinking on a user message would be malformed; ignore
@@ -851,5 +889,97 @@ mod tests {
             other => panic!("expected ThinkingComplete, got {:?}", other),
         }
         assert!(!state.in_reasoning);
+    }
+
+    // ---- build_tool_result_output -----------------------------------------
+
+    fn image_content(media_type: &str, data: &str) -> ToolResultContent {
+        ToolResultContent::Image {
+            source: crate::provider::ImageSource {
+                source_type: "base64".to_string(),
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_build_tool_result_output_text_only_returns_string() {
+        let content = vec![ToolResultContent::Text {
+            text: "result".to_string(),
+        }];
+        let out = build_tool_result_output(&content);
+        assert_eq!(out, serde_json::Value::String("result".to_string()));
+    }
+
+    #[test]
+    fn test_build_tool_result_output_with_image_returns_array() {
+        let content = vec![
+            ToolResultContent::Text {
+                text: "before".to_string(),
+            },
+            image_content("image/png", "AAAA"),
+            ToolResultContent::Text {
+                text: "after".to_string(),
+            },
+        ];
+        let out = build_tool_result_output(&content);
+        let array = out.as_array().expect("should be array when image present");
+        assert_eq!(array.len(), 3);
+        assert_eq!(array[0]["type"], "input_text");
+        assert_eq!(array[0]["text"], "before");
+        assert_eq!(array[1]["type"], "input_image");
+        assert_eq!(array[1]["image_url"], "data:image/png;base64,AAAA");
+        assert_eq!(array[1]["detail"], "auto");
+        assert_eq!(array[2]["type"], "input_text");
+        assert_eq!(array[2]["text"], "after");
+    }
+
+    #[test]
+    fn test_build_tool_result_output_image_only_returns_array() {
+        let content = vec![image_content("image/jpeg", "DEAD")];
+        let out = build_tool_result_output(&content);
+        let array = out.as_array().expect("should be array");
+        assert_eq!(array.len(), 1);
+        assert_eq!(array[0]["type"], "input_image");
+        assert_eq!(array[0]["image_url"], "data:image/jpeg;base64,DEAD");
+    }
+
+    #[test]
+    fn test_function_call_output_carries_image_array_in_request_body() {
+        // End-to-end: build_request_body wires build_tool_result_output via
+        // encode_user_message; confirm the function_call_output's `output`
+        // field is the array form when an image is present.
+        let mut messages = vec![
+            Message::user("look at this"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "screenshot".to_string(),
+                    input: serde_json::json!({}),
+                }],
+            },
+        ];
+        messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: vec![image_content("image/png", "QkFTRTY0")],
+                is_error: false,
+            }],
+        });
+        let body = build_request_body("gpt-5", "", &messages, &[], None, true);
+        let input = body["input"].as_array().expect("input array");
+        let output_item = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("function_call_output present");
+        let output = output_item["output"]
+            .as_array()
+            .expect("output should be array (image present)");
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "input_image");
+        assert_eq!(output[0]["image_url"], "data:image/png;base64,QkFTRTY0");
     }
 }

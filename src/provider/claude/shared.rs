@@ -36,6 +36,14 @@ pub(super) const REDACTION_TARGET_BYTES: usize = 24 * 1024 * 1024;
 /// the request body would otherwise exceed [`MAX_REQUEST_BYTES`].
 pub(super) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
 
+/// Anthropic accepts up to 8000 px per axis on a *single*-image request,
+/// but rejects anything over 2000 px on either axis once the request
+/// contains more than one image. We always downscale to fit so a session
+/// can freely accumulate images without tripping the multi-image cap.
+/// This is enforced at the Claude provider layer only — non-Claude
+/// providers don't need it (and shouldn't pay the resize cost).
+pub(super) const MAX_IMAGE_DIMENSION_PX: u32 = 2000;
+
 /// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both
 /// the non-streaming response parser and the SSE driver — Anthropic emits
 /// the same shape (`input_tokens`, `output_tokens`,
@@ -658,6 +666,101 @@ pub(super) fn redact_oldest_images(
     (Cow::Owned(redacted), stats)
 }
 
+/// Walk `messages` and downscale any `ToolResultContent::Image` whose
+/// pixel dimensions exceed [`MAX_IMAGE_DIMENSION_PX`] on either axis.
+/// The body bytes (base64) for those images are replaced with a
+/// re-encoded PNG that fits within the cap; smaller images are left
+/// alone. Returns `Cow::Borrowed` when no work was needed.
+///
+/// Anthropic-specific: the 2000 px cap only matters for Anthropic's
+/// multi-image requests; this helper is intentionally not applied to
+/// non-Claude providers. Decode/resize cost is incurred per turn for
+/// each oversized image — typical sessions have few oversized images,
+/// and the cheap [`crate::image::read_image_dimensions`] header read
+/// short-circuits the common case.
+pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Message]> {
+    use base64::Engine;
+    use image::ImageFormat;
+
+    fn parse_format(media_type: &str) -> Option<ImageFormat> {
+        ImageFormat::from_mime_type(media_type)
+    }
+
+    // First pass: detect whether any image needs downscaling. Cheap —
+    // just base64-decode to peek at header bytes. If nothing's oversized,
+    // skip the clone+rewrite entirely and return Cow::Borrowed.
+    let needs_work = messages.iter().any(|message| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::ToolResult { content, .. } => content.iter().any(|item| match item {
+                ToolResultContent::Image { source } => {
+                    let Some(format) = parse_format(&source.media_type) else {
+                        return false;
+                    };
+                    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&source.data)
+                    else {
+                        return false;
+                    };
+                    crate::image::read_image_dimensions(&bytes, format)
+                        .map(|(w, h)| w > MAX_IMAGE_DIMENSION_PX || h > MAX_IMAGE_DIMENSION_PX)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            }),
+            _ => false,
+        })
+    });
+    if !needs_work {
+        return Cow::Borrowed(messages);
+    }
+
+    let mut owned: Vec<Message> = messages.to_vec();
+    for message in owned.iter_mut() {
+        for block in message.content.iter_mut() {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                for item in content.iter_mut() {
+                    if let ToolResultContent::Image { source } = item {
+                        let Some(format) = parse_format(&source.media_type) else {
+                            continue;
+                        };
+                        let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(&source.data)
+                        else {
+                            continue;
+                        };
+                        let Ok((w, h)) = crate::image::read_image_dimensions(&bytes, format) else {
+                            continue;
+                        };
+                        if w <= MAX_IMAGE_DIMENSION_PX && h <= MAX_IMAGE_DIMENSION_PX {
+                            continue;
+                        }
+                        match crate::image::downscale_to_dim_cap(
+                            &bytes,
+                            format,
+                            MAX_IMAGE_DIMENSION_PX,
+                        ) {
+                            Ok(png) => {
+                                source.media_type = "image/png".to_string();
+                                source.data =
+                                    base64::engine::general_purpose::STANDARD.encode(&png);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "failed to downscale {}x{} {} image: {}",
+                                    w,
+                                    h,
+                                    source.media_type,
+                                    error,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Cow::Owned(owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,6 +1001,90 @@ mod tests {
         assert_eq!(owned.len(), 3);
         for (orig, copy) in messages.iter().zip(owned.iter()) {
             assert_eq!(orig.content.len(), copy.content.len());
+        }
+    }
+
+    fn synthesize_png_base64(width: u32, height: u32) -> String {
+        use base64::Engine;
+        use image::{ImageFormat, RgbaImage};
+        use std::io::Cursor;
+        let img = RgbaImage::from_pixel(width, height, image::Rgba([100, 150, 200, 255]));
+        let mut bytes = Vec::new();
+        img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode png");
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    }
+
+    fn user_with_image_block(tool_use_id: &str, base64_payload: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: vec![ToolResultContent::Image {
+                    source: crate::provider::ImageSource {
+                        source_type: "base64".to_string(),
+                        media_type: "image/png".to_string(),
+                        data: base64_payload.to_string(),
+                    },
+                }],
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_downscale_no_op_when_all_within_cap() {
+        let small = synthesize_png_base64(800, 600);
+        let messages = vec![
+            user_with_image_block("call_a", &small),
+            assistant_text("ack"),
+        ];
+        assert!(matches!(
+            downscale_oversized_images(&messages),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_downscale_resizes_oversized_image() {
+        use base64::Engine;
+        use image::ImageFormat;
+        let big = synthesize_png_base64(2400, 1200);
+        let small = synthesize_png_base64(800, 600);
+        let messages = vec![
+            user_with_image_block("call_big", &big),
+            user_with_image_block("call_small", &small),
+        ];
+        let result = downscale_oversized_images(&messages);
+        let owned = match result {
+            Cow::Owned(v) => v,
+            Cow::Borrowed(_) => panic!("expected owned (resize triggered)"),
+        };
+        // First image was downscaled to fit 2000 px on each axis.
+        match &owned[0].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolResultContent::Image { source } => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(&source.data)
+                        .expect("decode");
+                    let decoded =
+                        image::load_from_memory_with_format(&bytes, ImageFormat::Png).expect("png");
+                    assert!(decoded.width() <= MAX_IMAGE_DIMENSION_PX);
+                    assert!(decoded.height() <= MAX_IMAGE_DIMENSION_PX);
+                    // 2:1 aspect ratio preserved.
+                    assert_eq!(decoded.width() / decoded.height(), 2);
+                }
+                _ => panic!("expected resized image"),
+            },
+            _ => unreachable!(),
+        }
+        // Second image was within cap → unchanged.
+        match &owned[1].content[0] {
+            ContentBlock::ToolResult { content, .. } => match &content[0] {
+                ToolResultContent::Image { source } => assert_eq!(source.data, small),
+                _ => panic!("small image should be untouched"),
+            },
+            _ => unreachable!(),
         }
     }
 }

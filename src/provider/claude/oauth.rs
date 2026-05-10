@@ -422,6 +422,13 @@ impl ClaudeOAuthProvider {
         tools: &[ToolDefinition],
         stream: bool,
     ) -> Result<String> {
+        // Anthropic rejects images >2000 px on either axis in multi-image
+        // requests. Downscale before serialization so the request body
+        // never contains an oversized image. Cow::Borrowed when nothing
+        // needs work, so the common case pays only a header-only check.
+        let prepared = shared::downscale_oversized_images(messages);
+        let messages = prepared.as_ref();
+
         let body_json =
             serde_json::to_string(&self.build_request_body(system_prompt, messages, tools, stream))
                 .map_err(|error| {
