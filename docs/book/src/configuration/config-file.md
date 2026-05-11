@@ -495,6 +495,7 @@ An array of MCP server configurations. Each entry defines a server to connect to
 | `permission` | No | Server-wide permission override. Applies to every tool on this server, beating the `readOnlyHint` the server advertises and the `[mcp].default_permission` global fallback. See *Permission resolution* below. |
 | `allowed_tools` | No | Optional allow-list of raw tool names (the form the server advertises, not the `server__tool` namespaced form). When set and non-empty, only these tools are registered; all others from this server are ignored. |
 | `disabled_tools` | No | Optional block-list of raw tool names. Applied **after** `allowed_tools` — tools listed here are never registered. Both lists can coexist; the net set is `allowed_tools \ disabled_tools`. |
+| `eager_load_tools` | No | Raw tool names that should ship **eager-loaded** instead of deferred. Listed tools skip the `load_tool` round-trip and sit in the cacheable tools-array prefix from turn 1. Use this for tools the agent invokes constantly (search, fetch, …); leave others deferred so the tools array stays lean. |
 | `tool_permissions` | No | Per-tool permission overrides keyed by raw tool name. Beats the server-level `permission` and the server's `readOnlyHint` when resolving a tool's required permission. |
 | `sampling` | No | Allow this server to call `sampling/createMessage` against your configured LLM provider. Default `false` (reject). Enabling this lets a compromised server inject arbitrary messages into your LLM context and burn your provider quota — opt in per-server, deliberately. |
 | `sampling_limit` | No | Cap on sampling calls per agsh session from this server when `sampling = true`. Default `10`. Requests beyond the limit return an `INTERNAL_ERROR` to the server. |
@@ -532,7 +533,7 @@ User-supplied config (1, 2, 4) always beats the server's self-classification —
 
 **Hint spoofing**: a compromised server could claim `readOnlyHint = true` on a destructive tool. Defend by setting `server.permission = "write"` on suspect servers (step 2 wins) or by listing the destructive tools explicitly in `tool_permissions` / `disabled_tools`.
 
-**Stale config**: entries in `allowed_tools` / `disabled_tools` / `tool_permissions` that don't match any advertised tool get a `warn!` line at connect time. The server still connects; you just see a heads-up so you can clean up after the server renames a tool.
+**Stale config**: entries in `allowed_tools` / `disabled_tools` / `eager_load_tools` / `tool_permissions` that don't match any advertised tool get a `warn!` line at connect time. The server still connects; you just see a heads-up so you can clean up after the server renames a tool. A name that appears in both `eager_load_tools` and `disabled_tools` also warns — the disabled filter wins, so eager-loading the disabled tool is a no-op.
 
 **Visibility across levels**: the resolved permission doesn't hide a tool from the agent. Every registered tool is listed in the system prompt with its required level noted inline, and a per-turn `[Permission context]` block names the current level plus any tools it blocks. The agent can still reason about an inaccessible tool and suggest `/permission <level>` to enable it; the permission gate is enforced at dispatch time. Keeping the tool catalogue visible across levels is also what lets the Claude prompt cache survive mid-session permission toggles.
 
@@ -652,6 +653,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `--permission <none\|read\|ask\|write>` | Per-server permission cap (applies to all tools on the server). |
 | `--allow-tool <NAME>` | Raw tool name to allow (repeatable). When set, only listed tools register. |
 | `--disable-tool <NAME>` | Raw tool name to block (repeatable). Applied after `--allow-tool`. |
+| `--eager-load-tool <NAME>` | Raw tool name to eager-load (repeatable). Listed tools skip the `load_tool` round-trip and ship in the cacheable tools-array prefix from turn 1. |
 | `--tool-permission <NAME=LEVEL>` | Per-tool permission override (repeatable). `LEVEL` is `none`/`read`/`ask`/`write`. |
 | `--sampling`, `--sampling-limit <N>` | Opt into server-initiated `sampling/createMessage`. |
 

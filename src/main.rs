@@ -1019,6 +1019,7 @@ async fn run_mcp_subcommand(
             no_login,
             allow_tool,
             disable_tool,
+            eager_load_tool,
             tool_permission,
             disabled,
         } => {
@@ -1044,6 +1045,7 @@ async fn run_mcp_subcommand(
                     no_login: *no_login,
                     allow_tool: allow_tool.clone(),
                     disable_tool: disable_tool.clone(),
+                    eager_load_tool: eager_load_tool.clone(),
                     tool_permission: tool_permission.clone(),
                     disabled: *disabled,
                 },

@@ -197,19 +197,26 @@ async fn discover_and_register_tools(
 ) -> Result<usize> {
     use crate::tools::Tool as _;
     let adapters = build_mcp_adapters(entry, mcp_default_permission).await?;
-    let registered_names: Vec<String> = adapters
+    // Decide which adapters should ship deferred BEFORE we erase the
+    // concrete type into `Arc<dyn Tool>` — `tool_should_eager_load`
+    // needs the raw name, which the trait object doesn't expose.
+    let deferred_names: Vec<String> = adapters
         .iter()
-        .map(|a| a.definition().name.clone())
+        .filter(|adapter| {
+            !crate::mcp::tool_should_eager_load(adapter.server_config(), adapter.raw_name())
+        })
+        .map(|adapter| adapter.definition().name.clone())
         .collect();
+    let registered_count = adapters.len();
     let arc_adapters: Vec<Arc<dyn crate::tools::Tool>> = adapters
         .into_iter()
         .map(|a| Arc::new(a) as Arc<dyn crate::tools::Tool>)
         .collect();
     tool_registry.replace_server_tools(&entry.server_name, arc_adapters);
-    for name in &registered_names {
+    for name in &deferred_names {
         tool_registry.mark_deferred(name);
     }
-    Ok(registered_names.len())
+    Ok(registered_count)
 }
 
 /// Core adapter-construction logic shared between initial discovery (via
@@ -473,6 +480,7 @@ mod tests {
             permission: None,
             allowed_tools: None,
             disabled_tools: None,
+            eager_load_tools: None,
             tool_permissions: None,
             sampling: false,
             sampling_limit: None,

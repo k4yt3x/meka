@@ -103,6 +103,12 @@ pub struct McpServerConfig {
     /// Optional block-list of raw tool names. Applied after
     /// [`Self::allowed_tools`] — tools listed here are never registered.
     pub disabled_tools: Option<Vec<String>>,
+    /// Raw tool names (server-advertised, not the `mcp__<server>__<tool>`
+    /// namespaced form) that should ship eager-loaded instead of deferred.
+    /// Saves a `load_tool` round-trip and keeps the schema in the cacheable
+    /// tools-array prefix. Names that don't match an advertised tool surface
+    /// as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
+    pub eager_load_tools: Option<Vec<String>>,
     /// Optional per-tool permission overrides keyed by raw tool name.
     /// Beats the server-level `permission` and the server's
     /// `readOnlyHint` annotation when resolving a tool's required

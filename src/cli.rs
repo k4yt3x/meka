@@ -222,6 +222,12 @@ pub enum McpAction {
         #[arg(long = "disable-tool", value_name = "TOOL")]
         disable_tool: Vec<String>,
 
+        /// Raw tool name to eager-load (repeatable). Tools listed here
+        /// skip the `load_tool` round-trip and ship in the cacheable
+        /// tools-array prefix from turn 1.
+        #[arg(long = "eager-load-tool", value_name = "TOOL")]
+        eager_load_tool: Vec<String>,
+
         /// Per-tool permission override (repeatable).
         /// Format: `TOOL=LEVEL`, where LEVEL is none/read/ask/write.
         #[arg(long = "tool-permission", value_name = "TOOL=LEVEL")]

@@ -834,6 +834,7 @@ mod tests {
             permission: None,
             allowed_tools: None,
             disabled_tools: None,
+            eager_load_tools: None,
             tool_permissions: None,
             sampling: false,
             sampling_limit: None,
@@ -865,8 +866,8 @@ mod tests {
                 "MCP resource tool {} not registered",
                 name
             );
-            assert_eq!(
-                by_name[name], true,
+            assert!(
+                by_name[name],
                 "MCP resource tool {} should still be deferred (would otherwise \
                  bloat the tools array on every MCP-enabled session)",
                 name,

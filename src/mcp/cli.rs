@@ -564,6 +564,8 @@ pub struct AddArgs {
     pub allow_tool: Vec<String>,
     /// Raw tool names to block-list (never register).
     pub disable_tool: Vec<String>,
+    /// Raw tool names to eager-load (skip `load_tool` round-trip).
+    pub eager_load_tool: Vec<String>,
     /// Raw `NAME=LEVEL` pairs for per-tool permission overrides.
     pub tool_permission: Vec<String>,
     /// Persist with `disabled = true` so the server is skipped at startup
@@ -594,6 +596,7 @@ struct ResolvedAddArgs {
     permission: Option<String>,
     allowed_tools: Option<Vec<String>>,
     disabled_tools: Option<Vec<String>>,
+    eager_load_tools: Option<Vec<String>>,
     tool_permissions: Option<std::collections::HashMap<String, String>>,
     sampling: bool,
     sampling_limit: Option<u32>,
@@ -850,6 +853,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         no_login,
         allow_tool,
         disable_tool,
+        eager_load_tool,
         tool_permission,
         disabled,
     } = args;
@@ -922,6 +926,11 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
     } else {
         Some(disable_tool)
     };
+    let eager_load_tools = if eager_load_tool.is_empty() {
+        None
+    } else {
+        Some(eager_load_tool)
+    };
 
     let auth_flags_present = client_id.is_some()
         || client_secret.is_some()
@@ -963,6 +972,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 permission,
                 allowed_tools,
                 disabled_tools,
+                eager_load_tools,
                 tool_permissions,
                 sampling,
                 sampling_limit,
@@ -1009,6 +1019,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
                 permission,
                 allowed_tools,
                 disabled_tools,
+                eager_load_tools,
                 tool_permissions,
                 sampling,
                 sampling_limit,
@@ -1175,6 +1186,7 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
         permission: resolved.permission.clone(),
         allowed_tools: resolved.allowed_tools.clone(),
         disabled_tools: resolved.disabled_tools.clone(),
+        eager_load_tools: resolved.eager_load_tools.clone(),
         tool_permissions: resolved.tool_permissions.clone(),
         sampling: resolved.sampling,
         sampling_limit: resolved.sampling_limit,
@@ -1499,6 +1511,7 @@ mod tests {
             no_login: false,
             allow_tool: Vec::new(),
             disable_tool: Vec::new(),
+            eager_load_tool: Vec::new(),
             tool_permission: Vec::new(),
             disabled: false,
         }

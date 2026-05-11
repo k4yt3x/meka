@@ -98,16 +98,27 @@ impl ClientHandler for AgshClientHandler {
             // explicit permission needs to be threaded here.
             match manager.discover_tools_for_server(&server_name).await {
                 Ok(adapters) => {
+                    // Match the initial-registration path: only mark
+                    // non-eager tools deferred. Compute the deferred set
+                    // before we erase the adapters into `Arc<dyn Tool>`,
+                    // since `raw_name`/`server_config` live on the
+                    // concrete type.
+                    let deferred_names: Vec<String> = adapters
+                        .iter()
+                        .filter(|adapter| {
+                            !crate::mcp::tool_should_eager_load(
+                                adapter.server_config(),
+                                adapter.raw_name(),
+                            )
+                        })
+                        .map(|adapter| adapter.definition().name)
+                        .collect();
                     let new_tools: Vec<Arc<dyn Tool>> = adapters
                         .into_iter()
                         .map(|a| Arc::new(a) as Arc<dyn Tool>)
                         .collect();
-                    let new_names: Vec<String> =
-                        new_tools.iter().map(|t| t.definition().name).collect();
                     registry.replace_server_tools(&server_name, new_tools);
-                    // Mark freshly-registered tools as deferred so they match
-                    // the behaviour of the initial startup registration.
-                    for name in new_names {
+                    for name in deferred_names {
                         registry.mark_deferred(&name);
                     }
                     tracing::info!("MCP server '{}' tool registry refreshed", server_name);
@@ -477,6 +488,20 @@ impl McpToolAdapter {
             meta,
             title,
         }
+    }
+
+    /// Raw, server-advertised tool name (not the `mcp__<server>__<tool>`
+    /// namespaced form). Used to look the tool up in per-server config
+    /// fields like `eager_load_tools`.
+    pub(crate) fn raw_name(&self) -> &str {
+        &self.remote_tool_name
+    }
+
+    /// The server config that produced this adapter. Used to read
+    /// per-server policy (eager-load, permission overrides, …) without
+    /// rediscovering the manager.
+    pub(crate) fn server_config(&self) -> &crate::config::McpServerConfig {
+        &self.entry.config
     }
 
     /// Resolves a per-call tool-call timeout. Respects `AGSH_MCP_TOOL_TIMEOUT`

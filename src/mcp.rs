@@ -795,11 +795,25 @@ pub(crate) fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &s
     true
 }
 
+/// Whether the given raw tool name is in this server's
+/// [`eager_load_tools`][McpServerConfig::eager_load_tools] list. Mirrors
+/// [`tool_is_allowed`]'s shape. When true, the registration sites skip
+/// `mark_deferred` so the tool ships in the cacheable tools-array prefix
+/// from the first turn instead of after a `load_tool` round-trip.
+pub(crate) fn tool_should_eager_load(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
+    server_config
+        .eager_load_tools
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|n| n == tool_raw_name))
+}
+
 /// Emit a `warn!` once per entry in `allowed_tools` / `disabled_tools`
-/// / `tool_permissions` that doesn't match anything the server
-/// currently advertises. Users get a visible heads-up without failing
-/// the connect — tool lists can change between server releases, and
-/// forcing a hard error on every rename would be hostile.
+/// / `eager_load_tools` / `tool_permissions` that doesn't match anything
+/// the server currently advertises. Users get a visible heads-up without
+/// failing the connect — tool lists can change between server releases,
+/// and forcing a hard error on every rename would be hostile. Also warns
+/// on the disabled∩eager-load overlap, which is meaningless (disabled
+/// tools aren't registered, so eager-loading them is a no-op).
 pub(crate) fn warn_on_stale_tool_config(
     server_name: &str,
     server_config: &McpServerConfig,
@@ -821,6 +835,26 @@ pub(crate) fn warn_on_stale_tool_config(
             if !advertised.contains(name.as_str()) {
                 tracing::warn!(
                     "MCP server '{}': disabled_tools entry '{}' doesn't match any advertised tool",
+                    server_name,
+                    name
+                );
+            }
+        }
+    }
+    if let Some(eager) = server_config.eager_load_tools.as_deref() {
+        let disabled = server_config.disabled_tools.as_deref().unwrap_or(&[]);
+        for name in eager {
+            if !advertised.contains(name.as_str()) {
+                tracing::warn!(
+                    "MCP server '{}': eager_load_tools entry '{}' doesn't match any advertised tool",
+                    server_name,
+                    name
+                );
+            }
+            if disabled.iter().any(|d| d == name) {
+                tracing::warn!(
+                    "MCP server '{}': eager_load_tools entry '{}' is also in disabled_tools \
+                     (the tool won't be registered at all, so eager-loading it is a no-op)",
                     server_name,
                     name
                 );
@@ -1189,6 +1223,7 @@ mod tests {
             permission: None,
             allowed_tools: None,
             disabled_tools: None,
+            eager_load_tools: None,
             tool_permissions: None,
             sampling: false,
             sampling_limit: None,
@@ -1413,10 +1448,12 @@ mod tests {
         // The function just emits `warn!` lines; we can't easily
         // assert on tracing output from a unit test. Smoke-test that
         // the happy path (empty config) doesn't panic and that it
-        // accepts a server_config with all three fields populated.
+        // accepts a server_config with all four list fields populated
+        // plus tool_permissions.
         let mut server = bare_server_config("s");
         server.allowed_tools = Some(vec!["a".into(), "unknown".into()]);
         server.disabled_tools = Some(vec!["b".into(), "gone".into()]);
+        server.eager_load_tools = Some(vec!["a".into(), "stale".into(), "b".into()]);
         let mut perms = std::collections::HashMap::new();
         perms.insert("a".to_string(), "read".to_string());
         perms.insert("missing".to_string(), "write".to_string());
@@ -1424,8 +1461,49 @@ mod tests {
 
         let advertised: std::collections::HashSet<&str> =
             ["a", "b", "search"].into_iter().collect();
-        // Just confirm the call doesn't panic.
+        // Just confirm the call doesn't panic; "stale" should warn
+        // (unknown), and "b" should warn (disabled∩eager overlap).
         warn_on_stale_tool_config("s", &server, &advertised);
+    }
+
+    #[test]
+    fn tool_should_eager_load_unset_returns_false() {
+        let server = bare_server_config("s");
+        assert!(!tool_should_eager_load(&server, "search"));
+        assert!(!tool_should_eager_load(&server, "anything"));
+    }
+
+    #[test]
+    fn tool_should_eager_load_empty_list_returns_false() {
+        let mut server = bare_server_config("s");
+        server.eager_load_tools = Some(Vec::new());
+        assert!(!tool_should_eager_load(&server, "search"));
+    }
+
+    #[test]
+    fn tool_should_eager_load_matching_name_returns_true() {
+        let mut server = bare_server_config("s");
+        server.eager_load_tools = Some(vec!["search".into(), "fetch".into()]);
+        assert!(tool_should_eager_load(&server, "search"));
+        assert!(tool_should_eager_load(&server, "fetch"));
+    }
+
+    #[test]
+    fn tool_should_eager_load_nonmatching_returns_false() {
+        let mut server = bare_server_config("s");
+        server.eager_load_tools = Some(vec!["search".into()]);
+        assert!(!tool_should_eager_load(&server, "create-page"));
+    }
+
+    #[test]
+    fn tool_should_eager_load_uses_raw_not_namespaced_name() {
+        // The check is against the server-advertised raw name; the
+        // namespaced `mcp__notion__search` form must NOT match an entry
+        // of `"search"` — that would create a footgun where users could
+        // accidentally over-match across servers.
+        let mut server = bare_server_config("notion");
+        server.eager_load_tools = Some(vec!["search".into()]);
+        assert!(!tool_should_eager_load(&server, "mcp__notion__search"));
     }
 
     #[test]

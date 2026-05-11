@@ -967,18 +967,15 @@ pub(crate) mod tests {
 
         let by_name: std::collections::HashMap<_, _> =
             entries.iter().map(|(n, _, _, d)| (n.clone(), *d)).collect();
-        assert_eq!(
-            by_name["fixture_alpha"], true,
+        assert!(
+            by_name["fixture_alpha"],
             "deferred fixture must be flagged deferred"
         );
-        assert_eq!(
-            by_name["scratchpad_read"], false,
+        assert!(
+            !by_name["scratchpad_read"],
             "scratchpad_read ships active and must not be flagged deferred"
         );
-        assert_eq!(
-            by_name["write_file"], false,
-            "write_file is an active builtin"
-        );
+        assert!(!by_name["write_file"], "write_file is an active builtin");
 
         let required: std::collections::HashMap<_, _> =
             entries.iter().map(|(n, _, p, _)| (n.clone(), *p)).collect();
