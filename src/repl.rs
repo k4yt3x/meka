@@ -165,6 +165,12 @@ pub enum SlashCommand {
     /// `/status` — print cumulative session stats (turns, tokens, cache
     /// hit ratio, image redactions).
     Status,
+    /// `/history [N]` — reprint past conversation in REPL style. Bare
+    /// `/history` dumps every materialised message; `/history N` shows
+    /// the last `N` turns (turn = user prompt + the agent work it
+    /// triggered). Any non-numeric argument (e.g. `all`) falls back to
+    /// the dump-everything path.
+    History(Option<usize>),
 }
 
 pub enum ReplEvent {
@@ -214,6 +220,11 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "mcp" => parse_mcp_slash(argument.as_deref().unwrap_or("")),
         "skill" => Some(parse_skill_slash(argument.as_deref().unwrap_or(""))),
         "status" => Some(SlashCommand::Status),
+        "history" => Some(SlashCommand::History(
+            argument
+                .as_deref()
+                .and_then(|s| s.trim().parse::<usize>().ok()),
+        )),
         _ => None,
     }
 }
@@ -314,6 +325,9 @@ fn print_help() {
     eprintln!("  /mcp <server>:<prompt> [args]  Render an MCP prompt as the next turn");
     eprintln!(
         "  /status                        Show session stats (turns, tokens, cache, redactions)"
+    );
+    eprintln!(
+        "  /history [N]                   Reprint past conversation (bare = all, N = last N turns)"
     );
     eprintln!();
     eprintln!("Shortcuts:");
@@ -438,7 +452,8 @@ pub fn run_repl(
                             | SlashCommand::McpLogout { .. }
                             | SlashCommand::SkillList
                             | SlashCommand::SkillInvoke { .. }
-                            | SlashCommand::Status),
+                            | SlashCommand::Status
+                            | SlashCommand::History(_)),
                         ) => {
                             if input_sender.send(ReplEvent::Command(command)).is_err() {
                                 break;
@@ -904,6 +919,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_slash_command_history_no_args() {
+        assert!(matches!(
+            parse_slash_command("/history"),
+            Some(SlashCommand::History(None))
+        ));
+    }
+
+    #[test]
+    fn test_parse_slash_command_history_with_n() {
+        assert!(matches!(
+            parse_slash_command("/history 5"),
+            Some(SlashCommand::History(Some(5)))
+        ));
+        // Whitespace is tolerated.
+        assert!(matches!(
+            parse_slash_command("/history   12"),
+            Some(SlashCommand::History(Some(12)))
+        ));
+    }
+
+    #[test]
+    fn test_parse_slash_command_history_garbage_falls_back_to_all() {
+        // Non-numeric argument (including `all`) collapses to None so the
+        // dispatch dumps the whole conversation. Documented behaviour:
+        // graceful fallback, no error.
+        assert!(matches!(
+            parse_slash_command("/history all"),
+            Some(SlashCommand::History(None))
+        ));
+        assert!(matches!(
+            parse_slash_command("/history banana"),
+            Some(SlashCommand::History(None))
+        ));
+    }
+
+    #[test]
     fn test_shorten_path_with_tilde_home() {
         if let Some(home) = dirs::home_dir() {
             assert_eq!(shorten_path_with_tilde(&home), "~");
@@ -1154,6 +1205,7 @@ mod tests {
             Some(SlashCommand::SkillList) => "SkillList",
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",
             Some(SlashCommand::Status) => "Status",
+            Some(SlashCommand::History(_)) => "History",
         }
     }
 

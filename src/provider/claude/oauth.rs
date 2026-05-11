@@ -1430,8 +1430,7 @@ mod tests {
         assert!(ms < 4_102_444_800_000);
     }
 
-    // ---- Cache prefix stability tests ----
-    //
+    // Cache prefix stability tests.
     // These tests simulate multi-turn conversations and tool-use loops to
     // verify that the serialized request bodies share a stable prefix across
     // successive API calls, which is the fundamental requirement for KV cache
@@ -1636,7 +1635,6 @@ mod tests {
 
         let provider = test_provider();
 
-        // ---- Turn 1 @ Read ---------------------------------------------
         // The agent fetches these once per turn. None of them take the
         // current permission — that's the invariant we're testing.
         let catalogue = registry.tool_catalogue();
@@ -1650,12 +1648,11 @@ mod tests {
         let messages_t1 = vec![Message::user(&u1_text)];
         let body_t1 = provider.build_request_body(&system, &messages_t1, &tools, true);
 
-        // ---- /permission write toggle ---------------------------------
-        // (In real code this happens on a different thread via
-        // `SharedPermission::set`. Here we just re-read the catalogue and
-        // rebuild everything to prove the outputs don't depend on it.)
+        // Simulate a `/permission write` toggle: in real code this
+        // happens on a different thread via `SharedPermission::set`;
+        // here we just re-read the catalogue and rebuild everything to
+        // prove the outputs don't depend on the live permission state.
 
-        // ---- Turn 2 @ Write -------------------------------------------
         let catalogue_t2 = registry.tool_catalogue();
         let system_t2 = build_system_prompt(&catalogue_t2, true, &[], None, &[]);
         let tools_t2 = registry.definitions_active(&[]);
@@ -1746,7 +1743,7 @@ mod tests {
         let catalogue = registry.tool_catalogue();
         let system = build_system_prompt(&catalogue, true, &[], None, &[]);
 
-        // ---- Turn 1: empty history, fixture_deferred is deferred --------
+        // Turn 1: empty history, fixture_deferred not yet exposed.
         let u1_text = {
             let block = build_turn_context(Permission::Write, &[]);
             format!("{}\n\n{}", block, "investigate scratchpad")
@@ -1760,7 +1757,8 @@ mod tests {
             "fixture_deferred should be deferred in turn 1"
         );
 
-        // ---- Turn 2: model invoked load_tool for fixture_deferred -------
+        // Turn 2: the model has called `load_tool` for fixture_deferred,
+        // so the next request should expose its schema.
         let messages_t2 = vec![
             Message::user(&u1_text),
             Message {
@@ -1860,7 +1858,7 @@ mod tests {
         .expect("default web client config should build cleanly");
         crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
 
-        // ---- Pre-compaction: load fixture_deferred via load_tool. ----
+        // Pre-compaction: load fixture_deferred via load_tool.
         let mut log = Conversation::new();
         log.append(Message::user("question 1"));
         log.append(Message {
@@ -1887,7 +1885,7 @@ mod tests {
         let pre_tools = registry.definitions_active_with_loaded(&pre_loaded);
         assert!(pre_tools.iter().any(|t| t.name == "fixture_deferred"));
 
-        // ---- Compact: the snapshot carries the loaded set forward. ----
+        // Compact: the snapshot must carry the loaded set forward.
         log.replace_for_compaction(
             Message::user("[summary]"),
             vec![Message::user("question 2")],

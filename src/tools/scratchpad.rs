@@ -99,10 +99,6 @@ fn build_large_output_preview(name: &str, text: &str) -> String {
     replacement
 }
 
-// ---------------------------------------------------------------------------
-// Framework functions called from agent.rs
-// ---------------------------------------------------------------------------
-
 /// Save tool results to the scratchpad when the agent explicitly requested it
 /// via the `scratchpad` parameter on a tool call. Replaces the inline result
 /// with a brief reference.
@@ -198,10 +194,6 @@ pub async fn persist_oversized_results(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// scratchpad_write
-// ---------------------------------------------------------------------------
-
 pub(super) struct ScratchpadWriteTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
@@ -275,10 +267,6 @@ impl Tool for ScratchpadWriteTool {
         ))
     }
 }
-
-// ---------------------------------------------------------------------------
-// scratchpad_read
-// ---------------------------------------------------------------------------
 
 pub(super) struct ScratchpadReadTool {
     pub session_manager: SessionManager,
@@ -391,10 +379,6 @@ fn read_mode(content: &str, input: &serde_json::Value) -> Result<ToolOutput> {
         false,
     ))
 }
-
-// ---------------------------------------------------------------------------
-// scratchpad_edit
-// ---------------------------------------------------------------------------
 
 pub(super) struct ScratchpadEditTool {
     pub session_manager: SessionManager,
@@ -544,10 +528,6 @@ impl Tool for ScratchpadEditTool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// scratchpad_list
-// ---------------------------------------------------------------------------
-
 pub(super) struct ScratchpadListTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
@@ -600,10 +580,6 @@ impl Tool for ScratchpadListTool {
         Ok(ToolOutput::text(output, false))
     }
 }
-
-// ---------------------------------------------------------------------------
-// scratchpad_delete
-// ---------------------------------------------------------------------------
 
 pub(super) struct ScratchpadDeleteTool {
     pub session_manager: SessionManager,
@@ -666,10 +642,6 @@ impl Tool for ScratchpadDeleteTool {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

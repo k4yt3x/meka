@@ -447,8 +447,6 @@ mod tests {
     use super::*;
     use crate::provider::ToolResultContent;
 
-    // ---- Request body encoder tests ----------------------------------------
-
     #[test]
     fn test_request_body_minimal() {
         let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, true);
@@ -602,8 +600,6 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "function_call_output");
     }
-
-    // ---- SSE event handler tests -------------------------------------------
 
     fn run_events(
         events: &[(&str, serde_json::Value)],
@@ -890,8 +886,6 @@ mod tests {
         }
         assert!(!state.in_reasoning);
     }
-
-    // ---- build_tool_result_output -----------------------------------------
 
     fn image_content(media_type: &str, data: &str) -> ToolResultContent {
         ToolResultContent::Image {

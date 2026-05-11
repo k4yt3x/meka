@@ -1830,8 +1830,7 @@ mod tests {
         assert!(preview.len() <= 84); // 80 chars + "…"
     }
 
-    // ---- end-to-end regression tests for `agsh list`'s preview ----
-    //
+    // End-to-end regression tests for `agsh list`'s preview.
     // These tests mock the complete pipeline that produces the
     // `Preview` column: build the turn-context block the agent
     // actually sends, prepend it to a user prompt the way
@@ -2116,7 +2115,7 @@ mod tests {
         assert!(manager.session_exists(session_id).await.expect("failed"));
     }
 
-    // --- MCP TokenStore tests ---
+    // MCP TokenStore tests.
     // Exercise the methods backing `agsh mcp login/logout` and the auth-probe
     // cache that skips unauthenticated connects after a 401. In-memory DB
     // keeps each case hermetic.

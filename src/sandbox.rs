@@ -223,10 +223,6 @@ struct LandlockPathBeneathAttr {
 pub const SANDBOX_PROFILE_READONLY: &str =
     "(version 1)(allow default)(deny file-write*)(deny file-write-setugid)";
 
-// --------------------------------------------------------------------------
-// Windows PowerShell output encoding
-// --------------------------------------------------------------------------
-
 /// PowerShell prelude that switches `$OutputEncoding` and
 /// `[Console]::OutputEncoding` to UTF-8. See
 /// [`wrap_command_with_utf8_output`] for why this is necessary.
@@ -247,12 +243,6 @@ pub fn wrap_command_with_utf8_output(command: &str) -> String {
     wrapped
 }
 
-// --------------------------------------------------------------------------
-// Windows argv quoting (cross-platform — the rules are Windows-specific but
-// the implementation is pure string manipulation, so it compiles and tests
-// on every platform)
-// --------------------------------------------------------------------------
-
 /// Quote a single command-line argument per Windows `CommandLineToArgvW`
 /// rules. Mirrors the algorithm used by `std::process::Command` on Windows.
 ///
@@ -261,6 +251,11 @@ pub fn wrap_command_with_utf8_output(command: &str) -> String {
 /// Low-integrity sandbox invokes. It is **not** the correct encoding for
 /// `cmd.exe /C` (cmd treats `\` literally); don't apply this to cmd command
 /// bodies.
+///
+/// Compiled on every platform even though the rules are Windows-specific:
+/// the implementation is pure string manipulation, so unit tests run on
+/// Linux/macOS without an `#[cfg(target_os = "windows")]` gate (the
+/// `cfg_attr` below just silences the dead-code warning off-Windows).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn quote_command_arg(arg: &str) -> String {
     if !arg.is_empty()
@@ -303,10 +298,6 @@ pub fn quote_command_arg(arg: &str) -> String {
     quoted.push('"');
     quoted
 }
-
-// --------------------------------------------------------------------------
-// Windows Low-integrity sandbox
-// --------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
 pub use windows_impl::spawn_low_integrity_command;

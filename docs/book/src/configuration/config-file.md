@@ -249,6 +249,19 @@ The `in` column is the total of all three Anthropic input tiers (live, cache-wri
 
 Default: `false`
 
+### `display.resume_show_recent`
+
+When set to a positive integer `N`, resuming a session reprints the **last `N` turns** (each turn = the user's prompt plus everything the agent did in response, styled to match the live REPL) instead of just the last assistant message.
+
+Useful when you regularly resume long-running sessions and want more context than the single-message default. Inside a session, the `/history` slash command provides the same rendering on demand (`/history` dumps everything; `/history N` shows the last N turns).
+
+Default: unset (resume reprints only the last assistant message — today's behaviour).
+
+```toml
+[display]
+resume_show_recent = 3
+```
+
 ### `display.input_style`
 
 Visual style applied to text typed into the REPL prompt. Makes submitted prompts easy to spot when scrolling back through a long session — reedline paints the buffer with this style on every repaint, including the final paint before the newline, so the styling lands in the terminal's scrollback alongside the literal text.

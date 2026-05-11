@@ -17,10 +17,6 @@ use termimad::MadSkin;
 /// Monokai Extended theme, vendored from bat's `sharkdp/sublime-monokai-extended` (MIT).
 const MONOKAI_EXTENDED_TMTHEME: &[u8] = include_bytes!("../assets/themes/Monokai Extended.tmTheme");
 
-// ---------------------------------------------------------------------------
-// Output spacing state machine
-// ---------------------------------------------------------------------------
-
 enum LastOutput {
     Nothing,
     Prompt,
@@ -76,10 +72,6 @@ impl OutputSpacing {
         self.last = LastOutput::Prompt;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Render mode
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -683,6 +675,176 @@ pub fn render_provider_setup_hint() {
     eprintln!("Configure a provider and model to use agsh.");
     eprintln!("Example: agsh --provider openai-api --model gpt-4o \"hello\"");
     eprintln!("Or set AGSH_PROVIDER, AGSH_MODEL, and OPENAI_API_KEY environment variables.");
+}
+
+/// Walk backwards through `messages` and return the suffix that starts at
+/// the `n`th most recent user turn. A "turn" begins at a User-role message
+/// whose content is not purely `ToolResult` blocks — i.e. an actual user
+/// prompt, not an agent-driven tool result echoed back as a User message.
+/// `n == 0` or no qualifying turns returns an empty slice.
+pub fn last_n_turns(
+    messages: &[crate::provider::Message],
+    n: usize,
+) -> &[crate::provider::Message] {
+    if n == 0 || messages.is_empty() {
+        return &[];
+    }
+    // Walk backwards, tracking the earliest qualifying boundary seen so
+    // far. If we hit `n` boundaries we stop there; if we exhaust the
+    // slice without reaching `n`, we return everything from the earliest
+    // boundary we did find (so `N=999` on a 2-turn session still returns
+    // both turns, not an empty slice).
+    let mut seen = 0usize;
+    let mut earliest_boundary: Option<usize> = None;
+    for (index, message) in messages.iter().enumerate().rev() {
+        if is_user_prompt_boundary(message) {
+            seen += 1;
+            earliest_boundary = Some(index);
+            if seen == n {
+                break;
+            }
+        }
+    }
+    match earliest_boundary {
+        Some(start) => &messages[start..],
+        None => &[],
+    }
+}
+
+/// True when `message` is the start of a new turn from the user's
+/// perspective — Role::User with at least one non-`ToolResult` block.
+fn is_user_prompt_boundary(message: &crate::provider::Message) -> bool {
+    use crate::provider::{ContentBlock, Role};
+    if !matches!(message.role, Role::User) {
+        return false;
+    }
+    message
+        .content
+        .iter()
+        .any(|block| !matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// Knobs for [`render_message_history`]. Mirrors the fields the live REPL
+/// reads off `ResolvedConfig` so resumed/dumped history matches what the
+/// user sees during a live turn.
+pub struct HistoryRenderOptions {
+    pub render_mode: RenderMode,
+    pub show_thinking: bool,
+    pub input_style: nu_ansi_term::Style,
+    /// Blank line before each user prompt (mirrors
+    /// `[display].newline_before_prompt`).
+    pub newline_before_prompt: bool,
+    /// Blank line after each user prompt (mirrors
+    /// `[display].newline_after_prompt`). Acts as the visual separator
+    /// between the prompt and the agent's first response block.
+    pub newline_after_prompt: bool,
+}
+
+/// Reprint a slice of historical messages styled to match the live REPL
+/// output. Inter-block spacing flows through [`OutputSpacing`] (the same
+/// state machine the live loop uses) so transitions like
+/// tool-indicator → text get a blank line; user-prompt spacing follows
+/// the `newline_before_prompt` / `newline_after_prompt` config flags
+/// just like the live REPL.
+pub fn render_message_history(messages: &[crate::provider::Message], opts: &HistoryRenderOptions) {
+    use crate::provider::{ContentBlock, Role};
+    if messages.is_empty() {
+        return;
+    }
+    let mut spacing = OutputSpacing::new();
+    // The caller (e.g. the `/history` dispatch) is expected to emit the
+    // leading blank — the equivalent of the live REPL's
+    // `newline_after_prompt` — between its own command line and this
+    // rendered history. So the very first user prompt we render must
+    // skip its own `newline_before_prompt` to avoid stacking blanks.
+    // Once anything has been emitted, the inner spacing rules take
+    // over and turn-to-turn transitions get their own blanks naturally.
+    let mut emitted_any = false;
+    for message in messages {
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text } => match message.role {
+                    Role::Assistant => {
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        if spacing.before_text() {
+                            eprintln!();
+                        }
+                        render_assistant_text(text, opts.render_mode);
+                        emitted_any = true;
+                    }
+                    Role::User => {
+                        let leading_blank = opts.newline_before_prompt && emitted_any;
+                        if !render_user_prompt(text, opts.input_style, leading_blank) {
+                            continue;
+                        }
+                        if opts.newline_after_prompt {
+                            eprintln!();
+                        }
+                        spacing.after_prompt();
+                        emitted_any = true;
+                    }
+                },
+                ContentBlock::Thinking { thinking, .. } => {
+                    if opts.show_thinking && !thinking.trim().is_empty() {
+                        if spacing.before_thinking() {
+                            eprintln!();
+                        }
+                        render_thinking_block(thinking, true);
+                        emitted_any = true;
+                    }
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    if spacing.before_tool_indicator() {
+                        eprintln!();
+                    }
+                    render_tool_indicator(name, input, None);
+                    emitted_any = true;
+                }
+                // Tool results are intentionally hidden — the live REPL
+                // doesn't echo them either, so showing them in history
+                // would be a fidelity regression. The user sees the
+                // tool indicator (above) and whatever the assistant's
+                // next text block says about the result.
+                ContentBlock::ToolResult { .. } => {}
+            }
+        }
+    }
+}
+
+fn render_assistant_text(text: &str, render_mode: RenderMode) {
+    // Caller has already emitted the leading blank line (via
+    // `OutputSpacing::before_text`) when needed, and verified the text
+    // is non-empty. We just stream the markdown — no trailing blank,
+    // because the next block's `before_*` will add one if appropriate.
+    let mut renderer = StreamingRenderer::new(render_mode);
+    if let Err(error) = renderer.push_delta(text) {
+        tracing::debug!("history: failed to render assistant delta: {}", error);
+    }
+    if let Err(error) = renderer.finish() {
+        tracing::debug!("history: failed to finish assistant render: {}", error);
+    }
+}
+
+/// Render a user prompt with the cyan `>` gutter plus `input_style`
+/// applied to each line, optionally preceded by a blank line. Returns
+/// `false` when the prompt was empty (after `strip_context_tags`) and
+/// nothing was emitted, so the caller can skip the after-prompt
+/// blank/state update.
+fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_before: bool) -> bool {
+    let stripped = crate::session::strip_context_tags(text);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if newline_before {
+        eprintln!();
+    }
+    for line in trimmed.lines() {
+        eprintln!("{} {}", ">".with(Color::Cyan), input_style.paint(line));
+    }
+    true
 }
 
 pub fn render_thinking_block(thinking: &str, show_full: bool) {
@@ -1452,5 +1614,221 @@ mod tests {
         let input = "| A | B |\n|---|---|\n| 1 | 2 |";
         let output = normalize_spacing(input);
         assert_eq!(output, "| A | B |\n|---|---|\n| 1 | 2 |");
+    }
+
+    use crate::provider::{ContentBlock, ImageSource, Message, Role, ToolResultContent};
+
+    fn user_prompt(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn tool_result_message(tool_use_id: &str, body: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: vec![ToolResultContent::Text {
+                    text: body.to_string(),
+                }],
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_last_n_turns_handles_empty() {
+        assert!(last_n_turns(&[], 1).is_empty());
+        assert!(last_n_turns(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn test_last_n_turns_zero_returns_empty() {
+        let messages = vec![user_prompt("hi"), assistant_text("hello")];
+        assert!(last_n_turns(&messages, 0).is_empty());
+    }
+
+    #[test]
+    fn test_last_n_turns_one_counts_to_last_user_prompt() {
+        let messages = vec![
+            user_prompt("first"),
+            assistant_text("ack one"),
+            user_prompt("second"),
+            assistant_text("ack two"),
+        ];
+        let slice = last_n_turns(&messages, 1);
+        assert_eq!(slice.len(), 2);
+        assert!(matches!(slice[0].role, Role::User));
+        // The "second" prompt is the boundary; both messages after it
+        // belong to that turn.
+        assert_eq!(
+            slice[0].text_content(),
+            "second",
+            "boundary should be the most recent user prompt"
+        );
+    }
+
+    #[test]
+    fn test_last_n_turns_two_returns_from_earlier_boundary() {
+        let messages = vec![
+            user_prompt("first"),
+            assistant_text("ack one"),
+            user_prompt("second"),
+            assistant_text("ack two"),
+        ];
+        let slice = last_n_turns(&messages, 2);
+        assert_eq!(slice.len(), 4, "N=2 includes both turns end-to-end");
+        assert_eq!(slice[0].text_content(), "first");
+    }
+
+    #[test]
+    fn test_last_n_turns_n_exceeds_available_returns_all() {
+        let messages = vec![user_prompt("only"), assistant_text("ack")];
+        let slice = last_n_turns(&messages, 99);
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0].text_content(), "only");
+    }
+
+    #[test]
+    fn test_last_n_turns_skips_tool_result_user_messages() {
+        // A User message that's purely ToolResult blocks must not count
+        // as a turn boundary — otherwise N=1 would land on the tool
+        // result echo instead of the user's actual prompt.
+        let messages = vec![
+            user_prompt("real prompt"),
+            assistant_text("calling tool"),
+            tool_result_message("toolu_1", "tool output"),
+            assistant_text("answer"),
+        ];
+        let slice = last_n_turns(&messages, 1);
+        assert_eq!(slice.len(), 4, "all messages belong to the one real turn");
+        assert_eq!(slice[0].text_content(), "real prompt");
+    }
+
+    #[test]
+    fn test_last_n_turns_no_user_prompt_returns_empty() {
+        // Assistant-only history (rare; only happens if the materialised
+        // view starts mid-conversation) has no turn boundaries — N
+        // doesn't find anything.
+        let messages = vec![assistant_text("orphan reply")];
+        assert!(last_n_turns(&messages, 1).is_empty());
+    }
+
+    #[test]
+    fn test_is_user_prompt_boundary_classification() {
+        assert!(is_user_prompt_boundary(&user_prompt("hi")));
+        assert!(!is_user_prompt_boundary(&assistant_text("hi")));
+        assert!(!is_user_prompt_boundary(&tool_result_message("u", "out")));
+
+        // User message with mixed blocks (rare but possible) is still a
+        // boundary — at least one block is not a ToolResult.
+        let mixed = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "u".to_string(),
+                    content: vec![],
+                    is_error: false,
+                },
+                ContentBlock::Text {
+                    text: "follow-up".to_string(),
+                },
+            ],
+        };
+        assert!(is_user_prompt_boundary(&mixed));
+    }
+
+    #[test]
+    fn test_render_message_history_does_not_panic_on_all_block_kinds() {
+        // We can't capture stderr/stdout easily from a unit test, so we
+        // settle for "every variant flows through without panicking".
+        let messages = vec![
+            user_prompt("can you read the file?"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "I should call read_file.".to_string(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "Sure, reading now.".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "u1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "a.txt"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "u1".to_string(),
+                    content: vec![
+                        ToolResultContent::Text {
+                            text: "hello\n".to_string(),
+                        },
+                        ToolResultContent::Image {
+                            source: ImageSource {
+                                source_type: "base64".to_string(),
+                                media_type: "image/png".to_string(),
+                                data: "deadbeef".to_string(),
+                            },
+                        },
+                    ],
+                    is_error: false,
+                }],
+            },
+            assistant_text("File starts with `hello`."),
+        ];
+        // Show-thinking on. If this panics, the test fails — we don't
+        // assert on captured output (would need a TTY harness).
+        let opts_with_thinking = HistoryRenderOptions {
+            render_mode: RenderMode::Raw,
+            show_thinking: true,
+            input_style: nu_ansi_term::Style::default(),
+            newline_before_prompt: true,
+            newline_after_prompt: true,
+        };
+        render_message_history(&messages, &opts_with_thinking);
+        // And off — the call must still complete cleanly.
+        let opts_no_thinking = HistoryRenderOptions {
+            show_thinking: false,
+            ..opts_with_thinking
+        };
+        render_message_history(&messages, &opts_no_thinking);
+        // Also: no-newline-prompt config must still produce non-panicking output.
+        let opts_tight = HistoryRenderOptions {
+            newline_before_prompt: false,
+            newline_after_prompt: false,
+            ..opts_with_thinking
+        };
+        render_message_history(&messages, &opts_tight);
+    }
+
+    #[test]
+    fn test_render_message_history_empty_is_a_noop() {
+        let opts = HistoryRenderOptions {
+            render_mode: RenderMode::Raw,
+            show_thinking: false,
+            input_style: nu_ansi_term::Style::default(),
+            newline_before_prompt: true,
+            newline_after_prompt: true,
+        };
+        render_message_history(&[], &opts);
     }
 }

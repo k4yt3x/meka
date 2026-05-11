@@ -175,6 +175,11 @@ pub struct DisplayConfig {
     /// out in scrollback. Parsed by [`parse_input_style`]. Accepts
     /// `bold`, `dim`, `none`, or a colour name (`cyan`, `yellow`, …).
     pub input_style: Option<String>,
+    /// When set to `Some(N)` with `N > 0`, resuming a session reprints
+    /// the last `N` turns (user prompts plus the agent's response,
+    /// styled like the live REPL) instead of just the last assistant
+    /// message. Unset preserves the legacy behaviour.
+    pub resume_show_recent: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -384,6 +389,7 @@ pub struct ResolvedConfig {
     pub show_session_id_on_exit: bool,
     pub show_path_in_prompt: bool,
     pub show_token_usage: bool,
+    pub resume_show_recent: Option<usize>,
     pub web_client: WebClientConfig,
     pub sandbox: bool,
     pub render_mode: RenderMode,
@@ -872,6 +878,7 @@ impl ResolvedConfig {
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
             show_session_id_on_exit: file_display.show_session_id_on_exit.unwrap_or(true),
             show_token_usage: file_display.show_token_usage.unwrap_or(false),
+            resume_show_recent: file_display.resume_show_recent,
             show_path_in_prompt: file_display.show_path_in_prompt.unwrap_or(true),
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),

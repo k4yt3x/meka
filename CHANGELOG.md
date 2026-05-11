@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `edit_file` gained `insert_before` / `insert_after` for anchor-based inserts without rewriting context.
 - `read_file` gained a `regex` parameter mirroring `scratchpad_read`'s line-grep mode.
 - Per-server `eager_load_tools` lets named MCP tools skip `load_tool` and ship in the cacheable prefix.
+- `/history [N]` reprints past conversation in REPL style; `[display].resume_show_recent` does the same on resume.
 
 ### Changed
 

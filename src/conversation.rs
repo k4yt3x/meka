@@ -109,8 +109,6 @@ impl Conversation {
         self.materialized.iter()
     }
 
-    // -------- Named destructive methods --------
-
     /// Roll back an [`Conversation::append`] that did not reach the
     /// persistence layer. Used by `Agent::run_turn`'s error path when
     /// `save_message(user)` fails before any consumer could observe the
@@ -401,8 +399,6 @@ mod tests {
         }
     }
 
-    // ---- PR 1 invariants (still pass after the events refactor) ----
-
     #[test]
     fn test_message_log_append_and_read() {
         let mut log = Conversation::new();
@@ -509,8 +505,6 @@ mod tests {
         let texts: Vec<String> = (&log).into_iter().map(|m| m.text_content()).collect();
         assert_eq!(texts, vec!["a", "b"]);
     }
-
-    // ---- PR 2: event-sourced semantics ----
 
     #[test]
     fn test_events_are_append_only_after_compaction() {

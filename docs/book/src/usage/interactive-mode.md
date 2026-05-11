@@ -107,6 +107,15 @@ agsh supports `/` prefix commands for controlling the shell:
 | `/mcp logout <server>` | Revoke cached credentials for a server |
 | `/mcp <server>:<prompt> [args...]` | Render a server-defined prompt and send it to the agent |
 | `/status` | Show cumulative session stats (turns, tokens, cache hit ratio, redactions, message count) |
+| `/history [N]` | Reprint past conversation styled like the live REPL. Bare `/history` dumps everything; `/history N` shows the last `N` turns |
+
+### `/history`
+
+Replays prior messages in the current session so you can scroll back through context without exiting and re-resuming. `/history` with no argument dumps every materialised message; `/history 5` shows the last 5 turns (a *turn* = the user's prompt plus everything the agent did to respond). Any non-numeric argument (`/history all`, `/history foo`) falls back to the dump-everything path.
+
+The renderer mimics the live REPL: assistant text flows through the same markdown highlighter, tool calls appear as `[tool ReadFile(...)]` indicators, and thinking blocks honour `[thinking].show_content`. User prompts are prefixed with a cyan `>` so they stand out from agent text.
+
+For users who always want extra context at resume time, set [`display.resume_show_recent`](../configuration/config-file.md#displayresume_show_recent) — the resume code path then renders the last N turns through the same function.
 
 ### `/status`
 

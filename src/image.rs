@@ -228,8 +228,6 @@ mod tests {
         out
     }
 
-    // --- classify_content_type -------------------------------------------
-
     #[test]
     fn test_classify_content_type_pass_through_png() {
         assert_eq!(
@@ -314,8 +312,6 @@ mod tests {
         );
     }
 
-    // --- classify_extension ----------------------------------------------
-
     #[test]
     fn test_classify_extension_native() {
         assert_eq!(
@@ -364,8 +360,6 @@ mod tests {
         assert_eq!(classify_extension(""), ImageHandling::Unsupported);
     }
 
-    // --- convert_to_png --------------------------------------------------
-
     #[test]
     fn test_convert_bmp_to_png_roundtrip() {
         let bmp = synthesize_image_bytes(ImageFormat::Bmp);
@@ -389,8 +383,6 @@ mod tests {
         let result = convert_to_png(b"not a real image", ImageFormat::Png);
         assert!(result.is_err());
     }
-
-    // --- prepare_image_payload ------------------------------------------
 
     #[test]
     fn test_prepare_pass_through_within_limit() {
@@ -425,8 +417,6 @@ mod tests {
             prepare_image_payload(ImageHandling::Unsupported, b"anything").expect_err("should err");
         assert!(error.contains("unsupported"));
     }
-
-    // --- dimension helpers (called by Claude provider) -------------------
 
     #[test]
     fn test_read_image_dimensions_png() {
@@ -463,8 +453,6 @@ mod tests {
         assert!(decoded.width() <= 2000 && decoded.height() <= 2000);
     }
 
-    // --- classify_bytes ---------------------------------------------------
-
     #[test]
     fn test_classify_bytes_png() {
         let png = synthesize_image_bytes(ImageFormat::Png);
@@ -488,8 +476,6 @@ mod tests {
         assert_eq!(classify_bytes(b"not an image"), ImageHandling::Unsupported);
         assert_eq!(classify_bytes(&[]), ImageHandling::Unsupported);
     }
-
-    // --- build_image_tool_output -----------------------------------------
 
     #[test]
     fn test_build_image_tool_output_pass_through_png() {

@@ -534,7 +534,21 @@ async fn run_interactive(
         resolve_session_resume(&session_manager, &config).await?;
 
     if !messages.is_empty() {
-        reprint_last_message(messages.as_slice(), config.render_mode);
+        match config.resume_show_recent {
+            Some(n) if n > 0 => {
+                render::render_message_history(
+                    render::last_n_turns(messages.as_slice(), n),
+                    &history_render_options(&config),
+                );
+                // Match the live-turn-end convention: blank line
+                // between the rendered content and the first REPL
+                // prompt. `reprint_last_message` does the same.
+                if config.newline_before_prompt {
+                    eprintln!();
+                }
+            }
+            _ => reprint_last_message(messages.as_slice(), config.render_mode),
+        }
     }
 
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ReplEvent>();
@@ -880,6 +894,27 @@ async fn run_interactive(
                     repl::SlashCommand::Status => {
                         let snap = agent.session_stats_snapshot();
                         render::render_session_status(&snap, messages.len());
+                    }
+                    repl::SlashCommand::History(limit) => {
+                        let materialised = messages.as_slice();
+                        let slice = match limit {
+                            Some(n) => render::last_n_turns(materialised, n),
+                            None => materialised,
+                        };
+                        // Bracket the rendered history with the same
+                        // blank-line spacing the live REPL puts around
+                        // a regular turn: a `newline_after_prompt`
+                        // blank between the user's `/history` line and
+                        // the rendered content, plus a
+                        // `newline_before_prompt` blank between the
+                        // content and the next REPL prompt.
+                        if config.newline_after_prompt {
+                            eprintln!();
+                        }
+                        render::render_message_history(slice, &history_render_options(&config));
+                        if config.newline_before_prompt {
+                            eprintln!();
+                        }
                     }
                     _ => {}
                 }
@@ -1312,6 +1347,20 @@ fn resolve_large_output_tags(
         }
     })
     .into_owned()
+}
+
+/// Translate the live-REPL display config into the options that
+/// [`render::render_message_history`] consumes. Keeps the spacing /
+/// styling rules between live output and history rendering in sync from
+/// a single source of truth.
+fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptions {
+    render::HistoryRenderOptions {
+        render_mode: config.render_mode,
+        show_thinking: config.thinking_show_content,
+        input_style: config.input_style,
+        newline_before_prompt: config.newline_before_prompt,
+        newline_after_prompt: config.newline_after_prompt,
+    }
 }
 
 fn resolve_credential(config: &ResolvedConfig) -> anyhow::Result<AuthCredential> {

@@ -1105,8 +1105,7 @@ mod tests {
         assert!(!has_tool_results(&result[0].content));
     }
 
-    // ---- Cache prefix stability tests ----
-    //
+    // Cache prefix stability tests.
     // These tests simulate the agent's message-assembly logic (stable base +
     // appended tool-loop messages) to verify that the prefix sent to the API
     // remains identical across iterations of the tool-use loop.  This is the

@@ -271,8 +271,7 @@ pub(super) fn apply_headers(
     session_id: &str,
     betas: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    // --- SDK buildDefaultHeaders() ---
-    // Accept, User-Agent, retry/timeout, platform headers, anthropic-version
+    // Mirrors the Claude SDK's `buildDefaultHeaders()`.
     let mut request = request
         .header("accept", "application/json")
         .header("User-Agent", claude_user_agent())
@@ -285,14 +284,14 @@ pub(super) fn apply_headers(
         .header("x-stainless-runtime", STAINLESS_RUNTIME)
         .header("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION)
         .header("anthropic-version", "2023-06-01")
-        // --- authHeaders ---
+        // From the SDK's `authHeaders()`.
         .header(auth_header_name, auth_header_value)
-        // --- Claude Code defaultHeaders (x-app, session-id; User-Agent updates in-place above) ---
+        // From Claude Code's `defaultHeaders()` (User-Agent updates in place above).
         .header("x-app", "cli")
         .header("X-Claude-Code-Session-Id", session_id)
-        // --- bodyHeaders ---
+        // From the SDK's `bodyHeaders()`.
         .header("content-type", "application/json")
-        // --- per-request headers ---
+        // Per-request headers (not from SDK helpers).
         .header("x-client-request-id", Uuid::new_v4().to_string())
         .header("Connection", "keep-alive")
         .header("Accept-Encoding", "gzip, deflate, br, zstd");
