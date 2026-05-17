@@ -11,11 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `[shell].sandbox_backend` selects between `"landlock"` and `"bubblewrap"` for Linux read-mode sandboxing.
 - Setup wizard prompts for the Linux sandbox backend when both options are available.
+- `todo_read` tool lets the model fetch the current task list on demand.
+- Tool calls within one assistant message now dispatch in parallel, including multiple `spawn_agent` calls.
 
 ### Changed
 
 - Linux read-mode sandbox auto-uses Bubblewrap when installed; set `sandbox_backend = "landlock"` to opt out.
 - `execute_command` in read mode now hard-errors when the configured sandbox backend is unavailable.
+- Sub-agents inherit the parent's permission level instead of being capped at read.
+- Each sub-agent has a private todo list; `todo_write` from a sub-agent no longer renders to the user.
 
 ## [0.22.1] - 2026-05-12
 

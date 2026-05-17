@@ -135,6 +135,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "search_contents",
     "skill",
     "spawn_agent",
+    "todo_read",
     "todo_write",
     "web_search",
     "write_file",
@@ -490,7 +491,11 @@ impl ToolRegistry {
             session_id: shared_session_id.clone(),
             session_manager: session_manager.clone(),
         }));
-        registry.register_builtin(Arc::new(todo::TodoWriteTool { todo_list }));
+        registry.register_builtin(Arc::new(todo::TodoWriteTool {
+            todo_list: todo_list.clone(),
+            render_visible: true,
+        }));
+        registry.register_builtin(Arc::new(todo::TodoReadTool { todo_list }));
         registry.register_builtin(Arc::new(scratchpad::ScratchpadWriteTool {
             session_manager: session_manager.clone(),
             session_id: shared_session_id.clone(),
@@ -514,8 +519,10 @@ impl ToolRegistry {
         Ok(registry)
     }
 
-    /// Build a tool registry for sub-agents. Excludes `todo_write` (parent
-    /// owns task tracking) and `spawn_agent` (no recursive spawning).
+    /// Build a tool registry for sub-agents. Each sub-agent gets its own
+    /// private `SharedTodoList` so `todo_write` and `todo_read` operate on
+    /// per-agent state. `spawn_agent` remains absent — sub-agents cannot
+    /// recursively spawn further sub-agents.
     #[allow(clippy::too_many_arguments)]
     pub fn build_for_subagent(
         web_client_config: crate::config::WebClientConfig,
@@ -525,6 +532,7 @@ impl ToolRegistry {
         sandbox_backend: crate::config::SandboxBackend,
         backend_probe: crate::sandbox::BackendProbe,
         builtin_filter: BuiltinToolFilter,
+        todo_list: todo::SharedTodoList,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
         registry.register_core_tools(
@@ -540,6 +548,11 @@ impl ToolRegistry {
         registry.register_builtin(Arc::new(skill::SkillTool {
             session_id: Arc::new(RwLock::new(None)),
         }));
+        registry.register_builtin(Arc::new(todo::TodoWriteTool {
+            todo_list: todo_list.clone(),
+            render_visible: false,
+        }));
+        registry.register_builtin(Arc::new(todo::TodoReadTool { todo_list }));
         Ok(registry)
     }
 }
@@ -1222,10 +1235,14 @@ pub(crate) mod tests {
             crate::config::SandboxBackend::Landlock,
             backend_probe,
             filter,
+            test_todo_list(),
         )
         .expect("default web client config should build cleanly");
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("web_search").is_none());
+        assert!(registry.get("todo_write").is_some());
+        assert!(registry.get("todo_read").is_some());
+        assert!(registry.get("spawn_agent").is_none());
     }
 
     #[test]
@@ -1244,6 +1261,7 @@ pub(crate) mod tests {
             "fetch_url",
             "web_search",
             "todo_write",
+            "todo_read",
             "scratchpad_read",
             "scratchpad_write",
             "scratchpad_edit",

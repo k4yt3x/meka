@@ -27,6 +27,10 @@ pub type SharedTodoList = Arc<RwLock<Vec<TodoItem>>>;
 
 pub(super) struct TodoWriteTool {
     pub todo_list: SharedTodoList,
+    /// Whether `render::render_todo_list` should be invoked after a successful
+    /// write. Parent agents render to the user's stderr; sub-agents do not,
+    /// since the rest of the sub-agent loop is silent.
+    pub render_visible: bool,
 }
 
 #[async_trait]
@@ -96,12 +100,53 @@ impl Tool for TodoWriteTool {
         let count = tasks.len();
         *self.todo_list.write().await = tasks.clone();
 
-        render::render_todo_list(&tasks);
+        if self.render_visible {
+            render::render_todo_list(&tasks);
+        }
 
         Ok(ToolOutput::text(
             format!("Task list updated ({} tasks)", count),
             false,
         ))
+    }
+}
+
+pub(super) struct TodoReadTool {
+    pub todo_list: SharedTodoList,
+}
+
+#[async_trait]
+impl Tool for TodoReadTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "todo_read".to_string(),
+            description: "Read the current task list. Returns an empty list if no tasks have \
+                          been written. Use this to check progress before deciding the next step."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<ToolOutput> {
+        let items = self.todo_list.read().await;
+        let text = if items.is_empty() {
+            "[Current task list]\n(empty)\n".to_string()
+        } else {
+            format_todo_for_context(&items)
+        };
+        Ok(ToolOutput::text(text, false))
     }
 }
 
@@ -137,6 +182,7 @@ mod tests {
         let list = test_list();
         let tool = TodoWriteTool {
             todo_list: list.clone(),
+            render_visible: false,
         };
 
         let result = tool
@@ -166,6 +212,7 @@ mod tests {
         let list = test_list();
         let tool = TodoWriteTool {
             todo_list: list.clone(),
+            render_visible: false,
         };
 
         tool.execute(
@@ -193,6 +240,58 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].id, "a");
         assert_eq!(items[1].id, "b");
+    }
+
+    #[tokio::test]
+    async fn test_todo_read_empty() {
+        let list = test_list();
+        let tool = TodoReadTool {
+            todo_list: list.clone(),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({}), CancellationToken::new())
+            .await
+            .expect("should succeed");
+
+        assert!(!result.is_error);
+        let text = text_content(&result);
+        assert!(text.contains("[Current task list]"));
+        assert!(text.contains("(empty)"));
+    }
+
+    #[tokio::test]
+    async fn test_todo_read_after_write() {
+        let list = test_list();
+        let writer = TodoWriteTool {
+            todo_list: list.clone(),
+            render_visible: false,
+        };
+        let reader = TodoReadTool {
+            todo_list: list.clone(),
+        };
+
+        writer
+            .execute(
+                serde_json::json!({
+                    "tasks": [
+                        {"id": "1", "description": "Plan", "status": "in_progress"},
+                        {"id": "2", "description": "Execute", "status": "pending"}
+                    ]
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("write should succeed");
+
+        let result = reader
+            .execute(serde_json::json!({}), CancellationToken::new())
+            .await
+            .expect("read should succeed");
+
+        let text = text_content(&result);
+        assert!(text.contains("[~] 1 - Plan"));
+        assert!(text.contains("[ ] 2 - Execute"));
     }
 
     #[test]

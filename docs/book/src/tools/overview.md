@@ -15,6 +15,7 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`web_search`](./web.md#web_search) | Read | Search the web |
 | [`execute_command`](./shell.md#execute_command) | Read/Write | Run a shell command |
 | [`todo_write`](./overview.md#todo_write) | Read | Manage a structured task list |
+| [`todo_read`](./overview.md#todo_read) | Read | Read the current task list |
 | [`spawn_agent`](./overview.md#spawn_agent) | Read | Delegate tasks to a sub-agent |
 | [`scratchpad_write`](./scratchpad.md#scratchpad_write) | Read | Store content in the scratchpad |
 | [`scratchpad_read`](./scratchpad.md#scratchpad_read) | Read | Read a scratchpad entry |
@@ -31,7 +32,7 @@ Tools are grouped by the minimum permission level required:
 **Read permission** (available in read, ask, and write modes):
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`
 - `execute_command` (sandboxed, filesystem write-protected)
-- `todo_write`, `spawn_agent`, `skill`, `render_image`
+- `todo_write`, `todo_read`, `spawn_agent`, `skill`, `render_image`
 - All scratchpad tools
 
 **Write permission** (only available in write mode):
@@ -82,11 +83,17 @@ Tool calls and their results are displayed in the terminal so you can see what t
 
 ## `todo_write`
 
-A built-in tool for managing a structured task list during a session. The agent uses this to track multi-step work and communicate progress. The task list is displayed in the terminal and injected into the conversation context each turn.
+A built-in tool for managing a structured task list during a session. The agent uses this to track multi-step work and communicate progress. The task list is displayed in the terminal (for the main agent) and injected into the conversation context each turn. Calling `todo_write` replaces the entire list each time.
+
+## `todo_read`
+
+Reads the current task list and returns it as plain text. The main agent normally sees the latest list via the per-turn context block, so `todo_read` mostly matters for sub-agents (whose context isn't re-injected mid-loop) — but it's available to any agent that wants to fetch its current list explicitly.
 
 ## `spawn_agent`
 
-Spawns a read-only sub-agent to perform research or analysis tasks. The sub-agent has access to the same tools (except `spawn_agent` and `todo_write`) and returns a report. This is useful for delegating exploration without polluting the main conversation context.
+Spawns a sub-agent to perform research, analysis, or any other delegated task. The sub-agent inherits the parent's permission level, gets its own private todo list (`todo_write` / `todo_read` operate on the sub-agent's own state), and cannot recursively spawn further sub-agents. The sub-agent runs silently — its tool calls are not surfaced to the terminal — and returns a single text report. Use this to keep exploratory or speculative work out of the main conversation context.
+
+Multiple `spawn_agent` calls in one assistant turn run in parallel — useful when independent investigations can proceed concurrently.
 
 ## `skill`
 

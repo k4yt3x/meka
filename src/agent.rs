@@ -597,8 +597,10 @@ impl Agent {
         cancellation: CancellationToken,
         spacing: &mut render::OutputSpacing,
     ) -> Vec<ContentBlock> {
-        let mut results = Vec::new();
-
+        // Pass 1 (serial): render indicators in source order and collect the
+        // plan. Rendering must happen before any await so concurrent tool
+        // execution can't interleave indicator lines on stderr.
+        let mut planned: Vec<(String, String, serde_json::Value)> = Vec::new();
         for block in &assistant_message.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 if !self.options.streaming {
@@ -611,31 +613,38 @@ impl Agent {
                         .map(|t| t.definition().parameters);
                     render::render_tool_indicator(name, input, schema.as_ref());
                 }
-
-                let output = self
-                    .resolve_and_execute_tool(name, input, cancellation.clone())
-                    .await;
-
-                // If todo_write was called with a non-empty list, the rendered
-                // todo list has its own trailing blank line on stderr.
-                if name == "todo_write" && !self.todo_list.read().await.is_empty() {
-                    spacing.after_todo_list();
-                }
-
-                // Stash scratchpad-naming hints on a per-turn map keyed by
-                // tool_use_id so persist_oversized_results can use the
-                // MCP-style `mcp_<server>_<tool>` name instead of the
-                // plain tool name.
-                if let Some(hint) = output.scratchpad_hint.clone() {
-                    self.scratchpad_hints.write().await.insert(id.clone(), hint);
-                }
-
-                results.push(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: output.content,
-                    is_error: output.is_error,
-                });
+                planned.push((id.clone(), name.clone(), input.clone()));
             }
+        }
+
+        // Pass 2 (concurrent): dispatch every tool in this assistant message
+        // in parallel. `join_all` preserves the input ordering so the i-th
+        // output corresponds to the i-th planned tool call.
+        let futures = planned.iter().map(|(_, name, input)| {
+            self.resolve_and_execute_tool(name.as_str(), input, cancellation.clone())
+        });
+        let outputs = futures::future::join_all(futures).await;
+
+        // Pass 3 (serial): accumulate scratchpad hints, build ToolResult
+        // blocks in source order, and run the spacing update once after all
+        // tools have settled.
+        let mut results = Vec::with_capacity(planned.len());
+        let mut todo_write_fired = false;
+        for ((id, name, _), output) in planned.into_iter().zip(outputs) {
+            if name == "todo_write" && !self.todo_list.read().await.is_empty() {
+                todo_write_fired = true;
+            }
+            if let Some(hint) = output.scratchpad_hint.clone() {
+                self.scratchpad_hints.write().await.insert(id.clone(), hint);
+            }
+            results.push(ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: output.content,
+                is_error: output.is_error,
+            });
+        }
+        if todo_write_fired {
+            spacing.after_todo_list();
         }
 
         results
