@@ -21,6 +21,8 @@ pub struct ToolBuilderParams {
     pub web_client: crate::config::WebClientConfig,
     pub sandbox_enabled: bool,
     pub sandbox_capability: crate::sandbox::SandboxCapability,
+    pub sandbox_backend: crate::config::SandboxBackend,
+    pub backend_probe: crate::sandbox::BackendProbe,
     /// Parent's `[tools]` filter — sub-agents inherit it.
     pub builtin_filter: BuiltinToolFilter,
 }
@@ -90,7 +92,9 @@ impl Tool for SpawnAgentTool {
             self.tool_builder_params.web_client.clone(),
             sub_shared_perm,
             self.tool_builder_params.sandbox_enabled,
-            self.tool_builder_params.sandbox_capability,
+            self.tool_builder_params.sandbox_capability.clone(),
+            self.tool_builder_params.sandbox_backend,
+            self.tool_builder_params.backend_probe.clone(),
             self.tool_builder_params.builtin_filter.clone(),
         )
         .map_err(|error| AgshError::ToolExecution {

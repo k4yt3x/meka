@@ -213,11 +213,14 @@ pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
         Some(base_url_input)
     };
 
+    let sandbox_choice = configure_sandbox_backend()?;
+
     config::write_config_file(
         provider_name,
         &model,
         api_key.as_deref(),
         base_url.as_deref(),
+        sandbox_choice,
     )?;
 
     if let Some(path) = config::config_file_path() {
@@ -227,6 +230,86 @@ pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Prompt the user (Linux) or auto-decide (other platforms) which
+/// sandbox backend to write into the freshly initialized config.
+/// `Ok(None)` means "leave the `[shell]` section out of the TOML
+/// entirely" (macOS / Windows, where the choice has no effect — the
+/// platform's single backend applies regardless of TOML state).
+/// `Err(...)` propagates a real I/O failure from the prompt loop so
+/// the caller doesn't silently fall back to a config with no
+/// `[shell]` section.
+#[cfg(target_os = "linux")]
+fn configure_sandbox_backend() -> anyhow::Result<Option<config::SandboxConfigChoice>> {
+    use crate::sandbox::{self, BackendProbe};
+    use config::SandboxBackend;
+
+    let landlock_probe = sandbox::probe_backend(SandboxBackend::Landlock);
+    let bubblewrap_probe = sandbox::probe_backend(SandboxBackend::Bubblewrap);
+
+    eprintln!();
+    let choice = match (&bubblewrap_probe, &landlock_probe) {
+        (BackendProbe::Ok(_), BackendProbe::Ok(_)) => {
+            let pick = prompt_choice(
+                "Select a sandbox backend for read-mode shell commands:",
+                &[
+                    "Bubblewrap (recommended — stronger sandbox)",
+                    "Landlock (lighter, weaker)",
+                ],
+            )?;
+            let backend = if pick == 0 {
+                SandboxBackend::Bubblewrap
+            } else {
+                SandboxBackend::Landlock
+            };
+            Some(config::SandboxConfigChoice::Enabled(backend))
+        }
+        (BackendProbe::Ok(_), _) => {
+            // Only bubblewrap is usable. Auto-pick it; no prompt
+            // needed.
+            eprintln!("Sandbox: using Bubblewrap (Landlock LSM not available on this kernel).");
+            Some(config::SandboxConfigChoice::Enabled(
+                SandboxBackend::Bubblewrap,
+            ))
+        }
+        (_, BackendProbe::Ok(_)) => {
+            // Bubblewrap not usable; fall back to Landlock with a
+            // one-line note explaining why bubblewrap was skipped.
+            let why = match &bubblewrap_probe {
+                BackendProbe::Missing { reason } => reason.clone(),
+                BackendProbe::UserNamespaceDenied { .. } => {
+                    "user namespaces are denied on this host".to_string()
+                }
+                _ => "unavailable".to_string(),
+            };
+            eprintln!(
+                "Sandbox: using Landlock (weaker); Bubblewrap is unavailable \
+                 ({}). Install `bubblewrap` for stronger protection.",
+                why
+            );
+            Some(config::SandboxConfigChoice::Enabled(
+                SandboxBackend::Landlock,
+            ))
+        }
+        _ => {
+            eprintln!(
+                "Sandbox: disabled (no usable backend on this host). \
+                 Sandboxed read-mode shell commands will be unavailable; \
+                 use write mode (Shift+Tab) to execute shell commands."
+            );
+            Some(config::SandboxConfigChoice::Disabled)
+        }
+    };
+    Ok(choice)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_sandbox_backend() -> anyhow::Result<Option<config::SandboxConfigChoice>> {
+    // macOS uses `sandbox-exec` and Windows uses Low-integrity tokens —
+    // both single-option backends. The `sandbox_backend` config key is
+    // silently ignored on those platforms, so don't write it.
+    Ok(None)
 }
 
 async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {

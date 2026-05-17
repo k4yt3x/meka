@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `[shell].sandbox_backend` selects between `"landlock"` and `"bubblewrap"` for Linux read-mode sandboxing.
+- Setup wizard prompts for the Linux sandbox backend when both options are available.
+
+### Changed
+
+- Linux read-mode sandbox auto-uses Bubblewrap when installed; set `sandbox_backend = "landlock"` to opt out.
+- `execute_command` in read mode now hard-errors when the configured sandbox backend is unavailable.
+
 ## [0.22.1] - 2026-05-12
 
 ### Added

@@ -341,6 +341,7 @@ pub fn run_repl(
     show_path_in_prompt: bool,
     input_style: nu_ansi_term::Style,
     initial_turn_pending: bool,
+    sandbox_state: crate::sandbox::SandboxState,
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
 ) {
@@ -372,6 +373,18 @@ pub fn run_repl(
                 if buffer == CYCLE_PERMISSION_SENTINEL {
                     let new_permission = shared_permission.cycle();
                     tracing::debug!("permission cycled to {}", new_permission);
+                    // Re-emit the "backend unavailable" warn at the moment
+                    // the user enters read mode, so a misconfigured sandbox
+                    // surfaces immediately instead of waiting for the first
+                    // `execute_command` failure. The "stronger sandbox
+                    // available" nudge (Warn 2) intentionally doesn't fire
+                    // here — startup-only, to avoid nagging.
+                    if new_permission == crate::permission::Permission::Read {
+                        crate::sandbox::warn_if_sandbox_issues(
+                            &sandbox_state,
+                            crate::sandbox::WarnContext::ReadModeEntry,
+                        );
+                    }
                     continue;
                 }
 

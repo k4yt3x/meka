@@ -336,6 +336,50 @@ pub const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x
 #[derive(Debug, Deserialize, Default)]
 pub struct ShellConfig {
     pub sandbox: Option<bool>,
+    /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When
+    /// omitted, the resolver auto-picks bubblewrap if available and
+    /// falls back to landlock with a one-shot warning (see
+    /// `src/sandbox.rs` and `Warn 2` in `warn_if_sandbox_issues`).
+    pub sandbox_backend: Option<SandboxBackend>,
+}
+
+/// Linux sandbox backend. Silently ignored on macOS and Windows
+/// (sandbox-exec and Low-integrity respectively are the only options
+/// on those platforms). The absence of a default impl is intentional:
+/// an unset value is meaningful and triggers auto-resolution in
+/// [`ResolvedConfig::from_cli`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackend {
+    Landlock,
+    Bubblewrap,
+}
+
+impl SandboxBackend {
+    /// Lowercase form used for TOML serialization. Must round-trip
+    /// with the `#[serde(rename_all = "lowercase")]` deserialization.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Landlock => "landlock",
+            Self::Bubblewrap => "bubblewrap",
+        }
+    }
+
+    /// Brand-cased name for user-facing prose (logs, errors, wizard
+    /// prompts). Use [`Self::as_str`] when the rendered text is a
+    /// config value or package name rather than a brand reference.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Landlock => "Landlock",
+            Self::Bubblewrap => "Bubblewrap",
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_name())
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -392,6 +436,22 @@ pub struct ResolvedConfig {
     pub resume_show_recent: Option<usize>,
     pub web_client: WebClientConfig,
     pub sandbox: bool,
+    /// Resolved Linux sandbox backend. Auto-picked at startup when
+    /// `[shell].sandbox_backend` was not set: prefers bubblewrap, falls
+    /// back to landlock. Silently `Landlock` on macOS / Windows
+    /// (those platforms have their own backend and ignore the field).
+    pub sandbox_backend: SandboxBackend,
+    /// True when [`Self::sandbox_backend`] was auto-resolved (i.e. the
+    /// user did not pin a value in `[shell].sandbox_backend`). Used to
+    /// gate the "stronger sandbox available; install bwrap" startup
+    /// warn — we don't want to nag users who explicitly chose
+    /// landlock.
+    pub sandbox_auto_resolved: bool,
+    /// Cached probe of the resolved backend. Consulted by
+    /// `warn_if_sandbox_issues` and by the lazy hard-error path in
+    /// `src/tools/shell.rs` when read-mode `execute_command` is
+    /// invoked.
+    pub backend_probe: crate::sandbox::BackendProbe,
     pub render_mode: RenderMode,
     pub context_messages: Option<usize>,
     pub retention_days: Option<u64>,
@@ -574,11 +634,24 @@ pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result
     })
 }
 
+/// Sandbox-section content the setup wizard wants to write into a
+/// freshly initialized `config.toml`. `None` means "don't write a
+/// `[shell]` table" (e.g. macOS / Windows, where no choice is
+/// applicable); `Some(Enabled(backend))` writes both `sandbox = true`
+/// and `sandbox_backend = "..."`; `Some(Disabled)` writes `sandbox =
+/// false` and omits `sandbox_backend`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SandboxConfigChoice {
+    Enabled(SandboxBackend),
+    Disabled,
+}
+
 pub(crate) fn write_config_file(
     provider_name: &str,
     model: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
+    sandbox: Option<SandboxConfigChoice>,
 ) -> std::io::Result<()> {
     let path = config_file_path().ok_or_else(|| {
         std::io::Error::new(
@@ -602,6 +675,23 @@ pub(crate) fn write_config_file(
 
     let mut root = toml::map::Map::new();
     root.insert("provider".to_string(), toml::Value::Table(provider_table));
+
+    if let Some(choice) = sandbox {
+        let mut shell_table = toml::map::Map::new();
+        match choice {
+            SandboxConfigChoice::Enabled(backend) => {
+                shell_table.insert("sandbox".to_string(), toml::Value::Boolean(true));
+                shell_table.insert(
+                    "sandbox_backend".to_string(),
+                    toml::Value::String(backend.as_str().to_string()),
+                );
+            }
+            SandboxConfigChoice::Disabled => {
+                shell_table.insert("sandbox".to_string(), toml::Value::Boolean(false));
+            }
+        }
+        root.insert("shell".to_string(), toml::Value::Table(shell_table));
+    }
 
     let content = toml::to_string_pretty(&root)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
@@ -734,6 +824,78 @@ fn resolve_permission(
     };
 
     (permission, enabled)
+}
+
+/// Resolve the active Linux sandbox backend.
+///
+/// When the user pinned `[shell].sandbox_backend = "..."` in
+/// `config.toml`, that choice is binding — no silent fallback at
+/// runtime; an unavailable explicit backend surfaces at use time via
+/// the `BackendProbe::Missing` / `UserNamespaceDenied` variants.
+///
+/// When the value is unset (`None`), agsh probes bubblewrap and picks
+/// it if available, falling back to landlock otherwise. The
+/// `auto_resolved` flag is propagated so the startup warn helper can
+/// nudge the user once toward installing bwrap (without nagging users
+/// who explicitly pinned landlock).
+#[cfg(target_os = "linux")]
+fn resolve_sandbox_backend(
+    configured: Option<SandboxBackend>,
+) -> (SandboxBackend, bool, crate::sandbox::BackendProbe) {
+    use crate::sandbox::{BackendProbe, probe_backend};
+
+    // Probe Bubblewrap only when its result is load-bearing for the
+    // resolution: either the user pinned it explicitly, or no value
+    // was configured (so we need the probe to decide whether to
+    // auto-pick it). When the user pinned Landlock, the Bubblewrap
+    // smoke test would be pure waste (~500 ms on every agsh start).
+    let (backend, auto_resolved, cached_bubblewrap_probe) = match configured {
+        Some(explicit) => (explicit, false, None),
+        None => {
+            let probe = probe_backend(SandboxBackend::Bubblewrap);
+            let picked = match &probe {
+                BackendProbe::Ok(_) => SandboxBackend::Bubblewrap,
+                _ => SandboxBackend::Landlock,
+            };
+            (picked, true, Some(probe))
+        }
+    };
+    // The Landlock arm discards `cached_bubblewrap_probe` because
+    // the auto-resolve path that populated it landed on Bubblewrap
+    // (it only falls through to Landlock when Bubblewrap probes
+    // unavailable, and that probe isn't useful for the chosen
+    // backend's status).
+    let backend_probe = match (backend, cached_bubblewrap_probe) {
+        (SandboxBackend::Bubblewrap, Some(probe)) => probe,
+        (SandboxBackend::Bubblewrap, None) => probe_backend(SandboxBackend::Bubblewrap),
+        (SandboxBackend::Landlock, _) => probe_backend(SandboxBackend::Landlock),
+    };
+    (backend, auto_resolved, backend_probe)
+}
+
+/// Non-Linux platforms have a single platform-native sandbox
+/// (`sandbox-exec` on macOS, Low-integrity on Windows, nothing
+/// elsewhere). `[shell].sandbox_backend` is documented as Linux-only
+/// and is ignored here: the resolved capability comes from
+/// [`crate::sandbox::detect`] and is surfaced through the same
+/// `BackendProbe::Ok` envelope so the downstream wiring in
+/// `src/main.rs` doesn't need a platform branch.
+#[cfg(not(target_os = "linux"))]
+fn resolve_sandbox_backend(
+    _configured: Option<SandboxBackend>,
+) -> (SandboxBackend, bool, crate::sandbox::BackendProbe) {
+    use crate::sandbox::{BackendProbe, SandboxCapability};
+
+    let probe = match crate::sandbox::detect() {
+        SandboxCapability::Unavailable => BackendProbe::Missing {
+            reason: "no platform sandbox backend available".to_string(),
+        },
+        capability => BackendProbe::Ok(capability),
+    };
+    // `SandboxBackend::Landlock` is a stand-in here — the field
+    // exists for Linux config parity but is never consulted on this
+    // platform.
+    (SandboxBackend::Landlock, false, probe)
 }
 
 /// Merge `--eager-load-tool SERVER:TOOL` CLI values into the matching
@@ -914,6 +1076,30 @@ impl ResolvedConfig {
         let effort = effort::resolve(file_provider.effort.as_deref());
         let redact_thinking = file_provider.redact_thinking.unwrap_or(false);
 
+        // Only probe the sandbox backend when sandboxing is actually
+        // enabled. Skipping the probe for `sandbox = false` saves the
+        // smoke-test cost on every invocation of subcommands that
+        // don't touch the shell (`agsh list`, `agsh export`,
+        // `agsh mcp list`, etc.) when the user has disabled
+        // sandboxing globally. The placeholder probe is never
+        // consulted in that state — the shell tool short-circuits on
+        // `sandbox_enabled = false`, and the warn helper early-
+        // returns on `!state.enabled`.
+        let (sandbox_backend, sandbox_auto_resolved, backend_probe) =
+            if file_shell.sandbox.unwrap_or(true) {
+                resolve_sandbox_backend(file_shell.sandbox_backend)
+            } else {
+                (
+                    file_shell
+                        .sandbox_backend
+                        .unwrap_or(SandboxBackend::Landlock),
+                    false,
+                    crate::sandbox::BackendProbe::Missing {
+                        reason: "sandbox disabled in config".to_string(),
+                    },
+                )
+            };
+
         Self {
             provider_name,
             model,
@@ -936,6 +1122,9 @@ impl ResolvedConfig {
             show_path_in_prompt: file_display.show_path_in_prompt.unwrap_or(true),
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
+            sandbox_backend,
+            sandbox_auto_resolved,
+            backend_probe,
             render_mode: cli
                 .render_mode
                 .or(file_display.render_mode)
@@ -2302,5 +2491,86 @@ enabled = ["read", "write"]
             perms.enabled.as_deref(),
             Some(&[String::from("read"), String::from("write")][..])
         );
+    }
+
+    /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize
+    /// cleanly. Any other value, including the prior internal alias
+    /// `"bwrap"`, must be rejected — we don't want alias creep that
+    /// would silently desync `agsh setup`-generated configs from
+    /// hand-edited ones.
+    #[test]
+    fn test_sandbox_backend_deserializes_strict_values() {
+        let bubblewrap: ShellConfig =
+            toml::from_str(r#"sandbox_backend = "bubblewrap""#).expect("deserialize bubblewrap");
+        assert_eq!(bubblewrap.sandbox_backend, Some(SandboxBackend::Bubblewrap));
+        let landlock: ShellConfig =
+            toml::from_str(r#"sandbox_backend = "landlock""#).expect("deserialize landlock");
+        assert_eq!(landlock.sandbox_backend, Some(SandboxBackend::Landlock));
+        // No aliases / case variants accepted.
+        assert!(toml::from_str::<ShellConfig>(r#"sandbox_backend = "bwrap""#).is_err());
+        assert!(toml::from_str::<ShellConfig>(r#"sandbox_backend = "Bubblewrap""#).is_err());
+        assert!(toml::from_str::<ShellConfig>(r#"sandbox_backend = "none""#).is_err());
+    }
+
+    /// When the user pins `sandbox_backend = "..."` explicitly, the
+    /// resolver returns that choice with `auto_resolved == false` —
+    /// no silent fallback even if the probe would suggest otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_sandbox_backend_explicit_value_is_binding() {
+        let (backend, auto_resolved, _probe) =
+            resolve_sandbox_backend(Some(SandboxBackend::Landlock));
+        assert_eq!(backend, SandboxBackend::Landlock);
+        assert!(!auto_resolved);
+
+        let (backend, auto_resolved, _probe) =
+            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
+        assert_eq!(backend, SandboxBackend::Bubblewrap);
+        assert!(!auto_resolved);
+    }
+
+    /// When the user has not pinned a backend, resolve_sandbox_backend
+    /// must surface `auto_resolved == true`. The exact backend it
+    /// picks depends on whether the host has bwrap installed and
+    /// supports user namespaces, so we just assert the auto flag is
+    /// set and one of the two backends came back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_sandbox_backend_auto_resolves_when_unset() {
+        let (backend, auto_resolved, _probe) = resolve_sandbox_backend(None);
+        assert!(auto_resolved);
+        assert!(matches!(
+            backend,
+            SandboxBackend::Bubblewrap | SandboxBackend::Landlock
+        ));
+    }
+
+    /// On macOS / Windows the `sandbox_backend` config field is
+    /// documented as ignored. The resolver must still return a probe
+    /// that reflects the platform's native sandbox capability rather
+    /// than the never-applicable Linux defaults, so the downstream
+    /// wiring in `src/main.rs` can map it to `SandboxCapability` for
+    /// `sandbox-exec` / Low-integrity. Guards against the regression
+    /// that surfaces when only the Linux probe paths are wired up.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_resolve_sandbox_backend_uses_platform_sandbox_on_non_linux() {
+        use crate::sandbox::{BackendProbe, SandboxCapability};
+
+        // Explicit `Some(...)` is ignored on non-Linux — the field
+        // is documented as Linux-only.
+        let (_backend, auto_resolved, probe) =
+            resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
+        assert!(!auto_resolved);
+        // The probe should reflect what `detect()` reports for this
+        // host, surfaced as `Ok(...)` so the consumer can drop into
+        // the platform's spawn path.
+        match probe {
+            BackendProbe::Ok(SandboxCapability::Unavailable) => {
+                panic!("Ok(Unavailable) is incoherent — expected a real capability or Missing")
+            }
+            BackendProbe::Ok(_) | BackendProbe::Missing { .. } => {}
+            other => panic!("unexpected probe variant on non-Linux: {:?}", other),
+        }
     }
 }

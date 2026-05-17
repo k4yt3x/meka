@@ -208,6 +208,15 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
     // "invalid value" message instead of the downstream credential error.
     config.validate()?;
 
+    // Warn once at startup about an unusable configured sandbox backend
+    // or an auto-fallback to landlock that the user could improve by
+    // installing bubblewrap. Re-emitted at read-mode entry boundaries
+    // below.
+    crate::sandbox::warn_if_sandbox_issues(
+        &crate::sandbox::SandboxState::from_config(&config),
+        crate::sandbox::WarnContext::Startup,
+    );
+
     let session_manager = SessionManager::open(None).await?;
     let token_store = session_manager.token_store();
 
@@ -350,7 +359,10 @@ async fn create_agent_from_config(
         .session_stats(Some(Arc::clone(&session_stats)))
         .build()?;
 
-    let sandbox_capability = crate::sandbox::detect();
+    let sandbox_capability: crate::sandbox::SandboxCapability = match &config.backend_probe {
+        crate::sandbox::BackendProbe::Ok(capability) => capability.clone(),
+        _ => crate::sandbox::SandboxCapability::Unavailable,
+    };
     let sandboxed_shell = config.sandbox
         && !matches!(
             sandbox_capability,
@@ -373,7 +385,9 @@ async fn create_agent_from_config(
         config.web_client.clone(),
         shared_permission.clone(),
         config.sandbox,
-        sandbox_capability,
+        sandbox_capability.clone(),
+        config.sandbox_backend,
+        config.backend_probe.clone(),
         todo_list.clone(),
         session_manager.clone(),
         shared_session_id.clone(),
@@ -389,6 +403,8 @@ async fn create_agent_from_config(
                 web_client: config.web_client.clone(),
                 sandbox_enabled: config.sandbox,
                 sandbox_capability,
+                sandbox_backend: config.sandbox_backend,
+                backend_probe: config.backend_probe.clone(),
                 builtin_filter: builtin_filter.clone(),
             },
             user_instructions: config.user_instructions.clone(),
@@ -467,6 +483,12 @@ async fn run_oneshot(
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
+    if config.permission == crate::permission::Permission::Read {
+        crate::sandbox::warn_if_sandbox_issues(
+            &crate::sandbox::SandboxState::from_config(&config),
+            crate::sandbox::WarnContext::InitialReadMode,
+        );
+    }
     let credential = resolve_credential(&config)?;
     let session_stats = Arc::new(stats::SessionStats::default());
     let agent = create_agent_from_config(
@@ -527,6 +549,12 @@ async fn run_interactive(
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
     let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
+    if config.permission == crate::permission::Permission::Read {
+        crate::sandbox::warn_if_sandbox_issues(
+            &crate::sandbox::SandboxState::from_config(&config),
+            crate::sandbox::WarnContext::InitialReadMode,
+        );
+    }
 
     // Resolve session resumption BEFORE spawning the REPL so the
     // "Resuming session" message appears before the first prompt.
@@ -596,12 +624,14 @@ async fn run_interactive(
     let repl_permission = shared_permission.clone();
     let show_path_in_prompt = config.show_path_in_prompt;
     let input_style = config.input_style;
+    let repl_sandbox_state = crate::sandbox::SandboxState::from_config(&config);
     let repl_handle = tokio::task::spawn_blocking(move || {
         repl::run_repl(
             repl_permission,
             show_path_in_prompt,
             input_style,
             initial_turn_pending,
+            repl_sandbox_state,
             input_sender,
             agent_event_receiver,
         );
@@ -1115,7 +1145,10 @@ async fn run_tools_subcommand(
             let session_manager = SessionManager::open(None).await?;
             let shared_permission =
                 SharedPermission::new(config.permission, config.enabled_permissions);
-            let sandbox_capability = crate::sandbox::detect();
+            let sandbox_capability = match &config.backend_probe {
+                crate::sandbox::BackendProbe::Ok(capability) => capability.clone(),
+                _ => crate::sandbox::SandboxCapability::Unavailable,
+            };
             let todo_list: crate::tools::todo::SharedTodoList =
                 std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
             let shared_session_id: std::sync::Arc<tokio::sync::RwLock<Option<uuid::Uuid>>> =
@@ -1125,6 +1158,8 @@ async fn run_tools_subcommand(
                 shared_permission,
                 config.sandbox,
                 sandbox_capability,
+                config.sandbox_backend,
+                config.backend_probe.clone(),
                 todo_list,
                 session_manager,
                 shared_session_id,

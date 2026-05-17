@@ -407,12 +407,15 @@ impl ToolRegistry {
 
     /// Register the core tools shared by the main agent and sub-agents:
     /// file I/O, search, web, and shell execution.
+    #[allow(clippy::too_many_arguments)]
     fn register_core_tools(
         &self,
         web_client_config: &crate::config::WebClientConfig,
         shared_permission: crate::permission::SharedPermission,
         sandbox_enabled: bool,
         sandbox_capability: crate::sandbox::SandboxCapability,
+        sandbox_backend: crate::config::SandboxBackend,
+        backend_probe: crate::sandbox::BackendProbe,
     ) -> Result<()> {
         let read_tracker: ReadTracker = Arc::new(RwLock::new(HashSet::new()));
         self.register_builtin(Arc::new(file::ReadFileTool {
@@ -432,6 +435,8 @@ impl ToolRegistry {
         self.register_builtin(Arc::new(web::WebSearchTool { client: web_client }));
         self.register_builtin(Arc::new(shell::ExecuteCommandTool {
             sandbox_capability,
+            sandbox_backend,
+            backend_probe,
             shared_permission,
             sandbox_enabled,
         }));
@@ -458,6 +463,8 @@ impl ToolRegistry {
         shared_permission: crate::permission::SharedPermission,
         sandbox_enabled: bool,
         sandbox_capability: crate::sandbox::SandboxCapability,
+        sandbox_backend: crate::config::SandboxBackend,
+        backend_probe: crate::sandbox::BackendProbe,
         todo_list: todo::SharedTodoList,
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
@@ -469,6 +476,8 @@ impl ToolRegistry {
             shared_permission,
             sandbox_enabled,
             sandbox_capability,
+            sandbox_backend,
+            backend_probe,
         )?;
         registry.register_builtin(Arc::new(load_tool::LoadToolTool {
             tools: Arc::downgrade(&registry.tools),
@@ -507,11 +516,14 @@ impl ToolRegistry {
 
     /// Build a tool registry for sub-agents. Excludes `todo_write` (parent
     /// owns task tracking) and `spawn_agent` (no recursive spawning).
+    #[allow(clippy::too_many_arguments)]
     pub fn build_for_subagent(
         web_client_config: crate::config::WebClientConfig,
         shared_permission: crate::permission::SharedPermission,
         sandbox_enabled: bool,
         sandbox_capability: crate::sandbox::SandboxCapability,
+        sandbox_backend: crate::config::SandboxBackend,
+        backend_probe: crate::sandbox::BackendProbe,
         builtin_filter: BuiltinToolFilter,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
@@ -520,6 +532,8 @@ impl ToolRegistry {
             shared_permission,
             sandbox_enabled,
             sandbox_capability,
+            sandbox_backend,
+            backend_probe,
         )?;
         // Sub-agents don't have a session of their own — skills still load but
         // ${AGSH_SESSION_ID} stays unresolved for their invocations.
@@ -556,11 +570,15 @@ pub(crate) mod tests {
             .await
             .expect("failed to open in-memory database");
         let shared_session_id = Arc::new(RwLock::new(None));
+        let sandbox_capability = crate::sandbox::detect();
+        let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         ToolRegistry::build_default(
             crate::config::WebClientConfig::default(),
             test_shared_permission(),
             true,
-            crate::sandbox::detect(),
+            sandbox_capability,
+            crate::config::SandboxBackend::Landlock,
+            backend_probe,
             test_todo_list(),
             session_manager,
             shared_session_id,
@@ -1191,6 +1209,8 @@ pub(crate) mod tests {
     async fn test_subagent_registry_honours_filter() {
         let filter =
             BuiltinToolFilter::from_config(None, vec!["web_search".to_string()], HashMap::new());
+        let sandbox_capability = crate::sandbox::detect();
+        let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         let registry = ToolRegistry::build_for_subagent(
             crate::config::WebClientConfig::default(),
             crate::permission::SharedPermission::new(
@@ -1198,7 +1218,9 @@ pub(crate) mod tests {
                 crate::permission::EnabledPermissions::ALL,
             ),
             true,
-            crate::sandbox::detect(),
+            sandbox_capability,
+            crate::config::SandboxBackend::Landlock,
+            backend_probe,
             filter,
         )
         .expect("default web client config should build cleanly");

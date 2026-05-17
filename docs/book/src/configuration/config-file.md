@@ -347,7 +347,26 @@ Default: `true`
 sandbox = false  # disable sandboxed shell in read mode
 ```
 
-The sandbox uses Landlock on Linux (kernel 5.13+) and sandbox-exec on macOS. On platforms where sandboxing is unavailable, shell commands always require write mode regardless of this setting.
+The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require write mode regardless of this setting.
+
+### `shell.sandbox_backend`
+
+Linux-only choice between `"landlock"` and `"bubblewrap"`:
+
+- **Bubblewrap** (`"bubblewrap"`) — wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
+- **Landlock** (`"landlock"`) — uses the Landlock LSM (kernel 5.13+) to block filesystem writes. Does **not** block dbus / systemd-user IPC; a sandboxed shell can still invoke state-mutating dbus methods. Kept as the lighter-weight fallback for hosts without Bubblewrap.
+
+When omitted, agsh probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. Run `agsh setup` to get an interactive prompt and a pinned value.
+
+If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `execute_command` in read mode hard-errors with a message naming the configured backend and the specific failure reason. Read mode is not blocked for other tools — only `execute_command` requires a usable sandbox.
+
+Default: unset (auto-detect). Ignored on macOS and Windows.
+
+```toml
+[shell]
+sandbox = true
+sandbox_backend = "bubblewrap"  # or "landlock"
+```
 
 ## `[permissions]`
 

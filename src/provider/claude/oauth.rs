@@ -1626,6 +1626,10 @@ mod tests {
             shared_permission,
             true,
             crate::sandbox::detect(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Missing {
+                reason: "test fixture".to_string(),
+            },
             todo_list,
             session_manager,
             shared_session_id,
@@ -1727,6 +1731,10 @@ mod tests {
             shared_permission,
             true,
             crate::sandbox::detect(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Missing {
+                reason: "test fixture".to_string(),
+            },
             todo_list,
             session_manager,
             shared_session_id,
@@ -1850,6 +1858,10 @@ mod tests {
             shared_permission,
             true,
             crate::sandbox::detect(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Missing {
+                reason: "test fixture".to_string(),
+            },
             todo_list,
             session_manager,
             shared_session_id,
@@ -1944,6 +1956,10 @@ mod tests {
             shared_permission.clone(),
             true,
             crate::sandbox::detect(),
+            crate::config::SandboxBackend::Landlock,
+            crate::sandbox::BackendProbe::Missing {
+                reason: "test fixture".to_string(),
+            },
             todo_list,
             session_manager,
             shared_session_id,

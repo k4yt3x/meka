@@ -30,16 +30,51 @@ Execute a shell command and return its output.
 
 ### Read-Only Sandbox
 
-In **read mode**, commands run inside a filesystem sandbox that blocks writes to the user's real data. Reads and program execution still work normally:
+In **read mode**, commands run inside a sandbox that blocks writes to the user's real data. Reads, program execution, and network access still work normally — the threat model is "no state mutation, but `curl http://x | pdftotext` must keep working."
 
-- **Linux**: Uses [Landlock LSM](https://landlock.io/) (kernel 5.13+). The child process is restricted via `landlock_restrict_self` before exec. Only `READ_FILE`, `READ_DIR`, and `EXECUTE` access rights are granted — writes anywhere on the filesystem return `EACCES`.
-- **macOS**: Uses `sandbox-exec` with a SBPL profile that denies all `file-write*` operations.
-- **Windows**: Spawns the child with a duplicated primary token dropped to **Low integrity** (`SECURITY_MANDATORY_LOW_RID`) via `SetTokenInformation(TokenIntegrityLevel, …)`. Writes to the home directory, `%APPDATA%`, Program Files, and system directories — any location with Medium-or-higher integrity ACLs — are blocked by the kernel. Unlike Landlock, Low integrity is not a total write-denial: the child can still write to the small residual Low-integrity-writable surface (`%LOCALAPPDATA%\Low`, `%TEMP%\Low`, any path with an explicit Low-integrity write ACE) and to files it creates itself (which inherit Low integrity). For practical purposes this matches the guarantees of `sandbox-exec` and prevents the agent from touching user data, but full "zero writes anywhere" on Windows would require Windows Sandbox or an AppContainer and is out of scope.
-- **Unsupported platforms**: Shell commands are not available in read mode — switch to write mode to execute commands without a sandbox.
+#### What's blocked vs allowed (across all backends)
 
-In **write mode**, commands run without any sandbox restrictions.
+| Surface | Blocked | Allowed |
+|---|---|---|
+| Filesystem writes outside tmp / Low-integrity paths | ✓ | |
+| Filesystem reads | | ✓ |
+| Program execution | | ✓ |
+| Outbound network (TCP/UDP) | | ✓ |
+| dbus / systemd-user state mutations | Bubblewrap only | Landlock / macOS / Windows |
+| Mach IPC (macOS) | | ✓ |
+| COM / RPC to Low-integrity-accepting services (Windows) | | ✓ |
 
-To disable sandboxed shell execution in read mode, set `sandbox = false` under `[shell]` in the config file. When disabled, shell commands require write mode.
+The sandbox is not an adversarial containment boundary — it's defense-in-depth against an agent accidentally modifying user data. Set permission to `none` if you don't trust a turn at all.
+
+#### Linux: pick a backend
+
+Linux supports two backends, selected via `[shell].sandbox_backend` in `config.toml`:
+
+- **Bubblewrap** (`sandbox_backend = "bubblewrap"`, recommended): wraps the command in `bwrap` with `--ro-bind /`, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and `$XDG_RUNTIME_DIR`, plus `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks make the dbus session bus, systemd-user socket, and other socket-on-disk IPC paths unreachable, so `systemctl --user start <unit>`, `dbus-send`, and similar state-changing calls fail. Network is not unshared. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
+- **Landlock** (`sandbox_backend = "landlock"`, legacy / fallback): uses the [Landlock LSM](https://landlock.io/) (kernel 5.13+). Blocks filesystem writes via `landlock_restrict_self`. Does **not** block dbus / systemd-user IPC, so a sandboxed shell can still invoke state-mutating dbus methods.
+
+When `sandbox_backend` is unset, agsh probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with a one-shot warning that points at the install path and the suppress-this-warning escape hatch. Run `agsh setup` on first launch to get an interactive prompt and a pinned value in `config.toml`.
+
+```toml
+[shell]
+sandbox = true                       # default — set to false to disable
+sandbox_backend = "bubblewrap"       # or "landlock"; unset = auto-detect
+```
+
+#### macOS and Windows
+
+- **macOS**: Uses `sandbox-exec` with a SBPL profile that denies all `file-write*` operations. The `sandbox_backend` config key is ignored.
+- **Windows**: Spawns the child with a duplicated primary token dropped to **Low integrity** (`SECURITY_MANDATORY_LOW_RID`) via `SetTokenInformation(TokenIntegrityLevel, …)`. Writes to the home directory, `%APPDATA%`, Program Files, and system directories — any location with Medium-or-higher integrity ACLs — are blocked by the kernel. Low integrity also strips token privileges and scrubs the environment block of sensitive variables (`ANTHROPIC_*`, `*_TOKEN`, etc.) before spawning. The `sandbox_backend` config key is ignored.
+
+Low integrity is not a total write-denial: the child can still write to the small residual Low-integrity-writable surface (`%LOCALAPPDATA%\Low`, `%TEMP%\Low`, any path with an explicit Low-integrity write ACE) and to files it creates itself.
+
+#### When the configured backend is unavailable
+
+If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `execute_command` in read mode returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to write mode (Shift+Tab).
+
+#### Disabling the sandbox entirely
+
+To disable sandboxed shell execution in read mode altogether, set `sandbox = false` under `[shell]`. When disabled, shell commands require write mode.
 
 ```toml
 [shell]

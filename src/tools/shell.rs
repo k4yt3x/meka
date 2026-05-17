@@ -19,6 +19,15 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 pub(super) struct ExecuteCommandTool {
     pub sandbox_capability: crate::sandbox::SandboxCapability,
+    /// Backend chosen in config (or auto-resolved). Used only for the
+    /// "configured backend is unavailable" hard error message.
+    pub sandbox_backend: crate::config::SandboxBackend,
+    /// Probe outcome for [`Self::sandbox_backend`]. Drives the
+    /// hard-error path in read mode when the backend isn't usable
+    /// (bwrap missing, user namespaces denied, etc.). When `Ok(_)`,
+    /// [`Self::sandbox_capability`] mirrors the inner capability and
+    /// the spawn path runs normally.
+    pub backend_probe: crate::sandbox::BackendProbe,
     pub shared_permission: crate::permission::SharedPermission,
     pub sandbox_enabled: bool,
 }
@@ -87,19 +96,34 @@ impl Tool for ExecuteCommandTool {
         let permission = self.shared_permission.get();
         let sandboxed = self.sandbox_enabled && permission != Permission::Write;
 
-        if sandboxed
-            && matches!(
-                self.sandbox_capability,
-                crate::sandbox::SandboxCapability::Unavailable
-            )
-        {
-            return Ok(ToolOutput::text(
-                "Shell command execution in read mode is not available on this \
-                    platform because filesystem sandboxing is not supported. Switch to \
-                    write mode (Shift+Tab) to execute commands without sandboxing."
-                    .to_string(),
-                true,
-            ));
+        if sandboxed {
+            // Configured backend isn't usable on this host. Hard-error
+            // with the specific reason so the model can surface it via
+            // `render::render_error` rather than treat the failure as
+            // a tool result it could try to recover from.
+            if let Some(reason) = crate::sandbox::backend_unavailable_reason(&self.backend_probe) {
+                // `sandbox_backend` is Linux-only; on other platforms
+                // there's nothing to reconfigure — the only escape
+                // hatch is write mode.
+                #[cfg(target_os = "linux")]
+                let message = format!(
+                    "configured sandbox backend ({}) is unavailable: {}. \
+                     Switch to write mode (Shift+Tab) to run shell commands \
+                     without a sandbox, or update [shell].sandbox_backend in \
+                     your config.",
+                    self.sandbox_backend, reason
+                );
+                #[cfg(not(target_os = "linux"))]
+                let message = format!(
+                    "sandbox is unavailable: {}. Switch to write mode \
+                     (Shift+Tab) to run shell commands without a sandbox.",
+                    reason
+                );
+                return Err(AgshError::ToolExecution {
+                    tool_name: "execute_command".to_string(),
+                    message,
+                });
+            }
         }
 
         // Windows + sandboxed: spawn directly via CreateProcessAsUserW with a
@@ -151,7 +175,49 @@ impl Tool for ExecuteCommandTool {
         };
 
         #[cfg(target_os = "linux")]
-        let mut command_builder = {
+        let mut command_builder = if sandboxed
+            && let crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path } =
+                &self.sandbox_capability
+        {
+            // Bubblewrap path: `--ro-bind /` enforces "no writes",
+            // `--unshare-*` cuts off PID / user / UTS / IPC views,
+            // tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and
+            // `$XDG_RUNTIME_DIR` make the dbus and systemd-user
+            // sockets unreachable so the agent can't `dbus-send`
+            // state-changing methods. `--unshare-net` is intentionally
+            // absent — network must stay open for `curl | pdftotext`
+            // and similar pipelines.
+            let mut cmd = tokio::process::Command::new(bwrap_path);
+            cmd.args([
+                "--new-session",
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/var/tmp",
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-uts",
+                "--unshare-ipc",
+                "--unshare-cgroup-try",
+            ]);
+            if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
+                && std::path::Path::new(&xdg).is_absolute()
+            {
+                cmd.arg("--tmpfs").arg(&xdg);
+            }
+            cmd.arg("--").arg("sh").arg("-c").arg(&command);
+            cmd
+        } else {
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c").arg(&command);
             cmd
@@ -162,7 +228,10 @@ impl Tool for ExecuteCommandTool {
         // (including backgrounded grandchildren such as `(sleep 3600 &)`)
         // via `kill(-pgid, …)`. On Linux the Landlock setup runs in the
         // same closure — `pre_exec` overwrites rather than chains, so we
-        // fold both steps into one.
+        // fold both steps into one. Landlock is applied ONLY for the
+        // Landlock capability; under Bubblewrap, the `--ro-bind /`
+        // mount layer already enforces "no writes" and layering both
+        // is fragile to test across kernels.
         #[cfg(unix)]
         {
             #[cfg(target_os = "linux")]
@@ -531,13 +600,29 @@ mod tests {
         )
     }
 
+    /// Construct an `ExecuteCommandTool` for tests with a backend probe
+    /// matching whatever the host actually supports. Tests that need a
+    /// specific probe state (e.g. exercising the "backend unavailable"
+    /// hard-error path) should build `ExecuteCommandTool` directly with
+    /// the desired `BackendProbe` rather than going through this helper.
+    fn test_tool(
+        shared_permission: crate::permission::SharedPermission,
+        sandbox_enabled: bool,
+    ) -> ExecuteCommandTool {
+        let sandbox_capability = crate::sandbox::detect();
+        let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
+        ExecuteCommandTool {
+            sandbox_capability,
+            sandbox_backend: crate::config::SandboxBackend::Landlock,
+            backend_probe,
+            shared_permission,
+            sandbox_enabled,
+        }
+    }
+
     #[tokio::test]
     async fn test_execute_command() {
-        let tool = ExecuteCommandTool {
-            sandbox_capability: crate::sandbox::detect(),
-            shared_permission: test_shared_permission(),
-            sandbox_enabled: true,
-        };
+        let tool = test_tool(test_shared_permission(), true);
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo hello"}),
@@ -562,11 +647,7 @@ mod tests {
         let marker = temp_dir.path().join("marker");
         let marker_str = marker.to_str().expect("utf-8 path").to_string();
 
-        let tool = ExecuteCommandTool {
-            sandbox_capability: crate::sandbox::detect(),
-            shared_permission: test_shared_permission(),
-            sandbox_enabled: false,
-        };
+        let tool = test_tool(test_shared_permission(), false);
 
         // The grandchild sleeps 3s then touches `marker`. If it survived
         // the timeout, the marker file will appear. The timeout is 300ms
@@ -600,11 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_command_failure() {
-        let tool = ExecuteCommandTool {
-            sandbox_capability: crate::sandbox::detect(),
-            shared_permission: test_shared_permission(),
-            sandbox_enabled: true,
-        };
+        let tool = test_tool(test_shared_permission(), true);
         let result = tool
             .execute(
                 serde_json::json!({"command": "false"}),
@@ -616,15 +693,89 @@ mod tests {
         assert!(result.is_error);
     }
 
+    /// When the configured sandbox backend isn't usable, read-mode
+    /// `execute_command` must return `Err(AgshError::ToolExecution)`
+    /// — *not* `Ok(ToolOutput { is_error: true })`. The hard error
+    /// path is how the model is forced to surface the failure to the
+    /// user rather than just retrying or describing it as a tool
+    /// result.
+    #[tokio::test]
+    async fn test_execute_command_hard_errors_when_backend_unavailable() {
+        let read_only_perm = crate::permission::SharedPermission::new(
+            Permission::Read,
+            crate::permission::EnabledPermissions::ALL,
+        );
+        let tool = ExecuteCommandTool {
+            sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
+            sandbox_backend: crate::config::SandboxBackend::Bubblewrap,
+            backend_probe: crate::sandbox::BackendProbe::Missing {
+                reason: "bwrap not found on PATH".to_string(),
+            },
+            shared_permission: read_only_perm,
+            sandbox_enabled: true,
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "echo nope"}),
+                CancellationToken::new(),
+            )
+            .await;
+        match result {
+            Err(AgshError::ToolExecution { tool_name, message }) => {
+                assert_eq!(tool_name, "execute_command");
+                assert!(
+                    message.contains("Bubblewrap"),
+                    "expected backend display name in error: {}",
+                    message
+                );
+                assert!(
+                    message.contains("bwrap not found on PATH"),
+                    "expected probe reason in error: {}",
+                    message
+                );
+            }
+            Err(other) => panic!("expected ToolExecution, got {:?}", other),
+            Ok(output) => panic!(
+                "expected hard error, got Ok({:?})",
+                ContentBlock::tool_result_text_content(&output.content)
+            ),
+        }
+    }
+
+    /// When the tool is invoked at Write permission, an unavailable
+    /// sandbox backend must NOT short-circuit the spawn — the user
+    /// has explicitly opted out of sandboxing for this command.
+    #[tokio::test]
+    async fn test_execute_command_runs_without_sandbox_when_write_mode() {
+        let write_perm = crate::permission::SharedPermission::new(
+            Permission::Write,
+            crate::permission::EnabledPermissions::ALL,
+        );
+        let tool = ExecuteCommandTool {
+            sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
+            sandbox_backend: crate::config::SandboxBackend::Bubblewrap,
+            backend_probe: crate::sandbox::BackendProbe::Missing {
+                reason: "bwrap not found on PATH".to_string(),
+            },
+            shared_permission: write_perm,
+            sandbox_enabled: true,
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "echo hello"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed in write mode");
+        assert!(!result.is_error);
+        assert_eq!(text_content(&result).trim(), "hello");
+    }
+
     #[tokio::test]
     async fn test_execute_command_large_output_not_truncated() {
         // Output well over the old 30 KB cap — the tool must return it in
         // full. The agent layer handles oversize downstream.
-        let tool = ExecuteCommandTool {
-            sandbox_capability: crate::sandbox::detect(),
-            shared_permission: test_shared_permission(),
-            sandbox_enabled: true,
-        };
+        let tool = test_tool(test_shared_permission(), true);
         let result = tool
             .execute(
                 // 50 000 "x" characters. POSIX-portable — uses `head` and `tr`

@@ -9,11 +9,15 @@
 //! platforms, sandboxing is unavailable and shell execution is gated by the
 //! permission level alone.
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum SandboxCapability {
     #[cfg(target_os = "linux")]
     Landlock {
         abi_version: i32,
+    },
+    #[cfg(target_os = "linux")]
+    Bubblewrap {
+        bwrap_path: std::path::PathBuf,
     },
     #[cfg(target_os = "macos")]
     SandboxExec,
@@ -22,6 +26,387 @@ pub enum SandboxCapability {
     Unavailable,
 }
 
+/// Result of probing a specific sandbox backend at config-resolution
+/// time. The probe is run once per agsh launch (twice when the resolver
+/// needs to consider both Landlock and Bubblewrap for auto-pick) and
+/// cached on `ResolvedConfig.backend_probe`.
+#[derive(Debug, Clone)]
+pub enum BackendProbe {
+    Ok(SandboxCapability),
+    /// The backend's prerequisite is missing — `bwrap` isn't on
+    /// `$PATH`, the Landlock kernel ABI isn't supported, etc. The
+    /// `reason` is plain text and is plumbed into user-facing
+    /// warnings/errors verbatim.
+    Missing {
+        reason: String,
+    },
+    /// Linux + bubblewrap only: the user-namespace smoke test failed
+    /// with stderr that matched the documented denial fingerprints.
+    /// Stored stderr is truncated to a few KiB.
+    UserNamespaceDenied {
+        stderr: String,
+    },
+    /// The asked-for backend doesn't apply on this platform
+    /// (e.g. `Bubblewrap` on macOS). Constructed on non-Linux
+    /// platforms by [`probe_backend`]; on Linux the lint sees this as
+    /// dead, hence the explicit allow.
+    #[allow(dead_code)]
+    UnsupportedPlatform,
+}
+
+/// Snapshot of the sandbox-relevant config slice. Carried by
+/// components that need to emit the sandbox warns
+/// (`warn_if_sandbox_issues`) without depending on the whole
+/// `ResolvedConfig`.
+#[derive(Clone)]
+pub struct SandboxState {
+    pub enabled: bool,
+    pub backend: crate::config::SandboxBackend,
+    pub auto_resolved: bool,
+    pub probe: BackendProbe,
+}
+
+impl SandboxState {
+    pub fn from_config(config: &crate::config::ResolvedConfig) -> Self {
+        Self {
+            enabled: config.sandbox,
+            backend: config.sandbox_backend,
+            auto_resolved: config.sandbox_auto_resolved,
+            probe: config.backend_probe.clone(),
+        }
+    }
+}
+
+/// Where in the agsh lifecycle the sandbox-state check is happening.
+/// The "stronger sandbox available" nudge (Warn 2) only fires at
+/// startup; "backend unavailable" (Warn 1) fires at every relevant
+/// boundary because the user needs to know read-mode shell is broken
+/// right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarnContext {
+    /// Once-per-launch warn during `ResolvedConfig` construction or
+    /// agent setup. Both Warn 1 and Warn 2 fire here.
+    Startup,
+    /// Initial permission mode was `Read` at `agsh --permission read`
+    /// launch. Only Warn 1 fires.
+    InitialReadMode,
+    /// User pressed Shift+Tab and cycled into `Read`. Only Warn 1
+    /// fires.
+    ReadModeEntry,
+}
+
+/// Emit any relevant sandbox warnings for the configured backend
+/// state.
+///
+/// * **Warn 1** (backend unavailable): probe failed and `sandbox =
+///   true`. Read-mode shell commands will hard-error at use time, so
+///   we tell the user up front. Re-emitted at every lifecycle
+///   boundary.
+/// * **Warn 2** (could be stronger): the user has not pinned a
+///   backend and we auto-resolved to landlock because bubblewrap
+///   wasn't usable. Nudges them once toward installing bwrap, with an
+///   explicit escape hatch (pin landlock to suppress). Startup only.
+pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
+    if !state.enabled {
+        return;
+    }
+
+    // `sandbox_backend` is a Linux-only config knob; the warnings
+    // below name it directly and would be misleading on macOS /
+    // Windows where the platform has a single fixed backend. On
+    // those hosts an unusable platform sandbox is a near-impossible
+    // configuration and surfaces at use time via the hard-error
+    // path in `src/tools/shell.rs` anyway.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (state, context);
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(reason) = backend_unavailable_reason(&state.probe) {
+            // We deliberately don't suggest a specific alternative
+            // backend here — the "other" backend might also be
+            // unavailable on this host (kernel without Landlock,
+            // bwrap not installed, etc.), and `agsh setup` is the
+            // path that probes both and resolves it correctly.
+            tracing::warn!(
+                "read-mode sandbox: {} (configured: {}). Read-mode shell commands will fail \
+                 until this is fixed. Run `agsh setup` to reconfigure, or update \
+                 [shell].sandbox_backend in config.toml.",
+                reason,
+                state.backend,
+            );
+            return;
+        }
+
+        if context == WarnContext::Startup
+            && state.auto_resolved
+            && matches!(state.backend, crate::config::SandboxBackend::Landlock)
+        {
+            tracing::warn!(
+                "using Landlock for sandbox; install Bubblewrap for stronger \
+                 protection, or pin `sandbox_backend = \"landlock\"` to suppress this warning."
+            );
+        }
+    }
+}
+
+/// Human-readable reason a backend probe failed, or `None` when the
+/// probe is `Ok`. Used by both the startup `warn!` path
+/// ([`warn_if_sandbox_issues`]) and the lazy hard-error path in
+/// `src/tools/shell.rs` so the two surfaces stay in sync.
+pub(crate) fn backend_unavailable_reason(probe: &BackendProbe) -> Option<String> {
+    match probe {
+        BackendProbe::Ok(_) => None,
+        BackendProbe::Missing { reason } => Some(reason.clone()),
+        BackendProbe::UserNamespaceDenied { stderr } => {
+            let first_line = stderr.lines().next().unwrap_or("").trim();
+            if first_line.is_empty() {
+                Some("user namespaces are denied on this host".to_string())
+            } else {
+                Some(format!(
+                    "user namespaces are denied on this host ({})",
+                    first_line
+                ))
+            }
+        }
+        BackendProbe::UnsupportedPlatform => {
+            Some("backend is not supported on this platform".to_string())
+        }
+    }
+}
+
+/// Probe a specific sandbox backend. Linux only resolves both
+/// variants; macOS/Windows return `UnsupportedPlatform` for anything
+/// not native to that OS.
+pub fn probe_backend(backend: crate::config::SandboxBackend) -> BackendProbe {
+    match backend {
+        crate::config::SandboxBackend::Landlock => probe_landlock(),
+        crate::config::SandboxBackend::Bubblewrap => probe_bubblewrap(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn probe_landlock() -> BackendProbe {
+    match detect_landlock() {
+        Some(abi_version) => BackendProbe::Ok(SandboxCapability::Landlock { abi_version }),
+        None => BackendProbe::Missing {
+            reason: "Landlock LSM not supported by this kernel (needs Linux 5.13+)".to_string(),
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_landlock() -> BackendProbe {
+    BackendProbe::UnsupportedPlatform
+}
+
+#[cfg(target_os = "linux")]
+fn probe_bubblewrap() -> BackendProbe {
+    let Some(bwrap_path) = bwrap_on_path() else {
+        return BackendProbe::Missing {
+            reason: "bwrap not found on PATH".to_string(),
+        };
+    };
+
+    match smoke_test_bwrap(&bwrap_path, BWRAP_PROBE_TIMEOUT) {
+        SmokeResult::Success => BackendProbe::Ok(SandboxCapability::Bubblewrap { bwrap_path }),
+        SmokeResult::UserNamespaceDenied { stderr } => BackendProbe::UserNamespaceDenied { stderr },
+        SmokeResult::OtherFailure { reason } => BackendProbe::Missing { reason },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_bubblewrap() -> BackendProbe {
+    BackendProbe::UnsupportedPlatform
+}
+
+#[cfg(target_os = "linux")]
+const BWRAP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const BWRAP_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+#[cfg(target_os = "linux")]
+const BWRAP_STDERR_LIMIT: usize = 64 * 1024;
+
+/// Stderr substrings that indicate the kernel refused the user
+/// namespace request rather than some other transient failure.
+/// Mirrors the fingerprint list Codex uses
+/// (`temp/codex/codex-rs/sandboxing/src/bwrap.rs:30-35`).
+#[cfg(target_os = "linux")]
+const USER_NAMESPACE_FAILURE_MARKERS: &[&str] = &[
+    "loopback: Failed RTM_NEWADDR",
+    "loopback: Failed RTM_NEWLINK",
+    "setting up uid map: Permission denied",
+    "No permissions to create a new namespace",
+];
+
+#[cfg(target_os = "linux")]
+enum SmokeResult {
+    Success,
+    UserNamespaceDenied { stderr: String },
+    OtherFailure { reason: String },
+}
+
+/// Look up `bwrap` on `$PATH`. Returns the first entry whose target
+/// metadata is a regular executable file. Manual implementation to
+/// avoid pulling in the `which` crate just for one lookup.
+#[cfg(target_os = "linux")]
+fn bwrap_on_path() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("bwrap");
+        let Ok(metadata) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Run a `bwrap … /bin/true` smoke test with a short timeout.
+///
+/// The flag set mirrors the production-path argv in
+/// `src/tools/shell.rs` so a host that succeeds here also succeeds at
+/// runtime — without it, a kernel that quietly rejects (say)
+/// `--unshare-cgroup-try` or `--die-with-parent` would pass the probe
+/// and blow past the lazy hard-error gate the first time
+/// `execute_command` ran. `--unshare-net` is added on top so the
+/// probe stays self-contained (no outbound DNS / network calls), even
+/// though production keeps the host network namespace.
+#[cfg(target_os = "linux")]
+fn smoke_test_bwrap(bwrap_path: &std::path::Path, timeout: std::time::Duration) -> SmokeResult {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let mut child = match std::process::Command::new(bwrap_path)
+        .args([
+            "--new-session",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-ipc",
+            "--unshare-cgroup-try",
+            "--unshare-net",
+            "/bin/true",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return SmokeResult::OtherFailure {
+                reason: format!("failed to spawn bwrap for smoke test: {}", error),
+            };
+        }
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Drain stderr non-blocking. The grandchild is gone so
+                // nothing else will write; any data already buffered is
+                // all we'll get.
+                let stderr = match child.stderr.take() {
+                    Some(mut handle) => {
+                        let fd = handle.as_raw_fd();
+                        // SAFETY: fcntl with F_GETFL/F_SETFL on a valid
+                        // open file descriptor; failure is fine and just
+                        // means we'll attempt a regular read that may
+                        // block briefly on a closed pipe.
+                        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                        if flags >= 0 {
+                            unsafe {
+                                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                            }
+                        }
+                        let mut bytes = Vec::new();
+                        let mut take = handle.by_ref().take(BWRAP_STDERR_LIMIT as u64);
+                        if let Err(error) = take.read_to_end(&mut bytes)
+                            && error.kind() != std::io::ErrorKind::WouldBlock
+                        {
+                            tracing::debug!("smoke test stderr read: {}", error);
+                        }
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                    None => String::new(),
+                };
+                if status.success() {
+                    return SmokeResult::Success;
+                }
+                if USER_NAMESPACE_FAILURE_MARKERS
+                    .iter()
+                    .any(|marker| stderr.contains(marker))
+                {
+                    return SmokeResult::UserNamespaceDenied { stderr };
+                }
+                let truncated_stderr = stderr.lines().next().unwrap_or("").trim().to_string();
+                let reason = if truncated_stderr.is_empty() {
+                    format!("bwrap smoke test failed (exit {:?})", status.code())
+                } else {
+                    format!(
+                        "bwrap smoke test failed (exit {:?}): {}",
+                        status.code(),
+                        truncated_stderr
+                    )
+                };
+                return SmokeResult::OtherFailure { reason };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    reap_smoke_test_child(&mut child);
+                    return SmokeResult::OtherFailure {
+                        reason: format!(
+                            "bwrap smoke test exceeded {}ms timeout",
+                            timeout.as_millis()
+                        ),
+                    };
+                }
+                std::thread::sleep(BWRAP_PROBE_POLL);
+            }
+            Err(error) => {
+                reap_smoke_test_child(&mut child);
+                return SmokeResult::OtherFailure {
+                    reason: format!("bwrap smoke test wait failed: {}", error),
+                };
+            }
+        }
+    }
+}
+
+/// Best-effort cleanup of a stuck smoke-test child: kill it and reap
+/// its status so we don't leave a zombie. Errors are logged at debug
+/// level only — by this point the smoke test has already failed and
+/// the caller is about to return a higher-priority error reason.
+#[cfg(target_os = "linux")]
+fn reap_smoke_test_child(child: &mut std::process::Child) {
+    if let Err(error) = child.kill() {
+        tracing::debug!("bwrap smoke test: failed to kill stuck child: {}", error);
+    }
+    if let Err(error) = child.wait() {
+        tracing::debug!("bwrap smoke test: failed to reap child: {}", error);
+    }
+}
+
+/// Test-only "what's the strongest sandbox available right now?"
+/// entry point. Production code consults
+/// [`crate::config::ResolvedConfig::backend_probe`] instead; tests
+/// reach for whatever capability the host happens to support.
+#[cfg(any(test, not(target_os = "linux")))]
 pub fn detect() -> SandboxCapability {
     #[cfg(target_os = "linux")]
     {
@@ -1127,5 +1512,69 @@ mod tests {
         assert!(access & LANDLOCK_ACCESS_FS_REFER != 0);
         assert!(access & LANDLOCK_ACCESS_FS_TRUNCATE != 0);
         assert!(access & LANDLOCK_ACCESS_FS_IOCTL_DEV == 0);
+    }
+
+    #[test]
+    fn test_backend_unavailable_reason_maps_each_variant() {
+        assert!(
+            backend_unavailable_reason(&BackendProbe::Ok(SandboxCapability::Unavailable)).is_none()
+        );
+        let reason = backend_unavailable_reason(&BackendProbe::Missing {
+            reason: "bwrap not found on PATH".to_string(),
+        });
+        assert_eq!(reason.as_deref(), Some("bwrap not found on PATH"));
+        let reason = backend_unavailable_reason(&BackendProbe::UserNamespaceDenied {
+            stderr: "bwrap: setting up uid map: Permission denied\n".to_string(),
+        });
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("user namespaces are denied")
+        );
+        assert!(
+            backend_unavailable_reason(&BackendProbe::UnsupportedPlatform)
+                .as_deref()
+                .unwrap_or("")
+                .contains("not supported")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_probe_backend_landlock_returns_known_variant() {
+        // Smoke test — confirms the probe runs without panicking on
+        // whatever kernel this build host has. We can't assert which
+        // specific variant comes back because CI may have an older
+        // kernel where Landlock is unavailable.
+        let probe = probe_backend(crate::config::SandboxBackend::Landlock);
+        assert!(matches!(
+            probe,
+            BackendProbe::Ok(_) | BackendProbe::Missing { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn test_probe_backend_bubblewrap_via_path_when_available() {
+        // Opt-in: only runs when explicitly requested via
+        // `--ignored`. Skipped if `bwrap` isn't on `$PATH` since the
+        // probe will report `Missing { reason: "bwrap not found on
+        // PATH" }` which would fail the assertion below.
+        if bwrap_on_path().is_none() {
+            eprintln!("skipping: bwrap not on PATH");
+            return;
+        }
+        let probe = probe_backend(crate::config::SandboxBackend::Bubblewrap);
+        match probe {
+            BackendProbe::Ok(SandboxCapability::Bubblewrap { bwrap_path }) => {
+                assert!(bwrap_path.is_absolute());
+            }
+            BackendProbe::UserNamespaceDenied { .. } => {
+                eprintln!("skipping: host doesn't support user namespaces");
+            }
+            other => panic!("unexpected probe result: {:?}", other),
+        }
     }
 }
