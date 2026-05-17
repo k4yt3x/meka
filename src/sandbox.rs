@@ -42,14 +42,19 @@ pub enum BackendProbe {
     },
     /// Linux + bubblewrap only: the user-namespace smoke test failed
     /// with stderr that matched the documented denial fingerprints.
-    /// Stored stderr is truncated to a few KiB.
+    /// Stored stderr is truncated to a few KiB. The only constructor
+    /// (`smoke_test_bwrap`) is Linux-only, so the variant is dead on
+    /// other platforms — the explicit allow lets non-Linux clippy
+    /// stay clean without hiding regressions on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     UserNamespaceDenied {
         stderr: String,
     },
-    /// The asked-for backend doesn't apply on this platform
-    /// (e.g. `Bubblewrap` on macOS). Constructed on non-Linux
-    /// platforms by [`probe_backend`]; on Linux the lint sees this as
-    /// dead, hence the explicit allow.
+    /// The asked-for backend doesn't apply on this platform. No
+    /// production code currently constructs this variant (the legacy
+    /// non-Linux `probe_*` wrappers were folded into
+    /// `resolve_sandbox_backend`), so the explicit allow is for the
+    /// test-only constructor in `tests::test_backend_unavailable_reason_maps_each_variant`.
     #[allow(dead_code)]
     UnsupportedPlatform,
 }
@@ -58,7 +63,17 @@ pub enum BackendProbe {
 /// components that need to emit the sandbox warns
 /// (`warn_if_sandbox_issues`) without depending on the whole
 /// `ResolvedConfig`.
+///
+/// All fields are functionally only read on Linux —
+/// `warn_if_sandbox_issues` early-returns on other platforms because
+/// the warns reference Linux-only config keys — but the struct is
+/// constructed unconditionally so the call sites in `src/main.rs`
+/// and `src/repl.rs` don't need a platform branch. The
+/// `cfg_attr(not(target_os = "linux"), allow(dead_code))]` silences
+/// the "field never read" warning on non-Linux without hiding real
+/// regressions on Linux where the lint stays loud.
 #[derive(Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct SandboxState {
     pub enabled: bool,
     pub backend: crate::config::SandboxBackend,
@@ -178,9 +193,11 @@ pub(crate) fn backend_unavailable_reason(probe: &BackendProbe) -> Option<String>
     }
 }
 
-/// Probe a specific sandbox backend. Linux only resolves both
-/// variants; macOS/Windows return `UnsupportedPlatform` for anything
-/// not native to that OS.
+/// Probe a specific sandbox backend. Linux-only — the
+/// `SandboxBackend` enum represents Linux-specific backends, and
+/// non-Linux platforms route through `detect()` in
+/// `src/config.rs::resolve_sandbox_backend` instead.
+#[cfg(target_os = "linux")]
 pub fn probe_backend(backend: crate::config::SandboxBackend) -> BackendProbe {
     match backend {
         crate::config::SandboxBackend::Landlock => probe_landlock(),
@@ -198,11 +215,6 @@ fn probe_landlock() -> BackendProbe {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn probe_landlock() -> BackendProbe {
-    BackendProbe::UnsupportedPlatform
-}
-
 #[cfg(target_os = "linux")]
 fn probe_bubblewrap() -> BackendProbe {
     let Some(bwrap_path) = bwrap_on_path() else {
@@ -216,11 +228,6 @@ fn probe_bubblewrap() -> BackendProbe {
         SmokeResult::UserNamespaceDenied { stderr } => BackendProbe::UserNamespaceDenied { stderr },
         SmokeResult::OtherFailure { reason } => BackendProbe::Missing { reason },
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn probe_bubblewrap() -> BackendProbe {
-    BackendProbe::UnsupportedPlatform
 }
 
 #[cfg(target_os = "linux")]

@@ -19,8 +19,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
 pub(super) struct ExecuteCommandTool {
     pub sandbox_capability: crate::sandbox::SandboxCapability,
-    /// Backend chosen in config (or auto-resolved). Used only for the
-    /// "configured backend is unavailable" hard error message.
+    /// Backend chosen in config (or auto-resolved). Read only by the
+    /// Linux hard-error message in [`Tool::execute`]; on macOS /
+    /// Windows the field is populated but unused, so suppress the
+    /// "never read" lint there without hiding regressions on Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub sandbox_backend: crate::config::SandboxBackend,
     /// Probe outcome for [`Self::sandbox_backend`]. Drives the
     /// hard-error path in read mode when the backend isn't usable
@@ -723,6 +726,12 @@ mod tests {
         match result {
             Err(AgshError::ToolExecution { tool_name, message }) => {
                 assert_eq!(tool_name, "execute_command");
+                // The Linux error path splices in the configured
+                // backend's display name (`Bubblewrap`); the non-Linux
+                // variant drops the Linux-specific config reference
+                // and reads "sandbox is unavailable: ...". Both must
+                // include the probe reason verbatim.
+                #[cfg(target_os = "linux")]
                 assert!(
                     message.contains("Bubblewrap"),
                     "expected backend display name in error: {}",
@@ -813,6 +822,28 @@ mod tests {
             )
         }
 
+        /// Build an `ExecuteCommandTool` for the Low-integrity Windows
+        /// path. Mirrors `super::test_tool` (which always calls
+        /// `sandbox::detect()` and would resolve to `LowIntegrity` on
+        /// Windows anyway) but constructs the fields explicitly so the
+        /// tests document the intended state.
+        fn windows_test_tool(
+            shared_permission: crate::permission::SharedPermission,
+        ) -> ExecuteCommandTool {
+            let sandbox_capability = crate::sandbox::SandboxCapability::LowIntegrity;
+            let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
+            ExecuteCommandTool {
+                sandbox_capability,
+                // `sandbox_backend` is Linux-only metadata; on Windows
+                // the value is never read but the field must still be
+                // populated. `Landlock` is the conventional placeholder.
+                sandbox_backend: crate::config::SandboxBackend::Landlock,
+                backend_probe,
+                shared_permission,
+                sandbox_enabled: true,
+            }
+        }
+
         /// Under Low integrity, writing to the user's profile directory
         /// must be denied by the OS. The test probes a path under
         /// `%USERPROFILE%` and asserts the file is never created.
@@ -825,11 +856,7 @@ mod tests {
             // Clean any stray file from an earlier failed run before starting.
             let _ = std::fs::remove_file(&probe_path);
 
-            let tool = ExecuteCommandTool {
-                sandbox_capability: crate::sandbox::SandboxCapability::LowIntegrity,
-                shared_permission: read_permission(),
-                sandbox_enabled: true,
-            };
+            let tool = windows_test_tool(read_permission());
             let _ = tool
                 .execute(
                     serde_json::json!({
@@ -857,11 +884,7 @@ mod tests {
         /// the tool would report a spurious timeout.
         #[tokio::test]
         async fn test_windows_sandbox_large_output_under_sandbox() {
-            let tool = ExecuteCommandTool {
-                sandbox_capability: crate::sandbox::SandboxCapability::LowIntegrity,
-                shared_permission: read_permission(),
-                sandbox_enabled: true,
-            };
+            let tool = windows_test_tool(read_permission());
             // PowerShell builds a 262144-char string in memory then emits it
             // as one line. Total output is ~256 KB — well past any plausible
             // pipe buffer.
@@ -896,11 +919,7 @@ mod tests {
         /// dangling stdin.
         #[tokio::test]
         async fn test_windows_sandbox_stdin_is_null() {
-            let tool = ExecuteCommandTool {
-                sandbox_capability: crate::sandbox::SandboxCapability::LowIntegrity,
-                shared_permission: read_permission(),
-                sandbox_enabled: true,
-            };
+            let tool = windows_test_tool(read_permission());
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 tool.execute(
@@ -930,11 +949,7 @@ mod tests {
         /// test exercises our command-line encoding, not PS string rules.
         #[tokio::test]
         async fn test_windows_sandbox_quoting_roundtrip() {
-            let tool = ExecuteCommandTool {
-                sandbox_capability: crate::sandbox::SandboxCapability::LowIntegrity,
-                shared_permission: read_permission(),
-                sandbox_enabled: true,
-            };
+            let tool = windows_test_tool(read_permission());
 
             let cases: &[&str] = &[
                 "plain",
@@ -978,11 +993,7 @@ mod tests {
                 std::env::set_var("ANTHROPIC_API_KEY", "probe-12345-leaked");
             }
 
-            let tool = ExecuteCommandTool {
-                sandbox_capability: crate::sandbox::SandboxCapability::LowIntegrity,
-                shared_permission: read_permission(),
-                sandbox_enabled: true,
-            };
+            let tool = windows_test_tool(read_permission());
             let result = tool
                 .execute(
                     serde_json::json!({
@@ -1010,11 +1021,7 @@ mod tests {
         /// readable by Everyone on stock Windows, so it's a good probe.
         #[tokio::test]
         async fn test_windows_sandbox_allows_read() {
-            let tool = ExecuteCommandTool {
-                sandbox_capability: crate::sandbox::SandboxCapability::LowIntegrity,
-                shared_permission: read_permission(),
-                sandbox_enabled: true,
-            };
+            let tool = windows_test_tool(read_permission());
             let result = tool
                 .execute(
                     serde_json::json!({
