@@ -401,84 +401,6 @@ impl ClaudeOAuthProvider {
 
         serde_json::Value::Object(body)
     }
-
-    pub(super) fn parse_non_streaming_response(
-        &self,
-        response: &serde_json::Value,
-    ) -> Result<(Message, StopReason, TokenUsage)> {
-        parse_non_streaming_response(response)
-    }
-
-    /// Build and serialize the request body, reactively redacting old
-    /// tool-result image blocks if the serialized JSON exceeds Anthropic's
-    /// 32 MiB request-body limit (with 2 MiB headroom — see
-    /// [`shared::MAX_REQUEST_BYTES`]). The cached prefix is preserved as
-    /// long as possible: redaction is oldest-first and never touches the
-    /// final message that carries the moving `cache_control` breakpoint.
-    /// When redaction fires, the body is shrunk past the threshold to
-    /// [`shared::REDACTION_TARGET_BYTES`] so the next several turns don't
-    /// re-trigger redaction (one bigger cache miss vs. many small ones).
-    fn build_body_within_budget(
-        &self,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-        stream: bool,
-    ) -> Result<String> {
-        // Anthropic rejects images >2000 px on either axis in multi-image
-        // requests. Downscale before serialization so the request body
-        // never contains an oversized image. Cow::Borrowed when nothing
-        // needs work, so the common case pays only a header-only check.
-        let prepared = shared::downscale_oversized_images(messages);
-        let messages = prepared.as_ref();
-
-        let body_json =
-            serde_json::to_string(&self.build_request_body(system_prompt, messages, tools, stream))
-                .map_err(|error| {
-                    AgshError::Provider(format!("failed to serialize body: {}", error))
-                })?;
-
-        if body_json.len() <= shared::MAX_REQUEST_BYTES {
-            return Ok(body_json);
-        }
-
-        // Redact aggressively to the target watermark, not just under the
-        // hard ceiling — keeps the cache prefix stable across many turns.
-        let bytes_to_drop = body_json.len() - shared::REDACTION_TARGET_BYTES;
-        let (redacted, stats) = shared::redact_oldest_images(messages, bytes_to_drop);
-        let body_json = serde_json::to_string(&self.build_request_body(
-            system_prompt,
-            redacted.as_ref(),
-            tools,
-            stream,
-        ))
-        .map_err(|error| AgshError::Provider(format!("failed to serialize body: {}", error)))?;
-
-        if body_json.len() > shared::MAX_REQUEST_BYTES {
-            return Err(AgshError::Provider(format!(
-                "request body is {} MiB after redacting old tool-result images; \
-                 Anthropic's limit is 32 MiB. Run /compact, remove large attachments \
-                 from the most recent turn, or split the work across smaller turns.",
-                body_json.len() / 1_048_576,
-            )));
-        }
-
-        if let Some(session_stats) = &self.session_stats {
-            session_stats.record_redaction(stats.images_redacted as u64, stats.bytes_freed as u64);
-        }
-        crate::render::render_hint(&format!(
-            "Redacted {} old image{} (~{} MiB freed). Cache prefix invalidated for those messages.",
-            stats.images_redacted,
-            if stats.images_redacted == 1 { "" } else { "s" },
-            stats.bytes_freed / 1_048_576,
-        ));
-        tracing::warn!(
-            "redacted {} old tool-result image(s); body now {} MiB",
-            stats.images_redacted,
-            body_json.len() / 1_048_576,
-        );
-        Ok(body_json)
-    }
 }
 
 #[async_trait]
@@ -489,7 +411,13 @@ impl Provider for ClaudeOAuthProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason, TokenUsage)> {
-        let body_json = self.build_body_within_budget(system_prompt, messages, tools, false)?;
+        let body_json =
+            shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
+                serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, false))
+                    .map_err(|error| {
+                        AgshError::Provider(format!("failed to serialize body: {}", error))
+                    })
+            })?;
         let body_json = if !system_prompt.is_empty() {
             attestation::patch_request_body(&body_json)?
         } else {
@@ -533,7 +461,7 @@ impl Provider for ClaudeOAuthProvider {
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|error| AgshError::Provider(format!("invalid JSON response: {}", error)))?;
 
-        self.parse_non_streaming_response(&response_json)
+        parse_non_streaming_response(&response_json)
     }
 
     async fn stream(
@@ -544,7 +472,13 @@ impl Provider for ClaudeOAuthProvider {
         event_sender: mpsc::UnboundedSender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let body_json = self.build_body_within_budget(system_prompt, messages, tools, true)?;
+        let body_json =
+            shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
+                serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, true))
+                    .map_err(|error| {
+                        AgshError::Provider(format!("failed to serialize body: {}", error))
+                    })
+            })?;
         let body_json = if !system_prompt.is_empty() {
             attestation::patch_request_body(&body_json)?
         } else {
@@ -757,8 +691,6 @@ mod tests {
 
     #[test]
     fn test_claude_parse_non_streaming_text() {
-        let provider = test_provider();
-
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -771,9 +703,8 @@ mod tests {
             "usage": { "input_tokens": 10, "output_tokens": 5 }
         });
 
-        let (message, stop_reason, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (message, stop_reason, _) =
+            parse_non_streaming_response(&response).expect("should parse");
 
         assert_eq!(message.text_content(), "Hello there!");
         assert_eq!(stop_reason, StopReason::EndTurn);
@@ -781,8 +712,6 @@ mod tests {
 
     #[test]
     fn test_claude_parse_non_streaming_tool_use() {
-        let provider = test_provider();
-
         let response = serde_json::json!({
             "id": "msg_456",
             "type": "message",
@@ -803,9 +732,8 @@ mod tests {
             "usage": { "input_tokens": 20, "output_tokens": 15 }
         });
 
-        let (message, stop_reason, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (message, stop_reason, _) =
+            parse_non_streaming_response(&response).expect("should parse");
 
         assert_eq!(stop_reason, StopReason::ToolUse);
         assert_eq!(message.text_content(), "I'll read that file for you.");
@@ -872,8 +800,6 @@ mod tests {
 
     #[test]
     fn test_claude_parse_missing_tool_use_id() {
-        let provider = test_provider();
-
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -886,14 +812,12 @@ mod tests {
             "stop_reason": "tool_use"
         });
 
-        let result = provider.parse_non_streaming_response(&response);
+        let result = parse_non_streaming_response(&response);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_claude_parse_missing_tool_use_name() {
-        let provider = test_provider();
-
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -906,7 +830,7 @@ mod tests {
             "stop_reason": "tool_use"
         });
 
-        let result = provider.parse_non_streaming_response(&response);
+        let result = parse_non_streaming_response(&response);
         assert!(result.is_err());
     }
 
@@ -1008,35 +932,30 @@ mod tests {
 
     #[test]
     fn test_claude_parse_missing_content_array() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
             "role": "assistant",
             "stop_reason": "end_turn"
         });
-        let result = provider.parse_non_streaming_response(&response);
+        let result = parse_non_streaming_response(&response);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_claude_parse_missing_stop_reason_defaults_to_end_turn() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
             "role": "assistant",
             "content": [{"type": "text", "text": "hi"}]
         });
-        let (_, stop_reason, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (_, stop_reason, _) = parse_non_streaming_response(&response).expect("should parse");
         assert_eq!(stop_reason, StopReason::EndTurn);
     }
 
     #[test]
     fn test_claude_parse_max_tokens_stop_reason() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1044,15 +963,12 @@ mod tests {
             "content": [{"type": "text", "text": "truncated"}],
             "stop_reason": "max_tokens"
         });
-        let (_, stop_reason, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (_, stop_reason, _) = parse_non_streaming_response(&response).expect("should parse");
         assert_eq!(stop_reason, StopReason::MaxTokens);
     }
 
     #[test]
     fn test_claude_parse_unknown_stop_reason() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1060,9 +976,7 @@ mod tests {
             "content": [{"type": "text", "text": "hi"}],
             "stop_reason": "something_new"
         });
-        let (_, stop_reason, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (_, stop_reason, _) = parse_non_streaming_response(&response).expect("should parse");
         assert_eq!(
             stop_reason,
             StopReason::Unknown("something_new".to_string())
@@ -1071,7 +985,6 @@ mod tests {
 
     #[test]
     fn test_claude_parse_empty_content_array() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1079,16 +992,13 @@ mod tests {
             "content": [],
             "stop_reason": "end_turn"
         });
-        let (message, _, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
         assert!(message.content.is_empty());
         assert_eq!(message.text_content(), "");
     }
 
     #[test]
     fn test_claude_parse_thinking_block() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1099,9 +1009,7 @@ mod tests {
             ],
             "stop_reason": "end_turn"
         });
-        let (message, _, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
         assert_eq!(message.content.len(), 2);
         assert!(
             matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "hmm...")
@@ -1111,7 +1019,6 @@ mod tests {
 
     #[test]
     fn test_claude_parse_unknown_block_type_skipped() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1122,16 +1029,13 @@ mod tests {
             ],
             "stop_reason": "end_turn"
         });
-        let (message, _, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
         assert_eq!(message.content.len(), 1);
         assert_eq!(message.text_content(), "answer");
     }
 
     #[test]
     fn test_claude_parse_tool_use_missing_input_defaults() {
-        let provider = test_provider();
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1143,9 +1047,7 @@ mod tests {
             }],
             "stop_reason": "tool_use"
         });
-        let (message, _, _) = provider
-            .parse_non_streaming_response(&response)
-            .expect("should parse");
+        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
         if let ContentBlock::ToolUse { input, .. } = &message.content[0] {
             assert_eq!(*input, serde_json::json!({}));
         } else {

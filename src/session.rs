@@ -80,19 +80,18 @@ fn default_database_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(value).join("sessions.db"));
     }
 
-    // `dirs::data_dir()` honors XDG_DATA_HOME on Linux and the platform's
-    // standard data directory elsewhere. Fall back to `$HOME/.local/share`
-    // so a tilde never reaches the filesystem (which doesn't expand it).
-    let base = dirs::data_dir()
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
-        .ok_or_else(|| {
-            AgshError::Config(
-                "could not determine a data directory; set AGSH_DATA_DIR, \
-                 XDG_DATA_HOME, or HOME, or pass an explicit session database \
-                 path"
-                    .into(),
-            )
-        })?;
+    // `dirs::data_dir()` honors XDG_DATA_HOME on Linux, returns
+    // `~/Library/Application Support` on macOS, and `%APPDATA%` on Windows.
+    // No silent fallback: writing the session DB to a wrong-for-the-platform
+    // path (e.g. the old Linux-only `~/.local/share` default) is worse than
+    // asking the user to set `AGSH_DATA_DIR` explicitly.
+    let base = dirs::data_dir().ok_or_else(|| {
+        AgshError::Config(
+            "could not determine a data directory for the session database; \
+             set AGSH_DATA_DIR to an absolute path"
+                .into(),
+        )
+    })?;
     Ok(base.join("agsh").join("sessions.db"))
 }
 

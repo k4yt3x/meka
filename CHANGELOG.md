@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sub-agents inherit the parent's permission level instead of being capped at read.
 - Each sub-agent has a private todo list; `todo_write` from a sub-agent no longer renders to the user.
 
+### Security
+
+- macOS read-mode sandbox profile hardened: IPC mutation (launchd, pasteboard, LaunchServices, distributed notifications) now blocked alongside filesystem writes.
+- `sandbox-exec` is now invoked via its absolute path `/usr/bin/sandbox-exec` rather than `$PATH` lookup.
+
+### Fixed
+
+- Windows command-timeout teardown now kills grandchild processes via a Job Object, matching Unix `kill(-pgid, …)` semantics.
+- Session DB path resolution no longer silently falls back to a Linux-only path on macOS/Windows; misconfigured installs now error with a clear `AGSH_DATA_DIR` recommendation.
+
 ## [0.22.1] - 2026-05-12
 
 ### Added

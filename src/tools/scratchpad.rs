@@ -649,10 +649,7 @@ mod tests {
 
     use super::*;
     use crate::provider::{ContentBlock, Role};
-
-    fn text_content(output: &ToolOutput) -> String {
-        ContentBlock::tool_result_text_content(&output.content)
-    }
+    use crate::tools::tests::text_content;
 
     async fn test_manager() -> SessionManager {
         SessionManager::open(Some(Path::new(":memory:")))

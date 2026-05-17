@@ -151,6 +151,11 @@ impl EnabledPermissions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisabledMode(pub Permission);
 
+/// Lock-free shared handle to the current [`Permission`] level. Cloned
+/// freely across agent, REPL, and tool-dispatch tasks. The REPL mutates
+/// this when the user cycles permission via `Shift+Tab` or `/permission`;
+/// the dispatch loop reads it once at the enforcement site so mid-turn
+/// cycling can't leave a tool acting on a stale snapshot.
 #[derive(Clone)]
 pub struct SharedPermission {
     inner: Arc<AtomicU8>,

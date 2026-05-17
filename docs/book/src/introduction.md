@@ -13,7 +13,7 @@ Instead of remembering `find . -name '*.rs' | xargs wc -l`, you describe what yo
 - **Natural language interface** -- describe what you want instead of memorizing syntax
 - **Built-in tools** -- file read/write/edit, glob search, regex content search (ripgrep), web fetch, web search, shell command execution
 - **Scratchpad** -- session-scoped working memory for the agent to store and retrieve intermediate results
-- **Sub-agents** -- delegate research tasks to read-only sub-agents
+- **Sub-agents** -- delegate research tasks to sub-agents that inherit the parent's permission level
 - **Multiple LLM providers** -- OpenAI API, OpenAI Codex (ChatGPT subscription), Claude API, and Claude OAuth (Claude subscription), with support for any OpenAI-compatible endpoint
 - **MCP support** -- extend the agent with tools from external MCP servers
 - **Permission system** -- control what the agent can do (none/read/ask/write), switchable mid-session

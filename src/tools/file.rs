@@ -576,11 +576,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::provider::ContentBlock;
-
-    fn text_content(output: &ToolOutput) -> String {
-        ContentBlock::tool_result_text_content(&output.content)
-    }
+    use crate::tools::tests::text_content;
 
     fn test_tracker() -> ReadTracker {
         Arc::new(RwLock::new(HashSet::new()))

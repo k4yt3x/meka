@@ -40,8 +40,8 @@ In **read mode**, commands run inside a sandbox that blocks writes to the user's
 | Filesystem reads | | ✓ |
 | Program execution | | ✓ |
 | Outbound network (TCP/UDP) | | ✓ |
-| dbus / systemd-user state mutations | Bubblewrap only | Landlock / macOS / Windows |
-| Mach IPC (macOS) | | ✓ |
+| dbus / systemd-user state mutations | Bubblewrap / macOS | Landlock / Windows |
+| Mach IPC state mutation (launchd, pasteboard, LaunchServices) | macOS | Linux / Windows |
 | COM / RPC to Low-integrity-accepting services (Windows) | | ✓ |
 
 The sandbox is not an adversarial containment boundary — it's defense-in-depth against an agent accidentally modifying user data. Set permission to `none` if you don't trust a turn at all.
@@ -63,7 +63,7 @@ sandbox_backend = "bubblewrap"       # or "landlock"; unset = auto-detect
 
 #### macOS and Windows
 
-- **macOS**: Uses `sandbox-exec` with a SBPL profile that denies all `file-write*` operations. The `sandbox_backend` config key is ignored.
+- **macOS**: Uses `sandbox-exec` with a hardened SBPL profile (modeled after [Codex](https://github.com/openai/codex)'s vendored seatbelt policy, which is itself based on Chrome's renderer sandbox). The profile is closed-by-default: filesystem writes are blocked, Mach-lookup is restricted to a curated allow-list of safe services, and mutation paths (launchd job control, pasteboard, LaunchServices, distributed notifications) are not in the allow-list. Network and DNS resolution remain available. The `sandbox_backend` config key is ignored.
 - **Windows**: Spawns the child with a duplicated primary token dropped to **Low integrity** (`SECURITY_MANDATORY_LOW_RID`) via `SetTokenInformation(TokenIntegrityLevel, …)`. Writes to the home directory, `%APPDATA%`, Program Files, and system directories — any location with Medium-or-higher integrity ACLs — are blocked by the kernel. Low integrity also strips token privileges and scrubs the environment block of sensitive variables (`ANTHROPIC_*`, `*_TOKEN`, etc.) before spawning. The `sandbox_backend` config key is ignored.
 
 Low integrity is not a total write-denial: the child can still write to the small residual Low-integrity-writable surface (`%LOCALAPPDATA%\Low`, `%TEMP%\Low`, any path with an explicit Low-integrity write ACE) and to files it creates itself.

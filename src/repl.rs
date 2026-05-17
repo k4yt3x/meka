@@ -188,7 +188,7 @@ pub struct ToolApprovalRequest {
     /// REPL thread has no access to the tool registry needed for MCP
     /// schema lookups.
     pub primary_param: Option<String>,
-    pub response_sender: std::sync::mpsc::SyncSender<bool>,
+    pub response_sender: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// Messages sent from the agent to the REPL thread.
@@ -574,7 +574,7 @@ fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEv
         match agent_event_receiver.recv() {
             Ok(AgentToReplEvent::Done) => return true,
             Ok(AgentToReplEvent::ApprovalRequest(request)) => {
-                handle_approval_request(&request);
+                handle_approval_request(request);
             }
             Ok(AgentToReplEvent::McpElicitation(prompt)) => {
                 handle_elicitation_prompt(prompt);
@@ -723,7 +723,7 @@ fn handle_elicitation_prompt(prompt: crate::mcp::elicitation::ElicitationPrompt)
     let _ = prompt.responder.send(response);
 }
 
-fn handle_approval_request(request: &ToolApprovalRequest) {
+fn handle_approval_request(request: ToolApprovalRequest) {
     use crossterm::style::Stylize;
 
     let display_name = crate::render::tool_display_name_for_approval(&request.tool_name);
@@ -752,11 +752,8 @@ fn handle_approval_request(request: &ToolApprovalRequest) {
         Err(_) => false,
     };
 
-    if let Err(error) = request.response_sender.send(allowed) {
-        tracing::warn!(
-            "failed to send approval response (agent disconnected): {}",
-            error
-        );
+    if request.response_sender.send(allowed).is_err() {
+        tracing::warn!("failed to send approval response (agent disconnected)");
     }
 }
 

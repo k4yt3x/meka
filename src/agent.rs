@@ -20,18 +20,41 @@ use crate::session::SessionManager;
 use crate::tools::ToolRegistry;
 use crate::tools::todo::SharedTodoList;
 
+/// Trigger auto-compaction once a turn's input tokens exceed this fraction of
+/// the configured context window.
+const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
+
+/// Per-turn configuration knobs for [`Agent`]. Constructed once by `main` from
+/// the [`crate::config::ResolvedConfig`] and held immutably for the agent's
+/// lifetime; mid-session permission cycling and tool loading are handled by
+/// shared state (see [`SharedPermission`] and [`ToolRegistry`]) rather than
+/// by mutating fields here.
 pub struct AgentOptions {
+    /// When true, assistant responses stream token-by-token via
+    /// `Provider::stream`; otherwise the agent uses the blocking
+    /// `Provider::complete`.
     pub streaming: bool,
     pub newline_before_prompt: bool,
     pub newline_after_prompt: bool,
     pub show_session_id_on_create: bool,
     pub show_token_usage: bool,
+    /// Whether read-mode `execute_command` calls run inside the platform
+    /// sandbox. Forced off when no sandbox backend is available.
     pub sandboxed_shell: bool,
     pub render_mode: crate::render::RenderMode,
+    /// Cap on messages sent to the provider per turn. `None` = unlimited;
+    /// the agent walks back to a safe boundary so tool-result chains stay
+    /// intact (see `truncate_messages_for_context`).
     pub context_messages: Option<usize>,
+    /// When true, the agent auto-compacts the conversation once a turn's
+    /// input tokens cross [`AUTO_COMPACT_THRESHOLD_PERCENT`] of
+    /// [`Self::context_window`]. Requires `context_window > 0`.
     pub auto_compact: bool,
+    /// Provider's advertised context window in tokens. Drives auto-compact.
     pub context_window: u64,
     pub thinking_show_content: bool,
+    /// User-authored instructions, surfaced in the system prompt and to
+    /// sub-agents. Per-run `--instructions` overrides the config-file value.
     pub user_instructions: Option<String>,
     /// Pre-turn MCP readiness gate. When true, a turn is rejected with
     /// `AgshError::McpTurnGated` if any enabled server isn't `Connected`
@@ -42,6 +65,14 @@ pub struct AgentOptions {
     pub mcp_grace: std::time::Duration,
 }
 
+/// Driver for a single conversation. One [`Agent`] handles one or more
+/// sequential turns against a single provider, with a shared tool registry,
+/// shared permission state, and a persistent SQLite session. A turn fans
+/// out tool calls (in parallel via `join_all`) and persists every assistant
+/// and tool-result message to the session store.
+///
+/// `Agent` is held across turns but not across providers — switching
+/// providers requires a fresh instance.
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tool_registry: ToolRegistry,
@@ -127,6 +158,9 @@ impl Agent {
             return self.handle_mcp_not_ready(not_ready);
         }
 
+        // Best-effort grace wait — we re-check readiness below regardless of
+        // whether `await_settled` returned in time. The timeout result is
+        // intentionally discarded.
         let _ = tokio::time::timeout(self.options.mcp_grace, manager.await_settled()).await;
 
         let not_ready = manager.enabled_not_connected().await;
@@ -188,18 +222,19 @@ impl Agent {
         // Keep the shared session ID in sync so scratchpad tools can access it.
         *self.shared_session_id.write().await = Some(sid);
 
-        // Auto-compact if the last turn's input tokens exceeded 80% of the
-        // context window. This runs between turns (not mid-tool-loop) so the
-        // stable base_messages invariant is preserved.
+        // Auto-compact if the last turn's input tokens exceeded the threshold
+        // fraction of the context window. This runs between turns (not
+        // mid-tool-loop) so the stable base_messages invariant is preserved.
         if self.options.auto_compact && self.options.context_window > 0 {
             let last_tokens = self
                 .last_input_tokens
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let threshold = self.options.context_window * 80 / 100;
+            let threshold = self.options.context_window * AUTO_COMPACT_THRESHOLD_PERCENT / 100;
             if last_tokens > threshold && messages.len() > 1 {
                 tracing::info!(
-                    "auto-compacting: {} input tokens exceeds 80% of {} context window",
+                    "auto-compacting: {} input tokens exceeds {}% of {} context window",
                     last_tokens,
+                    AUTO_COMPACT_THRESHOLD_PERCENT,
                     self.options.context_window
                 );
                 // Automatic lifecycle signpost — hidden at default
@@ -713,7 +748,7 @@ impl Agent {
             );
         };
 
-        let (response_sender, response_receiver) = std::sync::mpsc::sync_channel(1);
+        let (response_sender, response_receiver) = tokio::sync::oneshot::channel::<bool>();
         let schema = tool.definition().parameters;
         let primary_param = crate::render::resolve_primary_param(name, input, Some(&schema));
         let request = crate::repl::ToolApprovalRequest {
@@ -732,7 +767,11 @@ impl Agent {
             );
         }
 
-        match response_receiver.recv() {
+        // Awaiting the oneshot receiver (rather than a blocking
+        // `SyncReceiver::recv()`) keeps the executor thread free, so multiple
+        // parallel tool calls in Ask mode each suspend cleanly while waiting
+        // for the user's Y/n.
+        match response_receiver.await {
             Ok(true) => Self::run_tool(tool, input, cancellation).await,
             Ok(false) => {
                 crate::tools::ToolOutput::text("User denied tool execution.".to_string(), true)

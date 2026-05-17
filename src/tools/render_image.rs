@@ -130,7 +130,8 @@ mod tests {
     use image::{ImageFormat, RgbaImage};
 
     use super::*;
-    use crate::provider::{ContentBlock, ToolResultContent};
+    use crate::provider::ToolResultContent;
+    use crate::tools::tests::text_content;
 
     async fn test_manager() -> SessionManager {
         SessionManager::open(Some(Path::new(":memory:")))
@@ -144,10 +145,6 @@ mod tests {
         img.write_to(&mut Cursor::new(&mut out), format)
             .expect("encode");
         out
-    }
-
-    fn text_content(output: &ToolOutput) -> String {
-        ContentBlock::tool_result_text_content(&output.content)
     }
 
     fn build_tool(session_manager: SessionManager, session_id: Option<Uuid>) -> RenderImageTool {

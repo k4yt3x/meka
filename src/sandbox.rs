@@ -9,20 +9,35 @@
 //! platforms, sandboxing is unavailable and shell execution is gated by the
 //! permission level alone.
 
+/// What kind of read-mode sandbox is available on this platform. Resolved
+/// once at config time and threaded into [`crate::tools::shell::ExecuteCommandTool`]
+/// so the spawn path knows which argv shape and `pre_exec` hook to use.
 #[derive(Debug, Clone)]
 pub enum SandboxCapability {
+    /// Linux: filesystem-write restriction via Landlock LSM (kernel 5.13+).
+    /// Does NOT block Unix-domain-socket mutation — dbus, systemd-user, etc.
+    /// remain reachable. Prefer Bubblewrap when available for full parity.
     #[cfg(target_os = "linux")]
-    Landlock {
-        abi_version: i32,
-    },
+    Landlock { abi_version: i32 },
+    /// Linux: read-only root bind via `bwrap --ro-bind /` plus tmpfs masks
+    /// over `/tmp`, `/run`, `/var/tmp`, and `$XDG_RUNTIME_DIR`. Blocks both
+    /// filesystem writes and IPC-socket mutation; network is unrestricted.
     #[cfg(target_os = "linux")]
-    Bubblewrap {
-        bwrap_path: std::path::PathBuf,
-    },
+    Bubblewrap { bwrap_path: std::path::PathBuf },
+    /// macOS: `sandbox-exec` with the hardened SBPL profile defined in
+    /// [`SANDBOX_PROFILE_READONLY`]. Blocks filesystem writes and IPC
+    /// mutation (no launchd, pasteboard, LaunchServices, etc.); network
+    /// is unrestricted.
     #[cfg(target_os = "macos")]
     SandboxExec,
+    /// Windows: child runs with a duplicated primary token dropped to Low
+    /// integrity. Blocks writes outside the Low-integrity surface (user
+    /// home, AppData, Program Files); IPC mutation is constrained but not
+    /// as tightly as Linux/macOS.
     #[cfg(target_os = "windows")]
     LowIntegrity,
+    /// No sandbox available on this platform / configuration. Read-mode
+    /// shell commands hard-error rather than silently bypass the sandbox.
     Unavailable,
 }
 
@@ -610,10 +625,179 @@ struct LandlockPathBeneathAttr {
     parent_fd: i32,
 }
 
-// macOS sandbox profile
+/// Path of the macOS `sandbox-exec` binary. Hardcoded (not PATH-searched) so
+/// a hostile `PATH` entry can't shadow it with a wrapper that drops the
+/// sandbox.
 #[cfg(target_os = "macos")]
-pub const SANDBOX_PROFILE_READONLY: &str =
-    "(version 1)(allow default)(deny file-write*)(deny file-write-setugid)";
+pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+
+/// Read-mode SBPL profile for the macOS sandbox. Modeled after Codex's
+/// hardened Seatbelt profile (Apache 2.0; see attribution inside the
+/// policy), which is itself inspired by Chrome's renderer sandbox.
+///
+/// Threat-model parity with Linux Bubblewrap:
+/// - Filesystem read-only — `(deny default)` denies writes; only `/dev/null`
+///   and PTY device nodes get write access for legitimate shell behavior.
+/// - IPC mutation blocked — `mach-lookup` is denied by default; only a
+///   curated allow-list of safe Mach services is whitelisted. Mutation
+///   services (`com.apple.launchd`, `com.apple.pasteboard.1`,
+///   `com.apple.launchservicesd`, the cfprefsd *write* path via
+///   `user-preference-write`) are NOT in the allow-list.
+/// - Network allowed — outbound BSD sockets, DNS resolution, TLS trust
+///   evaluation, and proxy/network configuration reads are explicitly
+///   permitted.
+#[cfg(target_os = "macos")]
+pub const SANDBOX_PROFILE_READONLY: &str = r#"
+; Vendored from Codex (Apache 2.0 License):
+;   github.com/openai/codex/blob/main/codex-rs/sandboxing/src/seatbelt_base_policy.sbpl
+;   github.com/openai/codex/blob/main/codex-rs/sandboxing/src/seatbelt_network_policy.sbpl
+; The base policy is itself inspired by Chrome's renderer sandbox:
+;   https://source.chromium.org/chromium/chromium/src/+/main:sandbox/policy/mac/common.sb
+
+(version 1)
+
+; start with closed-by-default
+(deny default)
+
+; broad filesystem read — agent needs to read arbitrary files in read-mode
+(allow file-read*)
+(allow file-test-existence)
+(allow file-ioctl)
+(allow file-map-executable)
+(allow file-read-metadata)
+
+; child processes inherit the policy of their parent
+(allow process-exec)
+(allow process-fork)
+(allow signal (target same-sandbox))
+
+; process-info
+(allow process-info* (target same-sandbox))
+
+; /dev/null writes are universally legitimate for shell redirects
+(allow file-write-data
+  (require-all
+    (path "/dev/null")
+    (vnode-type CHARACTER-DEVICE)))
+
+; sysctls permitted (CPU / kernel info reads)
+(allow sysctl-read
+  (sysctl-name "hw.activecpu")
+  (sysctl-name "hw.busfrequency_compat")
+  (sysctl-name "hw.byteorder")
+  (sysctl-name "hw.cacheconfig")
+  (sysctl-name "hw.cachelinesize_compat")
+  (sysctl-name "hw.cpufamily")
+  (sysctl-name "hw.cpufrequency_compat")
+  (sysctl-name "hw.cputype")
+  (sysctl-name "hw.l1dcachesize_compat")
+  (sysctl-name "hw.l1icachesize_compat")
+  (sysctl-name "hw.l2cachesize_compat")
+  (sysctl-name "hw.l3cachesize_compat")
+  (sysctl-name "hw.logicalcpu_max")
+  (sysctl-name "hw.machine")
+  (sysctl-name "hw.model")
+  (sysctl-name "hw.memsize")
+  (sysctl-name "hw.ncpu")
+  (sysctl-name "hw.nperflevels")
+  (sysctl-name-prefix "hw.optional.arm.")
+  (sysctl-name-prefix "hw.optional.armv8_")
+  (sysctl-name "hw.packages")
+  (sysctl-name "hw.pagesize_compat")
+  (sysctl-name "hw.pagesize")
+  (sysctl-name "hw.physicalcpu")
+  (sysctl-name "hw.physicalcpu_max")
+  (sysctl-name "hw.logicalcpu")
+  (sysctl-name "hw.cpufrequency")
+  (sysctl-name "hw.tbfrequency_compat")
+  (sysctl-name "hw.vectorunit")
+  (sysctl-name "machdep.cpu.brand_string")
+  (sysctl-name "kern.argmax")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.maxfilesperproc")
+  (sysctl-name "kern.maxproc")
+  (sysctl-name "kern.osproductversion")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.osvariant_status")
+  (sysctl-name "kern.osversion")
+  (sysctl-name "kern.secure_kernel")
+  (sysctl-name "kern.usrstack64")
+  (sysctl-name "kern.version")
+  (sysctl-name "sysctl.proc_cputype")
+  (sysctl-name "vm.loadavg")
+  (sysctl-name-prefix "hw.perflevel")
+  (sysctl-name-prefix "kern.proc.pgrp.")
+  (sysctl-name-prefix "kern.proc.pid.")
+  (sysctl-name-prefix "net.routetable.")
+)
+
+; Java reads some CPU info via a misclassified "sysctl-write"
+(allow sysctl-write
+  (sysctl-name "kern.grade_cputype"))
+
+; IOKit
+(allow iokit-open
+  (iokit-registry-entry-class "RootDomainUserClient"))
+
+; Python multiprocessing
+(allow ipc-posix-sem)
+
+; PyTorch/libomp register OpenMP runtimes
+(allow ipc-posix-shm-read-data
+  ipc-posix-shm-write-create
+  ipc-posix-shm-write-unlink
+  (ipc-posix-name-regex #"^/__KMP_REGISTERED_LIB_[0-9]+$"))
+
+; power management queries
+(allow mach-lookup
+  (global-name "com.apple.PowerManagement.control"))
+
+; PTYs (interactive shell behavior)
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl (literal "/dev/ptmx"))
+(allow file-read* file-write*
+  (require-all
+    (regex #"^/dev/ttys[0-9]+")
+    (extension "com.apple.sandbox.pty")))
+(allow file-ioctl (regex #"^/dev/ttys[0-9]+"))
+
+; read-only user preferences (writes are blocked by deny default since
+; we do NOT allow `user-preference-write`)
+(allow ipc-posix-shm-read* (ipc-posix-name-prefix "apple.cfprefs."))
+(allow mach-lookup
+  (global-name "com.apple.cfprefsd.daemon")
+  (global-name "com.apple.cfprefsd.agent")
+  (local-name "com.apple.cfprefsd.agent"))
+(allow user-preference-read)
+
+; ====== network rules ======
+; AF_SYSTEM control sockets used by some platform helpers.
+(allow system-socket
+  (require-all
+    (socket-domain AF_SYSTEM)
+    (socket-protocol 2)))
+
+; Outbound BSD sockets (curl, http clients, etc.)
+(allow network-outbound)
+(allow network-bind (local ip "*:0"))
+(allow network-inbound (local ip "*:0"))
+
+; Services needed for hostname lookup, TLS trust evaluation, proxy config.
+(allow mach-lookup
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.ocspd")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.SystemConfiguration.configd")
+  (global-name "com.apple.mDNSResponder"))
+
+(allow sysctl-read
+  (sysctl-name-regex #"^net.routetable"))
+"#;
 
 /// PowerShell prelude that switches `$OutputEncoding` and
 /// `[Console]::OutputEncoding` to UTF-8. See
@@ -717,14 +901,19 @@ mod windows_impl {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+    };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
         CreateProcessWithTokenW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
         LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
-        UpdateProcThreadAttribute, WaitForSingleObject,
+        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+        TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     // SE_GROUP_INTEGRITY isn't exported by the `Win32_Security` feature in
@@ -775,8 +964,15 @@ mod windows_impl {
     /// are anonymous pipes wrapped in [`File`] (convertible to tokio async
     /// readers via `tokio::fs::File::from_std`). `wait_blocking` / `kill` run
     /// synchronous Win32 calls; call them from `tokio::task::spawn_blocking`.
+    ///
+    /// The child is wrapped in a Job Object with
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so any grandchildren spawned by
+    /// the user command are atomically killed when the job handle drops
+    /// (matching Unix's `setsid()` + `kill(-pgid, …)` semantics). `kill()`
+    /// terminates the entire job, not just the direct child.
     pub struct SandboxedChild {
         process: OwnedHandle,
+        job: OwnedHandle,
         stdout: Option<File>,
         stderr: Option<File>,
     }
@@ -807,16 +1003,18 @@ mod windows_impl {
             }
         }
 
-        /// Terminate the child process. Returns success even if the process
-        /// had already exited; Win32 distinguishes these but the shell tool
-        /// treats both as "gone".
+        /// Terminate the child process and every grandchild via the Job
+        /// Object. Returns success even if the job was already empty; Win32
+        /// distinguishes these but the shell tool treats both as "gone".
         pub fn kill(&self) -> std::io::Result<()> {
-            // SAFETY: `process` is a valid open process HANDLE until Drop.
+            // SAFETY: `job` is a valid open Job HANDLE until Drop.
+            // Terminating the job cascades to every process assigned to it,
+            // including any grandchildren the user command spawned.
             unsafe {
-                if TerminateProcess(self.process.as_raw(), 1) == 0 {
+                if TerminateJobObject(self.job.as_raw(), 1) == 0 {
                     let err = std::io::Error::last_os_error();
-                    // ERROR_ACCESS_DENIED (5) is returned when the process
-                    // already exited — treat as success.
+                    // ERROR_ACCESS_DENIED (5) is returned when the job is
+                    // already gone — treat as success.
                     if err.raw_os_error() == Some(5) {
                         return Ok(());
                     }
@@ -1018,7 +1216,18 @@ mod windows_impl {
 
             let mut proc_info: PROCESS_INFORMATION = mem::zeroed();
 
-            // 8. Spawn. The child inherits only the three listed handles.
+            // 8. Create a Job Object with `KILL_ON_JOB_CLOSE` BEFORE spawning,
+            //    so the child can be assigned to it while still suspended.
+            //    When `SandboxedChild` drops, the job handle drops too — that
+            //    automatic close cascades to every assigned process,
+            //    eliminating grandchild leaks on normal exit, kill, or panic.
+            let job = create_kill_on_close_job()?;
+
+            // 9. Spawn SUSPENDED. We assign the child to the job before any
+            //    of its code runs; otherwise the child could spawn a
+            //    grandchild outside the job in the gap between create and
+            //    assign. With `CREATE_SUSPENDED` set, the main thread is
+            //    created suspended and we manually resume it after assignment.
             let spawn_result = create_process_low_integrity(
                 low_token.as_raw(),
                 &cmd_line,
@@ -1039,6 +1248,32 @@ mod windows_impl {
 
             spawn_result?;
 
+            // 10. Assign the suspended child to the job, then resume.
+            if AssignProcessToJobObject(job.as_raw(), proc_info.hProcess) == 0 {
+                let err = std::io::Error::last_os_error();
+                // Best-effort kill of the suspended child before bailing,
+                // so the orphan doesn't sit around if AssignProcess failed.
+                TerminateProcess(proc_info.hProcess, 1);
+                CloseHandle(proc_info.hProcess);
+                if !proc_info.hThread.is_null() {
+                    CloseHandle(proc_info.hThread);
+                }
+                return Err(err);
+            }
+
+            // Resume the main thread. ResumeThread returns the previous
+            // suspend count, or u32::MAX on failure.
+            if ResumeThread(proc_info.hThread) == u32::MAX {
+                let err = std::io::Error::last_os_error();
+                // Kill via job since assignment already succeeded.
+                TerminateJobObject(job.as_raw(), 1);
+                CloseHandle(proc_info.hProcess);
+                if !proc_info.hThread.is_null() {
+                    CloseHandle(proc_info.hThread);
+                }
+                return Err(err);
+            }
+
             // We don't need the main thread handle — close it immediately.
             if !proc_info.hThread.is_null() {
                 CloseHandle(proc_info.hThread);
@@ -1052,10 +1287,46 @@ mod windows_impl {
 
             Ok(SandboxedChild {
                 process: OwnedHandle(proc_info.hProcess),
+                job,
                 stdout: Some(File::from_raw_handle(stdout_handle as _)),
                 stderr: Some(File::from_raw_handle(stderr_handle as _)),
             })
         }
+    }
+
+    /// Create an empty Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// set. Any process later assigned to the job is killed when the job's
+    /// last handle closes — the Windows analogue to Unix process groups
+    /// teardown via `kill(-pgid, SIGKILL)`. Grandchildren inherit job
+    /// membership automatically.
+    unsafe fn create_kill_on_close_job() -> std::io::Result<OwnedHandle> {
+        // SAFETY: CreateJobObjectW with null name and null SECURITY_ATTRIBUTES
+        // returns an unnamed Job HANDLE the current process owns.
+        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = OwnedHandle(job);
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { mem::zeroed() };
+        info.BasicLimitInformation = JOBOBJECT_BASIC_LIMIT_INFORMATION {
+            LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            ..unsafe { mem::zeroed() }
+        };
+
+        if unsafe {
+            SetInformationJobObject(
+                job.as_raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(job)
     }
 
     /// Create an anonymous pipe using the supplied SECURITY_ATTRIBUTES.
@@ -1124,8 +1395,14 @@ mod windows_impl {
         startup: &STARTUPINFOEXW,
         proc_info: &mut PROCESS_INFORMATION,
     ) -> std::io::Result<()> {
-        let creation_flags =
-            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+        // CREATE_SUSPENDED so the child sits at its entry point until we've
+        // assigned it to the Job Object — otherwise the child could spawn a
+        // grandchild before assignment, and that grandchild would never be
+        // bound to the job.
+        let creation_flags = CREATE_NO_WINDOW
+            | EXTENDED_STARTUPINFO_PRESENT
+            | CREATE_UNICODE_ENVIRONMENT
+            | CREATE_SUSPENDED;
         let startup_ptr = startup as *const STARTUPINFOEXW as *const STARTUPINFOW;
 
         // Build a scrubbed UTF-16 environment block once. Passing this for

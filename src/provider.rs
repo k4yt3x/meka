@@ -276,8 +276,15 @@ pub enum StopReason {
     Unknown(String),
 }
 
+/// Abstraction over an LLM provider (Claude API/OAuth, OpenAI, etc.).
+/// Implementors are held behind `Arc<dyn Provider>` and shared across
+/// concurrent tool dispatch — calls must be safe to make in parallel from
+/// multiple sub-agents in one turn.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Single round-trip request. Returns the assistant message plus
+    /// stop-reason and token-usage metadata. No streaming; the agent
+    /// awaits the full response.
     async fn complete(
         &self,
         system_prompt: &str,
@@ -285,6 +292,10 @@ pub trait Provider: Send + Sync {
         tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason, TokenUsage)>;
 
+    /// Streaming variant. The provider pushes `StreamEvent`s onto
+    /// `event_sender` as they arrive. Cancellation is observed via
+    /// `cancellation` — implementors must check the token and abort
+    /// in-flight HTTP work when it fires.
     async fn stream(
         &self,
         system_prompt: &str,
@@ -298,7 +309,9 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
     /// Override thinking for the next API call. `Some(false)` disables,
-    /// `Some(true)` enables, `None` restores the default.
+    /// `Some(true)` enables, `None` restores the default. Default impl is
+    /// a silent no-op — providers that don't support thinking should leave
+    /// it that way; providers that do must override.
     fn set_thinking_override(&self, _enabled: Option<bool>) {}
 }
 

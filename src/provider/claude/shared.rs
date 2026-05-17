@@ -761,6 +761,64 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
     Cow::Owned(owned)
 }
 
+/// Serialize a Claude request body, downscaling oversized images first and
+/// reactively redacting old tool-result image blocks if the serialized JSON
+/// still exceeds [`MAX_REQUEST_BYTES`]. Both Claude providers run this same
+/// redact-and-retry loop; the caller supplies the body builder via `build` so
+/// each provider's thinking / metadata wiring stays in its own file.
+///
+/// `build` takes a `messages` slice (the downscaled-then-maybe-redacted view)
+/// and returns the serialized JSON. It's called once on the original messages
+/// and, if oversized, a second time on the redacted set.
+///
+/// On a successful redaction pass, this records the [`RedactionStats`] on
+/// `session_stats` (when provided) and emits a single user-visible
+/// `render::render_hint` line describing what was dropped.
+pub(super) fn build_body_within_budget<F>(
+    messages: &[Message],
+    session_stats: Option<&std::sync::Arc<crate::stats::SessionStats>>,
+    mut build: F,
+) -> Result<String>
+where
+    F: FnMut(&[Message]) -> Result<String>,
+{
+    let prepared = downscale_oversized_images(messages);
+    let body_json = build(prepared.as_ref())?;
+
+    if body_json.len() <= MAX_REQUEST_BYTES {
+        return Ok(body_json);
+    }
+
+    let bytes_to_drop = body_json.len() - REDACTION_TARGET_BYTES;
+    let (redacted, stats) = redact_oldest_images(prepared.as_ref(), bytes_to_drop);
+    let body_json = build(redacted.as_ref())?;
+
+    if body_json.len() > MAX_REQUEST_BYTES {
+        return Err(AgshError::Provider(format!(
+            "request body is {} MiB after redacting old tool-result images; \
+             Anthropic's limit is 32 MiB. Run /compact, remove large attachments \
+             from the most recent turn, or split the work across smaller turns.",
+            body_json.len() / 1_048_576,
+        )));
+    }
+
+    if let Some(session_stats) = session_stats {
+        session_stats.record_redaction(stats.images_redacted as u64, stats.bytes_freed as u64);
+    }
+    crate::render::render_hint(&format!(
+        "Redacted {} old image{} (~{} MiB freed). Cache prefix invalidated for those messages.",
+        stats.images_redacted,
+        if stats.images_redacted == 1 { "" } else { "s" },
+        stats.bytes_freed / 1_048_576,
+    ));
+    tracing::warn!(
+        "redacted {} old tool-result image(s); body now {} MiB",
+        stats.images_redacted,
+        body_json.len() / 1_048_576,
+    );
+    Ok(body_json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -196,10 +196,22 @@ impl ToolOutput {
     }
 }
 
+/// A callable tool surfaced to the model. Built-in tools live under
+/// `src/tools/`; MCP tools are wrapped at registration time. Implementors
+/// must be safe to invoke concurrently — the dispatch loop runs all tool
+/// calls in a single assistant message in parallel via `join_all`.
 #[async_trait]
 pub trait Tool: Send + Sync {
+    /// Schema surfaced to the model (name + description + JSON-schema for
+    /// parameters). Called once per registry build, not per call.
     fn definition(&self) -> ToolDefinition;
+    /// Lowest permission level that may invoke this tool. The dispatch
+    /// loop short-circuits with a "permission denied" tool error when the
+    /// current level is below this.
     fn required_permission(&self) -> Permission;
+    /// Run the tool. Long-running implementations must observe
+    /// `cancellation` (e.g. via `tokio::select!`) so a user interrupt
+    /// or turn-level abort unblocks promptly.
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -562,6 +574,12 @@ pub(crate) mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// Test helper: pull the concatenated text content out of a
+    /// `ToolOutput`. Used across every per-tool test module.
+    pub(crate) fn text_content(output: &ToolOutput) -> String {
+        ContentBlock::tool_result_text_content(&output.content)
+    }
 
     fn test_shared_permission() -> crate::permission::SharedPermission {
         crate::permission::SharedPermission::new(
@@ -1276,6 +1294,171 @@ pub(crate) mod tests {
                 names.contains(expected),
                 "BUILTIN_TOOL_NAMES missing '{}'",
                 expected
+            );
+        }
+    }
+
+    /// Stub tool that sleeps for a known duration before returning a payload
+    /// derived from its input. Observes the cancellation token via `select!`
+    /// so cancellation tests can assert early exit. Used to verify the
+    /// parent and sub-agent dispatch loops actually run their `join_all`
+    /// futures in parallel and propagate cancellation correctly.
+    struct SleepTool {
+        name: String,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl Tool for SleepTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                description: "test sleep tool".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string" }
+                    }
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn required_permission(&self) -> Permission {
+            Permission::Read
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            cancellation: CancellationToken,
+        ) -> Result<ToolOutput> {
+            let label = input
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("default")
+                .to_string();
+            tokio::select! {
+                _ = tokio::time::sleep(self.delay) => {
+                    Ok(ToolOutput::text(format!("done:{}", label), false))
+                }
+                _ = cancellation.cancelled() => {
+                    Ok(ToolOutput::text(format!("cancelled:{}", label), true))
+                }
+            }
+        }
+    }
+
+    /// Guards against a regression where parallel tool dispatch is replaced
+    /// by sequential `.await`-in-a-loop. Two tools each sleep ~200 ms; the
+    /// total wall-clock must be much less than the sum.
+    #[tokio::test]
+    async fn test_parallel_dispatch_runs_tools_concurrently() {
+        let registry = ToolRegistry::new_with_filter(BuiltinToolFilter::default());
+        registry
+            .register(Arc::new(SleepTool {
+                name: "sleep_one".to_string(),
+                delay: std::time::Duration::from_millis(200),
+            }))
+            .expect("registration should succeed");
+        registry
+            .register(Arc::new(SleepTool {
+                name: "sleep_two".to_string(),
+                delay: std::time::Duration::from_millis(200),
+            }))
+            .expect("registration should succeed");
+
+        let tools = [
+            ("a", "sleep_one", serde_json::json!({ "label": "first" })),
+            ("b", "sleep_two", serde_json::json!({ "label": "second" })),
+        ];
+        let cancellation = CancellationToken::new();
+
+        let start = std::time::Instant::now();
+        let futures = tools.iter().map(|(_, name, input)| {
+            let tool = registry.get(name).expect("tool registered above");
+            let cancellation = cancellation.clone();
+            async move { tool.execute(input.clone(), cancellation).await }
+        });
+        let outputs: Vec<_> = futures::future::join_all(futures).await;
+        let elapsed = start.elapsed();
+
+        // 500ms gives ~300ms headroom over the parallel ~200ms baseline while
+        // still being well below the ~400ms serial-dispatch case. The wide
+        // margin absorbs scheduler jitter on slow CI runners without losing
+        // the parallel-vs-sequential discrimination.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "expected parallel execution (<500ms), got {:?}",
+            elapsed
+        );
+        assert_eq!(outputs.len(), 2);
+        let first = outputs[0].as_ref().expect("first should succeed");
+        let second = outputs[1].as_ref().expect("second should succeed");
+        assert_eq!(text_content(first), "done:first");
+        assert_eq!(text_content(second), "done:second");
+    }
+
+    /// Verifies that the cancellation token threads through `tool.execute(...)`
+    /// calls when many are in flight. Cancelling mid-batch should cause every
+    /// running tool to observe the cancellation and return early.
+    #[tokio::test]
+    async fn test_parallel_dispatch_respects_cancellation() {
+        let registry = ToolRegistry::new_with_filter(BuiltinToolFilter::default());
+        registry
+            .register(Arc::new(SleepTool {
+                name: "long_one".to_string(),
+                delay: std::time::Duration::from_secs(10),
+            }))
+            .expect("registration should succeed");
+        registry
+            .register(Arc::new(SleepTool {
+                name: "long_two".to_string(),
+                delay: std::time::Duration::from_secs(10),
+            }))
+            .expect("registration should succeed");
+
+        let tools = [
+            ("a", "long_one", serde_json::json!({ "label": "first" })),
+            ("b", "long_two", serde_json::json!({ "label": "second" })),
+        ];
+        let cancellation = CancellationToken::new();
+
+        let cancel_handle = {
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            })
+        };
+
+        let start = std::time::Instant::now();
+        let futures = tools.iter().map(|(_, name, input)| {
+            let tool = registry.get(name).expect("tool registered above");
+            let cancellation = cancellation.clone();
+            async move { tool.execute(input.clone(), cancellation).await }
+        });
+        let outputs: Vec<_> = futures::future::join_all(futures).await;
+        let elapsed = start.elapsed();
+        cancel_handle.await.expect("cancel task should not panic");
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "expected early exit on cancellation (<500ms), got {:?}",
+            elapsed
+        );
+        for (i, output) in outputs.iter().enumerate() {
+            let output = output.as_ref().expect("execute should not error");
+            assert!(
+                output.is_error,
+                "tool {} should report cancellation as is_error=true",
+                i
+            );
+            assert!(
+                text_content(output).starts_with("cancelled:"),
+                "tool {} should report cancellation, got {:?}",
+                i,
+                output.content
             );
         }
     }

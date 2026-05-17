@@ -12,6 +12,10 @@ use crate::permission::{EnabledPermissions, Permission};
 use crate::provider::AuthCredential;
 use crate::render::RenderMode;
 
+/// In-memory shape of `config.toml`. Each top-level `[section]` deserializes
+/// into its own sub-struct; missing sections fall back to `Default`. This is
+/// the raw deserialized form — `resolve_config` merges it with CLI flags
+/// and env vars to produce a [`ResolvedConfig`].
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
     pub provider: Option<ProviderConfig>,
@@ -413,6 +417,10 @@ pub struct ProviderConfig {
     pub redact_thinking: Option<bool>,
 }
 
+/// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env
+/// vars. This is what the rest of the binary reads — `ConfigFile` is for
+/// deserialization only. Resolution lives in `resolve_config` (Linux) and
+/// the non-Linux variant below it.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub provider_name: Option<String>,

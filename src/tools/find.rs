@@ -138,11 +138,7 @@ impl Tool for FindFilesTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ContentBlock;
-
-    fn text_content(output: &ToolOutput) -> String {
-        ContentBlock::tool_result_text_content(&output.content)
-    }
+    use crate::tools::tests::text_content;
 
     #[tokio::test]
     async fn test_find_files() {

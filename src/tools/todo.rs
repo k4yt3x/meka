@@ -167,11 +167,7 @@ pub fn format_todo_for_context(items: &[TodoItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ContentBlock;
-
-    fn text_content(output: &ToolOutput) -> String {
-        ContentBlock::tool_result_text_content(&output.content)
-    }
+    use crate::tools::tests::text_content;
 
     fn test_list() -> SharedTodoList {
         Arc::new(RwLock::new(Vec::new()))

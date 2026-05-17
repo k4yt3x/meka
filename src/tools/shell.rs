@@ -164,7 +164,7 @@ impl Tool for ExecuteCommandTool {
                 self.sandbox_capability,
                 crate::sandbox::SandboxCapability::SandboxExec
             ) {
-            let mut cmd = tokio::process::Command::new("sandbox-exec");
+            let mut cmd = tokio::process::Command::new(crate::sandbox::SANDBOX_EXEC_PATH);
             cmd.arg("-p")
                 .arg(crate::sandbox::SANDBOX_PROFILE_READONLY)
                 .arg("sh")
@@ -590,11 +590,7 @@ fn append_drain_truncation_note(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ContentBlock;
-
-    fn text_content(output: &ToolOutput) -> String {
-        ContentBlock::tool_result_text_content(&output.content)
-    }
+    use crate::tools::tests::text_content;
 
     fn test_shared_permission() -> crate::permission::SharedPermission {
         crate::permission::SharedPermission::new(
@@ -744,10 +740,7 @@ mod tests {
                 );
             }
             Err(other) => panic!("expected ToolExecution, got {:?}", other),
-            Ok(output) => panic!(
-                "expected hard error, got Ok({:?})",
-                ContentBlock::tool_result_text_content(&output.content)
-            ),
+            Ok(output) => panic!("expected hard error, got Ok({:?})", text_content(&output)),
         }
     }
 

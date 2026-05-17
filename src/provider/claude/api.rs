@@ -113,71 +113,6 @@ impl ClaudeApiProvider {
         serde_json::Value::Object(body)
     }
 
-    /// Mirror of `ClaudeOAuthProvider::build_body_within_budget`: serialize
-    /// the request body and, if it exceeds [`shared::MAX_REQUEST_BYTES`],
-    /// reactively redact the oldest tool-result image blocks (preserving the
-    /// final message's cache breakpoint) and shrink past
-    /// [`shared::REDACTION_TARGET_BYTES`] so subsequent turns don't
-    /// re-trigger.
-    fn build_body_within_budget(
-        &self,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-        stream: bool,
-    ) -> Result<String> {
-        // Anthropic rejects images >2000 px on either axis in multi-image
-        // requests. Downscale before serialization. See
-        // `shared::downscale_oversized_images` for the rationale.
-        let prepared = shared::downscale_oversized_images(messages);
-        let messages = prepared.as_ref();
-
-        let body_json =
-            serde_json::to_string(&self.build_request_body(system_prompt, messages, tools, stream))
-                .map_err(|error| {
-                    AgshError::Provider(format!("failed to serialize body: {}", error))
-                })?;
-
-        if body_json.len() <= shared::MAX_REQUEST_BYTES {
-            return Ok(body_json);
-        }
-
-        let bytes_to_drop = body_json.len() - shared::REDACTION_TARGET_BYTES;
-        let (redacted, stats) = shared::redact_oldest_images(messages, bytes_to_drop);
-        let body_json = serde_json::to_string(&self.build_request_body(
-            system_prompt,
-            redacted.as_ref(),
-            tools,
-            stream,
-        ))
-        .map_err(|error| AgshError::Provider(format!("failed to serialize body: {}", error)))?;
-
-        if body_json.len() > shared::MAX_REQUEST_BYTES {
-            return Err(AgshError::Provider(format!(
-                "request body is {} MiB after redacting old tool-result images; \
-                 Anthropic's limit is 32 MiB. Run /compact, remove large attachments \
-                 from the most recent turn, or split the work across smaller turns.",
-                body_json.len() / 1_048_576,
-            )));
-        }
-
-        if let Some(session_stats) = &self.session_stats {
-            session_stats.record_redaction(stats.images_redacted as u64, stats.bytes_freed as u64);
-        }
-        crate::render::render_hint(&format!(
-            "Redacted {} old image{} (~{} MiB freed). Cache prefix invalidated for those messages.",
-            stats.images_redacted,
-            if stats.images_redacted == 1 { "" } else { "s" },
-            stats.bytes_freed / 1_048_576,
-        ));
-        tracing::warn!(
-            "redacted {} old tool-result image(s); body now {} MiB",
-            stats.images_redacted,
-            body_json.len() / 1_048_576,
-        );
-        Ok(body_json)
-    }
-
     fn apply_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let mut request = request
             .header("accept", "application/json")
@@ -201,7 +136,13 @@ impl Provider for ClaudeApiProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason, TokenUsage)> {
-        let body_json = self.build_body_within_budget(system_prompt, messages, tools, false)?;
+        let body_json =
+            shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
+                serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, false))
+                    .map_err(|error| {
+                        AgshError::Provider(format!("failed to serialize body: {}", error))
+                    })
+            })?;
         let body_size_mib = body_json.len() / 1_048_576;
         let request = self
             .apply_headers(self.client.post(format!("{}/v1/messages", self.base_url)))
@@ -242,7 +183,13 @@ impl Provider for ClaudeApiProvider {
         event_sender: mpsc::UnboundedSender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let body_json = self.build_body_within_budget(system_prompt, messages, tools, true)?;
+        let body_json =
+            shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
+                serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, true))
+                    .map_err(|error| {
+                        AgshError::Provider(format!("failed to serialize body: {}", error))
+                    })
+            })?;
         let body_size_mib = body_json.len() / 1_048_576;
         let request = self
             .apply_headers(

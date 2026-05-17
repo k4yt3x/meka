@@ -3,7 +3,7 @@ name = "agsh"
 version = "0.23.0"
 edition = "2024"
 license = "MIT"
-description = "An agentic shell where you speak human, not bash"
+description = "A general-purpose AI agent runtime"
 repository = "https://github.com/k4yt3x/agsh"
 
 [dependencies]
@@ -60,6 +60,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
