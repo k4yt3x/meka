@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.23.0] - 2026-05-17
 
 ### Added
 
@@ -23,13 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- macOS read-mode sandbox profile hardened: IPC mutation (launchd, pasteboard, LaunchServices, distributed notifications) now blocked alongside filesystem writes.
-- `sandbox-exec` is now invoked via its absolute path `/usr/bin/sandbox-exec` rather than `$PATH` lookup.
+- macOS read-mode sandbox profile hardened: IPC mutation now blocked alongside filesystem writes.
+- `sandbox-exec` invoked via absolute path `/usr/bin/sandbox-exec` instead of `$PATH` lookup.
+- Read-mode shell now scrubs the child environment on Linux and macOS (Windows already did).
 
 ### Fixed
 
-- Windows command-timeout teardown now kills grandchild processes via a Job Object, matching Unix `kill(-pgid, …)` semantics.
-- Session DB path resolution no longer silently falls back to a Linux-only path on macOS/Windows; misconfigured installs now error with a clear `AGSH_DATA_DIR` recommendation.
+- Windows command timeout now kills the full process tree via a Job Object.
+- Session DB path no longer falls back to a Linux-only default on macOS/Windows; set `AGSH_DATA_DIR`.
 
 ## [0.22.1] - 2026-05-12
 

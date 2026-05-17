@@ -271,6 +271,19 @@ impl Tool for ExecuteCommandTool {
             }
         }
 
+        // Scrub env before spawn so secrets in the parent process
+        // (`ANTHROPIC_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, …) can't ride
+        // along into the read-mode child. Sandboxes block writes/IPC
+        // but leave the network open, so leaked env is a live exfil
+        // vector under prompt injection. Write mode keeps the parent
+        // env (trusted-operation path). The Windows sandboxed branch
+        // applies the same scrub inside `spawn_low_integrity_command`.
+        #[cfg(unix)]
+        if sandboxed {
+            command_builder.env_clear();
+            command_builder.envs(crate::sandbox::sandbox_child_env());
+        }
+
         let mut child = command_builder
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())

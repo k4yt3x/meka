@@ -10,7 +10,7 @@
 //! permission level alone.
 
 /// What kind of read-mode sandbox is available on this platform. Resolved
-/// once at config time and threaded into [`crate::tools::shell::ExecuteCommandTool`]
+/// once at config time and threaded into `tools::shell::ExecuteCommandTool`
 /// so the spawn path knows which argv shape and `pre_exec` hook to use.
 #[derive(Debug, Clone)]
 pub enum SandboxCapability {
@@ -875,6 +875,204 @@ pub fn quote_command_arg(arg: &str) -> String {
     quoted
 }
 
+/// Curated env-var set for a sandboxed shell child. Applied via
+/// `Command::env_clear()` + `Command::envs(...)` before spawn so it
+/// covers Bubblewrap, Landlock, Seatbelt, and the Windows Low-integrity
+/// path uniformly without per-backend flag plumbing.
+///
+/// Read-mode sandboxes still allow outbound network (curl, dns, etc.),
+/// so a leaked secret in env (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
+/// `GITHUB_TOKEN`, …) is a live exfiltration vector under prompt
+/// injection. Stripping the env at spawn time closes that gap without
+/// touching what the sandbox itself enforces.
+///
+/// **Unix** uses an explicit allow-list (small, curated). Unknown vars
+/// are dropped — `EDITOR`, `PAGER`, `BAT_THEME`, etc. don't survive
+/// into read-mode shells. Users who need a specific var should switch
+/// to write mode (trusted-operation path; no scrubbing applies).
+///
+/// **Windows** uses a heuristic deny-list ([`is_sensitive_env_name`])
+/// because PowerShell pulls in a long tail of system vars (`PSModulePath`,
+/// `APPDATA`, `ProgramFiles`, etc.) that don't fit a tidy allow-list —
+/// an allow-list version was tried first and broke core cmdlets.
+pub fn sandbox_child_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(name_os, _)| match name_os.to_str() {
+            Some(name) => keep_sandbox_env_var(name),
+            None => false,
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn keep_sandbox_env_var(name: &str) -> bool {
+    // Exact-match allow-list. Names that an empty-env `sh -c …`
+    // typically needs to function: `PATH` so commands resolve, `HOME`
+    // for tools that read `~/.config`, locale so `grep`/`sort` don't
+    // mangle non-ASCII, etc.
+    const ALLOW_EXACT: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PWD",
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    ];
+    // Prefix allow-list keeps the LC_* / XDG_* families future-proof
+    // without enumerating each var. Locale (`LC_ALL`, `LC_CTYPE`,
+    // `LC_MESSAGES`, …) and XDG paths (`XDG_RUNTIME_DIR`,
+    // `XDG_CONFIG_HOME`, …) are both legitimately broad.
+    const ALLOW_PREFIX: &[&str] = &["LC_", "XDG_"];
+
+    if ALLOW_EXACT.contains(&name) {
+        return true;
+    }
+    if ALLOW_PREFIX.iter().any(|prefix| name.starts_with(prefix)) {
+        return true;
+    }
+    // Apple frameworks (CFString, foundation, etc.) read this to pick a
+    // text encoding; dropping it makes some CLIs misbehave with no
+    // useful error.
+    #[cfg(target_os = "macos")]
+    if name == "__CF_USER_TEXT_ENCODING" {
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn keep_sandbox_env_var(name: &str) -> bool {
+    !is_sensitive_env_name(name)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn keep_sandbox_env_var(_name: &str) -> bool {
+    // No sandbox is reachable on other platforms (SandboxCapability::Unavailable
+    // hard-errors at use time), so this filter is never exercised — pass
+    // through for completeness.
+    true
+}
+
+/// Heuristic match for variable names that commonly carry credentials
+/// or point to credential-bearing resources (SSH agent socket, kubeconfig,
+/// `.netrc`, GPG home, etc.). Case-insensitive substring match on a list
+/// of credential-shaped markers plus prefix match on known provider /
+/// service / database namespaces.
+///
+/// Tuned to be **aggressive on false positives** — a legitimate
+/// `GITHUB_ACTOR` is dropped alongside `GITHUB_TOKEN`, `SLACK_CHANNEL`
+/// alongside `SLACK_WEBHOOK_URL` — because the downside of a missing
+/// env var is a confusing tool error the user can recover from, while
+/// the downside of a leaked secret is a live exfiltration channel.
+///
+/// Used by the Windows arm of [`sandbox_child_env`]; not consulted on
+/// Unix, where the curated allow-list already drops every var by
+/// default. Lives at module scope (not inside `windows_impl`) so its
+/// tests exercise both platforms in CI — the function is pure string
+/// manipulation with no Windows-specific dependency.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn is_sensitive_env_name(name: &str) -> bool {
+    const SENSITIVE_SUBSTRINGS: &[&str] = &[
+        // Credential-shaped name fragments.
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "API_KEY",
+        "APIKEY",
+        "PRIVATE_KEY",
+        "BEARER",
+        "CREDENTIAL",
+        "SESSION_KEY",
+        "ACCESS_KEY",
+        // Broader `_KEY` catches `SIGNING_KEY`, `ENCRYPTION_KEY`,
+        // `DEPLOY_KEY`, `MASTER_KEY`, etc. without enumerating each.
+        "_KEY",
+        // Specific names that don't share a credential-shaped fragment
+        // but point to credentials, sockets, or other exfil-relevant
+        // resources. Substring (not exact) match so derivatives like
+        // `WSL_SSH_AUTH_SOCK` are also caught.
+        "SSH_AUTH_SOCK",
+        "SSH_ASKPASS",
+        "GIT_ASKPASS",
+        "GIT_SSH_COMMAND",
+        "KUBECONFIG",
+        "GNUPGHOME",
+        "NETRC",
+    ];
+    const SENSITIVE_PREFIXES: &[&str] = &[
+        // Agent / first-party.
+        "ANTHROPIC_",
+        "OPENAI_",
+        "CLAUDE_",
+        "AGSH_",
+        // Major clouds.
+        "AWS_",
+        "GCP_",
+        "GOOGLE_",
+        "AZURE_",
+        // Source control / CI.
+        "GITHUB_",
+        "GITLAB_",
+        // Model hubs / AI APIs.
+        "HF_",
+        "HUGGINGFACE_",
+        "OPENROUTER_",
+        "GROQ_",
+        "MISTRAL_",
+        "COHERE_",
+        "REPLICATE_",
+        "TOGETHER_",
+        "FIREWORKS_",
+        // Package registries.
+        "NPM_",
+        "PYPI_",
+        "CARGO_REGISTRY_",
+        "DOCKER_",
+        // Database connection strings often embed credentials.
+        "DATABASE_",
+        "POSTGRES_",
+        "MYSQL_",
+        "MONGO_",
+        "REDIS_",
+        // PaaS / hosting providers with API tokens.
+        "STRIPE_",
+        "CLOUDFLARE_",
+        "HEROKU_",
+        "VERCEL_",
+        "NETLIFY_",
+        "SUPABASE_",
+        "RAILWAY_",
+        // Identity / secret managers.
+        "OKTA_",
+        "AUTH0_",
+        "VAULT_",
+        "JWT_",
+        "OAUTH_",
+        // Observability tools with ingest keys.
+        "SENTRY_",
+        "DATADOG_",
+        // Communication APIs with bot tokens / webhooks.
+        "SLACK_",
+        "DISCORD_",
+    ];
+
+    let upper = name.to_ascii_uppercase();
+    SENSITIVE_SUBSTRINGS
+        .iter()
+        .any(|needle| upper.contains(needle))
+        || SENSITIVE_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+}
+
 #[cfg(target_os = "windows")]
 pub use windows_impl::spawn_low_integrity_command;
 
@@ -1490,86 +1688,24 @@ mod windows_impl {
     }
 
     /// Build a UTF-16 `NAME=VALUE\0NAME=VALUE\0\0` environment block for
-    /// the sandboxed child. Starts from the parent environment and drops
-    /// names that look sensitive — anything containing `TOKEN`, `SECRET`,
-    /// `PASSWORD`, or `API_KEY`, plus names prefixed with known provider
-    /// namespaces. Everything else passes through so PowerShell can load
-    /// its built-in modules (it needs `PSModulePath`, `APPDATA`,
-    /// `ProgramFiles`, and friends) without a brittle allowlist that
-    /// breaks whenever Windows adds a new required variable.
-    ///
-    /// A Low-integrity child can still open outbound sockets, so a stray
-    /// `ANTHROPIC_API_KEY` in the parent env is a live exfil vector —
-    /// hence the denylist. An allowlist version was tried first but
-    /// couldn't keep core cmdlets like `Write-Output` / `Measure-Object`
-    /// working without enumerating half of the Windows environment.
+    /// the sandboxed child. Delegates to [`super::sandbox_child_env`]
+    /// for the filter (Windows uses the deny-list arm) so the Low-integrity
+    /// spawn path stays in sync with the Unix sandbox paths.
     fn build_scrubbed_env_block_utf16() -> Vec<u16> {
         let mut block: Vec<u16> = Vec::new();
-        for (name_os, value_os) in std::env::vars_os() {
+        for (name_os, value_os) in super::sandbox_child_env() {
             let Some(name) = name_os.to_str() else {
                 continue;
             };
             let Some(value) = value_os.to_str() else {
                 continue;
             };
-            if is_sensitive_env_name(name) {
-                continue;
-            }
             append_env_entry(&mut block, name, value);
         }
         // Double-NUL terminator (each entry already ends with one NUL; we
         // need another to close the block).
         block.push(0);
         block
-    }
-
-    /// Heuristic match for variable names that commonly carry credentials.
-    /// Case-insensitive substring match on a short list of markers plus
-    /// a prefix match on known provider namespaces. Tuned to be
-    /// aggressive on false positives (a legitimate `GITHUB_ACTOR` is
-    /// dropped alongside `GITHUB_TOKEN`) because the downside of a
-    /// missing env var is a confusing tool error; the downside of a
-    /// leaked key is a live exfil channel.
-    pub(super) fn is_sensitive_env_name(name: &str) -> bool {
-        const SENSITIVE_SUBSTRINGS: &[&str] = &[
-            "TOKEN",
-            "SECRET",
-            "PASSWORD",
-            "PASSWD",
-            "API_KEY",
-            "APIKEY",
-            "PRIVATE_KEY",
-            "BEARER",
-            "CREDENTIAL",
-            "SESSION_KEY",
-            "ACCESS_KEY",
-        ];
-        const SENSITIVE_PREFIXES: &[&str] = &[
-            "ANTHROPIC_",
-            "OPENAI_",
-            "CLAUDE_",
-            "AGSH_",
-            "AWS_",
-            "GCP_",
-            "GOOGLE_",
-            "AZURE_",
-            "GITHUB_",
-            "GITLAB_",
-            "HF_",
-            "HUGGINGFACE_",
-            "NPM_",
-            "PYPI_",
-            "CARGO_REGISTRY_",
-            "DOCKER_",
-        ];
-
-        let upper = name.to_ascii_uppercase();
-        SENSITIVE_SUBSTRINGS
-            .iter()
-            .any(|needle| upper.contains(needle))
-            || SENSITIVE_PREFIXES
-                .iter()
-                .any(|prefix| upper.starts_with(prefix))
     }
 
     fn append_env_entry(block: &mut Vec<u16>, name: &str, value: &str) {
@@ -1688,23 +1824,81 @@ mod windows_impl {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn test_is_sensitive_env_name_matches_known_secret_patterns() {
-        use windows_impl::is_sensitive_env_name;
+        // Provider API keys.
         assert!(is_sensitive_env_name("ANTHROPIC_API_KEY"));
         assert!(is_sensitive_env_name("OPENAI_API_KEY"));
+        assert!(is_sensitive_env_name("anthropic_api_key"));
+        // VCS / CI tokens.
         assert!(is_sensitive_env_name("GITHUB_TOKEN"));
+        assert!(is_sensitive_env_name("GITLAB_PRIVATE_TOKEN"));
+        // Cloud secrets.
         assert!(is_sensitive_env_name("AWS_SECRET_ACCESS_KEY"));
+        assert!(is_sensitive_env_name("AWS_SESSION_TOKEN"));
+        // Credential-shaped fragments.
         assert!(is_sensitive_env_name("my_bearer_auth"));
         assert!(is_sensitive_env_name("DATABASE_PASSWORD"));
-        assert!(is_sensitive_env_name("anthropic_api_key"));
+        assert!(is_sensitive_env_name("GPG_PASSPHRASE"));
+        // `_KEY` catches non-API-key creds that don't match the older
+        // `API_KEY`/`PRIVATE_KEY`/`SESSION_KEY`/`ACCESS_KEY` patterns.
+        assert!(is_sensitive_env_name("SIGNING_KEY"));
+        assert!(is_sensitive_env_name("ENCRYPTION_KEY"));
+        assert!(is_sensitive_env_name("DEPLOY_KEY"));
     }
 
-    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_is_sensitive_env_name_catches_pointer_vars() {
+        // Specific named variables that point to credentials, agent
+        // sockets, or other exfil-relevant resources — caught by
+        // substring even when wrapped in a longer name.
+        assert!(is_sensitive_env_name("SSH_AUTH_SOCK"));
+        assert!(is_sensitive_env_name("WSL_SSH_AUTH_SOCK"));
+        assert!(is_sensitive_env_name("KUBECONFIG"));
+        assert!(is_sensitive_env_name("GNUPGHOME"));
+        assert!(is_sensitive_env_name("NETRC"));
+        assert!(is_sensitive_env_name("CURLOPT_NETRC"));
+        assert!(is_sensitive_env_name("GIT_SSH_COMMAND"));
+        assert!(is_sensitive_env_name("GIT_ASKPASS"));
+        assert!(is_sensitive_env_name("SSH_ASKPASS"));
+    }
+
+    #[test]
+    fn test_is_sensitive_env_name_catches_service_prefixes() {
+        // AI provider namespaces beyond the original list.
+        assert!(is_sensitive_env_name("OPENROUTER_API_KEY"));
+        assert!(is_sensitive_env_name("GROQ_API_KEY"));
+        assert!(is_sensitive_env_name("MISTRAL_API_KEY"));
+        assert!(is_sensitive_env_name("COHERE_API_KEY"));
+        // Database connection strings: DATABASE_URL embeds the password.
+        assert!(is_sensitive_env_name("DATABASE_URL"));
+        assert!(is_sensitive_env_name("POSTGRES_HOST"));
+        assert!(is_sensitive_env_name("MONGO_URI"));
+        assert!(is_sensitive_env_name("REDIS_PASSWORD"));
+        // PaaS / hosting providers.
+        assert!(is_sensitive_env_name("STRIPE_SECRET_KEY"));
+        assert!(is_sensitive_env_name("CLOUDFLARE_API_TOKEN"));
+        assert!(is_sensitive_env_name("VERCEL_TOKEN"));
+        assert!(is_sensitive_env_name("SUPABASE_KEY"));
+        // Identity / secret managers.
+        assert!(is_sensitive_env_name("VAULT_TOKEN"));
+        assert!(is_sensitive_env_name("OKTA_CLIENT_SECRET"));
+        assert!(is_sensitive_env_name("AUTH0_CLIENT_ID"));
+        // Generic auth tokens.
+        assert!(is_sensitive_env_name("JWT_SECRET"));
+        assert!(is_sensitive_env_name("OAUTH_CLIENT_SECRET"));
+        // Observability and communications.
+        assert!(is_sensitive_env_name("SENTRY_DSN"));
+        assert!(is_sensitive_env_name("DATADOG_API_KEY"));
+        assert!(is_sensitive_env_name("SLACK_WEBHOOK_URL"));
+        assert!(is_sensitive_env_name("DISCORD_BOT_TOKEN"));
+    }
+
     #[test]
     fn test_is_sensitive_env_name_allows_system_vars() {
-        use windows_impl::is_sensitive_env_name;
+        // Windows system vars PowerShell needs at startup must NOT be
+        // flagged sensitive — that's the whole reason Windows uses
+        // deny-list instead of allow-list.
         assert!(!is_sensitive_env_name("SystemRoot"));
         assert!(!is_sensitive_env_name("PATH"));
         assert!(!is_sensitive_env_name("PSModulePath"));
@@ -1713,6 +1907,106 @@ mod tests {
         assert!(!is_sensitive_env_name("ProgramFiles"));
         assert!(!is_sensitive_env_name("USERPROFILE"));
         assert!(!is_sensitive_env_name("TEMP"));
+        // Unix basics also shouldn't flag (the function is used on
+        // Windows but compiles cross-platform for testability).
+        assert!(!is_sensitive_env_name("HOME"));
+        assert!(!is_sensitive_env_name("USER"));
+        assert!(!is_sensitive_env_name("LANG"));
+        assert!(!is_sensitive_env_name("TERM"));
+        // `KEYBOARD_LAYOUT` doesn't have `_KEY` as a substring (the
+        // pattern requires an underscore before KEY), so it survives.
+        assert!(!is_sensitive_env_name("KEYBOARD_LAYOUT"));
+    }
+
+    /// `cargo test` always runs with `PATH` set (the test binary needs
+    /// it to invoke itself), so this is a no-mutation sanity check that
+    /// the filter doesn't accidentally strip it. Windows env-var names
+    /// are case-insensitive and typically stored as `Path`, so the match
+    /// is case-insensitive.
+    #[test]
+    fn test_sandbox_child_env_keeps_path() {
+        let env = sandbox_child_env();
+        assert!(
+            env.iter()
+                .any(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH")),
+            "expected PATH to survive the sandbox env filter"
+        );
+    }
+
+    /// Token-shaped sentinel: dropped by the Unix allow-list (not in
+    /// the curated list) AND by the Windows deny-list (`TOKEN` substring
+    /// match in `is_sensitive_env_name`). Verifies both arms strip it.
+    #[test]
+    fn test_sandbox_child_env_drops_token_sentinel() {
+        const NAME: &str = "AGSH_TEST_SCRUB_TOKEN_PROBE";
+        // SAFETY: `set_var`/`remove_var` are process-global and `cargo
+        // test` runs in-process tests in parallel. The variable name is
+        // long and test-specific so it can't collide with another test
+        // or the real environment.
+        unsafe {
+            std::env::set_var(NAME, "sentinel-should-be-dropped");
+        }
+        let env = sandbox_child_env();
+        let leaked = env.iter().any(|(name, _)| name.to_string_lossy() == NAME);
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert!(
+            !leaked,
+            "token-shaped sentinel leaked through the sandbox env filter"
+        );
+    }
+
+    /// Unix: any var not in the curated allow-list (and not matching
+    /// `LC_*`/`XDG_*`) is dropped. The sentinel name has no special
+    /// shape — pure "unknown var" test.
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_child_env_drops_unknown_var() {
+        const NAME: &str = "AGSH_TEST_SCRUB_UNKNOWN_PROBE";
+        unsafe {
+            std::env::set_var(NAME, "should-be-dropped");
+        }
+        let env = sandbox_child_env();
+        let leaked = env.iter().any(|(name, _)| name.to_string_lossy() == NAME);
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert!(!leaked, "unknown var leaked through the Unix allow-list");
+    }
+
+    /// Unix: `LC_*` prefix match keeps the locale family without
+    /// enumerating each variant.
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_child_env_keeps_lc_prefix() {
+        const NAME: &str = "LC_AGSH_TEST_PROBE";
+        unsafe {
+            std::env::set_var(NAME, "en_US.UTF-8");
+        }
+        let env = sandbox_child_env();
+        let kept = env.iter().any(|(name, _)| name.to_string_lossy() == NAME);
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert!(kept, "LC_* prefix var was dropped from sandbox env");
+    }
+
+    /// Unix: `XDG_*` prefix match keeps the XDG basedir family without
+    /// enumerating each variant.
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_child_env_keeps_xdg_prefix() {
+        const NAME: &str = "XDG_AGSH_TEST_PROBE";
+        unsafe {
+            std::env::set_var(NAME, "/tmp/agsh-probe");
+        }
+        let env = sandbox_child_env();
+        let kept = env.iter().any(|(name, _)| name.to_string_lossy() == NAME);
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert!(kept, "XDG_* prefix var was dropped from sandbox env");
     }
 
     #[test]

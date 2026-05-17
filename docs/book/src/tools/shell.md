@@ -43,8 +43,23 @@ In **read mode**, commands run inside a sandbox that blocks writes to the user's
 | dbus / systemd-user state mutations | Bubblewrap / macOS | Landlock / Windows |
 | Mach IPC state mutation (launchd, pasteboard, LaunchServices) | macOS | Linux / Windows |
 | COM / RPC to Low-integrity-accepting services (Windows) | | ✓ |
+| Inheritance of sensitive parent env vars (API keys, OAuth tokens, …) | ✓ (all platforms) | |
 
 The sandbox is not an adversarial containment boundary — it's defense-in-depth against an agent accidentally modifying user data. Set permission to `none` if you don't trust a turn at all.
+
+#### Environment variable scrubbing
+
+Read-mode sandboxes still permit outbound network (the threat model intentionally keeps `curl http://x | pdftotext`-style pipelines working), so any secret in the parent process's environment — `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, OAuth tokens, etc. — would be a live exfiltration vector under prompt injection. agsh scrubs the child environment at spawn time across every backend (Bubblewrap, Landlock, Seatbelt, Windows Low-integrity).
+
+- **Unix (Linux + macOS): allow-list.** Only a curated set of vars survives into the read-mode child: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PWD`, `TERM`, `COLORTERM`, `LANG`, `TMPDIR`, `TMP`, `TEMP`, plus everything matching the `LC_*` and `XDG_*` prefixes. Anything else is dropped — including credential-shaped vars (`AWS_*`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, …) and credential-pointer vars (`SSH_AUTH_SOCK`, `KUBECONFIG`, `GNUPGHOME`, `NETRC`, `GIT_ASKPASS`, `GIT_SSH_COMMAND`, etc.) as well as benign-but-unlisted vars like `EDITOR`, `PAGER`, `DISPLAY`, custom toolchain vars, and so on. Unknown vars are dropped by default.
+- **Windows: deny-list.** PowerShell pulls in a long tail of system vars (`PSModulePath`, `APPDATA`, `ProgramFiles`, etc.) that don't fit a tidy allow-list, so the Windows path lets everything through *except* names that match a heuristic deny-list. Dropped names include:
+    - Credential-shaped substrings: `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*PASSPHRASE*`, `*API_KEY*`, `*_KEY*`, `*BEARER*`, `*CREDENTIAL*`, etc.
+    - Credential-pointer substrings: `SSH_AUTH_SOCK`, `KUBECONFIG`, `GNUPGHOME`, `NETRC`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH_COMMAND`.
+    - Provider / service prefixes: `ANTHROPIC_*`, `OPENAI_*`, `AWS_*`, `GCP_*`, `GOOGLE_*`, `AZURE_*`, `GITHUB_*`, `OPENROUTER_*`, `GROQ_*`, `MISTRAL_*`, `COHERE_*`, `DATABASE_*`, `POSTGRES_*`, `MONGO_*`, `STRIPE_*`, `CLOUDFLARE_*`, `VAULT_*`, `OAUTH_*`, `JWT_*`, `SENTRY_*`, `SLACK_*`, `DISCORD_*`, and others — see `is_sensitive_env_name` in `src/sandbox.rs` for the full list.
+
+  The deny-list is intentionally aggressive on false positives (a legitimate `GITHUB_ACTOR` is dropped alongside `GITHUB_TOKEN`) because the cost of a missing env var is a confusing tool error, while the cost of a leaked credential is a live exfiltration channel.
+
+**Write mode keeps the full parent environment.** Write mode is the trusted-operation path where users legitimately need `NPM_TOKEN` for `npm publish`, `AWS_*` creds for `aws s3 cp`, `GH_TOKEN` for `gh pr create`, etc. If you need a specific var inside a read-mode shell command, switch to write mode for that turn.
 
 #### Linux: pick a backend
 
@@ -64,7 +79,7 @@ sandbox_backend = "bubblewrap"       # or "landlock"; unset = auto-detect
 #### macOS and Windows
 
 - **macOS**: Uses `sandbox-exec` with a hardened SBPL profile (modeled after [Codex](https://github.com/openai/codex)'s vendored seatbelt policy, which is itself based on Chrome's renderer sandbox). The profile is closed-by-default: filesystem writes are blocked, Mach-lookup is restricted to a curated allow-list of safe services, and mutation paths (launchd job control, pasteboard, LaunchServices, distributed notifications) are not in the allow-list. Network and DNS resolution remain available. The `sandbox_backend` config key is ignored.
-- **Windows**: Spawns the child with a duplicated primary token dropped to **Low integrity** (`SECURITY_MANDATORY_LOW_RID`) via `SetTokenInformation(TokenIntegrityLevel, …)`. Writes to the home directory, `%APPDATA%`, Program Files, and system directories — any location with Medium-or-higher integrity ACLs — are blocked by the kernel. Low integrity also strips token privileges and scrubs the environment block of sensitive variables (`ANTHROPIC_*`, `*_TOKEN`, etc.) before spawning. The `sandbox_backend` config key is ignored.
+- **Windows**: Spawns the child with a duplicated primary token dropped to **Low integrity** (`SECURITY_MANDATORY_LOW_RID`) via `SetTokenInformation(TokenIntegrityLevel, …)`. Writes to the home directory, `%APPDATA%`, Program Files, and system directories — any location with Medium-or-higher integrity ACLs — are blocked by the kernel. Low integrity also strips token privileges, and the same env scrubbing applied on Unix runs here (see [Environment variable scrubbing](#environment-variable-scrubbing) above). The `sandbox_backend` config key is ignored.
 
 Low integrity is not a total write-denial: the child can still write to the small residual Low-integrity-writable surface (`%LOCALAPPDATA%\Low`, `%TEMP%\Low`, any path with an explicit Low-integrity write ACE) and to files it creates itself.
 
