@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Skills cached at startup with mtime-based auto-reload; parse warnings now fire at startup.
+
+### Fixed
+
+- `/skill <name>` error paths no longer hang the REPL when the skill is missing or non-invocable.
+
 ## [0.23.0] - 2026-05-17
 
 ### Added

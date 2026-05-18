@@ -12,13 +12,17 @@ use uuid::Uuid;
 use crate::error::{AgshError, Result};
 use crate::permission::Permission;
 use crate::provider::ToolDefinition;
-use crate::skills::{self, Skill};
+use crate::skills::{self, Skill, SkillCache};
 
 use super::util::require_str;
 use super::{Tool, ToolOutput};
 
 pub(super) struct SkillTool {
     pub session_id: Arc<RwLock<Option<Uuid>>>,
+    /// Shared skill cache with the agent. Dispatch reads through
+    /// `current().await` so the tool sees any auto-reloads that happened
+    /// during the turn.
+    pub skills: Arc<SkillCache>,
 }
 
 #[async_trait]
@@ -55,8 +59,8 @@ impl Tool for SkillTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "skill")?;
+        let skills = self.skills.current().await;
 
-        let skills = skills::discover_skills();
         let skill = match find_skill(&skills, &name) {
             Some(skill) => skill,
             None => {
@@ -114,6 +118,7 @@ mod tests {
     async fn test_skill_tool_unknown_skill() {
         let tool = SkillTool {
             session_id: Arc::new(RwLock::new(None)),
+            skills: SkillCache::for_root(None),
         };
         let result = tool
             .execute(
@@ -132,6 +137,7 @@ mod tests {
     async fn test_skill_tool_missing_name() {
         let tool = SkillTool {
             session_id: Arc::new(RwLock::new(None)),
+            skills: SkillCache::for_root(None),
         };
         let result = tool
             .execute(serde_json::json!({}), CancellationToken::new())
@@ -156,10 +162,6 @@ mod tests {
         assert!(find_skill(&skills, "bar").is_none());
     }
 
-    // Exercise the happy-path flow by pointing the tool at a temp dir via env
-    // override. Since `discover_skills` uses `dirs::config_dir`, we can't easily
-    // override it without environment trickery; the skills.rs tests already
-    // cover the loading logic end-to-end.
     #[test]
     fn test_write_skill_helper() {
         let temp = tempfile::tempdir().expect("tempdir");

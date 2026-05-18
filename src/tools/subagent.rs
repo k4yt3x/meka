@@ -25,6 +25,10 @@ pub struct ToolBuilderParams {
     pub backend_probe: crate::sandbox::BackendProbe,
     /// Parent's `[tools]` filter — sub-agents inherit it.
     pub builtin_filter: BuiltinToolFilter,
+    /// Shared skill cache. Sub-agents read from the same cache as the
+    /// parent so their system prompts stay consistent and pick up the
+    /// same auto-reloads.
+    pub skills: Arc<crate::skills::SkillCache>,
 }
 
 pub struct SpawnAgentTool {
@@ -96,6 +100,7 @@ impl Tool for SpawnAgentTool {
             self.tool_builder_params.backend_probe.clone(),
             self.tool_builder_params.builtin_filter.clone(),
             sub_todo_list,
+            self.tool_builder_params.skills.clone(),
         )
         .map_err(|error| AgshError::ToolExecution {
             tool_name: "spawn_agent".to_string(),
@@ -337,6 +342,7 @@ mod tests {
             },
             BuiltinToolFilter::default(),
             todo_list,
+            crate::skills::SkillCache::for_root(None),
         )
         .expect("subagent registry should build");
 
@@ -372,6 +378,7 @@ mod tests {
             },
             BuiltinToolFilter::default(),
             sub_list.clone(),
+            crate::skills::SkillCache::for_root(None),
         )
         .expect("subagent registry should build");
 

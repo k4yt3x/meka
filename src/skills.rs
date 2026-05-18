@@ -5,9 +5,13 @@
 
 pub mod cli;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde::Deserialize;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -73,8 +77,15 @@ pub fn discover_skills() -> Vec<Skill> {
     let Some(root) = skills_dir() else {
         return Vec::new();
     };
+    discover_skills_in(&root)
+}
 
-    let entries = match std::fs::read_dir(&root) {
+/// Walk a specific skills root and parse every `SKILL.md`. Emits
+/// `tracing::warn!` for each malformed entry; that warning behavior is the
+/// signal the [`SkillCache`] relies on to surface broken-skill notices at
+/// startup and only re-fire when the on-disk snapshot changes.
+fn discover_skills_in(root: &Path) -> Vec<Skill> {
+    let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(error) => {
@@ -113,6 +124,115 @@ pub fn discover_skills() -> Vec<Skill> {
 
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+/// Snapshot the disk state of a skills root: `subdir/SKILL.md → mtime` for
+/// every non-dot subdirectory. Used by [`SkillCache`] to decide whether to
+/// re-run discovery on the next turn.
+///
+/// Returns `None` when `read_dir` fails with anything other than `NotFound`
+/// — that signals the caller to serve the cached (stale) state rather than
+/// wiping it on a transient filesystem hiccup. A `NotFound` error maps to
+/// `Some(empty)` so a deleted skills dir properly clears the cache.
+fn disk_snapshot(root: &Path) -> Option<BTreeMap<PathBuf, SystemTime>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(BTreeMap::new());
+        }
+        Err(_) => return None,
+    };
+
+    let mut map = BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let skill_file = path.join("SKILL.md");
+        // Stat failure (file missing, perm denied) maps to UNIX_EPOCH so a
+        // later stat-success transition forces a snapshot diff and reload.
+        let mtime = std::fs::metadata(&skill_file)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        map.insert(skill_file, mtime);
+    }
+    Some(map)
+}
+
+/// Shared, atomically-swappable view of the skill list. Construction runs
+/// an initial [`discover_skills_in`] pass so broken-skill warnings surface
+/// during agent startup (above the first REPL prompt) instead of during
+/// the first turn. Subsequent reads via [`SkillCache::current`] perform a
+/// cheap mtime-snapshot check and only re-discover when the on-disk state
+/// actually changed; identical broken-skill warnings naturally dedup
+/// across turns because the inner walk is skipped when the snapshot is
+/// stable.
+pub struct SkillCache {
+    /// Resolved skills root. `None` when [`skills_dir`] returns `None` or
+    /// when constructed via `SkillCache::for_root(None)` for test
+    /// scaffolding / subcommands that don't read skills.
+    root: Option<PathBuf>,
+    state: Mutex<CacheState>,
+}
+
+struct CacheState {
+    skills: Arc<Vec<Skill>>,
+    snapshot: BTreeMap<PathBuf, SystemTime>,
+}
+
+impl SkillCache {
+    /// Production constructor. Resolves [`skills_dir`] and seeds the cache.
+    pub fn discover() -> Arc<Self> {
+        Self::for_root(skills_dir())
+    }
+
+    /// Construct a cache backed by a specific root. `None` produces a
+    /// permanently-empty cache — useful for tests and for subcommands
+    /// (`agsh tools list`) that don't read skill metadata.
+    pub fn for_root(root: Option<PathBuf>) -> Arc<Self> {
+        let (skills, snapshot) = match root.as_deref() {
+            Some(root) => (
+                discover_skills_in(root),
+                disk_snapshot(root).unwrap_or_default(),
+            ),
+            None => (Vec::new(), BTreeMap::new()),
+        };
+        Arc::new(Self {
+            root,
+            state: Mutex::new(CacheState {
+                skills: Arc::new(skills),
+                snapshot,
+            }),
+        })
+    }
+
+    /// Return the current skill list, re-discovering first if the on-disk
+    /// snapshot has changed since the last call. Cheap when nothing
+    /// changed: one `read_dir` + N `metadata()` calls and a `BTreeMap`
+    /// comparison, then an `Arc::clone` of the cached vec.
+    pub async fn current(&self) -> Arc<Vec<Skill>> {
+        let Some(root) = self.root.as_deref() else {
+            return self.state.lock().await.skills.clone();
+        };
+        // Transient errors (e.g. EACCES on the dir) yield `None` — serve
+        // stale state rather than wipe the cache.
+        let Some(now) = disk_snapshot(root) else {
+            return self.state.lock().await.skills.clone();
+        };
+        let mut state = self.state.lock().await;
+        if state.snapshot != now {
+            state.skills = Arc::new(discover_skills_in(root));
+            state.snapshot = now;
+        }
+        state.skills.clone()
+    }
 }
 
 fn load_skill_definition(
@@ -487,5 +607,90 @@ mod tests {
 
         let body = load_skill_body(&skill, None).expect("body");
         assert!(body.contains("Session: ${AGSH_SESSION_ID}"));
+    }
+
+    fn valid_frontmatter(description: &str) -> String {
+        format!(
+            "---\ndescription: {}\nwhen_to_use: when needed\n---\nBody\n",
+            description
+        )
+    }
+
+    /// Bump the mtime of a file far enough in the future to defeat 1-second
+    /// filesystem resolution. Uses `File::set_modified` (stable since Rust
+    /// 1.75) so no extra dep is required.
+    fn bump_mtime(path: &Path) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for mtime bump");
+        let future = SystemTime::now() + std::time::Duration::from_secs(10);
+        file.set_modified(future).expect("set_modified");
+    }
+
+    #[tokio::test]
+    async fn test_skill_cache_picks_up_new_skill() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
+        assert!(cache.current().await.is_empty());
+
+        write_skill(temp.path(), "foo", &valid_frontmatter("first"));
+
+        let skills = cache.current().await;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "foo");
+    }
+
+    #[tokio::test]
+    async fn test_skill_cache_detects_modified_frontmatter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "foo", &valid_frontmatter("old"));
+
+        let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
+        let skills = cache.current().await;
+        assert_eq!(skills[0].description, "old");
+
+        let skill_md = temp.path().join("foo").join("SKILL.md");
+        std::fs::write(&skill_md, valid_frontmatter("new")).expect("rewrite");
+        bump_mtime(&skill_md);
+
+        let skills = cache.current().await;
+        assert_eq!(skills[0].description, "new");
+    }
+
+    #[tokio::test]
+    async fn test_skill_cache_drops_removed_skill() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "foo", &valid_frontmatter("first"));
+
+        let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
+        assert_eq!(cache.current().await.len(), 1);
+
+        std::fs::remove_dir_all(temp.path().join("foo")).expect("rm skill");
+        let skills = cache.current().await;
+        assert!(skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_skill_cache_stable_when_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_skill(temp.path(), "foo", &valid_frontmatter("first"));
+
+        let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
+        let first = cache.current().await;
+        let second = cache.current().await;
+
+        // Same Arc pointer ⇒ no rediscovery happened — proves the cache
+        // really did skip the inner walk on the stable-snapshot path.
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "expected cache to skip rediscovery when nothing changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skill_cache_with_no_root_is_empty() {
+        let cache = SkillCache::for_root(None);
+        assert!(cache.current().await.is_empty());
     }
 }

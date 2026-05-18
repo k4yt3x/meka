@@ -17,6 +17,7 @@ use crate::provider::{
 };
 use crate::render::{self, StreamingRenderer};
 use crate::session::SessionManager;
+use crate::skills::SkillCache;
 use crate::tools::ToolRegistry;
 use crate::tools::todo::SharedTodoList;
 
@@ -81,6 +82,12 @@ pub struct Agent {
     options: AgentOptions,
     todo_list: SharedTodoList,
     shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
+    /// Shared skill cache. Re-checks the on-disk snapshot at the top of
+    /// each turn and re-discovers when something changed, so adds /
+    /// removes / frontmatter edits land without restart. Body-only edits
+    /// take effect even sooner — `load_skill_body` re-reads from disk on
+    /// every invocation regardless of cache state.
+    skills: Arc<SkillCache>,
     approval_sender: Option<std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>>,
     last_input_tokens: std::sync::atomic::AtomicU64,
     /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by
@@ -107,6 +114,7 @@ impl Agent {
         options: AgentOptions,
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
+        skills: Arc<SkillCache>,
         approval_sender: Option<std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>>,
         session_stats: Arc<crate::stats::SessionStats>,
     ) -> Self {
@@ -118,6 +126,7 @@ impl Agent {
             options,
             todo_list,
             shared_session_id,
+            skills,
             approval_sender,
             last_input_tokens: std::sync::atomic::AtomicU64::new(0),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
@@ -130,6 +139,13 @@ impl Agent {
     /// from the REPL on demand.
     pub fn session_stats_snapshot(&self) -> crate::stats::SessionStatsSnapshot {
         self.session_stats.snapshot()
+    }
+
+    /// Shared handle to the auto-refreshing skill cache. The REPL's
+    /// `/skill <name>` dispatch reads from this so the agent's system
+    /// prompt and the user-invocable list never diverge.
+    pub fn skills(&self) -> &Arc<SkillCache> {
+        &self.skills
     }
 
     /// Attach the MCP client manager so server-supplied `initialize`
@@ -256,7 +272,7 @@ impl Agent {
         };
         let user_message = Message::user(&augmented_input);
         messages.append(user_message);
-        let skills = crate::skills::discover_skills();
+        let skills = self.skills.current().await;
         let mcp_instructions = self
             .mcp_manager
             .as_ref()
@@ -265,7 +281,7 @@ impl Agent {
         let system_prompt = context::build_system_prompt(
             &catalogue,
             self.options.sandboxed_shell,
-            &skills,
+            skills.as_slice(),
             self.options.user_instructions.as_deref(),
             &mcp_instructions,
         );

@@ -1535,6 +1535,7 @@ mod tests {
             todo_list,
             session_manager,
             shared_session_id,
+            crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
         )
         .expect("default web client config should build cleanly");
@@ -1640,6 +1641,7 @@ mod tests {
             todo_list,
             session_manager,
             shared_session_id,
+            crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
         )
         .expect("default web client config should build cleanly");
@@ -1767,6 +1769,7 @@ mod tests {
             todo_list,
             session_manager,
             shared_session_id,
+            crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
         )
         .expect("default web client config should build cleanly");
@@ -1865,6 +1868,7 @@ mod tests {
             todo_list,
             session_manager,
             shared_session_id,
+            crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
         )
         .expect("default web client config should build cleanly");

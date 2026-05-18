@@ -375,6 +375,14 @@ async fn create_agent_from_config(
     let shared_session_id: std::sync::Arc<tokio::sync::RwLock<Option<uuid::Uuid>>> =
         std::sync::Arc::new(tokio::sync::RwLock::new(None));
 
+    // Discover skills once at startup. Any malformed `SKILL.md` emits its
+    // `tracing::warn!` here (tracing is already initialized), so the user
+    // sees parse errors above the first prompt rather than interleaved with
+    // their first turn's output. The cache also drives mid-session auto-
+    // reload — `SkillCache::current()` re-snapshots on each turn and
+    // re-discovers only when the on-disk state changes.
+    let skills = crate::skills::SkillCache::discover();
+
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
         config.builtin_allowed_tools.clone(),
         config.builtin_disabled_tools.clone(),
@@ -391,6 +399,7 @@ async fn create_agent_from_config(
         todo_list.clone(),
         session_manager.clone(),
         shared_session_id.clone(),
+        skills.clone(),
         builtin_filter.clone(),
     )?;
 
@@ -406,6 +415,7 @@ async fn create_agent_from_config(
                 sandbox_backend: config.sandbox_backend,
                 backend_probe: config.backend_probe.clone(),
                 builtin_filter: builtin_filter.clone(),
+                skills: skills.clone(),
             },
             user_instructions: config.user_instructions.clone(),
         }))?;
@@ -465,6 +475,7 @@ async fn create_agent_from_config(
         },
         todo_list,
         shared_session_id,
+        skills,
         approval_sender,
         session_stats,
     );
@@ -869,8 +880,15 @@ async fn run_interactive(
                             render::render_error(&error);
                         }
                     }
-                    repl::SlashCommand::SkillInvoke { name, extra } => {
-                        let installed = skills::discover_skills();
+                    repl::SlashCommand::SkillInvoke { name, extra } => 'invoke: {
+                        // Labeled block so the early-exit error paths can
+                        // `break 'invoke` out of the arm body without
+                        // skipping the `AgentToReplEvent::Done` send below
+                        // — `continue` would short-circuit the outer
+                        // `while let`, leaving the REPL stuck in
+                        // `wait_for_agent` and never drawing the next
+                        // prompt.
+                        let installed = agent.skills().current().await;
                         let Some(skill) = installed.iter().find(|s| s.name == name) else {
                             let available: Vec<&str> =
                                 installed.iter().map(|s| s.name.as_str()).collect();
@@ -878,14 +896,14 @@ async fn run_interactive(
                                 "unknown skill '{}'; available: {:?}",
                                 name, available
                             ));
-                            continue;
+                            break 'invoke;
                         };
                         if !skill.user_invocable {
                             render::render_error(&format!(
                                 "skill '{}' is not user-invocable; remove `user_invocable: false` from its frontmatter to allow direct invocation",
                                 name
                             ));
-                            continue;
+                            break 'invoke;
                         }
                         let session_str = session_id.map(|id| id.to_string());
                         let body = match skills::load_skill_body(skill, session_str.as_deref()) {
@@ -895,7 +913,7 @@ async fn run_interactive(
                                     "failed to load skill '{}': {}",
                                     name, error
                                 ));
-                                continue;
+                                break 'invoke;
                             }
                         };
                         // Prepend the user's free-form directive to the
@@ -1163,6 +1181,9 @@ async fn run_tools_subcommand(
                 todo_list,
                 session_manager,
                 shared_session_id,
+                // `agsh tools list` only prints the tool catalogue; skill
+                // metadata isn't read, so skip the filesystem walk.
+                crate::skills::SkillCache::for_root(None),
                 crate::tools::BuiltinToolFilter::default(),
             )?;
 

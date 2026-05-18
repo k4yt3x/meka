@@ -481,6 +481,7 @@ impl ToolRegistry {
         todo_list: todo::SharedTodoList,
         session_manager: SessionManager,
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
+        skills: Arc<crate::skills::SkillCache>,
         builtin_filter: BuiltinToolFilter,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
@@ -498,6 +499,7 @@ impl ToolRegistry {
         }));
         registry.register_builtin(Arc::new(skill::SkillTool {
             session_id: shared_session_id.clone(),
+            skills,
         }));
         registry.register_builtin(Arc::new(render_image::RenderImageTool {
             session_id: shared_session_id.clone(),
@@ -545,6 +547,7 @@ impl ToolRegistry {
         backend_probe: crate::sandbox::BackendProbe,
         builtin_filter: BuiltinToolFilter,
         todo_list: todo::SharedTodoList,
+        skills: Arc<crate::skills::SkillCache>,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
         registry.register_core_tools(
@@ -559,6 +562,7 @@ impl ToolRegistry {
         // ${AGSH_SESSION_ID} stays unresolved for their invocations.
         registry.register_builtin(Arc::new(skill::SkillTool {
             session_id: Arc::new(RwLock::new(None)),
+            skills,
         }));
         registry.register_builtin(Arc::new(todo::TodoWriteTool {
             todo_list: todo_list.clone(),
@@ -613,6 +617,7 @@ pub(crate) mod tests {
             test_todo_list(),
             session_manager,
             shared_session_id,
+            crate::skills::SkillCache::for_root(None),
             filter,
         )
         .expect("default web client config should build cleanly")
@@ -1254,6 +1259,7 @@ pub(crate) mod tests {
             backend_probe,
             filter,
             test_todo_list(),
+            crate::skills::SkillCache::for_root(None),
         )
         .expect("default web client config should build cleanly");
         assert!(registry.get("read_file").is_some());
