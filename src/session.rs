@@ -251,9 +251,6 @@ impl SessionManager {
                     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
                         ON sessions(updated_at);
 
-                    CREATE INDEX IF NOT EXISTS idx_sessions_parent
-                        ON sessions(parent_session_id);
-
                     CREATE TABLE IF NOT EXISTS messages (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -345,9 +342,12 @@ impl SessionManager {
 
                 // Migration: add `sessions.parent_session_id` so sub-agent
                 // sessions can be linked back to the parent that spawned
-                // them. Primary sessions store NULL. The index covers both
-                // the `agsh list` parent-only filter and the cascade lookup
-                // in `delete_session`.
+                // them. Primary sessions store NULL. The cascade-FK is
+                // attached later in the rebuild migration below; this step
+                // only guarantees the column exists. Index is created
+                // unconditionally afterwards so fresh DBs (column from
+                // CREATE TABLE) and migrated DBs (column from ALTER TABLE)
+                // both end up with it.
                 let has_parent_col: bool = connection
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'parent_session_id'",
@@ -357,12 +357,13 @@ impl SessionManager {
                     .unwrap_or(0)
                     > 0;
                 if !has_parent_col {
-                    connection.execute_batch(
-                        "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;
-                         CREATE INDEX IF NOT EXISTS idx_sessions_parent
-                             ON sessions(parent_session_id);",
-                    )?;
+                    connection
+                        .execute_batch("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")?;
                 }
+                connection.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_parent
+                         ON sessions(parent_session_id)",
+                )?;
 
                 // Migration: drop the legacy `sessions.metadata` column. It
                 // was reserved for future use but never populated by any
@@ -2284,6 +2285,141 @@ mod tests {
             .expect("failed to enforce");
         assert_eq!(deleted, 0);
         assert!(manager.session_exists(session_id).await.expect("failed"));
+    }
+
+    // Regression: upgrading a pre-0.24 on-disk DB (no parent_session_id
+    // column, FKs without ON DELETE CASCADE, `metadata` still present)
+    // must succeed end-to-end with data preserved and the post-migration
+    // schema in place. Previously the initial `CREATE INDEX ... ON
+    // sessions(parent_session_id)` ran before the ADD COLUMN step and
+    // bombed with "no such column: parent_session_id".
+    #[tokio::test]
+    async fn test_migration_from_pre_0_24_schema() {
+        use rusqlite::Connection as RusqliteConnection;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("sessions.db");
+        let session_id = Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Stage a pre-0.24 schema with a session + message + tool_output.
+        {
+            let conn = RusqliteConnection::open(&db_path).expect("rusqlite open");
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL,
+                     metadata TEXT
+                 );
+                 CREATE TABLE messages (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     session_id TEXT NOT NULL,
+                     role TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     FOREIGN KEY (session_id) REFERENCES sessions(id)
+                 );
+                 CREATE INDEX idx_messages_session_id ON messages(session_id);
+                 CREATE TABLE tool_outputs (
+                     session_id TEXT NOT NULL,
+                     name TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     PRIMARY KEY (session_id, name),
+                     FOREIGN KEY (session_id) REFERENCES sessions(id)
+                 );",
+            )
+            .expect("stage pre-0.24 schema");
+            conn.execute(
+                "INSERT INTO sessions(id, created_at, updated_at, metadata) \
+                 VALUES (?1, ?2, ?2, NULL)",
+                rusqlite::params![session_id.to_string(), &now],
+            )
+            .expect("insert session");
+            conn.execute(
+                "INSERT INTO messages(session_id, role, content, created_at) \
+                 VALUES (?1, 'user', 'preserved', ?2)",
+                rusqlite::params![session_id.to_string(), &now],
+            )
+            .expect("insert message");
+            conn.execute(
+                "INSERT INTO tool_outputs(session_id, name, content, created_at) \
+                 VALUES (?1, 'scratch', 'body', ?2)",
+                rusqlite::params![session_id.to_string(), &now],
+            )
+            .expect("insert tool_output");
+        }
+
+        let manager = SessionManager::open(Some(&db_path))
+            .await
+            .expect("migration should succeed for pre-0.24 schema");
+
+        // Data preserved.
+        assert!(
+            manager.session_exists(session_id).await.expect("exists"),
+            "session row should survive migration"
+        );
+        let preserved = manager
+            .load_tool_output(session_id, "scratch")
+            .await
+            .expect("load tool_output");
+        assert_eq!(preserved.as_deref(), Some("body"));
+
+        // Schema reshaped to 0.24+ form.
+        let (has_metadata, has_parent, messages_cascade, tool_outputs_cascade): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = manager
+            .connection
+            .call(move |conn| -> rusqlite::Result<_> {
+                let has_metadata = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='metadata'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let has_parent = conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions') \
+                     WHERE name='parent_session_id'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let messages_cascade = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type='table' AND name='messages' \
+                       AND sql LIKE '%ON DELETE CASCADE%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let tool_outputs_cascade = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type='table' AND name='tool_outputs' \
+                       AND sql LIKE '%ON DELETE CASCADE%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok((
+                    has_metadata,
+                    has_parent,
+                    messages_cascade,
+                    tool_outputs_cascade,
+                ))
+            })
+            .await
+            .expect("schema introspection");
+
+        assert_eq!(has_metadata, 0, "metadata column should be dropped");
+        assert_eq!(has_parent, 1, "parent_session_id column should be added");
+        assert_eq!(
+            messages_cascade, 1,
+            "messages FK should carry ON DELETE CASCADE"
+        );
+        assert_eq!(
+            tool_outputs_cascade, 1,
+            "tool_outputs FK should carry ON DELETE CASCADE"
+        );
     }
 
     // Child-session tests: parent→sub-agent linkage, cascade-on-delete,
