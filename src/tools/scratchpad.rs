@@ -645,19 +645,19 @@ impl Tool for ScratchpadListTool {
             return Ok(ToolOutput::text("Scratchpad is empty.".to_string(), false));
         }
 
-        let mut output = format!(
-            "{:<24} {:<10} {:<20} {}\n",
-            "Name", "Size", "Created", "Origin",
-        );
-        for (entry, origin) in &rows {
-            output.push_str(&format!(
-                "{:<24} {:<10} {:<20} {}\n",
-                entry.name,
-                format_size(entry.size),
-                &entry.created_at[..19.min(entry.created_at.len())],
-                origin,
-            ));
-        }
+        let table_rows: Vec<Vec<String>> = rows
+            .iter()
+            .map(|(entry, origin)| {
+                vec![
+                    entry.name.clone(),
+                    format_size(entry.size),
+                    entry.created_at[..19.min(entry.created_at.len())].to_string(),
+                    origin.to_string(),
+                ]
+            })
+            .collect();
+        let mut output =
+            crate::render::format_columns(&["Name", "Size", "Created", "Origin"], &table_rows);
         output.push_str(&format!("\n{} entries total", rows.len()));
 
         Ok(ToolOutput::text(output, false))

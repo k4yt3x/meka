@@ -41,56 +41,57 @@ pub async fn run_list(
         }
     }
 
-    if manager.is_some() {
-        println!(
-            "{:<24} {:<8} {:<9} {:<8} target",
-            "name", "transport", "state", "perm"
-        );
-        println!("{}", "-".repeat(72));
-    } else {
-        println!("{:<24} {:<8} {:<8} target", "name", "transport", "perm");
-        println!("{}", "-".repeat(72));
-    }
+    // The live-manager variant adds a `State` column; both share the
+    // shared column formatter so the table aligns regardless of how
+    // long a server name or target gets.
+    let with_state = manager.is_some();
 
-    for config in servers {
-        let target = match config.transport {
-            McpTransport::Stdio => {
-                let args = config
-                    .args
-                    .as_ref()
-                    .map(|a| a.join(" "))
-                    .unwrap_or_default();
-                format!(
-                    "{} {}",
-                    config.command.as_deref().unwrap_or("(no command)"),
-                    args
-                )
-                .trim()
-                .to_string()
+    let rows: Vec<Vec<String>> = servers
+        .iter()
+        .map(|config| {
+            let target = match config.transport {
+                McpTransport::Stdio => {
+                    let args = config
+                        .args
+                        .as_ref()
+                        .map(|a| a.join(" "))
+                        .unwrap_or_default();
+                    format!(
+                        "{} {}",
+                        config.command.as_deref().unwrap_or("(no command)"),
+                        args
+                    )
+                    .trim()
+                    .to_string()
+                }
+                McpTransport::Http => config.url.clone().unwrap_or_else(|| "(no url)".to_string()),
+            };
+            let transport_label = match config.transport {
+                McpTransport::Stdio => "stdio",
+                McpTransport::Http => "http",
+            };
+            let perm_label = config.permission.as_deref().unwrap_or("read");
+
+            let mut row = vec![config.name.clone(), transport_label.to_string()];
+            if with_state {
+                let state_label = states
+                    .get(config.name.as_str())
+                    .copied()
+                    .unwrap_or("(unknown)");
+                row.push(state_label.to_string());
             }
-            McpTransport::Http => config.url.clone().unwrap_or_else(|| "(no url)".to_string()),
-        };
-        let transport_label = match config.transport {
-            McpTransport::Stdio => "stdio",
-            McpTransport::Http => "http",
-        };
-        let perm_label = config.permission.as_deref().unwrap_or("read");
-        if manager.is_some() {
-            let state_label = states
-                .get(config.name.as_str())
-                .copied()
-                .unwrap_or("(unknown)");
-            println!(
-                "{:<24} {:<8} {:<9} {:<8} {}",
-                config.name, transport_label, state_label, perm_label, target
-            );
-        } else {
-            println!(
-                "{:<24} {:<8} {:<8} {}",
-                config.name, transport_label, perm_label, target
-            );
-        }
-    }
+            row.push(perm_label.to_string());
+            row.push(target);
+            row
+        })
+        .collect();
+
+    let headers: &[&str] = if with_state {
+        &["Name", "Transport", "State", "Permission", "Target"]
+    } else {
+        &["Name", "Transport", "Permission", "Target"]
+    };
+    print!("{}", crate::render::format_columns(headers, &rows));
     Ok(())
 }
 
@@ -217,42 +218,25 @@ pub async fn run_tools(
         return Ok(());
     }
 
-    let name_width = tools
+    let rows: Vec<Vec<String>> = tools
         .iter()
-        .map(|t| t.raw_name.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let source_width = tools
-        .iter()
-        .map(|t| t.permission_source.as_str().len())
-        .max()
-        .unwrap_or(6)
-        .max(6);
-
-    println!(
-        "{:<name_w$}  {:<5}  {:<src_w$}  {:<7}  description",
-        "name",
-        "perm",
-        "source",
-        "status",
-        name_w = name_width,
-        src_w = source_width,
+        .map(|tool| {
+            vec![
+                tool.raw_name.clone(),
+                tool.resolved_permission.to_string(),
+                tool.permission_source.as_str().to_string(),
+                if tool.allowed { "allowed" } else { "blocked" }.to_string(),
+                describe_one_line(&tool.description),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        crate::render::format_columns(
+            &["Name", "Permission", "Source", "Status", "Description"],
+            &rows,
+        )
     );
-    for tool in &tools {
-        let status = if tool.allowed { "allowed" } else { "blocked" };
-        let description = describe_one_line(&tool.description);
-        println!(
-            "{:<name_w$}  {:<5}  {:<src_w$}  {:<7}  {}",
-            tool.raw_name,
-            tool.resolved_permission.to_string(),
-            tool.permission_source.as_str(),
-            status,
-            description,
-            name_w = name_width,
-            src_w = source_width,
-        );
-    }
 
     let total = tools.len();
     let allowed = tools.iter().filter(|t| t.allowed).count();

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-05-20
+
+### Added
+
+- `agsh skill update` re-fetches skills from their `source_url` and replaces them on disk.
+- Skill frontmatter gains optional `author` and `source_url` fields.
+
+### Changed
+
+- CLI list tables (`skill`/`mcp list`, `mcp tools`, `list`) share one column formatter with dynamic widths.
+
+### Removed
+
+- Skill frontmatter fields `when_to_use`, `allowed_tools`, and `user_invocable`.
+
 ## [0.25.2] - 2026-05-20
 
 ### Changed

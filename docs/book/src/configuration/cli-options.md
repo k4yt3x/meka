@@ -158,14 +158,14 @@ agsh --instructions "Be terse. No code fences in answers."
 
 ### `--skill <NAME>`
 
-Invoke a [user-invocable skill](../usage/skills.md) as the first turn. Mirrors the REPL slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli) — the positional `[PROMPT]` arg, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#oneshot) to exit after the turn instead of opening the REPL.
+Invoke a [skill](../usage/skills.md) as the first turn. Mirrors the REPL slash command [`/skill <name> [extra...]`](../usage/skills.md#invoking-a-skill-from-the-cli) — the positional `[PROMPT]` arg, if given, is prepended to the rendered skill body as additional context. Pair with [`--oneshot`](#oneshot) to exit after the turn instead of opening the REPL.
 
 ```bash
 agsh --skill download-videos "https://example.com/video"             # first turn, then REPL
 agsh --skill download-videos --oneshot "https://example.com/video"   # first turn, then exit
 ```
 
-Errors out with a clean message if the skill name is unknown or the skill's frontmatter sets `user_invocable: false`.
+Errors out with a clean message if the skill name is unknown.
 
 ### `--oneshot`
 

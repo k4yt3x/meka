@@ -80,7 +80,7 @@ pub enum SkillAction {
     /// Scaffold a new skill at `~/.config/agsh/skills/<name>/SKILL.md`.
     ///
     /// Examples:
-    ///   agsh skill add demo --description "X" --when-to-use "Y"
+    ///   agsh skill add demo --description "X"
     ///   agsh skill add custom --from-file ./template.md
     #[command(verbatim_doc_comment)]
     Add {
@@ -91,21 +91,17 @@ pub enum SkillAction {
         #[arg(long)]
         description: Option<String>,
 
-        /// One-line "when to use" hint
-        #[arg(long = "when-to-use")]
-        when_to_use: Option<String>,
-
-        /// Allowed-tool name (repeatable; advisory)
-        #[arg(long = "allowed-tools", value_name = "TOOL")]
-        allowed_tools: Vec<String>,
-
         /// Version label
         #[arg(long)]
         version: Option<String>,
 
-        /// User-invocable via `/skill <name>` (default true)
-        #[arg(long = "user-invocable")]
-        user_invocable: Option<bool>,
+        /// Author / attribution string
+        #[arg(long)]
+        author: Option<String>,
+
+        /// https:// URL the skill can be re-fetched from by `skill update`
+        #[arg(long = "source-url", value_name = "URL")]
+        source_url: Option<String>,
 
         /// Copy this file's contents instead of the default template
         #[arg(long = "from-file", value_name = "PATH")]
@@ -121,6 +117,25 @@ pub enum SkillAction {
     },
     /// Remove a skill's directory
     Remove { name: String },
+    /// Re-fetch skills from their `source_url` and replace them on disk.
+    ///
+    /// Examples:
+    ///   agsh skill update my-skill
+    ///   agsh skill update --all          # dry run: lists what would update
+    ///   agsh skill update --all --yes    # applies the updates
+    #[command(verbatim_doc_comment)]
+    Update {
+        /// Skill name to update. Omit and pass --all to update every skill.
+        name: Option<String>,
+
+        /// Update every skill that declares a source_url
+        #[arg(long)]
+        all: bool,
+
+        /// Apply --all updates (without this, --all only lists)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 // Same reasoning as `Command` above: `Add` is the outlier and the enum

@@ -1,7 +1,7 @@
 //! Handlers for the `agsh skill <subcommand>` CLI: list, get, show, add,
-//! remove. Mirrors the structure of [`crate::mcp::cli`]: each handler
-//! returns `Result<()>`, prints parseable data to stdout (the user
-//! requested it; pipes / scripts read from there) and lifecycle /
+//! remove, update. Mirrors the structure of [`crate::mcp::cli`]: each
+//! handler returns `Result<()>`, prints parseable data to stdout (the
+//! user requested it; pipes / scripts read from there) and lifecycle /
 //! diagnostic messages via `tracing` per the project's logging
 //! guidelines.
 
@@ -11,7 +11,6 @@ use crate::error::{AgshError, Result};
 use crate::skills;
 
 const DESCRIPTION_TRUNCATE: usize = 40;
-const WHEN_TO_USE_TRUNCATE: usize = 40;
 
 /// Argument bag for [`run_add`]. Borrowed so callers don't have to
 /// clone every field out of the clap-derived `cli::SkillAction::Add`
@@ -19,10 +18,9 @@ const WHEN_TO_USE_TRUNCATE: usize = 40;
 pub struct AddArgs<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
-    pub when_to_use: Option<&'a str>,
-    pub allowed_tools: &'a [String],
     pub version: Option<&'a str>,
-    pub user_invocable: Option<bool>,
+    pub author: Option<&'a str>,
+    pub source_url: Option<&'a str>,
     pub from_file: Option<&'a Path>,
     pub force: bool,
     pub edit: bool,
@@ -42,17 +40,23 @@ fn print_list(skills: &[skills::Skill]) {
         println!("(no skills installed)");
         return;
     }
-    println!("name\tdescription\twhen_to_use\tinvocable\tpath");
-    for skill in skills {
-        println!(
-            "{}\t{}\t{}\t{}\t{}",
-            skill.name,
-            truncate(&skill.description, DESCRIPTION_TRUNCATE),
-            truncate(&skill.when_to_use, WHEN_TO_USE_TRUNCATE),
-            skill.user_invocable,
-            skill.source_dir.display(),
-        );
-    }
+
+    let rows: Vec<Vec<String>> = skills
+        .iter()
+        .map(|skill| {
+            vec![
+                skill.name.clone(),
+                skill.version.clone().unwrap_or_else(|| "-".to_string()),
+                truncate(&skill.description, DESCRIPTION_TRUNCATE),
+                skill.source_dir.display().to_string(),
+            ]
+        })
+        .collect();
+
+    print!(
+        "{}",
+        crate::render::format_columns(&["Name", "Version", "Description", "Path"], &rows)
+    );
 }
 
 /// `agsh skill get <name>` — dump frontmatter as `key: value` lines.
@@ -65,10 +69,12 @@ pub async fn run_get(name: &str) -> Result<()> {
     println!("source_dir: {}", skill.source_dir.display());
     println!("body_path: {}", skill.body_path.display());
     println!("description: {}", skill.description);
-    println!("when_to_use: {}", skill.when_to_use);
-    println!("allowed_tools: {}", skill.allowed_tools.join(", "));
     println!("version: {}", skill.version.as_deref().unwrap_or("(unset)"));
-    println!("user_invocable: {}", skill.user_invocable);
+    println!("author: {}", skill.author.as_deref().unwrap_or("(unset)"));
+    println!(
+        "source_url: {}",
+        skill.source_url.as_deref().unwrap_or("(unset)")
+    );
     println!("body: {} bytes", body_bytes);
     Ok(())
 }
@@ -145,9 +151,9 @@ pub async fn run_add(args: AddArgs<'_>) -> Result<()> {
 
 fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
     if let Some(path) = args.from_file {
-        if args.description.is_some() || args.when_to_use.is_some() {
+        if args.description.is_some() {
             return Err(AgshError::Config(
-                "--from-file is mutually exclusive with --description / --when-to-use".to_string(),
+                "--from-file is mutually exclusive with --description".to_string(),
             ));
         }
         let content = std::fs::read_to_string(path).map_err(|error| {
@@ -160,18 +166,12 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
                 "--description is required (or pass --from-file to copy a template)".to_string(),
             )
         })?;
-        let when_to_use = args.when_to_use.ok_or_else(|| {
-            AgshError::Config(
-                "--when-to-use is required (or pass --from-file to copy a template)".to_string(),
-            )
-        })?;
         Ok(skills::render_template(
             args.name,
             description,
-            when_to_use,
-            args.allowed_tools,
             args.version,
-            args.user_invocable.unwrap_or(true),
+            args.author,
+            args.source_url,
         ))
     }
 }
@@ -194,6 +194,176 @@ pub async fn run_remove(name: &str) -> Result<()> {
     })?;
     tracing::info!("removed skill '{}'", name);
     Ok(())
+}
+
+/// Outcome of a single skill re-fetch.
+#[derive(Debug)]
+enum UpdateOutcome {
+    /// Fetched content was byte-identical to what's on disk — nothing
+    /// written (avoids bumping mtime / a spurious skill-cache reload).
+    Unchanged,
+    Updated {
+        from: Option<String>,
+        to: Option<String>,
+    },
+}
+
+fn version_label(version: &Option<String>) -> &str {
+    version.as_deref().unwrap_or("unversioned")
+}
+
+/// `agsh skill update [<name>] [--all] [--yes]` — re-fetch skills that
+/// declare a `source_url` and replace them on disk.
+pub async fn run_update(name: Option<&str>, all: bool, yes: bool) -> Result<()> {
+    match (name, all) {
+        (Some(_), true) => Err(AgshError::Config(
+            "pass either a skill name or --all, not both".to_string(),
+        )),
+        (None, false) => Err(AgshError::Config(
+            "specify a skill name, or pass --all to update every skill".to_string(),
+        )),
+        (Some(name), false) => update_one(name).await,
+        (None, true) => update_all(yes).await,
+    }
+}
+
+async fn update_one(name: &str) -> Result<()> {
+    let skill = require_skill(name)?;
+    if skill.source_url.is_none() {
+        return Err(AgshError::Config(format!(
+            "skill '{}' has no source_url; nothing to update",
+            name
+        )));
+    }
+    match fetch_and_replace_skill(&skill).await? {
+        UpdateOutcome::Unchanged => println!("{}: unchanged", name),
+        UpdateOutcome::Updated { from, to } => println!(
+            "{}: updated ({} -> {})",
+            name,
+            version_label(&from),
+            version_label(&to),
+        ),
+    }
+    Ok(())
+}
+
+async fn update_all(yes: bool) -> Result<()> {
+    let updatable: Vec<skills::Skill> = skills::discover_skills()
+        .into_iter()
+        .filter(|skill| skill.source_url.is_some())
+        .collect();
+
+    if updatable.is_empty() {
+        println!("(no skills declare a source_url)");
+        return Ok(());
+    }
+
+    // Dry run: --all without --yes lists what would change and stops.
+    // This is the confirmation gate for a bulk remote fetch.
+    if !yes {
+        println!("Skills that would be updated (re-run with --yes to apply):");
+        for skill in &updatable {
+            println!(
+                "  {}\t{}\t{}",
+                skill.name,
+                version_label(&skill.version),
+                skill.source_url.as_deref().unwrap_or(""),
+            );
+        }
+        return Ok(());
+    }
+
+    // A per-skill failure is reported and does not abort the rest.
+    for skill in &updatable {
+        match fetch_and_replace_skill(skill).await {
+            Ok(UpdateOutcome::Unchanged) => println!("{}: unchanged", skill.name),
+            Ok(UpdateOutcome::Updated { from, to }) => println!(
+                "{}: updated ({} -> {})",
+                skill.name,
+                version_label(&from),
+                version_label(&to),
+            ),
+            Err(error) => eprintln!("{}: update failed: {}", skill.name, error),
+        }
+    }
+    Ok(())
+}
+
+/// Fetch a skill's `source_url`, validate the response parses as a
+/// skill, and atomically replace the on-disk `SKILL.md`. A failed fetch
+/// or a malformed response leaves the existing file untouched —
+/// validation happens entirely in memory before any write.
+async fn fetch_and_replace_skill(skill: &skills::Skill) -> Result<UpdateOutcome> {
+    let url = skill
+        .source_url
+        .as_deref()
+        .ok_or_else(|| AgshError::Config(format!("skill '{}' has no source_url", skill.name)))?;
+
+    // Explicit scheme check for a clear error; `https_only(true)` below
+    // is the defense-in-depth that also blocks an http downgrade on a
+    // redirect (GitHub-raw / gist URLs do redirect).
+    if !url.starts_with("https://") {
+        return Err(AgshError::Config(format!(
+            "skill '{}' source_url must be https://, got: {}",
+            skill.name, url
+        )));
+    }
+
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(crate::config::DEFAULT_WEB_USER_AGENT)
+        .build()
+        .map_err(|error| AgshError::Config(format!("failed to build HTTP client: {}", error)))?;
+
+    let fetched = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| {
+            AgshError::Config(format!("fetch failed for '{}': {}", skill.name, error))
+        })?
+        .error_for_status()
+        .map_err(|error| {
+            AgshError::Config(format!("fetch failed for '{}': {}", skill.name, error))
+        })?
+        .text()
+        .await
+        .map_err(|error| {
+            AgshError::Config(format!(
+                "failed to read response body for '{}': {}",
+                skill.name, error
+            ))
+        })?;
+
+    // Validate in memory — never overwrite the on-disk skill with a 404
+    // page, a non-skill file, or malformed frontmatter.
+    let parsed =
+        skills::parse_skill_definition(&skill.name, &skill.source_dir, &skill.body_path, &fetched)
+            .map_err(|error| {
+                AgshError::Config(format!(
+                    "fetched content for '{}' is not a valid skill: {}",
+                    skill.name, error
+                ))
+            })?;
+
+    let current = std::fs::read_to_string(&skill.body_path).unwrap_or_default();
+    if current == fetched {
+        return Ok(UpdateOutcome::Unchanged);
+    }
+
+    crate::config::write_config_atomic(&skill.body_path, &fetched).map_err(|error| {
+        AgshError::Config(format!(
+            "failed to write {}: {}",
+            skill.body_path.display(),
+            error
+        ))
+    })?;
+
+    Ok(UpdateOutcome::Updated {
+        from: skill.version.clone(),
+        to: parsed.version,
+    })
 }
 
 pub(crate) fn require_skill(name: &str) -> Result<skills::Skill> {
@@ -237,19 +407,13 @@ mod tests {
         guard
     }
 
-    fn add_args<'a>(
-        name: &'a str,
-        description: &'a str,
-        when_to_use: &'a str,
-        allowed_tools: &'a [String],
-    ) -> AddArgs<'a> {
+    fn add_args<'a>(name: &'a str, description: &'a str) -> AddArgs<'a> {
         AddArgs {
             name,
             description: Some(description),
-            when_to_use: Some(when_to_use),
-            allowed_tools,
             version: None,
-            user_invocable: None,
+            author: None,
+            source_url: None,
             from_file: None,
             force: false,
             edit: false,
@@ -261,19 +425,13 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env = isolate_config_dir(&temp).await;
 
-        let tools = vec!["execute_command".to_string()];
-        run_add(add_args("demo", "demo desc", "for testing", &tools))
-            .await
-            .expect("add");
+        run_add(add_args("demo", "demo desc")).await.expect("add");
 
         let skills = skills::discover_skills();
         assert_eq!(skills.len(), 1);
         let skill = &skills[0];
         assert_eq!(skill.name, "demo");
         assert_eq!(skill.description, "demo desc");
-        assert_eq!(skill.when_to_use, "for testing");
-        assert_eq!(skill.allowed_tools, vec!["execute_command".to_string()]);
-        assert!(skill.user_invocable);
     }
 
     #[tokio::test]
@@ -281,10 +439,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env = isolate_config_dir(&temp).await;
 
-        run_add(add_args("dup", "first", "first use", &[]))
-            .await
-            .expect("first add");
-        let err = run_add(add_args("dup", "second", "second use", &[]))
+        run_add(add_args("dup", "first")).await.expect("first add");
+        let err = run_add(add_args("dup", "second"))
             .await
             .expect_err("second add should fail");
         assert!(format!("{}", err).contains("already exists"));
@@ -295,10 +451,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env = isolate_config_dir(&temp).await;
 
-        run_add(add_args("over", "old", "old use", &[]))
-            .await
-            .expect("first add");
-        let mut args = add_args("over", "new", "new use", &[]);
+        run_add(add_args("over", "old")).await.expect("first add");
+        let mut args = add_args("over", "new");
         args.force = true;
         run_add(args).await.expect("force overwrite");
 
@@ -308,21 +462,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_add_with_source_url_round_trips() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _env = isolate_config_dir(&temp).await;
+
+        let mut args = add_args("sourced", "a sourced skill");
+        args.version = Some("1.0");
+        args.author = Some("k4yt3x");
+        args.source_url = Some("https://example.com/SKILL.md");
+        run_add(args).await.expect("add");
+
+        let skill = require_skill("sourced").expect("found");
+        assert_eq!(skill.version.as_deref(), Some("1.0"));
+        assert_eq!(skill.author.as_deref(), Some("k4yt3x"));
+        assert_eq!(
+            skill.source_url.as_deref(),
+            Some("https://example.com/SKILL.md")
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_add_from_file_copies_verbatim() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env = isolate_config_dir(&temp).await;
 
         let template = temp.path().join("template.md");
-        let body = "---\ndescription: tpl desc\nwhen_to_use: tpl use\n---\n# Templated\n\nbody.\n";
+        let body = "---\ndescription: tpl desc\n---\n# Templated\n\nbody.\n";
         std::fs::write(&template, body).expect("write template");
 
         let args = AddArgs {
             name: "tpl",
             description: None,
-            when_to_use: None,
-            allowed_tools: &[],
             version: None,
-            user_invocable: None,
+            author: None,
+            source_url: None,
             from_file: Some(&template),
             force: false,
             edit: false,
@@ -340,15 +513,14 @@ mod tests {
         let _env = isolate_config_dir(&temp).await;
 
         let template = temp.path().join("template.md");
-        std::fs::write(&template, "---\ndescription: x\nwhen_to_use: y\n---\n").expect("write");
+        std::fs::write(&template, "---\ndescription: x\n---\n").expect("write");
 
         let args = AddArgs {
             name: "tpl",
             description: Some("collides"),
-            when_to_use: None,
-            allowed_tools: &[],
             version: None,
-            user_invocable: None,
+            author: None,
+            source_url: None,
             from_file: Some(&template),
             force: false,
             edit: false,
@@ -365,10 +537,9 @@ mod tests {
         let args = AddArgs {
             name: "needs",
             description: None,
-            when_to_use: Some("only when"),
-            allowed_tools: &[],
             version: None,
-            user_invocable: None,
+            author: None,
+            source_url: None,
             from_file: None,
             force: false,
             edit: false,
@@ -382,7 +553,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env = isolate_config_dir(&temp).await;
 
-        run_add(add_args("gone", "x", "y", &[])).await.expect("add");
+        run_add(add_args("gone", "x")).await.expect("add");
         assert_eq!(skills::discover_skills().len(), 1);
 
         run_remove("gone").await.expect("remove");
@@ -408,26 +579,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_update_requires_name_or_all() {
+        let err = run_update(None, false, false)
+            .await
+            .expect_err("should error");
+        assert!(format!("{}", err).contains("specify a skill name"));
+    }
+
+    #[tokio::test]
+    async fn test_run_update_rejects_name_and_all_together() {
+        let err = run_update(Some("x"), true, false)
+            .await
+            .expect_err("should error");
+        assert!(format!("{}", err).contains("not both"));
+    }
+
+    #[tokio::test]
+    async fn test_run_update_errors_when_skill_has_no_source_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _env = isolate_config_dir(&temp).await;
+
+        run_add(add_args("local", "no source url"))
+            .await
+            .expect("add");
+        let err = run_update(Some("local"), false, false)
+            .await
+            .expect_err("should error");
+        assert!(format!("{}", err).contains("no source_url"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_replace_rejects_non_https() {
+        // The scheme check fires before any network call, so this needs
+        // no server. A non-https source_url must error and never write.
+        let skill = skills::Skill {
+            name: "insecure".to_string(),
+            source_dir: std::path::PathBuf::from("/tmp/insecure"),
+            description: "x".to_string(),
+            version: None,
+            author: None,
+            source_url: Some("http://example.com/SKILL.md".to_string()),
+            body_path: std::path::PathBuf::from("/tmp/insecure/SKILL.md"),
+        };
+        let err = fetch_and_replace_skill(&skill)
+            .await
+            .expect_err("should reject http://");
+        assert!(format!("{}", err).contains("https://"));
+    }
+
+    #[tokio::test]
     async fn test_run_show_substitutes_skill_dir() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _env = isolate_config_dir(&temp).await;
 
-        let args = AddArgs {
-            name: "subst",
-            description: Some("desc"),
-            when_to_use: Some("use"),
-            allowed_tools: &[],
-            version: None,
-            user_invocable: None,
-            from_file: None,
-            force: false,
-            edit: false,
-        };
-        run_add(args).await.expect("add");
+        run_add(add_args("subst", "desc")).await.expect("add");
 
         // Inject a marker into the skill body that references the dir.
         let dir = skills::skill_dir_for("subst").expect("dir resolves");
-        let body = "---\ndescription: x\nwhen_to_use: y\n---\nDir is ${AGSH_SKILL_DIR}\n";
+        let body = "---\ndescription: x\n---\nDir is ${AGSH_SKILL_DIR}\n";
         std::fs::write(dir.join("SKILL.md"), body).expect("rewrite");
 
         // run_show prints to stdout; we exercise the loader directly to

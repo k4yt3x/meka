@@ -293,10 +293,7 @@ pub fn build_system_prompt(
              user's request matches its stated purpose.\n\n",
         );
         for skill in skills {
-            prompt.push_str(&format!(
-                "- **{}**: {} — {}\n",
-                skill.name, skill.description, skill.when_to_use
-            ));
+            prompt.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
         }
         prompt.push('\n');
     }
@@ -444,10 +441,9 @@ mod tests {
             name: name.to_string(),
             source_dir: std::path::PathBuf::from("/tmp").join(name),
             description: format!("{} description", name),
-            when_to_use: format!("{} use case", name),
-            allowed_tools: Vec::new(),
             version: None,
-            user_invocable: true,
+            author: None,
+            source_url: None,
             body_path: std::path::PathBuf::from("/tmp").join(name).join("SKILL.md"),
         }
     }
@@ -761,7 +757,6 @@ mod tests {
         assert!(prompt.contains("## Skills"));
         assert!(prompt.contains("**setup-server**"));
         assert!(prompt.contains("setup-server description"));
-        assert!(prompt.contains("setup-server use case"));
         assert!(prompt.contains("**deploy-app**"));
     }
 

@@ -156,12 +156,6 @@ fn build_skill_prompt(cli: &cli::Cli) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     let skill = skills::cli::require_skill(name)?;
-    if !skill.user_invocable {
-        return Err(anyhow::anyhow!(
-            "skill '{}' is not user-invocable; remove `user_invocable: false` from its frontmatter to allow direct invocation",
-            name
-        ));
-    }
     // Pass `None` for session_id: the session is created lazily on the
     // first turn, so `${AGSH_SESSION_ID}` would be unresolvable here.
     // This matches the REPL's first-turn `/skill` behaviour, where
@@ -921,13 +915,6 @@ async fn run_interactive(
                             ));
                             break 'invoke;
                         };
-                        if !skill.user_invocable {
-                            render::render_error(&format!(
-                                "skill '{}' is not user-invocable; remove `user_invocable: false` from its frontmatter to allow direct invocation",
-                                name
-                            ));
-                            break 'invoke;
-                        }
                         let session_str = session_id.map(|id| id.to_string());
                         let body = match skills::load_skill_body(skill, session_str.as_deref()) {
                             Ok(body) => body,
@@ -1256,10 +1243,9 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
         cli::SkillAction::Add {
             name,
             description,
-            when_to_use,
-            allowed_tools,
             version,
-            user_invocable,
+            author,
+            source_url,
             from_file,
             force,
             edit,
@@ -1267,10 +1253,9 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
             skills::cli::run_add(skills::cli::AddArgs {
                 name,
                 description: description.as_deref(),
-                when_to_use: when_to_use.as_deref(),
-                allowed_tools,
                 version: version.as_deref(),
-                user_invocable: *user_invocable,
+                author: author.as_deref(),
+                source_url: source_url.as_deref(),
                 from_file: from_file.as_deref(),
                 force: *force,
                 edit: *edit,
@@ -1278,6 +1263,9 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
             .await?
         }
         cli::SkillAction::Remove { name } => skills::cli::run_remove(name).await?,
+        cli::SkillAction::Update { name, all, yes } => {
+            skills::cli::run_update(name.as_deref(), *all, *yes).await?
+        }
     }
     Ok(())
 }
@@ -1296,12 +1284,20 @@ async fn list_sessions(
         return Ok(());
     }
 
-    println!("{:<36}  {:<20}  Preview", "ID", "Updated");
-
-    for session in &sessions {
-        let updated = format_timestamp(&session.updated_at);
-        println!("{:<36}  {:<20}  {}", session.id, updated, session.preview);
-    }
+    let rows: Vec<Vec<String>> = sessions
+        .iter()
+        .map(|session| {
+            vec![
+                session.id.to_string(),
+                format_timestamp(&session.updated_at),
+                session.preview.clone(),
+            ]
+        })
+        .collect();
+    print!(
+        "{}",
+        render::format_columns(&["ID", "Updated", "Preview"], &rows)
+    );
 
     Ok(())
 }

@@ -613,6 +613,63 @@ pub fn render_session_id(label: &str, id: &str) {
     eprintln!("{}", format!("{}: {}", label, id).with(Color::DarkGrey));
 }
 
+/// Format `rows` into a left-aligned, space-padded column layout — the
+/// shared renderer for agsh's CLI list tables (`skill list`, `mcp list`,
+/// `list`, `scratchpad_list`).
+///
+/// Each column is widened to its longest cell, the matching header
+/// included. Columns are separated by two spaces; the final column is
+/// left unpadded so a long trailing value (a path, a URL, a preview)
+/// doesn't drag a run of trailing whitespace. The returned string has
+/// one trailing newline per line and no extra blank line — the caller
+/// picks the stream (`print!` for stdout list commands, or embed it in
+/// a tool result).
+///
+/// (Distinct from the private `format_table`, which lays out *markdown*
+/// pipe tables for the streaming renderer.)
+///
+/// Width is measured in `char`s, which is correct for the
+/// ASCII-dominated data agsh tabulates (names, versions, UUIDs,
+/// timestamps); a CJK-heavy cell would pad slightly short — no caller
+/// hits that today.
+pub fn format_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
+    if headers.is_empty() {
+        return String::new();
+    }
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (index, cell) in row.iter().take(widths.len()).enumerate() {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+
+    let mut out = format_columns_row(headers, &widths);
+    for row in rows {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        out.push_str(&format_columns_row(&cells, &widths));
+    }
+    out
+}
+
+fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
+    use std::fmt::Write as _;
+
+    let mut line = String::new();
+    let last = cells.len().saturating_sub(1);
+    for (index, cell) in cells.iter().enumerate() {
+        if index == last {
+            // Final column: never padded — nothing follows it.
+            line.push_str(cell);
+        } else {
+            let width = widths.get(index).copied().unwrap_or(0);
+            let _ = write!(line, "{:<w$}  ", cell, w = width);
+        }
+    }
+    line.push('\n');
+    line
+}
+
 pub fn render_hint(message: &str) {
     eprintln!("{}", message.with(Color::DarkGrey));
 }
@@ -1034,6 +1091,39 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_columns_aligns_and_leaves_last_unpadded() {
+        let table = format_columns(
+            &["Name", "Version", "Path"],
+            &[
+                vec!["a".to_string(), "1.0".to_string(), "/long/path".to_string()],
+                vec![
+                    "longer-name".to_string(),
+                    "12".to_string(),
+                    "/p".to_string(),
+                ],
+            ],
+        );
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows");
+
+        // The `Name` column widens to "longer-name" (11 chars); the
+        // header and the short row pad to that width.
+        assert!(lines[0].starts_with("Name         Version  Path"));
+        assert!(lines[1].starts_with("a            1.0      /long/path"));
+        assert!(lines[2].starts_with("longer-name  12       /p"));
+
+        // The last column is never padded — no trailing whitespace.
+        for line in &lines {
+            assert_eq!(*line, line.trim_end(), "no trailing padding: {:?}", line);
+        }
+    }
+
+    #[test]
+    fn test_format_columns_empty_headers() {
+        assert_eq!(format_columns(&[], &[]), "");
+    }
 
     #[test]
     fn test_highlight_markdown_emits_ansi() {

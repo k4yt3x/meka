@@ -1,7 +1,8 @@
 //! Skill discovery and loading. Walks `~/.config/agsh/skills/<name>/SKILL.md`,
-//! parses the YAML frontmatter (description, when_to_use, allowed_tools,
-//! version, user_invocable), and exposes the resulting [`Skill`] structs to
-//! the agent for system-prompt injection and `skill` tool dispatch.
+//! parses the YAML frontmatter (`description`, `version`, `author`,
+//! `source_url`; unknown keys are ignored), and exposes the resulting
+//! [`Skill`] structs to the agent for system-prompt injection and `skill`
+//! tool dispatch.
 
 pub mod cli;
 
@@ -18,53 +19,22 @@ pub struct Skill {
     pub name: String,
     pub source_dir: PathBuf,
     pub description: String,
-    pub when_to_use: String,
-    pub allowed_tools: Vec<String>,
     pub version: Option<String>,
-    /// User-side invocability gate consulted by the REPL `/skill <name>`
-    /// command. Defaults to `true` when the frontmatter omits the field.
-    /// The agent-side `SkillTool` (in `src/tools/skill.rs`) ignores this
-    /// — gating model invocation is a separate concern.
-    pub user_invocable: bool,
+    /// Optional attribution string. Informational only.
+    pub author: Option<String>,
+    /// Optional `https://` URL the skill's `SKILL.md` can be re-fetched
+    /// from. When set, `agsh skill update` can refresh the skill in
+    /// place. `None` skills are skipped by `update`.
+    pub source_url: Option<String>,
     pub body_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
 struct Frontmatter {
     description: Option<String>,
-    when_to_use: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_allowed_tools")]
-    allowed_tools: Vec<String>,
     version: Option<String>,
-    #[serde(default = "default_user_invocable")]
-    user_invocable: bool,
-}
-
-fn default_user_invocable() -> bool {
-    true
-}
-
-/// Accept either an array `[a, b]` or a CSV string `"a, b"` for `allowed_tools`.
-fn deserialize_allowed_tools<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrVec {
-        String(String),
-        Vec(Vec<String>),
-    }
-
-    match Option::<StringOrVec>::deserialize(deserializer)? {
-        None => Ok(Vec::new()),
-        Some(StringOrVec::Vec(vec)) => Ok(vec),
-        Some(StringOrVec::String(s)) => Ok(s
-            .split(',')
-            .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty())
-            .collect()),
-    }
+    author: Option<String>,
+    source_url: Option<String>,
 }
 
 pub fn skills_dir() -> Option<PathBuf> {
@@ -242,9 +212,20 @@ fn load_skill_definition(
 ) -> Result<Skill, String> {
     let content = std::fs::read_to_string(skill_file)
         .map_err(|error| format!("failed to read {}: {}", skill_file.display(), error))?;
+    parse_skill_definition(name, source_dir, skill_file, &content)
+}
 
+/// Parse a `SKILL.md`'s text into a [`Skill`]. Split out from
+/// [`load_skill_definition`] so `agsh skill update` can validate fetched
+/// content in memory before it touches the on-disk file.
+pub fn parse_skill_definition(
+    name: &str,
+    source_dir: &Path,
+    skill_file: &Path,
+    content: &str,
+) -> Result<Skill, String> {
     let (frontmatter_str, _body) =
-        split_frontmatter(&content).ok_or_else(|| "missing YAML frontmatter".to_string())?;
+        split_frontmatter(content).ok_or_else(|| "missing YAML frontmatter".to_string())?;
 
     let frontmatter: Frontmatter = serde_yaml::from_str(frontmatter_str)
         .map_err(|error| format!("invalid frontmatter: {}", error))?;
@@ -254,19 +235,13 @@ fn load_skill_definition(
         .filter(|description| !description.trim().is_empty())
         .ok_or_else(|| "missing required field 'description'".to_string())?;
 
-    let when_to_use = frontmatter
-        .when_to_use
-        .filter(|when_to_use| !when_to_use.trim().is_empty())
-        .ok_or_else(|| "missing required field 'when_to_use'".to_string())?;
-
     Ok(Skill {
         name: name.to_string(),
         source_dir: source_dir.to_path_buf(),
         description,
-        when_to_use,
-        allowed_tools: frontmatter.allowed_tools,
         version: frontmatter.version,
-        user_invocable: frontmatter.user_invocable,
+        author: frontmatter.author,
+        source_url: frontmatter.source_url,
         body_path: skill_file.to_path_buf(),
     })
 }
@@ -356,35 +331,27 @@ pub fn skill_dir_for(name: &str) -> Option<PathBuf> {
 
 /// Render the default `SKILL.md` template for a new skill. Optional
 /// fields are emitted only when set, so the resulting file stays as
-/// minimal as the user's input — `--user-invocable true` (the default)
-/// is *not* written to keep the frontmatter lean.
+/// minimal as the user's input.
 pub fn render_template(
     name: &str,
     description: &str,
-    when_to_use: &str,
-    allowed_tools: &[String],
     version: Option<&str>,
-    user_invocable: bool,
+    author: Option<&str>,
+    source_url: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
     out.push_str("---\n");
     let _ = writeln!(out, "description: {}", yaml_scalar(description));
-    let _ = writeln!(out, "when_to_use: {}", yaml_scalar(when_to_use));
-    if !allowed_tools.is_empty() {
-        let joined = allowed_tools
-            .iter()
-            .map(|t| yaml_scalar(t))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = writeln!(out, "allowed_tools: [{}]", joined);
-    }
     if let Some(v) = version {
         let _ = writeln!(out, "version: {}", yaml_scalar(v));
     }
-    if !user_invocable {
-        out.push_str("user_invocable: false\n");
+    if let Some(a) = author {
+        let _ = writeln!(out, "author: {}", yaml_scalar(a));
+    }
+    if let Some(url) = source_url {
+        let _ = writeln!(out, "source_url: {}", yaml_scalar(url));
     }
     out.push_str("---\n\n");
     let _ = writeln!(out, "# {}", name);
@@ -452,7 +419,7 @@ mod tests {
         write_skill(
             temp.path(),
             "test-skill",
-            "---\ndescription: A test skill\nwhen_to_use: For testing\n---\nBody content\n",
+            "---\ndescription: A test skill\n---\nBody content\n",
         );
 
         let skill_path = temp.path().join("test-skill");
@@ -462,9 +429,9 @@ mod tests {
 
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.description, "A test skill");
-        assert_eq!(skill.when_to_use, "For testing");
-        assert!(skill.user_invocable);
-        assert!(skill.allowed_tools.is_empty());
+        assert!(skill.version.is_none());
+        assert!(skill.author.is_none());
+        assert!(skill.source_url.is_none());
     }
 
     #[test]
@@ -475,10 +442,9 @@ mod tests {
             "full-skill",
             "---\n\
              description: Complete skill\n\
-             when_to_use: All the time\n\
-             allowed_tools: [read_file, execute_command]\n\
              version: \"1.2\"\n\
-             user_invocable: false\n\
+             author: k4yt3x\n\
+             source_url: https://example.com/SKILL.md\n\
              ---\nBody\n",
         );
 
@@ -486,29 +452,35 @@ mod tests {
         let skill = load_skill_definition("full-skill", &skill_path, &skill_path.join("SKILL.md"))
             .expect("should load");
 
-        assert_eq!(skill.allowed_tools, vec!["read_file", "execute_command"]);
         assert_eq!(skill.version.as_deref(), Some("1.2"));
-        assert!(!skill.user_invocable);
+        assert_eq!(skill.author.as_deref(), Some("k4yt3x"));
+        assert_eq!(
+            skill.source_url.as_deref(),
+            Some("https://example.com/SKILL.md")
+        );
     }
 
     #[test]
-    fn test_allowed_tools_as_csv_string() {
+    fn test_unknown_frontmatter_keys_are_ignored() {
+        // Skills authored for Claude Code carry keys agsh doesn't model
+        // (when_to_use, allowed-tools, hooks, ...). serde ignores unknown
+        // fields, so such a skill still parses on a `description`.
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
-            "csv-skill",
+            "cc-skill",
             "---\n\
-             description: X\n\
-             when_to_use: Y\n\
-             allowed_tools: \"read_file, execute_command\"\n\
+             description: A CC-shaped skill\n\
+             when_to_use: legacy field\n\
+             allowed-tools: [read_file]\n\
+             user-invocable: false\n\
              ---\nBody\n",
         );
 
-        let skill_path = temp.path().join("csv-skill");
-        let skill = load_skill_definition("csv-skill", &skill_path, &skill_path.join("SKILL.md"))
-            .expect("should load");
-
-        assert_eq!(skill.allowed_tools, vec!["read_file", "execute_command"]);
+        let skill_path = temp.path().join("cc-skill");
+        let skill = load_skill_definition("cc-skill", &skill_path, &skill_path.join("SKILL.md"))
+            .expect("unknown keys must not break parsing");
+        assert_eq!(skill.description, "A CC-shaped skill");
     }
 
     #[test]
@@ -517,28 +489,13 @@ mod tests {
         write_skill(
             temp.path(),
             "bad-skill",
-            "---\nwhen_to_use: something\n---\nBody\n",
+            "---\nversion: \"1.0\"\n---\nBody\n",
         );
 
         let skill_path = temp.path().join("bad-skill");
         let result = load_skill_definition("bad-skill", &skill_path, &skill_path.join("SKILL.md"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("description"));
-    }
-
-    #[test]
-    fn test_missing_when_to_use_rejected() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        write_skill(
-            temp.path(),
-            "bad-skill",
-            "---\ndescription: something\n---\nBody\n",
-        );
-
-        let skill_path = temp.path().join("bad-skill");
-        let result = load_skill_definition("bad-skill", &skill_path, &skill_path.join("SKILL.md"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("when_to_use"));
     }
 
     #[test]
@@ -574,7 +531,6 @@ mod tests {
             "var-skill",
             "---\n\
              description: X\n\
-             when_to_use: Y\n\
              ---\n\
              Path: ${AGSH_SKILL_DIR}\nSession: ${AGSH_SESSION_ID}\n",
         );
@@ -596,7 +552,6 @@ mod tests {
             "var-skill",
             "---\n\
              description: X\n\
-             when_to_use: Y\n\
              ---\n\
              Session: ${AGSH_SESSION_ID}\n",
         );
@@ -610,10 +565,7 @@ mod tests {
     }
 
     fn valid_frontmatter(description: &str) -> String {
-        format!(
-            "---\ndescription: {}\nwhen_to_use: when needed\n---\nBody\n",
-            description
-        )
+        format!("---\ndescription: {}\n---\nBody\n", description)
     }
 
     /// Bump the mtime of a file far enough in the future to defeat 1-second

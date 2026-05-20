@@ -86,14 +86,6 @@ impl Tool for SkillTool {
             }
         })?;
 
-        if !skill.allowed_tools.is_empty() {
-            tracing::debug!(
-                "skill '{}' declares allowed_tools: {:?} (not currently enforced)",
-                skill.name,
-                skill.allowed_tools
-            );
-        }
-
         Ok(ToolOutput::text(body, false))
     }
 }
@@ -151,10 +143,9 @@ mod tests {
             name: "foo".to_string(),
             source_dir: std::path::PathBuf::from("/tmp"),
             description: "desc".to_string(),
-            when_to_use: "use".to_string(),
-            allowed_tools: Vec::new(),
             version: None,
-            user_invocable: true,
+            author: None,
+            source_url: None,
             body_path: std::path::PathBuf::from("/tmp/SKILL.md"),
         };
         let skills = vec![skill];
