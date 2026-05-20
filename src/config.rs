@@ -360,18 +360,8 @@ pub enum SandboxBackend {
 }
 
 impl SandboxBackend {
-    /// Lowercase form used for TOML serialization. Must round-trip
-    /// with the `#[serde(rename_all = "lowercase")]` deserialization.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Landlock => "landlock",
-            Self::Bubblewrap => "bubblewrap",
-        }
-    }
-
-    /// Brand-cased name for user-facing prose (logs, errors, wizard
-    /// prompts). Use [`Self::as_str`] when the rendered text is a
-    /// config value or package name rather than a brand reference.
+    /// Brand-cased name for user-facing prose (logs, errors). Also the
+    /// `Display` impl's output.
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Landlock => "Landlock",
@@ -642,24 +632,16 @@ pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result
     })
 }
 
-/// Sandbox-section content the setup wizard wants to write into a
-/// freshly initialized `config.toml`. `None` means "don't write a
-/// `[shell]` table" (e.g. macOS / Windows, where no choice is
-/// applicable); `Some(Enabled(backend))` writes both `sandbox = true`
-/// and `sandbox_backend = "..."`; `Some(Disabled)` writes `sandbox =
-/// false` and omits `sandbox_backend`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SandboxConfigChoice {
-    Enabled(SandboxBackend),
-    Disabled,
-}
-
+/// Write a freshly initialized `config.toml` from the setup wizard. No
+/// `[shell]` table is emitted — the sandbox backend auto-resolves at
+/// runtime (bubblewrap preferred, landlock fallback; see
+/// [`resolve_sandbox_backend`]), so a pinned value is only ever needed
+/// when the user wants to override that default by hand.
 pub(crate) fn write_config_file(
     provider_name: &str,
     model: &str,
     api_key: Option<&str>,
     base_url: Option<&str>,
-    sandbox: Option<SandboxConfigChoice>,
 ) -> std::io::Result<()> {
     let path = config_file_path().ok_or_else(|| {
         std::io::Error::new(
@@ -683,23 +665,6 @@ pub(crate) fn write_config_file(
 
     let mut root = toml::map::Map::new();
     root.insert("provider".to_string(), toml::Value::Table(provider_table));
-
-    if let Some(choice) = sandbox {
-        let mut shell_table = toml::map::Map::new();
-        match choice {
-            SandboxConfigChoice::Enabled(backend) => {
-                shell_table.insert("sandbox".to_string(), toml::Value::Boolean(true));
-                shell_table.insert(
-                    "sandbox_backend".to_string(),
-                    toml::Value::String(backend.as_str().to_string()),
-                );
-            }
-            SandboxConfigChoice::Disabled => {
-                shell_table.insert("sandbox".to_string(), toml::Value::Boolean(false));
-            }
-        }
-        root.insert("shell".to_string(), toml::Value::Table(shell_table));
-    }
 
     let content = toml::to_string_pretty(&root)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;

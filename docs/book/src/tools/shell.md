@@ -68,7 +68,7 @@ Linux supports two backends, selected via `[shell].sandbox_backend` in `config.t
 - **Bubblewrap** (`sandbox_backend = "bubblewrap"`, recommended): wraps the command in `bwrap` with `--ro-bind /`, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and `$XDG_RUNTIME_DIR`, plus `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks make the dbus session bus, systemd-user socket, and other socket-on-disk IPC paths unreachable, so `systemctl --user start <unit>`, `dbus-send`, and similar state-changing calls fail. Network is not unshared. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
 - **Landlock** (`sandbox_backend = "landlock"`, legacy / fallback): uses the [Landlock LSM](https://landlock.io/) (kernel 5.13+). Blocks filesystem writes via `landlock_restrict_self`. Does **not** block dbus / systemd-user IPC, so a sandboxed shell can still invoke state-mutating dbus methods.
 
-When `sandbox_backend` is unset, agsh probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with a one-shot warning that points at the install path and the suppress-this-warning escape hatch. Run `agsh setup` on first launch to get an interactive prompt and a pinned value in `config.toml`.
+`sandbox_backend` is unset unless you pin it yourself — `agsh setup` does not write it. When unset, agsh probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with a one-shot warning that points at the install path and the suppress-this-warning escape hatch.
 
 ```toml
 [shell]
