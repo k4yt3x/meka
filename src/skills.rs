@@ -443,7 +443,7 @@ mod tests {
             "---\n\
              description: Complete skill\n\
              version: \"1.2\"\n\
-             author: k4yt3x\n\
+             author: John Doe <john.doe@example.com>\n\
              source_url: https://example.com/SKILL.md\n\
              ---\nBody\n",
         );
@@ -453,7 +453,10 @@ mod tests {
             .expect("should load");
 
         assert_eq!(skill.version.as_deref(), Some("1.2"));
-        assert_eq!(skill.author.as_deref(), Some("k4yt3x"));
+        assert_eq!(
+            skill.author.as_deref(),
+            Some("John Doe <john.doe@example.com>")
+        );
         assert_eq!(
             skill.source_url.as_deref(),
             Some("https://example.com/SKILL.md")

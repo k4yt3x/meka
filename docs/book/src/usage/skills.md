@@ -28,7 +28,7 @@ A skill is a directory under `~/.config/agsh/skills/` containing a `SKILL.md` fi
 ---
 description: Download videos from various websites using yt-dlp. Use when the user wants a video off a URL.
 version: "1.0"
-author: k4yt3x
+author: John Doe <john.doe@example.com>
 source_url: https://gist.githubusercontent.com/k4yt3x/.../raw/SKILL.md
 ---
 
@@ -64,7 +64,7 @@ Skills missing `description` are skipped at discovery with a warning log. Unknow
 | Field | Default | Description |
 |-------|---------|-------------|
 | `version` | none | Free-form version label (e.g. `"1.0"`, `"2024-03-14"`). |
-| `author` | none | Attribution string. Informational only. |
+| `author` | none | Attribution, conventionally `Name <email>` (e.g. `John Doe <john.doe@example.com>`). Informational only. |
 | `source_url` | none | An `https://` URL the skill's `SKILL.md` can be re-fetched from. Enables [`agsh skill update`](#updating-skills). |
 
 ### Variable Substitution

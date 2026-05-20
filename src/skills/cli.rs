@@ -468,13 +468,16 @@ mod tests {
 
         let mut args = add_args("sourced", "a sourced skill");
         args.version = Some("1.0");
-        args.author = Some("k4yt3x");
+        args.author = Some("John Doe <john.doe@example.com>");
         args.source_url = Some("https://example.com/SKILL.md");
         run_add(args).await.expect("add");
 
         let skill = require_skill("sourced").expect("found");
         assert_eq!(skill.version.as_deref(), Some("1.0"));
-        assert_eq!(skill.author.as_deref(), Some("k4yt3x"));
+        assert_eq!(
+            skill.author.as_deref(),
+            Some("John Doe <john.doe@example.com>")
+        );
         assert_eq!(
             skill.source_url.as_deref(),
             Some("https://example.com/SKILL.md")

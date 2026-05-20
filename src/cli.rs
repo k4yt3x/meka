@@ -95,7 +95,7 @@ pub enum SkillAction {
         #[arg(long)]
         version: Option<String>,
 
-        /// Author / attribution string
+        /// Author, in `Name <email>` form
         #[arg(long)]
         author: Option<String>,
 
