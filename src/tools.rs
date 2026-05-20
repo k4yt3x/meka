@@ -131,6 +131,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "scratchpad_edit",
     "scratchpad_list",
     "scratchpad_load_file",
+    "scratchpad_merge",
     "scratchpad_read",
     "scratchpad_rename",
     "scratchpad_save_file",
@@ -437,8 +438,10 @@ impl ToolRegistry {
         self.register_builtin(Arc::new(file::ReadFileTool {
             read_tracker: read_tracker.clone(),
         }));
-        self.register_builtin(Arc::new(file::EditFileTool { read_tracker }));
-        self.register_builtin(Arc::new(file::WriteFileTool));
+        self.register_builtin(Arc::new(file::EditFileTool {
+            read_tracker: read_tracker.clone(),
+        }));
+        self.register_builtin(Arc::new(file::WriteFileTool { read_tracker }));
         self.register_builtin(Arc::new(find::FindFilesTool));
         self.register_builtin(Arc::new(grep::SearchContentsTool));
         // A malformed proxy URL or unreadable CA file surfaces as a
@@ -529,6 +532,12 @@ impl ToolRegistry {
             inherited_names: inherited_scratchpad_names.clone(),
         }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadListTool {
+            session_manager: session_manager.clone(),
+            session_id: shared_session_id.clone(),
+            parent_session_id,
+            inherited_names: inherited_scratchpad_names.clone(),
+        }));
+        self.register_builtin(Arc::new(scratchpad::ScratchpadMergeTool {
             session_manager: session_manager.clone(),
             session_id: shared_session_id.clone(),
             parent_session_id,
@@ -1116,6 +1125,7 @@ pub(crate) mod tests {
             "scratchpad_read",
             "scratchpad_edit",
             "scratchpad_list",
+            "scratchpad_merge",
             "scratchpad_delete",
             "scratchpad_rename",
             "scratchpad_load_file",

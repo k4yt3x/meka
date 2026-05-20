@@ -10,9 +10,10 @@ use crate::provider::ToolDefinition;
 use super::util::{redirects_to_scratchpad, require_str};
 use super::{Tool, ToolOutput};
 
-/// Inline result cap when the agent isn't redirecting to the scratchpad.
-/// Single source of truth for the description and the runtime cap.
-const MAX_INLINE_RESULTS: usize = 200;
+/// Default inline result cap when the agent isn't redirecting to the
+/// scratchpad and didn't pass an explicit `limit`. Single source of truth
+/// for the description and the runtime default.
+const DEFAULT_INLINE_RESULTS: usize = 500;
 
 pub(super) struct FindFilesTool;
 
@@ -30,9 +31,11 @@ impl Tool for FindFilesTool {
                  contains the answer; if that returns nothing, widen the \
                  `path` by one level or loosen the pattern, and repeat. Only \
                  fall back to a tree-wide scan if targeted attempts have all \
-                 failed. Inline results are capped at {} entries; use the \
-                 `scratchpad` parameter to collect an unbounded result set.",
-                MAX_INLINE_RESULTS,
+                 failed. Inline results default to {} entries; pass `limit` to \
+                 raise the cap or `scratchpad` to collect them all. \
+                 Multiple independent find_files calls in one assistant message \
+                 run in parallel.",
+                DEFAULT_INLINE_RESULTS,
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -44,6 +47,16 @@ impl Tool for FindFilesTool {
                     "path": {
                         "type": "string",
                         "description": "Directory to search in. Defaults to current directory. Prefer the smallest subtree that can answer the question."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": format!(
+                            "Maximum results to return. Defaults to {} when output is inline, \
+                             unbounded when `scratchpad` is set. Pass an explicit value to \
+                             override either default.",
+                            DEFAULT_INLINE_RESULTS,
+                        )
                     },
                     "scratchpad": {
                         "type": "string",
@@ -73,26 +86,36 @@ impl Tool for FindFilesTool {
             None => pattern.clone(),
         };
 
-        // Cap result count for inline use; lift it when redirecting output to
-        // the scratchpad so the agent can collect an unbounded result set.
-        let max_results = if redirects_to_scratchpad(&input) {
-            usize::MAX
-        } else {
-            MAX_INLINE_RESULTS
+        // Cap precedence:
+        //   1. explicit `limit` parameter — honoured verbatim
+        //   2. no limit + `scratchpad` set — unbounded (preserves the
+        //      "collect everything" escape hatch)
+        //   3. otherwise — DEFAULT_INLINE_RESULTS
+        let explicit_limit = input
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize);
+        let cap = match explicit_limit {
+            Some(limit) => limit,
+            None if redirects_to_scratchpad(&input) => usize::MAX,
+            None => DEFAULT_INLINE_RESULTS,
         };
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut matches = Vec::new();
-            let mut truncated = false;
+            let mut matches: Vec<String> = Vec::new();
+            // Total continues past the storage cap so we can report
+            // the real count of matches in the truncation message —
+            // glob walks are FS-metadata only, so the extra iteration
+            // past the cap is cheap.
+            let mut total: usize = 0;
             match glob::glob(&full_pattern) {
                 Ok(paths) => {
                     for entry in paths {
                         match entry {
                             Ok(path) => {
-                                matches.push(path.display().to_string());
-                                if matches.len() >= max_results {
-                                    truncated = true;
-                                    break;
+                                total += 1;
+                                if matches.len() < cap {
+                                    matches.push(path.display().to_string());
                                 }
                             }
                             Err(error) => {
@@ -108,7 +131,7 @@ impl Tool for FindFilesTool {
                     });
                 }
             }
-            Ok((matches, truncated, max_results))
+            Ok((matches, total, cap))
         })
         .await
         .map_err(|error| AgshError::ToolExecution {
@@ -116,7 +139,7 @@ impl Tool for FindFilesTool {
             message: format!("task join error: {}", error),
         })??;
 
-        let (matches, truncated, max_results) = result;
+        let (matches, total, cap) = result;
         if matches.is_empty() {
             Ok(ToolOutput::text(
                 "No files found matching the pattern.".to_string(),
@@ -124,10 +147,12 @@ impl Tool for FindFilesTool {
             ))
         } else {
             let mut output = matches.join("\n");
-            if truncated {
+            if total > matches.len() {
                 output.push_str(&format!(
-                    "\n\n... (truncated, showing first {} results)",
-                    max_results
+                    "\n\n... (showed first {} of {} matches; refine `pattern` to narrow, \
+                     pass `limit: <n>` to raise the cap, or pass `scratchpad: \"name\"` to \
+                     collect them all)",
+                    cap, total,
                 ));
             }
             Ok(ToolOutput::text(output, false))
@@ -166,9 +191,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_files_inline_capped_at_200() {
+    async fn test_find_files_inline_default_cap_reports_total() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        for i in 0..250 {
+        for i in 0..600 {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
         }
 
@@ -184,13 +209,45 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert!(text_content(&result).contains("truncated, showing first 200"));
+        let text = text_content(&result);
+        assert!(
+            text.contains("showed first 500 of 600 matches"),
+            "expected real total in truncation message, got: {:.300}",
+            text,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_files_limit_overrides_default() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..600 {
+            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+        }
+
+        let tool = FindFilesTool;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "*.txt",
+                    "path": temp_dir.path().to_str().expect("path"),
+                    "limit": 100
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(text.contains("showed first 100 of 600 matches"));
+        // 100 entries plus the trailing truncation line.
+        let path_lines = text.lines().filter(|line| line.ends_with(".txt")).count();
+        assert_eq!(path_lines, 100);
     }
 
     #[tokio::test]
     async fn test_find_files_scratchpad_lifts_cap() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        for i in 0..250 {
+        for i in 0..600 {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
         }
 
@@ -209,16 +266,43 @@ mod tests {
 
         let text = text_content(&result);
         assert!(
-            !text.contains("truncated"),
+            !text.contains("showed first"),
             "expected no truncation marker when scratchpad set, got: {:.200}...",
-            text
+            text,
         );
-        // All 250 entries should be listed.
-        let line_count = text.lines().count();
+        let line_count = text.lines().filter(|l| l.ends_with(".txt")).count();
         assert!(
-            line_count >= 250,
-            "expected >= 250 entries, got {}",
+            line_count >= 600,
+            "expected >= 600 entries, got {}",
             line_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_find_files_explicit_limit_with_scratchpad_caps() {
+        // Regression: an explicit `limit` should beat the scratchpad
+        // "unbounded" default — the agent might legitimately want a
+        // bounded scratchpad collection.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..600 {
+            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+        }
+
+        let tool = FindFilesTool;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "*.txt",
+                    "path": temp_dir.path().to_str().expect("path"),
+                    "scratchpad": "paths",
+                    "limit": 50
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("should succeed");
+
+        let text = text_content(&result);
+        assert!(text.contains("showed first 50 of 600 matches"));
     }
 }

@@ -109,7 +109,9 @@ impl Tool for ReadFileTool {
                  to PNG. Only read image files if the current model supports \
                  vision input. Provide `regex` to return matching lines (max {}) \
                  instead of a line range; `regex` ignores `offset`/`limit` and \
-                 cannot be combined with image reads.",
+                 cannot be combined with image reads. Multiple independent \
+                 read_file calls in one assistant message run in parallel \
+                 \u{2014} batch them instead of reading files sequentially.",
                 MAX_SEARCH_MATCHES,
             ),
             parameters: serde_json::json!({
@@ -476,7 +478,14 @@ fn build_context_snippet(content: &str, change_byte_offset: usize, lines_around:
     output
 }
 
-pub(super) struct WriteFileTool;
+pub(super) struct WriteFileTool {
+    /// Shared with `ReadFileTool` / `EditFileTool`. After a successful
+    /// write we insert the canonical target so a follow-up `edit_file`
+    /// against the same path doesn't require a redundant `read_file` or
+    /// `force: true` — the agent obviously knows the content it just
+    /// wrote.
+    pub read_tracker: ReadTracker,
+}
 
 #[async_trait]
 impl Tool for WriteFileTool {
@@ -561,6 +570,11 @@ impl Tool for WriteFileTool {
                 message: format!("failed to write '{}': {}", path, error),
             })?;
 
+        // Record the canonical path so subsequent `edit_file` calls
+        // accept it without `force: true`. We just produced the content,
+        // so the "must read first" safety check has nothing to gain.
+        self.read_tracker.write().await.insert(target);
+
         Ok(ToolOutput::text(
             format!("Successfully wrote {} bytes to '{}'", content.len(), path),
             false,
@@ -637,7 +651,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let file_path = temp_dir.path().join("output.txt");
 
-        let write_tool = WriteFileTool;
+        let write_tool = WriteFileTool {
+            read_tracker: test_tracker(),
+        };
         let write_result = write_tool
             .execute(
                 serde_json::json!({
@@ -652,6 +668,52 @@ mod tests {
 
         let content = std::fs::read_to_string(&file_path).expect("failed to read");
         assert_eq!(content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_after_write_no_force_needed() {
+        // Regression: `write_file` should mark the target as read so a
+        // follow-up `edit_file` doesn't require `force: true`.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("write_then_edit.txt");
+        let tracker = test_tracker();
+
+        let write_tool = WriteFileTool {
+            read_tracker: tracker.clone(),
+        };
+        write_tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "content": "hello world"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("write should succeed");
+
+        let edit_tool = EditFileTool {
+            read_tracker: tracker.clone(),
+        };
+        let edit_result = edit_tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path.to_str().expect("path"),
+                    "old_string": "world",
+                    "new_string": "rust"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("edit should succeed without force");
+        assert!(
+            !edit_result.is_error,
+            "edit after write should succeed without force, got: {}",
+            text_content(&edit_result)
+        );
+
+        let content = std::fs::read_to_string(&file_path).expect("read");
+        assert_eq!(content, "hello rust");
     }
 
     #[tokio::test]

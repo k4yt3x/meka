@@ -48,7 +48,9 @@ impl Tool for ExecuteCommandTool {
                 wrap with another `powershell -Command` or the outer PowerShell will \
                 expand your inner `$var` references to empty strings. In read mode \
                 the command runs in a read-only sandbox where filesystem writes are \
-                blocked."
+                blocked. Multiple independent execute_command calls in one assistant \
+                message run in parallel; use this for read-only commands and \
+                serialize anything that mutates shared state (files, git, packages)."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",

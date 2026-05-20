@@ -32,7 +32,8 @@ impl Tool for SearchContentsTool {
                  loosen the `glob`, and repeat. Only fall back to a tree-wide \
                  scan if targeted attempts have all failed. Inline results are \
                  capped at {} matches; use the `scratchpad` parameter to \
-                 collect an unbounded result set.",
+                 collect an unbounded result set. Multiple independent \
+                 search_contents calls in one assistant message run in parallel.",
                 MAX_INLINE_MATCHES,
             ),
             parameters: serde_json::json!({

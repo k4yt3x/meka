@@ -664,6 +664,187 @@ impl Tool for ScratchpadListTool {
     }
 }
 
+pub(super) struct ScratchpadMergeTool {
+    pub session_manager: SessionManager,
+    pub session_id: Arc<RwLock<Option<Uuid>>>,
+    /// See [`ScratchpadReadTool::parent_session_id`] — sources may be
+    /// inherited from the parent's scratchpad.
+    pub parent_session_id: Option<Uuid>,
+    /// See [`ScratchpadWriteTool::inherited_names`] — the `target` is
+    /// blocked if listed here; sources are also matched against this set
+    /// for the parent-fallback read.
+    pub inherited_names: Vec<String>,
+}
+
+#[async_trait]
+impl Tool for ScratchpadMergeTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "scratchpad_merge".to_string(),
+            description: "Combine multiple scratchpad entries into one without routing the \
+                bytes through the conversation. Useful for collecting parallel sub-agent \
+                reports or any accumulated scratchpad data. `format` controls how entries \
+                are joined: `concat_with_headers` (default, prepends `--- name ---` before \
+                each entry), `concat` (plain join), or `json_array` (each source parsed as \
+                JSON if valid, else quoted as a string; result is a compact JSON array). \
+                Sub-agents cannot merge into a name inherited read-only from the parent. \
+                Source entries may be inherited."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "sources": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Names of scratchpad entries to combine, in order."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Name to store the merged result under. Overwrites if it already exists."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["concat_with_headers", "concat", "json_array"],
+                        "description": "How to join the source entries. Defaults to `concat_with_headers`."
+                    }
+                },
+                "required": ["sources", "target"]
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn required_permission(&self) -> Permission {
+        Permission::Read
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _cancellation: CancellationToken,
+    ) -> Result<ToolOutput> {
+        let target = input["target"]
+            .as_str()
+            .ok_or_else(|| AgshError::ToolExecution {
+                tool_name: "scratchpad_merge".to_string(),
+                message: "missing 'target' parameter".to_string(),
+            })?;
+
+        if is_inherited(&self.inherited_names, target) {
+            return inherited_write_error(target);
+        }
+
+        let sources: Vec<String> = input["sources"]
+            .as_array()
+            .ok_or_else(|| AgshError::ToolExecution {
+                tool_name: "scratchpad_merge".to_string(),
+                message: "missing 'sources' parameter (expected non-empty array of strings)"
+                    .to_string(),
+            })?
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect();
+
+        if sources.is_empty() {
+            return Ok(ToolOutput::text(
+                "scratchpad_merge: 'sources' must contain at least one entry name".to_string(),
+                true,
+            ));
+        }
+
+        let format = input
+            .get("format")
+            .and_then(|value| value.as_str())
+            .unwrap_or("concat_with_headers");
+
+        let session_id = resolve_session_id(&self.session_id, "scratchpad_merge").await?;
+
+        // Resolve each source. Inheritance-aware: child first, then
+        // parent if the name is allowlisted — same fallback path as
+        // ScratchpadReadTool. Any missing source aborts the merge so we
+        // never partially write the target.
+        let mut loaded: Vec<(String, String)> = Vec::with_capacity(sources.len());
+        for name in &sources {
+            let mut content = self
+                .session_manager
+                .load_tool_output(session_id, name)
+                .await?;
+            if content.is_none()
+                && let Some(parent_sid) = self.parent_session_id
+                && self.inherited_names.iter().any(|n| n == name)
+            {
+                content = self
+                    .session_manager
+                    .load_tool_output(parent_sid, name)
+                    .await?;
+            }
+            let content = content.ok_or_else(|| AgshError::ToolExecution {
+                tool_name: "scratchpad_merge".to_string(),
+                message: format!("scratchpad entry \"{}\" not found", name),
+            })?;
+            loaded.push((name.clone(), content));
+        }
+
+        let merged = match format {
+            "concat" => loaded
+                .iter()
+                .map(|(_, body)| body.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "json_array" => {
+                let values: Vec<serde_json::Value> = loaded
+                    .iter()
+                    .map(|(_, body)| {
+                        serde_json::from_str::<serde_json::Value>(body)
+                            .unwrap_or_else(|_| serde_json::Value::String(body.clone()))
+                    })
+                    .collect();
+                serde_json::to_string(&values).map_err(|error| AgshError::ToolExecution {
+                    tool_name: "scratchpad_merge".to_string(),
+                    message: format!("failed to serialize merged JSON array: {}", error),
+                })?
+            }
+            "concat_with_headers" => {
+                let mut output = String::new();
+                for (idx, (name, body)) in loaded.iter().enumerate() {
+                    if idx > 0 {
+                        output.push('\n');
+                    }
+                    output.push_str(&format!("--- {} ---\n", name));
+                    output.push_str(body);
+                }
+                output
+            }
+            other => {
+                return Ok(ToolOutput::text(
+                    format!(
+                        "scratchpad_merge: unknown `format` value '{}' (expected \
+                         'concat_with_headers', 'concat', or 'json_array')",
+                        other,
+                    ),
+                    true,
+                ));
+            }
+        };
+
+        let merged_size = merged.len();
+        self.session_manager
+            .save_tool_output(session_id, target, &merged)
+            .await?;
+
+        Ok(ToolOutput::text(
+            format!(
+                "Merged {} entries into scratchpad entry \"{}\" ({} bytes)",
+                loaded.len(),
+                target,
+                merged_size,
+            ),
+            false,
+        ))
+    }
+}
+
 pub(super) struct ScratchpadDeleteTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
@@ -2632,6 +2813,191 @@ mod tests {
         assert_eq!(
             manager.load_tool_output(child, "captured").await.unwrap(),
             None,
+        );
+    }
+
+    // -- scratchpad_merge --
+
+    #[tokio::test]
+    async fn test_scratchpad_merge_concat_with_headers_default() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session().await.expect("create");
+        for (name, body) in [("a", "first"), ("b", "second"), ("c", "third")] {
+            manager
+                .save_tool_output(session_id, name, body)
+                .await
+                .expect("seed");
+        }
+
+        let tool = ScratchpadMergeTool {
+            session_manager: manager.clone(),
+            session_id: test_session_id(session_id),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"sources": ["a", "b", "c"], "target": "merged"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("merge");
+
+        assert!(!result.is_error, "got: {}", text_content(&result));
+        let stored = manager
+            .load_tool_output(session_id, "merged")
+            .await
+            .expect("load")
+            .expect("present");
+        assert!(stored.contains("--- a ---"));
+        assert!(stored.contains("--- b ---"));
+        assert!(stored.contains("--- c ---"));
+        assert!(stored.contains("first"));
+        assert!(stored.contains("second"));
+        assert!(stored.contains("third"));
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_merge_json_array_parses_valid_and_quotes_invalid() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session().await.expect("create");
+        manager
+            .save_tool_output(session_id, "obj", r#"{"k":1}"#)
+            .await
+            .expect("seed obj");
+        manager
+            .save_tool_output(session_id, "num", "42")
+            .await
+            .expect("seed num");
+        manager
+            .save_tool_output(session_id, "plain", "not json")
+            .await
+            .expect("seed plain");
+
+        let tool = ScratchpadMergeTool {
+            session_manager: manager.clone(),
+            session_id: test_session_id(session_id),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+        };
+        tool.execute(
+            serde_json::json!({
+                "sources": ["obj", "num", "plain"],
+                "target": "combined",
+                "format": "json_array"
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("merge");
+
+        let stored = manager
+            .load_tool_output(session_id, "combined")
+            .await
+            .expect("load")
+            .expect("present");
+        let parsed: serde_json::Value = serde_json::from_str(&stored).expect("valid JSON");
+        let array = parsed.as_array().expect("array");
+        assert_eq!(array.len(), 3);
+        assert_eq!(array[0]["k"], serde_json::json!(1));
+        assert_eq!(array[1], serde_json::json!(42));
+        assert_eq!(array[2], serde_json::json!("not json"));
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_merge_blocks_inherited_target() {
+        let manager = test_manager().await;
+        let parent = manager.create_session().await.expect("parent");
+        let child = manager.create_child_session(parent).await.expect("child");
+        manager
+            .save_tool_output(child, "src", "data")
+            .await
+            .expect("seed");
+
+        let tool = ScratchpadMergeTool {
+            session_manager: manager.clone(),
+            session_id: test_session_id(child),
+            parent_session_id: Some(parent),
+            inherited_names: vec!["shadow".to_string()],
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"sources": ["src"], "target": "shadow"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("execute");
+        assert!(result.is_error);
+        assert!(text_content(&result).contains("inherited read-only"));
+        assert_eq!(
+            manager.load_tool_output(child, "shadow").await.unwrap(),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_merge_reads_inherited_sources() {
+        let manager = test_manager().await;
+        let parent = manager.create_session().await.expect("parent");
+        let child = manager.create_child_session(parent).await.expect("child");
+        manager
+            .save_tool_output(parent, "shared", "parent payload")
+            .await
+            .expect("seed parent");
+        manager
+            .save_tool_output(child, "mine", "child payload")
+            .await
+            .expect("seed child");
+
+        let tool = ScratchpadMergeTool {
+            session_manager: manager.clone(),
+            session_id: test_session_id(child),
+            parent_session_id: Some(parent),
+            inherited_names: vec!["shared".to_string()],
+        };
+        tool.execute(
+            serde_json::json!({"sources": ["shared", "mine"], "target": "combined"}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("merge");
+
+        let stored = manager
+            .load_tool_output(child, "combined")
+            .await
+            .expect("load")
+            .expect("present");
+        assert!(stored.contains("parent payload"));
+        assert!(stored.contains("child payload"));
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_merge_missing_source_aborts_without_writing() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session().await.expect("create");
+        manager
+            .save_tool_output(session_id, "real", "stuff")
+            .await
+            .expect("seed");
+
+        let tool = ScratchpadMergeTool {
+            session_manager: manager.clone(),
+            session_id: test_session_id(session_id),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"sources": ["real", "missing"], "target": "out"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err(), "missing source must propagate an error");
+        // Target must not have been written.
+        assert_eq!(
+            manager.load_tool_output(session_id, "out").await.unwrap(),
+            None,
+            "target row must not exist after a failed merge",
         );
     }
 }
