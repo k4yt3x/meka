@@ -501,6 +501,35 @@ async fn create_agent_from_config(
     Ok(agent)
 }
 
+/// Run one agent turn with Ctrl+C wired to a fresh cancellation token.
+/// Spawns a `ctrl_c()` listener for the turn's duration and aborts it
+/// afterward, so a SIGINT during the turn cancels it (and every tool
+/// and sub-agent it spawned), while a SIGINT between turns is not
+/// consumed by a leaked listener. Every `run_turn` callsite in the
+/// REPL / CLI path must go through here — a bare `CancellationToken`
+/// with no signal source silently swallows Ctrl+C.
+async fn run_turn_interruptible(
+    agent: &Agent,
+    session_id: &mut Option<uuid::Uuid>,
+    messages: &mut conversation::Conversation,
+    input: String,
+) -> error::Result<()> {
+    let cancellation = CancellationToken::new();
+    let signal_handle = {
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancellation.cancel();
+            }
+        })
+    };
+    let result = agent
+        .run_turn(session_id, messages, input, cancellation)
+        .await;
+    signal_handle.abort();
+    result
+}
+
 async fn run_oneshot(
     config: ResolvedConfig,
     session_manager: SessionManager,
@@ -531,22 +560,10 @@ async fn run_oneshot(
     )
     .await?;
 
-    let cancellation = CancellationToken::new();
-    let cancellation_clone = cancellation.clone();
-
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancellation_clone.cancel();
-        }
-    });
-
     let mut session_id = None;
     let mut messages = conversation::Conversation::new();
 
-    match agent
-        .run_turn(&mut session_id, &mut messages, prompt, cancellation)
-        .await
-    {
+    match run_turn_interruptible(&agent, &mut session_id, &mut messages, prompt).await {
         Ok(()) => {}
         Err(error::AgshError::Interrupted) => {
             eprintln!("\nInterrupted.");
@@ -702,19 +719,7 @@ async fn run_interactive(
     while let Some(event) = input_receiver.recv().await {
         match event {
             ReplEvent::UserInput(input) => {
-                let cancellation = CancellationToken::new();
-
-                let cancellation_for_signal = cancellation.clone();
-                let signal_handle = tokio::spawn(async move {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        cancellation_for_signal.cancel();
-                    }
-                });
-
-                match agent
-                    .run_turn(&mut session_id, &mut messages, input, cancellation)
-                    .await
-                {
+                match run_turn_interruptible(&agent, &mut session_id, &mut messages, input).await {
                     Ok(()) => {}
                     Err(error::AgshError::Interrupted) => {
                         eprintln!("\nInterrupted.");
@@ -741,8 +746,6 @@ async fn run_interactive(
                         Err(error) => render::render_error(&error),
                     }
                 }
-
-                signal_handle.abort();
 
                 if agent_event_sender
                     .send(repl::AgentToReplEvent::Done)
@@ -869,17 +872,21 @@ async fn run_interactive(
                                         }
                                     }
                                     let user_input = body.trim().to_string();
-                                    if !user_input.is_empty()
-                                        && let Err(error) = agent
-                                            .run_turn(
-                                                &mut session_id,
-                                                &mut messages,
-                                                user_input,
-                                                CancellationToken::new(),
-                                            )
-                                            .await
-                                    {
-                                        render::render_error(&error);
+                                    if !user_input.is_empty() {
+                                        match run_turn_interruptible(
+                                            &agent,
+                                            &mut session_id,
+                                            &mut messages,
+                                            user_input,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {}
+                                            Err(error::AgshError::Interrupted) => {
+                                                eprintln!("\nInterrupted.");
+                                            }
+                                            Err(error) => render::render_error(&error),
+                                        }
                                     }
                                 }
                                 Err(error) => {
@@ -943,16 +950,14 @@ async fn run_interactive(
                         } else {
                             format!("{}\n\n{}", extra, body)
                         };
-                        if let Err(error) = agent
-                            .run_turn(
-                                &mut session_id,
-                                &mut messages,
-                                body,
-                                CancellationToken::new(),
-                            )
+                        match run_turn_interruptible(&agent, &mut session_id, &mut messages, body)
                             .await
                         {
-                            render::render_error(&error);
+                            Ok(()) => {}
+                            Err(error::AgshError::Interrupted) => {
+                                eprintln!("\nInterrupted.");
+                            }
+                            Err(error) => render::render_error(&error),
                         }
                     }
                     repl::SlashCommand::Status => {
