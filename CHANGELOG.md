@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Skill frontmatter fields `when_to_use`, `allowed_tools`, and `user_invocable`.
 
+### Fixed
+
+- Orphaned session lock files are pruned at startup and after deletions instead of accumulating.
+
 ## [0.25.2] - 2026-05-20
 
 ### Changed

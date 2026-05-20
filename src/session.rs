@@ -242,6 +242,7 @@ impl SessionManager {
             lock_dir,
         };
         manager.initialize_schema().await?;
+        manager.prune_orphan_lock_files().await;
         Ok(manager)
     }
 
@@ -562,6 +563,76 @@ impl SessionManager {
         })
     }
 
+    /// Best-effort removal of `<lock_dir>/<uuid>.lock` files whose
+    /// session no longer exists. `lock_session` creates these files but
+    /// never deletes them — the OS releases the *lock* on process exit,
+    /// yet the empty file remains. A file for a UUID that isn't in the
+    /// `sessions` table is pure garbage.
+    ///
+    /// Housekeeping only: never fails the caller. A DB-query failure is
+    /// a recoverable fallback (`warn!`); a per-file unlink failure
+    /// (e.g. a root-owned file left by a container run) is expected and
+    /// logged at `debug!`.
+    ///
+    /// Deleting a *held* lock file for an already-deleted session is
+    /// benign — no process starts a deleted session — and the sweep
+    /// never races a live one: a session's row is committed before its
+    /// lock file is acquired (see `main.rs`), so a live UUID is always
+    /// in the set this query returns.
+    async fn prune_orphan_lock_files(&self) {
+        let live_ids: std::collections::HashSet<String> = match self
+            .connection
+            .call(|connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare("SELECT id FROM sessions")?;
+                let ids = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<std::collections::HashSet<String>>>()?;
+                Ok(ids)
+            })
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::warn!("lock-file prune: failed to list sessions: {}", error);
+                return;
+            }
+        };
+
+        let entries = match std::fs::read_dir(&self.lock_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(
+                    "lock-file prune: cannot read {}: {}",
+                    self.lock_dir.display(),
+                    error
+                );
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
+                continue;
+            }
+            // Only touch files whose stem is a UUID — never delete an
+            // unrelated file someone dropped into the lock directory.
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if Uuid::parse_str(stem).is_err() || live_ids.contains(stem) {
+                continue;
+            }
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::debug!(
+                    "lock-file prune: cannot remove {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
+
     /// Persist a single event from the conversation log. Events are
     /// encoded into the existing `messages(role, content, …)` table:
     ///
@@ -812,7 +883,8 @@ impl SessionManager {
         let cutoff = chrono::Utc::now() - chrono::TimeDelta::days(retention_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
-        self.connection
+        let deleted = self
+            .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // FK CASCADE sweeps messages, tool_outputs, and any
                 // sub-agent child sessions of the expired parents.
@@ -825,7 +897,9 @@ impl SessionManager {
             .await
             .map_err(|error| {
                 AgshError::Database(format!("failed to delete expired sessions: {}", error))
-            })
+            })?;
+        self.prune_orphan_lock_files().await;
+        Ok(deleted)
     }
 
     #[cfg(test)]
@@ -853,7 +927,8 @@ impl SessionManager {
     }
 
     pub async fn delete_session(&self, session_id: Uuid) -> Result<bool> {
-        self.connection
+        let deleted = self
+            .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // ON DELETE CASCADE on `messages.session_id`,
                 // `tool_outputs.session_id`, and `sessions.parent_session_id`
@@ -866,11 +941,14 @@ impl SessionManager {
                 Ok(deleted > 0)
             })
             .await
-            .map_err(|error| AgshError::Database(format!("failed to delete session: {}", error)))
+            .map_err(|error| AgshError::Database(format!("failed to delete session: {}", error)))?;
+        self.prune_orphan_lock_files().await;
+        Ok(deleted)
     }
 
     pub async fn delete_all_sessions(&self) -> Result<u64> {
-        self.connection
+        let deleted = self
+            .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // FK CASCADE clears messages and tool_outputs.
                 let deleted = connection.execute("DELETE FROM sessions", [])?;
@@ -879,7 +957,9 @@ impl SessionManager {
             .await
             .map_err(|error| {
                 AgshError::Database(format!("failed to delete all sessions: {}", error))
-            })
+            })?;
+        self.prune_orphan_lock_files().await;
+        Ok(deleted)
     }
 
     pub async fn save_tool_output(
@@ -1053,7 +1133,8 @@ impl SessionManager {
     }
 
     pub async fn enforce_storage_limit(&self, max_bytes: u64) -> Result<u64> {
-        self.connection
+        let deleted = self
+            .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut deleted: u64 = 0;
 
@@ -1094,7 +1175,9 @@ impl SessionManager {
             .await
             .map_err(|error| {
                 AgshError::Database(format!("failed to enforce storage limit: {}", error))
-            })
+            })?;
+        self.prune_orphan_lock_files().await;
+        Ok(deleted)
     }
 }
 
@@ -1798,6 +1881,58 @@ mod tests {
         let _lock2 = manager
             .lock_session(session_id)
             .expect("failed to re-acquire session lock after drop");
+    }
+
+    #[tokio::test]
+    async fn test_prune_orphan_lock_files() {
+        let manager = test_manager().await;
+        let live = manager.create_session().await.expect("create");
+
+        let live_lock = manager.lock_dir.join(format!("{}.lock", live));
+        let orphan_lock = manager.lock_dir.join(format!("{}.lock", Uuid::new_v4()));
+        let stray = manager.lock_dir.join("not-a-uuid.lock");
+        std::fs::write(&live_lock, "").expect("write live lock");
+        std::fs::write(&orphan_lock, "").expect("write orphan lock");
+        std::fs::write(&stray, "").expect("write stray file");
+
+        manager.prune_orphan_lock_files().await;
+
+        assert!(live_lock.exists(), "live session's lock file must be kept");
+        assert!(!orphan_lock.exists(), "orphan lock file must be removed");
+        assert!(stray.exists(), "non-UUID file must be left untouched");
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_removes_lock_file() {
+        let manager = test_manager().await;
+        let session = manager.create_session().await.expect("create");
+        let lock_path = manager.lock_dir.join(format!("{}.lock", session));
+        std::fs::write(&lock_path, "").expect("write lock");
+
+        manager.delete_session(session).await.expect("delete");
+        assert!(
+            !lock_path.exists(),
+            "deleting a session must remove its lock file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_prunes_orphan_lock_files() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("sessions.db");
+        let lock_dir = temp_dir.path().join("locks");
+        std::fs::create_dir_all(&lock_dir).expect("create locks dir");
+        let orphan = lock_dir.join(format!("{}.lock", Uuid::new_v4()));
+        std::fs::write(&orphan, "").expect("write orphan");
+
+        // A fresh DB has no sessions, so the planted file is an orphan.
+        let _manager = SessionManager::open(Some(&db_path))
+            .await
+            .expect("open should succeed");
+        assert!(
+            !orphan.exists(),
+            "open() must prune pre-existing orphan lock files"
+        );
     }
 
     #[tokio::test]
