@@ -203,10 +203,9 @@ impl Tool for ReadMcpResourceTool {
     }
 }
 
-/// Render MCP `ResourceContents` into formatted chunks with Unicode
-/// sanitisation applied to all server-supplied strings (URIs, MIME types,
-/// text bodies) and a hard byte budget across the whole response. Split
-/// from `ReadMcpResourceTool::execute` so it's exercisable from tests.
+/// Render MCP `ResourceContents` into formatted chunks with Unicode sanitisation applied to all
+/// server-supplied strings (URIs, MIME types, text bodies) and a hard byte budget across the whole
+/// response. Split from `ReadMcpResourceTool::execute` so it's exercisable from tests.
 fn format_resource_contents(
     contents: &[rmcp::model::ResourceContents],
     max_bytes: usize,
@@ -493,8 +492,8 @@ impl Tool for GetMcpPromptTool {
 }
 
 pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClientManager>) {
-    // Skip registration if no servers are configured — these tools rely on
-    // the manager and there's nothing useful to do without at least one.
+    // Skip registration if no servers are configured — these tools rely on the manager and there's
+    // nothing useful to do without at least one.
     if manager.server_names().is_empty() {
         return;
     }
@@ -533,10 +532,9 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
         .expect("builtin list_mcp_resource_updates tool name collision");
     drop(manager);
 
-    // These tools are discovery-style helpers — mark them deferred so they
-    // don't clutter the tool list until a prompt/resource-focused flow is
-    // activated. The registry's auto-activate path already promotes them to
-    // the API when invoked.
+    // These tools are discovery-style helpers — mark them deferred so they don't clutter the tool
+    // list until a prompt/resource-focused flow is activated. The registry's auto-activate path
+    // already promotes them to the API when invoked.
     registry.mark_deferred("list_mcp_resources");
     registry.mark_deferred("read_mcp_resource");
     registry.mark_deferred("list_mcp_prompts");
@@ -788,8 +786,8 @@ mod tests {
             text_contents("file:///second.txt", Some("text/plain"), "short"),
         ];
         let out = format_resource_contents(&contents, 1024);
-        // The truncation marker for the first chunk is present, and no
-        // second-chunk line should appear.
+        // The truncation marker for the first chunk is present, and no second-chunk line should
+        // appear.
         let joined = out.join("\n");
         assert!(joined.contains("first.txt"));
         assert!(joined.contains("truncated"));
@@ -809,10 +807,9 @@ mod tests {
         assert!(out[1].contains("beta"));
     }
 
-    /// Regression guard for the scratchpad un-defer change: the seven MCP
-    /// resource tools must STILL be deferred after registration. We only
-    /// relaxed `scratchpad_*` deferral; if a future refactor accidentally
-    /// drops `mark_deferred` calls here too, every MCP-using session would
+    /// Regression guard for the scratchpad un-defer change: the seven MCP resource tools must STILL
+    /// be deferred after registration. We only relaxed `scratchpad_*` deferral; if a future
+    /// refactor accidentally drops `mark_deferred` calls here too, every MCP-using session would
     /// see seven extra tool schemas in its tools array on the first turn.
     #[tokio::test]
     async fn test_mcp_resource_tools_remain_deferred() {

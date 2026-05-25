@@ -5,31 +5,28 @@
 //!   (required for subscription auth).
 //! - The `exp` claim from the `access_token` — used to schedule refresh before the token expires.
 //!
-//! The id_token's payload nests ChatGPT-specific claims under the
-//! namespaced key `https://api.openai.com/auth`, matching Codex's own
-//! parsing in `temp/codex/codex-rs/login/src/token_data.rs:71-99`.
+//! The id_token's payload nests ChatGPT-specific claims under the namespaced key
+//! `https://api.openai.com/auth`, matching Codex's own parsing in
+//! `temp/codex/codex-rs/login/src/token_data.rs:71-99`.
 //!
-//! No signature verification — the auth server's TLS handshake provides
-//! integrity for the in-transit token, and the API server validates the
-//! token on every request. Local validation would only catch tampering
-//! by a process that already has full access to our memory.
+//! No signature verification — the auth server's TLS handshake provides integrity for the
+//! in-transit token, and the API server validates the token on every request. Local validation
+//! would only catch tampering by a process that already has full access to our memory.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 
 use crate::error::{AgshError, Result};
 
-/// Pull `chatgpt_account_id` out of an OpenAI id_token JWT. Returns `None`
-/// when the claim is absent (e.g. for a free-tier account with no
-/// workspace) — the caller decides whether absence is fatal.
+/// Pull `chatgpt_account_id` out of an OpenAI id_token JWT. Returns `None` when the claim is absent
+/// (e.g. for a free-tier account with no workspace) — the caller decides whether absence is fatal.
 pub(super) fn extract_account_id(id_token: &str) -> Result<Option<String>> {
     let claims: IdClaims = decode_jwt_payload(id_token)?;
     Ok(claims.auth.and_then(|auth| auth.chatgpt_account_id))
 }
 
-/// Pull the `exp` (expiration) claim out of any JWT (access_token or
-/// id_token). Value is unix epoch seconds. Returns `None` if the claim
-/// is missing.
+/// Pull the `exp` (expiration) claim out of any JWT (access_token or id_token). Value is unix epoch
+/// seconds. Returns `None` if the claim is missing.
 pub(super) fn extract_expiration_seconds(jwt: &str) -> Result<Option<i64>> {
     let claims: StandardClaims = decode_jwt_payload(jwt)?;
     Ok(claims.exp)
@@ -80,9 +77,9 @@ fn decode_jwt_payload<T: serde::de::DeserializeOwned>(jwt: &str) -> Result<T> {
 mod tests {
     use super::*;
 
-    /// Build a synthesised JWT-shape string from a payload JSON object.
-    /// Header and signature are placeholders — `decode_jwt_payload` only
-    /// reads the middle segment, so the others just need to be non-empty.
+    /// Build a synthesised JWT-shape string from a payload JSON object. Header and signature are
+    /// placeholders — `decode_jwt_payload` only reads the middle segment, so the others just need
+    /// to be non-empty.
     fn make_jwt(payload: serde_json::Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
         let payload = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());

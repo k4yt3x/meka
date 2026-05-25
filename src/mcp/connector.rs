@@ -1,6 +1,6 @@
-//! Background connector that drives `Pending` MCP server entries through
-//! initial handshake + tool discovery + registration. Split into a stdio
-//! stream and an HTTP stream, each bounded by its own concurrency cap.
+//! Background connector that drives `Pending` MCP server entries through initial handshake + tool
+//! discovery + registration. Split into a stdio stream and an HTTP stream, each bounded by its own
+//! concurrency cap.
 
 use std::sync::Arc;
 
@@ -19,13 +19,12 @@ use crate::{
     session::TokenStore,
 };
 
-/// Drive the actual connect work for every `Pending` entry, split into a
-/// stdio stream and an HTTP stream, each bounded by its own concurrency
-/// cap. Runs in a spawned task so [`super::McpClientManager::start_connector`]
-/// can return immediately and the REPL paints without waiting.
+/// Drive the actual connect work for every `Pending` entry, split into a stdio stream and an HTTP
+/// stream, each bounded by its own concurrency cap. Runs in a spawned task so
+/// [`super::McpClientManager::start_connector`] can return immediately and the REPL paints without
+/// waiting.
 ///
-/// When both streams drain, flips the `settled` watch so the turn gate
-/// can short-circuit.
+/// When both streams drain, flips the `settled` watch so the turn gate can short-circuit.
 pub(super) async fn run_connector(
     pending: Vec<Arc<ServerEntry>>,
     manager: Arc<McpClientManager>,
@@ -74,11 +73,10 @@ pub(super) async fn run_connector(
     let _ = settled.send(true);
 }
 
-/// Connect a single `Pending` server: wrap the existing `connect_server`
-/// in a per-server timeout, capture instructions, discover + register
-/// tools into the registry, and flip the entry's state to `Connected` on
-/// success or `Failed` on error. Never panics — errors are logged and
-/// reflected in [`ServerState::Failed`] so the turn gate can surface them.
+/// Connect a single `Pending` server: wrap the existing `connect_server` in a per-server timeout,
+/// capture instructions, discover + register tools into the registry, and flip the entry's state to
+/// `Connected` on success or `Failed` on error. Never panics — errors are logged and reflected in
+/// [`ServerState::Failed`] so the turn gate can surface them.
 async fn connect_one(
     entry: Arc<ServerEntry>,
     manager: Arc<McpClientManager>,
@@ -87,11 +85,10 @@ async fn connect_one(
 ) {
     let server_name = entry.server_name.clone();
 
-    // connect_server's future can be `!Send` for OAuth-authenticated
-    // servers (rmcp 1.5 holds a `form_urlencoded::Serializer` across an
-    // await in its auth module, whose `Option<&dyn Fn(&str) -> Cow<[u8]>>`
-    // closure slot is not `Sync`). Drive it on a `spawn_blocking` thread
-    // using the outer runtime's `Handle` — same approach `reconnect` uses.
+    // connect_server's future can be `!Send` for OAuth-authenticated servers (rmcp 1.5 holds a
+    // `form_urlencoded::Serializer` across an await in its auth module, whose `Option<&dyn Fn(&str)
+    // -> Cow<[u8]>>` closure slot is not `Sync`). Drive it on a `spawn_blocking` thread using the
+    // outer runtime's `Handle` — same approach `reconnect` uses.
     let handle = tokio::runtime::Handle::current();
     let entry_for_connect = Arc::clone(&entry);
     let server_name_for_task = server_name.clone();
@@ -152,8 +149,8 @@ async fn connect_one(
 
     tracing::info!("connected to MCP server '{}'", server_name);
 
-    // Capture InitializeResult.instructions on the first Connected
-    // transition. Immutable per MCP spec so reconnects don't overwrite.
+    // Capture InitializeResult.instructions on the first Connected transition. Immutable per MCP
+    // spec so reconnects don't overwrite.
     let captured = connected
         .peer()
         .peer_info()
@@ -166,16 +163,15 @@ async fn connect_one(
         });
     let _ = entry.instructions.set(captured);
 
-    // Flip state to Connected BEFORE tool registration so `list_all_tools`
-    // below goes through the live peer via `require_connected`.
+    // Flip state to Connected BEFORE tool registration so `list_all_tools` below goes through the
+    // live peer via `require_connected`.
     let service_arc = Arc::new(connected);
     *entry.state.write().await = ServerState::Connected {
         service: Arc::clone(&service_arc),
     };
 
-    // Discover + register tools. Any error here doesn't undo the
-    // Connected state — the server is reachable, just its tool list
-    // failed. Surface it as a warn and leave tool set empty.
+    // Discover + register tools. Any error here doesn't undo the Connected state — the server is
+    // reachable, just its tool list failed. Surface it as a warn and leave tool set empty.
     match discover_and_register_tools(&entry, mcp_default_permission, &manager).await {
         Ok(count) => {
             tracing::info!("MCP server '{}' registered {} tool(s)", server_name, count);
@@ -190,11 +186,10 @@ async fn connect_one(
     }
 }
 
-/// Fetch `list_tools` from a just-connected server and route the
-/// resulting adapters through [`McpClientManager::update_server_tools`]
-/// so every attached per-session registry receives them. The deferred
-/// marker on tools that ship lazily is still applied via the manager's
-/// attached registries.
+/// Fetch `list_tools` from a just-connected server and route the resulting adapters through
+/// [`McpClientManager::update_server_tools`] so every attached per-session registry receives them.
+/// The deferred marker on tools that ship lazily is still applied via the manager's attached
+/// registries.
 async fn discover_and_register_tools(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,
@@ -202,9 +197,8 @@ async fn discover_and_register_tools(
 ) -> Result<usize> {
     use crate::tools::Tool as _;
     let adapters = build_mcp_adapters(entry, mcp_default_permission).await?;
-    // Decide which adapters should ship deferred BEFORE we erase the
-    // concrete type into `Arc<dyn Tool>` — `tool_should_eager_load`
-    // needs the raw name, which the trait object doesn't expose.
+    // Decide which adapters should ship deferred BEFORE we erase the concrete type into `Arc<dyn
+    // Tool>` — `tool_should_eager_load` needs the raw name, which the trait object doesn't expose.
     let deferred_names: Vec<String> = adapters
         .iter()
         .filter(|adapter| {
@@ -226,9 +220,8 @@ async fn discover_and_register_tools(
     Ok(registered_count)
 }
 
-/// Core adapter-construction logic shared between initial discovery (via
-/// the connector) and ad-hoc discovery (via
-/// [`super::McpClientManager::discover_tools_for_server`]).
+/// Core adapter-construction logic shared between initial discovery (via the connector) and ad-hoc
+/// discovery (via [`super::McpClientManager::discover_tools_for_server`]).
 async fn build_mcp_adapters(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,
@@ -290,9 +283,8 @@ async fn build_mcp_adapters(
             mcp_default_permission,
         )?;
 
-        // Annotations carry permission hints (`readOnlyHint`,
-        // `destructiveHint`); silently dropping them on a serialization
-        // failure could quietly relax permission resolution. Log so the
+        // Annotations carry permission hints (`readOnlyHint`, `destructiveHint`); silently dropping
+        // them on a serialization failure could quietly relax permission resolution. Log so the
         // failure shows up at default verbosity.
         let annotations =
             tool.annotations
@@ -343,15 +335,12 @@ async fn build_mcp_adapters(
     Ok(adapters)
 }
 
-/// Connect to an MCP server, dispatching to the auth or no-auth path. This
-/// function is only called from top-level startup code (e.g. `connect_all`)
-/// where a `Send` future isn't required — the OAuth path pulls in an rmcp
-/// auth future that is `!Send`.
-/// Connect to an MCP server. The returned future is `!Send` when the server
-/// config uses OAuth (rmcp 1.5's auth module holds a `!Sync` closure across
-/// an await). Callers that need a `Send` future (e.g. `Tool::execute` during
-/// reconnect) drive this on a `spawn_blocking` thread via
-/// [`ServerEntry::reconnect`].
+/// Connect to an MCP server, dispatching to the auth or no-auth path. This function is only called
+/// from top-level startup code (e.g. `connect_all`) where a `Send` future isn't required — the
+/// OAuth path pulls in an rmcp auth future that is `!Send`. Connect to an MCP server. The returned
+/// future is `!Send` when the server config uses OAuth (rmcp 1.5's auth module holds a `!Sync`
+/// closure across an await). Callers that need a `Send` future (e.g. `Tool::execute` during
+/// reconnect) drive this on a `spawn_blocking` thread via [`ServerEntry::reconnect`].
 pub(super) async fn connect_server(
     server_name: &str,
     config: &McpServerConfig,
@@ -408,10 +397,9 @@ pub(super) async fn connect_server(
                     message: "http transport requires 'url' field".to_string(),
                 })?;
 
-            // Consult the auth-probe cache: if a prior connect returned 401
-            // recently and we have no stored creds, skip the unauthenticated
-            // probe and drive straight into the OAuth flow. The cache entry
-            // is cleared on a successful connect below.
+            // Consult the auth-probe cache: if a prior connect returned 401 recently and we have no
+            // stored creds, skip the unauthenticated probe and drive straight into the OAuth flow.
+            // The cache entry is cleared on a successful connect below.
             if config.auth.is_some()
                 && let Some(store) = token_store
             {
@@ -499,9 +487,8 @@ mod tests {
     #[tokio::test]
     async fn connect_one_timeout_marks_entry_failed() {
         use std::sync::OnceLock;
-        // A hung stdio process (`sleep 999`) forces `connect_server`'s
-        // initialize handshake to never complete. With a 50 ms timeout,
-        // `connect_one` must bail and mark the entry Failed.
+        // A hung stdio process (`sleep 999`) forces `connect_server`'s initialize handshake to
+        // never complete. With a 50 ms timeout, `connect_one` must bail and mark the entry Failed.
         let mut config = bare_server_config("hung");
         config.transport = McpTransport::Stdio;
         config.command = Some("/bin/sleep".to_string());
@@ -518,9 +505,8 @@ mod tests {
             instructions: OnceLock::new(),
         });
 
-        // The test never reaches tool discovery (the connect itself
-        // times out), so the manager isn't observed; build a minimal
-        // one just to satisfy the signature.
+        // The test never reaches tool discovery (the connect itself times out), so the manager
+        // isn't observed; build a minimal one just to satisfy the signature.
         let context = McpClientContext::new();
         let manager = McpClientManager::prepare(&[], None, None, context)
             .await

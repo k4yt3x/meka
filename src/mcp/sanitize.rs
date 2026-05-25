@@ -1,11 +1,10 @@
-//! String hygiene helpers for data crossing the MCP boundary. Strips
-//! invisible/control characters that could be used for prompt injection or
-//! UI spoofing (RTL/LTR overrides, zero-width joiners, C0/C1 controls) and
-//! normalises MCP server names to the alphabet accepted by provider tool
+//! String hygiene helpers for data crossing the MCP boundary. Strips invisible/control characters
+//! that could be used for prompt injection or UI spoofing (RTL/LTR overrides, zero-width joiners,
+//! C0/C1 controls) and normalises MCP server names to the alphabet accepted by provider tool
 //! schemas.
 
-/// Reserved server names that collide with agsh internals or with the tool
-/// namespace separator. Connection requests for these names are rejected.
+/// Reserved server names that collide with agsh internals or with the tool namespace separator.
+/// Connection requests for these names are rejected.
 pub const RESERVED_SERVER_NAMES: &[&str] = &["agsh", "ide"];
 
 /// Strip control + format characters that could hijack the terminal or be
@@ -16,8 +15,7 @@ pub const RESERVED_SERVER_NAMES: &[&str] = &["agsh", "ide"];
 ///   language tags).
 /// - Unpaired surrogate code units (already impossible in a valid `&str`, noted for completeness).
 ///
-/// Emoji, CJK, combining marks, and all other printable Unicode pass through
-/// unchanged.
+/// Emoji, CJK, combining marks, and all other printable Unicode pass through unchanged.
 pub fn sanitize_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -45,8 +43,8 @@ fn is_safe_char(ch: char) -> bool {
         return false;
     }
 
-    // Cf category (Format): covers RTL/LTR overrides, ZWJ/ZWNJ, BOM,
-    // interlinear annotations, and language tags (E0000–E007F).
+    // Cf category (Format): covers RTL/LTR overrides, ZWJ/ZWNJ, BOM, interlinear annotations, and
+    // language tags (E0000–E007F).
     if is_format_char(code) {
         return false;
     }
@@ -56,8 +54,8 @@ fn is_safe_char(ch: char) -> bool {
 
 /// Returns true for Unicode General Category `Cf` (Format).
 ///
-/// Enumerated from Unicode 15.1 — only the ranges that exist; the bulk of
-/// the BMP has no Cf characters so this stays a short list.
+/// Enumerated from Unicode 15.1 — only the ranges that exist; the bulk of the BMP has no Cf
+/// characters so this stays a short list.
 fn is_format_char(code: u32) -> bool {
     matches!(
         code,
@@ -85,13 +83,12 @@ fn is_format_char(code: u32) -> bool {
     )
 }
 
-/// Normalise a user-supplied MCP server name into the alphabet accepted as
-/// the `<server>` segment of a `mcp__<server>__<tool>` tool name.
+/// Normalise a user-supplied MCP server name into the alphabet accepted as the `<server>` segment
+/// of a `mcp__<server>__<tool>` tool name.
 ///
-/// Any character outside `[A-Za-z0-9_-]` is replaced with `_`; runs of `_`
-/// are collapsed, and leading/trailing `_` are trimmed. Empty results are
-/// mapped to `"mcp_server"` (the caller is expected to reject that via the
-/// reserved check anyway, but this keeps the string non-empty).
+/// Any character outside `[A-Za-z0-9_-]` is replaced with `_`; runs of `_` are collapsed, and
+/// leading/trailing `_` are trimmed. Empty results are mapped to `"mcp_server"` (the caller is
+/// expected to reject that via the reserved check anyway, but this keeps the string non-empty).
 pub fn normalize_server_name(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut last_underscore = false;
@@ -120,8 +117,7 @@ pub fn normalize_server_name(input: &str) -> String {
 }
 
 /// Returns true when the given name is reserved (either an explicit entry in
-/// [`RESERVED_SERVER_NAMES`] or starts with the `mcp_` prefix that agsh uses
-/// for internal tools).
+/// [`RESERVED_SERVER_NAMES`] or starts with the `mcp_` prefix that agsh uses for internal tools).
 pub fn is_reserved_server_name(name: &str) -> bool {
     if RESERVED_SERVER_NAMES
         .iter()

@@ -1,16 +1,14 @@
-//! Clap-derived CLI definition. Owns the top-level argument struct, the
-//! subcommand enum (`setup`, `export`, `delete`, `list`), and the small
-//! parsers for permission/render-mode flag values.
+//! Clap-derived CLI definition. Owns the top-level argument struct, the subcommand enum (`setup`,
+//! `export`, `delete`, `list`), and the small parsers for permission/render-mode flag values.
 
 use clap::Parser;
 
 use crate::permission::Permission;
 
-// `Mcp { action: McpAction }` is bigger than every other variant because
-// `McpAction::Add` holds every CLI flag inline, but the enum is only ever
-// constructed once per process by clap and held on the stack of `main`,
-// so the few extra words of padding on the other variants aren't worth
-// the indirection cost of boxing.
+// `Mcp { action: McpAction }` is bigger than every other variant because `McpAction::Add` holds
+// every CLI flag inline, but the enum is only ever constructed once per process by clap and held on
+// the stack of `main`, so the few extra words of padding on the other variants aren't worth the
+// indirection cost of boxing.
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
@@ -37,9 +35,8 @@ pub enum Command {
         /// Maximum number of sessions to show
         #[arg(short = 'n', long, default_value = "20")]
         limit: u32,
-        /// Include sub-agent sessions (children of a parent session) in the
-        /// listing. Hidden by default to keep the view focused on
-        /// user-initiated conversations.
+        /// Include sub-agent sessions (children of a parent session) in the listing. Hidden by
+        /// default to keep the view focused on user-initiated conversations.
         #[arg(long)]
         include_children: bool,
     },
@@ -60,9 +57,8 @@ pub enum Command {
     },
     /// Run agsh as an ACP (Agent Client Protocol) agent over stdio.
     ///
-    /// Speaks newline-framed JSON-RPC on stdin/stdout so ACP clients
-    /// (Zed, JetBrains, Neovim, VS Code via the ACP extension, etc.)
-    /// can drive agsh turns directly. Diagnostic output stays on
+    /// Speaks newline-framed JSON-RPC on stdin/stdout so ACP clients (Zed, JetBrains, Neovim, VS
+    /// Code via the ACP extension, etc.) can drive agsh turns directly. Diagnostic output stays on
     /// stderr; stdout is reserved for the protocol.
     #[command(verbatim_doc_comment)]
     Acp,
@@ -74,8 +70,8 @@ pub enum ToolsAction {
     List,
 }
 
-// `Add` is the outlier with several flags inline; same one-shot CLI
-// dispatch reasoning as [`Command`] and [`McpAction`] above.
+// `Add` is the outlier with several flags inline; same one-shot CLI dispatch reasoning as
+// [`Command`] and [`McpAction`] above.
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Debug)]
 pub enum SkillAction {
@@ -146,9 +142,8 @@ pub enum SkillAction {
     },
 }
 
-// Same reasoning as `Command` above: `Add` is the outlier and the enum
-// lives on `main`'s stack for exactly one dispatch, not in a hot
-// collection, so boxing would trade clarity for nothing.
+// Same reasoning as `Command` above: `Add` is the outlier and the enum lives on `main`'s stack for
+// exactly one dispatch, not in a hot collection, so boxing would trade clarity for nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Debug)]
 pub enum McpAction {
@@ -171,13 +166,12 @@ pub enum McpAction {
     ///   agsh mcp add notion https://mcp.notion.com/mcp
     ///   agsh mcp add api https://api.example.com/mcp --auth-token $API_TOKEN
     ///   agsh mcp add notion https://mcp.notion.com/mcp --auth oauth
-    // `rustdoc::bare_urls` normally turns URLs like https://example into
-    // auto-links, but these doc lines are ALSO the text clap prints for
-    // `agsh mcp add --help`. Angle-brackets would leak into the CLI
-    // help. Allow bare URLs just on this variant.
+    // `rustdoc::bare_urls` normally turns URLs like https://example into auto-links, but these doc
+    // lines are ALSO the text clap prints for `agsh mcp add --help`. Angle-brackets would leak into
+    // the CLI help. Allow bare URLs just on this variant.
     #[allow(rustdoc::bare_urls)]
-    // Preserve line breaks in the `Examples:` block; clap's default
-    // joins consecutive `///` lines into one re-wrapped paragraph.
+    // Preserve line breaks in the `Examples:` block; clap's default joins consecutive `///` lines
+    // into one re-wrapped paragraph.
     #[command(verbatim_doc_comment)]
     Add {
         /// Unique server name (alphanumerics, `-`, `_` only)
@@ -276,9 +270,9 @@ pub enum McpAction {
     Enable { name: String },
 }
 
-/// Authentication flavours selectable from the CLI. Maps onto the
-/// [`crate::config::McpAuthConfig`] variants, except `None` which means
-/// "no `[auth]` block at all" (static token or unauthenticated).
+/// Authentication flavours selectable from the CLI. Maps onto the [`crate::config::McpAuthConfig`]
+/// variants, except `None` which means "no `[auth]` block at all" (static token or
+/// unauthenticated).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum McpAuthKind {
     OAuth,

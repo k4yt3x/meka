@@ -1,8 +1,7 @@
 //! OpenAI Responses API encoder + SSE decoder.
 //!
-//! Codex's subscription endpoint (`chatgpt.com/backend-api/codex/responses`)
-//! speaks the Responses API, not Chat Completions. The on-the-wire request
-//! shape is documented at
+//! Codex's subscription endpoint (`chatgpt.com/backend-api/codex/responses`) speaks the Responses
+//! API, not Chat Completions. The on-the-wire request shape is documented at
 //! <https://platform.openai.com/docs/guides/function-calling?api-mode=responses>.
 //!
 //! Reference Codex source:
@@ -23,9 +22,9 @@ use crate::{
     },
 };
 
-/// Build the JSON body POSTed to `/responses`. Translates the agsh internal
-/// `Message` / `ContentBlock` shape into Responses API `input` items
-/// (`message`, `function_call`, `function_call_output`).
+/// Build the JSON body POSTed to `/responses`. Translates the agsh internal `Message` /
+/// `ContentBlock` shape into Responses API `input` items (`message`, `function_call`,
+/// `function_call_output`).
 pub(super) fn build_request_body(
     model: &str,
     system_prompt: &str,
@@ -68,17 +67,16 @@ pub(super) fn build_request_body(
     body
 }
 
-/// Build the `output` field of a `function_call_output` item from a slice of
-/// `ToolResultContent`. The Responses API accepts either a plain string OR
-/// an array of `input_text` / `input_image` / `input_file` content items
-/// (per OpenAI's docs: "For functions that return images or files, you can
-/// pass an array of image or file objects instead of a string."). We emit
-/// the array form when at least one image is present to preserve image
-/// data; otherwise we collapse to a string for the simpler wire shape.
+/// Build the `output` field of a `function_call_output` item from a slice of `ToolResultContent`.
+/// The Responses API accepts either a plain string OR an array of `input_text` / `input_image` /
+/// `input_file` content items (per OpenAI's docs: "For functions that return images or files, you
+/// can pass an array of image or file objects instead of a string."). We emit the array form when
+/// at least one image is present to preserve image data; otherwise we collapse to a string for the
+/// simpler wire shape.
 ///
-/// Sent unconditionally — non-vision models will return a clear API error
-/// rather than us trying to detect model capabilities client-side. Mirrors
-/// our Claude path, which also sends images without a model gate.
+/// Sent unconditionally — non-vision models will return a clear API error rather than us trying to
+/// detect model capabilities client-side. Mirrors our Claude path, which also sends images without
+/// a model gate.
 fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value {
     let has_image = content
         .iter()
@@ -122,8 +120,8 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
                     "output": build_tool_result_output(content),
                 }));
             }
-            // ToolUse / Thinking on a user message would be malformed; ignore
-            // defensively to match the Chat Completions encoder's behaviour.
+            // ToolUse / Thinking on a user message would be malformed; ignore defensively to match
+            // the Chat Completions encoder's behaviour.
             _ => {}
         }
     }
@@ -185,15 +183,15 @@ fn encode_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Mutable state threaded through SSE event processing — tracks the
-/// in-flight tool call's accumulated arguments so we can return a parsed
-/// `ToolUseEnd` even if the server elides the final `arguments` field.
+/// Mutable state threaded through SSE event processing — tracks the in-flight tool call's
+/// accumulated arguments so we can return a parsed `ToolUseEnd` even if the server elides the final
+/// `arguments` field.
 #[derive(Default)]
 pub(super) struct SseState {
     active_tool_call: Option<ActiveToolCall>,
     in_reasoning: bool,
-    /// Once `response.completed` (or `response.failed` / `response.incomplete`)
-    /// has been processed, the driver should stop pulling new events.
+    /// Once `response.completed` (or `response.failed` / `response.incomplete`) has been
+    /// processed, the driver should stop pulling new events.
     pub(super) finished: bool,
 }
 
@@ -201,10 +199,9 @@ struct ActiveToolCall {
     arguments_buffer: String,
 }
 
-/// Pure SSE-event handler. Inspects the named event + parsed JSON payload,
-/// updates `state`, and returns the agsh-level [`StreamEvent`]s to forward
-/// to the agent. Returns `Err` when the server reports a fatal stream
-/// error — the driver propagates this back to the caller.
+/// Pure SSE-event handler. Inspects the named event + parsed JSON payload, updates `state`, and
+/// returns the agsh-level [`StreamEvent`]s to forward to the agent. Returns `Err` when the server
+/// reports a fatal stream error — the driver propagates this back to the caller.
 pub(super) fn process_event(
     event_name: &str,
     data: &serde_json::Value,
@@ -271,8 +268,8 @@ pub(super) fn process_event(
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if item_type == "function_call" {
                 let buffered = state.active_tool_call.take();
-                // Prefer the final `arguments` string from the item over our
-                // accumulated buffer — the server may normalise it.
+                // Prefer the final `arguments` string from the item over our accumulated buffer —
+                // the server may normalise it.
                 let arguments_str = item
                     .get("arguments")
                     .and_then(|v| v.as_str())
@@ -371,9 +368,8 @@ fn parse_response_status(status: &str) -> StopReason {
     }
 }
 
-/// Drive the SSE stream for a Responses API call. Pulls events off the
-/// transport, runs them through [`process_event`], and forwards the
-/// resulting [`StreamEvent`]s to the agent.
+/// Drive the SSE stream for a Responses API call. Pulls events off the transport, runs them through
+/// [`process_event`], and forwards the resulting [`StreamEvent`]s to the agent.
 pub(super) async fn drive_responses_sse_stream(
     response: reqwest::Response,
     event_sender: mpsc::Sender<StreamEvent>,
@@ -554,9 +550,8 @@ mod tests {
         let body = build_request_body("gpt-5", "", &[], &tools, None, true);
         let tools_arr = body["tools"].as_array().expect("tools");
         assert_eq!(tools_arr[0]["type"], "function");
-        // Top-level `name` / `description` / `parameters` (NOT wrapped under
-        // a `function` object like Chat Completions). This is the Responses
-        // API shape.
+        // Top-level `name` / `description` / `parameters` (NOT wrapped under a `function` object
+        // like Chat Completions). This is the Responses API shape.
         assert_eq!(tools_arr[0]["name"], "demo");
         assert_eq!(tools_arr[0]["description"], "A demo tool");
         assert!(tools_arr[0].get("parameters").is_some());
@@ -574,8 +569,8 @@ mod tests {
             true,
         );
         assert_eq!(body["reasoning"]["effort"], "high");
-        // Codex always asks for encrypted reasoning content so the server
-        // round-trips reasoning blocks across multi-turn conversations.
+        // Codex always asks for encrypted reasoning content so the server round-trips reasoning
+        // blocks across multi-turn conversations.
         let include = body["include"].as_array().expect("include");
         assert!(include.iter().any(|v| v == "reasoning.encrypted_content"));
     }
@@ -589,8 +584,8 @@ mod tests {
 
     #[test]
     fn test_request_body_user_message_with_tool_result_only_no_text_block() {
-        // A user turn that's *only* a tool_result must produce only a
-        // function_call_output input item — no empty user message.
+        // A user turn that's *only* a tool_result must produce only a function_call_output input
+        // item — no empty user message.
         let messages = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
@@ -945,9 +940,9 @@ mod tests {
 
     #[test]
     fn test_function_call_output_carries_image_array_in_request_body() {
-        // End-to-end: build_request_body wires build_tool_result_output via
-        // encode_user_message; confirm the function_call_output's `output`
-        // field is the array form when an image is present.
+        // End-to-end: build_request_body wires build_tool_result_output via encode_user_message;
+        // confirm the function_call_output's `output` field is the array form when an image is
+        // present.
         let mut messages = vec![Message::user("look at this"), Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {

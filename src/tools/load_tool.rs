@@ -1,9 +1,7 @@
-//! `load_tool` meta-tool: makes a deferred tool's full schema visible to the
-//! model on subsequent turns. The active tool set is derived by scanning
-//! the conversation for successful `load_tool` calls
-//! ([`super::extract_loaded_tool_names`]); this tool's `execute` only renders
-//! the description and schema as `tool_result` text — it never mutates the
-//! registry.
+//! `load_tool` meta-tool: makes a deferred tool's full schema visible to the model on subsequent
+//! turns. The active tool set is derived by scanning the conversation for successful `load_tool`
+//! calls ([`super::extract_loaded_tool_names`]); this tool's `execute` only renders the description
+//! and schema as `tool_result` text — it never mutates the registry.
 
 use std::{
     collections::HashSet,
@@ -16,10 +14,10 @@ use tokio_util::sync::CancellationToken;
 use super::{LOAD_TOOL_NAME, Tool, ToolOutput, util::require_str};
 use crate::{error::Result, permission::Permission, provider::ToolDefinition};
 
-/// Meta-tool that makes a deferred tool's schema visible for use. Held by
-/// the [`super::ToolRegistry`] like any other tool, so the same `Arc`
-/// lifecycle applies — the `Weak` handles avoid a self-referential cycle
-/// (registry → `Arc<dyn Tool>` → `Arc<RwLock<…>>` → registry).
+/// Meta-tool that makes a deferred tool's schema visible for use. Held by the
+/// [`super::ToolRegistry`] like any other tool, so the same `Arc` lifecycle applies — the `Weak`
+/// handles avoid a self-referential cycle (registry → `Arc<dyn Tool>` → `Arc<RwLock<…>>` →
+/// registry).
 pub(super) struct LoadToolTool {
     pub(super) tools: Weak<RwLock<Vec<std::sync::Arc<dyn Tool>>>>,
     pub(super) deferred: Weak<RwLock<HashSet<String>>>,
@@ -87,10 +85,9 @@ impl Tool for LoadToolTool {
             ));
         };
 
-        // Tools that aren't deferred are already part of the active tool set.
-        // Treat this as a no-op success so the scanner harmlessly records the
-        // name (it was already there) — the model gets a clear hint to call
-        // the tool directly next time without an extra round trip.
+        // Tools that aren't deferred are already part of the active tool set. Treat this as a no-op
+        // success so the scanner harmlessly records the name (it was already there) — the model
+        // gets a clear hint to call the tool directly next time without an extra round trip.
         let is_deferred = self
             .deferred
             .upgrade()
@@ -123,8 +120,8 @@ mod tests {
     use super::*;
     use crate::provider::ContentBlock;
 
-    /// Minimal fake tool for testing the registry-lookup paths of
-    /// `LoadToolTool` without dragging in `ToolRegistry::build_default`.
+    /// Minimal fake tool for testing the registry-lookup paths of `LoadToolTool` without dragging
+    /// in `ToolRegistry::build_default`.
     struct FakeTool {
         name: String,
         description: String,
@@ -158,9 +155,9 @@ mod tests {
     type ToolStorage = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
     type DeferredStorage = Arc<RwLock<HashSet<String>>>;
 
-    /// Test fixture: holds the strong `Arc`s for `tools` and `deferred`
-    /// so the `Weak`s inside `LoadToolTool` stay live for the duration of
-    /// a test. `take()` either field to simulate registry teardown.
+    /// Test fixture: holds the strong `Arc`s for `tools` and `deferred` so the `Weak`s inside
+    /// `LoadToolTool` stay live for the duration of a test. `take()` either field to simulate
+    /// registry teardown.
     struct Fixture {
         tools: Option<ToolStorage>,
         deferred: Option<DeferredStorage>,
@@ -247,9 +244,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_tool_already_available_tool() {
-        // Registered but not in the deferred set: model should be told to
-        // call it directly. Returned as success so the scanner records the
-        // name harmlessly (it was already in the active set).
+        // Registered but not in the deferred set: model should be told to call it directly.
+        // Returned as success so the scanner records the name harmlessly (it was already in the
+        // active set).
         let fake = Arc::new(FakeTool {
             name: "read_file".to_string(),
             description: "Read a file from disk.".to_string(),
@@ -276,9 +273,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_tool_registry_dropped() {
-        // Simulate the registry going away while the LoadToolTool is still
-        // held somewhere. Both Weak upgrades should fail gracefully —
-        // returning a plain error tool_result, not panicking.
+        // Simulate the registry going away while the LoadToolTool is still held somewhere. Both
+        // Weak upgrades should fail gracefully — returning a plain error tool_result, not
+        // panicking.
         let mut fixture = build_test_tool(Vec::new(), &[]);
         fixture.tools.take();
         fixture.deferred.take();

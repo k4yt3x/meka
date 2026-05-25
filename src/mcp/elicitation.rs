@@ -1,7 +1,6 @@
-//! MCP `elicitation/create` handling. When a server asks for user input
-//! (either a structured form or a URL-consent flow), we route the request
-//! through the shell's existing approval channel so the TUI can prompt the
-//! user. Declines unanswered (or timed-out) requests by default so a
+//! MCP `elicitation/create` handling. When a server asks for user input (either a structured form
+//! or a URL-consent flow), we route the request through the shell's existing approval channel so
+//! the TUI can prompt the user. Declines unanswered (or timed-out) requests by default so a
 //! misbehaving server can't stall the session.
 
 use std::sync::{Mutex, OnceLock, mpsc::SyncSender};
@@ -22,8 +21,8 @@ pub struct ElicitationPrompt {
 pub enum ElicitationKind {
     /// Structured form: the server sent a JSON schema of fields to fill.
     Form { schema: serde_json::Value },
-    /// URL consent: the server wants the user to visit a URL (e.g. to log
-    /// in to a third-party service).
+    /// URL consent: the server wants the user to visit a URL (e.g. to log in to a third-party
+    /// service).
     Url { url: String },
 }
 
@@ -57,25 +56,24 @@ impl ElicitationResponse {
     }
 }
 
-/// Callback for forwarding elicitation prompts to the shell. Set once at
-/// startup by the agent loop; if unset (non-interactive mode), elicitation
-/// requests are auto-declined.
+/// Callback for forwarding elicitation prompts to the shell. Set once at startup by the agent loop;
+/// if unset (non-interactive mode), elicitation requests are auto-declined.
 static SINK: OnceLock<Mutex<Option<ElicitationSink>>> = OnceLock::new();
 
 fn sink_slot() -> &'static Mutex<Option<ElicitationSink>> {
     SINK.get_or_init(|| Mutex::new(None))
 }
 
-/// Install the shell sink. Later calls replace the sink, which is useful
-/// when the TUI is re-initialised mid-process.
+/// Install the shell sink. Later calls replace the sink, which is useful when the TUI is
+/// re-initialised mid-process.
 pub fn set_shell_sink(sink: Option<ElicitationSink>) {
     if let Ok(mut guard) = sink_slot().lock() {
         *guard = sink;
     }
 }
 
-/// Forward a prompt to the shell. Returns `false` if no sink is installed
-/// (caller should auto-decline).
+/// Forward a prompt to the shell. Returns `false` if no sink is installed (caller should
+/// auto-decline).
 pub fn send_prompt(prompt: ElicitationPrompt) -> bool {
     let Ok(guard) = sink_slot().lock() else {
         return false;
@@ -120,9 +118,8 @@ mod tests {
 
     #[test]
     fn send_prompt_without_sink_returns_false() {
-        // Don't install sink; result should be false (unless a prior test
-        // installed one that outlives this test — OnceLock is not
-        // resettable, so be tolerant).
+        // Don't install sink; result should be false (unless a prior test installed one that
+        // outlives this test — OnceLock is not resettable, so be tolerant).
         let (responder, _rx) = std::sync::mpsc::sync_channel(1);
         let prompt = ElicitationPrompt {
             server_name: "srv".into(),

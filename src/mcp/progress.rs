@@ -1,9 +1,8 @@
-//! Plumbing for forwarding MCP `notifications/progress` updates from servers
-//! up into the shell UI. The MCP protocol requires the client to announce a
-//! per-request `progressToken`; the server then emits progress notifications
-//! carrying that token. We keep a global map from token → sink so the
-//! notification handler can route updates to the correct in-flight tool
-//! call, with cleanup on drop to avoid leaks when calls time out or error.
+//! Plumbing for forwarding MCP `notifications/progress` updates from servers up into the shell UI.
+//! The MCP protocol requires the client to announce a per-request `progressToken`; the server then
+//! emits progress notifications carrying that token. We keep a global map from token → sink so the
+//! notification handler can route updates to the correct in-flight tool call, with cleanup on drop
+//! to avoid leaks when calls time out or error.
 
 use std::{
     collections::HashMap,
@@ -19,11 +18,10 @@ pub type ProgressSink = Box<dyn Fn(ProgressUpdate) + Send + Sync + 'static>;
 pub struct ProgressUpdate {
     pub server_name: String,
     pub tool_name: String,
-    /// The provider's `tool_use_id` for the in-flight call, when one was
-    /// supplied. Reserved for a future renderer that correlates progress
-    /// lines to the tool-use entry the LLM is waiting on. Not currently
-    /// consumed by the shell, but always populated at the emit site so
-    /// downstream code doesn't need a plumbing migration later.
+    /// The provider's `tool_use_id` for the in-flight call, when one was supplied. Reserved for a
+    /// future renderer that correlates progress lines to the tool-use entry the LLM is waiting on.
+    /// Not currently consumed by the shell, but always populated at the emit site so downstream
+    /// code doesn't need a plumbing migration later.
     #[allow(dead_code)]
     pub tool_use_id: Option<String>,
     pub progress: f64,
@@ -31,13 +29,13 @@ pub struct ProgressUpdate {
     pub message: Option<String>,
 }
 
-/// Global progress registry. Singleton so the client handler (constructed at
-/// startup) and every concurrent tool call share the same routing table.
+/// Global progress registry. Singleton so the client handler (constructed at startup) and every
+/// concurrent tool call share the same routing table.
 struct Registry {
     /// Map from opaque progress token → (context, sink).
     entries: Mutex<HashMap<String, Entry>>,
-    /// Optional callback for the shell UI. Populated once the agent loop
-    /// wires itself up; until then, updates are silently dropped.
+    /// Optional callback for the shell UI. Populated once the agent loop wires itself up; until
+    /// then, updates are silently dropped.
     ui: OnceLock<ProgressSink>,
 }
 
@@ -55,16 +53,14 @@ fn registry() -> &'static Registry {
     })
 }
 
-/// Install a UI sink. Subsequent progress notifications fan out here in
-/// addition to tracing logs. Only the first sink wins; later calls are
-/// no-ops.
+/// Install a UI sink. Subsequent progress notifications fan out here in addition to tracing logs.
+/// Only the first sink wins; later calls are no-ops.
 pub fn set_ui_sink(sink: ProgressSink) {
     let _ = registry().ui.set(sink);
 }
 
-/// Register a freshly-generated progress token for an in-flight tool call.
-/// Returns a [`ProgressGuard`] that removes the entry when dropped so
-/// orphaned tokens don't pile up.
+/// Register a freshly-generated progress token for an in-flight tool call. Returns a
+/// [`ProgressGuard`] that removes the entry when dropped so orphaned tokens don't pile up.
 pub fn register(
     server_name: String,
     tool_name: String,
@@ -101,9 +97,9 @@ impl Drop for ProgressGuard {
     }
 }
 
-/// Called from `AgshClientHandler::on_progress` (the `ClientHandler` trait
-/// impl in `src/mcp.rs`). Looks up the registered context and forwards an
-/// update to the UI sink (if any) plus a tracing log at info level.
+/// Called from `AgshClientHandler::on_progress` (the `ClientHandler` trait impl in `src/mcp.rs`).
+/// Looks up the registered context and forwards an update to the UI sink (if any) plus a tracing
+/// log at info level.
 pub fn dispatch(params: ProgressNotificationParam) {
     let key = match &params.progress_token.0 {
         NumberOrString::String(s) => s.to_string(),
@@ -149,9 +145,8 @@ pub fn dispatch(params: ProgressNotificationParam) {
     }
 }
 
-/// Test helper: check whether a specific progress-token key is in the
-/// registry. Race-free against concurrent tests because the key is a
-/// UUID only the caller knows.
+/// Test helper: check whether a specific progress-token key is in the registry. Race-free against
+/// concurrent tests because the key is a UUID only the caller knows.
 #[cfg(test)]
 pub(crate) fn is_registered(key: &str) -> bool {
     registry()
@@ -161,8 +156,8 @@ pub(crate) fn is_registered(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-// Needed so the `uuid` crate's dependency-only presence is documented; other
-// code already uses it via `crate::session`.
+// Needed so the `uuid` crate's dependency-only presence is documented; other code already uses it
+// via `crate::session`.
 #[allow(unused_imports)]
 use uuid as _uuid_used_for_v4;
 
@@ -174,11 +169,10 @@ mod tests {
 
     #[test]
     fn guard_cleans_up_on_drop() {
-        // Cargo runs unit tests in parallel and the registry is a
-        // shared global. Checking `outstanding_count()` deltas races
-        // with other tests registering/dropping tokens concurrently —
-        // scan for this specific token's UUID key instead, which only
-        // this test knows about.
+        // Cargo runs unit tests in parallel and the registry is a shared global. Checking
+        // `outstanding_count()` deltas races with other tests registering/dropping tokens
+        // concurrently — scan for this specific token's UUID key instead, which only this test
+        // knows about.
         let token_key: String;
         {
             let (token, _guard) = register("srv".into(), "tool".into(), None);

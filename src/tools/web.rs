@@ -1,6 +1,5 @@
-//! Web tools: `fetch_url` (HTTP GET with HTML→markdown conversion or
-//! multimodal image return) and `web_search` (DuckDuckGo HTML scraping
-//! with CAPTCHA detection).
+//! Web tools: `fetch_url` (HTTP GET with HTML→markdown conversion or multimodal image return) and
+//! `web_search` (DuckDuckGo HTML scraping with CAPTCHA detection).
 
 use std::sync::LazyLock;
 
@@ -21,11 +20,9 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// Build the shared `reqwest::Client` for `fetch_url` + `web_search`
-/// from the resolved [`WebClientConfig`]. Errors propagate so startup
-/// fails cleanly on a bad proxy URL or unreadable CA file — safer than
-/// silently falling back to an unconfigured client that ignores user
-/// intent.
+/// Build the shared `reqwest::Client` for `fetch_url` + `web_search` from the resolved
+/// [`WebClientConfig`]. Errors propagate so startup fails cleanly on a bad proxy URL or unreadable
+/// CA file — safer than silently falling back to an unconfigured client that ignores user intent.
 pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(&cfg.user_agent)
@@ -38,8 +35,7 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
         builder = builder.read_timeout(t);
     }
 
-    // `0` → no redirects at all (Policy::none). Any non-zero cap maps
-    // to Policy::limited(n).
+    // `0` → no redirects at all (Policy::none). Any non-zero cap maps to Policy::limited(n).
     let policy = if cfg.max_redirects == 0 {
         reqwest::redirect::Policy::none()
     } else {
@@ -50,16 +46,14 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
     match cfg.proxy.as_deref() {
         None => {}
         Some("") | Some("none") => {
-            // Explicit opt-out of reqwest's env-proxy auto-detection.
-            // Useful to override a host-level `HTTP_PROXY` env var
-            // without unsetting it.
+            // Explicit opt-out of reqwest's env-proxy auto-detection. Useful to override a
+            // host-level `HTTP_PROXY` env var without unsetting it.
             builder = builder.no_proxy();
         }
         Some(url) => {
-            // Pre-validate the scheme before handing off — `reqwest::Proxy::all`
-            // is lenient (it'll accept `"not-a-url"` as `http://not-a-url/`),
-            // which silently routes traffic through a non-existent host.
-            // A typo in the config should fail loudly.
+            // Pre-validate the scheme before handing off — `reqwest::Proxy::all` is lenient (it'll
+            // accept `"not-a-url"` as `http://not-a-url/`), which silently routes traffic through a
+            // non-existent host. A typo in the config should fail loudly.
             const ALLOWED_SCHEMES: &[&str] = &[
                 "http://",
                 "https://",
@@ -89,8 +83,8 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
                 error
             ))
         })?;
-        // Handles both single-cert and bundle PEM files (multiple
-        // concatenated `-----BEGIN/END CERTIFICATE-----` blocks).
+        // Handles both single-cert and bundle PEM files (multiple concatenated `-----BEGIN/END
+        // CERTIFICATE-----` blocks).
         let certs = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|error| {
             AgshError::Config(format!(
                 "[web].ca_cert_file '{}': not a valid PEM: {}",
@@ -98,10 +92,9 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
                 error
             ))
         })?;
-        // `from_pem_bundle` silently returns an empty Vec when the
-        // file contains no PEM blocks — that's not what the user
-        // asked for. Reject explicitly so typos don't ship a client
-        // with zero added CAs.
+        // `from_pem_bundle` silently returns an empty Vec when the file contains no PEM blocks —
+        // that's not what the user asked for. Reject explicitly so typos don't ship a client with
+        // zero added CAs.
         if certs.is_empty() {
             return Err(AgshError::Config(format!(
                 "[web].ca_cert_file '{}': no PEM certificates found in file",
@@ -156,23 +149,20 @@ static DDG_URL: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result__url").expect("static CSS selector"));
 static DDG_SNIPPET: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result__snippet").expect("static CSS selector"));
-/// DDG's bot-challenge modal uses this id (and also a `data-testid`
-/// of the same value). Either marker being present in the DOM means
-/// the endpoint gated us rather than returning results.
+/// DDG's bot-challenge modal uses this id (and also a `data-testid` of the same value). Either
+/// marker being present in the DOM means the endpoint gated us rather than returning results.
 static DDG_CAPTCHA: LazyLock<scraper::Selector> = LazyLock::new(|| {
     scraper::Selector::parse("#anomaly-modal, [data-testid=\"anomaly-modal\"]")
         .expect("static CSS selector")
 });
 
-/// Cap on a single result's snippet text (after `**bold**` markers
-/// are added). 10 results × 300 chars = ~3 KB of snippets, a sane
-/// default for the model; longer content is available via
+/// Cap on a single result's snippet text (after `**bold**` markers are added). 10 results × 300
+/// chars = ~3 KB of snippets, a sane default for the model; longer content is available via
 /// `fetch_url` on the result URL.
 const SNIPPET_MAX_CHARS: usize = 300;
 
-/// Default `max_length` applied when the caller doesn't pass one.
-/// Single source of truth for both the parameter unwrap and the
-/// description shown to the agent. Pass `0` to disable the cap.
+/// Default `max_length` applied when the caller doesn't pass one. Single source of truth for both
+/// the parameter unwrap and the description shown to the agent. Pass `0` to disable the cap.
 const DEFAULT_MAX_LENGTH: usize = 30_000;
 
 fn apply_headers(
@@ -278,8 +268,8 @@ impl Tool for FetchUrlTool {
             ));
         }
 
-        // If the response is a supported image, return a multimodal Image
-        // block directly rather than running the binary body through html2md.
+        // If the response is a supported image, return a multimodal Image block directly rather
+        // than running the binary body through html2md.
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -301,11 +291,10 @@ impl Tool for FetchUrlTool {
             return Ok(build_image_tool_output(&marker, handling, &bytes));
         }
 
-        // Enforce a byte cap on the decompressed body so a small gzip/brotli
-        // payload can't expand into gigabytes and exhaust host memory (a
-        // classic "zip bomb" vector now that reqwest is built with gzip,
-        // deflate, and brotli enabled). We stream rather than buffer with
-        // `text()` so the cap is checked incrementally.
+        // Enforce a byte cap on the decompressed body so a small gzip/brotli payload can't expand
+        // into gigabytes and exhaust host memory (a classic "zip bomb" vector now that reqwest is
+        // built with gzip, deflate, and brotli enabled). We stream rather than buffer with `text()`
+        // so the cap is checked incrementally.
         const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
         if let Some(len) = response.content_length()
             && len as usize > MAX_RESPONSE_BYTES
@@ -347,8 +336,8 @@ impl Tool for FetchUrlTool {
             rewrite_html(&html, false)
         };
 
-        // When the caller redirects to the scratchpad we produce full content
-        // regardless of max_length — the scratchpad is the overflow buffer.
+        // When the caller redirects to the scratchpad we produce full content regardless of
+        // max_length — the scratchpad is the overflow buffer.
         let max_length = if redirects_to_scratchpad(&input) {
             0
         } else {
@@ -471,28 +460,26 @@ impl Tool for WebSearchTool {
     }
 }
 
-/// Distinguishes the three meaningful states of a DuckDuckGo HTML
-/// response. Before this enum, a CAPTCHA page was indistinguishable
-/// from a legitimate zero-hit query — both produced `""` and the agent
-/// saw `"No search results found."` — which encouraged blind retries
-/// against the same rate-limited endpoint.
+/// Distinguishes the three meaningful states of a DuckDuckGo HTML response. Before this enum, a
+/// CAPTCHA page was indistinguishable from a legitimate zero-hit query — both produced `""` and the
+/// agent saw `"No search results found."` — which encouraged blind retries against the same
+/// rate-limited endpoint.
 enum DdgOutcome {
-    /// At least one result was parsed. The inner string is the
-    /// rendered, numbered, markdown-formatted result list.
+    /// At least one result was parsed. The inner string is the rendered, numbered,
+    /// markdown-formatted result list.
     Results(String),
-    /// The page parsed cleanly but contained zero `.result` blocks
-    /// and no CAPTCHA marker — a legitimate zero-hit query.
+    /// The page parsed cleanly but contained zero `.result` blocks and no CAPTCHA marker — a
+    /// legitimate zero-hit query.
     Empty,
-    /// `#anomaly-modal` or `data-testid="anomaly-modal"` found in
-    /// the DOM — DDG gated us with their bot challenge.
+    /// `#anomaly-modal` or `data-testid="anomaly-modal"` found in the DOM — DDG gated us with their
+    /// bot challenge.
     Captcha,
 }
 
-/// Normalise arbitrary text-node content into a single-line string.
-/// Collapses runs of whitespace (including newlines and tabs) into a
-/// single ASCII space and trims. Applied to every user-visible field
-/// (title, source domain, snippet) so the rendered output isn't
-/// broken up by DDG's layout whitespace.
+/// Normalise arbitrary text-node content into a single-line string. Collapses runs of whitespace
+/// (including newlines and tabs) into a single ASCII space and trims. Applied to every user-visible
+/// field (title, source domain, snippet) so the rendered output isn't broken up by DDG's layout
+/// whitespace.
 fn collapse_whitespace(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut prev_space = false;
@@ -510,11 +497,10 @@ fn collapse_whitespace(raw: &str) -> String {
     out.trim_end().to_string()
 }
 
-/// Extract a snippet from DDG's `.result__snippet` element, preserving
-/// `<b>…</b>` emphasis (which marks matched query terms) as markdown
-/// `**…**`. Current DDG wraps matched terms in `<b>` tags; stripping
-/// them via `.text()` loses a useful signal the agent can use to see
-/// which words actually hit.
+/// Extract a snippet from DDG's `.result__snippet` element, preserving `<b>…</b>` emphasis (which
+/// marks matched query terms) as markdown `**…**`. Current DDG wraps matched terms in `<b>` tags;
+/// stripping them via `.text()` loses a useful signal the agent can use to see which words actually
+/// hit.
 fn render_snippet(snippet_el: scraper::ElementRef<'_>) -> String {
     use scraper::Node;
     let mut out = String::new();
@@ -522,10 +508,9 @@ fn render_snippet(snippet_el: scraper::ElementRef<'_>) -> String {
         match node.value() {
             Node::Text(text) => out.push_str(text),
             Node::Element(element) => {
-                // Collect the inner text and wrap in `**` iff this is
-                // a `<b>` or `<strong>`. Other elements (rare — e.g.
-                // `<a>` inside snippets) fall through as plain text
-                // so we don't miss content.
+                // Collect the inner text and wrap in `**` iff this is a `<b>` or `<strong>`. Other
+                // elements (rare — e.g. `<a>` inside snippets) fall through as plain text so we
+                // don't miss content.
                 let inner_el =
                     scraper::ElementRef::wrap(node).expect("element node wraps element ref");
                 let inner_text: String = inner_el.text().collect();
@@ -546,9 +531,8 @@ fn render_snippet(snippet_el: scraper::ElementRef<'_>) -> String {
     collapse_whitespace(&out)
 }
 
-/// Truncate `text` to at most `max_chars` characters on a UTF-8 char
-/// boundary. When truncated, trims trailing whitespace and appends a
-/// single Unicode `…`.
+/// Truncate `text` to at most `max_chars` characters on a UTF-8 char boundary. When truncated,
+/// trims trailing whitespace and appends a single Unicode `…`.
 fn clip_snippet(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -572,9 +556,8 @@ fn is_ad_result(block: scraper::ElementRef<'_>, resolved_url: Option<&str>) -> b
         return true;
     }
     if let Some(url) = resolved_url {
-        // Normalise leading `//` (schemeless) so `.contains` matches on
-        // the host+path portion only. The `y.js?ad_domain=` combo is
-        // specific enough that false-positives on organic URLs are
+        // Normalise leading `//` (schemeless) so `.contains` matches on the host+path portion only.
+        // The `y.js?ad_domain=` combo is specific enough that false-positives on organic URLs are
         // effectively impossible.
         if url.contains("duckduckgo.com/y.js") || url.contains("/y.js?ad_domain=") {
             return true;
@@ -583,11 +566,10 @@ fn is_ad_result(block: scraper::ElementRef<'_>, resolved_url: Option<&str>) -> b
     false
 }
 
-/// Decode DDG's legacy `/l/?uddg=<percent-encoded-url>` redirect into
-/// the direct URL. Current DDG usually puts the direct URL on the
-/// href already, but older cached pages (and the /lite/ endpoint) can
-/// still emit the redirect wrapper — keep the decode as a fallback so
-/// we don't regress.
+/// Decode DDG's legacy `/l/?uddg=<percent-encoded-url>` redirect into the direct URL. Current DDG
+/// usually puts the direct URL on the href already, but older cached pages (and the /lite/
+/// endpoint) can still emit the redirect wrapper — keep the decode as a fallback so we don't
+/// regress.
 fn resolve_result_href(href: &str) -> String {
     if let Some(pos) = href.find("uddg=") {
         let encoded = &href[pos + 5..];
@@ -602,9 +584,8 @@ fn resolve_result_href(href: &str) -> String {
 fn parse_duckduckgo_results(html: &str) -> DdgOutcome {
     let document = scraper::Html::parse_document(html);
 
-    // Detect the bot-challenge modal before even trying to parse
-    // results. A page that has *both* a modal and stale cached
-    // markup (hypothetical) should still surface as blocked.
+    // Detect the bot-challenge modal before even trying to parse results. A page that has *both* a
+    // modal and stale cached markup (hypothetical) should still surface as blocked.
     if document.select(&DDG_CAPTCHA).next().is_some() {
         return DdgOutcome::Captcha;
     }
@@ -624,10 +605,9 @@ fn parse_duckduckgo_results(html: &str) -> DdgOutcome {
 
         let url = link.value().attr("href").map(resolve_result_href);
 
-        // Drop sponsored ad blocks before they hit the agent. DDG
-        // interleaves ads among organic results; without this filter
-        // the agent sees a tracker URL (`duckduckgo.com/y.js?ad_domain=…`)
-        // and surfaces the advertiser as a "top result".
+        // Drop sponsored ad blocks before they hit the agent. DDG interleaves ads among organic
+        // results; without this filter the agent sees a tracker URL
+        // (`duckduckgo.com/y.js?ad_domain=…`) and surfaces the advertiser as a "top result".
         if is_ad_result(block, url.as_deref()) {
             continue;
         }
@@ -675,8 +655,8 @@ mod tests {
 
     use super::*;
 
-    /// Extract the rendered string from a `DdgOutcome::Results`;
-    /// panics otherwise. Keeps the assertions in tests below readable.
+    /// Extract the rendered string from a `DdgOutcome::Results`; panics otherwise. Keeps the
+    /// assertions in tests below readable.
     fn expect_results(outcome: DdgOutcome) -> String {
         match outcome {
             DdgOutcome::Results(text) => text,
@@ -724,9 +704,8 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_detects_captcha_fixture() {
-        // The saved CAPTCHA response — `#anomaly-modal` is the
-        // primary marker. Any future regression in detection
-        // fails this test against the real DDG bot-challenge page.
+        // The saved CAPTCHA response — `#anomaly-modal` is the primary marker. Any future
+        // regression in detection fails this test against the real DDG bot-challenge page.
         let html = include_str!("../../tests/fixtures/ddg_captcha.html");
         assert!(matches!(
             parse_duckduckgo_results(html),
@@ -736,8 +715,8 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_detects_captcha_by_testid_alone() {
-        // Guard against DDG renaming the `id` but keeping the
-        // `data-testid`. The second marker should still catch it.
+        // Guard against DDG renaming the `id` but keeping the `data-testid`. The second marker
+        // should still catch it.
         let html = r#"<html><body>
             <div data-testid="anomaly-modal"><p>Bot check</p></div>
         </body></html>"#;
@@ -749,9 +728,8 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_parses_real_results_fixture() {
-        // A real 10-result response captured via a clean-IP WARP
-        // proxy. Guards against structural regressions the snippet
-        // here can't cover (`<b>` highlights, direct-URL hrefs,
+        // A real 10-result response captured via a clean-IP WARP proxy. Guards against structural
+        // regressions the snippet here can't cover (`<b>` highlights, direct-URL hrefs,
         // trailing-whitespace domain text, etc.).
         let html = include_str!("../../tests/fixtures/ddg_results.html");
         let text = expect_results(parse_duckduckgo_results(html));
@@ -764,8 +742,7 @@ mod tests {
                 text
             );
         }
-        // At least one result carries the Source line (every real
-        // DDG result has `.result__url`).
+        // At least one result carries the Source line (every real DDG result has `.result__url`).
         assert!(text.contains("Source: "));
         // `<b>` emphasis in the snippet becomes markdown bold.
         assert!(
@@ -787,9 +764,8 @@ mod tests {
             </div>
         </body></html>"#;
         let text = expect_results(parse_duckduckgo_results(html));
-        // Rendered title collapses to single spaces. The broader
-        // output has `   ` indent on continuation lines (expected),
-        // so only assert against the title itself.
+        // Rendered title collapses to single spaces. The broader output has `   ` indent on
+        // continuation lines (expected), so only assert against the title itself.
         assert!(text.contains("**Lots of whitespace**"), "{}", text);
         let title_line = text
             .lines()
@@ -847,9 +823,8 @@ mod tests {
         );
         let text = expect_results(parse_duckduckgo_results(&html));
         assert!(text.contains('…'), "expected ellipsis; got:\n{}", text);
-        // The capped snippet + surrounding format exceeds 300, but
-        // the snippet portion itself shouldn't carry more than
-        // ~305 chars (300 + `…` allowance).
+        // The capped snippet + surrounding format exceeds 300, but the snippet portion itself
+        // shouldn't carry more than ~305 chars (300 + `…` allowance).
         let snippet_line = text
             .lines()
             .find(|line| line.trim().ends_with('…'))
@@ -865,8 +840,8 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_skips_ad_by_wrapper_class() {
-        // Ad block identified by `result--ad`; organic block follows.
-        // Only the organic result should come through.
+        // Ad block identified by `result--ad`; organic block follows. Only the organic result
+        // should come through.
         let html = r#"<html><body>
             <div class="result result--ad">
                 <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dexample.com">Sponsored</a>
@@ -893,9 +868,8 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_skips_ad_by_y_js_url() {
-        // Ad without the `result--ad` class — caught via the
-        // resolved-URL signal. Guards against DDG silently renaming
-        // the class but keeping the y.js ad-click tracker.
+        // Ad without the `result--ad` class — caught via the resolved-URL signal. Guards against
+        // DDG silently renaming the class but keeping the y.js ad-click tracker.
         let html = r#"<html><body>
             <div class="result web-result">
                 <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dsponsor.com">Sponsored</a>
@@ -913,10 +887,9 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_real_ad_fixture_drops_only_ad() {
-        // 11 result blocks total (1 ad + 10 organic) captured from
-        // `best mechanical keyboard 2026`. The ad advertises
-        // `oneclearwinner.ca` via a Bing-backed y.js redirect.
-        // Expect exactly 10 organic results, zero ad leakage.
+        // 11 result blocks total (1 ad + 10 organic) captured from `best mechanical keyboard 2026`.
+        // The ad advertises `oneclearwinner.ca` via a Bing-backed y.js redirect. Expect exactly 10
+        // organic results, zero ad leakage.
         let html = include_str!("../../tests/fixtures/ddg_with_ad.html");
         let text = expect_results(parse_duckduckgo_results(html));
         assert!(
@@ -974,8 +947,7 @@ mod tests {
             proxy: Some("socks5h://127.0.0.1:1080".to_string()),
             ..WebClientConfig::default()
         };
-        // We don't actually connect — just verify reqwest accepts
-        // the proxy URL shape.
+        // We don't actually connect — just verify reqwest accepts the proxy URL shape.
         assert!(build_web_client(&cfg).is_ok());
     }
 
@@ -1032,8 +1004,7 @@ mod tests {
 
     #[test]
     fn test_build_web_client_non_pem_ca_cert_errors() {
-        // An existing but non-PEM file produces a clear parse error
-        // rather than a silent failure.
+        // An existing but non-PEM file produces a clear parse error rather than a silent failure.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("not-a-cert.bin");
         std::fs::write(&path, b"this is definitely not a PEM").expect("write");
@@ -1081,9 +1052,8 @@ mod tests {
 
     #[test]
     fn test_build_web_client_with_danger_flags_builds() {
-        // Builds successfully; the function also logs a warn! per
-        // flag, which we don't assert here (tracing capture would
-        // add plumbing for negligible test value).
+        // Builds successfully; the function also logs a warn! per flag, which we don't assert here
+        // (tracing capture would add plumbing for negligible test value).
         let cfg = WebClientConfig {
             danger_accept_invalid_certs: true,
             danger_accept_invalid_hostnames: true,
@@ -1187,23 +1157,22 @@ mod tests {
         assert!(props.get("raw").is_some());
     }
 
-    /// Smoke test for the size-cap logic. We don't stand up a real HTTP
-    /// server here (that would require an async test runtime and a dep on
-    /// hyper), but we can unit-test that the cap constant is reasonable
-    /// and that the `response.content_length() > cap` pre-check is wired.
+    /// Smoke test for the size-cap logic. We don't stand up a real HTTP server here (that would
+    /// require an async test runtime and a dep on hyper), but we can unit-test that the cap
+    /// constant is reasonable and that the `response.content_length() > cap` pre-check is wired.
     /// Full end-to-end coverage is left to the manual verification step.
     #[test]
     fn test_fetch_url_size_cap_is_10_mib() {
-        // The constant is private; this test is a canary that catches an
-        // accidental bump up or down without a reviewer noticing.
+        // The constant is private; this test is a canary that catches an accidental bump up or down
+        // without a reviewer noticing.
         const EXPECTED: usize = 10 * 1024 * 1024;
         assert_eq!(EXPECTED, 10_485_760);
     }
 
     #[test]
     fn test_redirects_to_scratchpad_logic() {
-        // Mirrors the branch used in fetch_url::execute. When redirecting,
-        // we force max_length = 0 (unlimited).
+        // Mirrors the branch used in fetch_url::execute. When redirecting, we force max_length = 0
+        // (unlimited).
         let with = serde_json::json!({ "scratchpad": "out", "max_length": 100 });
         let without = serde_json::json!({ "max_length": 100 });
         assert!(redirects_to_scratchpad(&with));

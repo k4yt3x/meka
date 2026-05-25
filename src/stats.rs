@@ -1,9 +1,8 @@
-//! Per-session counters surfaced by `/status`. Shared across the agent
-//! (which records tokens and turn count) and the Claude providers (which
-//! record image-redaction events).
+//! Per-session counters surfaced by `/status`. Shared across the agent (which records tokens and
+//! turn count) and the Claude providers (which record image-redaction events).
 //!
-//! All fields are lock-free atomics so any task can update without
-//! contention; readers take a [`SessionStatsSnapshot`] for display.
+//! All fields are lock-free atomics so any task can update without contention; readers take a
+//! [`SessionStatsSnapshot`] for display.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -33,9 +32,8 @@ impl SessionStats {
             .fetch_add(usage.cache_read_input_tokens, Relaxed);
     }
 
-    /// Record a single body-redaction event from one of the Claude
-    /// providers. Called when image-block redaction fires on an oversized
-    /// request body.
+    /// Record a single body-redaction event from one of the Claude providers. Called when
+    /// image-block redaction fires on an oversized request body.
     pub fn record_redaction(&self, images: u64, bytes: u64) {
         self.redactions.fetch_add(1, Relaxed);
         self.redacted_images.fetch_add(images, Relaxed);
@@ -69,16 +67,16 @@ pub struct SessionStatsSnapshot {
 }
 
 impl SessionStatsSnapshot {
-    /// Sum of all three input-token tiers (live, cache-write, cache-read).
-    /// Matches what Anthropic bills against "input".
+    /// Sum of all three input-token tiers (live, cache-write, cache-read). Matches what Anthropic
+    /// bills against "input".
     pub fn total_input_tokens(&self) -> u64 {
         self.input_tokens
             .saturating_add(self.cache_creation_input_tokens)
             .saturating_add(self.cache_read_input_tokens)
     }
 
-    /// Cache-hit ratio as an integer percent (0–100). Returns 0 when no
-    /// input tokens have been recorded yet.
+    /// Cache-hit ratio as an integer percent (0–100). Returns 0 when no input tokens have been
+    /// recorded yet.
     pub fn cache_hit_pct(&self) -> u64 {
         let total = self.total_input_tokens();
         if total == 0 {

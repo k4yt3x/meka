@@ -1,6 +1,6 @@
-//! First-launch interactive configuration wizard. Walks the user through
-//! provider selection, runs the Claude OAuth/PKCE flow when applicable, and
-//! writes the resulting `~/.config/agsh/config.toml`.
+//! First-launch interactive configuration wizard. Walks the user through provider selection, runs
+//! the Claude OAuth/PKCE flow when applicable, and writes the resulting
+//! `~/.config/agsh/config.toml`.
 
 use std::io::{self, Write};
 
@@ -234,9 +234,8 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
 
     let url = build_authorize_url(&client_id, &code_challenge, &state)?;
 
-    // The URL is printed unconditionally below; silently try to open
-    // it as a convenience on desktop, and keep the failure at debug
-    // since headless hosts will hit this path every time.
+    // The URL is printed unconditionally below; silently try to open it as a convenience on
+    // desktop, and keep the failure at debug since headless hosts will hit this path every time.
     if let Err(error) = open::that(&url) {
         tracing::debug!("failed to open browser for setup: {}", error);
     }
@@ -339,9 +338,9 @@ fn build_codex_authorize_url(
     Ok(url.to_string())
 }
 
-/// Accept one HTTP request on the bound listener, parse the OAuth callback
-/// path, and return `(code, state)`. Loops past unrelated requests
-/// (favicons, browser preflights) until the deadline elapses.
+/// Accept one HTTP request on the bound listener, parse the OAuth callback path, and return `(code,
+/// state)`. Loops past unrelated requests (favicons, browser preflights) until the deadline
+/// elapses.
 async fn accept_codex_callback(
     listener: tokio::net::TcpListener,
     timeout: std::time::Duration,
@@ -361,8 +360,7 @@ async fn accept_codex_callback(
         };
         let (mut stream, _) = accept;
 
-        // Read until end-of-headers or 64 KiB cap; same approach as MCP's
-        // OAuth callback handler.
+        // Read until end-of-headers or 64 KiB cap; same approach as MCP's OAuth callback handler.
         const MAX_BYTES: usize = 64 * 1024;
         let mut buffer = Vec::with_capacity(4096);
         let mut temp = [0u8; 4096];
@@ -534,9 +532,9 @@ async fn exchange_codex_code(
     })
 }
 
-/// Decode an OpenAI id_token JWT and extract `chatgpt_account_id` from the
-/// nested `https://api.openai.com/auth` claim. Returns `None` on any
-/// failure — the absence of an account_id isn't fatal at login time.
+/// Decode an OpenAI id_token JWT and extract `chatgpt_account_id` from the nested
+/// `https://api.openai.com/auth` claim. Returns `None` on any failure — the absence of an
+/// account_id isn't fatal at login time.
 fn extract_codex_account_id(jwt: &str) -> Option<String> {
     let payload = jwt.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
@@ -548,8 +546,8 @@ fn extract_codex_account_id(jwt: &str) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-/// Decode the `exp` claim of a JWT (in seconds) and return millis. Returns
-/// `None` if the claim is missing or the JWT is malformed.
+/// Decode the `exp` claim of a JWT (in seconds) and return millis. Returns `None` if the claim is
+/// missing or the JWT is malformed.
 fn extract_jwt_expiration_millis(jwt: &str) -> Option<i64> {
     let payload = jwt.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;

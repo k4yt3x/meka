@@ -13,9 +13,8 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// Default inline result cap when the agent isn't redirecting to the
-/// scratchpad and didn't pass an explicit `limit`. Single source of truth
-/// for the description and the runtime default.
+/// Default inline result cap when the agent isn't redirecting to the scratchpad and didn't pass an
+/// explicit `limit`. Single source of truth for the description and the runtime default.
 const DEFAULT_INLINE_RESULTS: usize = 500;
 
 pub(super) struct FindFilesTool {
@@ -84,9 +83,9 @@ impl Tool for FindFilesTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "find_files")?;
-        // Resolve the optional `path` against the agent's per-session
-        // cwd so the search runs in the right tree regardless of where
-        // the process was launched. Absolute paths pass through unchanged.
+        // Resolve the optional `path` against the agent's per-session cwd so the search runs in the
+        // right tree regardless of where the process was launched. Absolute paths pass through
+        // unchanged.
         let base_path = input["path"]
             .as_str()
             .map(|raw| crate::agent::resolve_against_cwd(&self.cwd, raw))
@@ -114,10 +113,9 @@ impl Tool for FindFilesTool {
 
         let result = tokio::task::spawn_blocking(move || {
             let mut matches: Vec<String> = Vec::new();
-            // Total continues past the storage cap so we can report
-            // the real count of matches in the truncation message —
-            // glob walks are FS-metadata only, so the extra iteration
-            // past the cap is cheap.
+            // Total continues past the storage cap so we can report the real count of matches in
+            // the truncation message — glob walks are FS-metadata only, so the extra iteration past
+            // the cap is cheap.
             let mut total: usize = 0;
             match glob::glob(&full_pattern) {
                 Ok(paths) => {
@@ -299,9 +297,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_files_explicit_limit_with_scratchpad_caps() {
-        // Regression: an explicit `limit` should beat the scratchpad
-        // "unbounded" default — the agent might legitimately want a
-        // bounded scratchpad collection.
+        // Regression: an explicit `limit` should beat the scratchpad "unbounded" default — the
+        // agent might legitimately want a bounded scratchpad collection.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..600 {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");

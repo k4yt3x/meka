@@ -1,92 +1,78 @@
 //! Filesystem sandboxing for read-only command execution.
 //!
-//! On Linux, uses Landlock LSM (kernel 5.13+) to restrict child processes
-//! to read-only filesystem access. On macOS, uses `sandbox-exec`. On Windows,
-//! spawns the child with a duplicated primary token dropped to Low integrity
-//! via `SetTokenInformation(TokenIntegrityLevel, …)`; this blocks writes to
-//! anything outside the documented Low-integrity surface (the user's home
-//! directory, `%APPDATA%`, Program Files, system dirs, etc.). On unsupported
-//! platforms, sandboxing is unavailable and shell execution is gated by the
-//! permission level alone.
+//! On Linux, uses Landlock LSM (kernel 5.13+) to restrict child processes to read-only filesystem
+//! access. On macOS, uses `sandbox-exec`. On Windows, spawns the child with a duplicated primary
+//! token dropped to Low integrity via `SetTokenInformation(TokenIntegrityLevel, …)`; this blocks
+//! writes to anything outside the documented Low-integrity surface (the user's home directory,
+//! `%APPDATA%`, Program Files, system dirs, etc.). On unsupported platforms, sandboxing is
+//! unavailable and shell execution is gated by the permission level alone.
 
-/// What kind of read-mode sandbox is available on this platform. Resolved
-/// once at config time and threaded into `tools::shell::ExecuteCommandTool`
-/// so the spawn path knows which argv shape and `pre_exec` hook to use.
+/// What kind of read-mode sandbox is available on this platform. Resolved once at config time and
+/// threaded into `tools::shell::ExecuteCommandTool` so the spawn path knows which argv shape and
+/// `pre_exec` hook to use.
 #[derive(Debug, Clone)]
 pub enum SandboxCapability {
-    /// Linux: filesystem-write restriction via Landlock LSM (kernel 5.13+).
-    /// Does NOT block Unix-domain-socket mutation — dbus, systemd-user, etc.
-    /// remain reachable. Prefer Bubblewrap when available for full parity.
+    /// Linux: filesystem-write restriction via Landlock LSM (kernel 5.13+). Does NOT block
+    /// Unix-domain-socket mutation — dbus, systemd-user, etc. remain reachable. Prefer Bubblewrap
+    /// when available for full parity.
     #[cfg(target_os = "linux")]
     Landlock { abi_version: i32 },
-    /// Linux: read-only root bind via `bwrap --ro-bind /` plus tmpfs masks
-    /// over `/tmp`, `/run`, `/var/tmp`, and `$XDG_RUNTIME_DIR`. Blocks both
-    /// filesystem writes and IPC-socket mutation; network is unrestricted.
+    /// Linux: read-only root bind via `bwrap --ro-bind /` plus tmpfs masks over `/tmp`, `/run`,
+    /// `/var/tmp`, and `$XDG_RUNTIME_DIR`. Blocks both filesystem writes and IPC-socket mutation;
+    /// network is unrestricted.
     #[cfg(target_os = "linux")]
     Bubblewrap { bwrap_path: std::path::PathBuf },
     /// macOS: `sandbox-exec` with the hardened SBPL profile defined in
-    /// [`SANDBOX_PROFILE_READONLY`]. Blocks filesystem writes and IPC
-    /// mutation (no launchd, pasteboard, LaunchServices, etc.); network
-    /// is unrestricted.
+    /// [`SANDBOX_PROFILE_READONLY`]. Blocks filesystem writes and IPC mutation (no launchd,
+    /// pasteboard, LaunchServices, etc.); network is unrestricted.
     #[cfg(target_os = "macos")]
     SandboxExec,
-    /// Windows: child runs with a duplicated primary token dropped to Low
-    /// integrity. Blocks writes outside the Low-integrity surface (user
-    /// home, AppData, Program Files); IPC mutation is constrained but not
-    /// as tightly as Linux/macOS.
+    /// Windows: child runs with a duplicated primary token dropped to Low integrity. Blocks writes
+    /// outside the Low-integrity surface (user home, AppData, Program Files); IPC mutation is
+    /// constrained but not as tightly as Linux/macOS.
     #[cfg(target_os = "windows")]
     LowIntegrity,
-    /// No sandbox available on this platform / configuration. Read-mode
-    /// shell commands hard-error rather than silently bypass the sandbox.
+    /// No sandbox available on this platform / configuration. Read-mode shell commands hard-error
+    /// rather than silently bypass the sandbox.
     Unavailable,
 }
 
-/// Result of probing a specific sandbox backend at config-resolution
-/// time. The probe is run once per agsh launch (twice when the resolver
-/// needs to consider both Landlock and Bubblewrap for auto-pick) and
-/// cached on `ResolvedConfig.backend_probe`.
+/// Result of probing a specific sandbox backend at config-resolution time. The probe is run once
+/// per agsh launch (twice when the resolver needs to consider both Landlock and Bubblewrap for
+/// auto-pick) and cached on `ResolvedConfig.backend_probe`.
 #[derive(Debug, Clone)]
 pub enum BackendProbe {
     Ok(SandboxCapability),
-    /// The backend's prerequisite is missing — `bwrap` isn't on
-    /// `$PATH`, the Landlock kernel ABI isn't supported, etc. The
-    /// `reason` is plain text and is plumbed into user-facing
+    /// The backend's prerequisite is missing — `bwrap` isn't on `$PATH`, the Landlock kernel ABI
+    /// isn't supported, etc. The `reason` is plain text and is plumbed into user-facing
     /// warnings/errors verbatim.
     Missing {
         reason: String,
     },
-    /// Linux + bubblewrap only: the user-namespace smoke test failed
-    /// with stderr that matched the documented denial fingerprints.
-    /// Stored stderr is truncated to a few KiB. The only constructor
-    /// (`smoke_test_bwrap`) is Linux-only, so the variant is dead on
-    /// other platforms — the explicit allow lets non-Linux clippy
-    /// stay clean without hiding regressions on Linux.
+    /// Linux + bubblewrap only: the user-namespace smoke test failed with stderr that matched the
+    /// documented denial fingerprints. Stored stderr is truncated to a few KiB. The only
+    /// constructor (`smoke_test_bwrap`) is Linux-only, so the variant is dead on other platforms —
+    /// the explicit allow lets non-Linux clippy stay clean without hiding regressions on Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     UserNamespaceDenied {
         stderr: String,
     },
-    /// The asked-for backend doesn't apply on this platform. No
-    /// production code currently constructs this variant (the legacy
-    /// non-Linux `probe_*` wrappers were folded into
-    /// `resolve_sandbox_backend`), so the explicit allow is for the
-    /// test-only constructor in `tests::test_backend_unavailable_reason_maps_each_variant`.
+    /// The asked-for backend doesn't apply on this platform. No production code currently
+    /// constructs this variant (the legacy non-Linux `probe_*` wrappers were folded into
+    /// `resolve_sandbox_backend`), so the explicit allow is for the test-only constructor in
+    /// `tests::test_backend_unavailable_reason_maps_each_variant`.
     #[allow(dead_code)]
     UnsupportedPlatform,
 }
 
-/// Snapshot of the sandbox-relevant config slice. Carried by
-/// components that need to emit the sandbox warns
-/// (`warn_if_sandbox_issues`) without depending on the whole
-/// `ResolvedConfig`.
+/// Snapshot of the sandbox-relevant config slice. Carried by components that need to emit the
+/// sandbox warns (`warn_if_sandbox_issues`) without depending on the whole `ResolvedConfig`.
 ///
-/// All fields are functionally only read on Linux —
-/// `warn_if_sandbox_issues` early-returns on other platforms because
-/// the warns reference Linux-only config keys — but the struct is
-/// constructed unconditionally so the call sites in `src/main.rs`
-/// and `src/repl.rs` don't need a platform branch. The
-/// `cfg_attr(not(target_os = "linux"), allow(dead_code))]` silences
-/// the "field never read" warning on non-Linux without hiding real
-/// regressions on Linux where the lint stays loud.
+/// All fields are functionally only read on Linux — `warn_if_sandbox_issues` early-returns on other
+/// platforms because the warns reference Linux-only config keys — but the struct is constructed
+/// unconditionally so the call sites in `src/main.rs` and `src/repl.rs` don't need a platform
+/// branch. The `cfg_attr(not(target_os = "linux"), allow(dead_code))]` silences the "field never
+/// read" warning on non-Linux without hiding real regressions on Linux where the lint stays loud.
 #[derive(Clone)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct SandboxState {
@@ -107,26 +93,21 @@ impl SandboxState {
     }
 }
 
-/// Where in the agsh lifecycle the sandbox-state check is happening.
-/// The "stronger sandbox available" nudge (Warn 2) only fires at
-/// startup; "backend unavailable" (Warn 1) fires at every relevant
-/// boundary because the user needs to know read-mode shell is broken
-/// right now.
+/// Where in the agsh lifecycle the sandbox-state check is happening. The "stronger sandbox
+/// available" nudge (Warn 2) only fires at startup; "backend unavailable" (Warn 1) fires at every
+/// relevant boundary because the user needs to know read-mode shell is broken right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarnContext {
-    /// Once-per-launch warn during `ResolvedConfig` construction or
-    /// agent setup. Both Warn 1 and Warn 2 fire here.
+    /// Once-per-launch warn during `ResolvedConfig` construction or agent setup. Both Warn 1 and
+    /// Warn 2 fire here.
     Startup,
-    /// Initial permission mode was `Read` at `agsh --permission read`
-    /// launch. Only Warn 1 fires.
+    /// Initial permission mode was `Read` at `agsh --permission read` launch. Only Warn 1 fires.
     InitialReadMode,
-    /// User pressed Shift+Tab and cycled into `Read`. Only Warn 1
-    /// fires.
+    /// User pressed Shift+Tab and cycled into `Read`. Only Warn 1 fires.
     ReadModeEntry,
 }
 
-/// Emit any relevant sandbox warnings for the configured backend
-/// state.
+/// Emit any relevant sandbox warnings for the configured backend state.
 ///
 /// * **Warn 1** (backend unavailable): probe failed and `sandbox = true`. Read-mode shell commands
 ///   will hard-error at use time, so we tell the user up front. Re-emitted at every lifecycle
@@ -139,12 +120,10 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
         return;
     }
 
-    // `sandbox_backend` is a Linux-only config knob; the warnings
-    // below name it directly and would be misleading on macOS /
-    // Windows where the platform has a single fixed backend. On
-    // those hosts an unusable platform sandbox is a near-impossible
-    // configuration and surfaces at use time via the hard-error
-    // path in `src/tools/shell.rs` anyway.
+    // `sandbox_backend` is a Linux-only config knob; the warnings below name it directly and would
+    // be misleading on macOS / Windows where the platform has a single fixed backend. On those
+    // hosts an unusable platform sandbox is a near-impossible configuration and surfaces at use
+    // time via the hard-error path in `src/tools/shell.rs` anyway.
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (state, context);
@@ -154,11 +133,10 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
     #[cfg(target_os = "linux")]
     {
         if let Some(reason) = backend_unavailable_reason(&state.probe) {
-            // We deliberately don't suggest a specific alternative
-            // backend here — the "other" backend might also be
-            // unavailable on this host (kernel without Landlock,
-            // bwrap not installed, etc.), and `agsh setup` is the
-            // path that probes both and resolves it correctly.
+            // We deliberately don't suggest a specific alternative backend here — the "other"
+            // backend might also be unavailable on this host (kernel without Landlock, bwrap not
+            // installed, etc.), and `agsh setup` is the path that probes both and resolves it
+            // correctly.
             tracing::warn!(
                 "read-mode sandbox: {} (configured: {}). Read-mode shell commands will fail \
                  until this is fixed. Run `agsh setup` to reconfigure, or update \
@@ -181,9 +159,8 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
     }
 }
 
-/// Human-readable reason a backend probe failed, or `None` when the
-/// probe is `Ok`. Used by both the startup `warn!` path
-/// ([`warn_if_sandbox_issues`]) and the lazy hard-error path in
+/// Human-readable reason a backend probe failed, or `None` when the probe is `Ok`. Used by both the
+/// startup `warn!` path ([`warn_if_sandbox_issues`]) and the lazy hard-error path in
 /// `src/tools/shell.rs` so the two surfaces stay in sync.
 pub(crate) fn backend_unavailable_reason(probe: &BackendProbe) -> Option<String> {
     match probe {
@@ -206,9 +183,8 @@ pub(crate) fn backend_unavailable_reason(probe: &BackendProbe) -> Option<String>
     }
 }
 
-/// Probe a specific sandbox backend. Linux-only — the
-/// `SandboxBackend` enum represents Linux-specific backends, and
-/// non-Linux platforms route through `detect()` in
+/// Probe a specific sandbox backend. Linux-only — the `SandboxBackend` enum represents
+/// Linux-specific backends, and non-Linux platforms route through `detect()` in
 /// `src/config.rs::resolve_sandbox_backend` instead.
 #[cfg(target_os = "linux")]
 pub fn probe_backend(backend: crate::config::SandboxBackend) -> BackendProbe {
@@ -250,9 +226,8 @@ const BWRAP_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(5
 #[cfg(target_os = "linux")]
 const BWRAP_STDERR_LIMIT: usize = 64 * 1024;
 
-/// Stderr substrings that indicate the kernel refused the user
-/// namespace request rather than some other transient failure.
-/// Mirrors the fingerprint list Codex uses
+/// Stderr substrings that indicate the kernel refused the user namespace request rather than some
+/// other transient failure. Mirrors the fingerprint list Codex uses
 /// (`temp/codex/codex-rs/sandboxing/src/bwrap.rs:30-35`).
 #[cfg(target_os = "linux")]
 const USER_NAMESPACE_FAILURE_MARKERS: &[&str] = &[
@@ -269,9 +244,9 @@ enum SmokeResult {
     OtherFailure { reason: String },
 }
 
-/// Look up `bwrap` on `$PATH`. Returns the first entry whose target
-/// metadata is a regular executable file. Manual implementation to
-/// avoid pulling in the `which` crate just for one lookup.
+/// Look up `bwrap` on `$PATH`. Returns the first entry whose target metadata is a regular
+/// executable file. Manual implementation to avoid pulling in the `which` crate just for one
+/// lookup.
 #[cfg(target_os = "linux")]
 fn bwrap_on_path() -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
@@ -291,14 +266,12 @@ fn bwrap_on_path() -> Option<std::path::PathBuf> {
 
 /// Run a `bwrap … /bin/true` smoke test with a short timeout.
 ///
-/// The flag set mirrors the production-path argv in
-/// `src/tools/shell.rs` so a host that succeeds here also succeeds at
-/// runtime — without it, a kernel that quietly rejects (say)
-/// `--unshare-cgroup-try` or `--die-with-parent` would pass the probe
-/// and blow past the lazy hard-error gate the first time
-/// `execute_command` ran. `--unshare-net` is added on top so the
-/// probe stays self-contained (no outbound DNS / network calls), even
-/// though production keeps the host network namespace.
+/// The flag set mirrors the production-path argv in `src/tools/shell.rs` so a host that succeeds
+/// here also succeeds at runtime — without it, a kernel that quietly rejects (say)
+/// `--unshare-cgroup-try` or `--die-with-parent` would pass the probe and blow past the lazy
+/// hard-error gate the first time `execute_command` ran. `--unshare-net` is added on top so the
+/// probe stays self-contained (no outbound DNS / network calls), even though production keeps the
+/// host network namespace.
 #[cfg(target_os = "linux")]
 fn smoke_test_bwrap(bwrap_path: &std::path::Path, timeout: std::time::Duration) -> SmokeResult {
     use std::{io::Read, os::fd::AsRawFd};
@@ -337,15 +310,13 @@ fn smoke_test_bwrap(bwrap_path: &std::path::Path, timeout: std::time::Duration) 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Drain stderr non-blocking. The grandchild is gone so
-                // nothing else will write; any data already buffered is
-                // all we'll get.
+                // Drain stderr non-blocking. The grandchild is gone so nothing else will write; any
+                // data already buffered is all we'll get.
                 let stderr = match child.stderr.take() {
                     Some(mut handle) => {
                         let fd = handle.as_raw_fd();
-                        // SAFETY: fcntl with F_GETFL/F_SETFL on a valid
-                        // open file descriptor; failure is fine and just
-                        // means we'll attempt a regular read that may
+                        // SAFETY: fcntl with F_GETFL/F_SETFL on a valid open file descriptor;
+                        // failure is fine and just means we'll attempt a regular read that may
                         // block briefly on a closed pipe.
                         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                         if flags >= 0 {
@@ -407,10 +378,9 @@ fn smoke_test_bwrap(bwrap_path: &std::path::Path, timeout: std::time::Duration) 
     }
 }
 
-/// Best-effort cleanup of a stuck smoke-test child: kill it and reap
-/// its status so we don't leave a zombie. Errors are logged at debug
-/// level only — by this point the smoke test has already failed and
-/// the caller is about to return a higher-priority error reason.
+/// Best-effort cleanup of a stuck smoke-test child: kill it and reap its status so we don't leave a
+/// zombie. Errors are logged at debug level only — by this point the smoke test has already failed
+/// and the caller is about to return a higher-priority error reason.
 #[cfg(target_os = "linux")]
 fn reap_smoke_test_child(child: &mut std::process::Child) {
     if let Err(error) = child.kill() {
@@ -421,10 +391,9 @@ fn reap_smoke_test_child(child: &mut std::process::Child) {
     }
 }
 
-/// Test-only "what's the strongest sandbox available right now?"
-/// entry point. Production code consults
-/// [`crate::config::ResolvedConfig::backend_probe`] instead; tests
-/// reach for whatever capability the host happens to support.
+/// Test-only "what's the strongest sandbox available right now?" entry point. Production code
+/// consults [`crate::config::ResolvedConfig::backend_probe`] instead; tests reach for whatever
+/// capability the host happens to support.
 #[cfg(any(test, not(target_os = "linux")))]
 pub fn detect() -> SandboxCapability {
     #[cfg(target_os = "linux")]
@@ -445,8 +414,8 @@ pub fn detect() -> SandboxCapability {
 
     #[cfg(target_os = "windows")]
     {
-        // Token-integrity APIs are available on every supported Windows
-        // version (7+). No runtime probe is needed.
+        // Token-integrity APIs are available on every supported Windows version (7+). No runtime
+        // probe is needed.
         return SandboxCapability::LowIntegrity;
     }
 
@@ -475,9 +444,9 @@ fn detect_landlock() -> Option<i32> {
 ///
 /// # Safety
 ///
-/// This function uses raw syscalls and must only be called in a `pre_exec`
-/// context (after fork, before exec) where the process is single-threaded.
-/// All operations are async-signal-safe (syscalls only, no heap allocation).
+/// This function uses raw syscalls and must only be called in a `pre_exec` context (after fork,
+/// before exec) where the process is single-threaded. All operations are async-signal-safe
+/// (syscalls only, no heap allocation).
 #[cfg(target_os = "linux")]
 pub unsafe fn apply_landlock_readonly(abi_version: i32) -> Result<(), i32> {
     unsafe {
@@ -567,10 +536,9 @@ fn handled_access_for_abi(abi_version: i32) -> u64 {
     access
 }
 
-/// IPC scoping flags for the ruleset. ABI v6 (kernel 6.12) added scoping;
-/// restricting it blocks the sandboxed child from reaching abstract Unix
-/// sockets (D-Bus and similar) and from signalling processes outside its own
-/// Landlock domain. Setting an unknown `scoped` bit makes
+/// IPC scoping flags for the ruleset. ABI v6 (kernel 6.12) added scoping; restricting it blocks the
+/// sandboxed child from reaching abstract Unix sockets (D-Bus and similar) and from signalling
+/// processes outside its own Landlock domain. Setting an unknown `scoped` bit makes
 /// `landlock_create_ruleset` fail with `EINVAL`, so this stays zero below v6.
 #[cfg(target_os = "linux")]
 fn scoped_for_abi(abi_version: i32) -> u64 {
@@ -641,15 +609,14 @@ struct LandlockPathBeneathAttr {
     parent_fd: i32,
 }
 
-/// Path of the macOS `sandbox-exec` binary. Hardcoded (not PATH-searched) so
-/// a hostile `PATH` entry can't shadow it with a wrapper that drops the
-/// sandbox.
+/// Path of the macOS `sandbox-exec` binary. Hardcoded (not PATH-searched) so a hostile `PATH` entry
+/// can't shadow it with a wrapper that drops the sandbox.
 #[cfg(target_os = "macos")]
 pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 
-/// Read-mode SBPL profile for the macOS sandbox. Modeled after Codex's
-/// hardened Seatbelt profile (Apache 2.0; see attribution inside the
-/// policy), which is itself inspired by Chrome's renderer sandbox.
+/// Read-mode SBPL profile for the macOS sandbox. Modeled after Codex's hardened Seatbelt profile
+/// (Apache 2.0; see attribution inside the policy), which is itself inspired by Chrome's renderer
+/// sandbox.
 ///
 /// Threat-model parity with Linux Bubblewrap:
 /// - Filesystem read-only — `(deny default)` denies writes; only `/dev/null` and PTY device nodes
@@ -813,17 +780,15 @@ pub const SANDBOX_PROFILE_READONLY: &str = r#"
   (sysctl-name-regex #"^net.routetable"))
 "#;
 
-/// PowerShell prelude that switches `$OutputEncoding` and
-/// `[Console]::OutputEncoding` to UTF-8. See
+/// PowerShell prelude that switches `$OutputEncoding` and `[Console]::OutputEncoding` to UTF-8. See
 /// [`wrap_command_with_utf8_output`] for why this is necessary.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const POWERSHELL_UTF8_PRELUDE: &str = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
      $OutputEncoding=[System.Text.Encoding]::UTF8;";
 
-/// Prepend the UTF-8 encoding prelude to a PowerShell command. Used by
-/// both the sandboxed and non-sandboxed Windows `execute_command` paths
-/// so pipe output is always decoded as UTF-8 on the Rust side regardless
-/// of the console's legacy code page.
+/// Prepend the UTF-8 encoding prelude to a PowerShell command. Used by both the sandboxed and
+/// non-sandboxed Windows `execute_command` paths so pipe output is always decoded as UTF-8 on the
+/// Rust side regardless of the console's legacy code page.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn wrap_command_with_utf8_output(command: &str) -> String {
     let mut wrapped = String::with_capacity(POWERSHELL_UTF8_PRELUDE.len() + command.len() + 1);
@@ -833,14 +798,13 @@ pub fn wrap_command_with_utf8_output(command: &str) -> String {
     wrapped
 }
 
-/// Quote a single command-line argument per Windows `CommandLineToArgvW`
-/// rules. Mirrors the algorithm used by `std::process::Command` on Windows.
+/// Quote a single command-line argument per Windows `CommandLineToArgvW` rules. Mirrors the
+/// algorithm used by `std::process::Command` on Windows.
 ///
-/// This is the correct encoding for any program that parses its command line
-/// with `CommandLineToArgvW` — including `powershell.exe`, which is what the
-/// Low-integrity sandbox invokes. It is **not** the correct encoding for
-/// `cmd.exe /C` (cmd treats `\` literally); don't apply this to cmd command
-/// bodies.
+/// This is the correct encoding for any program that parses its command line with
+/// `CommandLineToArgvW` — including `powershell.exe`, which is what the Low-integrity sandbox
+/// invokes. It is **not** the correct encoding for `cmd.exe /C` (cmd treats `\` literally); don't
+/// apply this to cmd command bodies.
 ///
 /// Compiled on every platform even though the rules are Windows-specific:
 /// the implementation is pure string manipulation, so unit tests run on
@@ -880,8 +844,7 @@ pub fn quote_command_arg(arg: &str) -> String {
             }
         }
     }
-    // Any trailing backslashes must be doubled so the closing quote is
-    // not escaped by them.
+    // Any trailing backslashes must be doubled so the closing quote is not escaped by them.
     for _ in 0..(pending_backslashes * 2) {
         quoted.push('\\');
     }
@@ -889,26 +852,22 @@ pub fn quote_command_arg(arg: &str) -> String {
     quoted
 }
 
-/// Curated env-var set for a sandboxed shell child. Applied via
-/// `Command::env_clear()` + `Command::envs(...)` before spawn so it
-/// covers Bubblewrap, Landlock, Seatbelt, and the Windows Low-integrity
-/// path uniformly without per-backend flag plumbing.
+/// Curated env-var set for a sandboxed shell child. Applied via `Command::env_clear()` +
+/// `Command::envs(...)` before spawn so it covers Bubblewrap, Landlock, Seatbelt, and the Windows
+/// Low-integrity path uniformly without per-backend flag plumbing.
 ///
-/// Read-mode sandboxes still allow outbound network (curl, dns, etc.),
-/// so a leaked secret in env (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
-/// `GITHUB_TOKEN`, …) is a live exfiltration vector under prompt
-/// injection. Stripping the env at spawn time closes that gap without
-/// touching what the sandbox itself enforces.
+/// Read-mode sandboxes still allow outbound network (curl, dns, etc.), so a leaked secret in env
+/// (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, …) is a live exfiltration vector
+/// under prompt injection. Stripping the env at spawn time closes that gap without touching what
+/// the sandbox itself enforces.
 ///
-/// **Unix** uses an explicit allow-list (small, curated). Unknown vars
-/// are dropped — `EDITOR`, `PAGER`, `BAT_THEME`, etc. don't survive
-/// into read-mode shells. Users who need a specific var should switch
-/// to write mode (trusted-operation path; no scrubbing applies).
+/// **Unix** uses an explicit allow-list (small, curated). Unknown vars are dropped — `EDITOR`,
+/// `PAGER`, `BAT_THEME`, etc. don't survive into read-mode shells. Users who need a specific var
+/// should switch to write mode (trusted-operation path; no scrubbing applies).
 ///
-/// **Windows** uses a heuristic deny-list ([`is_sensitive_env_name`])
-/// because PowerShell pulls in a long tail of system vars (`PSModulePath`,
-/// `APPDATA`, `ProgramFiles`, etc.) that don't fit a tidy allow-list —
-/// an allow-list version was tried first and broke core cmdlets.
+/// **Windows** uses a heuristic deny-list ([`is_sensitive_env_name`]) because PowerShell pulls in a
+/// long tail of system vars (`PSModulePath`, `APPDATA`, `ProgramFiles`, etc.) that don't fit a tidy
+/// allow-list — an allow-list version was tried first and broke core cmdlets.
 pub fn sandbox_child_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     std::env::vars_os()
         .filter(|(name_os, _)| match name_os.to_str() {
@@ -920,9 +879,8 @@ pub fn sandbox_child_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
 
 #[cfg(unix)]
 fn keep_sandbox_env_var(name: &str) -> bool {
-    // Exact-match allow-list. Names that an empty-env `sh -c …`
-    // typically needs to function: `PATH` so commands resolve, `HOME`
-    // for tools that read `~/.config`, locale so `grep`/`sort` don't
+    // Exact-match allow-list. Names that an empty-env `sh -c …` typically needs to function: `PATH`
+    // so commands resolve, `HOME` for tools that read `~/.config`, locale so `grep`/`sort` don't
     // mangle non-ASCII, etc.
     const ALLOW_EXACT: &[&str] = &[
         "PATH",
@@ -938,9 +896,8 @@ fn keep_sandbox_env_var(name: &str) -> bool {
         "TMP",
         "TEMP",
     ];
-    // Prefix allow-list keeps the LC_* / XDG_* families future-proof
-    // without enumerating each var. Locale (`LC_ALL`, `LC_CTYPE`,
-    // `LC_MESSAGES`, …) and XDG paths (`XDG_RUNTIME_DIR`,
+    // Prefix allow-list keeps the LC_* / XDG_* families future-proof without enumerating each var.
+    // Locale (`LC_ALL`, `LC_CTYPE`, `LC_MESSAGES`, …) and XDG paths (`XDG_RUNTIME_DIR`,
     // `XDG_CONFIG_HOME`, …) are both legitimately broad.
     const ALLOW_PREFIX: &[&str] = &["LC_", "XDG_"];
 
@@ -950,9 +907,8 @@ fn keep_sandbox_env_var(name: &str) -> bool {
     if ALLOW_PREFIX.iter().any(|prefix| name.starts_with(prefix)) {
         return true;
     }
-    // Apple frameworks (CFString, foundation, etc.) read this to pick a
-    // text encoding; dropping it makes some CLIs misbehave with no
-    // useful error.
+    // Apple frameworks (CFString, foundation, etc.) read this to pick a text encoding; dropping it
+    // makes some CLIs misbehave with no useful error.
     #[cfg(target_os = "macos")]
     if name == "__CF_USER_TEXT_ENCODING" {
         return true;
@@ -967,29 +923,25 @@ fn keep_sandbox_env_var(name: &str) -> bool {
 
 #[cfg(not(any(unix, windows)))]
 fn keep_sandbox_env_var(_name: &str) -> bool {
-    // No sandbox is reachable on other platforms (SandboxCapability::Unavailable
-    // hard-errors at use time), so this filter is never exercised — pass
-    // through for completeness.
+    // No sandbox is reachable on other platforms (SandboxCapability::Unavailable hard-errors at use
+    // time), so this filter is never exercised — pass through for completeness.
     true
 }
 
-/// Heuristic match for variable names that commonly carry credentials
-/// or point to credential-bearing resources (SSH agent socket, kubeconfig,
-/// `.netrc`, GPG home, etc.). Case-insensitive substring match on a list
-/// of credential-shaped markers plus prefix match on known provider /
-/// service / database namespaces.
+/// Heuristic match for variable names that commonly carry credentials or point to
+/// credential-bearing resources (SSH agent socket, kubeconfig, `.netrc`, GPG home, etc.).
+/// Case-insensitive substring match on a list of credential-shaped markers plus prefix match on
+/// known provider / service / database namespaces.
 ///
-/// Tuned to be **aggressive on false positives** — a legitimate
-/// `GITHUB_ACTOR` is dropped alongside `GITHUB_TOKEN`, `SLACK_CHANNEL`
-/// alongside `SLACK_WEBHOOK_URL` — because the downside of a missing
-/// env var is a confusing tool error the user can recover from, while
-/// the downside of a leaked secret is a live exfiltration channel.
+/// Tuned to be **aggressive on false positives** — a legitimate `GITHUB_ACTOR` is dropped alongside
+/// `GITHUB_TOKEN`, `SLACK_CHANNEL` alongside `SLACK_WEBHOOK_URL` — because the downside of a
+/// missing env var is a confusing tool error the user can recover from, while the downside of a
+/// leaked secret is a live exfiltration channel.
 ///
-/// Used by the Windows arm of [`sandbox_child_env`]; not consulted on
-/// Unix, where the curated allow-list already drops every var by
-/// default. Lives at module scope (not inside `windows_impl`) so its
-/// tests exercise both platforms in CI — the function is pure string
-/// manipulation with no Windows-specific dependency.
+/// Used by the Windows arm of [`sandbox_child_env`]; not consulted on Unix, where the curated
+/// allow-list already drops every var by default. Lives at module scope (not inside `windows_impl`)
+/// so its tests exercise both platforms in CI — the function is pure string manipulation with no
+/// Windows-specific dependency.
 #[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn is_sensitive_env_name(name: &str) -> bool {
     const SENSITIVE_SUBSTRINGS: &[&str] = &[
@@ -1006,13 +958,12 @@ pub(crate) fn is_sensitive_env_name(name: &str) -> bool {
         "CREDENTIAL",
         "SESSION_KEY",
         "ACCESS_KEY",
-        // Broader `_KEY` catches `SIGNING_KEY`, `ENCRYPTION_KEY`,
-        // `DEPLOY_KEY`, `MASTER_KEY`, etc. without enumerating each.
+        // Broader `_KEY` catches `SIGNING_KEY`, `ENCRYPTION_KEY`, `DEPLOY_KEY`, `MASTER_KEY`, etc.
+        // without enumerating each.
         "_KEY",
-        // Specific names that don't share a credential-shaped fragment
-        // but point to credentials, sockets, or other exfil-relevant
-        // resources. Substring (not exact) match so derivatives like
-        // `WSL_SSH_AUTH_SOCK` are also caught.
+        // Specific names that don't share a credential-shaped fragment but point to credentials,
+        // sockets, or other exfil-relevant resources. Substring (not exact) match so derivatives
+        // like `WSL_SSH_AUTH_SOCK` are also caught.
         "SSH_AUTH_SOCK",
         "SSH_ASKPASS",
         "GIT_ASKPASS",
@@ -1131,17 +1082,16 @@ mod windows_impl {
         },
     };
 
-    // SE_GROUP_INTEGRITY isn't exported by the `Win32_Security` feature in
-    // windows-sys 0.59; define it locally. See
+    // SE_GROUP_INTEGRITY isn't exported by the `Win32_Security` feature in windows-sys 0.59; define
+    // it locally. See
     // <https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-sid_and_attributes>.
     const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 
-    /// RAII wrapper for a Win32 `HANDLE`. Closes the handle on drop, unless
-    /// ownership is transferred out via [`OwnedHandle::into_raw`], which
-    /// invalidates the wrapper. `!Send`/`!Sync` for raw pointers is
-    /// overridden here because the underlying kernel object is process-wide
-    /// and thread-safe to close from any thread; we serialize usage through
-    /// the owning struct.
+    /// RAII wrapper for a Win32 `HANDLE`. Closes the handle on drop, unless ownership is
+    /// transferred out via [`OwnedHandle::into_raw`], which invalidates the wrapper.
+    /// `!Send`/`!Sync` for raw pointers is overridden here because the underlying kernel object is
+    /// process-wide and thread-safe to close from any thread; we serialize usage through the owning
+    /// struct.
     struct OwnedHandle(HANDLE);
 
     unsafe impl Send for OwnedHandle {}
@@ -1152,10 +1102,9 @@ mod windows_impl {
             self.0
         }
 
-        /// Consume the wrapper and return the raw handle, suppressing the
-        /// Drop-time `CloseHandle`. Use when the handle is being transferred
-        /// into another owner (e.g. `File::from_raw_handle`, or into the
-        /// `SandboxedChild` long-lived handles).
+        /// Consume the wrapper and return the raw handle, suppressing the Drop-time `CloseHandle`.
+        /// Use when the handle is being transferred into another owner (e.g.
+        /// `File::from_raw_handle`, or into the `SandboxedChild` long-lived handles).
         fn into_raw(mut self) -> HANDLE {
             let h = self.0;
             self.0 = INVALID_HANDLE_VALUE;
@@ -1166,8 +1115,8 @@ mod windows_impl {
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
             if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-                // SAFETY: We own this handle and haven't already closed it.
-                // After Drop the struct is gone so no double-close is possible.
+                // SAFETY: We own this handle and haven't already closed it. After Drop the struct
+                // is gone so no double-close is possible.
                 unsafe {
                     CloseHandle(self.0);
                 }
@@ -1175,16 +1124,15 @@ mod windows_impl {
         }
     }
 
-    /// Child process spawned under a Low-integrity token. `stdout`/`stderr`
-    /// are anonymous pipes wrapped in [`File`] (convertible to tokio async
-    /// readers via `tokio::fs::File::from_std`). `wait_blocking` / `kill` run
-    /// synchronous Win32 calls; call them from `tokio::task::spawn_blocking`.
+    /// Child process spawned under a Low-integrity token. `stdout`/`stderr` are anonymous pipes
+    /// wrapped in [`File`] (convertible to tokio async readers via `tokio::fs::File::from_std`).
+    /// `wait_blocking` / `kill` run synchronous Win32 calls; call them from
+    /// `tokio::task::spawn_blocking`.
     ///
-    /// The child is wrapped in a Job Object with
-    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so any grandchildren spawned by
-    /// the user command are atomically killed when the job handle drops
-    /// (matching Unix's `setsid()` + `kill(-pgid, …)` semantics). `kill()`
-    /// terminates the entire job, not just the direct child.
+    /// The child is wrapped in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so any
+    /// grandchildren spawned by the user command are atomically killed when the job handle drops
+    /// (matching Unix's `setsid()` + `kill(-pgid, …)` semantics). `kill()` terminates the entire
+    /// job, not just the direct child.
     pub struct SandboxedChild {
         process: OwnedHandle,
         job: OwnedHandle,
@@ -1201,8 +1149,8 @@ mod windows_impl {
             self.stderr.take()
         }
 
-        /// Block the current thread until the child exits. Must be called
-        /// from a blocking context (e.g. `tokio::task::spawn_blocking`).
+        /// Block the current thread until the child exits. Must be called from a blocking context
+        /// (e.g. `tokio::task::spawn_blocking`).
         pub fn wait_blocking(&self) -> std::io::Result<ExitStatus> {
             // SAFETY: `process` is a valid open process HANDLE until Drop.
             unsafe {
@@ -1218,18 +1166,17 @@ mod windows_impl {
             }
         }
 
-        /// Terminate the child process and every grandchild via the Job
-        /// Object. Returns success even if the job was already empty; Win32
-        /// distinguishes these but the shell tool treats both as "gone".
+        /// Terminate the child process and every grandchild via the Job Object. Returns success
+        /// even if the job was already empty; Win32 distinguishes these but the shell tool treats
+        /// both as "gone".
         pub fn kill(&self) -> std::io::Result<()> {
-            // SAFETY: `job` is a valid open Job HANDLE until Drop.
-            // Terminating the job cascades to every process assigned to it,
-            // including any grandchildren the user command spawned.
+            // SAFETY: `job` is a valid open Job HANDLE until Drop. Terminating the job cascades to
+            // every process assigned to it, including any grandchildren the user command spawned.
             unsafe {
                 if TerminateJobObject(self.job.as_raw(), 1) == 0 {
                     let err = std::io::Error::last_os_error();
-                    // ERROR_ACCESS_DENIED (5) is returned when the job is
-                    // already gone — treat as success.
+                    // ERROR_ACCESS_DENIED (5) is returned when the job is already gone — treat as
+                    // success.
                     if err.raw_os_error() == Some(5) {
                         return Ok(());
                     }
@@ -1240,24 +1187,21 @@ mod windows_impl {
         }
     }
 
-    /// Spawn `powershell.exe -NoProfile -NonInteractive -Command <command>`
-    /// under a Low-integrity token. Stdout and stderr are captured via
-    /// anonymous pipes; stdin is not connected.
+    /// Spawn `powershell.exe -NoProfile -NonInteractive -Command <command>` under a Low-integrity
+    /// token. Stdout and stderr are captured via anonymous pipes; stdin is not connected.
     ///
-    /// PowerShell parses its command line per `CommandLineToArgvW` rules, so
-    /// the user command is encoded with the standard argv-escape helper —
-    /// embedded `"`, `\`, spaces, and shell metacharacters all pass through
-    /// unmangled. `-NoProfile` skips user profile scripts (fast startup, no
-    /// unrelated side effects); `-NonInteractive` makes the child fail fast
-    /// on any prompt instead of hanging on stdin.
+    /// PowerShell parses its command line per `CommandLineToArgvW` rules, so the user command is
+    /// encoded with the standard argv-escape helper — embedded `"`, `\`, spaces, and shell
+    /// metacharacters all pass through unmangled. `-NoProfile` skips user profile scripts (fast
+    /// startup, no unrelated side effects); `-NonInteractive` makes the child fail fast on any
+    /// prompt instead of hanging on stdin.
     ///
-    /// Returns [`std::io::Error`] mirroring the underlying Win32 call so the
-    /// shell tool can surface a standard error message.
+    /// Returns [`std::io::Error`] mirroring the underlying Win32 call so the shell tool can surface
+    /// a standard error message.
     pub fn spawn_low_integrity_command(command: &str) -> std::io::Result<SandboxedChild> {
-        // Embedded NULs would silently truncate the CreateProcess command
-        // line (Win32 treats the UTF-16 command-line buffer as a C string).
-        // Agent-driven commands shouldn't contain these, but fail loudly
-        // rather than silently execute a truncated prefix.
+        // Embedded NULs would silently truncate the CreateProcess command line (Win32 treats the
+        // UTF-16 command-line buffer as a C string). Agent-driven commands shouldn't contain these,
+        // but fail loudly rather than silently execute a truncated prefix.
         if command.contains('\0') {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1265,23 +1209,20 @@ mod windows_impl {
             ));
         }
 
-        // Force UTF-8 output before running the user's command. PowerShell
-        // 5.1 (the inbox version we invoke as `powershell.exe`) defaults
-        // `[Console]::OutputEncoding` to the system's legacy OEM code
-        // page — CP 437 / 1252 on most English installs — which mangles
-        // non-ASCII output (日本語 → `???`) when the process writes to a
-        // redirected pipe like ours. Prefixing every script with a UTF-8
-        // encoding switch makes output round-trip losslessly regardless
+        // Force UTF-8 output before running the user's command. PowerShell 5.1 (the inbox version
+        // we invoke as `powershell.exe`) defaults `[Console]::OutputEncoding` to the system's
+        // legacy OEM code page — CP 437 / 1252 on most English installs — which mangles non-ASCII
+        // output (日本語 → `???`) when the process writes to a redirected pipe like ours. Prefixing
+        // every script with a UTF-8 encoding switch makes output round-trip losslessly regardless
         // of the host's console configuration.
         let wrapped_command = super::wrap_command_with_utf8_output(command);
 
         let mut cmd_line = String::from(r#""powershell.exe" -NoProfile -NonInteractive -Command "#);
         cmd_line.push_str(&super::quote_command_arg(&wrapped_command));
 
-        // SAFETY: All Win32 calls below are documented and we check return
-        // values. Handles are wrapped in `OwnedHandle` to close on drop.
-        // Pipe handles transfer ownership into the spawned child (for the
-        // write ends) or into the returned `File` (for the read ends).
+        // SAFETY: All Win32 calls below are documented and we check return values. Handles are
+        // wrapped in `OwnedHandle` to close on drop. Pipe handles transfer ownership into the
+        // spawned child (for the write ends) or into the returned `File` (for the read ends).
         unsafe {
             // 1. Open our own process token and duplicate it as a primary token we can modify. The
             //    duplicate is what we'll drop to Low integrity — we must NOT mutate our own token.
@@ -1297,11 +1238,10 @@ mod windows_impl {
             let self_token = OwnedHandle(self_token);
 
             let mut low_token: HANDLE = ptr::null_mut();
-            // `SecurityAnonymous` is the least-capable impersonation level and
-            // is the correct "don't care" value when the target is a primary
-            // token — per Win32 docs the parameter is only consulted for
-            // impersonation tokens, but some kernel versions have historically
-            // honored it, so pick the safest constant.
+            // `SecurityAnonymous` is the least-capable impersonation level and is the correct
+            // "don't care" value when the target is a primary token — per Win32 docs the parameter
+            // is only consulted for impersonation tokens, but some kernel versions have
+            // historically honored it, so pick the safest constant.
             if DuplicateTokenEx(
                 self_token.as_raw(),
                 TOKEN_ASSIGN_PRIMARY
@@ -1443,12 +1383,10 @@ mod windows_impl {
                 &mut proc_info,
             );
 
-            // Parent no longer needs the child-side write ends or the NUL
-            // stdin handle regardless of success/failure. Dropping the
-            // OwnedHandle wrappers closes them. On success, closing the
-            // write ends ensures the parent's read end sees EOF when the
-            // child exits. Drop before any early-return so the handles
-            // aren't leaked if later steps fail.
+            // Parent no longer needs the child-side write ends or the NUL stdin handle regardless
+            // of success/failure. Dropping the OwnedHandle wrappers closes them. On success,
+            // closing the write ends ensures the parent's read end sees EOF when the child exits.
+            // Drop before any early-return so the handles aren't leaked if later steps fail.
             drop(stdout_write);
             drop(stderr_write);
             drop(nul_stdin);
@@ -1459,8 +1397,8 @@ mod windows_impl {
             // 10. Assign the suspended child to the job, then resume.
             if AssignProcessToJobObject(job.as_raw(), proc_info.hProcess) == 0 {
                 let err = std::io::Error::last_os_error();
-                // Best-effort kill of the suspended child before bailing,
-                // so the orphan doesn't sit around if AssignProcess failed.
+                // Best-effort kill of the suspended child before bailing, so the orphan doesn't sit
+                // around if AssignProcess failed.
                 TerminateProcess(proc_info.hProcess, 1);
                 CloseHandle(proc_info.hProcess);
                 if !proc_info.hThread.is_null() {
@@ -1469,8 +1407,8 @@ mod windows_impl {
                 return Err(err);
             }
 
-            // Resume the main thread. ResumeThread returns the previous
-            // suspend count, or u32::MAX on failure.
+            // Resume the main thread. ResumeThread returns the previous suspend count, or u32::MAX
+            // on failure.
             if ResumeThread(proc_info.hThread) == u32::MAX {
                 let err = std::io::Error::last_os_error();
                 // Kill via job since assignment already succeeded.
@@ -1487,9 +1425,8 @@ mod windows_impl {
                 CloseHandle(proc_info.hThread);
             }
 
-            // Transfer pipe read ends into owned `File`s.
-            // `File::from_raw_handle` takes ownership of the HANDLE;
-            // `OwnedHandle::into_raw` suppresses the wrapper's Drop.
+            // Transfer pipe read ends into owned `File`s. `File::from_raw_handle` takes ownership
+            // of the HANDLE; `OwnedHandle::into_raw` suppresses the wrapper's Drop.
             let stdout_handle = stdout_read.into_raw();
             let stderr_handle = stderr_read.into_raw();
 
@@ -1502,14 +1439,13 @@ mod windows_impl {
         }
     }
 
-    /// Create an empty Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-    /// set. Any process later assigned to the job is killed when the job's
-    /// last handle closes — the Windows analogue to Unix process groups
-    /// teardown via `kill(-pgid, SIGKILL)`. Grandchildren inherit job
+    /// Create an empty Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set. Any process later
+    /// assigned to the job is killed when the job's last handle closes — the Windows analogue to
+    /// Unix process groups teardown via `kill(-pgid, SIGKILL)`. Grandchildren inherit job
     /// membership automatically.
     unsafe fn create_kill_on_close_job() -> std::io::Result<OwnedHandle> {
-        // SAFETY: CreateJobObjectW with null name and null SECURITY_ATTRIBUTES
-        // returns an unnamed Job HANDLE the current process owns.
+        // SAFETY: CreateJobObjectW with null name and null SECURITY_ATTRIBUTES returns an unnamed
+        // Job HANDLE the current process owns.
         let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
         if job.is_null() {
             return Err(std::io::Error::last_os_error());
@@ -1547,23 +1483,22 @@ mod windows_impl {
         const PIPE_BUFFER_SIZE: u32 = 1 << 20;
         let mut read: HANDLE = ptr::null_mut();
         let mut write: HANDLE = ptr::null_mut();
-        // SAFETY: CreatePipe writes two HANDLEs through the provided pointers
-        // on success. SECURITY_ATTRIBUTES is a valid initialized struct.
+        // SAFETY: CreatePipe writes two HANDLEs through the provided pointers on success.
+        // SECURITY_ATTRIBUTES is a valid initialized struct.
         if unsafe { CreatePipe(&mut read, &mut write, sa, PIPE_BUFFER_SIZE) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok((OwnedHandle(read), OwnedHandle(write)))
     }
 
-    /// Open the `NUL` device for read. Inherit flag is left unset by the
-    /// caller's `SECURITY_ATTRIBUTES`; promote via `SetHandleInformation`
-    /// right before the handle is passed to `CreateProcess`. The child sees
-    /// immediate EOF on any read — the correct "no stdin" primitive on
-    /// Windows, equivalent to `/dev/null` on Unix.
+    /// Open the `NUL` device for read. Inherit flag is left unset by the caller's
+    /// `SECURITY_ATTRIBUTES`; promote via `SetHandleInformation` right before the handle is passed
+    /// to `CreateProcess`. The child sees immediate EOF on any read — the correct "no stdin"
+    /// primitive on Windows, equivalent to `/dev/null` on Unix.
     unsafe fn open_nul_read(sa: &SECURITY_ATTRIBUTES) -> std::io::Result<OwnedHandle> {
         let path: Vec<u16> = "NUL\0".encode_utf16().collect();
-        // SAFETY: `path` is NUL-terminated; `sa` is a valid initialized
-        // SECURITY_ATTRIBUTES owned by the caller for the duration of the call.
+        // SAFETY: `path` is NUL-terminated; `sa` is a valid initialized SECURITY_ATTRIBUTES owned
+        // by the caller for the duration of the call.
         let h = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -1581,44 +1516,39 @@ mod windows_impl {
         Ok(OwnedHandle(h))
     }
 
-    /// Create a process under the Low-integrity token. Tries
-    /// `CreateProcessAsUserW` first (the usual path); on
-    /// `ERROR_PRIVILEGE_NOT_HELD` — which happens when the current user
-    /// lacks `SE_INCREASE_QUOTA_NAME` (common on locked-down corp-managed
-    /// accounts) — falls back to `CreateProcessWithTokenW`, which requires
-    /// the more broadly-granted `SE_IMPERSONATE_NAME` instead.
+    /// Create a process under the Low-integrity token. Tries `CreateProcessAsUserW` first (the
+    /// usual path); on `ERROR_PRIVILEGE_NOT_HELD` — which happens when the current user lacks
+    /// `SE_INCREASE_QUOTA_NAME` (common on locked-down corp-managed accounts) — falls back to
+    /// `CreateProcessWithTokenW`, which requires the more broadly-granted `SE_IMPERSONATE_NAME`
+    /// instead.
     ///
-    /// The command line is re-encoded to UTF-16 for *each* attempt: Win32
-    /// documents `lpCommandLine` as in/out, and the first call may mutate
-    /// the buffer (typically inserting a NUL to split argv[0]) before
-    /// failing, so re-using the same buffer between attempts could hand
-    /// the fallback a corrupted string.
+    /// The command line is re-encoded to UTF-16 for *each* attempt: Win32 documents `lpCommandLine`
+    /// as in/out, and the first call may mutate the buffer (typically inserting a NUL to split
+    /// argv[0]) before failing, so re-using the same buffer between attempts could hand the
+    /// fallback a corrupted string.
     ///
-    /// Both invocations pass `EXTENDED_STARTUPINFO_PRESENT` together with
-    /// `STARTUPINFOEXW`, so the handle-list filter in the attribute list
-    /// applies uniformly across both paths.
+    /// Both invocations pass `EXTENDED_STARTUPINFO_PRESENT` together with `STARTUPINFOEXW`, so the
+    /// handle-list filter in the attribute list applies uniformly across both paths.
     unsafe fn create_process_low_integrity(
         token: HANDLE,
         cmd_line_utf8: &str,
         startup: &STARTUPINFOEXW,
         proc_info: &mut PROCESS_INFORMATION,
     ) -> std::io::Result<()> {
-        // CREATE_SUSPENDED so the child sits at its entry point until we've
-        // assigned it to the Job Object — otherwise the child could spawn a
-        // grandchild before assignment, and that grandchild would never be
-        // bound to the job.
+        // CREATE_SUSPENDED so the child sits at its entry point until we've assigned it to the Job
+        // Object — otherwise the child could spawn a grandchild before assignment, and that
+        // grandchild would never be bound to the job.
         let creation_flags = CREATE_NO_WINDOW
             | EXTENDED_STARTUPINFO_PRESENT
             | CREATE_UNICODE_ENVIRONMENT
             | CREATE_SUSPENDED;
         let startup_ptr = startup as *const STARTUPINFOEXW as *const STARTUPINFOW;
 
-        // Build a scrubbed UTF-16 environment block once. Passing this for
-        // both `CreateProcessAsUserW` and the `CreateProcessWithTokenW`
-        // fallback ensures the sandboxed child never sees the agent's
-        // `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or any `*_TOKEN` /
-        // `*_SECRET` variable — a Low-integrity child can still open
-        // outbound sockets, so a leaked key in env is a live exfil vector.
+        // Build a scrubbed UTF-16 environment block once. Passing this for both
+        // `CreateProcessAsUserW` and the `CreateProcessWithTokenW` fallback ensures the sandboxed
+        // child never sees the agent's `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or any `*_TOKEN` /
+        // `*_SECRET` variable — a Low-integrity child can still open outbound sockets, so a leaked
+        // key in env is a live exfil vector.
         let mut env_block = build_scrubbed_env_block_utf16();
         let env_ptr = env_block.as_mut_ptr() as *const core::ffi::c_void;
 
@@ -1627,8 +1557,8 @@ mod windows_impl {
             .chain(std::iter::once(0u16))
             .collect();
 
-        // SAFETY: All pointers are valid for the duration of the call per the
-        // caller's obligations. Win32 writes to `proc_info` on success.
+        // SAFETY: All pointers are valid for the duration of the call per the caller's obligations.
+        // Win32 writes to `proc_info` on success.
         let ok = unsafe {
             CreateProcessAsUserW(
                 token,
@@ -1661,19 +1591,18 @@ mod windows_impl {
              SECURITY_ATTRIBUTES)."
         );
 
-        // Rebuild the command-line buffer — the previous call may have
-        // mutated it before failing (Win32 documents lpCommandLine as in/out).
+        // Rebuild the command-line buffer — the previous call may have mutated it before failing
+        // (Win32 documents lpCommandLine as in/out).
         let mut cmd_line_utf16_retry: Vec<u16> = cmd_line_utf8
             .encode_utf16()
             .chain(std::iter::once(0u16))
             .collect();
 
-        // SAFETY: same contract as CreateProcessAsUserW; the two APIs only
-        // differ in their parameter list (no process/thread security attrs,
-        // no bInheritHandles — inheritance is driven by the per-handle
-        // `HANDLE_FLAG_INHERIT` flag plus the attribute-list filter). We
-        // re-use the scrubbed environment block so the fallback path
-        // doesn't accidentally regress to inheriting the parent's env.
+        // SAFETY: same contract as CreateProcessAsUserW; the two APIs only differ in their
+        // parameter list (no process/thread security attrs, no bInheritHandles — inheritance is
+        // driven by the per-handle `HANDLE_FLAG_INHERIT` flag plus the attribute-list filter). We
+        // re-use the scrubbed environment block so the fallback path doesn't accidentally regress
+        // to inheriting the parent's env.
         let ok = unsafe {
             CreateProcessWithTokenW(
                 token,
@@ -1687,9 +1616,8 @@ mod windows_impl {
                 proc_info,
             )
         };
-        // Keep `env_block` alive until after both calls complete — Win32
-        // copies the contents but documents `lpEnvironment` as a pointer
-        // that must be valid through the call.
+        // Keep `env_block` alive until after both calls complete — Win32 copies the contents but
+        // documents `lpEnvironment` as a pointer that must be valid through the call.
         drop(env_block);
         if ok == 0 {
             return Err(std::io::Error::last_os_error());
@@ -1697,10 +1625,9 @@ mod windows_impl {
         Ok(())
     }
 
-    /// Build a UTF-16 `NAME=VALUE\0NAME=VALUE\0\0` environment block for
-    /// the sandboxed child. Delegates to [`super::sandbox_child_env`]
-    /// for the filter (Windows uses the deny-list arm) so the Low-integrity
-    /// spawn path stays in sync with the Unix sandbox paths.
+    /// Build a UTF-16 `NAME=VALUE\0NAME=VALUE\0\0` environment block for the sandboxed child.
+    /// Delegates to [`super::sandbox_child_env`] for the filter (Windows uses the deny-list arm) so
+    /// the Low-integrity spawn path stays in sync with the Unix sandbox paths.
     fn build_scrubbed_env_block_utf16() -> Vec<u16> {
         let mut block: Vec<u16> = Vec::new();
         for (name_os, value_os) in super::sandbox_child_env() {
@@ -1712,8 +1639,8 @@ mod windows_impl {
             };
             append_env_entry(&mut block, name, value);
         }
-        // Double-NUL terminator (each entry already ends with one NUL; we
-        // need another to close the block).
+        // Double-NUL terminator (each entry already ends with one NUL; we need another to close the
+        // block).
         block.push(0);
         block
     }
@@ -1725,30 +1652,27 @@ mod windows_impl {
         block.push(0);
     }
 
-    /// RAII wrapper around `PROC_THREAD_ATTRIBUTE_LIST`. Owns both the
-    /// attribute-list backing buffer and the HANDLE array it points into —
-    /// Win32 stores the handle-list address (not a copy), so the array must
-    /// outlive any `CreateProcess*` call that consumes the attribute list.
+    /// RAII wrapper around `PROC_THREAD_ATTRIBUTE_LIST`. Owns both the attribute-list backing
+    /// buffer and the HANDLE array it points into — Win32 stores the handle-list address (not a
+    /// copy), so the array must outlive any `CreateProcess*` call that consumes the attribute list.
     struct ProcThreadAttributeList {
-        // Both fields are kept alive for Drop. The Vec's heap buffer is the
-        // attribute-list storage; `list_ptr` caches a stable mutable pointer
-        // to it. The boxed handle slice is referenced (by pointer) from
-        // inside the attribute-list buffer, so it must not move or drop
-        // while the list is alive.
+        // Both fields are kept alive for Drop. The Vec's heap buffer is the attribute-list
+        // storage; `list_ptr` caches a stable mutable pointer to it. The boxed handle
+        // slice is referenced (by pointer) from inside the attribute-list buffer, so it
+        // must not move or drop while the list is alive.
         _buffer: Vec<u8>,
         _handles: Box<[HANDLE]>,
         list_ptr: LPPROC_THREAD_ATTRIBUTE_LIST,
     }
 
     impl ProcThreadAttributeList {
-        /// Build a one-attribute list containing a `HANDLE_LIST` attribute
-        /// referencing the supplied handles. `UpdateProcThreadAttribute`
-        /// stores the pointer to the handle array, not a copy — the array
-        /// is boxed into the returned wrapper so it stays at a fixed
-        /// address for the wrapper's lifetime.
+        /// Build a one-attribute list containing a `HANDLE_LIST` attribute referencing the supplied
+        /// handles. `UpdateProcThreadAttribute` stores the pointer to the handle array, not a copy
+        /// — the array is boxed into the returned wrapper so it stays at a fixed address for the
+        /// wrapper's lifetime.
         unsafe fn new_with_handle_list(handles: &[HANDLE]) -> std::io::Result<Self> {
-            // First call: buffer=NULL, size=0 → fails with
-            // ERROR_INSUFFICIENT_BUFFER but writes the required size.
+            // First call: buffer=NULL, size=0 → fails with ERROR_INSUFFICIENT_BUFFER but writes the
+            // required size.
             let mut size: usize = 0;
             unsafe {
                 InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size);
@@ -1760,8 +1684,8 @@ mod windows_impl {
             let mut buffer: Vec<u8> = vec![0; size];
             let list_ptr = buffer.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
 
-            // SAFETY: `list_ptr` points to a correctly-sized buffer from the
-            // previous size query, and `size` is that queried value.
+            // SAFETY: `list_ptr` points to a correctly-sized buffer from the previous size query,
+            // and `size` is that queried value.
             if unsafe { InitializeProcThreadAttributeList(list_ptr, 1, 0, &mut size) } == 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1769,9 +1693,8 @@ mod windows_impl {
             let boxed_handles: Box<[HANDLE]> = handles.to_vec().into_boxed_slice();
             let handles_bytes = std::mem::size_of_val(&*boxed_handles);
 
-            // SAFETY: `list_ptr` was just initialized; `boxed_handles` lives
-            // for 'self because it's stored in the returned wrapper; the
-            // byte size passed matches the boxed array.
+            // SAFETY: `list_ptr` was just initialized; `boxed_handles` lives for 'self because it's
+            // stored in the returned wrapper; the byte size passed matches the boxed array.
             if unsafe {
                 UpdateProcThreadAttribute(
                     list_ptr,
@@ -1785,8 +1708,8 @@ mod windows_impl {
             } == 0
             {
                 let err = std::io::Error::last_os_error();
-                // SAFETY: Initialize succeeded; must be paired with Delete
-                // regardless of subsequent failures.
+                // SAFETY: Initialize succeeded; must be paired with Delete regardless of subsequent
+                // failures.
                 unsafe { DeleteProcThreadAttributeList(list_ptr) };
                 return Err(err);
             }
@@ -1805,9 +1728,8 @@ mod windows_impl {
 
     impl Drop for ProcThreadAttributeList {
         fn drop(&mut self) {
-            // SAFETY: constructor either fully initialized the list (and
-            // stored its pointer in `list_ptr`) or returned Err (in which
-            // case this Drop doesn't run).
+            // SAFETY: constructor either fully initialized the list (and stored its pointer in
+            // `list_ptr`) or returned Err (in which case this Drop doesn't run).
             unsafe {
                 DeleteProcThreadAttributeList(self.list_ptr);
             }
@@ -1820,8 +1742,8 @@ mod windows_impl {
     impl Drop for LocalFreeGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                // SAFETY: pointer was returned by a Win32 API that documents
-                // `LocalFree` as the correct release call.
+                // SAFETY: pointer was returned by a Win32 API that documents `LocalFree` as the
+                // correct release call.
                 unsafe {
                     LocalFree(self.0);
                 }
@@ -1859,9 +1781,8 @@ mod tests {
 
     #[test]
     fn test_is_sensitive_env_name_catches_pointer_vars() {
-        // Specific named variables that point to credentials, agent
-        // sockets, or other exfil-relevant resources — caught by
-        // substring even when wrapped in a longer name.
+        // Specific named variables that point to credentials, agent sockets, or other
+        // exfil-relevant resources — caught by substring even when wrapped in a longer name.
         assert!(is_sensitive_env_name("SSH_AUTH_SOCK"));
         assert!(is_sensitive_env_name("WSL_SSH_AUTH_SOCK"));
         assert!(is_sensitive_env_name("KUBECONFIG"));
@@ -1906,9 +1827,8 @@ mod tests {
 
     #[test]
     fn test_is_sensitive_env_name_allows_system_vars() {
-        // Windows system vars PowerShell needs at startup must NOT be
-        // flagged sensitive — that's the whole reason Windows uses
-        // deny-list instead of allow-list.
+        // Windows system vars PowerShell needs at startup must NOT be flagged sensitive — that's
+        // the whole reason Windows uses deny-list instead of allow-list.
         assert!(!is_sensitive_env_name("SystemRoot"));
         assert!(!is_sensitive_env_name("PATH"));
         assert!(!is_sensitive_env_name("PSModulePath"));
@@ -1917,22 +1837,21 @@ mod tests {
         assert!(!is_sensitive_env_name("ProgramFiles"));
         assert!(!is_sensitive_env_name("USERPROFILE"));
         assert!(!is_sensitive_env_name("TEMP"));
-        // Unix basics also shouldn't flag (the function is used on
-        // Windows but compiles cross-platform for testability).
+        // Unix basics also shouldn't flag (the function is used on Windows but compiles
+        // cross-platform for testability).
         assert!(!is_sensitive_env_name("HOME"));
         assert!(!is_sensitive_env_name("USER"));
         assert!(!is_sensitive_env_name("LANG"));
         assert!(!is_sensitive_env_name("TERM"));
-        // `KEYBOARD_LAYOUT` doesn't have `_KEY` as a substring (the
-        // pattern requires an underscore before KEY), so it survives.
+        // `KEYBOARD_LAYOUT` doesn't have `_KEY` as a substring (the pattern requires an underscore
+        // before KEY), so it survives.
         assert!(!is_sensitive_env_name("KEYBOARD_LAYOUT"));
     }
 
-    /// `cargo test` always runs with `PATH` set (the test binary needs
-    /// it to invoke itself), so this is a no-mutation sanity check that
-    /// the filter doesn't accidentally strip it. Windows env-var names
-    /// are case-insensitive and typically stored as `Path`, so the match
-    /// is case-insensitive.
+    /// `cargo test` always runs with `PATH` set (the test binary needs it to invoke itself), so
+    /// this is a no-mutation sanity check that the filter doesn't accidentally strip it. Windows
+    /// env-var names are case-insensitive and typically stored as `Path`, so the match is
+    /// case-insensitive.
     #[test]
     fn test_sandbox_child_env_keeps_path() {
         let env = sandbox_child_env();
@@ -1943,16 +1862,15 @@ mod tests {
         );
     }
 
-    /// Token-shaped sentinel: dropped by the Unix allow-list (not in
-    /// the curated list) AND by the Windows deny-list (`TOKEN` substring
-    /// match in `is_sensitive_env_name`). Verifies both arms strip it.
+    /// Token-shaped sentinel: dropped by the Unix allow-list (not in the curated list) AND by the
+    /// Windows deny-list (`TOKEN` substring match in `is_sensitive_env_name`). Verifies both arms
+    /// strip it.
     #[test]
     fn test_sandbox_child_env_drops_token_sentinel() {
         const NAME: &str = "AGSH_TEST_SCRUB_TOKEN_PROBE";
-        // SAFETY: `set_var`/`remove_var` are process-global and `cargo
-        // test` runs in-process tests in parallel. The variable name is
-        // long and test-specific so it can't collide with another test
-        // or the real environment.
+        // SAFETY: `set_var`/`remove_var` are process-global and `cargo test` runs in-process tests
+        // in parallel. The variable name is long and test-specific so it can't collide with another
+        // test or the real environment.
         unsafe {
             std::env::set_var(NAME, "sentinel-should-be-dropped");
         }
@@ -1967,9 +1885,8 @@ mod tests {
         );
     }
 
-    /// Unix: any var not in the curated allow-list (and not matching
-    /// `LC_*`/`XDG_*`) is dropped. The sentinel name has no special
-    /// shape — pure "unknown var" test.
+    /// Unix: any var not in the curated allow-list (and not matching `LC_*`/`XDG_*`) is dropped.
+    /// The sentinel name has no special shape — pure "unknown var" test.
     #[cfg(unix)]
     #[test]
     fn test_sandbox_child_env_drops_unknown_var() {
@@ -1985,8 +1902,7 @@ mod tests {
         assert!(!leaked, "unknown var leaked through the Unix allow-list");
     }
 
-    /// Unix: `LC_*` prefix match keeps the locale family without
-    /// enumerating each variant.
+    /// Unix: `LC_*` prefix match keeps the locale family without enumerating each variant.
     #[cfg(unix)]
     #[test]
     fn test_sandbox_child_env_keeps_lc_prefix() {
@@ -2002,8 +1918,7 @@ mod tests {
         assert!(kept, "LC_* prefix var was dropped from sandbox env");
     }
 
-    /// Unix: `XDG_*` prefix match keeps the XDG basedir family without
-    /// enumerating each variant.
+    /// Unix: `XDG_*` prefix match keeps the XDG basedir family without enumerating each variant.
     #[cfg(unix)]
     #[test]
     fn test_sandbox_child_env_keeps_xdg_prefix() {
@@ -2044,14 +1959,14 @@ mod tests {
         assert!(wrapped.starts_with("[Console]::OutputEncoding="));
         assert!(wrapped.contains("$OutputEncoding=[System.Text.Encoding]::UTF8"));
         assert!(wrapped.ends_with("Write-Output '日本語'"));
-        // A space must separate the prelude from the user command so
-        // PowerShell doesn't glue them into one malformed statement.
+        // A space must separate the prelude from the user command so PowerShell doesn't glue them
+        // into one malformed statement.
         assert!(wrapped.contains("UTF8; Write-Output"));
     }
 
-    /// Reference table covering the corners of the `CommandLineToArgvW`
-    /// encoding. Cross-platform — `quote_command_arg` is pure string
-    /// manipulation and has no Windows-specific runtime dependency.
+    /// Reference table covering the corners of the `CommandLineToArgvW` encoding. Cross-platform —
+    /// `quote_command_arg` is pure string manipulation and has no Windows-specific runtime
+    /// dependency.
     #[test]
     fn test_quote_command_arg_reference_table() {
         let cases: &[(&str, &str)] = &[
@@ -2062,14 +1977,14 @@ mod tests {
             (r#"say "hi""#, r#""say \"hi\"""#),
             (r#"a\"b"#, r#""a\\\"b""#),
             (r"path with space\", r#""path with space\\""#),
-            // A quote preceded by a single backslash: the backslash is
-            // doubled and the quote is escaped.
+            // A quote preceded by a single backslash: the backslash is doubled and the quote is
+            // escaped.
             (r#"\""#, r#""\\\"""#),
-            // Backslashes not adjacent to a quote pass through literally
-            // (no escaping needed, no quoting needed — no special chars).
+            // Backslashes not adjacent to a quote pass through literally (no escaping needed, no
+            // quoting needed — no special chars).
             (r"a\\b", r"a\\b"),
-            // Unicode and newlines pass through. Newline counts as
-            // whitespace so the argument gets quoted.
+            // Unicode and newlines pass through. Newline counts as whitespace so the argument gets
+            // quoted.
             ("日本語", "日本語"),
             ("hello world\n", "\"hello world\n\""),
         ];
@@ -2131,9 +2046,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_probe_backend_landlock_returns_known_variant() {
-        // Smoke test — confirms the probe runs without panicking on
-        // whatever kernel this build host has. We can't assert which
-        // specific variant comes back because CI may have an older
+        // Smoke test — confirms the probe runs without panicking on whatever kernel this build host
+        // has. We can't assert which specific variant comes back because CI may have an older
         // kernel where Landlock is unavailable.
         let probe = probe_backend(crate::config::SandboxBackend::Landlock);
         assert!(matches!(
@@ -2146,10 +2060,9 @@ mod tests {
     #[test]
     #[ignore]
     fn test_probe_backend_bubblewrap_via_path_when_available() {
-        // Opt-in: only runs when explicitly requested via
-        // `--ignored`. Skipped if `bwrap` isn't on `$PATH` since the
-        // probe will report `Missing { reason: "bwrap not found on
-        // PATH" }` which would fail the assertion below.
+        // Opt-in: only runs when explicitly requested via `--ignored`. Skipped if `bwrap` isn't on
+        // `$PATH` since the probe will report `Missing { reason: "bwrap not found on PATH" }` which
+        // would fail the assertion below.
         if bwrap_on_path().is_none() {
             eprintln!("skipping: bwrap not on PATH");
             return;

@@ -1,13 +1,11 @@
-//! Builds the system prompt and per-turn context: tool catalog, environment
-//! info (PWD, date, shell, OS), todo list, and skill summaries.
+//! Builds the system prompt and per-turn context: tool catalog, environment info (PWD, date, shell,
+//! OS), todo list, and skill summaries.
 //!
-//! The system prompt is intentionally permission-independent: every tool is
-//! listed with its required permission level noted inline, so the cached
-//! prefix (system prompt + tools array) stays byte-identical across
-//! mid-session `/permission` toggles. The agent's current level and the
-//! subset of tools it can't currently invoke are carried in the per-turn
-//! `<context>` block instead, which keeps the expensive message-history
-//! cache (Claude breakpoint 4) warm across toggles.
+//! The system prompt is intentionally permission-independent: every tool is listed with its
+//! required permission level noted inline, so the cached prefix (system prompt + tools array) stays
+//! byte-identical across mid-session `/permission` toggles. The agent's current level and the
+//! subset of tools it can't currently invoke are carried in the per-turn `<context>` block instead,
+//! which keeps the expensive message-history cache (Claude breakpoint 4) warm across toggles.
 
 use crate::{
     permission::Permission,
@@ -21,14 +19,13 @@ use crate::{
 /// [`crate::tools::ToolRegistry::tool_catalogue`].
 pub type ToolCatalogueEntry = (String, String, Permission, bool);
 
-/// Per-entry cap for the `## Additional Tools` catalogue. Keeps the
-/// cached system prompt bounded when MCP servers advertise 2 KB blobs.
+/// Per-entry cap for the `## Additional Tools` catalogue. Keeps the cached system prompt bounded
+/// when MCP servers advertise 2 KB blobs.
 const TOOL_SUMMARY_MAX_CHARS: usize = 160;
 
-/// Names of the seven built-in MCP-resource helper tools (defined in
-/// `src/tools/mcp_resources.rs`). They share no common simple prefix, so
-/// they're enumerated explicitly. Used to group deferred entries into the
-/// `### MCP resource tools` subsection of `## Tool Discovery`.
+/// Names of the seven built-in MCP-resource helper tools (defined in `src/tools/mcp_resources.rs`).
+/// They share no common simple prefix, so they're enumerated explicitly. Used to group deferred
+/// entries into the `### MCP resource tools` subsection of `## Tool Discovery`.
 const MCP_RESOURCE_TOOLS: &[&str] = &[
     "list_mcp_resources",
     "read_mcp_resource",
@@ -63,10 +60,9 @@ fn group_deferred_entries<'a>(
         } else if mcp_resource_set.contains(name) {
             mcp_resource.push(entry);
         } else if let Some(rest) = name.strip_prefix("mcp__") {
-            // Format: `mcp__<server>__<tool>`. Split on the first `__` to
-            // isolate the server name; tools without the second separator
-            // are unexpected but bucketed under the literal first segment
-            // so we don't lose them.
+            // Format: `mcp__<server>__<tool>`. Split on the first `__` to isolate the server name;
+            // tools without the second separator are unexpected but bucketed under the literal
+            // first segment so we don't lose them.
             let server = rest.split("__").next().unwrap_or(rest).to_string();
             mcp_servers.entry(server).or_default().push(entry);
         } else {
@@ -90,8 +86,8 @@ fn group_deferred_entries<'a>(
     groups
 }
 
-/// Collapse whitespace, keep the first sentence, clamp to
-/// [`TOOL_SUMMARY_MAX_CHARS`], append `…` if clipped.
+/// Collapse whitespace, keep the first sentence, clamp to [`TOOL_SUMMARY_MAX_CHARS`], append `…` if
+/// clipped.
 fn short_description(description: &str) -> String {
     let collapsed: String = {
         let mut out = String::with_capacity(description.len());
@@ -114,10 +110,9 @@ fn short_description(description: &str) -> String {
         return collapsed;
     }
 
-    // Find the first sentence terminator followed by whitespace or EOS.
-    // Walks by char to avoid slicing a multi-byte UTF-8 scalar, and
-    // recognises CJK fullwidth punctuation (。！？) alongside ASCII
-    // so descriptions in non-Western scripts get the same treatment.
+    // Find the first sentence terminator followed by whitespace or EOS. Walks by char to avoid
+    // slicing a multi-byte UTF-8 scalar, and recognises CJK fullwidth punctuation (。！？)
+    // alongside ASCII so descriptions in non-Western scripts get the same treatment.
     let mut sentence_end_byte: Option<usize> = None;
     let mut prev_term: Option<(char, usize)> = None;
     for (byte_idx, ch) in collapsed.char_indices() {
@@ -149,16 +144,15 @@ fn short_description(description: &str) -> String {
         return candidate;
     }
 
-    // Char-cap fallback. Walking by char preserves UTF-8 boundaries
-    // without relying on the unstable `floor_char_boundary`.
+    // Char-cap fallback. Walking by char preserves UTF-8 boundaries without relying on the unstable
+    // `floor_char_boundary`.
     let clipped: String = candidate.chars().take(TOOL_SUMMARY_MAX_CHARS).collect();
     format!("{}…", clipped.trim_end())
 }
 
-/// OS description for the system prompt's environment block, detected once.
-/// Probing the OS is blocking I/O (`sw_vers` subprocess on macOS,
-/// `/etc/os-release` read on Linux); the system prompt is rebuilt every turn
-/// from the async agent loop, so the result is cached process-wide.
+/// OS description for the system prompt's environment block, detected once. Probing the OS is
+/// blocking I/O (`sw_vers` subprocess on macOS, `/etc/os-release` read on Linux); the system prompt
+/// is rebuilt every turn from the async agent loop, so the result is cached process-wide.
 static OS_DESCRIPTION: std::sync::LazyLock<Option<String>> =
     std::sync::LazyLock::new(detect_os_description);
 
@@ -189,10 +183,9 @@ fn detect_os_description() -> Option<String> {
     }
 }
 
-/// Build the static, session-level system prompt: role, permission model,
-/// user instructions, full tool catalogue, skills, guidelines, and
-/// environment info. The output does NOT depend on `permission`, so callers
-/// can reuse it across `/permission` toggles without busting the prompt
+/// Build the static, session-level system prompt: role, permission model, user instructions, full
+/// tool catalogue, skills, guidelines, and environment info. The output does NOT depend on
+/// `permission`, so callers can reuse it across `/permission` toggles without busting the prompt
 /// cache.
 pub fn build_system_prompt(
     catalogue: &[ToolCatalogueEntry],
@@ -270,10 +263,9 @@ pub fn build_system_prompt(
         prompt.push('\n');
     }
 
-    // MCP server instructions: each connected server can advertise a block
-    // during `initialize` describing usage tips / mental model for its tools.
-    // Immutable for the lifetime of the connection, so we splice into the
-    // system prompt once per turn.
+    // MCP server instructions: each connected server can advertise a block during `initialize`
+    // describing usage tips / mental model for its tools. Immutable for the lifetime of the
+    // connection, so we splice into the system prompt once per turn.
     if !mcp_server_instructions.is_empty() {
         prompt.push_str("## MCP Server Instructions\n\n");
         prompt.push_str(
@@ -347,13 +339,11 @@ pub fn build_system_prompt(
     prompt
 }
 
-/// Build the per-turn `[Permission context]` block. Names the current
-/// permission level plus a one-line statement of what tools can execute
-/// at that level. The static system-prompt catalogue already lists every
-/// tool's required level, so the per-turn block stays short and bounded
-/// regardless of how many tools are registered. Permission-dependent
-/// content lives here — NOT in the system prompt — so `/permission`
-/// toggles don't invalidate the cached prefix.
+/// Build the per-turn `[Permission context]` block. Names the current permission level plus a
+/// one-line statement of what tools can execute at that level. The static system-prompt catalogue
+/// already lists every tool's required level, so the per-turn block stays short and bounded
+/// regardless of how many tools are registered. Permission-dependent content lives here — NOT in
+/// the system prompt — so `/permission` toggles don't invalidate the cached prefix.
 pub fn build_permission_context(permission: Permission) -> String {
     let summary = match permission {
         Permission::None => "No tools are executable.",
@@ -367,11 +357,10 @@ pub fn build_permission_context(permission: Permission) -> String {
     )
 }
 
-/// Build the per-turn environment context block (pwd, date).
-/// Returns an empty string in `None` permission mode so system info isn't leaked.
-/// The `cwd` argument is the agent's per-session working directory; passing
-/// it explicitly (rather than reading process state) lets multiple sessions
-/// in one process report their own cwds correctly.
+/// Build the per-turn environment context block (pwd, date). Returns an empty string in `None`
+/// permission mode so system info isn't leaked. The `cwd` argument is the agent's per-session
+/// working directory; passing it explicitly (rather than reading process state) lets multiple
+/// sessions in one process report their own cwds correctly.
 pub fn build_environment_context(permission: Permission, cwd: &std::path::Path) -> String {
     if permission == Permission::None {
         return String::new();
@@ -386,10 +375,9 @@ pub fn build_environment_context(permission: Permission, cwd: &std::path::Path) 
     context
 }
 
-/// Build the `<context>...</context>` block that wraps per-turn user input
-/// with permission state, the active todo list, and environment info. The
-/// `[Permission context]` section is always included so the model sees the
-/// current level on every turn.
+/// Build the `<context>...</context>` block that wraps per-turn user input with permission state,
+/// the active todo list, and environment info. The `[Permission context]` section is always
+/// included so the model sees the current level on every turn.
 pub fn build_turn_context(
     permission: Permission,
     todos: &[TodoItem],
@@ -411,9 +399,8 @@ pub fn build_turn_context(
     format!("<context>\n{}</context>", sections.join("\n"))
 }
 
-/// Build the post-compaction context block summarizing live session state
-/// (environment, todos, scratchpad inventory) that must persist across the
-/// compacted message window.
+/// Build the post-compaction context block summarizing live session state (environment, todos,
+/// scratchpad inventory) that must persist across the compacted message window.
 pub fn build_post_compact_context(
     permission: Permission,
     todos: &[TodoItem],
@@ -544,10 +531,9 @@ mod tests {
 
     #[test]
     fn test_system_prompt_omits_active_tool_descriptions() {
-        // Active tools' descriptions already live in the API tools array —
-        // the system prompt catalogue is now name + permission only, so
-        // the description string must not appear in the `## Available
-        // Tools` section.
+        // Active tools' descriptions already live in the API tools array — the system prompt
+        // catalogue is now name + permission only, so the description string must not appear in the
+        // `## Available Tools` section.
         let catalogue = sample_catalogue();
         let prompt = build_system_prompt(&catalogue, false, &[], None, &[]);
         let active_header = prompt.find("## Available Tools").unwrap();
@@ -567,8 +553,7 @@ mod tests {
         assert!(prompt.contains("## Tool Discovery"));
         assert!(prompt.contains("### Scratchpad operations"));
         assert!(prompt.contains("**scratchpad_read** (requires `read`)"));
-        // The deferred tool must NOT appear in the active "Available Tools"
-        // section.
+        // The deferred tool must NOT appear in the active "Available Tools" section.
         let active_header = prompt.find("## Available Tools").unwrap();
         let deferred_header = prompt.find("## Tool Discovery").unwrap();
         let active_section = &prompt[active_header..deferred_header];
@@ -577,9 +562,8 @@ mod tests {
 
     #[test]
     fn test_system_prompt_truncates_deferred_tool_descriptions() {
-        // A 2 KB MCP description must collapse to a one-liner; the
-        // full description still flows through the tool schema once
-        // `load_tool` exposes it, so the only loss is the prose repeat
+        // A 2 KB MCP description must collapse to a one-liner; the full description still flows
+        // through the tool schema once `load_tool` exposes it, so the only loss is the prose repeat
         // in the system prompt.
         let big_desc = "x".repeat(2048);
         let catalogue: Vec<ToolCatalogueEntry> = vec![(
@@ -599,8 +583,8 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("- **mcp__notion__search**"))
             .expect("mcp__notion__search entry present");
-        // Summary char cap + one-line prose scaffolding; well under the
-        // 2048 char full description that used to ship here.
+        // Summary char cap + one-line prose scaffolding; well under the 2048 char full description
+        // that used to ship here.
         let line_len = entry_line.chars().count();
         assert!(
             line_len <= TOOL_SUMMARY_MAX_CHARS + 60,
@@ -612,9 +596,8 @@ mod tests {
 
     #[test]
     fn test_system_prompt_load_tool_itself_is_active_not_deferred() {
-        // load_tool is the bootstrap meta-tool — listing it under
-        // `## Tool Discovery` would create a chicken-and-egg problem,
-        // so it must always be in the active `## Available Tools`
+        // load_tool is the bootstrap meta-tool — listing it under `## Tool Discovery` would create
+        // a chicken-and-egg problem, so it must always be in the active `## Available Tools`
         // section, never in the deferred catalogue.
         let catalogue: Vec<ToolCatalogueEntry> = vec![
             (
@@ -719,9 +702,8 @@ mod tests {
 
     #[test]
     fn test_short_description_no_sentence_terminator_short() {
-        // A short description without an ASCII/CJK sentence terminator
-        // is the complete description — no ellipsis suffix, since the
-        // model is seeing the whole text already.
+        // A short description without an ASCII/CJK sentence terminator is the complete description
+        // — no ellipsis suffix, since the model is seeing the whole text already.
         let s = "no terminator at all here just words";
         assert_eq!(short_description(s), "no terminator at all here just words");
     }
@@ -749,9 +731,9 @@ mod tests {
 
     #[test]
     fn test_system_prompt_is_permission_independent() {
-        // The system prompt signature no longer takes a permission; callers
-        // that previously toggled permission had their prompts cached
-        // differently. This test simply pins the current signature.
+        // The system prompt signature no longer takes a permission; callers that previously toggled
+        // permission had their prompts cached differently. This test simply pins the current
+        // signature.
         let catalogue = sample_catalogue();
         let a = build_system_prompt(&catalogue, true, &[], None, &[]);
         let b = build_system_prompt(&catalogue, true, &[], None, &[]);
@@ -812,9 +794,9 @@ mod tests {
         assert!(context.contains("[Permission context]"));
         assert!(context.contains("Current permission level: read"));
         assert!(context.contains("Only read-only tools are executable."));
-        // The per-turn block must NOT enumerate individual tools — that
-        // duplicates the static system-prompt catalogue and balloons with
-        // MCP-tool count. Regression-guards the O(1) size invariant.
+        // The per-turn block must NOT enumerate individual tools — that duplicates the static
+        // system-prompt catalogue and balloons with MCP-tool count. Regression-guards the O(1) size
+        // invariant.
         assert!(!context.contains("write_file"));
         assert!(!context.contains("requires `"));
     }
@@ -843,8 +825,8 @@ mod tests {
 
     #[test]
     fn test_permission_context_size_bounded_regardless_of_catalogue() {
-        // Whatever the registered tool count, the block's token cost
-        // stays constant — this is the whole point of the trim.
+        // Whatever the registered tool count, the block's token cost stays constant — this is the
+        // whole point of the trim.
         for level in [
             Permission::None,
             Permission::Read,

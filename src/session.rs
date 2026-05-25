@@ -1,13 +1,11 @@
-//! SQLite-backed session store. Persists messages, large tool outputs (so
-//! they can be referenced from the conversation by handle), OAuth tokens,
-//! and MCP credentials. Per-session mutual exclusion is provided by an
-//! OS-level file lock ([`SessionLock`]) so the kernel reclaims it whenever
-//! the holder dies — no PID-aliveness check, no risk of stale locks.
+//! SQLite-backed session store. Persists messages, large tool outputs (so they can be referenced
+//! from the conversation by handle), OAuth tokens, and MCP credentials. Per-session mutual
+//! exclusion is provided by an OS-level file lock ([`SessionLock`]) so the kernel reclaims it
+//! whenever the holder dies — no PID-aliveness check, no risk of stale locks.
 //!
-//! On Unix the data directory (`0700`), lock directory (`0700`), and the
-//! database file itself (`0600`) are tightened after creation so the
-//! persisted OAuth tokens, MCP credentials, and conversation content
-//! aren't readable by other local users regardless of the user's umask.
+//! On Unix the data directory (`0700`), lock directory (`0700`), and the database file itself
+//! (`0600`) are tightened after creation so the persisted OAuth tokens, MCP credentials, and
+//! conversation content aren't readable by other local users regardless of the user's umask.
 
 use std::{
     fs::{File, OpenOptions},
@@ -26,9 +24,8 @@ use crate::{
 };
 
 /// Raw row from the `messages` table — the on-disk shape of a single
-/// [`crate::conversation::Event`]. Internal to the session module: only
-/// the encoder and decoder helpers handle these directly. External
-/// consumers go through [`SessionManager::save_event`] /
+/// [`crate::conversation::Event`]. Internal to the session module: only the encoder and decoder
+/// helpers handle these directly. External consumers go through [`SessionManager::save_event`] /
 /// [`SessionManager::load_events`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredMessage {
@@ -42,9 +39,8 @@ pub struct SessionSummary {
     pub id: Uuid,
     pub updated_at: String,
     pub preview: String,
-    /// Working directory captured at `create_session` time. `None`
-    /// for legacy rows from before the `cwd` column was added;
-    /// ACP-facing code falls back to the process cwd for display.
+    /// Working directory captured at `create_session` time. `None` for legacy rows from before the
+    /// `cwd` column was added; ACP-facing code falls back to the process cwd for display.
     pub cwd: Option<std::path::PathBuf>,
 }
 
@@ -69,16 +65,14 @@ pub struct SessionManager {
     lock_dir: PathBuf,
 }
 
-/// RAII handle for an exclusive per-session OS file lock. Holding this value
-/// keeps the underlying lock file descriptor open; dropping it (including
-/// when the process exits or panics) closes the FD, which causes the kernel
-/// to release the `flock`/`LockFileEx` lock automatically. There is no
+/// RAII handle for an exclusive per-session OS file lock. Holding this value keeps the underlying
+/// lock file descriptor open; dropping it (including when the process exits or panics) closes the
+/// FD, which causes the kernel to release the `flock`/`LockFileEx` lock automatically. There is no
 /// "stale lock" failure mode — even `SIGKILL` is safe.
 ///
-/// Internally this is a self-referential struct: `guard` borrows from
-/// `*lock` (a `Box` for stable heap address). The explicit [`Drop`] impl
-/// drops `guard` before `lock` regardless of field declaration order — the
-/// safety invariant of the lifetime transmute used during construction.
+/// Internally this is a self-referential struct: `guard` borrows from `*lock` (a `Box` for stable
+/// heap address). The explicit [`Drop`] impl drops `guard` before `lock` regardless of field
+/// declaration order — the safety invariant of the lifetime transmute used during construction.
 pub struct SessionLock {
     guard: std::mem::ManuallyDrop<FdRwLockWriteGuard<'static, File>>,
     lock: std::mem::ManuallyDrop<Box<FdRwLock<File>>>,
@@ -86,10 +80,9 @@ pub struct SessionLock {
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        // SAFETY: `guard` borrows from `*lock`; drop it first so the borrow
-        // never outlives the borrowee. This ordering is explicit here and
-        // does not depend on the field declaration order above. Neither
-        // field is touched again after this.
+        // SAFETY: `guard` borrows from `*lock`; drop it first so the borrow never outlives the
+        // borrowee. This ordering is explicit here and does not depend on the field declaration
+        // order above. Neither field is touched again after this.
         unsafe {
             std::mem::ManuallyDrop::drop(&mut self.guard);
             std::mem::ManuallyDrop::drop(&mut self.lock);
@@ -98,21 +91,19 @@ impl Drop for SessionLock {
 }
 
 fn default_database_path() -> Result<PathBuf> {
-    // `AGSH_DATA_DIR` is the cross-platform override — the only env var that
-    // works on every OS, mirroring how `AGSH_CONFIG_DIR` overrides the config
-    // directory. The value points at the `agsh` data dir itself (the parent
-    // that contains `sessions.db`). Useful for tests, portable installs, and
-    // isolating per-project session state from the global one.
+    // `AGSH_DATA_DIR` is the cross-platform override — the only env var that works on every OS,
+    // mirroring how `AGSH_CONFIG_DIR` overrides the config directory. The value points at the
+    // `agsh` data dir itself (the parent that contains `sessions.db`). Useful for tests, portable
+    // installs, and isolating per-project session state from the global one.
     if let Ok(value) = std::env::var("AGSH_DATA_DIR")
         && !value.is_empty()
     {
         return Ok(PathBuf::from(value).join("sessions.db"));
     }
 
-    // `dirs::data_dir()` honors XDG_DATA_HOME on Linux, returns
-    // `~/Library/Application Support` on macOS, and `%APPDATA%` on Windows.
-    // No silent fallback: writing the session DB to a wrong-for-the-platform
-    // path (e.g. the old Linux-only `~/.local/share` default) is worse than
+    // `dirs::data_dir()` honors XDG_DATA_HOME on Linux, returns `~/Library/Application Support` on
+    // macOS, and `%APPDATA%` on Windows. No silent fallback: writing the session DB to a
+    // wrong-for-the-platform path (e.g. the old Linux-only `~/.local/share` default) is worse than
     // asking the user to set `AGSH_DATA_DIR` explicitly.
     let base = dirs::data_dir().ok_or_else(|| {
         AgshError::Config(
@@ -124,13 +115,12 @@ fn default_database_path() -> Result<PathBuf> {
     Ok(base.join("agsh").join("sessions.db"))
 }
 
-/// Create a directory (and any missing parents) born at mode 0700 on Unix.
-/// Avoids the umask window that `create_dir_all` + later `set_permissions`
-/// would open: between `mkdir(2)` and `chmod(2)`, the directory would be
-/// readable by other local users on a permissive umask. `DirBuilderExt::mode`
-/// passes the mode straight to `mkdir`. Pre-existing directories keep their
-/// mode — callers that need to tighten an already-existing dir should still
-/// follow up with `restrict_permissions`.
+/// Create a directory (and any missing parents) born at mode 0700 on Unix. Avoids the umask window
+/// that `create_dir_all` + later `set_permissions` would open: between `mkdir(2)` and `chmod(2)`,
+/// the directory would be readable by other local users on a permissive umask.
+/// `DirBuilderExt::mode` passes the mode straight to `mkdir`. Pre-existing directories keep their
+/// mode — callers that need to tighten an already-existing dir should still follow up with
+/// `restrict_permissions`.
 #[cfg(unix)]
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
@@ -145,11 +135,10 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
-/// Restrict a path's permissions on Unix. Best-effort — if the call fails
-/// we log and continue, because on some mounts (`/tmp` under specific
-/// overlay setups, NFS without proper support, etc.) `chmod` returns
-/// `EPERM`/`EROFS` and refusing to open the session is a strictly worse
-/// failure than leaving the file at the umask-derived mode.
+/// Restrict a path's permissions on Unix. Best-effort — if the call fails we log and continue,
+/// because on some mounts (`/tmp` under specific overlay setups, NFS without proper support, etc.)
+/// `chmod` returns `EPERM`/`EROFS` and refusing to open the session is a strictly worse failure
+/// than leaving the file at the umask-derived mode.
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -188,9 +177,9 @@ impl SessionManager {
             None => default_database_path()?,
         };
 
-        // In-memory SQLite databases (used by tests) have no on-disk parent;
-        // give each `open()` call its own ephemeral lock dir under the system
-        // temp directory so concurrent tests don't share lock files.
+        // In-memory SQLite databases (used by tests) have no on-disk parent; give each `open()`
+        // call its own ephemeral lock dir under the system temp directory so concurrent tests don't
+        // share lock files.
         let is_in_memory = database_path == Path::new(":memory:");
         let lock_dir = if is_in_memory {
             std::env::temp_dir().join(format!("agsh-test-locks-{}", Uuid::new_v4()))
@@ -208,12 +197,11 @@ impl SessionManager {
         create_private_dir(&lock_dir)?;
         restrict_permissions(&lock_dir, 0o700);
 
-        // Pre-touch the DB file at 0600 so SQLite's `Connection::open` reuses
-        // an already-restricted file rather than creating one at umask
-        // defaults that we then chmod down — the latter leaves a window
-        // where another local user could open the file. `-wal`/`-shm`
-        // companions still inherit the umask, but the parent directory's
-        // 0700 mode keeps them inaccessible to other users.
+        // Pre-touch the DB file at 0600 so SQLite's `Connection::open` reuses an already-restricted
+        // file rather than creating one at umask defaults that we then chmod down — the latter
+        // leaves a window where another local user could open the file. `-wal`/`-shm` companions
+        // still inherit the umask, but the parent directory's 0700 mode keeps them inaccessible to
+        // other users.
         #[cfg(unix)]
         if !is_in_memory {
             use std::os::unix::fs::OpenOptionsExt;
@@ -236,17 +224,16 @@ impl SessionManager {
             .await
             .map_err(|error| AgshError::Database(format!("failed to open database: {}", error)))?;
 
-        // Belt-and-braces: if the file pre-existed at a more permissive mode
-        // (manual setup, restored backup, etc.), tighten it now. The
-        // pre-touch above is the primary protection for newly-created files.
+        // Belt-and-braces: if the file pre-existed at a more permissive mode (manual setup,
+        // restored backup, etc.), tighten it now. The pre-touch above is the primary protection for
+        // newly-created files.
         if !is_in_memory {
             restrict_permissions(&database_path, 0o600);
         }
 
-        // SQLite defaults foreign-key enforcement to OFF per-connection — the
-        // `FOREIGN KEY` clauses in `CREATE TABLE` are decorative without this.
-        // Set before `initialize_schema` so the migration's DELETE/ALTER
-        // statements run with enforcement active. Must run outside any
+        // SQLite defaults foreign-key enforcement to OFF per-connection — the `FOREIGN KEY` clauses
+        // in `CREATE TABLE` are decorative without this. Set before `initialize_schema` so the
+        // migration's DELETE/ALTER statements run with enforcement active. Must run outside any
         // transaction to take effect.
         connection
             .call(|connection| -> rusqlite::Result<_> {
@@ -324,10 +311,9 @@ impl SessionManager {
                     connection.execute_batch("DROP TABLE tool_outputs")?;
                 }
 
-                // Migration: drop the legacy `sessions.locked_by` column.
-                // Locks are now OS file locks managed via `SessionLock`, so
-                // any value left in this column is meaningless and a stale
-                // PID can permanently lock a session if the column survives.
+                // Migration: drop the legacy `sessions.locked_by` column. Locks are now OS file
+                // locks managed via `SessionLock`, so any value left in this column is meaningless
+                // and a stale PID can permanently lock a session if the column survives.
                 let has_locked_by: bool = connection
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'locked_by'",
@@ -340,9 +326,9 @@ impl SessionManager {
                     connection.execute_batch("ALTER TABLE sessions DROP COLUMN locked_by")?;
                 }
 
-                // Migration: add `oauth_tokens.account_id` for openai-codex's
-                // ChatGPT-Account-ID header. Existing rows get NULL, which is
-                // fine for providers that don't use it (Claude OAuth).
+                // Migration: add `oauth_tokens.account_id` for openai-codex's ChatGPT-Account-ID
+                // header. Existing rows get NULL, which is fine for providers that don't use it
+                // (Claude OAuth).
                 let has_account_id: bool = connection
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('oauth_tokens') WHERE name = 'account_id'",
@@ -371,14 +357,12 @@ impl SessionManager {
                     );",
                 )?;
 
-                // Migration: add `sessions.parent_session_id` so sub-agent
-                // sessions can be linked back to the parent that spawned
-                // them. Primary sessions store NULL. The cascade-FK is
-                // attached later in the rebuild migration below; this step
-                // only guarantees the column exists. Index is created
-                // unconditionally afterwards so fresh DBs (column from
-                // CREATE TABLE) and migrated DBs (column from ALTER TABLE)
-                // both end up with it.
+                // Migration: add `sessions.parent_session_id` so sub-agent sessions can be linked
+                // back to the parent that spawned them. Primary sessions store NULL. The cascade-FK
+                // is attached later in the rebuild migration below; this step only guarantees the
+                // column exists. Index is created unconditionally afterwards so fresh DBs (column
+                // from CREATE TABLE) and migrated DBs (column from ALTER TABLE) both end up with
+                // it.
                 let has_parent_col: bool = connection
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'parent_session_id'",
@@ -396,13 +380,10 @@ impl SessionManager {
                          ON sessions(parent_session_id)",
                 )?;
 
-                // Migration: add `sessions.cwd` so ACP's
-                // `session/list` can report each session's working
-                // directory and `session/load` has a stored cwd to
-                // validate the client's request against. Existing
-                // rows get NULL; the ACP handlers fall back to the
-                // process cwd for those entries so legacy sessions
-                // stay listable.
+                // Migration: add `sessions.cwd` so ACP's `session/list` can report each session's
+                // working directory and `session/load` has a stored cwd to validate the client's
+                // request against. Existing rows get NULL; the ACP handlers fall back to the
+                // process cwd for those entries so legacy sessions stay listable.
                 let has_cwd_col: bool = connection
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'cwd'",
@@ -415,9 +396,8 @@ impl SessionManager {
                     connection.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT")?;
                 }
 
-                // Migration: drop the legacy `sessions.metadata` column. It
-                // was reserved for future use but never populated by any
-                // codepath, so it's pure schema noise.
+                // Migration: drop the legacy `sessions.metadata` column. It was reserved for future
+                // use but never populated by any codepath, so it's pure schema noise.
                 let has_metadata: bool = connection
                     .query_row(
                         "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'metadata'",
@@ -430,18 +410,16 @@ impl SessionManager {
                     connection.execute_batch("ALTER TABLE sessions DROP COLUMN metadata")?;
                 }
 
-                // Migration: rebuild sessions / messages / tool_outputs so
-                // their session-referencing FKs carry `ON DELETE CASCADE`,
-                // and so `parent_session_id` has a FK at all (it was added
-                // as a plain TEXT column). SQLite can't ALTER a column's
-                // constraints, so we follow the documented redefinition
-                // procedure: disable FK enforcement, recreate each table
-                // with the final schema, copy rows, drop old, rename, then
-                // re-enable enforcement. Wrapped in a transaction so a
-                // crash mid-migration leaves the original tables intact.
+                // Migration: rebuild sessions / messages / tool_outputs so their
+                // session-referencing FKs carry `ON DELETE CASCADE`, and so `parent_session_id` has
+                // a FK at all (it was added as a plain TEXT column). SQLite can't ALTER a column's
+                // constraints, so we follow the documented redefinition procedure: disable FK
+                // enforcement, recreate each table with the final schema, copy rows, drop old,
+                // rename, then re-enable enforcement. Wrapped in a transaction so a crash
+                // mid-migration leaves the original tables intact.
                 //
-                // Detection key: the `messages` table SQL contains the
-                // literal `ON DELETE CASCADE` after the migration runs.
+                // Detection key: the `messages` table SQL contains the literal `ON DELETE CASCADE`
+                // after the migration runs.
                 let has_cascade: bool = connection
                     .query_row(
                         "SELECT COUNT(*) FROM sqlite_master \
@@ -453,9 +431,8 @@ impl SessionManager {
                     .unwrap_or(0)
                     > 0;
                 if !has_cascade {
-                    // PRAGMA foreign_keys only takes effect outside any
-                    // transaction. Toggle, run rebuild, restore — even on
-                    // failure — so the connection isn't left in a state
+                    // PRAGMA foreign_keys only takes effect outside any transaction. Toggle, run
+                    // rebuild, restore — even on failure — so the connection isn't left in a state
                     // where FKs are silently off for subsequent queries.
                     connection.execute_batch("PRAGMA foreign_keys = OFF")?;
                     let migration_result = (|| -> rusqlite::Result<()> {
@@ -512,12 +489,10 @@ impl SessionManager {
             .map_err(|error| AgshError::Database(format!("failed to initialize schema: {}", error)))
     }
 
-    /// Create a new session, optionally recording its working
-    /// directory. `cwd` is persisted as an absolute path string; pass
-    /// `None` only for code paths that genuinely have no cwd context
-    /// (legacy/test fixtures, `agsh tools list`). Production paths
-    /// (the REPL and `agsh acp`) pass the agent's current cwd so
-    /// `session/list` can surface it later.
+    /// Create a new session, optionally recording its working directory. `cwd` is persisted as an
+    /// absolute path string; pass `None` only for code paths that genuinely have no cwd context
+    /// (legacy/test fixtures, `agsh tools list`). Production paths (the REPL and `agsh acp`) pass
+    /// the agent's current cwd so `session/list` can surface it later.
     pub async fn create_session(&self, cwd: Option<std::path::PathBuf>) -> Result<Uuid> {
         let session_id = Uuid::new_v4();
         let now = chrono::Utc::now().to_rfc3339();
@@ -538,11 +513,10 @@ impl SessionManager {
         Ok(session_id)
     }
 
-    /// Create a session whose `parent_session_id` references an existing
-    /// session — used by `spawn_agent` so sub-agent conversations persist
-    /// as children of the parent for auditing. Cascades on parent delete
-    /// (see [`Self::delete_session`]). The optional `cwd` is the
-    /// parent's cwd snapshot at spawn time.
+    /// Create a session whose `parent_session_id` references an existing session — used by
+    /// `spawn_agent` so sub-agent conversations persist as children of the parent for auditing.
+    /// Cascades on parent delete (see [`Self::delete_session`]). The optional `cwd` is the parent's
+    /// cwd snapshot at spawn time.
     pub async fn create_child_session(
         &self,
         parent: Uuid,
@@ -575,12 +549,11 @@ impl SessionManager {
         Ok(session_id)
     }
 
-    /// Acquire an exclusive OS file lock on the session. Returns a
-    /// [`SessionLock`] handle whose lifetime owns the lock; drop it (or let
-    /// the process exit) to release.
+    /// Acquire an exclusive OS file lock on the session. Returns a [`SessionLock`] handle whose
+    /// lifetime owns the lock; drop it (or let the process exit) to release.
     ///
-    /// The session must already exist in the database. Returns
-    /// [`AgshError::SessionLocked`] if another live process holds the lock.
+    /// The session must already exist in the database. Returns [`AgshError::SessionLocked`] if
+    /// another live process holds the lock.
     pub fn lock_session(&self, session_id: Uuid) -> Result<SessionLock> {
         let path = self.lock_dir.join(format!("{}.lock", session_id));
         let file = OpenOptions::new()
@@ -612,10 +585,9 @@ impl SessionManager {
             }
         };
 
-        // SAFETY: `guard` borrows from `*lock`. We move the box (not the
-        // RwLock inside it) into the returned `SessionLock`, so the RwLock's
-        // heap address is stable for as long as the box lives. The explicit
-        // `Drop` impl on `SessionLock` drops `guard` before `lock`, so the
+        // SAFETY: `guard` borrows from `*lock`. We move the box (not the RwLock inside it) into the
+        // returned `SessionLock`, so the RwLock's heap address is stable for as long as the box
+        // lives. The explicit `Drop` impl on `SessionLock` drops `guard` before `lock`, so the
         // borrow never outlives the borrowee.
         let guard: FdRwLockWriteGuard<'static, File> = unsafe { std::mem::transmute(guard) };
 
@@ -625,22 +597,19 @@ impl SessionManager {
         })
     }
 
-    /// Best-effort removal of `<lock_dir>/<uuid>.lock` files whose
-    /// session no longer exists. `lock_session` creates these files but
-    /// never deletes them — the OS releases the *lock* on process exit,
-    /// yet the empty file remains. A file for a UUID that isn't in the
-    /// `sessions` table is pure garbage.
+    /// Best-effort removal of `<lock_dir>/<uuid>.lock` files whose session no longer exists.
+    /// `lock_session` creates these files but never deletes them — the OS releases the *lock* on
+    /// process exit, yet the empty file remains. A file for a UUID that isn't in the `sessions`
+    /// table is pure garbage.
     ///
-    /// Housekeeping only: never fails the caller. A DB-query failure is
-    /// a recoverable fallback (`warn!`); a per-file unlink failure
-    /// (e.g. a root-owned file left by a container run) is expected and
-    /// logged at `debug!`.
+    /// Housekeeping only: never fails the caller. A DB-query failure is a recoverable fallback
+    /// (`warn!`); a per-file unlink failure (e.g. a root-owned file left by a container run) is
+    /// expected and logged at `debug!`.
     ///
-    /// Deleting a *held* lock file for an already-deleted session is
-    /// benign — no process starts a deleted session — and the sweep
-    /// never races a live one: a session's row is committed before its
-    /// lock file is acquired (see `main.rs`), so a live UUID is always
-    /// in the set this query returns.
+    /// Deleting a *held* lock file for an already-deleted session is benign — no process starts a
+    /// deleted session — and the sweep never races a live one: a session's row is committed before
+    /// its lock file is acquired (see `main.rs`), so a live UUID is always in the set this query
+    /// returns.
     async fn prune_orphan_lock_files(&self) {
         let live_ids: std::collections::HashSet<String> = match self
             .connection
@@ -677,8 +646,8 @@ impl SessionManager {
             if path.extension().and_then(|ext| ext.to_str()) != Some("lock") {
                 continue;
             }
-            // Only touch files whose stem is a UUID — never delete an
-            // unrelated file someone dropped into the lock directory.
+            // Only touch files whose stem is a UUID — never delete an unrelated file someone
+            // dropped into the lock directory.
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
@@ -703,9 +672,9 @@ impl SessionManager {
     /// - `Event::CompactBoundary { … }` writes one row with the pseudo-role `compact_boundary` and
     ///   a JSON-serialized envelope in `content`.
     ///
-    /// No schema migration: legacy databases (predating this commit) only
-    /// contain `Event::Append` rows; loading them via [`Self::load_events`]
-    /// yields the same events the in-memory log produced before.
+    /// No schema migration: legacy databases (predating this commit) only contain `Event::Append`
+    /// rows; loading them via [`Self::load_events`] yields the same events the in-memory log
+    /// produced before.
     pub async fn save_event(
         &self,
         session_id: Uuid,
@@ -716,11 +685,10 @@ impl SessionManager {
         self.save_message(session_id, &role, &content).await
     }
 
-    /// Load every event for a session in chronological order. Legacy
-    /// rows (role ∈ {`user`, `assistant`, `tool_results`}) are
-    /// reconstructed as `Event::Append`; rows with role
-    /// `compact_boundary` are deserialized from the JSON envelope.
-    /// Unknown roles are skipped with a warning.
+    /// Load every event for a session in chronological order. Legacy rows (role ∈ {`user`,
+    /// `assistant`, `tool_results`}) are reconstructed as `Event::Append`; rows with role
+    /// `compact_boundary` are deserialized from the JSON envelope. Unknown roles are skipped with a
+    /// warning.
     pub async fn load_events(&self, session_id: Uuid) -> Result<Vec<crate::conversation::Event>> {
         let stored = self.load_messages(session_id).await?;
         let mut events = Vec::with_capacity(stored.len());
@@ -742,9 +710,9 @@ impl SessionManager {
         Ok(events)
     }
 
-    /// Persist a single row into the `messages` table. Internal helper
-    /// for [`Self::save_event`]; external consumers go through the event
-    /// API. Tests still call this directly to populate fixtures.
+    /// Persist a single row into the `messages` table. Internal helper for [`Self::save_event`];
+    /// external consumers go through the event API. Tests still call this directly to populate
+    /// fixtures.
     pub(super) async fn save_message(
         &self,
         session_id: Uuid,
@@ -775,8 +743,8 @@ impl SessionManager {
             .map_err(|error| AgshError::Database(format!("failed to save message: {}", error)))
     }
 
-    /// Fetch raw rows for a session. Internal helper for
-    /// [`Self::load_events`]; external consumers go through the event API.
+    /// Fetch raw rows for a session. Internal helper for [`Self::load_events`]; external consumers
+    /// go through the event API.
     async fn load_messages(&self, session_id: Uuid) -> Result<Vec<StoredMessage>> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -842,14 +810,13 @@ impl SessionManager {
 
     /// Resolve a session-ID prefix (e.g. `d64`) to the matching full UUIDs.
     ///
-    /// Used by `agsh -c <prefix>` so the user doesn't have to type the
-    /// whole UUID. Capped at 16 matches; ordered most-recent-first so the
-    /// caller's "ambiguous prefix" listing leads with the session the user
-    /// most likely meant.
+    /// Used by `agsh -c <prefix>` so the user doesn't have to type the whole UUID. Capped at 16
+    /// matches; ordered most-recent-first so the caller's "ambiguous prefix" listing leads with the
+    /// session the user most likely meant.
     ///
-    /// Anything outside the UUID alphabet (`0-9a-fA-F-`) returns an empty
-    /// list — both because such a prefix can't match any real session ID
-    /// and to keep SQL `LIKE` wildcards (`%`, `_`) from sneaking through.
+    /// Anything outside the UUID alphabet (`0-9a-fA-F-`) returns an empty list — both because such
+    /// a prefix can't match any real session ID and to keep SQL `LIKE` wildcards (`%`, `_`) from
+    /// sneaking through.
     pub async fn find_sessions_by_prefix(&self, prefix: &str) -> Result<Vec<Uuid>> {
         if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             return Ok(Vec::new());
@@ -879,21 +846,19 @@ impl SessionManager {
             })
     }
 
-    /// List sessions, most-recent first. When `include_children` is `false`,
-    /// sub-agent sessions (rows with non-NULL `parent_session_id`) are hidden
-    /// — they're persisted for audit/debug but shouldn't clutter the user's
-    /// view of their own conversations. Set to `true` to surface them, e.g.
-    /// via `agsh list --include-children`.
+    /// List sessions, most-recent first. When `include_children` is `false`, sub-agent sessions
+    /// (rows with non-NULL `parent_session_id`) are hidden — they're persisted for audit/debug but
+    /// shouldn't clutter the user's view of their own conversations. Set to `true` to surface them,
+    /// e.g. via `agsh list --include-children`.
     ///
-    /// `cwd_filter`, if `Some`, restricts the result set to sessions whose
-    /// persisted `cwd` matches the given path (rows with NULL `cwd` are
-    /// excluded — legacy rows can't be filtered by cwd they never recorded).
+    /// `cwd_filter`, if `Some`, restricts the result set to sessions whose persisted `cwd` matches
+    /// the given path (rows with NULL `cwd` are excluded — legacy rows can't be filtered by cwd
+    /// they never recorded).
     ///
-    /// `cursor`, if `Some`, is a previous `next_cursor` value from this
-    /// method; rows are returned strictly *after* the cursor in
-    /// `(updated_at, id) DESC` order. Returns `(rows, next_cursor)` —
-    /// `next_cursor` is `Some` iff there is at least one more row past
-    /// `limit`. Invalid cursors are rejected with [`AgshError::Database`].
+    /// `cursor`, if `Some`, is a previous `next_cursor` value from this method; rows are returned
+    /// strictly *after* the cursor in `(updated_at, id) DESC` order. Returns `(rows, next_cursor)`
+    /// — `next_cursor` is `Some` iff there is at least one more row past `limit`. Invalid cursors
+    /// are rejected with [`AgshError::Database`].
     pub async fn list_sessions(
         &self,
         limit: u32,
@@ -917,9 +882,8 @@ impl SessionManager {
                     clauses.push("s.cwd = :cwd");
                 }
                 if cursor_decoded.is_some() {
-                    // Keyset on (updated_at, id) DESC: strictly past the
-                    // cursor row. Tie-break on id keeps pagination stable
-                    // when multiple sessions share an updated_at.
+                    // Keyset on (updated_at, id) DESC: strictly past the cursor row. Tie-break on
+                    // id keeps pagination stable when multiple sessions share an updated_at.
                     clauses.push(
                         "(s.updated_at < :cursor_updated_at \
                           OR (s.updated_at = :cursor_updated_at AND s.id < :cursor_id))",
@@ -946,8 +910,8 @@ impl SessionManager {
                 );
                 let mut statement = connection.prepare(&query)?;
 
-                // Fetch one extra row to detect whether a next page exists
-                // without a second COUNT query.
+                // Fetch one extra row to detect whether a next page exists without a second COUNT
+                // query.
                 let fetch_limit: i64 = i64::from(limit).saturating_add(1);
                 let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
                 params.push((":limit", &fetch_limit));
@@ -997,10 +961,9 @@ impl SessionManager {
             .map_err(|error| AgshError::Database(format!("failed to list sessions: {}", error)))
     }
 
-    /// Fetch a single session by id without scanning the full list. Returns
-    /// `Ok(None)` if the session doesn't exist. Used by ACP's `session/load`
-    /// to verify the requested session exists and to surface its persisted
-    /// cwd back to the client.
+    /// Fetch a single session by id without scanning the full list. Returns `Ok(None)` if the
+    /// session doesn't exist. Used by ACP's `session/load` to verify the requested session exists
+    /// and to surface its persisted cwd back to the client.
     pub async fn session_info(&self, id: Uuid) -> Result<Option<SessionSummary>> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1043,10 +1006,9 @@ impl SessionManager {
     }
 
     pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<u64> {
-        // `TimeDelta::days` panics on out-of-range input, so route through
-        // `try_days`: an absurdly large `retention_days` falls back to a
-        // ~100-year window, which deletes nothing — the intended
-        // "retain everything" outcome.
+        // `TimeDelta::days` panics on out-of-range input, so route through `try_days`: an absurdly
+        // large `retention_days` falls back to a ~100-year window, which deletes nothing — the
+        // intended "retain everything" outcome.
         let retention = i64::try_from(retention_days)
             .ok()
             .and_then(chrono::TimeDelta::try_days)
@@ -1057,8 +1019,8 @@ impl SessionManager {
         let deleted = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // FK CASCADE sweeps messages, tool_outputs, and any
-                // sub-agent child sessions of the expired parents.
+                // FK CASCADE sweeps messages, tool_outputs, and any sub-agent child sessions of the
+                // expired parents.
                 let deleted = connection.execute(
                     "DELETE FROM sessions WHERE updated_at < ?1",
                     rusqlite::params![cutoff_str],
@@ -1073,13 +1035,11 @@ impl SessionManager {
         Ok(deleted)
     }
 
-    /// Update the persisted cwd for an existing session. Called by
-    /// the ACP `session/load` / `session/resume` handlers when the
-    /// client's `cwd` differs from the persisted value — the client
-    /// wins so future `session/list` results reflect the live state.
-    /// `cwd` is stored as the path's `to_string_lossy()` form (UTF-8
-    /// is the only column type SQLite has). Returns the number of
-    /// rows updated (0 if the session id doesn't exist).
+    /// Update the persisted cwd for an existing session. Called by the ACP `session/load` /
+    /// `session/resume` handlers when the client's `cwd` differs from the persisted value — the
+    /// client wins so future `session/list` results reflect the live state. `cwd` is stored as the
+    /// path's `to_string_lossy()` form (UTF-8 is the only column type SQLite has). Returns the
+    /// number of rows updated (0 if the session id doesn't exist).
     pub async fn update_session_cwd(
         &self,
         session_id: Uuid,
@@ -1128,10 +1088,9 @@ impl SessionManager {
         let deleted = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // ON DELETE CASCADE on `messages.session_id`,
-                // `tool_outputs.session_id`, and `sessions.parent_session_id`
-                // sweeps own-session rows + any sub-agent children + their
-                // messages/tool_outputs in a single statement.
+                // ON DELETE CASCADE on `messages.session_id`, `tool_outputs.session_id`, and
+                // `sessions.parent_session_id` sweeps own-session rows + any sub-agent children +
+                // their messages/tool_outputs in a single statement.
                 let deleted = connection
                     .execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![
                         session_id.to_string()
@@ -1235,11 +1194,9 @@ impl SessionManager {
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // Pre-check: target must not exist. `tokio_rusqlite`
-                // serializes connection access so this and the UPDATE
-                // share a consistent view; the `PRIMARY KEY (session_id,
-                // name)` constraint at the schema layer is the final
-                // backstop.
+                // Pre-check: target must not exist. `tokio_rusqlite` serializes connection access
+                // so this and the UPDATE share a consistent view; the `PRIMARY KEY (session_id,
+                // name)` constraint at the schema layer is the final backstop.
                 let target_exists: i64 = connection.query_row(
                     "SELECT COUNT(*) FROM tool_outputs WHERE session_id = ?1 AND name = ?2",
                     rusqlite::params![session_id.to_string(), new],
@@ -1330,21 +1287,18 @@ impl SessionManager {
             .map_err(|error| AgshError::Database(format!("failed to load tool outputs: {}", error)))
     }
 
-    /// Delete the oldest sessions until total `messages.content` size is
-    /// at or below `max_bytes`. `active_ids` is the set of session ids
-    /// the caller knows to be currently in use — they are excluded
-    /// from the eviction sweep so the caller's in-flight `save_event`
-    /// calls don't trip on foreign-key violations after a deletion.
-    /// Pass an empty set when there are no live sessions (typical at
-    /// startup, when this is called before any session is opened).
+    /// Delete the oldest sessions until total `messages.content` size is at or below `max_bytes`.
+    /// `active_ids` is the set of session ids the caller knows to be currently in use — they are
+    /// excluded from the eviction sweep so the caller's in-flight `save_event` calls don't trip on
+    /// foreign-key violations after a deletion. Pass an empty set when there are no live sessions
+    /// (typical at startup, when this is called before any session is opened).
     pub async fn enforce_storage_limit(
         &self,
         max_bytes: u64,
         active_ids: &std::collections::HashSet<String>,
     ) -> Result<u64> {
-        // Take the caller's snapshot once and move it into the
-        // blocking task so the SQL closure can match against it
-        // without re-locking anything.
+        // Take the caller's snapshot once and move it into the blocking task so the SQL closure can
+        // match against it without re-locking anything.
         let active: Vec<String> = active_ids.iter().cloned().collect();
         let deleted = self
             .connection
@@ -1362,9 +1316,8 @@ impl SessionManager {
                         break;
                     }
 
-                    // Build the `NOT IN (?, ?, ...)` placeholder list
-                    // dynamically. SQLite's parameter index uses 1-based
-                    // values; we feed each id positionally below.
+                    // Build the `NOT IN (?, ?, ...)` placeholder list dynamically. SQLite's
+                    // parameter index uses 1-based values; we feed each id positionally below.
                     let placeholders = (1..=active.len())
                         .map(|index| format!("?{}", index))
                         .collect::<Vec<_>>()
@@ -1384,18 +1337,17 @@ impl SessionManager {
 
                     match oldest_id {
                         Ok(session_id) => {
-                            // FK CASCADE sweeps the session's messages and
-                            // tool_outputs along with the session row.
+                            // FK CASCADE sweeps the session's messages and tool_outputs along with
+                            // the session row.
                             connection.execute(
                                 "DELETE FROM sessions WHERE id = ?1",
                                 rusqlite::params![session_id],
                             )?;
                             deleted += 1;
                         }
-                        // No eligible row left — either the DB is
-                        // empty, or every remaining session is in the
-                        // active set. Either way, we can't reclaim
-                        // more without touching live state.
+                        // No eligible row left — either the DB is empty, or every remaining session
+                        // is in the active set. Either way, we can't reclaim more without touching
+                        // live state.
                         Err(rusqlite::Error::QueryReturnedNoRows) => break,
                         Err(error) => return Err(error),
                     }
@@ -1511,8 +1463,8 @@ impl TokenStore {
             })
     }
 
-    /// Load a cached needs-auth verdict for an MCP server, or `None` if
-    /// there is no entry or it is older than `ttl`.
+    /// Load a cached needs-auth verdict for an MCP server, or `None` if there is no entry or it is
+    /// older than `ttl`.
     pub async fn load_auth_probe(
         &self,
         server_name: &str,
@@ -1533,8 +1485,8 @@ impl TokenStore {
                     },
                 );
                 match result {
-                    // Strict `<` so a zero-duration TTL behaves as "never
-                    // cache" instead of "cache for the rest of this second".
+                    // Strict `<` so a zero-duration TTL behaves as "never cache" instead of "cache
+                    // for the rest of this second".
                     Ok((needs_auth, cached_at)) if now - cached_at < ttl_seconds => {
                         Ok(Some(needs_auth))
                     }
@@ -1549,8 +1501,8 @@ impl TokenStore {
             })
     }
 
-    /// Persist a needs-auth verdict for an MCP server (TTL is enforced at
-    /// load time, so we just record the current timestamp here).
+    /// Persist a needs-auth verdict for an MCP server (TTL is enforced at load time, so we just
+    /// record the current timestamp here).
     pub async fn save_auth_probe(&self, server_name: &str, needs_auth: bool) -> Result<()> {
         let server_name = server_name.to_string();
         let now = chrono::Utc::now().timestamp();
@@ -1647,8 +1599,8 @@ impl SessionManager {
     }
 }
 
-/// Strip `<context>...</context>` tags from a stored user message,
-/// returning only the actual user input.
+/// Strip `<context>...</context>` tags from a stored user message, returning only the actual user
+/// input.
 pub fn strip_context_tags(text: &str) -> &str {
     const CLOSING_TAG: &str = "</context>";
     if let Some(end) = text.find(CLOSING_TAG) {
@@ -1659,15 +1611,13 @@ pub fn strip_context_tags(text: &str) -> &str {
     }
 }
 
-/// Pseudo-role used in the `messages` table for `Event::CompactBoundary`
-/// rows. Coexists with the legacy `user`/`assistant`/`tool_results` roles
-/// without a schema migration.
+/// Pseudo-role used in the `messages` table for `Event::CompactBoundary` rows. Coexists with the
+/// legacy `user`/`assistant`/`tool_results` roles without a schema migration.
 const COMPACT_BOUNDARY_ROLE: &str = "compact_boundary";
 
-/// Encode an [`crate::conversation::Event`] into the `(role, content)`
-/// columns of the `messages` table. `Event::Append` writes the message's
-/// natural role; `Event::CompactBoundary` writes a JSON envelope under
-/// the [`COMPACT_BOUNDARY_ROLE`] pseudo-role.
+/// Encode an [`crate::conversation::Event`] into the `(role, content)` columns of the `messages`
+/// table. `Event::Append` writes the message's natural role; `Event::CompactBoundary` writes a JSON
+/// envelope under the [`COMPACT_BOUNDARY_ROLE`] pseudo-role.
 fn encode_event_for_db(
     event: &crate::conversation::Event,
 ) -> std::result::Result<(String, String), serde_json::Error> {
@@ -1701,9 +1651,8 @@ fn encode_event_for_db(
     }
 }
 
-/// Decode one persisted row back into an [`crate::conversation::Event`].
-/// Returns `Ok(None)` when the row's role is unrecognised (forward-
-/// compat for new variants).
+/// Decode one persisted row back into an [`crate::conversation::Event`]. Returns `Ok(None)` when
+/// the row's role is unrecognised (forward- compat for new variants).
 fn decode_event_from_row(
     row: &StoredMessage,
 ) -> std::result::Result<Option<crate::conversation::Event>, serde_json::Error> {
@@ -1739,10 +1688,9 @@ fn decode_event_from_row(
     }
 }
 
-/// Pagination cursor for [`SessionManager::list_sessions`]: encodes the
-/// `(updated_at, id)` of the last row in a page as base64-url JSON. The
-/// shape is opaque to clients — they only round-trip it back as
-/// `next_cursor`.
+/// Pagination cursor for [`SessionManager::list_sessions`]: encodes the `(updated_at, id)` of the
+/// last row in a page as base64-url JSON. The shape is opaque to clients — they only round-trip it
+/// back as `next_cursor`.
 #[derive(Serialize, Deserialize)]
 struct ListSessionsCursor {
     #[serde(rename = "u")]
@@ -1793,10 +1741,9 @@ mod tests {
             .expect("failed to open in-memory database")
     }
 
-    /// Persist one of every event variant via `save_event` and read it
-    /// back through `load_events`. Verifies the encoding/decoding round
-    /// trip — including the JSON envelope used for `CompactBoundary` —
-    /// matches the in-memory shape.
+    /// Persist one of every event variant via `save_event` and read it back through `load_events`.
+    /// Verifies the encoding/decoding round trip — including the JSON envelope used for
+    /// `CompactBoundary` — matches the in-memory shape.
     #[tokio::test]
     async fn test_save_and_load_events_round_trip() {
         use std::collections::HashSet;
@@ -1888,10 +1835,9 @@ mod tests {
         }
     }
 
-    /// Legacy databases (predating PR 2) only contain rows with the
-    /// `user` / `assistant` / `tool_results` roles — no `compact_boundary`.
-    /// `load_events` must hydrate every legacy row as an `Event::Append`
-    /// so resume works without a schema migration.
+    /// Legacy databases (predating PR 2) only contain rows with the `user` / `assistant` /
+    /// `tool_results` roles — no `compact_boundary`. `load_events` must hydrate every legacy row as
+    /// an `Event::Append` so resume works without a schema migration.
     #[tokio::test]
     async fn test_load_events_legacy_rows_as_append() {
         use crate::conversation::Event;
@@ -1918,9 +1864,8 @@ mod tests {
         assert!(events.iter().all(|e| matches!(e, Event::Append(_))));
     }
 
-    /// A row with an unknown role should be skipped (with a warning) so
-    /// a future schema bump that adds new event variants doesn't crash
-    /// older binaries reading newer DBs.
+    /// A row with an unknown role should be skipped (with a warning) so a future schema bump that
+    /// adds new event variants doesn't crash older binaries reading newer DBs.
     #[tokio::test]
     async fn test_load_events_skips_unknown_role() {
         let manager = test_manager().await;
@@ -1937,10 +1882,9 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
-    /// Regression test for the umask-dependent permission bug: the session
-    /// database file stores OAuth tokens and MCP credentials, so it must be
-    /// readable by the owner only (0600) and the surrounding directory by
-    /// the owner only (0700), regardless of the user's umask.
+    /// Regression test for the umask-dependent permission bug: the session database file stores
+    /// OAuth tokens and MCP credentials, so it must be readable by the owner only (0600) and the
+    /// surrounding directory by the owner only (0700), regardless of the user's umask.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_session_db_file_mode() {
@@ -2064,8 +2008,8 @@ mod tests {
             .create_session(None)
             .await
             .expect("failed to create session");
-        // First 8 hex chars (before the first dash) — guaranteed unique
-        // for a freshly-generated random UUID with only one row in the DB.
+        // First 8 hex chars (before the first dash) — guaranteed unique for a freshly-generated
+        // random UUID with only one row in the DB.
         let prefix: String = id.to_string().chars().take(8).collect();
         let matches = manager
             .find_sessions_by_prefix(&prefix)
@@ -2085,8 +2029,8 @@ mod tests {
             .find_sessions_by_prefix("ffffffff")
             .await
             .expect("failed prefix lookup");
-        // Real UUIDs are random; collision with this prefix is astronomically
-        // unlikely but theoretically possible — re-create a session if so.
+        // Real UUIDs are random; collision with this prefix is astronomically unlikely but
+        // theoretically possible — re-create a session if so.
         assert!(matches.is_empty() || matches.len() == 1);
     }
 
@@ -2443,14 +2387,13 @@ mod tests {
     //   - `strip_context_tags` / `truncate_preview`
     // that breaks the preview will fail one of these tests.
     //
-    // The preview has regressed several times historically; these
-    // guards exist so the next breakage is caught by CI, not a user.
+    // The preview has regressed several times historically; these guards exist so the next breakage
+    // is caught by CI, not a user.
 
-    /// Reconstructs what `agent::Agent::run_turn` passes to
-    /// `save_message` for a fresh user turn: the `<context>...</context>`
-    /// block followed by `\n\n` and the user's raw prompt. Kept
-    /// structurally identical to the real call-site (see
-    /// `src/agent.rs::run_turn` → `augmented_input = format!("{}\n\n{}", block, user_input)`).
+    /// Reconstructs what `agent::Agent::run_turn` passes to `save_message` for a fresh user turn:
+    /// the `<context>...</context>` block followed by `\n\n` and the user's raw prompt. Kept
+    /// structurally identical to the real call-site (see `src/agent.rs::run_turn` →
+    /// `augmented_input = format!("{}\n\n{}", block, user_input)`).
     fn mock_run_turn_user_message(
         permission: crate::permission::Permission,
         user_input: &str,
@@ -2461,9 +2404,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_is_user_prompt_not_context_wrapper() {
-        // The canonical regression: user types a prompt, turn runs,
-        // `agsh list` must show the prompt — not `<context>`, not the
-        // permission/environment metadata.
+        // The canonical regression: user types a prompt, turn runs, `agsh list` must show the
+        // prompt — not `<context>`, not the permission/environment metadata.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
 
@@ -2502,9 +2444,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_covers_all_permission_levels() {
-        // The context block's shape differs per permission level
-        // (Write omits the [Environment context], None differs again).
-        // Every level should still surface the user's prompt cleanly.
+        // The context block's shape differs per permission level (Write omits the [Environment
+        // context], None differs again). Every level should still surface the user's prompt
+        // cleanly.
         let manager = test_manager().await;
         for (label, permission) in &[
             ("none", crate::permission::Permission::None),
@@ -2538,8 +2480,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_truncates_long_prompt_with_ellipsis() {
-        // Long prompts are capped at 80 chars with a trailing ellipsis.
-        // The cap must apply to the user's prompt, not the wrapper.
+        // Long prompts are capped at 80 chars with a trailing ellipsis. The cap must apply to the
+        // user's prompt, not the wrapper.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
 
@@ -2571,9 +2513,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_is_first_user_turn_not_later() {
-        // Multiple turns in one session — preview must be the FIRST
-        // user prompt, not a later one. `ORDER BY id ASC LIMIT 1`
-        // guarantees this; guard against that being changed.
+        // Multiple turns in one session — preview must be the FIRST user prompt, not a later one.
+        // `ORDER BY id ASC LIMIT 1` guarantees this; guard against that being changed.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
 
@@ -2603,8 +2544,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_multiline_shows_first_line() {
-        // Multi-line user prompts collapse to the first line in the
-        // list view. The remaining lines are not leaked.
+        // Multi-line user prompts collapse to the first line in the list view. The remaining lines
+        // are not leaked.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
 
@@ -2627,8 +2568,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_independent_per_session() {
-        // Each session's preview is its own first user turn — no
-        // cross-contamination from neighbour sessions.
+        // Each session's preview is its own first user turn — no cross-contamination from neighbour
+        // sessions.
         let manager = test_manager().await;
         let a = manager.create_session(None).await.expect("create_session");
         let b = manager.create_session(None).await.expect("create_session");
@@ -2660,9 +2601,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_empty_session_has_empty_preview() {
-        // A session with zero user messages (e.g. created but Ctrl-C'd
-        // before first dispatch) falls back to an empty string — it
-        // should not panic or render `<no user msg>` scaffolding.
+        // A session with zero user messages (e.g. created but Ctrl-C'd before first dispatch) falls
+        // back to an empty string — it should not panic or render `<no user msg>` scaffolding.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
 
@@ -2676,11 +2616,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_compacted_session() {
-        // After `/compact`, the agent clears messages and inserts a
-        // single new user message starting with
-        // `[Conversation summary from session compaction]`. That has
-        // no `<context>` wrapper; `list_sessions` should surface the
-        // summary's first line, not an empty preview.
+        // After `/compact`, the agent clears messages and inserts a single new user message
+        // starting with `[Conversation summary from session compaction]`. That has no `<context>`
+        // wrapper; `list_sessions` should surface the summary's first line, not an empty preview.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
 
@@ -2704,10 +2642,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_legacy_unwrapped_user_message() {
-        // Backward-compat: older sessions (or future non-wrapper
-        // message paths) whose user content has no `<context>` block
-        // at all — the stored string IS the prompt, and the preview
-        // equals it.
+        // Backward-compat: older sessions (or future non-wrapper message paths) whose user content
+        // has no `<context>` block at all — the stored string IS the prompt, and the preview equals
+        // it.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
         manager
@@ -2741,10 +2678,9 @@ mod tests {
         assert!(manager.session_exists(session_id).await.expect("failed"));
     }
 
-    /// Active sessions must survive eviction even when they're the
-    /// oldest by `updated_at`. The eviction loop should walk
-    /// through younger eligible rows and only stop when the budget
-    /// is met or no inactive sessions remain.
+    /// Active sessions must survive eviction even when they're the oldest by `updated_at`. The
+    /// eviction loop should walk through younger eligible rows and only stop when the budget is met
+    /// or no inactive sessions remain.
     #[tokio::test]
     async fn test_enforce_storage_limit_skips_active_sessions() {
         let manager = test_manager().await;
@@ -2762,8 +2698,8 @@ mod tests {
             .await
             .expect("save younger");
 
-        // Mark the oldest as active — it must be skipped even though
-        // it would otherwise be the natural eviction target.
+        // Mark the oldest as active — it must be skipped even though it would otherwise be the
+        // natural eviction target.
         let mut active = std::collections::HashSet::new();
         active.insert(oldest.to_string());
 
@@ -2788,12 +2724,11 @@ mod tests {
         );
     }
 
-    // Regression: upgrading a pre-0.24 on-disk DB (no parent_session_id
-    // column, FKs without ON DELETE CASCADE, `metadata` still present)
-    // must succeed end-to-end with data preserved and the post-migration
-    // schema in place. Previously the initial `CREATE INDEX ... ON
-    // sessions(parent_session_id)` ran before the ADD COLUMN step and
-    // bombed with "no such column: parent_session_id".
+    // Regression: upgrading a pre-0.24 on-disk DB (no parent_session_id column, FKs without ON
+    // DELETE CASCADE, `metadata` still present) must succeed end-to-end with data preserved and the
+    // post-migration schema in place. Previously the initial `CREATE INDEX ... ON
+    // sessions(parent_session_id)` ran before the ADD COLUMN step and bombed with "no such column:
+    // parent_session_id".
     #[tokio::test]
     async fn test_migration_from_pre_0_24_schema() {
         use rusqlite::Connection as RusqliteConnection;
@@ -2923,8 +2858,8 @@ mod tests {
         );
     }
 
-    // Child-session tests: parent→sub-agent linkage, cascade-on-delete,
-    // and `agsh list` filter behavior.
+    // Child-session tests: parent→sub-agent linkage, cascade-on-delete, and `agsh list` filter
+    // behavior.
 
     #[tokio::test]
     async fn test_create_child_session_writes_parent_id() {
@@ -3030,9 +2965,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_cwd_filter_excludes_legacy_null_rows() {
-        // Sessions created via `create_session(None)` simulate legacy
-        // rows: they can't match any cwd filter (NULL is never equal to
-        // a TEXT value in SQL).
+        // Sessions created via `create_session(None)` simulate legacy rows: they can't match any
+        // cwd filter (NULL is never equal to a TEXT value in SQL).
         let manager = test_manager().await;
         let cwd = PathBuf::from("/home/agent/proj");
         let with_cwd = manager
@@ -3052,15 +2986,13 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions_pagination_cursor_round_trips() {
         let manager = test_manager().await;
-        // Create five sessions; cap each page at 2. Walking forward
-        // must visit all five exactly once with monotonically older
-        // updated_at.
+        // Create five sessions; cap each page at 2. Walking forward must visit all five exactly
+        // once with monotonically older updated_at.
         let mut ids = Vec::new();
         for _ in 0..5 {
             let id = manager.create_session(None).await.expect("create");
-            // `created_at`/`updated_at` use chrono::Utc::now() — pause to
-            // ensure each row's timestamp is strictly newer (RFC3339
-            // millisecond resolution).
+            // `created_at`/`updated_at` use chrono::Utc::now() — pause to ensure each row's
+            // timestamp is strictly newer (RFC3339 millisecond resolution).
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             ids.push(id);
         }
@@ -3081,8 +3013,8 @@ mod tests {
             cursor = next;
             assert!(walked.len() <= 5, "infinite pagination loop");
         }
-        // The walk emits sessions newest-first; the creation order is
-        // oldest-first, so reverse to compare.
+        // The walk emits sessions newest-first; the creation order is oldest-first, so reverse to
+        // compare.
         ids.reverse();
         assert_eq!(walked, ids, "pagination must visit every row in order");
     }
@@ -3108,9 +3040,8 @@ mod tests {
             .await
             .expect("create child");
 
-        // Populate the child with a message and a tool_output so the cascade
-        // has something to clean up — proves the descendant deletions run,
-        // not just the parent row.
+        // Populate the child with a message and a tool_output so the cascade has something to clean
+        // up — proves the descendant deletions run, not just the parent row.
         manager
             .save_message(child, "user", "hello from sub-agent")
             .await
@@ -3140,10 +3071,8 @@ mod tests {
         );
     }
 
-    // MCP TokenStore tests.
-    // Exercise the methods backing `agsh mcp login/logout` and the auth-probe
-    // cache that skips unauthenticated connects after a 401. In-memory DB
-    // keeps each case hermetic.
+    // MCP TokenStore tests. Exercise the methods backing `agsh mcp login/logout` and the auth-probe
+    // cache that skips unauthenticated connects after a 401. In-memory DB keeps each case hermetic.
 
     #[tokio::test]
     async fn mcp_credentials_round_trip() {
@@ -3311,8 +3240,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth_token_round_trip_account_id_optional() {
-        // Claude OAuth doesn't populate `account_id` — make sure round-tripping
-        // a `None` value works without losing other fields.
+        // Claude OAuth doesn't populate `account_id` — make sure round-tripping a `None` value
+        // works without losing other fields.
         let manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
             .expect("memory store");
@@ -3345,9 +3274,8 @@ mod tests {
         }
     }
 
-    /// Two providers can persist independently with different `account_id`
-    /// values — verifies the provider PK keeps openai-codex and a hypothetical
-    /// future OAuth provider isolated.
+    /// Two providers can persist independently with different `account_id` values — verifies the
+    /// provider PK keeps openai-codex and a hypothetical future OAuth provider isolated.
     #[tokio::test]
     async fn test_oauth_token_two_providers_independent() {
         let manager = SessionManager::open(Some(Path::new(":memory:")))

@@ -1,6 +1,5 @@
-//! Transport construction helpers for MCP: building stdio child commands
-//! and the streamable-HTTP transport config (headers, auth tokens, dynamic
-//! header helpers).
+//! Transport construction helpers for MCP: building stdio child commands and the streamable-HTTP
+//! transport config (headers, auth tokens, dynamic header helpers).
 
 use tokio::process::Command;
 
@@ -9,9 +8,9 @@ use crate::{
     error::{AgshError, Result},
 };
 
-/// Build a [`Command`] for a stdio MCP server, wrapping shell shims in
-/// `cmd /c` on Windows so `npx`, `*.cmd`, and `*.bat` executables can be
-/// launched directly as a command string. Unix paths pass through unchanged.
+/// Build a [`Command`] for a stdio MCP server, wrapping shell shims in `cmd /c` on Windows so
+/// `npx`, `*.cmd`, and `*.bat` executables can be launched directly as a command string. Unix paths
+/// pass through unchanged.
 pub fn build_stdio_command(command_str: &str, args: &[String]) -> Command {
     #[cfg(windows)]
     {
@@ -23,9 +22,9 @@ pub fn build_stdio_command(command_str: &str, args: &[String]) -> Command {
             || lower.ends_with(".bat")
             || lower.ends_with(".ps1");
         if is_shim {
-            // `cmd /c <command> <args...>` — Windows wraps argument quoting.
-            // We don't try to shell-quote the args; the `Command` API does
-            // the OS-appropriate escaping via CreateProcess's lpCommandLine.
+            // `cmd /c <command> <args...>` — Windows wraps argument quoting. We don't try to
+            // shell-quote the args; the `Command` API does the OS-appropriate escaping via
+            // CreateProcess's lpCommandLine.
             let mut cmd = Command::new("cmd");
             cmd.arg("/c").arg(command_str).args(args);
             return cmd;
@@ -37,8 +36,8 @@ pub fn build_stdio_command(command_str: &str, args: &[String]) -> Command {
     cmd
 }
 
-/// Build the shared HTTP transport config (URL, bearer token, custom headers)
-/// used by both the auth and no-auth paths.
+/// Build the shared HTTP transport config (URL, bearer token, custom headers) used by both the auth
+/// and no-auth paths.
 pub(super) fn build_http_transport_config(
     server_name: &str,
     config: &McpServerConfig,
@@ -58,8 +57,8 @@ pub(super) fn build_http_transport_config(
         transport_config = transport_config.auth_header(token.clone());
     }
 
-    // Merge dynamic headers from the optional `headers_helper` script on
-    // top of the static `headers` map (dynamic values override static ones).
+    // Merge dynamic headers from the optional `headers_helper` script on top of the static
+    // `headers` map (dynamic values override static ones).
     let mut merged_headers: std::collections::HashMap<String, String> =
         config.headers.clone().unwrap_or_default();
     if let Some(script) = &config.headers_helper {
@@ -91,13 +90,12 @@ pub(super) fn build_http_transport_config(
     Ok(transport_config)
 }
 
-/// Execute `headers_helper` and parse its stdout as an `Name: Value\n`
-/// stream, returning a map merged into the HTTP transport's custom headers.
+/// Execute `headers_helper` and parse its stdout as an `Name: Value\n` stream, returning a map
+/// merged into the HTTP transport's custom headers.
 ///
-/// The script is spawned synchronously (it's a startup-path helper, not
-/// called per-request) with a 15-second wall-clock timeout. `AGSH_MCP_SERVER_NAME`
-/// and `AGSH_MCP_SERVER_URL` are injected so one helper can serve multiple
-/// servers.
+/// The script is spawned synchronously (it's a startup-path helper, not called per-request) with a
+/// 15-second wall-clock timeout. `AGSH_MCP_SERVER_NAME` and `AGSH_MCP_SERVER_URL` are injected so
+/// one helper can serve multiple servers.
 fn run_headers_helper(
     server_name: &str,
     url: &str,
@@ -109,9 +107,8 @@ fn run_headers_helper(
         message: msg,
     };
 
-    // Resolve the script path. If it's relative and doesn't exist as-is,
-    // try resolving against the agsh config directory for safety (same place
-    // config.toml lives).
+    // Resolve the script path. If it's relative and doesn't exist as-is, try resolving against the
+    // agsh config directory for safety (same place config.toml lives).
     let script_path = std::path::Path::new(script);
     let resolved: std::path::PathBuf = if script_path.is_absolute() || script_path.exists() {
         script_path.to_path_buf()
@@ -140,8 +137,8 @@ fn run_headers_helper(
         ))
     })?;
 
-    // Poll for exit with a 15-second budget. std::process::Child doesn't
-    // expose a blocking wait_timeout, so loop on try_wait with a short sleep.
+    // Poll for exit with a 15-second budget. std::process::Child doesn't expose a blocking
+    // wait_timeout, so loop on try_wait with a short sleep.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let status = loop {
         match child.try_wait() {
@@ -165,9 +162,8 @@ fn run_headers_helper(
         }
     };
 
-    // Caps on how much helper output we're willing to buffer. stdout is the
-    // header list (rarely more than a few KiB); stderr is surfaced verbatim
-    // in the error message so keep it tight.
+    // Caps on how much helper output we're willing to buffer. stdout is the header list (rarely
+    // more than a few KiB); stderr is surfaced verbatim in the error message so keep it tight.
     const MAX_HELPER_STDOUT_BYTES: u64 = 64 * 1024;
     const MAX_HELPER_STDERR_BYTES: u64 = 4 * 1024;
 

@@ -1,6 +1,5 @@
-//! `spawn_agent` tool: delegates a self-contained research/exploration task
-//! to a fresh sub-agent with its own conversation, returning the
-//! sub-agent's final report as a single tool result.
+//! `spawn_agent` tool: delegates a self-contained research/exploration task to a fresh sub-agent
+//! with its own conversation, returning the sub-agent's final report as a single tool result.
 
 use std::sync::Arc;
 
@@ -30,50 +29,42 @@ pub struct ToolBuilderParams {
     pub backend_probe: crate::sandbox::BackendProbe,
     /// Parent's `[tools]` filter — sub-agents inherit it.
     pub builtin_filter: BuiltinToolFilter,
-    /// Shared skill cache. Sub-agents read from the same cache as the
-    /// parent so their system prompts stay consistent and pick up the
-    /// same auto-reloads.
+    /// Shared skill cache. Sub-agents read from the same cache as the parent so their system
+    /// prompts stay consistent and pick up the same auto-reloads.
     pub skills: Arc<crate::skills::SkillCache>,
-    /// Parent's MCP client manager, if any servers are configured. When
-    /// `Some`, every `spawn_agent` invocation calls
-    /// [`crate::mcp::McpClientManager::install_tools_on`] on the
-    /// freshly-built sub-agent registry so sub-agents see the same MCP
-    /// resource meta-tools and per-server adapters as the parent.
-    /// `None` is the no-MCP-configured case.
+    /// Parent's MCP client manager, if any servers are configured. When `Some`, every
+    /// `spawn_agent` invocation calls [`crate::mcp::McpClientManager::install_tools_on`] on
+    /// the freshly-built sub-agent registry so sub-agents see the same MCP resource meta-tools
+    /// and per-server adapters as the parent. `None` is the no-MCP-configured case.
     ///
-    /// Stored as a `Weak` to break the strong reference cycle that
-    /// would otherwise form: `McpClientManager.attached_registries`
-    /// holds each session's `ToolRegistry`, which holds this
-    /// `SpawnAgentTool`, which holds the manager. Without a `Weak`,
-    /// a session that drops without `session/close` calling
-    /// `detach_registry` leaks the entire chain until process exit.
+    /// Stored as a `Weak` to break the strong reference cycle that would otherwise form:
+    /// `McpClientManager.attached_registries` holds each session's `ToolRegistry`, which holds
+    /// this `SpawnAgentTool`, which holds the manager. Without a `Weak`, a session that drops
+    /// without `session/close` calling `detach_registry` leaks the entire chain until process
+    /// exit.
     pub mcp_manager: Option<std::sync::Weak<crate::mcp::McpClientManager>>,
-    /// Shared `SessionManager` so sub-agents can create their own DB
-    /// session at spawn time and persist their conversation under it.
+    /// Shared `SessionManager` so sub-agents can create their own DB session at spawn time and
+    /// persist their conversation under it.
     pub session_manager: SessionManager,
-    /// Parent agent's session ID. Read at spawn time so the new sub-agent
-    /// session's `parent_session_id` column points back here; cascade-on-
-    /// delete in `SessionManager::delete_session` then sweeps sub-agent
-    /// rows when the parent is deleted.
+    /// Parent agent's session ID. Read at spawn time so the new sub-agent session's
+    /// `parent_session_id` column points back here; cascade-on- delete in
+    /// `SessionManager::delete_session` then sweeps sub-agent rows when the parent is deleted.
     pub parent_shared_session_id: Arc<RwLock<Option<Uuid>>>,
-    /// Parent's session-level counters. Shared so sub-agent token usage
-    /// rolls up into the same `/status` totals — operators see the full
-    /// cost of a session including everything its sub-agents consumed.
+    /// Parent's session-level counters. Shared so sub-agent token usage rolls up into the same
+    /// `/status` totals — operators see the full cost of a session including everything its
+    /// sub-agents consumed.
     pub session_stats: Arc<crate::stats::SessionStats>,
-    /// Parent's options, used to derive the sub-agent's inherited fields
-    /// (`sandboxed_shell`, `context_messages`, `user_instructions`) inside
-    /// [`Agent::new_subagent`].
+    /// Parent's options, used to derive the sub-agent's inherited fields (`sandboxed_shell`,
+    /// `context_messages`, `user_instructions`) inside [`Agent::new_subagent`].
     pub parent_options: AgentOptions,
-    /// Parent's per-session working directory. Sub-agents snapshot the
-    /// current value at spawn time so a parent `/cd` mid-sub-agent-turn
-    /// can't change the sub-agent's path resolution mid-flight.
+    /// Parent's per-session working directory. Sub-agents snapshot the current value at spawn time
+    /// so a parent `/cd` mid-sub-agent-turn can't change the sub-agent's path resolution
+    /// mid-flight.
     pub parent_cwd: crate::agent::SharedCwd,
     /// Parent's frontend. Sub-agents wrap it in a
-    /// [`crate::frontend::PermissionForwardingFrontend`] so their
-    /// permission prompts surface in the parent's UI (REPL line or
-    /// ACP `session/request_permission`). Without this, sub-agents
-    /// have no human to ask and would have to refuse Ask-mode tools
-    /// outright.
+    /// [`crate::frontend::PermissionForwardingFrontend`] so their permission prompts surface
+    /// in the parent's UI (REPL line or ACP `session/request_permission`). Without this,
+    /// sub-agents have no human to ask and would have to refuse Ask-mode tools outright.
     pub parent_frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
@@ -151,9 +142,8 @@ impl Tool for SpawnAgentTool {
         input: serde_json::Value,
         cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
-        // Both `prompt` and `skill` are optional, but at least one must
-        // be present — mirrors the CLI's `--oneshot` guard in
-        // `src/main.rs`. An empty/whitespace `prompt` counts as absent.
+        // Both `prompt` and `skill` are optional, but at least one must be present — mirrors the
+        // CLI's `--oneshot` guard in `src/main.rs`. An empty/whitespace `prompt` counts as absent.
         let prompt = input["prompt"]
             .as_str()
             .map(str::trim)
@@ -171,9 +161,8 @@ impl Tool for SpawnAgentTool {
             });
         }
 
-        // Resolve the skill against the shared cache up front, before any
-        // session is created, so a bad name fails fast without leaving an
-        // orphan child session behind.
+        // Resolve the skill against the shared cache up front, before any session is created, so a
+        // bad name fails fast without leaving an orphan child session behind.
         let skill = match &skill_name {
             Some(name) => {
                 let installed = self.tool_builder_params.skills.current().await;
@@ -197,9 +186,8 @@ impl Tool for SpawnAgentTool {
             None => None,
         };
 
-        // `inherit_scratchpad`: optional array of parent-scratchpad
-        // names. Non-string entries are silently skipped so a partially-
-        // malformed array doesn't tank the whole spawn.
+        // `inherit_scratchpad`: optional array of parent-scratchpad names. Non-string entries are
+        // silently skipped so a partially- malformed array doesn't tank the whole spawn.
         let inherited_scratchpad: Vec<String> = input
             .get("inherit_scratchpad")
             .and_then(|value| value.as_array())
@@ -211,16 +199,14 @@ impl Tool for SpawnAgentTool {
             })
             .unwrap_or_default();
 
-        // Inherit the parent's permission level directly. Ask-mode
-        // prompts route through `PermissionForwardingFrontend` so
-        // they surface in the parent's UI.
+        // Inherit the parent's permission level directly. Ask-mode prompts route through
+        // `PermissionForwardingFrontend` so they surface in the parent's UI.
         let sub_perm = self.parent_permission.get();
 
-        // Resolve parent session ID. By the time a tool runs,
-        // `Agent::run_turn` has already written `shared_session_id` before
-        // dispatching tools. A missing value here means an agent ran a
-        // tool without first creating its session — an internal invariant
-        // break worth surfacing rather than silently producing an orphan.
+        // Resolve parent session ID. By the time a tool runs, `Agent::run_turn` has already written
+        // `shared_session_id` before dispatching tools. A missing value here means an agent ran a
+        // tool without first creating its session — an internal invariant break worth surfacing
+        // rather than silently producing an orphan.
         let parent_sid = self
             .tool_builder_params
             .parent_shared_session_id
@@ -231,9 +217,8 @@ impl Tool for SpawnAgentTool {
                 message: "parent session ID not yet assigned (run_turn invariant)".to_string(),
             })?;
 
-        // Create the sub-agent's own DB session, linked back to the parent
-        // via `parent_session_id`. Cascade-on-delete in `delete_session`
-        // sweeps it when the parent is removed.
+        // Create the sub-agent's own DB session, linked back to the parent via `parent_session_id`.
+        // Cascade-on-delete in `delete_session` sweeps it when the parent is removed.
         let sub_session_id = self
             .tool_builder_params
             .session_manager
@@ -256,10 +241,9 @@ impl Tool for SpawnAgentTool {
             sub_session_id
         );
 
-        // Render the skill body now that the sub-agent's session ID
-        // exists, so `${AGSH_SESSION_ID}` resolves to the sub-agent's own
-        // session. `load_skill_body` also prepends the base-directory
-        // header so bundled-file references resolve.
+        // Render the skill body now that the sub-agent's session ID exists, so `${AGSH_SESSION_ID}`
+        // resolves to the sub-agent's own session. `load_skill_body` also prepends the
+        // base-directory header so bundled-file references resolve.
         let skill_body = match &skill {
             Some(skill) => Some(
                 crate::skills::load_skill_body(skill, Some(&sub_session_id.to_string()))
@@ -272,17 +256,15 @@ impl Tool for SpawnAgentTool {
             None => None,
         };
 
-        // Build a sub-agent tool registry: no `spawn_agent` (no recursive
-        // spawning) and a fresh, private todo list so the sub-agent's
-        // todo_write / todo_read calls don't touch the parent's task
-        // tracking. Scratchpad and render_image use the new sub-session ID.
+        // Build a sub-agent tool registry: no `spawn_agent` (no recursive spawning) and a fresh,
+        // private todo list so the sub-agent's todo_write / todo_read calls don't touch the
+        // parent's task tracking. Scratchpad and render_image use the new sub-session ID.
         let sub_shared_perm = SharedPermission::new(sub_perm, self.parent_permission.enabled());
         let sub_todo_list: super::todo::SharedTodoList =
             Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        // Snapshot the parent's cwd at sub-agent build time so a parent
-        // `/cd` mid-sub-agent execution can't shift the sub-agent's path
-        // resolution mid-flight. The sub-agent's tool registry sees this
-        // snapshot; `Agent::new_subagent` makes the same snapshot for
+        // Snapshot the parent's cwd at sub-agent build time so a parent `/cd` mid-sub-agent
+        // execution can't shift the sub-agent's path resolution mid-flight. The sub-agent's tool
+        // registry sees this snapshot; `Agent::new_subagent` makes the same snapshot for
         // `Agent::cwd()`.
         let sub_cwd: crate::agent::SharedCwd = {
             let parent_path = self
@@ -319,23 +301,21 @@ impl Tool for SpawnAgentTool {
             message: format!("failed to build sub-agent tool registry: {}", error),
         })?;
 
-        // Inherit the parent's MCP toolset. Skipped silently when no MCP
-        // manager is attached (no servers configured) or when the parent's
-        // servers are still Pending / Failed at spawn time. `install_tools_on`
-        // is non-spawning and idempotent — see `src/mcp.rs:install_tools_on`.
+        // Inherit the parent's MCP toolset. Skipped silently when no MCP manager is attached (no
+        // servers configured) or when the parent's servers are still Pending / Failed at spawn
+        // time. `install_tools_on` is non-spawning and idempotent — see
+        // `src/mcp.rs:install_tools_on`.
         if let Some(weak) = self.tool_builder_params.mcp_manager.as_ref() {
-            // Upgrade only if the manager is still alive. If the
-            // parent's `agsh acp` process is mid-shutdown, the Arc
-            // may already be gone — skip silently.
+            // Upgrade only if the manager is still alive. If the parent's `agsh acp` process is
+            // mid-shutdown, the Arc may already be gone — skip silently.
             if let Some(manager) = weak.upgrade() {
                 manager.install_tools_on(&sub_registry).await;
             }
         }
 
-        // Build the sub-agent's system prompt against the fully-loaded
-        // registry (registry now includes MCP adapters). The override on
-        // `AgentOptions` is static, so this single build captures the
-        // full tool catalogue visible to the sub-agent.
+        // Build the sub-agent's system prompt against the fully-loaded registry (registry now
+        // includes MCP adapters). The override on `AgentOptions` is static, so this single build
+        // captures the full tool catalogue visible to the sub-agent.
         let tools = sub_registry.definitions_for_permission(sub_perm);
         let sub_system_prompt = build_subagent_system_prompt(
             sub_perm,
@@ -344,8 +324,8 @@ impl Tool for SpawnAgentTool {
             &inherited_scratchpad,
         );
 
-        // Compose the first-turn task: parent directive first, skill body
-        // second. The at-least-one check above guarantees a `Some`.
+        // Compose the first-turn task: parent directive first, skill body second. The at-least-one
+        // check above guarantees a `Some`.
         let task =
             compose_subagent_task(prompt.as_deref(), skill_body.as_deref()).ok_or_else(|| {
                 AgshError::ToolExecution {
@@ -357,9 +337,8 @@ impl Tool for SpawnAgentTool {
         let environment_context = build_environment_context(sub_perm, &sub_cwd_snapshot);
         let augmented_prompt = format!("{}\n{}", environment_context, task);
 
-        // Wrap so permission prompts surface in the parent's UI
-        // while emits stay silent (sub-agent output flows back via
-        // the spawn_agent tool result, not as live notifications).
+        // Wrap so permission prompts surface in the parent's UI while emits stay silent (sub-agent
+        // output flows back via the spawn_agent tool result, not as live notifications).
         let sub_frontend: Arc<dyn crate::frontend::Frontend> =
             Arc::new(crate::frontend::PermissionForwardingFrontend::new(
                 Arc::clone(&self.tool_builder_params.parent_frontend),
@@ -380,12 +359,10 @@ impl Tool for SpawnAgentTool {
             self.tool_builder_params.session_stats.clone(),
         );
 
-        // Run the sub-agent's single turn via the shared `Agent::run_turn`
-        // path. Conversation persistence (user message, assistant
-        // messages, tool results) happens inside `run_turn` against the
-        // sub-session, so the audit trail is identical to a primary
-        // agent's. Silent rendering and the omitted MCP gate are baked
-        // into the options via `new_subagent`.
+        // Run the sub-agent's single turn via the shared `Agent::run_turn` path. Conversation
+        // persistence (user message, assistant messages, tool results) happens inside `run_turn`
+        // against the sub-session, so the audit trail is identical to a primary agent's. Silent
+        // rendering and the omitted MCP gate are baked into the options via `new_subagent`.
         let mut messages = Conversation::new();
         let mut session_id_opt = Some(sub_session_id);
         sub_agent
@@ -404,11 +381,10 @@ impl Tool for SpawnAgentTool {
     }
 }
 
-/// Compose the sub-agent's first-turn task from an optional parent
-/// directive and an optional rendered skill body. Mirrors the CLI's
-/// `--skill` ordering (`build_skill_prompt` in `src/main.rs`): the parent
-/// directive comes first, the skill body second. Returns `None` only when
-/// both inputs are absent — the caller treats that as an error.
+/// Compose the sub-agent's first-turn task from an optional parent directive and an optional
+/// rendered skill body. Mirrors the CLI's `--skill` ordering (`build_skill_prompt` in
+/// `src/main.rs`): the parent directive comes first, the skill body second. Returns `None` only
+/// when both inputs are absent — the caller treats that as an error.
 fn compose_subagent_task(prompt: Option<&str>, skill_body: Option<&str>) -> Option<String> {
     match (prompt, skill_body) {
         (Some(prompt), Some(body)) => Some(format!("{}\n\n{}", prompt, body)),
@@ -562,9 +538,8 @@ mod tests {
             .expect("in-memory session manager")
     }
 
-    // (Permission gating and "Unknown tool" fold-into-ToolOutput
-    // semantics that used to live in `run_subagent_tool` are now
-    // exercised by the shared `Agent::run_turn` path's tool-dispatch
+    // (Permission gating and "Unknown tool" fold-into-ToolOutput semantics that used to live in
+    // `run_subagent_tool` are now exercised by the shared `Agent::run_turn` path's tool-dispatch
     // logic — covered by `src/agent.rs` and `src/tools.rs` test suites.)
 
     #[tokio::test]

@@ -1,6 +1,5 @@
-//! Configuration: parses `~/.config/agsh/config.toml`, layers CLI overrides
-//! and environment variables on top, and produces a [`ResolvedConfig`] that
-//! the rest of the binary consumes.
+//! Configuration: parses `~/.config/agsh/config.toml`, layers CLI overrides and environment
+//! variables on top, and produces a [`ResolvedConfig`] that the rest of the binary consumes.
 
 use std::{
     collections::HashMap,
@@ -16,10 +15,9 @@ use crate::{
     render::RenderMode,
 };
 
-/// In-memory shape of `config.toml`. Each top-level `[section]` deserializes
-/// into its own sub-struct; missing sections fall back to `Default`. This is
-/// the raw deserialized form — `resolve_config` merges it with CLI flags
-/// and env vars to produce a [`ResolvedConfig`].
+/// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
+/// sub-struct; missing sections fall back to `Default`. This is the raw deserialized form —
+/// `resolve_config` merges it with CLI flags and env vars to produce a [`ResolvedConfig`].
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
     pub provider: Option<ProviderConfig>,
@@ -35,26 +33,25 @@ pub struct ConfigFile {
     pub agent: Option<AgentConfig>,
 }
 
-/// `[agent]` table: agent-loop knobs that don't belong to any of the
-/// other domain-specific sections. Currently only `max_turn_requests`.
+/// `[agent]` table: agent-loop knobs that don't belong to any of the other domain-specific
+/// sections. Currently only `max_turn_requests`.
 #[derive(Debug, Deserialize, Default)]
 pub struct AgentConfig {
-    /// Cap on provider requests per turn. Surfaces as ACP
-    /// `max_turn_requests` stop reason when exceeded. Default 100.
+    /// Cap on provider requests per turn. Surfaces as ACP `max_turn_requests` stop reason when
+    /// exceeded. Default 100.
     pub max_turn_requests: Option<usize>,
 }
 
-/// `[permissions]` table: choose which modes are reachable at runtime
-/// and which mode the session starts in. See `docs/book/src/usage/permissions.md`.
+/// `[permissions]` table: choose which modes are reachable at runtime and which mode the session
+/// starts in. See `docs/book/src/usage/permissions.md`.
 #[derive(Debug, Deserialize, Default)]
 pub struct PermissionsConfig {
     pub default: Option<String>,
     pub enabled: Option<Vec<String>>,
 }
 
-/// Built-in tool filters, mirroring the per-server knobs on
-/// [`McpServerConfig`]. Applied at registration time by
-/// [`crate::tools::ToolRegistry`].
+/// Built-in tool filters, mirroring the per-server knobs on [`McpServerConfig`]. Applied at
+/// registration time by [`crate::tools::ToolRegistry`].
 #[derive(Debug, Deserialize, Default)]
 pub struct ToolsConfig {
     pub allowed_tools: Option<Vec<String>>,
@@ -76,22 +73,19 @@ pub struct ThinkingConfig {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct McpConfig {
-    /// Fallback permission for MCP tools when nothing more specific
-    /// applies (no `tool_permissions` override, no server-level
-    /// `permission`, no `readOnlyHint` from the server). If this is
-    /// also unset the hardcoded fallback is `Write` — i.e. strict.
+    /// Fallback permission for MCP tools when nothing more specific applies (no `tool_permissions`
+    /// override, no server-level `permission`, no `readOnlyHint` from the server). If this is also
+    /// unset the hardcoded fallback is `Write` — i.e. strict.
     pub default_permission: Option<String>,
     pub servers: Option<Vec<McpServerConfig>>,
-    /// When true (default), every turn is gated on all enabled MCP
-    /// servers being `Connected`. If any are not, the turn is rejected
-    /// with a shell-style error instead of sending the request.
+    /// When true (default), every turn is gated on all enabled MCP servers being `Connected`. If
+    /// any are not, the turn is rejected with a shell-style error instead of sending the request.
     pub strict: Option<bool>,
-    /// Per-turn cap on how long to wait for still-`Pending` MCP servers
-    /// to settle before applying the strict check. Default: 3.
+    /// Per-turn cap on how long to wait for still-`Pending` MCP servers to settle before applying
+    /// the strict check. Default: 3.
     pub grace_seconds: Option<u64>,
-    /// Per-server wrap around connect + `initialize` + `list_tools`.
-    /// A hung stdio spawn or slow HTTPS handshake can't stall the whole
-    /// fleet past this bound. Default: 30.
+    /// Per-server wrap around connect + `initialize` + `list_tools`. A hung stdio spawn or slow
+    /// HTTPS handshake can't stall the whole fleet past this bound. Default: 30.
     pub connect_timeout_seconds: Option<u64>,
 }
 
@@ -105,45 +99,41 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     pub auth_token: Option<String>,
     pub headers: Option<std::collections::HashMap<String, String>>,
-    /// Optional path to an executable that, when run, prints dynamic HTTP
-    /// headers to stdout in `Name: Value\n` form. Merged over [`Self::headers`]
-    /// (dynamic wins). Useful for SSO flows where bearer tokens rotate.
-    /// The script is spawned with `AGSH_MCP_SERVER_NAME` and
-    /// `AGSH_MCP_SERVER_URL` in its environment so one helper can drive
-    /// multiple servers. Non-zero exit fails the connect.
+    /// Optional path to an executable that, when run, prints dynamic HTTP headers to stdout in
+    /// `Name: Value\n` form. Merged over [`Self::headers`] (dynamic wins). Useful for SSO flows
+    /// where bearer tokens rotate. The script is spawned with `AGSH_MCP_SERVER_NAME` and
+    /// `AGSH_MCP_SERVER_URL` in its environment so one helper can drive multiple servers. Non-zero
+    /// exit fails the connect.
     pub headers_helper: Option<String>,
     pub auth: Option<McpAuthConfig>,
     pub permission: Option<String>,
-    /// Optional allow-list of raw tool names (the server-advertised
-    /// form, not the `mcp__<server>__<tool>` namespaced form). When set and
-    /// non-empty, only these tools from this server are registered.
+    /// Optional allow-list of raw tool names (the server-advertised form, not the
+    /// `mcp__<server>__<tool>` namespaced form). When set and non-empty, only these tools from
+    /// this server are registered.
     pub allowed_tools: Option<Vec<String>>,
-    /// Optional block-list of raw tool names. Applied after
-    /// [`Self::allowed_tools`] — tools listed here are never registered.
+    /// Optional block-list of raw tool names. Applied after [`Self::allowed_tools`] — tools listed
+    /// here are never registered.
     pub disabled_tools: Option<Vec<String>>,
-    /// Raw tool names (server-advertised, not the `mcp__<server>__<tool>`
-    /// namespaced form) that should ship eager-loaded instead of deferred.
-    /// Saves a `load_tool` round-trip and keeps the schema in the cacheable
-    /// tools-array prefix. Names that don't match an advertised tool surface
-    /// as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
+    /// Raw tool names (server-advertised, not the `mcp__<server>__<tool>` namespaced form) that
+    /// should ship eager-loaded instead of deferred. Saves a `load_tool` round-trip and keeps the
+    /// schema in the cacheable tools-array prefix. Names that don't match an advertised tool
+    /// surface as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
     pub eager_load_tools: Option<Vec<String>>,
-    /// Optional per-tool permission overrides keyed by raw tool name.
-    /// Beats the server-level `permission` and the server's
-    /// `readOnlyHint` annotation when resolving a tool's required
+    /// Optional per-tool permission overrides keyed by raw tool name. Beats the server-level
+    /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
     /// permission at registration time.
     pub tool_permissions: Option<std::collections::HashMap<String, String>>,
-    /// Allow this server to issue `sampling/createMessage` requests. When
-    /// false (default), any such request is rejected with `METHOD_NOT_FOUND`.
-    /// Use with caution: sampling lets the server inject arbitrary messages
-    /// into your LLM context and spend your provider quota.
+    /// Allow this server to issue `sampling/createMessage` requests. When false (default), any
+    /// such request is rejected with `METHOD_NOT_FOUND`. Use with caution: sampling lets the
+    /// server inject arbitrary messages into your LLM context and spend your provider quota.
     #[serde(default)]
     pub sampling: bool,
-    /// Cap on the number of sampling calls this server may issue per agsh
-    /// session. Only meaningful when `sampling = true`. Default: 10.
+    /// Cap on the number of sampling calls this server may issue per agsh session. Only meaningful
+    /// when `sampling = true`. Default: 10.
     pub sampling_limit: Option<u32>,
-    /// When true, this server is skipped at startup — no process is
-    /// spawned, no HTTP connect attempt is made. Lets users mute a
-    /// flaky or in-development server without removing the entry.
+    /// When true, this server is skipped at startup — no process is spawned, no HTTP connect
+    /// attempt is made. Lets users mute a flaky or in-development server without removing the
+    /// entry.
     #[serde(default)]
     pub disabled: bool,
 }
@@ -189,14 +179,13 @@ pub struct DisplayConfig {
     pub show_path_in_prompt: Option<bool>,
     pub show_token_usage: Option<bool>,
     pub render_mode: Option<RenderMode>,
-    /// Style applied to the REPL input buffer so submitted prompts stand
-    /// out in scrollback. Parsed by [`parse_input_style`]. Accepts
-    /// `bold`, `dim`, `none`, or a colour name (`cyan`, `yellow`, …).
+    /// Style applied to the REPL input buffer so submitted prompts stand out in scrollback. Parsed
+    /// by [`parse_input_style`]. Accepts `bold`, `dim`, `none`, or a colour name (`cyan`,
+    /// `yellow`, …).
     pub input_style: Option<String>,
-    /// When set to `Some(N)` with `N > 0`, resuming a session reprints
-    /// the last `N` turns (user prompts plus the agent's response,
-    /// styled like the live REPL) instead of just the last assistant
-    /// message. Unset preserves the legacy behaviour.
+    /// When set to `Some(N)` with `N > 0`, resuming a session reprints the last `N` turns (user
+    /// prompts plus the agent's response, styled like the live REPL) instead of just the last
+    /// assistant message. Unset preserves the legacy behaviour.
     pub resume_show_recent: Option<usize>,
 }
 
@@ -206,34 +195,31 @@ pub struct WebConfig {
     pub request_timeout_seconds: Option<u64>,
     pub connect_timeout_seconds: Option<u64>,
     pub read_timeout_seconds: Option<u64>,
-    /// Max number of redirects reqwest will follow. `0` disables
-    /// redirects entirely. Default: `10`.
+    /// Max number of redirects reqwest will follow. `0` disables redirects entirely. Default:
+    /// `10`.
     pub max_redirects: Option<u64>,
-    /// Proxy URL. Accepts `http://…`, `https://…`, `socks5://…`,
-    /// `socks5h://…`. The literal string `"none"` explicitly
-    /// disables env-var auto-detection (overriding `HTTP_PROXY` etc.).
-    /// Unset honours the env vars.
+    /// Proxy URL. Accepts `http://…`, `https://…`, `socks5://…`, `socks5h://…`. The literal string
+    /// `"none"` explicitly disables env-var auto-detection (overriding `HTTP_PROXY` etc.). Unset
+    /// honours the env vars.
     pub proxy: Option<String>,
-    /// Path to a PEM file containing one or more root CAs to trust
-    /// on top of the system trust store. Used for corporate MITM
-    /// proxies or self-signed internal services.
+    /// Path to a PEM file containing one or more root CAs to trust on top of the system trust
+    /// store. Used for corporate MITM proxies or self-signed internal services.
     pub ca_cert_file: Option<String>,
     /// Reject plain `http://` URLs — only `https://` allowed.
     pub https_only: Option<bool>,
-    /// Minimum TLS version: `"1.0"`, `"1.1"`, `"1.2"`, or `"1.3"`.
-    /// Anything else logs a warn and falls back to reqwest's default.
+    /// Minimum TLS version: `"1.0"`, `"1.1"`, `"1.2"`, or `"1.3"`. Anything else logs a warn and
+    /// falls back to reqwest's default.
     pub min_tls_version: Option<String>,
-    /// DANGER: disable TLS certificate validation entirely.
-    /// Allows MITM; only use against trusted local dev servers.
+    /// DANGER: disable TLS certificate validation entirely. Allows MITM; only use against trusted
+    /// local dev servers.
     pub danger_accept_invalid_certs: Option<bool>,
-    /// DANGER: accept certificates whose hostname doesn't match.
-    /// Allows MITM; only use against trusted local dev servers.
+    /// DANGER: accept certificates whose hostname doesn't match. Allows MITM; only use against
+    /// trusted local dev servers.
     pub danger_accept_invalid_hostnames: Option<bool>,
 }
 
-/// Minimum TLS version accepted by the web-tools client. Normalised
-/// from `[web].min_tls_version` so the rest of the crate doesn't
-/// pass free-form strings around.
+/// Minimum TLS version accepted by the web-tools client. Normalised from `[web].min_tls_version` so
+/// the rest of the crate doesn't pass free-form strings around.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MinTlsVersion {
     V1_0,
@@ -243,9 +229,8 @@ pub enum MinTlsVersion {
 }
 
 impl MinTlsVersion {
-    /// Parse the config-file string form. Returns `None` on unknown
-    /// input; callers are expected to log and fall through to the
-    /// reqwest backend default.
+    /// Parse the config-file string form. Returns `None` on unknown input; callers are expected to
+    /// log and fall through to the reqwest backend default.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim() {
             "1.0" => Some(Self::V1_0),
@@ -257,17 +242,15 @@ impl MinTlsVersion {
     }
 }
 
-/// Fully-resolved web-tools HTTP client configuration. Carried on
-/// [`ResolvedConfig`] and consumed by `crate::tools::web::build_web_client`
-/// at registry-build time.
+/// Fully-resolved web-tools HTTP client configuration. Carried on [`ResolvedConfig`] and consumed
+/// by `crate::tools::web::build_web_client` at registry-build time.
 #[derive(Debug, Clone)]
 pub struct WebClientConfig {
     pub user_agent: String,
     pub request_timeout: std::time::Duration,
     pub connect_timeout: Option<std::time::Duration>,
     pub read_timeout: Option<std::time::Duration>,
-    /// `0` means "no redirects" (`Policy::none`); any other value
-    /// becomes `Policy::limited(n)`.
+    /// `0` means "no redirects" (`Policy::none`); any other value becomes `Policy::limited(n)`.
     pub max_redirects: usize,
     pub proxy: Option<String>,
     pub ca_cert_file: Option<std::path::PathBuf>,
@@ -296,9 +279,8 @@ impl Default for WebClientConfig {
 }
 
 impl WebClientConfig {
-    /// Build a resolved config from the TOML section. Invalid
-    /// `min_tls_version` strings log a warn and fall through to
-    /// reqwest's default rather than aborting startup.
+    /// Build a resolved config from the TOML section. Invalid `min_tls_version` strings log a warn
+    /// and fall through to reqwest's default rather than aborting startup.
     pub fn from_file(file: &WebConfig) -> Self {
         let user_agent = file
             .user_agent
@@ -349,9 +331,8 @@ impl WebClientConfig {
     }
 }
 
-/// Default UA for the web tools when `[web].user_agent` is unset.
-/// Kept in sync with what real Chrome emits so anti-bot filters don't
-/// single out agsh by default.
+/// Default UA for the web tools when `[web].user_agent` is unset. Kept in sync with what real
+/// Chrome emits so anti-bot filters don't single out agsh by default.
 pub const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
 
 /// Max conversation messages kept in the per-turn API window by default.
@@ -366,9 +347,8 @@ const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
 #[derive(Debug, Deserialize, Default)]
 pub struct ShellConfig {
     pub sandbox: Option<bool>,
-    /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When
-    /// omitted, the resolver auto-picks bubblewrap if available and
-    /// falls back to landlock with a one-shot warning (see
+    /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When omitted, the resolver
+    /// auto-picks bubblewrap if available and falls back to landlock with a one-shot warning (see
     /// `src/sandbox.rs` and `Warn 2` in `warn_if_sandbox_issues`).
     pub sandbox_backend: Option<SandboxBackend>,
 }
@@ -386,8 +366,7 @@ pub enum SandboxBackend {
 }
 
 impl SandboxBackend {
-    /// Brand-cased name for user-facing prose (logs, errors). Also the
-    /// `Display` impl's output.
+    /// Brand-cased name for user-facing prose (logs, errors). Also the `Display` impl's output.
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Landlock => "Landlock",
@@ -421,22 +400,20 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub reasoning_effort: Option<String>,
     pub device_id: Option<String>,
-    /// `claude-oauth` only: value emitted as `output_config.effort`. Mirrors
-    /// Claude Code's effort knob — see `temp/claude-code/src/utils/effort.ts`.
-    /// Accepted values: `"low" | "medium" | "high"`. Defaults to `"high"`.
+    /// `claude-oauth` only: value emitted as `output_config.effort`. Mirrors Claude Code's effort
+    /// knob — see `temp/claude-code/src/utils/effort.ts`. Accepted values: `"low" | "medium" |
+    /// "high"`. Defaults to `"high"`.
     pub effort: Option<String>,
-    /// `claude-oauth` only: when true, agsh sends the
-    /// `redact-thinking-2026-02-12` beta header so the server returns
-    /// `redacted_thinking` blocks instead of full thinking summaries
-    /// (saves bandwidth, but the redacted payloads can't be replayed back
-    /// to the server in multi-turn conversations). Defaults to false.
+    /// `claude-oauth` only: when true, agsh sends the `redact-thinking-2026-02-12` beta header so
+    /// the server returns `redacted_thinking` blocks instead of full thinking summaries (saves
+    /// bandwidth, but the redacted payloads can't be replayed back to the server in multi-turn
+    /// conversations). Defaults to false.
     pub redact_thinking: Option<bool>,
 }
 
-/// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env
-/// vars. This is what the rest of the binary reads — `ConfigFile` is for
-/// deserialization only. Resolution lives in `resolve_config` (Linux) and
-/// the non-Linux variant below it.
+/// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env vars. This is what the
+/// rest of the binary reads — `ConfigFile` is for deserialization only. Resolution lives in
+/// `resolve_config` (Linux) and the non-Linux variant below it.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub provider_name: Option<String>,
@@ -448,10 +425,9 @@ pub struct ResolvedConfig {
     pub permission: Permission,
     pub enabled_permissions: EnabledPermissions,
     pub streaming: bool,
-    /// Cap on provider requests per turn. When the agent loop makes
-    /// this many calls without finishing, the turn resolves as the
-    /// ACP `max_turn_requests` stop reason. Defaults to 100 — generous
-    /// for legitimate tool chains, low enough to bound a runaway model.
+    /// Cap on provider requests per turn. When the agent loop makes this many calls without
+    /// finishing, the turn resolves as the ACP `max_turn_requests` stop reason. Defaults to 100 —
+    /// generous for legitimate tool chains, low enough to bound a runaway model.
     pub max_turn_requests: usize,
     pub continue_session: Option<String>,
     pub prompt: Option<String>,
@@ -465,21 +441,16 @@ pub struct ResolvedConfig {
     pub resume_show_recent: Option<usize>,
     pub web_client: WebClientConfig,
     pub sandbox: bool,
-    /// Resolved Linux sandbox backend. Auto-picked at startup when
-    /// `[shell].sandbox_backend` was not set: prefers bubblewrap, falls
-    /// back to landlock. Silently `Landlock` on macOS / Windows
+    /// Resolved Linux sandbox backend. Auto-picked at startup when `[shell].sandbox_backend` was
+    /// not set: prefers bubblewrap, falls back to landlock. Silently `Landlock` on macOS / Windows
     /// (those platforms have their own backend and ignore the field).
     pub sandbox_backend: SandboxBackend,
-    /// True when [`Self::sandbox_backend`] was auto-resolved (i.e. the
-    /// user did not pin a value in `[shell].sandbox_backend`). Used to
-    /// gate the "stronger sandbox available; install bwrap" startup
-    /// warn — we don't want to nag users who explicitly chose
-    /// landlock.
+    /// True when [`Self::sandbox_backend`] was auto-resolved (i.e. the user did not pin a value in
+    /// `[shell].sandbox_backend`). Used to gate the "stronger sandbox available; install bwrap"
+    /// startup warn — we don't want to nag users who explicitly chose landlock.
     pub sandbox_auto_resolved: bool,
-    /// Cached probe of the resolved backend. Consulted by
-    /// `warn_if_sandbox_issues` and by the lazy hard-error path in
-    /// `src/tools/shell.rs` when read-mode `execute_command` is
-    /// invoked.
+    /// Cached probe of the resolved backend. Consulted by `warn_if_sandbox_issues` and by the lazy
+    /// hard-error path in `src/tools/shell.rs` when read-mode `execute_command` is invoked.
     pub backend_probe: crate::sandbox::BackendProbe,
     pub render_mode: RenderMode,
     pub context_messages: Option<usize>,
@@ -489,12 +460,11 @@ pub struct ResolvedConfig {
     pub thinking_budget_tokens: u64,
     pub thinking_show_content: bool,
     pub reasoning_effort: Option<String>,
-    /// Stable per-device identifier for `claude-oauth`'s `metadata.user_id`.
-    /// Empty string for non-`claude-oauth` providers (the value is ignored
-    /// downstream).
+    /// Stable per-device identifier for `claude-oauth`'s `metadata.user_id`. Empty string for
+    /// non-`claude-oauth` providers (the value is ignored downstream).
     pub device_id: String,
-    /// `claude-oauth` `output_config.effort` value. Always one of
-    /// `"low" | "medium" | "high"` after `validate()`. Default `"high"`.
+    /// `claude-oauth` `output_config.effort` value. Always one of `"low" | "medium" | "high"`
+    /// after `validate()`. Default `"high"`.
     pub effort: String,
     /// `claude-oauth`: when true, request `redacted_thinking` blocks via
     /// `redact-thinking-2026-02-12` beta. Default false.
@@ -502,18 +472,17 @@ pub struct ResolvedConfig {
     pub auto_compact: bool,
     pub context_window: Option<u64>,
     pub mcp_servers: Vec<McpServerConfig>,
-    /// Parsed [`Permission`] from `[mcp].default_permission`, carried so
-    /// per-turn tool-permission resolution in `src/mcp.rs` doesn't have
-    /// to re-read the config file. `None` means "no `[mcp]` default
-    /// configured" — resolution falls through to the hardcoded Write.
+    /// Parsed [`Permission`] from `[mcp].default_permission`, carried so per-turn tool-permission
+    /// resolution in `src/mcp.rs` doesn't have to re-read the config file. `None` means "no
+    /// `[mcp]` default configured" — resolution falls through to the hardcoded Write.
     pub mcp_default_permission: Option<Permission>,
     pub user_instructions: Option<String>,
     pub builtin_allowed_tools: Option<Vec<String>>,
     pub builtin_disabled_tools: Vec<String>,
     pub builtin_tool_permissions: HashMap<String, Permission>,
     pub input_style: nu_ansi_term::Style,
-    /// Per-turn MCP readiness gate. When true, a turn is rejected if
-    /// any enabled server isn't `Connected` after `mcp_grace`.
+    /// Per-turn MCP readiness gate. When true, a turn is rejected if any enabled server isn't
+    /// `Connected` after `mcp_grace`.
     pub mcp_strict: bool,
     /// First-turn await cap for still-connecting MCP servers.
     pub mcp_grace: std::time::Duration,
@@ -521,10 +490,9 @@ pub struct ResolvedConfig {
     pub mcp_connect_timeout: std::time::Duration,
 }
 
-/// Default input style: bold, white-ish foreground, slate-blue background.
-/// Uses truecolor RGB (not palette indices or named colours) so the visual
-/// is consistent across terminals that remap the standard 16 colours to
-/// match their theme.
+/// Default input style: bold, white-ish foreground, slate-blue background. Uses truecolor RGB (not
+/// palette indices or named colours) so the visual is consistent across terminals that remap the
+/// standard 16 colours to match their theme.
 pub fn default_input_style() -> nu_ansi_term::Style {
     use nu_ansi_term::{Color, Style};
     Style::new()
@@ -533,10 +501,9 @@ pub fn default_input_style() -> nu_ansi_term::Style {
         .on(Color::Rgb(55, 75, 110))
 }
 
-/// Parse a `[display].input_style` value. `"default"` (or unset) yields
-/// [`default_input_style`]; `"none"` yields no styling; simple keywords
-/// pick a single colour or attribute. Unknown keywords warn and fall
-/// back to the default so a typo doesn't lose the session to a panic.
+/// Parse a `[display].input_style` value. `"default"` (or unset) yields [`default_input_style`];
+/// `"none"` yields no styling; simple keywords pick a single colour or attribute. Unknown keywords
+/// warn and fall back to the default so a typo doesn't lose the session to a panic.
 pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
     use nu_ansi_term::{Color, Style};
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -566,13 +533,11 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
     }
 }
 
-/// Returns the agsh config directory (the directory that contains
-/// `config.toml` and `skills/`). Honours the `AGSH_CONFIG_DIR` env var
-/// — used by tests for per-run isolation and by power users who want
-/// a non-standard location — before falling back to the platform-native
-/// `dirs::config_dir().join("agsh")`. The env-var route is the only
-/// reliable way to isolate state on macOS and Windows, where
-/// `dirs::config_dir()` doesn't honour `XDG_CONFIG_HOME`.
+/// Returns the agsh config directory (the directory that contains `config.toml` and `skills/`).
+/// Honours the `AGSH_CONFIG_DIR` env var — used by tests for per-run isolation and by power users
+/// who want a non-standard location — before falling back to the platform-native
+/// `dirs::config_dir().join("agsh")`. The env-var route is the only reliable way to isolate state
+/// on macOS and Windows, where `dirs::config_dir()` doesn't honour `XDG_CONFIG_HOME`.
 pub fn agsh_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("AGSH_CONFIG_DIR") {
         return Some(PathBuf::from(dir));
@@ -588,18 +553,17 @@ pub(crate) fn config_file_exists() -> bool {
     config_file_path().is_some_and(|path| path.exists())
 }
 
-/// Write `content` to `path` atomically: serialise to `<path>.tmp` in the
-/// same directory, `sync_all` the fd, then `rename` over the target. Also
-/// creates the parent directory (0700 on Unix) and chmods the final file
-/// to 0600 on Unix so `auth_token` / OAuth-derived secrets aren't
+/// Write `content` to `path` atomically: serialise to `<path>.tmp` in the same directory,
+/// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
+/// Unix) and chmods the final file to 0600 on Unix so `auth_token` / OAuth-derived secrets aren't
 /// world-readable regardless of the user's umask.
 pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
     if let Some(parent) = path.parent() {
-        // Create newly-missing parents already at 0700 to avoid the umask
-        // window left by `create_dir_all` followed by `set_permissions`.
-        // `DirBuilderExt::mode` passes the mode straight to `mkdir(2)`.
+        // Create newly-missing parents already at 0700 to avoid the umask window left by
+        // `create_dir_all` followed by `set_permissions`. `DirBuilderExt::mode` passes the mode
+        // straight to `mkdir(2)`.
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -614,9 +578,9 @@ pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Pre-existing dirs may have a different mode (e.g. user
-            // pre-created `~/.config` at 0755). Best-effort tighten to 0700;
-            // failure here gets a warning rather than aborting the write.
+            // Pre-existing dirs may have a different mode (e.g. user pre-created `~/.config` at
+            // 0755). Best-effort tighten to 0700; failure here gets a warning rather than aborting
+            // the write.
             if let Ok(metadata) = std::fs::metadata(parent) {
                 let mut perms = metadata.permissions();
                 if perms.mode() & 0o777 != 0o700 {
@@ -643,9 +607,8 @@ pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result
     tmp_name.push(".tmp");
     let tmp_path = path.with_file_name(tmp_name);
 
-    // Create the tmp file with restrictive perms on Unix before any bytes
-    // land on disk, so a concurrent reader never sees the partial content
-    // with a looser mode.
+    // Create the tmp file with restrictive perms on Unix before any bytes land on disk, so a
+    // concurrent reader never sees the partial content with a looser mode.
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -663,11 +626,10 @@ pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result
     })
 }
 
-/// Write a freshly initialized `config.toml` from the setup wizard. No
-/// `[shell]` table is emitted — the sandbox backend auto-resolves at
-/// runtime (bubblewrap preferred, landlock fallback; see
-/// [`resolve_sandbox_backend`]), so a pinned value is only ever needed
-/// when the user wants to override that default by hand.
+/// Write a freshly initialized `config.toml` from the setup wizard. No `[shell]` table is emitted —
+/// the sandbox backend auto-resolves at runtime (bubblewrap preferred, landlock fallback; see
+/// [`resolve_sandbox_backend`]), so a pinned value is only ever needed when the user wants to
+/// override that default by hand.
 pub(crate) fn write_config_file(
     provider_name: &str,
     model: &str,
@@ -724,12 +686,11 @@ fn load_config_file() -> ConfigFile {
     }
 }
 
-/// Resolve the runtime permission level and the set of enabled modes
-/// from the layered config sources. CLI > env > config file > built-in
-/// defaults. Invalid entries warn and are dropped; out-of-set overrides
-/// (e.g. `--permission ask` when `ask` is disabled) warn and clamp to
-/// the configured default rather than refusing to start, mirroring the
-/// `[tools.tool_permissions]` warn-and-skip pattern.
+/// Resolve the runtime permission level and the set of enabled modes from the layered config
+/// sources. CLI > env > config file > built-in defaults. Invalid entries warn and are dropped;
+/// out-of-set overrides (e.g. `--permission ask` when `ask` is disabled) warn and clamp to the
+/// configured default rather than refusing to start, mirroring the `[tools.tool_permissions]`
+/// warn-and-skip pattern.
 fn resolve_permission(
     cli_permission: Option<Permission>,
     env_permission: Option<&str>,
@@ -832,27 +793,24 @@ fn resolve_permission(
 
 /// Resolve the active Linux sandbox backend.
 ///
-/// When the user pinned `[shell].sandbox_backend = "..."` in
-/// `config.toml`, that choice is binding — no silent fallback at
-/// runtime; an unavailable explicit backend surfaces at use time via
-/// the `BackendProbe::Missing` / `UserNamespaceDenied` variants.
+/// When the user pinned `[shell].sandbox_backend = "..."` in `config.toml`, that choice is binding
+/// — no silent fallback at runtime; an unavailable explicit backend surfaces at use time via the
+/// `BackendProbe::Missing` / `UserNamespaceDenied` variants.
 ///
-/// When the value is unset (`None`), agsh probes bubblewrap and picks
-/// it if available, falling back to landlock otherwise. The
-/// `auto_resolved` flag is propagated so the startup warn helper can
-/// nudge the user once toward installing bwrap (without nagging users
-/// who explicitly pinned landlock).
+/// When the value is unset (`None`), agsh probes bubblewrap and picks it if available, falling back
+/// to landlock otherwise. The `auto_resolved` flag is propagated so the startup warn helper can
+/// nudge the user once toward installing bwrap (without nagging users who explicitly pinned
+/// landlock).
 #[cfg(target_os = "linux")]
 fn resolve_sandbox_backend(
     configured: Option<SandboxBackend>,
 ) -> (SandboxBackend, bool, crate::sandbox::BackendProbe) {
     use crate::sandbox::{BackendProbe, probe_backend};
 
-    // Probe Bubblewrap only when its result is load-bearing for the
-    // resolution: either the user pinned it explicitly, or no value
-    // was configured (so we need the probe to decide whether to
-    // auto-pick it). When the user pinned Landlock, the Bubblewrap
-    // smoke test would be pure waste (~500 ms on every agsh start).
+    // Probe Bubblewrap only when its result is load-bearing for the resolution: either the user
+    // pinned it explicitly, or no value was configured (so we need the probe to decide whether to
+    // auto-pick it). When the user pinned Landlock, the Bubblewrap smoke test would be pure waste
+    // (~500 ms on every agsh start).
     let (backend, auto_resolved, cached_bubblewrap_probe) = match configured {
         Some(explicit) => (explicit, false, None),
         None => {
@@ -864,11 +822,9 @@ fn resolve_sandbox_backend(
             (picked, true, Some(probe))
         }
     };
-    // The Landlock arm discards `cached_bubblewrap_probe` because
-    // the auto-resolve path that populated it landed on Bubblewrap
-    // (it only falls through to Landlock when Bubblewrap probes
-    // unavailable, and that probe isn't useful for the chosen
-    // backend's status).
+    // The Landlock arm discards `cached_bubblewrap_probe` because the auto-resolve path that
+    // populated it landed on Bubblewrap (it only falls through to Landlock when Bubblewrap probes
+    // unavailable, and that probe isn't useful for the chosen backend's status).
     let backend_probe = match (backend, cached_bubblewrap_probe) {
         (SandboxBackend::Bubblewrap, Some(probe)) => probe,
         (SandboxBackend::Bubblewrap, None) => probe_backend(SandboxBackend::Bubblewrap),
@@ -877,12 +833,10 @@ fn resolve_sandbox_backend(
     (backend, auto_resolved, backend_probe)
 }
 
-/// Non-Linux platforms have a single platform-native sandbox
-/// (`sandbox-exec` on macOS, Low-integrity on Windows, nothing
-/// elsewhere). `[shell].sandbox_backend` is documented as Linux-only
-/// and is ignored here: the resolved capability comes from
-/// [`crate::sandbox::detect`] and is surfaced through the same
-/// `BackendProbe::Ok` envelope so the downstream wiring in
+/// Non-Linux platforms have a single platform-native sandbox (`sandbox-exec` on macOS,
+/// Low-integrity on Windows, nothing elsewhere). `[shell].sandbox_backend` is documented as
+/// Linux-only and is ignored here: the resolved capability comes from [`crate::sandbox::detect`]
+/// and is surfaced through the same `BackendProbe::Ok` envelope so the downstream wiring in
 /// `src/main.rs` doesn't need a platform branch.
 #[cfg(not(target_os = "linux"))]
 fn resolve_sandbox_backend(
@@ -896,18 +850,16 @@ fn resolve_sandbox_backend(
         },
         capability => BackendProbe::Ok(capability),
     };
-    // `SandboxBackend::Landlock` is a stand-in here — the field
-    // exists for Linux config parity but is never consulted on this
-    // platform.
+    // `SandboxBackend::Landlock` is a stand-in here — the field exists for Linux config parity but
+    // is never consulted on this platform.
     (SandboxBackend::Landlock, false, probe)
 }
 
-/// Merge `--eager-load-tool SERVER:TOOL` CLI values into the matching
-/// server's [`McpServerConfig::eager_load_tools`] list. Malformed entries
-/// and unknown server names warn and are skipped — same philosophy as
-/// `warn_on_stale_tool_config`. Appends to (never replaces) the
-/// configured list, and deduplicates so a CLI flag that overlaps with
-/// `config.toml` doesn't grow the list.
+/// Merge `--eager-load-tool SERVER:TOOL` CLI values into the matching server's
+/// [`McpServerConfig::eager_load_tools`] list. Malformed entries and unknown server names warn and
+/// are skipped — same philosophy as `warn_on_stale_tool_config`. Appends to (never replaces) the
+/// configured list, and deduplicates so a CLI flag that overlaps with `config.toml` doesn't grow
+/// the list.
 fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServerConfig]) {
     for raw in raw_pairs {
         let (server_name, tool_name) = match raw.split_once(':') {
@@ -961,8 +913,8 @@ impl ResolvedConfig {
         let file_thinking = config_file.thinking.unwrap_or_default();
         let file_prompt = config_file.prompt.unwrap_or_default();
         let file_tools = config_file.tools.unwrap_or_default();
-        // Destructure the [mcp] table into its two independent fields so
-        // we don't have to re-open the config file later for resolution.
+        // Destructure the [mcp] table into its two independent fields so we don't have to re-open
+        // the config file later for resolution.
         let (
             mcp_default_permission_str,
             mut mcp_servers,
@@ -1072,22 +1024,18 @@ impl ResolvedConfig {
             file_permissions.enabled.as_deref(),
         );
 
-        // Compute device_id before the struct literal so we can borrow
-        // `provider_name` here without conflicting with the `provider_name`
-        // field move below.
+        // Compute device_id before the struct literal so we can borrow `provider_name` here without
+        // conflicting with the `provider_name` field move below.
         let device_id =
             device_id::resolve(provider_name.as_deref(), file_provider.device_id.as_deref());
         let effort = effort::resolve(file_provider.effort.as_deref());
         let redact_thinking = file_provider.redact_thinking.unwrap_or(false);
 
-        // Only probe the sandbox backend when sandboxing is actually
-        // enabled. Skipping the probe for `sandbox = false` saves the
-        // smoke-test cost on every invocation of subcommands that
-        // don't touch the shell (`agsh list`, `agsh export`,
-        // `agsh mcp list`, etc.) when the user has disabled
-        // sandboxing globally. The placeholder probe is never
-        // consulted in that state — the shell tool short-circuits on
-        // `sandbox_enabled = false`, and the warn helper early-
+        // Only probe the sandbox backend when sandboxing is actually enabled. Skipping the probe
+        // for `sandbox = false` saves the smoke-test cost on every invocation of subcommands that
+        // don't touch the shell (`agsh list`, `agsh export`, `agsh mcp list`, etc.) when the user
+        // has disabled sandboxing globally. The placeholder probe is never consulted in that state
+        // — the shell tool short-circuits on `sandbox_enabled = false`, and the warn helper early-
         // returns on `!state.enabled`.
         let (sandbox_backend, sandbox_auto_resolved, backend_probe) =
             if file_shell.sandbox.unwrap_or(true) {
@@ -1221,17 +1169,16 @@ pub fn context_window_for_model(model: &str) -> u64 {
     }
 }
 
-/// Stable per-device identity for `claude-oauth` (embedded in
-/// `metadata.user_id`). Other providers get an empty string — we don't
-/// write a stub config file just to hold an unused value.
+/// Stable per-device identity for `claude-oauth` (embedded in `metadata.user_id`). Other providers
+/// get an empty string — we don't write a stub config file just to hold an unused value.
 mod device_id {
     use std::path::Path;
 
     use super::{config_file_path, write_config_atomic};
 
-    /// Lookup order: configured → persisted → Claude Code's `~/.claude.json`
-    /// userID → freshly generated. The claude.json fallback lets agsh and
-    /// Claude Code on the same machine share a device identity.
+    /// Lookup order: configured → persisted → Claude Code's `~/.claude.json` userID → freshly
+    /// generated. The claude.json fallback lets agsh and Claude Code on the same machine share a
+    /// device identity.
     pub(super) fn resolve(provider_name: Option<&str>, configured: Option<&str>) -> String {
         if provider_name != Some("claude-oauth") {
             return String::new();
@@ -1320,9 +1267,8 @@ mod device_id {
 
 /// `[provider].effort` normalisation for Claude Code's `output_config.effort`.
 mod effort {
-    /// Resolves to one of `"low" | "medium" | "high"`, falling back to
-    /// `"high"` for missing or unrecognised values (with a warn log for the
-    /// latter so a typo isn't silently lost).
+    /// Resolves to one of `"low" | "medium" | "high"`, falling back to `"high"` for missing or
+    /// unrecognised values (with a warn log for the latter so a typo isn't silently lost).
     pub(super) fn resolve(configured: Option<&str>) -> String {
         const DEFAULT: &str = "high";
         let Some(value) = configured else {
@@ -1344,8 +1290,8 @@ mod effort {
     }
 }
 
-/// Provider credential lookup: env var → config file, with provider-specific
-/// env-var precedence. OAuth database fallback happens in `main.rs`.
+/// Provider credential lookup: env var → config file, with provider-specific env-var precedence.
+/// OAuth database fallback happens in `main.rs`.
 mod credential {
     use super::{AuthCredential, ProviderConfig};
 
@@ -1486,8 +1432,8 @@ mod tests {
     fn test_eager_load_override_skips_unknown_server() {
         let mut servers = vec![fixture_server("notion")];
         apply_cli_eager_load_overrides(&["nope:search".to_string()], &mut servers);
-        // The matching `notion` entry must remain untouched; the unknown
-        // `nope` entry simply produces a warn log (not captured here).
+        // The matching `notion` entry must remain untouched; the unknown `nope` entry simply
+        // produces a warn log (not captured here).
         assert!(servers[0].eager_load_tools.is_none());
     }
 
@@ -1614,9 +1560,8 @@ danger_accept_invalid_hostnames = true
 
     #[test]
     fn test_web_client_config_rejects_bad_min_tls_falls_back() {
-        // Invalid min_tls_version string logs a warn but doesn't
-        // abort — we fall through to reqwest's default rather than
-        // failing startup on a typo.
+        // Invalid min_tls_version string logs a warn but doesn't abort — we fall through to
+        // reqwest's default rather than failing startup on a typo.
         let file = WebConfig {
             min_tls_version: Some("1.5".to_string()),
             ..WebConfig::default()
@@ -1627,9 +1572,8 @@ danger_accept_invalid_hostnames = true
 
     #[test]
     fn test_web_client_config_zero_timeout_uses_default() {
-        // `0` in the config is treated as "fall through to default"
-        // so users can't accidentally set request_timeout = 0 and
-        // disable timeouts entirely.
+        // `0` in the config is treated as "fall through to default" so users can't accidentally set
+        // request_timeout = 0 and disable timeouts entirely.
         let file = WebConfig {
             request_timeout_seconds: Some(0),
             connect_timeout_seconds: Some(0),
@@ -1750,14 +1694,13 @@ name = "claude-oauth"
 
     #[test]
     fn test_resolve_device_id_returns_empty_for_non_claude_oauth() {
-        // Should not generate / persist anything when the provider doesn't
-        // need a device_id. Empty string flows through but is ignored by
-        // non-claude-oauth providers.
+        // Should not generate / persist anything when the provider doesn't need a device_id. Empty
+        // string flows through but is ignored by non-claude-oauth providers.
         assert_eq!(device_id::resolve(Some("openai-api"), None), "");
         assert_eq!(device_id::resolve(Some("claude-api"), None), "");
         assert_eq!(device_id::resolve(None, None), "");
-        // Even an explicit configured value is suppressed when the
-        // provider isn't claude-oauth — the field is provider-scoped.
+        // Even an explicit configured value is suppressed when the provider isn't claude-oauth —
+        // the field is provider-scoped.
         assert_eq!(device_id::resolve(Some("openai-api"), Some("explicit")), "");
     }
 
@@ -1810,8 +1753,8 @@ name = "claude-oauth"
 
     #[test]
     fn test_read_user_id_from_empty_string_returns_none() {
-        // An empty `userID` in claude.json shouldn't override agsh's
-        // own random-generation fallback — treat it as "not configured".
+        // An empty `userID` in claude.json shouldn't override agsh's own random-generation fallback
+        // — treat it as "not configured".
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("claude.json");
         std::fs::write(&path, r#"{"userID": ""}"#).expect("write");
@@ -1828,8 +1771,8 @@ name = "claude-oauth"
 
     #[test]
     fn test_read_user_id_from_non_string_returns_none() {
-        // A non-string `userID` (number, object, …) shouldn't crash —
-        // just decline to use the value.
+        // A non-string `userID` (number, object, …) shouldn't crash — just decline to use the
+        // value.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("claude.json");
         std::fs::write(&path, r#"{"userID": 12345}"#).expect("write");
@@ -2153,8 +2096,8 @@ auth_token = "bearer-token"
 
     #[test]
     fn test_parse_input_style_unknown_falls_back_to_default() {
-        // Invalid keywords warn but must not panic — fall back to the
-        // same preset used when the key is unset.
+        // Invalid keywords warn but must not panic — fall back to the same preset used when the key
+        // is unset.
         assert_eq!(parse_input_style("superbold"), default_input_style());
     }
 
@@ -2195,9 +2138,9 @@ read_file = "ask"
 
     #[test]
     fn test_tools_config_invalid_permission_drops_entry() {
-        // Drive the post-parse filter directly — ResolvedConfig::from_cli
-        // runs this loop. Checks that a bad level string is filtered out
-        // without panicking and that valid entries still land.
+        // Drive the post-parse filter directly — ResolvedConfig::from_cli runs this loop. Checks
+        // that a bad level string is filtered out without panicking and that valid entries still
+        // land.
         let raw: HashMap<String, String> = [
             ("read_file".to_string(), "write".to_string()),
             ("write_file".to_string(), "superuser".to_string()),
@@ -2301,13 +2244,12 @@ Rule 2.
         assert_eq!(resolved.as_deref(), Some("from config"));
     }
 
-    /// End-to-end check that AGSH_INSTRUCTIONS overrides
-    /// `[prompt].instructions` when `--instructions` is not on the CLI.
-    /// Drives the actual `from_cli` path against a tempdir-backed config
-    /// to catch any regression where the env-var read silently no-ops.
+    /// End-to-end check that AGSH_INSTRUCTIONS overrides `[prompt].instructions` when
+    /// `--instructions` is not on the CLI. Drives the actual `from_cli` path against a
+    /// tempdir-backed config to catch any regression where the env-var read silently no-ops.
     ///
-    /// Touches process env, so it serializes against any other env-var
-    /// test in this file via `ENV_LOCK`.
+    /// Touches process env, so it serializes against any other env-var test in this file via
+    /// `ENV_LOCK`.
     #[test]
     fn test_env_var_overrides_config_file_instructions() {
         use std::sync::{Mutex, OnceLock};
@@ -2471,8 +2413,8 @@ Rule 2.
 
     #[test]
     fn test_resolve_permission_cli_override_disabled_clamps_to_default() {
-        // `ask` not enabled → CLI request for ask warns and clamps to the
-        // configured default (Read).
+        // `ask` not enabled → CLI request for ask warns and clamps to the configured default
+        // (Read).
         let (perm, _enabled) = resolve_permission(Some(Permission::Ask), None, None, None);
         assert_eq!(perm, Permission::Read);
     }
@@ -2520,11 +2462,9 @@ enabled = ["read", "write"]
         );
     }
 
-    /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize
-    /// cleanly. Any other value, including the prior internal alias
-    /// `"bwrap"`, must be rejected — we don't want alias creep that
-    /// would silently desync `agsh setup`-generated configs from
-    /// hand-edited ones.
+    /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize cleanly. Any other value,
+    /// including the prior internal alias `"bwrap"`, must be rejected — we don't want alias creep
+    /// that would silently desync `agsh setup`-generated configs from hand-edited ones.
     #[test]
     fn test_sandbox_backend_deserializes_strict_values() {
         let bubblewrap: ShellConfig =
@@ -2539,9 +2479,9 @@ enabled = ["read", "write"]
         assert!(toml::from_str::<ShellConfig>(r#"sandbox_backend = "none""#).is_err());
     }
 
-    /// When the user pins `sandbox_backend = "..."` explicitly, the
-    /// resolver returns that choice with `auto_resolved == false` —
-    /// no silent fallback even if the probe would suggest otherwise.
+    /// When the user pins `sandbox_backend = "..."` explicitly, the resolver returns that choice
+    /// with `auto_resolved == false` — no silent fallback even if the probe would suggest
+    /// otherwise.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_resolve_sandbox_backend_explicit_value_is_binding() {
@@ -2556,11 +2496,10 @@ enabled = ["read", "write"]
         assert!(!auto_resolved);
     }
 
-    /// When the user has not pinned a backend, resolve_sandbox_backend
-    /// must surface `auto_resolved == true`. The exact backend it
-    /// picks depends on whether the host has bwrap installed and
-    /// supports user namespaces, so we just assert the auto flag is
-    /// set and one of the two backends came back.
+    /// When the user has not pinned a backend, resolve_sandbox_backend must surface `auto_resolved
+    /// == true`. The exact backend it picks depends on whether the host has bwrap installed and
+    /// supports user namespaces, so we just assert the auto flag is set and one of the two backends
+    /// came back.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_resolve_sandbox_backend_auto_resolves_when_unset() {
@@ -2572,26 +2511,22 @@ enabled = ["read", "write"]
         ));
     }
 
-    /// On macOS / Windows the `sandbox_backend` config field is
-    /// documented as ignored. The resolver must still return a probe
-    /// that reflects the platform's native sandbox capability rather
-    /// than the never-applicable Linux defaults, so the downstream
-    /// wiring in `src/main.rs` can map it to `SandboxCapability` for
-    /// `sandbox-exec` / Low-integrity. Guards against the regression
-    /// that surfaces when only the Linux probe paths are wired up.
+    /// On macOS / Windows the `sandbox_backend` config field is documented as ignored. The resolver
+    /// must still return a probe that reflects the platform's native sandbox capability rather than
+    /// the never-applicable Linux defaults, so the downstream wiring in `src/main.rs` can map it to
+    /// `SandboxCapability` for `sandbox-exec` / Low-integrity. Guards against the regression that
+    /// surfaces when only the Linux probe paths are wired up.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn test_resolve_sandbox_backend_uses_platform_sandbox_on_non_linux() {
         use crate::sandbox::{BackendProbe, SandboxCapability};
 
-        // Explicit `Some(...)` is ignored on non-Linux — the field
-        // is documented as Linux-only.
+        // Explicit `Some(...)` is ignored on non-Linux — the field is documented as Linux-only.
         let (_backend, auto_resolved, probe) =
             resolve_sandbox_backend(Some(SandboxBackend::Bubblewrap));
         assert!(!auto_resolved);
-        // The probe should reflect what `detect()` reports for this
-        // host, surfaced as `Ok(...)` so the consumer can drop into
-        // the platform's spawn path.
+        // The probe should reflect what `detect()` reports for this host, surfaced as `Ok(...)` so
+        // the consumer can drop into the platform's spawn path.
         match probe {
             BackendProbe::Ok(SandboxCapability::Unavailable) => {
                 panic!("Ok(Unavailable) is incoherent — expected a real capability or Missing")

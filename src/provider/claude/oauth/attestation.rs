@@ -1,7 +1,6 @@
-//! Claude Code anti-cheat machinery: request fingerprint, xxHash64-based
-//! `cch` attestation, billing header synthesis, and Stainless-SDK-matching
-//! HTTP headers. All of this is OAuth-specific — direct API-key requests
-//! (`claude-api`) don't send billing headers, so there's no caller.
+//! Claude Code anti-cheat machinery: request fingerprint, xxHash64-based `cch` attestation, billing
+//! header synthesis, and Stainless-SDK-matching HTTP headers. All of this is OAuth-specific —
+//! direct API-key requests (`claude-api`) don't send billing headers, so there's no caller.
 //!
 //! References:
 //! - Claude Code source: `src/constants/system.ts`, `src/utils/fingerprint.ts`,
@@ -32,9 +31,8 @@ fn compute_fingerprint(message_text: &str, version: &str) -> String {
 
     let input = format!("{}{}{}", FINGERPRINT_SALT, chars, version);
     let hash = Sha256::digest(input.as_bytes());
-    // Match Claude Code's `SHA256(...)[:3]`: take the first 3 hex chars of
-    // the byte-by-byte 2-digit-hex encoding. Two bytes give us 4 chars,
-    // enough to slice 3 and drop the rest.
+    // Match Claude Code's `SHA256(...)[:3]`: take the first 3 hex chars of the byte-by-byte
+    // 2-digit-hex encoding. Two bytes give us 4 chars, enough to slice 3 and drop the rest.
     let hex: String = hash
         .iter()
         .take(2)
@@ -67,10 +65,9 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
     compute_fingerprint(&first_message_text, CC_VERSION)
 }
 
-/// Generates the billing header with a `cch=00000` placeholder. The 3-char
-/// fingerprint suffix is derived from the first user message per Claude
-/// Code's behaviour (`services/api/claude.ts:1325`). The `cch` is replaced
-/// with the real attestation by [`patch_request_body`] after serialization.
+/// Generates the billing header with a `cch=00000` placeholder. The 3-char fingerprint suffix is
+/// derived from the first user message per Claude Code's behaviour (`services/api/claude.ts:1325`).
+/// The `cch` is replaced with the real attestation by [`patch_request_body`] after serialization.
 pub(super) fn generate_billing_header(messages: &[Message]) -> String {
     format!(
         "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;",
@@ -199,8 +196,8 @@ fn xxh64(input: &[u8], seed: u64) -> u64 {
     xxh64_avalanche(h64)
 }
 
-/// Replaces the `cch=00000` placeholder with xxHash64(body) & 0xFFFFF.
-/// Anchors the search to the billing header to avoid false matches in messages.
+/// Replaces the `cch=00000` placeholder with xxHash64(body) & 0xFFFFF. Anchors the search to the
+/// billing header to avoid false matches in messages.
 pub(super) fn patch_request_body(body_json: &str) -> Result<String> {
     const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
     const PLACEHOLDER: &str = "cch=00000";
@@ -233,10 +230,9 @@ fn claude_user_agent() -> String {
     format!("claude-cli/{} (external, cli)", CC_VERSION)
 }
 
-/// Stainless SDK / runtime versions. Must match the release corresponding
-/// to `CC_VERSION`. Values verified against wire captures of real Claude
-/// Code traffic — the runtime reports as `node` (Bun's Node.js compat
-/// layer) with a fixed version string.
+/// Stainless SDK / runtime versions. Must match the release corresponding to `CC_VERSION`. Values
+/// verified against wire captures of real Claude Code traffic — the runtime reports as `node`
+/// (Bun's Node.js compat layer) with a fixed version string.
 const STAINLESS_RUNTIME: &str = "node";
 const STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
 const STAINLESS_SDK_VERSION: &str = "0.90.0";
@@ -264,8 +260,8 @@ fn stainless_os() -> &'static str {
     }
 }
 
-/// Applies all HTTP headers in the order the Stainless SDK + Claude Code
-/// would produce on the wire. See `buildHeaders` in `@anthropic-ai/sdk`.
+/// Applies all HTTP headers in the order the Stainless SDK + Claude Code would produce on the wire.
+/// See `buildHeaders` in `@anthropic-ai/sdk`.
 pub(super) fn apply_headers(
     request: reqwest::RequestBuilder,
     auth_header_name: &str,
@@ -580,8 +576,8 @@ mod tests {
         assert!(header.contains("cch=00000"));
         assert!(header.ends_with("cch=00000;"));
 
-        // Fingerprint suffix is dynamic per first user message — different
-        // first message → different suffix.
+        // Fingerprint suffix is dynamic per first user message — different first message →
+        // different suffix.
         let other =
             generate_billing_header(&[Message::user("totally different first user message text")]);
         assert_ne!(header, other);

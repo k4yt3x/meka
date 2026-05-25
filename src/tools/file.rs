@@ -1,11 +1,10 @@
-//! Filesystem tools: `read_file`, `write_file`, and `edit_file`. Image files
-//! are returned as multimodal Image content blocks (transcoding to PNG when
-//! needed). Writes are gated by the active permission level.
+//! Filesystem tools: `read_file`, `write_file`, and `edit_file`. Image files are returned as
+//! multimodal Image content blocks (transcoding to PNG when needed). Writes are gated by the active
+//! permission level.
 //!
-//! All I/O goes through the canonicalized path and, on Unix, uses
-//! `O_NOFOLLOW` on the final `open(2)` so a symlink swap between the
-//! permission check and the I/O cannot redirect the operation onto an
-//! unintended target.
+//! All I/O goes through the canonicalized path and, on Unix, uses `O_NOFOLLOW` on the final
+//! `open(2)` so a symlink swap between the permission check and the I/O cannot redirect the
+//! operation onto an unintended target.
 
 use std::{path::Path, sync::Arc};
 
@@ -25,11 +24,9 @@ use crate::{
     provider::{ImageSource, ToolDefinition, ToolResultContent},
 };
 
-/// Open a file for reading, refusing to follow a symlink on Unix. Callers
-/// pass a canonicalized `PathBuf` so the check closes the
-/// canonicalize→open TOCTOU window: if the target was replaced by a
-/// symlink after we canonicalized, the open errors out instead of
-/// silently redirecting.
+/// Open a file for reading, refusing to follow a symlink on Unix. Callers pass a canonicalized
+/// `PathBuf` so the check closes the canonicalize→open TOCTOU window: if the target was replaced by
+/// a symlink after we canonicalized, the open errors out instead of silently redirecting.
 async fn open_read_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     #[cfg(unix)]
     {
@@ -45,11 +42,10 @@ async fn open_read_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     }
 }
 
-/// Open a file for writing (create-or-truncate) refusing to follow a
-/// symlink. A safer default than `tokio::fs::write` for paths that may race
-/// against a hostile rename. On Unix `O_NOFOLLOW` errors on a symlinked
-/// final component; on Windows the equivalent is opening the reparse point
-/// itself and rejecting it before any truncation happens.
+/// Open a file for writing (create-or-truncate) refusing to follow a symlink. A safer default than
+/// `tokio::fs::write` for paths that may race against a hostile rename. On Unix `O_NOFOLLOW` errors
+/// on a symlinked final component; on Windows the equivalent is opening the reparse point itself
+/// and rejecting it before any truncation happens.
 async fn open_write_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     #[cfg(unix)]
     {
@@ -64,10 +60,9 @@ async fn open_write_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_OPEN_REPARSE_POINT opens the link itself rather than
-        // following it, so a symlinked path yields a handle we can inspect.
-        // Truncation is deferred to `set_len` *after* the symlink check so
-        // a rejected target is never destroyed.
+        // FILE_FLAG_OPEN_REPARSE_POINT opens the link itself rather than following it, so a
+        // symlinked path yields a handle we can inspect. Truncation is deferred to `set_len`
+        // *after* the symlink check so a rejected target is never destroyed.
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         let file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -119,11 +114,10 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
 pub(super) struct ReadFileTool {
     pub read_tracker: ReadTracker,
     pub cwd: crate::agent::SharedCwd,
-    /// When the connected ACP client advertises `fs.read_text_file`,
-    /// plain-text reads are delegated to the editor's hosted
-    /// filesystem so it can serve the in-buffer view of the file
-    /// rather than the on-disk bytes. `None` from the frontend
-    /// means "fall back to local read".
+    /// When the connected ACP client advertises `fs.read_text_file`, plain-text reads are
+    /// delegated to the editor's hosted filesystem so it can serve the in-buffer view of the
+    /// file rather than the on-disk bytes. `None` from the frontend means "fall back to local
+    /// read".
     pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
@@ -200,8 +194,8 @@ impl Tool for ReadFileTool {
         let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
         let canonical = canonicalize_for_tool("read_file", &resolved).await?;
 
-        // Detect image files and return multimodal content, converting
-        // non-native formats (TIFF, ICO, etc.) to PNG along the way.
+        // Detect image files and return multimodal content, converting non-native formats (TIFF,
+        // ICO, etc.) to PNG along the way.
         let extension = canonical
             .extension()
             .and_then(|ext| ext.to_str())
@@ -264,19 +258,16 @@ impl Tool for ReadFileTool {
             .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
         let regex = input.get("regex").and_then(|v| v.as_str());
 
-        // Plain text reads delegate to the editor when it offers
-        // `fs.read_text_file` (in-buffer view wins over on-disk).
-        // Regex / image reads have no `fs/*` analogue — always local.
+        // Plain text reads delegate to the editor when it offers `fs.read_text_file` (in-buffer
+        // view wins over on-disk). Regex / image reads have no `fs/*` analogue — always local.
         if regex.is_none() {
             let delegate_line =
                 offset.map(|o| u32::try_from(o.saturating_add(1)).unwrap_or(u32::MAX));
-            // Mirror the local fallback's `DEFAULT_LINE_LIMIT` so the
-            // delegate path can't accidentally pull an unbounded file
-            // into the agent's context when the caller passed no
-            // limit. Without this, an `fs.read_text_file`-capable
-            // client (e.g. Zed) returns the whole file while the
-            // local path would cap at 2000 lines with a truncation
-            // marker — divergent behavior + context-window risk.
+            // Mirror the local fallback's `DEFAULT_LINE_LIMIT` so the delegate path can't
+            // accidentally pull an unbounded file into the agent's context when the caller passed
+            // no limit. Without this, an `fs.read_text_file`-capable client (e.g. Zed) returns the
+            // whole file while the local path would cap at 2000 lines with a truncation marker —
+            // divergent behavior + context-window risk.
             let delegate_limit = Some(
                 limit
                     .map(|l| u32::try_from(l).unwrap_or(u32::MAX))
@@ -338,9 +329,8 @@ impl Tool for ReadFileTool {
 pub(super) struct EditFileTool {
     pub read_tracker: ReadTracker,
     pub cwd: crate::agent::SharedCwd,
-    /// Read + write both go through the frontend so the editor can
-    /// apply the edit in-buffer (Zed's apply-diff UI). `None` from
-    /// the frontend means "fall back to local I/O".
+    /// Read + write both go through the frontend so the editor can apply the edit in-buffer (Zed's
+    /// apply-diff UI). `None` from the frontend means "fall back to local I/O".
     pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
@@ -454,9 +444,8 @@ impl Tool for EditFileTool {
             format!("{}{}", old_string, insert_after_opt.unwrap_or(""))
         };
 
-        // Canonicalize once. All subsequent I/O goes through this path so a
-        // symlink swap between the tracker check and the actual read/write
-        // can't redirect us onto a different file.
+        // Canonicalize once. All subsequent I/O goes through this path so a symlink swap between
+        // the tracker check and the actual read/write can't redirect us onto a different file.
         let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
         let canonical = canonicalize_for_tool("edit_file", &resolved).await?;
 
@@ -471,10 +460,9 @@ impl Tool for EditFileTool {
             ));
         }
 
-        // Prefer the editor's in-buffer view when offered. A
-        // delegate error short-circuits — silently reading on-disk
-        // bytes risks diffing a different document than the one
-        // the editor will apply against.
+        // Prefer the editor's in-buffer view when offered. A delegate error short-circuits —
+        // silently reading on-disk bytes risks diffing a different document than the one the editor
+        // will apply against.
         let content =
             match self.frontend.delegate_fs_read(&canonical, None, None).await {
                 Some(Ok(text)) => text,
@@ -503,10 +491,9 @@ impl Tool for EditFileTool {
             ));
         }
 
-        // Record the byte offset of the first match in the *original* content;
-        // since `replacen` / `replace` only mutate at-or-after this point, the
-        // byte offset is stable in the new content and locates the first edit
-        // site for the response snippet.
+        // Record the byte offset of the first match in the *original* content; since `replacen` /
+        // `replace` only mutate at-or-after this point, the byte offset is stable in the new
+        // content and locates the first edit site for the response snippet.
         let first_match_byte = content.find(&old_string).unwrap_or(0);
 
         let (new_content, count) = if replace_all {
@@ -516,9 +503,8 @@ impl Tool for EditFileTool {
             (content.replacen(&old_string, &effective_new_string, 1), 1)
         };
 
-        // Same delegate-or-local fork as `write_file`'s write step.
-        // A delegate error short-circuits to keep our view aligned
-        // with the editor's.
+        // Same delegate-or-local fork as `write_file`'s write step. A delegate error short-circuits
+        // to keep our view aligned with the editor's.
         match self
             .frontend
             .delegate_fs_write(&canonical, &new_content)
@@ -563,10 +549,9 @@ impl Tool for EditFileTool {
     }
 }
 
-/// Render a ±`lines_around` snippet around the line containing
-/// `change_byte_offset` in `content`. Each line is prefixed with a
-/// right-aligned 1-based line number and a `|` separator, and truncated to
-/// 200 chars to keep the response compact.
+/// Render a ±`lines_around` snippet around the line containing `change_byte_offset` in `content`.
+/// Each line is prefixed with a right-aligned 1-based line number and a `|` separator, and
+/// truncated to 200 chars to keep the response compact.
 fn build_context_snippet(content: &str, change_byte_offset: usize, lines_around: usize) -> String {
     let safe_offset = change_byte_offset.min(content.len());
     let line_index = content[..safe_offset]
@@ -590,17 +575,15 @@ fn build_context_snippet(content: &str, change_byte_offset: usize, lines_around:
 }
 
 pub(super) struct WriteFileTool {
-    /// Shared with `ReadFileTool` / `EditFileTool`. After a successful
-    /// write we insert the canonical target so a follow-up `edit_file`
-    /// against the same path doesn't require a redundant `read_file` or
-    /// `force: true` — the agent obviously knows the content it just
+    /// Shared with `ReadFileTool` / `EditFileTool`. After a successful write we insert the
+    /// canonical target so a follow-up `edit_file` against the same path doesn't require a
+    /// redundant `read_file` or `force: true` — the agent obviously knows the content it just
     /// wrote.
     pub read_tracker: ReadTracker,
     pub cwd: crate::agent::SharedCwd,
-    /// Write step is delegated to the editor's filesystem so the
-    /// apply-diff UI sees the new content alongside the
-    /// `tool_call_update`'s diff. `None` from the frontend means
-    /// "fall back to local write".
+    /// Write step is delegated to the editor's filesystem so the apply-diff UI sees the new
+    /// content alongside the `tool_call_update`'s diff. `None` from the frontend means "fall
+    /// back to local write".
     pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
@@ -644,12 +627,11 @@ impl Tool for WriteFileTool {
         let path = require_str(&input, "path", "write_file")?;
         let content = require_str(&input, "content", "write_file")?;
 
-        // The target file may not exist yet, so we canonicalize the *parent*
-        // directory and re-join the filename. This pins the final open to a
-        // directory whose symlinks have been resolved, closing the window
-        // where a symlink-pointing-at-a-parent swap could redirect the
-        // write. The per-file `O_NOFOLLOW` in `write_file_bytes` then
-        // prevents a last-component symlink swap.
+        // The target file may not exist yet, so we canonicalize the *parent* directory and re-join
+        // the filename. This pins the final open to a directory whose symlinks have been resolved,
+        // closing the window where a symlink-pointing-at-a-parent swap could redirect the write.
+        // The per-file `O_NOFOLLOW` in `write_file_bytes` then prevents a last-component symlink
+        // swap.
         let file_path = crate::agent::resolve_against_cwd(&self.cwd, &path);
         let file_name = file_path
             .file_name()
@@ -662,9 +644,8 @@ impl Tool for WriteFileTool {
             message: format!("invalid path (no parent): '{}'", path),
         })?;
 
-        // Treat an empty parent (relative filename like "out.txt") as the
-        // current directory; this matches the previous `tokio::fs::write`
-        // behavior for bare filenames.
+        // Treat an empty parent (relative filename like "out.txt") as the current directory; this
+        // matches the previous `tokio::fs::write` behavior for bare filenames.
         let parent_for_create: &Path = if parent.as_os_str().is_empty() {
             Path::new(".")
         } else {
@@ -680,16 +661,14 @@ impl Tool for WriteFileTool {
         let canonical_parent = canonicalize_for_tool("write_file", parent_for_create).await?;
         let target = canonical_parent.join(file_name);
 
-        // Snapshot the existing content (if any) so frontends can render
-        // a proper diff. `None` means the file did not exist (this is a
-        // create); we use the `not_found` ErrorKind to distinguish from
-        // a permissions error so the latter surfaces normally.
+        // Snapshot the existing content (if any) so frontends can render a proper diff. `None`
+        // means the file did not exist (this is a create); we use the `not_found` ErrorKind to
+        // distinguish from a permissions error so the latter surfaces normally.
         //
-        // When the client offers `fs.read_text_file`, ask the editor
-        // for its view first — buffers with unsaved changes give a
-        // more accurate `old_text` than the on-disk bytes. A delegate
-        // error is non-fatal here (diff metadata is informational),
-        // so we fall back to the local read on `Some(Err(_))` too.
+        // When the client offers `fs.read_text_file`, ask the editor for its view first — buffers
+        // with unsaved changes give a more accurate `old_text` than the on-disk bytes. A delegate
+        // error is non-fatal here (diff metadata is informational), so we fall back to the local
+        // read on `Some(Err(_))` too.
         //
         // Some clients return `Ok("")` for files that don't exist
         // (rather than an error). To avoid reporting `old_text:
@@ -722,9 +701,8 @@ impl Tool for WriteFileTool {
             },
         };
 
-        // Delegate the write when the editor offers `fs.write_text_file`.
-        // A delegate error surfaces verbatim — silently falling back
-        // to a local write would diverge from the editor's view of
+        // Delegate the write when the editor offers `fs.write_text_file`. A delegate error surfaces
+        // verbatim — silently falling back to a local write would diverge from the editor's view of
         // the file.
         match self.frontend.delegate_fs_write(&target, &content).await {
             Some(Ok(())) => {}
@@ -744,9 +722,9 @@ impl Tool for WriteFileTool {
             }
         }
 
-        // Record the canonical path so subsequent `edit_file` calls
-        // accept it without `force: true`. We just produced the content,
-        // so the "must read first" safety check has nothing to gain.
+        // Record the canonical path so subsequent `edit_file` calls accept it without `force:
+        // true`. We just produced the content, so the "must read first" safety check has nothing to
+        // gain.
         self.read_tracker.write().await.insert(target.clone());
 
         Ok(ToolOutput::text(
@@ -861,8 +839,8 @@ mod tests {
         let real = temp_dir.path().join("real.txt");
         std::fs::write(&real, "original").expect("seed real file");
         let link = temp_dir.path().join("link.txt");
-        // Symlink creation needs Developer Mode / SeCreateSymbolicLink; skip
-        // rather than fail if the runner can't create one.
+        // Symlink creation needs Developer Mode / SeCreateSymbolicLink; skip rather than fail if
+        // the runner can't create one.
         if std::os::windows::fs::symlink_file(&real, &link).is_err() {
             return;
         }
@@ -895,8 +873,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_file_after_write_no_force_needed() {
-        // Regression: `write_file` should mark the target as read so a
-        // follow-up `edit_file` doesn't require `force: true`.
+        // Regression: `write_file` should mark the target as read so a follow-up `edit_file`
+        // doesn't require `force: true`.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("write_then_edit.txt");
         let tracker = test_tracker();
@@ -1172,11 +1150,10 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// Regression test for the canonicalize/open TOCTOU fix: edit_file must
-    /// honor the canonical path, not re-interpret the raw argument after the
-    /// tracker check. Simulated here by read-tracking the resolved file,
-    /// then swapping the symlink's target between read and edit. The edit
-    /// must land on the original canonical file, never the new target.
+    /// Regression test for the canonicalize/open TOCTOU fix: edit_file must honor the canonical
+    /// path, not re-interpret the raw argument after the tracker check. Simulated here by
+    /// read-tracking the resolved file, then swapping the symlink's target between read and edit.
+    /// The edit must land on the original canonical file, never the new target.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_edit_file_symlink_swap_lands_on_canonical() {
@@ -1224,10 +1201,9 @@ mod tests {
             .await
             .expect("execute");
 
-        // Either the tracker rejects the new canonical target (expected,
-        // since `real_b` was never read) or the O_NOFOLLOW open hits the
-        // swapped symlink and errors. Both outcomes are acceptable; the
-        // critical invariant is that neither file is corrupted.
+        // Either the tracker rejects the new canonical target (expected, since `real_b` was never
+        // read) or the O_NOFOLLOW open hits the swapped symlink and errors. Both outcomes are
+        // acceptable; the critical invariant is that neither file is corrupted.
         assert!(
             result.is_error,
             "edit should be rejected after symlink swap, got: {}",

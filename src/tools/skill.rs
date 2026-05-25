@@ -1,6 +1,5 @@
-//! `skill` tool: loads a named skill body (with `${AGSH_SKILL_DIR}` and
-//! `${AGSH_SESSION_ID}` substitution) so its instructions become available to
-//! the agent on demand.
+//! `skill` tool: loads a named skill body (with `${AGSH_SKILL_DIR}` and `${AGSH_SESSION_ID}`
+//! substitution) so its instructions become available to the agent on demand.
 
 use std::sync::Arc;
 
@@ -19,9 +18,8 @@ use crate::{
 
 pub(super) struct SkillTool {
     pub session_id: Arc<RwLock<Option<Uuid>>>,
-    /// Shared skill cache with the agent. Dispatch reads through
-    /// `current().await` so the tool sees any auto-reloads that happened
-    /// during the turn.
+    /// Shared skill cache with the agent. Dispatch reads through `current().await` so the tool
+    /// sees any auto-reloads that happened during the turn.
     pub skills: Arc<SkillCache>,
 }
 

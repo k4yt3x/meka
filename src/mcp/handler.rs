@@ -1,8 +1,7 @@
-//! Client-side MCP handler: dispatches server-initiated sampling /
-//! `list_roots` / elicitation requests to the rest of the agent, forwards
-//! `tools/list_changed` notifications through the manager, and adapts the
-//! remote tool list into the `crate::tools` trait so the provider loop
-//! can call them like any other tool.
+//! Client-side MCP handler: dispatches server-initiated sampling / `list_roots` / elicitation
+//! requests to the rest of the agent, forwards `tools/list_changed` notifications through the
+//! manager, and adapts the remote tool list into the `crate::tools` trait so the provider loop can
+//! call them like any other tool.
 
 use std::sync::{
     Arc,
@@ -35,8 +34,8 @@ use crate::{
     tools::{Tool, ToolOutput},
 };
 
-/// Permission for each server to issue sampling requests. Mirrors the
-/// `sampling` / `sampling_limit` fields on `McpServerConfig`.
+/// Permission for each server to issue sampling requests. Mirrors the `sampling` / `sampling_limit`
+/// fields on `McpServerConfig`.
 #[derive(Clone)]
 pub struct SamplingPolicy {
     allowed: bool,
@@ -54,10 +53,9 @@ impl SamplingPolicy {
     }
 }
 
-/// Client-side MCP handler. Dispatches server-initiated requests
-/// (`sampling/createMessage`, `roots/list`, `elicitation/create`) and
-/// notifications (`tools/list_changed`, etc.) to the rest of the agent via
-/// the shared [`McpClientContext`].
+/// Client-side MCP handler. Dispatches server-initiated requests (`sampling/createMessage`,
+/// `roots/list`, `elicitation/create`) and notifications (`tools/list_changed`, etc.) to the rest
+/// of the agent via the shared [`McpClientContext`].
 #[derive(Clone)]
 pub struct AgshClientHandler {
     server_name: Arc<str>,
@@ -97,16 +95,13 @@ impl ClientHandler for AgshClientHandler {
                 return;
             };
 
-            // Tool-permission resolution reads the server config and
-            // `mcp_default_permission` from the manager itself — no
-            // explicit permission needs to be threaded here.
+            // Tool-permission resolution reads the server config and `mcp_default_permission` from
+            // the manager itself — no explicit permission needs to be threaded here.
             match manager.discover_tools_for_server(&server_name).await {
                 Ok(adapters) => {
-                    // Match the initial-registration path: only mark
-                    // non-eager tools deferred. Compute the deferred set
-                    // before we erase the adapters into `Arc<dyn Tool>`,
-                    // since `raw_name`/`server_config` live on the
-                    // concrete type.
+                    // Match the initial-registration path: only mark non-eager tools deferred.
+                    // Compute the deferred set before we erase the adapters into `Arc<dyn Tool>`,
+                    // since `raw_name`/`server_config` live on the concrete type.
                     let deferred_names: Vec<String> = adapters
                         .iter()
                         .filter(|adapter| {
@@ -121,8 +116,8 @@ impl ClientHandler for AgshClientHandler {
                         .into_iter()
                         .map(|a| Arc::new(a) as Arc<dyn Tool>)
                         .collect();
-                    // Routes through every attached registry so all
-                    // active sessions observe the updated tool set.
+                    // Routes through every attached registry so all active sessions observe the
+                    // updated tool set.
                     manager.update_server_tools(&server_name, new_tools).await;
                     if !deferred_names.is_empty() {
                         manager.mark_deferred_on_attached(&deferred_names).await;
@@ -176,11 +171,10 @@ impl ClientHandler for AgshClientHandler {
         }
     }
 
-    // Keep the explicit `impl Future` return type: other handlers in this
-    // trait impl have non-trivial captures (`Arc<str>` clones, server name
-    // in logging, etc.) and use the same signature shape. Staying uniform
-    // makes the module easier to read than mixing `async fn` and the
-    // manual-future form.
+    // Keep the explicit `impl Future` return type: other handlers in this trait impl have
+    // non-trivial captures (`Arc<str>` clones, server name in logging, etc.) and use the same
+    // signature shape. Staying uniform makes the module easier to read than mixing `async fn` and
+    // the manual-future form.
     #[allow(clippy::manual_async_fn)]
     fn on_progress(
         &self,
@@ -214,11 +208,9 @@ impl ClientHandler for AgshClientHandler {
         _context: RequestContext<RoleClient>,
     ) -> impl Future<Output = std::result::Result<ListRootsResult, McpError>> + Send + '_ {
         async move {
-            // Task-local override wins: when an MCP tool runs inside
-            // `with_session_cwd(session.cwd, …)`, this query reads
-            // that session's cwd. Outside such a scope (connection-
-            // time queries, REPL paths) the process default seeded
-            // on the context applies.
+            // Task-local override wins: when an MCP tool runs inside `with_session_cwd(session.cwd,
+            // …)`, this query reads that session's cwd. Outside such a scope (connection- time
+            // queries, REPL paths) the process default seeded on the context applies.
             let cwd = match self.context.cwd() {
                 Some(default) => crate::mcp::current_roots_cwd(default),
                 None => std::env::current_dir().map_err(|error| {
@@ -269,9 +261,9 @@ impl ClientHandler for AgshClientHandler {
                 }
             };
 
-            // 60-second user-response timeout so a distracted user can't stall
-            // an MCP tool call forever. Matches the elicitation deadline used
-            // for the ToolApprovalRequest channel in shell.rs.
+            // 60-second user-response timeout so a distracted user can't stall an MCP tool call
+            // forever. Matches the elicitation deadline used for the ToolApprovalRequest channel in
+            // shell.rs.
             let (responder, receiver) = std::sync::mpsc::sync_channel::<ElicitationResponse>(1);
             let prompt = ElicitationPrompt {
                 server_name: server.as_ref().to_string(),
@@ -288,11 +280,10 @@ impl ClientHandler for AgshClientHandler {
                 return Ok(ElicitationResponse::Decline.into_result());
             }
 
-            // Elicitations are standard MCP *requests*, so a `Decline`
-            // response IS how the server learns the user didn't answer —
-            // no separate `notifications/cancelled` is appropriate here
-            // (cancellation notifications are for long-running requests
-            // we started, not for server-initiated elicitations).
+            // Elicitations are standard MCP *requests*, so a `Decline` response IS how the server
+            // learns the user didn't answer — no separate `notifications/cancelled` is appropriate
+            // here (cancellation notifications are for long-running requests we started, not for
+            // server-initiated elicitations).
             let response = tokio::task::spawn_blocking(move || {
                 receiver
                     .recv_timeout(std::time::Duration::from_secs(60))
@@ -359,17 +350,16 @@ impl ClientHandler for AgshClientHandler {
             );
 
             let (system_prompt, converted) = convert_sampling_params(&params).map_err(|error| {
-                // The slot was reserved for a call that never reached the
-                // provider; free it so a well-formed retry isn't rejected.
+                // The slot was reserved for a call that never reached the provider; free it so a
+                // well-formed retry isn't rejected.
                 policy.count.fetch_sub(1, Ordering::SeqCst);
                 McpError::invalid_params(format!("sampling conversion failed: {}", error), None)
             })?;
 
-            // Sampling calls out to the provider with no MCP tools exposed —
-            // the server asked for pure reasoning, not tool-use. The empty
-            // tool list forces the provider into a plain text completion.
-            // Bounded by `MCP_SAMPLING_PROVIDER_TIMEOUT` so a hung provider
-            // can't pin the MCP request open indefinitely.
+            // Sampling calls out to the provider with no MCP tools exposed — the server asked for
+            // pure reasoning, not tool-use. The empty tool list forces the provider into a plain
+            // text completion. Bounded by `MCP_SAMPLING_PROVIDER_TIMEOUT` so a hung provider can't
+            // pin the MCP request open indefinitely.
             let completion = tokio::time::timeout(
                 MCP_SAMPLING_PROVIDER_TIMEOUT,
                 provider.complete(&system_prompt, &converted, &[]),
@@ -379,9 +369,8 @@ impl ClientHandler for AgshClientHandler {
             let (assistant_message, _stop_reason, _usage) = match completion {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => {
-                    // Provider returned an error before the timeout elapsed —
-                    // no quota was really consumed on our side, so hand the
-                    // sampling slot back.
+                    // Provider returned an error before the timeout elapsed — no quota was really
+                    // consumed on our side, so hand the sampling slot back.
                     policy.count.fetch_sub(1, Ordering::SeqCst);
                     return Err(McpError::internal_error(
                         format!("provider completion failed: {}", error),
@@ -410,20 +399,18 @@ impl ClientHandler for AgshClientHandler {
     }
 }
 
-/// Convert MCP `CreateMessageRequestParams` into the provider's
-/// `(system_prompt, Vec<Message>)` shape, flattening text content.
-/// Non-text sampling content (image, audio, tool_use, tool_result) is
-/// replaced with a placeholder string — none of agsh's providers accept
-/// these inside sampling calls.
+/// Convert MCP `CreateMessageRequestParams` into the provider's `(system_prompt, Vec<Message>)`
+/// shape, flattening text content. Non-text sampling content (image, audio, tool_use, tool_result)
+/// is replaced with a placeholder string — none of agsh's providers accept these inside sampling
+/// calls.
 fn convert_sampling_params(
     params: &CreateMessageRequestParams,
 ) -> std::result::Result<(String, Vec<crate::provider::Message>), String> {
     use crate::provider::{ContentBlock, Message, Role as ProviderRole};
 
-    // Defensive sanitisation: the system prompt is server-controlled and
-    // gets forwarded to the configured provider. Strip any Unicode Cc/Cf
-    // codepoints so a hostile server can't smuggle terminal escapes or
-    // homographs into our provider call.
+    // Defensive sanitisation: the system prompt is server-controlled and gets forwarded to the
+    // configured provider. Strip any Unicode Cc/Cf codepoints so a hostile server can't smuggle
+    // terminal escapes or homographs into our provider call.
     let system_prompt = params
         .system_prompt
         .as_deref()
@@ -469,10 +456,9 @@ pub struct McpToolAdapter {
     parameters: serde_json::Value,
     permission: Permission,
     entry: Arc<ServerEntry>,
-    /// `tool.annotations` and `tool.meta` captured from the remote
-    /// server. Surfaced to the provider as hints (read-only / destructive)
-    /// and round-tripped back in `_meta` so the MCP server can correlate
-    /// client-side context.
+    /// `tool.annotations` and `tool.meta` captured from the remote server. Surfaced to the
+    /// provider as hints (read-only / destructive) and round-tripped back in `_meta` so the
+    /// MCP server can correlate client-side context.
     annotations: Option<serde_json::Value>,
     meta: Option<serde_json::Value>,
     title: Option<String>,
@@ -504,24 +490,21 @@ impl McpToolAdapter {
         }
     }
 
-    /// Raw, server-advertised tool name (not the `mcp__<server>__<tool>`
-    /// namespaced form). Used to look the tool up in per-server config
-    /// fields like `eager_load_tools`.
+    /// Raw, server-advertised tool name (not the `mcp__<server>__<tool>` namespaced form). Used to
+    /// look the tool up in per-server config fields like `eager_load_tools`.
     pub(crate) fn raw_name(&self) -> &str {
         &self.remote_tool_name
     }
 
-    /// The server config that produced this adapter. Used to read
-    /// per-server policy (eager-load, permission overrides, …) without
-    /// rediscovering the manager.
+    /// The server config that produced this adapter. Used to read per-server policy (eager-load,
+    /// permission overrides, …) without rediscovering the manager.
     pub(crate) fn server_config(&self) -> &crate::config::McpServerConfig {
         &self.entry.config
     }
 
-    /// Resolves a per-call tool-call timeout. Respects `AGSH_MCP_TOOL_TIMEOUT`
-    /// (milliseconds) when set, otherwise falls back to 600 seconds — long
-    /// enough for a database index rebuild but short enough that a hung
-    /// server isn't invisible.
+    /// Resolves a per-call tool-call timeout. Respects `AGSH_MCP_TOOL_TIMEOUT` (milliseconds) when
+    /// set, otherwise falls back to 600 seconds — long enough for a database index rebuild but
+    /// short enough that a hung server isn't invisible.
     fn tool_call_timeout() -> std::time::Duration {
         std::env::var("AGSH_MCP_TOOL_TIMEOUT")
             .ok()
@@ -536,8 +519,8 @@ impl McpToolAdapter {
         cancellation: CancellationToken,
         tool_use_id: Option<String>,
     ) -> std::result::Result<rmcp::model::CallToolResult, ServiceError> {
-        // Per-call progress token: allows the server to emit
-        // `notifications/progress` updates that route back to our shell UI.
+        // Per-call progress token: allows the server to emit `notifications/progress` updates that
+        // route back to our shell UI.
         let (progress_token, _progress_guard) = crate::mcp::progress::register(
             self.entry.server_name().to_string(),
             self.remote_tool_name.clone(),
@@ -551,9 +534,8 @@ impl McpToolAdapter {
         }
         params.meta = Some(meta);
 
-        // Same error surface as an actually-closed transport — the
-        // upstream retry logic already handles `TransportClosed` by
-        // attempting a reconnect.
+        // Same error surface as an actually-closed transport — the upstream retry logic already
+        // handles `TransportClosed` by attempting a reconnect.
         let peer: Peer<RoleClient> = self
             .entry
             .require_connected()
@@ -566,8 +548,8 @@ impl McpToolAdapter {
         let request_id = handle.id.clone();
 
         let timeout = Self::tool_call_timeout();
-        // Cap how long we wait on the best-effort cancellation notification
-        // so a hung transport can't block Ctrl-C handling or shutdown.
+        // Cap how long we wait on the best-effort cancellation notification so a hung transport
+        // can't block Ctrl-C handling or shutdown.
         const CANCEL_NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         let notify_cancel = |reason: &'static str| {
             let peer = peer.clone();
@@ -690,10 +672,9 @@ impl Tool for McpToolAdapter {
                 }
             }
             Err(error) => {
-                // If the server rejected us with a 401/Unauthorized, persist
-                // the `needs-auth` verdict so the next startup skips the
-                // unauthenticated probe and goes straight to OAuth. The user
-                // must re-authenticate via `agsh mcp login <name>`.
+                // If the server rejected us with a 401/Unauthorized, persist the `needs-auth`
+                // verdict so the next startup skips the unauthenticated probe and goes straight to
+                // OAuth. The user must re-authenticate via `agsh mcp login <name>`.
                 let text = error.to_string().to_ascii_lowercase();
                 if (text.contains("401") || text.contains("unauthorized"))
                     && let Some(store) = self.entry.token_store()
@@ -725,10 +706,9 @@ impl Tool for McpToolAdapter {
         let is_error = result.is_error.unwrap_or(false);
         let mut content = convert_tool_result_content(&result.content);
 
-        // If the server included structured_content, append it as a fenced
-        // JSON block so providers can reason over it without needing a
-        // dedicated ToolResultContent variant. Matches Claude Code's
-        // pragmatic passthrough.
+        // If the server included structured_content, append it as a fenced JSON block so providers
+        // can reason over it without needing a dedicated ToolResultContent variant. Matches Claude
+        // Code's pragmatic passthrough.
         if let Some(structured) = &result.structured_content {
             let pretty = serde_json::to_string_pretty(structured).unwrap_or_default();
             if !pretty.is_empty() {
@@ -758,11 +738,10 @@ impl Tool for McpToolAdapter {
     }
 }
 
-/// Map MCP `CallToolResult.content` items to agsh's provider-layer
-/// `ToolResultContent` blocks. Text stays text; images pass through as
-/// multimodal blocks so providers like Claude and GPT-4o can see them;
-/// audio, embedded resources, and resource links collapse to informative
-/// text placeholders (no provider accepts them as tool-result blocks yet).
+/// Map MCP `CallToolResult.content` items to agsh's provider-layer `ToolResultContent` blocks. Text
+/// stays text; images pass through as multimodal blocks so providers like Claude and GPT-4o can see
+/// them; audio, embedded resources, and resource links collapse to informative text placeholders
+/// (no provider accepts them as tool-result blocks yet).
 fn convert_tool_result_content(
     items: &[rmcp::model::Content],
 ) -> Vec<crate::provider::ToolResultContent> {

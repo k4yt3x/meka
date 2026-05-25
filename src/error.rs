@@ -1,6 +1,5 @@
-//! Crate-wide [`AgshError`] enum and [`Result`] alias. All non-binary code
-//! paths return `Result<T, AgshError>`; the `main` binary wraps these in
-//! `anyhow::Result` for top-level reporting.
+//! Crate-wide [`AgshError`] enum and [`Result`] alias. All non-binary code paths return `Result<T,
+//! AgshError>`; the `main` binary wraps these in `anyhow::Result` for top-level reporting.
 
 use thiserror::Error;
 
@@ -30,9 +29,8 @@ pub enum AgshError {
     #[error("agent interrupted by user")]
     Interrupted,
 
-    /// A logic invariant in agsh itself was violated. Used in place of
-    /// `.expect()` for cases where a bug in our own code (not user input or
-    /// I/O) is the only path to the error.
+    /// A logic invariant in agsh itself was violated. Used in place of `.expect()` for cases where
+    /// a bug in our own code (not user input or I/O) is the only path to the error.
     #[error("internal error: {0}")]
     Internal(String),
 
@@ -58,11 +56,9 @@ pub enum AgshError {
         message: String,
     },
 
-    /// Strict MCP gate rejected the turn: at least one enabled server
-    /// wasn't `Connected` within the configured grace period. Turn
-    /// contents haven't been sent to the provider. The REPL catches
-    /// this and loops back to the prompt; one-shot mode propagates to
-    /// a non-zero process exit.
+    /// Strict MCP gate rejected the turn: at least one enabled server wasn't `Connected` within the
+    /// configured grace period. Turn contents haven't been sent to the provider. The REPL catches
+    /// this and loops back to the prompt; one-shot mode propagates to a non-zero process exit.
     #[error("mcp: {} server(s) not ready: {}", .servers.len(), .servers.iter().map(|(n, s)| format!("{} ({})", n, s)).collect::<Vec<_>>().join(", "))]
     McpTurnGated { servers: Vec<(String, String)> },
 }
@@ -71,15 +67,12 @@ pub type Result<T> = std::result::Result<T, AgshError>;
 
 /// Format a [`reqwest::Error`] together with its full source chain.
 ///
-/// reqwest's outer Display string ("error sending request for url …")
-/// usually hides the actual cause (TCP reset, HTTP/2 GOAWAY, TLS
-/// handshake failure, connect timeout, DNS resolution failure, …).
-/// Walking [`std::error::Error::source`] surfaces the underlying reason
-/// inline, so users (and bug reports) see what actually broke instead of
-/// reqwest's generic wrapper.
+/// reqwest's outer Display string ("error sending request for url …") usually hides the actual
+/// cause (TCP reset, HTTP/2 GOAWAY, TLS handshake failure, connect timeout, DNS resolution failure,
+/// …). Walking [`std::error::Error::source`] surfaces the underlying reason inline, so users (and
+/// bug reports) see what actually broke instead of reqwest's generic wrapper.
 ///
-/// Used at every site that wraps a `reqwest::Error` in an `AgshError`
-/// via Display formatting.
+/// Used at every site that wraps a `reqwest::Error` in an `AgshError` via Display formatting.
 pub(crate) fn format_reqwest_error(error: &reqwest::Error) -> String {
     use std::error::Error as _;
     let mut out = error.to_string();

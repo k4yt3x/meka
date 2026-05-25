@@ -1,18 +1,17 @@
 //! Environment-variable substitution for MCP server config strings.
 //!
-//! Supports `${VAR}` and `${VAR:-default}` syntax. Missing variables with no
-//! default leave the literal `${VAR}` in place (matches the behaviour of
-//! Claude Code) and accumulate a warning. Applied to every string field that
-//! could reasonably reference a user secret: stdio `command`/`args`/`env`
-//! values, and HTTP `url`/`headers` values.
+//! Supports `${VAR}` and `${VAR:-default}` syntax. Missing variables with no default leave the
+//! literal `${VAR}` in place (matches the behaviour of Claude Code) and accumulate a warning.
+//! Applied to every string field that could reasonably reference a user secret: stdio
+//! `command`/`args`/`env` values, and HTTP `url`/`headers` values.
 
 use std::collections::HashMap;
 
 use crate::config::McpServerConfig;
 
-/// Expand `${VAR}` / `${VAR:-default}` in `input`, consulting `lookup`
-/// (defaults to process environment). Returns the expanded string alongside
-/// the names of any variables that were missing and had no default.
+/// Expand `${VAR}` / `${VAR:-default}` in `input`, consulting `lookup` (defaults to process
+/// environment). Returns the expanded string alongside the names of any variables that were missing
+/// and had no default.
 pub fn expand_env_vars<F>(input: &str, mut lookup: F) -> (String, Vec<String>)
 where
     F: FnMut(&str) -> Option<String>,
@@ -22,15 +21,13 @@ where
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        // Fast path: any byte that is not the start of a `${…}` opener is
-        // copied verbatim by reading the next UTF-8 scalar and pushing the
-        // whole codepoint. Byte-level `as char` would mangle multi-byte
-        // sequences (e.g. `café` → `cafÃ©`).
+        // Fast path: any byte that is not the start of a `${…}` opener is copied verbatim by
+        // reading the next UTF-8 scalar and pushing the whole codepoint. Byte-level `as char` would
+        // mangle multi-byte sequences (e.g. `café` → `cafÃ©`).
         if bytes[i] != b'$' || i + 1 >= bytes.len() || bytes[i + 1] != b'{' {
-            // SAFETY: `input` is a valid &str, so slicing from a byte index
-            // that is a char boundary yields a valid &str. `i` is always on
-            // a char boundary because we advance by `ch.len_utf8()` below
-            // or jump to `end + 1` (the byte after a `}` — ASCII, always a
+            // SAFETY: `input` is a valid &str, so slicing from a byte index that is a char boundary
+            // yields a valid &str. `i` is always on a char boundary because we advance by
+            // `ch.len_utf8()` below or jump to `end + 1` (the byte after a `}` — ASCII, always a
             // boundary).
             let rest = &input[i..];
             let ch = rest.chars().next().expect("non-empty slice");
@@ -72,11 +69,11 @@ where
     (out, missing)
 }
 
-/// Walk every expandable string inside `config` and apply
-/// [`expand_env_vars`] using the process environment.
+/// Walk every expandable string inside `config` and apply [`expand_env_vars`] using the process
+/// environment.
 ///
-/// Returns the list of missing variable names (deduplicated, in first-seen
-/// order) so the caller can surface a single warning per startup.
+/// Returns the list of missing variable names (deduplicated, in first-seen order) so the caller can
+/// surface a single warning per startup.
 pub fn expand_server_config(config: &mut McpServerConfig) -> Vec<String> {
     let mut all_missing: Vec<String> = Vec::new();
     let mut record = |missing: Vec<String>| {

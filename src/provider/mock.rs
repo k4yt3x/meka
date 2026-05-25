@@ -1,20 +1,16 @@
-//! Scripted [`Provider`] for tests. Replays a queue of per-round
-//! `StreamEvent` lists so an integration test can drive a multi-round
-//! `Agent::run_turn` (tool-use round → tool-result round → final
-//! text round) without touching the network.
+//! Scripted [`Provider`] for tests. Replays a queue of per-round `StreamEvent` lists so an
+//! integration test can drive a multi-round `Agent::run_turn` (tool-use round → tool-result round →
+//! final text round) without touching the network.
 //!
-//! Activated by `agsh acp` only when the `AGSH_ACP_MOCK_PROVIDER`
-//! environment variable is set to `1`. The variable also names the
-//! file containing the JSON-encoded script (see [`load_script_from_env`]).
-//! Anything else (production, REPL, oneshot) is unaffected — this
-//! module is only reachable via the env-gated path.
+//! Activated by `agsh acp` only when the `AGSH_ACP_MOCK_PROVIDER` environment variable is set to
+//! `1`. The variable also names the file containing the JSON-encoded script (see
+//! [`crate::provider::mock::load_script_from_env`]). Anything else (production, REPL, oneshot) is
+//! unaffected — this module is only reachable via the env-gated path.
 //!
-//! The mock is intentionally minimal: text deltas, thinking deltas,
-//! tool-use lifecycle, `MessageEnd`, plus a synthetic `Fail` event
-//! that returns an error from [`Provider::stream`] so the agent's
-//! non-Interrupted error path can be exercised end-to-end. Image
-//! content and token-usage events are not supported; tests that
-//! need them should extend the mock first.
+//! The mock is intentionally minimal: text deltas, thinking deltas, tool-use lifecycle,
+//! `MessageEnd`, plus a synthetic `Fail` event that returns an error from [`Provider::stream`] so
+//! the agent's non-Interrupted error path can be exercised end-to-end. Image content and
+//! token-usage events are not supported; tests that need them should extend the mock first.
 
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -28,12 +24,10 @@ use crate::{
     provider::{Message, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
 };
 
-/// Serialized event used by [`MockProvider`]. Mirrors the runtime
-/// [`StreamEvent`] enum but uses owned struct-tagged variants so
-/// scripts can be loaded from JSON (`serde`'s internally-tagged enums
-/// don't accept tuple/newtype variants). `Sleep` is the one
-/// non-stream-event variant — it stalls the mock so a test can fire
-/// `session/cancel` mid-turn; the sleep races against the
+/// Serialized event used by [`MockProvider`]. Mirrors the runtime [`StreamEvent`] enum but uses
+/// owned struct-tagged variants so scripts can be loaded from JSON (`serde`'s internally-tagged
+/// enums don't accept tuple/newtype variants). `Sleep` is the one non-stream-event variant — it
+/// stalls the mock so a test can fire `session/cancel` mid-turn; the sleep races against the
 /// cancellation token, so cancel cuts it short cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -44,9 +38,8 @@ pub enum MockEvent {
     ThinkingDelta {
         text: String,
     },
-    /// Caps an in-flight thinking block. `signature` mirrors the
-    /// real Claude wire shape but is `None` in every test today; the
-    /// agent treats it as opaque pass-through (see
+    /// Caps an in-flight thinking block. `signature` mirrors the real Claude wire shape but is
+    /// `None` in every test today; the agent treats it as opaque pass-through (see
     /// [`crate::frontend::FrontendEvent::ThinkingBlock`]).
     ThinkingComplete {
         signature: Option<String>,
@@ -67,10 +60,9 @@ pub enum MockEvent {
     Sleep {
         ms: u64,
     },
-    /// Synthetic provider failure. The stream returns
-    /// `Err(AgshError::Provider(message))` immediately, exercising
-    /// the non-Interrupted error arm of `Agent::run_turn` (which
-    /// the ACP layer maps to a JSON-RPC `internal_error`).
+    /// Synthetic provider failure. The stream returns `Err(AgshError::Provider(message))`
+    /// immediately, exercising the non-Interrupted error arm of `Agent::run_turn` (which the ACP
+    /// layer maps to a JSON-RPC `internal_error`).
     Fail {
         message: String,
     },
@@ -82,9 +74,8 @@ pub enum MockStopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
-    /// Model-side refusal. Maps to `StopReason::Refusal("")`; the
-    /// text content of the assistant message is what the user sees
-    /// as the refusal explanation.
+    /// Model-side refusal. Maps to `StopReason::Refusal("")`; the text content of the assistant
+    /// message is what the user sees as the refusal explanation.
     Refusal,
 }
 
@@ -99,9 +90,9 @@ impl From<MockStopReason> for StopReason {
     }
 }
 
-/// A scripted multi-round response. Each call to [`Provider::stream`]
-/// drains one round (`Vec<MockEvent>`); subsequent rounds satisfy
-/// subsequent agent loop iterations after tool results return.
+/// A scripted multi-round response. Each call to [`Provider::stream`] drains one round
+/// (`Vec<MockEvent>`); subsequent rounds satisfy subsequent agent loop iterations after tool
+/// results return.
 #[derive(Debug, Default)]
 pub struct MockProvider {
     rounds: Mutex<VecDeque<Vec<MockEvent>>>,
@@ -123,9 +114,8 @@ impl Provider for MockProvider {
         _messages: &[Message],
         _tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason, TokenUsage)> {
-        // Tests only drive the streaming path; `complete` is reached
-        // only via auto-compaction, which the ACP test suite doesn't
-        // exercise. If a future test needs it, populate the rounds
+        // Tests only drive the streaming path; `complete` is reached only via auto-compaction,
+        // which the ACP test suite doesn't exercise. If a future test needs it, populate the rounds
         // queue the same way and add a matching impl here.
         Err(crate::error::AgshError::Provider(
             "MockProvider::complete is not implemented".to_string(),
@@ -153,9 +143,8 @@ impl Provider for MockProvider {
                     return Err(crate::error::AgshError::Provider(message));
                 }
                 MockEvent::Sleep { ms } => {
-                    // Race the sleep against cancellation so a
-                    // mid-turn `session/cancel` doesn't have to wait
-                    // for the full delay to elapse.
+                    // Race the sleep against cancellation so a mid-turn `session/cancel` doesn't
+                    // have to wait for the full delay to elapse.
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
                         _ = cancellation.cancelled() => return Ok(()),
@@ -196,10 +185,9 @@ impl Provider for MockProvider {
     }
 }
 
-/// Read the JSON script from the path named in
-/// `AGSH_ACP_MOCK_PROVIDER_SCRIPT`. Returns `Ok(None)` when the env
-/// var is unset; `Err` only on actual parse failure (so the agsh
-/// startup path can choose to log+abort vs proceed).
+/// Read the JSON script from the path named in `AGSH_ACP_MOCK_PROVIDER_SCRIPT`. Returns `Ok(None)`
+/// when the env var is unset; `Err` only on actual parse failure (so the agsh startup path can
+/// choose to log+abort vs proceed).
 pub fn load_script_from_env() -> Result<Option<Vec<Vec<MockEvent>>>> {
     let Ok(path) = std::env::var("AGSH_ACP_MOCK_PROVIDER_SCRIPT") else {
         return Ok(None);
@@ -277,11 +265,9 @@ mod tests {
         assert!(rx.recv().await.is_none(), "exhausted script emits nothing");
     }
 
-    /// `Fail` returns `Err(AgshError::Provider(_))` from
-    /// [`Provider::stream`] without emitting any events. The agent
-    /// loop turns that into a non-Interrupted `run_turn` error,
-    /// which the ACP layer maps to a JSON-RPC `internal_error`
-    /// response.
+    /// `Fail` returns `Err(AgshError::Provider(_))` from [`Provider::stream`] without emitting any
+    /// events. The agent loop turns that into a non-Interrupted `run_turn` error, which the ACP
+    /// layer maps to a JSON-RPC `internal_error` response.
     #[tokio::test]
     async fn test_mock_provider_fail_event_returns_error() {
         let provider = MockProvider::from_rounds(vec![vec![MockEvent::Fail {
@@ -301,11 +287,9 @@ mod tests {
         assert!(rx.recv().await.is_none(), "Fail must not emit events");
     }
 
-    /// `ThinkingDelta` + `ThinkingComplete` map straight through to
-    /// the same-named `StreamEvent` variants. The agent loop
-    /// collapses the pair into a single `FrontendEvent::ThinkingBlock`,
-    /// which the ACP frontend renders as a
-    /// `SessionUpdate::AgentThoughtChunk` notification.
+    /// `ThinkingDelta` + `ThinkingComplete` map straight through to the same-named `StreamEvent`
+    /// variants. The agent loop collapses the pair into a single `FrontendEvent::ThinkingBlock`,
+    /// which the ACP frontend renders as a `SessionUpdate::AgentThoughtChunk` notification.
     #[tokio::test]
     async fn test_mock_provider_emits_thinking_delta_and_complete() {
         let provider = MockProvider::from_rounds(vec![vec![

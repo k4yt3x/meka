@@ -1,7 +1,6 @@
-//! Model Context Protocol (MCP) client integration. Manages the lifecycle of
-//! configured MCP servers (stdio child processes or streamable HTTP), exposes
-//! their tools through the regular [`crate::tools`] registry, and handles
-//! OAuth/JWT authentication for HTTP transports.
+//! Model Context Protocol (MCP) client integration. Manages the lifecycle of configured MCP servers
+//! (stdio child processes or streamable HTTP), exposes their tools through the regular
+//! [`crate::tools`] registry, and handles OAuth/JWT authentication for HTTP transports.
 
 pub mod auth;
 pub mod cli;
@@ -38,56 +37,48 @@ use crate::{
     session::TokenStore,
 };
 
-/// Cap MCP-provided text (tool descriptions, resource/prompt descriptions) to
-/// this many characters so a chatty server can't blow up the system prompt.
-/// Mirrors Claude Code's `MAX_MCP_DESCRIPTION_LENGTH`.
+/// Cap MCP-provided text (tool descriptions, resource/prompt descriptions) to this many characters
+/// so a chatty server can't blow up the system prompt. Mirrors Claude Code's
+/// `MAX_MCP_DESCRIPTION_LENGTH`.
 pub const MAX_MCP_DESCRIPTION_LENGTH: usize = 2048;
 
-/// Cap on base64 payload size for an MCP image tool-result block. A server
-/// returning a giant image would otherwise be cloned verbatim, forwarded to
-/// the provider, billed against the user's API quota, and risk OOM. Mirrors
-/// the 10 MiB body cap on `fetch_url`.
+/// Cap on base64 payload size for an MCP image tool-result block. A server returning a giant image
+/// would otherwise be cloned verbatim, forwarded to the provider, billed against the user's API
+/// quota, and risk OOM. Mirrors the 10 MiB body cap on `fetch_url`.
 pub const MAX_MCP_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
-/// Wall-clock timeout on `provider.complete` calls invoked from a server's
-/// `sampling/createMessage` request. Without it, a hung provider keeps the
-/// MCP request open forever; with it, the server gets a timely error and
-/// the sampling slot is freed.
+/// Wall-clock timeout on `provider.complete` calls invoked from a server's `sampling/createMessage`
+/// request. Without it, a hung provider keeps the MCP request open forever; with it, the server
+/// gets a timely error and the sampling slot is freed.
 pub const MCP_SAMPLING_PROVIDER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Allow-list of image MIME types passed straight through to the provider.
-/// Anything else (notably `image/svg+xml`, which can embed script/link
-/// elements) is converted to a text placeholder.
+/// Allow-list of image MIME types passed straight through to the provider. Anything else (notably
+/// `image/svg+xml`, which can embed script/link elements) is converted to a text placeholder.
 pub const ALLOWED_IMAGE_MIME_TYPES: &[&str] =
     &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// Cache TTL for MCP "needs auth" probe verdicts. A value of 15 min matches
-/// Claude Code's `MCP_AUTH_CACHE_TTL_MS` and keeps a restart after a failed
-/// auth flow from re-probing servers in a tight loop.
+/// Cache TTL for MCP "needs auth" probe verdicts. A value of 15 min matches Claude Code's
+/// `MCP_AUTH_CACHE_TTL_MS` and keeps a restart after a failed auth flow from re-probing servers in
+/// a tight loop.
 pub const MCP_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 pub(crate) type McpRunningService =
     rmcp::service::RunningService<RoleClient, handler::AgshClientHandler>;
 
 tokio::task_local! {
-    /// Per-task override for the cwd reported in MCP `roots/list`.
-    /// When an agent dispatches an MCP tool from a multi-session ACP
-    /// process, the dispatch wraps the tool's `execute` future in
-    /// [`with_session_cwd`] so any `roots/list` callback fired
-    /// *during* the tool call sees the calling session's cwd —
-    /// rather than the process default the MCP context was seeded
-    /// with at startup.
+    /// Per-task override for the cwd reported in MCP `roots/list`. When an agent dispatches an MCP
+    /// tool from a multi-session ACP process, the dispatch wraps the tool's `execute` future in
+    /// [`with_session_cwd`] so any `roots/list` callback fired *during* the tool call sees the
+    /// calling session's cwd — rather than the process default the MCP context was seeded with at
+    /// startup.
     ///
-    /// `roots/list` queries outside a tool call (e.g. the
-    /// connection-establishment handshake before any session
-    /// exists) fall back to the process default via
-    /// [`current_roots_cwd`].
+    /// `roots/list` queries outside a tool call (e.g. the connection-establishment handshake before
+    /// any session exists) fall back to the process default via [`current_roots_cwd`].
     static SESSION_CWD: crate::agent::SharedCwd;
 }
 
-/// Read the cwd MCP should report for `roots/list`. Returns the
-/// task-local override if set (active tool call from a session) or
-/// the supplied `default` otherwise (connection-time queries,
+/// Read the cwd MCP should report for `roots/list`. Returns the task-local override if set (active
+/// tool call from a session) or the supplied `default` otherwise (connection-time queries,
 /// REPL/oneshot paths where there's a single process-wide cwd).
 pub(crate) fn current_roots_cwd(default: &crate::agent::SharedCwd) -> std::path::PathBuf {
     SESSION_CWD
@@ -95,10 +86,9 @@ pub(crate) fn current_roots_cwd(default: &crate::agent::SharedCwd) -> std::path:
         .unwrap_or_else(|_| crate::agent::cwd_snapshot(default))
 }
 
-/// Scope `cwd` as the task-local override for the duration of
-/// `fut`. Used by MCP tool dispatch so a session's cwd reaches the
-/// `roots/list` handler without explicit threading through the
-/// rmcp callback API (which doesn't carry session context).
+/// Scope `cwd` as the task-local override for the duration of `fut`. Used by MCP tool dispatch so a
+/// session's cwd reaches the `roots/list` handler without explicit threading through the rmcp
+/// callback API (which doesn't carry session context).
 pub async fn with_session_cwd<F, T>(cwd: crate::agent::SharedCwd, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -108,33 +98,28 @@ where
 
 pub struct McpClientManager {
     servers: HashMap<String, Arc<ServerEntry>>,
-    /// Global fallback permission from `[mcp].default_permission`.
-    /// Consulted by `resolve_tool_permission` at tool-registration time
-    /// when neither the server nor the user has configured a more
-    /// specific permission and the server didn't advertise a
-    /// `readOnlyHint`. `None` means "no user default" — resolution
-    /// falls through to the hardcoded strict `Write`.
+    /// Global fallback permission from `[mcp].default_permission`. Consulted by
+    /// `resolve_tool_permission` at tool-registration time when neither the server nor the user
+    /// has configured a more specific permission and the server didn't advertise a
+    /// `readOnlyHint`. `None` means "no user default" — resolution falls through to the
+    /// hardcoded strict `Write`.
     mcp_default_permission: Option<Permission>,
-    /// Flipped to `true` by the background connector once every enabled
-    /// entry has reached a terminal state (Connected or Failed). The turn
-    /// gate watches this via [`Self::await_settled`] / [`Self::all_ready`].
+    /// Flipped to `true` by the background connector once every enabled entry has reached a
+    /// terminal state (Connected or Failed). The turn gate watches this via
+    /// [`Self::await_settled`] / [`Self::all_ready`].
     settled: tokio::sync::watch::Sender<bool>,
-    /// Entries waiting to be connected by [`Self::start_connector`].
-    /// `None` once the connector has been started so a second call is
-    /// a no-op; avoids re-spawning the connector if a test or the REPL
-    /// re-enters the same manager.
+    /// Entries waiting to be connected by [`Self::start_connector`]. `None` once the connector has
+    /// been started so a second call is a no-op; avoids re-spawning the connector if a test or the
+    /// REPL re-enters the same manager.
     pending_entries: std::sync::Mutex<Option<Vec<Arc<ServerEntry>>>>,
-    /// Live snapshot of every connected server's currently-registered
-    /// tools. The connector writes here as each server reaches
-    /// `Connected`, and `on_tool_list_changed` writes here on dynamic
-    /// updates. New sessions read this snapshot at
-    /// [`Self::attach_registry`] time to backfill MCP tools into
-    /// their fresh per-session registry.
+    /// Live snapshot of every connected server's currently-registered tools. The connector writes
+    /// here as each server reaches `Connected`, and `on_tool_list_changed` writes here on dynamic
+    /// updates. New sessions read this snapshot at [`Self::attach_registry`] time to backfill MCP
+    /// tools into their fresh per-session registry.
     tools_snapshot: tokio::sync::RwLock<HashMap<String, Vec<Arc<dyn crate::tools::Tool>>>>,
-    /// Registries currently observing MCP tool updates. Sessions
-    /// attach at `session/new` (or REPL startup) and detach at
-    /// `session/close`. Updates from the connector or notification
-    /// handler propagate to every entry.
+    /// Registries currently observing MCP tool updates. Sessions attach at `session/new` (or REPL
+    /// startup) and detach at `session/close`. Updates from the connector or notification handler
+    /// propagate to every entry.
     attached_registries: tokio::sync::RwLock<Vec<crate::tools::ToolRegistry>>,
 }
 
@@ -169,10 +154,9 @@ impl ServerState {
     }
 }
 
-/// Holds the lifecycle state of a single MCP server plus reconnection
-/// machinery. Wrapped in an [`Arc`] and shared between the manager, the
-/// per-server tool adapters, and the resource/prompt builtin tools so
-/// every caller sees the current service (or the current failure) via
+/// Holds the lifecycle state of a single MCP server plus reconnection machinery. Wrapped in an
+/// [`Arc`] and shared between the manager, the per-server tool adapters, and the resource/prompt
+/// builtin tools so every caller sees the current service (or the current failure) via
 /// [`Self::require_connected`].
 pub struct ServerEntry {
     pub(crate) server_name: String,
@@ -181,22 +165,21 @@ pub struct ServerEntry {
     pub(crate) client_context: Arc<McpClientContext>,
     pub(crate) state: RwLock<ServerState>,
     pub(crate) reconnect_lock: Mutex<()>,
-    /// Optional `InitializeResult.instructions` captured on the first
-    /// `Connected` transition. Immutable for the lifetime of the
-    /// connection per the MCP spec, so reconnects don't reset it.
+    /// Optional `InitializeResult.instructions` captured on the first `Connected` transition.
+    /// Immutable for the lifetime of the connection per the MCP spec, so reconnects don't reset
+    /// it.
     pub(crate) instructions: OnceLock<Option<String>>,
 }
 
 impl ServerEntry {
-    /// Returns the server's `InitializeResult.instructions` (sanitised +
-    /// truncated to [`MAX_MCP_DESCRIPTION_LENGTH`]) if the server advertised
-    /// one during the handshake.
+    /// Returns the server's `InitializeResult.instructions` (sanitised + truncated to
+    /// [`MAX_MCP_DESCRIPTION_LENGTH`]) if the server advertised one during the handshake.
     pub fn instructions(&self) -> Option<&str> {
         self.instructions.get().and_then(|opt| opt.as_deref())
     }
 
-    /// Snapshot of the current lifecycle state. `Connected` carries an
-    /// `Arc<McpRunningService>` which is cheap to clone.
+    /// Snapshot of the current lifecycle state. `Connected` carries an `Arc<McpRunningService>`
+    /// which is cheap to clone.
     pub async fn state(&self) -> ServerState {
         self.state.read().await.clone()
     }
@@ -211,9 +194,8 @@ impl ServerEntry {
 }
 
 impl ServerEntry {
-    /// Return the live peer if the server is currently `Connected`;
-    /// otherwise return an error describing the current lifecycle
-    /// state. Every tool dispatch / list-call path funnels through
+    /// Return the live peer if the server is currently `Connected`; otherwise return an error
+    /// describing the current lifecycle state. Every tool dispatch / list-call path funnels through
     /// this so the "MCP X not ready" error surfaces at one site.
     pub(crate) async fn require_connected(&self) -> Result<Peer<RoleClient>> {
         match &*self.state.read().await {
@@ -233,8 +215,8 @@ impl ServerEntry {
         }
     }
 
-    /// Transport-close check used by [`Self::reconnect`]. Returns false
-    /// if the server isn't `Connected` (there's nothing to reconnect).
+    /// Transport-close check used by [`Self::reconnect`]. Returns false if the server isn't
+    /// `Connected` (there's nothing to reconnect).
     async fn needs_reconnect(&self) -> bool {
         match &*self.state.read().await {
             ServerState::Connected { service } => service.peer().is_transport_closed(),
@@ -242,20 +224,19 @@ impl ServerEntry {
         }
     }
 
-    /// Attempt to reconnect this server with exponential backoff. Serialised
-    /// via `reconnect_lock` so concurrent tool calls don't stampede. If
-    /// another caller already reopened the transport, returns immediately.
+    /// Attempt to reconnect this server with exponential backoff. Serialised via `reconnect_lock`
+    /// so concurrent tool calls don't stampede. If another caller already reopened the transport,
+    /// returns immediately.
     ///
-    /// Schedule: 1s, 2s, 4s, 8s, 16s, capped at 30s, max 5 attempts. Only
-    /// remote (HTTP) transports go through backoff — a dead stdio child has
-    /// to be respawned and retry-after-sleep doesn't help.
+    /// Schedule: 1s, 2s, 4s, 8s, 16s, capped at 30s, max 5 attempts. Only remote (HTTP) transports
+    /// go through backoff — a dead stdio child has to be respawned and retry-after-sleep doesn't
+    /// help.
     ///
-    /// The connect future itself can be `!Send` for OAuth-authenticated
-    /// servers (rmcp 1.5 holds a `form_urlencoded::Serializer` across an
-    /// await in its auth module, whose `Option<&dyn Fn(&str) -> Cow<[u8]>>`
-    /// closure slot is not `Sync`). To keep `Tool::execute`'s `Send` bound
-    /// satisfied, we drive the reconnect on a `spawn_blocking` thread using
-    /// the outer runtime's `Handle`.
+    /// The connect future itself can be `!Send` for OAuth-authenticated servers (rmcp 1.5 holds a
+    /// `form_urlencoded::Serializer` across an await in its auth module, whose `Option<&dyn
+    /// Fn(&str) -> Cow<[u8]>>` closure slot is not `Sync`). To keep `Tool::execute`'s `Send` bound
+    /// satisfied, we drive the reconnect on a `spawn_blocking` thread using the outer runtime's
+    /// `Handle`.
     pub(crate) async fn reconnect(self: &Arc<Self>) -> Result<()> {
         let _guard = self.reconnect_lock.lock().await;
 
@@ -337,16 +318,14 @@ impl ServerEntry {
     }
 }
 
-/// Runtime tuning for the background MCP connector. Pulled from
-/// `ResolvedConfig` by the binary; the manager uses it directly.
+/// Runtime tuning for the background MCP connector. Pulled from `ResolvedConfig` by the binary; the
+/// manager uses it directly.
 pub struct McpRuntimeConfig {
     /// Per-server wrap around connect + `initialize` + `list_tools`.
     pub connect_timeout: std::time::Duration,
-    /// Max concurrent stdio spawns. Defaults to 3 (env
-    /// `AGSH_MCP_STDIO_CONCURRENCY`).
+    /// Max concurrent stdio spawns. Defaults to 3 (env `AGSH_MCP_STDIO_CONCURRENCY`).
     pub stdio_concurrency: usize,
-    /// Max concurrent HTTP connects. Defaults to 20 (env
-    /// `AGSH_MCP_HTTP_CONCURRENCY`).
+    /// Max concurrent HTTP connects. Defaults to 20 (env `AGSH_MCP_HTTP_CONCURRENCY`).
     pub http_concurrency: usize,
 }
 
@@ -360,10 +339,9 @@ impl McpRuntimeConfig {
     }
 }
 
-/// Parse a positive-integer concurrency override from `env_var`. Falls
-/// back to `default` when the variable is unset, unparseable, or zero.
-/// Extracted from `McpRuntimeConfig::from_config` so tests can exercise
-/// the env-var override path without constructing a full `ResolvedConfig`.
+/// Parse a positive-integer concurrency override from `env_var`. Falls back to `default` when the
+/// variable is unset, unparseable, or zero. Extracted from `McpRuntimeConfig::from_config` so tests
+/// can exercise the env-var override path without constructing a full `ResolvedConfig`.
 fn resolve_concurrency_env(env_var: &str, default: usize) -> usize {
     std::env::var(env_var)
         .ok()
@@ -382,9 +360,8 @@ impl McpClientManager {
     /// 3. Build the tool registry and call `manager.attach_registry(registry.clone()).await`.
     /// 4. `manager.start_connector(runtime);`
     ///
-    /// The split exists so the connector can register MCP tools into
-    /// attached registries as each server comes online, without
-    /// forcing any registry to exist before config validation.
+    /// The split exists so the connector can register MCP tools into attached registries as each
+    /// server comes online, without forcing any registry to exist before config validation.
     pub async fn prepare(
         configs: &[McpServerConfig],
         mcp_default_permission: Option<Permission>,
@@ -395,8 +372,8 @@ impl McpClientManager {
         let mut pending: Vec<Arc<ServerEntry>> = Vec::new();
 
         for original_config in configs {
-            // Apply env-var substitution (`${VAR}` / `${VAR:-default}`) once,
-            // up-front, so the rest of the pipeline sees only resolved values.
+            // Apply env-var substitution (`${VAR}` / `${VAR:-default}`) once, up-front, so the rest
+            // of the pipeline sees only resolved values.
             let mut config = original_config.clone();
             let missing = crate::mcp::expand::expand_server_config(&mut config);
             if !missing.is_empty() {
@@ -414,8 +391,8 @@ impl McpClientManager {
                 });
             }
 
-            // Reject anything that would collide with agsh-internal names or
-            // our `mcp__<server>__<tool>` namespace separator.
+            // Reject anything that would collide with agsh-internal names or our
+            // `mcp__<server>__<tool>` namespace separator.
             if crate::mcp::sanitize::is_reserved_server_name(&config.name) {
                 return Err(AgshError::McpConnection {
                     server_name: config.name.clone(),
@@ -476,12 +453,10 @@ impl McpClientManager {
             servers.insert(config.name.clone(), entry);
         }
 
-        // Initialise the watch with `true` when nothing will ever be
-        // pending (all servers disabled, or no servers configured) so
-        // callers of `all_ready` / `await_settled` short-circuit
-        // immediately. `send` on a Sender with no receivers errors and
-        // drops the value, so the initial-value path is the only safe
-        // pre-subscription way to publish settled.
+        // Initialise the watch with `true` when nothing will ever be pending (all servers disabled,
+        // or no servers configured) so callers of `all_ready` / `await_settled` short-circuit
+        // immediately. `send` on a Sender with no receivers errors and drops the value, so the
+        // initial-value path is the only safe pre-subscription way to publish settled.
         let initial_settled = pending.is_empty();
         let (settled_tx, _) = tokio::sync::watch::channel(initial_settled);
         let manager = Arc::new(Self {
@@ -495,14 +470,12 @@ impl McpClientManager {
         Ok(manager)
     }
 
-    /// Update the live snapshot for one server's tools and propagate
-    /// the change to every attached registry. Called by the connector
-    /// when a server reaches `Connected` and by `on_tool_list_changed`
-    /// when a server signals a dynamic update.
+    /// Update the live snapshot for one server's tools and propagate the change to every attached
+    /// registry. Called by the connector when a server reaches `Connected` and by
+    /// `on_tool_list_changed` when a server signals a dynamic update.
     ///
-    /// The snapshot is what new sessions read at attach time; the
-    /// propagation keeps existing sessions in sync without requiring
-    /// them to re-attach.
+    /// The snapshot is what new sessions read at attach time; the propagation keeps existing
+    /// sessions in sync without requiring them to re-attach.
     pub async fn update_server_tools(
         &self,
         server_name: &str,
@@ -518,21 +491,18 @@ impl McpClientManager {
         }
     }
 
-    /// Attach a per-session registry to receive live MCP tool updates.
-    /// Pushes the registry into the attached list *before* backfilling
-    /// from the snapshot so any concurrent [`Self::update_server_tools`]
-    /// either fans out to the new registry (push happened first) or has
-    /// its result observed by the subsequent backfill (push happened
-    /// second). The opposite ordering — read snapshot, then push — has
-    /// a window where an update can land between the snapshot read and
-    /// the push, with the registry missing it forever.
+    /// Attach a per-session registry to receive live MCP tool updates. Pushes the registry into the
+    /// attached list *before* backfilling from the snapshot so any concurrent
+    /// [`Self::update_server_tools`] either fans out to the new registry (push happened first) or
+    /// has its result observed by the subsequent backfill (push happened second). The opposite
+    /// ordering — read snapshot, then push — has a window where an update can land between the
+    /// snapshot read and the push, with the registry missing it forever.
     ///
-    /// `replace_server_tools` is idempotent, so the double-write when
-    /// both paths fire is harmless.
+    /// `replace_server_tools` is idempotent, so the double-write when both paths fire is harmless.
     ///
-    /// Sessions call this at `session/new` (after building their
-    /// per-session [`crate::tools::ToolRegistry`]) and pair it with
-    /// [`Self::detach_registry`] at `session/close`.
+    /// Sessions call this at `session/new` (after building their per-session
+    /// [`crate::tools::ToolRegistry`]) and pair it with [`Self::detach_registry`] at
+    /// `session/close`.
     pub async fn attach_registry(&self, registry: crate::tools::ToolRegistry) {
         self.attached_registries
             .write()
@@ -544,19 +514,17 @@ impl McpClientManager {
         }
     }
 
-    /// Detach a registry from MCP tool updates. Identity is by inner
-    /// `Arc` pointer (see [`crate::tools::ToolRegistry::same_inner`])
-    /// so clones of the same registry match. No-op if not attached.
+    /// Detach a registry from MCP tool updates. Identity is by inner `Arc` pointer (see
+    /// [`crate::tools::ToolRegistry::same_inner`]) so clones of the same registry match. No-op if
+    /// not attached.
     pub async fn detach_registry(&self, registry: &crate::tools::ToolRegistry) {
         let mut registries = self.attached_registries.write().await;
         registries.retain(|other| !crate::tools::ToolRegistry::same_inner(other, registry));
     }
 
-    /// Mark a batch of tool names as deferred across every attached
-    /// registry. Called after [`Self::update_server_tools`] when some
-    /// of the newly-registered adapters are lazy-load only — the
-    /// agent's tools-array build then skips them until they're
-    /// explicitly requested.
+    /// Mark a batch of tool names as deferred across every attached registry. Called after
+    /// [`Self::update_server_tools`] when some of the newly-registered adapters are lazy-load only
+    /// — the agent's tools-array build then skips them until they're explicitly requested.
     pub async fn mark_deferred_on_attached(&self, tool_names: &[String]) {
         let registries = self.attached_registries.read().await;
         for registry in registries.iter() {
@@ -566,15 +534,13 @@ impl McpClientManager {
         }
     }
 
-    /// Spawn the background connector. Consumes the `Pending` entry list
-    /// stashed by [`Self::prepare`] so subsequent calls are no-ops. Safe
-    /// to call on managers with no pending entries.
+    /// Spawn the background connector. Consumes the `Pending` entry list stashed by
+    /// [`Self::prepare`] so subsequent calls are no-ops. Safe to call on managers with no pending
+    /// entries.
     ///
-    /// The connector writes tool discoveries through
-    /// [`Self::update_server_tools`], which fans out to every
-    /// registry attached via [`Self::attach_registry`]. The caller
-    /// does not pass a specific registry — attach yours first, then
-    /// start the connector.
+    /// The connector writes tool discoveries through [`Self::update_server_tools`], which fans out
+    /// to every registry attached via [`Self::attach_registry`]. The caller does not pass a
+    /// specific registry — attach yours first, then start the connector.
     pub fn start_connector(self: &Arc<Self>, runtime: McpRuntimeConfig) {
         let Some(pending) = self
             .pending_entries
@@ -593,16 +559,14 @@ impl McpClientManager {
         });
     }
 
-    /// True when every enabled server has reached a terminal state
-    /// (`Connected` or `Failed`). Returns `true` if there are no enabled
-    /// servers configured. Non-blocking.
+    /// True when every enabled server has reached a terminal state (`Connected` or `Failed`).
+    /// Returns `true` if there are no enabled servers configured. Non-blocking.
     pub fn all_ready(&self) -> bool {
         *self.settled.borrow()
     }
 
-    /// Parks until the background connector finishes processing every
-    /// enabled server. Returns immediately if already settled. Safe to
-    /// call concurrently from multiple turn dispatches.
+    /// Parks until the background connector finishes processing every enabled server. Returns
+    /// immediately if already settled. Safe to call concurrently from multiple turn dispatches.
     pub async fn await_settled(&self) {
         let mut rx = self.settled.subscribe();
         if *rx.borrow() {
@@ -611,9 +575,8 @@ impl McpClientManager {
         let _ = rx.wait_for(|done| *done).await;
     }
 
-    /// Snapshot of enabled servers that are not currently `Connected`
-    /// (still `Pending` or `Failed`). Used by the per-turn strict gate
-    /// to compose the rejection message.
+    /// Snapshot of enabled servers that are not currently `Connected` (still `Pending` or
+    /// `Failed`). Used by the per-turn strict gate to compose the rejection message.
     pub async fn enabled_not_connected(&self) -> Vec<(String, ServerState)> {
         let mut out = Vec::new();
         for (name, entry) in &self.servers {
@@ -635,11 +598,10 @@ impl McpClientManager {
         self.servers.keys().cloned().collect()
     }
 
-    /// Returns `(server_name, instructions)` pairs for every connected server
-    /// that advertised an `InitializeResult.instructions` string during the
-    /// handshake. Already sanitised and truncated to
-    /// [`MAX_MCP_DESCRIPTION_LENGTH`]. Used by the agent loop to splice MCP
-    /// server instructions into the system prompt.
+    /// Returns `(server_name, instructions)` pairs for every connected server that advertised an
+    /// `InitializeResult.instructions` string during the handshake. Already sanitised and truncated
+    /// to [`MAX_MCP_DESCRIPTION_LENGTH`]. Used by the agent loop to splice MCP server instructions
+    /// into the system prompt.
     pub fn server_instructions(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for (name, entry) in &self.servers {
@@ -672,9 +634,9 @@ impl McpClientManager {
                 message: format!("list_tools failed: {}", error),
             })?;
 
-        // Collect advertised raw names up-front so we can flag stale
-        // `allowed_tools` / `disabled_tools` / `tool_permissions` entries
-        // that no longer match anything the server returns.
+        // Collect advertised raw names up-front so we can flag stale `allowed_tools` /
+        // `disabled_tools` / `tool_permissions` entries that no longer match anything the server
+        // returns.
         let advertised: std::collections::HashSet<&str> =
             tools.iter().map(|t| t.name.as_ref()).collect();
         warn_on_stale_tool_config(server_name, server_config, &advertised);
@@ -687,9 +649,9 @@ impl McpClientManager {
                 continue;
             }
 
-            // Sanitise the tool's advertised name defensively — rare in the
-            // wild, but a server returning `my.tool` or anything with
-            // Unicode would cause the provider to reject the schema.
+            // Sanitise the tool's advertised name defensively — rare in the wild, but a server
+            // returning `my.tool` or anything with Unicode would cause the provider to reject the
+            // schema.
             let sanitised_tool_name = crate::mcp::sanitize::normalize_server_name(&raw_tool_name);
             let namespaced_name = format!("mcp__{}__{}", server_name, sanitised_tool_name);
 
@@ -717,9 +679,9 @@ impl McpClientManager {
                 }
             };
 
-            // Per-tool permission via the layered resolution. Hints come
-            // from `tool.annotations.readOnlyHint` as published by the
-            // server; the function handles all the precedence rules.
+            // Per-tool permission via the layered resolution. Hints come from
+            // `tool.annotations.readOnlyHint` as published by the server; the function handles all
+            // the precedence rules.
             let permission = resolve_tool_permission(
                 server_name,
                 &raw_tool_name,
@@ -757,21 +719,19 @@ impl McpClientManager {
         Ok(adapters)
     }
 
-    /// Install MCP tools onto a freshly-built sub-agent registry. Mirrors
-    /// the startup wiring at `main.rs:create_agent_from_config` minus the
-    /// `start_connector` spawn — only already-`Connected` servers
-    /// contribute adapters; Pending / Failed servers are skipped silently
-    /// and their tools simply don't appear in the sub-agent's catalogue.
-    /// The resource / prompt meta-tools are registered unconditionally —
-    /// they delegate through [`ServerEntry::require_connected`]
-    /// themselves and tolerate non-connected servers until invoked.
+    /// Install MCP tools onto a freshly-built sub-agent registry. Mirrors the startup wiring at
+    /// `main.rs:create_agent_from_config` minus the `start_connector` spawn — only
+    /// already-`Connected` servers contribute adapters; Pending / Failed servers are skipped
+    /// silently and their tools simply don't appear in the sub-agent's catalogue. The resource /
+    /// prompt meta-tools are registered unconditionally — they delegate through
+    /// [`ServerEntry::require_connected`] themselves and tolerate non-connected servers until
+    /// invoked.
     ///
-    /// Mirrors the connector's deferred-mark step so a sub-agent sees the
-    /// same eager-vs-deferred tool classification as the parent.
+    /// Mirrors the connector's deferred-mark step so a sub-agent sees the same eager-vs-deferred
+    /// tool classification as the parent.
     ///
-    /// Idempotent and safe to call concurrently from separate
-    /// `spawn_agent` invocations operating on distinct sub-agent
-    /// registries.
+    /// Idempotent and safe to call concurrently from separate `spawn_agent` invocations operating
+    /// on distinct sub-agent registries.
     pub async fn install_tools_on(self: &Arc<Self>, registry: &crate::tools::ToolRegistry) {
         use crate::tools::Tool as _;
 
@@ -780,10 +740,9 @@ impl McpClientManager {
             let adapters = match self.discover_tools_for_server(&name).await {
                 Ok(adapters) => adapters,
                 Err(error) => {
-                    // Pending / Failed servers fall through `require_connected`
-                    // as Err — that's normal, not worth a warn. The sub-agent
-                    // just won't see this server's tools until it next runs
-                    // (and the parent's connector finishes the handshake).
+                    // Pending / Failed servers fall through `require_connected` as Err — that's
+                    // normal, not worth a warn. The sub-agent just won't see this server's tools
+                    // until it next runs (and the parent's connector finishes the handshake).
                     tracing::debug!(
                         "mcp: sub-agent registry skipped server '{}': {}",
                         name,
@@ -813,15 +772,13 @@ impl McpClientManager {
         }
     }
 
-    /// Connect to the named server and list EVERY advertised tool —
-    /// including ones currently filtered out by `allowed_tools` /
-    /// `disabled_tools` so users editing those lists can see what
-    /// names are available. Permission is resolved through the normal
-    /// 5-step chain with the winning step recorded on each entry.
+    /// Connect to the named server and list EVERY advertised tool — including ones currently
+    /// filtered out by `allowed_tools` / `disabled_tools` so users editing those lists can see what
+    /// names are available. Permission is resolved through the normal 5-step chain with the winning
+    /// step recorded on each entry.
     ///
-    /// Differs from [`Self::discover_tools_for_server`] by (a) not
-    /// filtering by allow/block lists, (b) not registering adapters, and
-    /// (c) capturing the resolution source for display.
+    /// Differs from [`Self::discover_tools_for_server`] by (a) not filtering by allow/block lists,
+    /// (b) not registering adapters, and (c) capturing the resolution source for display.
     pub async fn list_advertised_tools(&self, server_name: &str) -> Result<Vec<AdvertisedTool>> {
         let Some(entry) = self.servers.get(server_name) else {
             return Err(AgshError::McpConnection {
@@ -873,10 +830,9 @@ impl McpClientManager {
         Ok(out)
     }
 
-    /// Shutdown helper for callers that hold the manager through an
-    /// `Arc`. Try-unwraps; if the Arc is unshared, drives the owned
-    /// [`Self::shutdown`]. If something still holds a reference, drops
-    /// the Arc and lets rmcp's drop guards clean up.
+    /// Shutdown helper for callers that hold the manager through an `Arc`. Try-unwraps; if the Arc
+    /// is unshared, drives the owned [`Self::shutdown`]. If something still holds a reference,
+    /// drops the Arc and lets rmcp's drop guards clean up.
     pub async fn shutdown_arc(self: Arc<Self>) {
         match Arc::try_unwrap(self) {
             Ok(manager) => manager.shutdown().await,
@@ -887,11 +843,11 @@ impl McpClientManager {
     }
 
     pub async fn shutdown(self) {
-        /// Max time to wait for in-flight tool calls to complete before we
-        /// drop the shared service Arc and let the drop-guard cancel it.
+        /// Max time to wait for in-flight tool calls to complete before we drop the shared service
+        /// Arc and let the drop-guard cancel it.
         const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
-        /// Max time to wait for `RunningService::close` to finish after the
-        /// shared references are released.
+        /// Max time to wait for `RunningService::close` to finish after the shared references are
+        /// released.
         const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
         for (server_name, entry) in self.servers {
@@ -903,17 +859,16 @@ impl McpClientManager {
                 continue;
             };
 
-            // Only Connected entries have a service to close; Pending /
-            // Failed / Disabled entries are tear-down no-ops.
+            // Only Connected entries have a service to close; Pending / Failed / Disabled entries
+            // are tear-down no-ops.
             let service = match entry.state.into_inner() {
                 ServerState::Connected { service } => service,
                 _ => continue,
             };
 
-            // In-flight tool calls hold their own Arc<RunningService> clone.
-            // Wait up to `SHUTDOWN_GRACE` for those to complete so the normal
-            // `RunningService::close` path can run instead of falling straight
-            // to the drop-guard abort.
+            // In-flight tool calls hold their own Arc<RunningService> clone. Wait up to
+            // `SHUTDOWN_GRACE` for those to complete so the normal `RunningService::close` path can
+            // run instead of falling straight to the drop-guard abort.
             let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
             while Arc::strong_count(&service) > 1 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -952,11 +907,10 @@ impl McpClientManager {
     }
 }
 
-/// Decide whether a tool advertised by a server should be registered.
-/// Applies `allowed_tools` (restrict-in, when set and non-empty) then
-/// `disabled_tools` (always-remove). Both fields can coexist — the
-/// allow-list acts as a restriction, and the block-list subtracts from
-/// whatever remains. A tool passes iff it survives both checks.
+/// Decide whether a tool advertised by a server should be registered. Applies `allowed_tools`
+/// (restrict-in, when set and non-empty) then `disabled_tools` (always-remove). Both fields can
+/// coexist — the allow-list acts as a restriction, and the block-list subtracts from whatever
+/// remains. A tool passes iff it survives both checks.
 pub(crate) fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
     if let Some(allow) = server_config.allowed_tools.as_deref()
         && !allow.is_empty()
@@ -973,10 +927,9 @@ pub(crate) fn tool_is_allowed(server_config: &McpServerConfig, tool_raw_name: &s
 }
 
 /// Whether the given raw tool name is in this server's
-/// [`eager_load_tools`][McpServerConfig::eager_load_tools] list. Mirrors
-/// [`tool_is_allowed`]'s shape. When true, the registration sites skip
-/// `mark_deferred` so the tool ships in the cacheable tools-array prefix
-/// from the first turn instead of after a `load_tool` round-trip.
+/// [`eager_load_tools`][McpServerConfig::eager_load_tools] list. Mirrors [`tool_is_allowed`]'s
+/// shape. When true, the registration sites skip `mark_deferred` so the tool ships in the cacheable
+/// tools-array prefix from the first turn instead of after a `load_tool` round-trip.
 pub(crate) fn tool_should_eager_load(server_config: &McpServerConfig, tool_raw_name: &str) -> bool {
     server_config
         .eager_load_tools
@@ -984,13 +937,12 @@ pub(crate) fn tool_should_eager_load(server_config: &McpServerConfig, tool_raw_n
         .is_some_and(|list| list.iter().any(|n| n == tool_raw_name))
 }
 
-/// Emit a `warn!` once per entry in `allowed_tools` / `disabled_tools`
-/// / `eager_load_tools` / `tool_permissions` that doesn't match anything
-/// the server currently advertises. Users get a visible heads-up without
-/// failing the connect — tool lists can change between server releases,
-/// and forcing a hard error on every rename would be hostile. Also warns
-/// on the disabled∩eager-load overlap, which is meaningless (disabled
-/// tools aren't registered, so eager-loading them is a no-op).
+/// Emit a `warn!` once per entry in `allowed_tools` / `disabled_tools` / `eager_load_tools` /
+/// `tool_permissions` that doesn't match anything the server currently advertises. Users get a
+/// visible heads-up without failing the connect — tool lists can change between server releases,
+/// and forcing a hard error on every rename would be hostile. Also warns on the disabled∩eager-load
+/// overlap, which is meaningless (disabled tools aren't registered, so eager-loading them is a
+/// no-op).
 pub(crate) fn warn_on_stale_tool_config(
     server_name: &str,
     server_config: &McpServerConfig,
@@ -1060,10 +1012,9 @@ pub(crate) fn warn_on_stale_tool_config(
 /// 4. `mcp.default_permission` — global fallback when no hint exists.
 /// 5. Hardcoded `Write` — ultimate strict fallback.
 ///
-/// User config at steps 1/2 always beats the server's hints. Hints
-/// beat the global fallback so a `readOnlyHint = false` destructive
-/// tool isn't silently promoted to Read just because the user opted
-/// into a lenient global default.
+/// User config at steps 1/2 always beats the server's hints. Hints beat the global fallback so a
+/// `readOnlyHint = false` destructive tool isn't silently promoted to Read just because the user
+/// opted into a lenient global default.
 pub(crate) fn resolve_tool_permission(
     server_name: &str,
     tool_raw_name: &str,
@@ -1081,9 +1032,8 @@ pub(crate) fn resolve_tool_permission(
     .map(|(permission, _)| permission)
 }
 
-/// Identifies which step of the 5-step resolution chain produced a
-/// tool's permission. Used by `agsh mcp tools <name>` so users can see
-/// which knob is driving each tool's classification when editing
+/// Identifies which step of the 5-step resolution chain produced a tool's permission. Used by `agsh
+/// mcp tools <name>` so users can see which knob is driving each tool's classification when editing
 /// allow/block lists or per-tool overrides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionSource {
@@ -1107,32 +1057,28 @@ impl PermissionSource {
     }
 }
 
-/// A tool advertised by an MCP server, paired with the resolved
-/// permission and the source step of the resolution chain. Returned
-/// by [`McpClientManager::list_advertised_tools`] and printed by
-/// `agsh mcp tools <server>`. The raw `readOnlyHint` value isn't
-/// carried here because [`PermissionSource::ReadOnlyHint`] already
-/// signals when the hint drove the decision; downstream renderers
-/// that want the raw value can re-query.
+/// A tool advertised by an MCP server, paired with the resolved permission and the source step of
+/// the resolution chain. Returned by [`McpClientManager::list_advertised_tools`] and printed by
+/// `agsh mcp tools <server>`. The raw `readOnlyHint` value isn't carried here because
+/// [`PermissionSource::ReadOnlyHint`] already signals when the hint drove the decision; downstream
+/// renderers that want the raw value can re-query.
 pub struct AdvertisedTool {
-    /// Raw name as advertised by the server — use this value in
-    /// `allowed_tools` / `disabled_tools` / `tool_permissions` config.
+    /// Raw name as advertised by the server — use this value in `allowed_tools` / `disabled_tools`
+    /// / `tool_permissions` config.
     pub raw_name: String,
-    /// Sanitised + truncated description (same pipeline as registered
-    /// tools).
+    /// Sanitised + truncated description (same pipeline as registered tools).
     pub description: String,
     /// Output of the 5-step permission resolution.
     pub resolved_permission: Permission,
     /// Which step of the chain won.
     pub permission_source: PermissionSource,
-    /// `false` if currently filtered out by `allowed_tools` /
-    /// `disabled_tools` — i.e. the agent would never see this tool.
+    /// `false` if currently filtered out by `allowed_tools` / `disabled_tools` — i.e. the agent
+    /// would never see this tool.
     pub allowed: bool,
 }
 
-/// Same resolution as [`resolve_tool_permission`] but also returns which
-/// step of the chain fired, so `agsh mcp tools` can show the user
-/// exactly why a given tool has its current permission.
+/// Same resolution as [`resolve_tool_permission`] but also returns which step of the chain fired,
+/// so `agsh mcp tools` can show the user exactly why a given tool has its current permission.
 fn resolve_tool_permission_with_source(
     server_name: &str,
     tool_raw_name: &str,
@@ -1189,25 +1135,21 @@ fn resolve_tool_permission_with_source(
     Ok((Permission::Write, PermissionSource::Fallback))
 }
 
-/// Shared context threaded into every [`handler::AgshClientHandler`] so
-/// notification callbacks and server-to-client requests (sampling,
-/// list_roots, elicitation) can reach the rest of the agent. All slots are
-/// optional because the handler is constructed before the agent/provider
-/// exist — they are filled in post-construction by `main.rs` using the
-/// `set_*` helpers.
+/// Shared context threaded into every [`handler::AgshClientHandler`] so notification callbacks and
+/// server-to-client requests (sampling, list_roots, elicitation) can reach the rest of the agent.
+/// All slots are optional because the handler is constructed before the agent/provider exist — they
+/// are filled in post-construction by `main.rs` using the `set_*` helpers.
 #[derive(Default)]
 pub struct McpClientContext {
-    /// LLM provider used to serve `sampling/createMessage` requests. Only
-    /// consulted when a server has `sampling = true` in its config.
+    /// LLM provider used to serve `sampling/createMessage` requests. Only consulted when a server
+    /// has `sampling = true` in its config.
     provider: OnceLock<Arc<dyn Provider>>,
-    /// Weak reference to the MCP manager so the notification callback can
-    /// rediscover tools without creating an Arc cycle through the handler.
-    /// Tool registry updates flow through the manager's attached
-    /// registries — no per-context registry slot is needed.
+    /// Weak reference to the MCP manager so the notification callback can rediscover tools without
+    /// creating an Arc cycle through the handler. Tool registry updates flow through the manager's
+    /// attached registries — no per-context registry slot is needed.
     manager: OnceLock<Weak<McpClientManager>>,
-    /// Per-session working directory shared with the agent. Read by the
-    /// `roots/list` handler so the path reported to MCP servers tracks
-    /// `/cd` rather than the process cwd at startup.
+    /// Per-session working directory shared with the agent. Read by the `roots/list` handler so
+    /// the path reported to MCP servers tracks `/cd` rather than the process cwd at startup.
     cwd: OnceLock<crate::agent::SharedCwd>,
 }
 
@@ -1247,9 +1189,8 @@ impl McpClientContext {
     }
 }
 
-/// Truncate a string to `max_chars` Unicode scalar values, appending an
-/// ellipsis marker if truncation occurred. Operates on `char` boundaries so
-/// the result is always valid UTF-8.
+/// Truncate a string to `max_chars` Unicode scalar values, appending an ellipsis marker if
+/// truncation occurred. Operates on `char` boundaries so the result is always valid UTF-8.
 pub fn truncate(text: &str, max_chars: usize) -> String {
     let mut byte_end = text.len();
     for (count, (idx, _)) in text.char_indices().enumerate() {
@@ -1268,8 +1209,8 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// List all resources advertised by a server. Returned verbatim from the
-/// current peer; no caching is done here.
+/// List all resources advertised by a server. Returned verbatim from the current peer; no caching
+/// is done here.
 pub async fn list_resources(entry: &Arc<ServerEntry>) -> Result<Vec<Resource>> {
     let peer = entry.require_connected().await?;
     match peer.list_all_resources().await {
@@ -1426,8 +1367,7 @@ mod tests {
         per_tool.insert("search".to_string(), "read".to_string());
         server.tool_permissions = Some(per_tool);
 
-        // Per-tool override wins even when both the server default AND
-        // the server's hint disagree.
+        // Per-tool override wins even when both the server default AND the server's hint disagree.
         let annotations = annotations_with_read_only_hint(Some(false));
         let resolved = resolve_tool_permission(
             "s",
@@ -1460,8 +1400,7 @@ mod tests {
     #[test]
     fn resolve_tool_permission_honours_read_only_hint() {
         let server = bare_server_config("s");
-        // readOnlyHint = true → Read, even though the global default
-        // would otherwise be Write.
+        // readOnlyHint = true → Read, even though the global default would otherwise be Write.
         let annotations = annotations_with_read_only_hint(Some(true));
         let resolved = resolve_tool_permission(
             "s",
@@ -1473,8 +1412,7 @@ mod tests {
         .expect("should resolve");
         assert_eq!(resolved, Permission::Read);
 
-        // readOnlyHint = false → Write, even though the global default
-        // is the lenient Read.
+        // readOnlyHint = false → Write, even though the global default is the lenient Read.
         let annotations = annotations_with_read_only_hint(Some(false));
         let resolved = resolve_tool_permission(
             "s",
@@ -1562,8 +1500,8 @@ mod tests {
 
     #[test]
     fn permission_source_labels_match_config_keys() {
-        // The labels printed by `agsh mcp tools` must match the config
-        // keys users would edit to change a classification.
+        // The labels printed by `agsh mcp tools` must match the config keys users would edit to
+        // change a classification.
         assert_eq!(PermissionSource::ToolOverride.as_str(), "tool_permission");
         assert_eq!(
             PermissionSource::ServerOverride.as_str(),
@@ -1595,8 +1533,8 @@ mod tests {
 
     #[test]
     fn tool_is_allowed_empty_allowlist_means_all() {
-        // An empty `allowed_tools` array is treated as "unset" — i.e.
-        // no restriction. A totally absent field behaves the same way.
+        // An empty `allowed_tools` array is treated as "unset" — i.e. no restriction. A totally
+        // absent field behaves the same way.
         let mut server = bare_server_config("s");
         server.allowed_tools = Some(Vec::new());
         assert!(tool_is_allowed(&server, "anything"));
@@ -1612,8 +1550,8 @@ mod tests {
 
     #[test]
     fn tool_is_allowed_both_lists_compose() {
-        // allow restricts to {search, fetch, write-page}, then block
-        // subtracts {write-page}. Net effect: only search + fetch.
+        // allow restricts to {search, fetch, write-page}, then block subtracts {write-page}. Net
+        // effect: only search + fetch.
         let mut server = bare_server_config("s");
         server.allowed_tools = Some(vec!["search".into(), "fetch".into(), "write-page".into()]);
         server.disabled_tools = Some(vec!["write-page".into()]);
@@ -1625,11 +1563,9 @@ mod tests {
 
     #[test]
     fn warn_on_stale_tool_config_smoke() {
-        // The function just emits `warn!` lines; we can't easily
-        // assert on tracing output from a unit test. Smoke-test that
-        // the happy path (empty config) doesn't panic and that it
-        // accepts a server_config with all four list fields populated
-        // plus tool_permissions.
+        // The function just emits `warn!` lines; we can't easily assert on tracing output from a
+        // unit test. Smoke-test that the happy path (empty config) doesn't panic and that it
+        // accepts a server_config with all four list fields populated plus tool_permissions.
         let mut server = bare_server_config("s");
         server.allowed_tools = Some(vec!["a".into(), "unknown".into()]);
         server.disabled_tools = Some(vec!["b".into(), "gone".into()]);
@@ -1641,8 +1577,8 @@ mod tests {
 
         let advertised: std::collections::HashSet<&str> =
             ["a", "b", "search"].into_iter().collect();
-        // Just confirm the call doesn't panic; "stale" should warn
-        // (unknown), and "b" should warn (disabled∩eager overlap).
+        // Just confirm the call doesn't panic; "stale" should warn (unknown), and "b" should warn
+        // (disabled∩eager overlap).
         warn_on_stale_tool_config("s", &server, &advertised);
     }
 
@@ -1677,10 +1613,9 @@ mod tests {
 
     #[test]
     fn tool_should_eager_load_uses_raw_not_namespaced_name() {
-        // The check is against the server-advertised raw name; the
-        // namespaced `mcp__notion__search` form must NOT match an entry
-        // of `"search"` — that would create a footgun where users could
-        // accidentally over-match across servers.
+        // The check is against the server-advertised raw name; the namespaced `mcp__notion__search`
+        // form must NOT match an entry of `"search"` — that would create a footgun where users
+        // could accidentally over-match across servers.
         let mut server = bare_server_config("notion");
         server.eager_load_tools = Some(vec!["search".into()]);
         assert!(!tool_should_eager_load(&server, "mcp__notion__search"));
@@ -1709,8 +1644,8 @@ mod tests {
         assert_eq!(out, "🦀🦀...");
     }
 
-    /// Build a bare server entry in `Pending` state for pure-state tests.
-    /// No network, no process spawn.
+    /// Build a bare server entry in `Pending` state for pure-state tests. No network, no process
+    /// spawn.
     fn pending_entry(name: &str, transport: McpTransport) -> Arc<ServerEntry> {
         let mut config = bare_server_config(name);
         config.transport = transport;
@@ -1878,8 +1813,8 @@ mod tests {
 
     #[tokio::test]
     async fn await_settled_unblocks_when_connector_finishes() {
-        // `/bin/false` exits immediately, so the connector reaches
-        // `settled.send(true)` via Failed state on the first entry.
+        // `/bin/false` exits immediately, so the connector reaches `settled.send(true)` via Failed
+        // state on the first entry.
         let mut config = bare_server_config("quick-fail");
         config.transport = McpTransport::Stdio;
         config.command = Some("/bin/false".to_string());
@@ -1914,17 +1849,15 @@ mod tests {
         );
     }
 
-    /// Sub-agent registry inherits the parent's MCP resource / prompt
-    /// meta-tools, even when no server is connected yet. The per-server
-    /// adapters only show up for `Connected` servers — covered separately
-    /// by manual verification since spinning up a real stdio MCP server
-    /// here is heavy.
+    /// Sub-agent registry inherits the parent's MCP resource / prompt meta-tools, even when no
+    /// server is connected yet. The per-server adapters only show up for `Connected` servers —
+    /// covered separately by manual verification since spinning up a real stdio MCP server here is
+    /// heavy.
     #[tokio::test]
     async fn install_tools_on_registers_resource_meta_tools() {
         let mut config = bare_server_config("subagent-fixture");
-        // Disable so `prepare` skips entirely without spawning a connector.
-        // `server_names()` still includes it, which is all `register_all`
-        // needs to gate on.
+        // Disable so `prepare` skips entirely without spawning a connector. `server_names()` still
+        // includes it, which is all `register_all` needs to gate on.
         config.disabled = true;
 
         let context = McpClientContext::new();
@@ -1952,8 +1885,8 @@ mod tests {
         }
     }
 
-    /// With zero servers configured, `register_all`'s `server_names().is_empty()`
-    /// guard kicks in and nothing is registered.
+    /// With zero servers configured, `register_all`'s `server_names().is_empty()` guard kicks in
+    /// and nothing is registered.
     #[tokio::test]
     async fn install_tools_on_noop_without_servers() {
         let context = McpClientContext::new();
@@ -1970,12 +1903,10 @@ mod tests {
         );
     }
 
-    /// Two concurrent tasks each scoping a different cwd through
-    /// [`with_session_cwd`] must each observe their own cwd from
-    /// [`current_roots_cwd`], not each other's and not the default.
-    /// This is the property that lets MCP `roots/list` callbacks fired
-    /// during a per-session tool invocation report the right roots
-    /// even when many sessions race tool calls in parallel.
+    /// Two concurrent tasks each scoping a different cwd through [`with_session_cwd`] must each
+    /// observe their own cwd from [`current_roots_cwd`], not each other's and not the default. This
+    /// is the property that lets MCP `roots/list` callbacks fired during a per-session tool
+    /// invocation report the right roots even when many sessions race tool calls in parallel.
     #[tokio::test]
     async fn current_roots_cwd_is_isolated_per_task_scope() {
         use std::sync::Arc;
@@ -1990,9 +1921,8 @@ mod tests {
             std::path::PathBuf::from("/tmp/default"),
         ));
 
-        // Force overlapping task lifetimes so the task-local can't
-        // accidentally "win" by being set, run to completion, and
-        // unset before the other task starts.
+        // Force overlapping task lifetimes so the task-local can't accidentally "win" by being set,
+        // run to completion, and unset before the other task starts.
         let barrier = Arc::new(Barrier::new(2));
 
         let task_a = {
@@ -2001,8 +1931,8 @@ mod tests {
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 with_session_cwd(cwd_a, async move {
-                    // Both tasks reach the barrier inside the scope so
-                    // their task-locals coexist before the read.
+                    // Both tasks reach the barrier inside the scope so their task-locals coexist
+                    // before the read.
                     barrier.wait().await;
                     current_roots_cwd(&default)
                 })
@@ -2036,19 +1966,16 @@ mod tests {
             "task B must see its own cwd — not A's, not the default"
         );
 
-        // Outside any `with_session_cwd` scope, the fallback path
-        // must report the process default.
+        // Outside any `with_session_cwd` scope, the fallback path must report the process default.
         let unscoped = current_roots_cwd(&default);
         assert_eq!(unscoped, std::path::PathBuf::from("/tmp/default"));
     }
 
-    /// `update_server_tools` racing against `attach_registry` must
-    /// not lose updates: every published tool list must reach every
-    /// session that attaches before or during the publish, with no
-    /// silent miss window. Regression guard for the race fixed in
-    /// [`McpClientManager::attach_registry`] where the original
-    /// "read snapshot → push registry" order let updates land in the
-    /// gap.
+    /// `update_server_tools` racing against `attach_registry` must not lose updates: every
+    /// published tool list must reach every session that attaches before or during the publish,
+    /// with no silent miss window. Regression guard for the race fixed in
+    /// [`McpClientManager::attach_registry`] where the original "read snapshot → push registry"
+    /// order let updates land in the gap.
     #[tokio::test]
     async fn attach_registry_races_with_update_without_losing_tools() {
         use std::sync::Arc;
@@ -2059,9 +1986,8 @@ mod tests {
             tools::{Tool, ToolOutput},
         };
 
-        // Minimal fixture so each server publishes a distinctively-
-        // named tool — empty Vec to `replace_server_tools` is a no-op
-        // and wouldn't actually exercise the propagation path.
+        // Minimal fixture so each server publishes a distinctively- named tool — empty Vec to
+        // `replace_server_tools` is a no-op and wouldn't actually exercise the propagation path.
         struct FixtureTool {
             name: String,
         }
@@ -2088,8 +2014,8 @@ mod tests {
             }
         }
 
-        // Empty config — we don't need real servers to exercise the
-        // snapshot/registry plumbing, just the manager methods.
+        // Empty config — we don't need real servers to exercise the snapshot/registry plumbing,
+        // just the manager methods.
         let context = McpClientContext::new();
         let manager = McpClientManager::prepare(&[], None, None, context)
             .await
@@ -2129,11 +2055,9 @@ mod tests {
             handle.await.expect("attach task");
         }
 
-        // The snapshot is the source of truth for "what got
-        // published". Every server's update must land there, and
-        // every registry must hold every server's tool. If the
-        // pre-fix race regressed, some registry would be missing at
-        // least one server.
+        // The snapshot is the source of truth for "what got published". Every server's update must
+        // land there, and every registry must hold every server's tool. If the pre-fix race
+        // regressed, some registry would be missing at least one server.
         let snapshot_keys: std::collections::HashSet<String> = manager
             .tools_snapshot
             .read()

@@ -1,7 +1,6 @@
-//! Terminal rendering: streaming markdown renderer (syntect highlighting +
-//! termimad), tool-call indicators, todo-list display, and helpers for
-//! one-off CLI status/error messages. Owns the embedded Monokai Extended
-//! theme used for code blocks.
+//! Terminal rendering: streaming markdown renderer (syntect highlighting + termimad), tool-call
+//! indicators, todo-list display, and helpers for one-off CLI status/error messages. Owns the
+//! embedded Monokai Extended theme used for code blocks.
 
 use std::{
     io::{self, Write},
@@ -42,24 +41,21 @@ impl OutputSpacing {
         }
     }
 
-    /// Call before printing streamed text. Returns true if a blank line
-    /// should be emitted first.
+    /// Call before printing streamed text. Returns true if a blank line should be emitted first.
     pub fn before_text(&mut self) -> bool {
         let need_blank = matches!(self.last, LastOutput::ToolIndicator | LastOutput::Thinking);
         self.last = LastOutput::Text;
         need_blank
     }
 
-    /// Call before printing a tool indicator. Returns true if a blank line
-    /// should be emitted first.
+    /// Call before printing a tool indicator. Returns true if a blank line should be emitted first.
     pub fn before_tool_indicator(&mut self) -> bool {
         let need_blank = matches!(self.last, LastOutput::Text | LastOutput::Thinking);
         self.last = LastOutput::ToolIndicator;
         need_blank
     }
 
-    /// Call before printing a thinking block. Returns true if a blank line
-    /// should be emitted first.
+    /// Call before printing a thinking block. Returns true if a blank line should be emitted first.
     pub fn before_thinking(&mut self) -> bool {
         let need_blank = matches!(self.last, LastOutput::Text | LastOutput::ToolIndicator);
         self.last = LastOutput::Thinking;
@@ -84,11 +80,10 @@ pub enum RenderMode {
     Bat,
     Termimad,
     Raw,
-    /// Emits no output to stdout/stderr. Used by sub-agents and any
-    /// other in-process [`crate::agent::Agent`] that shouldn't leak to
-    /// the user's terminal. The [`StreamingRenderer`] no-ops for this
-    /// mode; agent-side `render::*` calls are gated by
-    /// [`crate::agent::Agent::is_silent`].
+    /// Emits no output to stdout/stderr. Used by sub-agents and any other in-process
+    /// [`crate::agent::Agent`] that shouldn't leak to the user's terminal. The
+    /// [`StreamingRenderer`] no-ops for this mode and the `render::*` helpers short-circuit on
+    /// `matches!(mode, RenderMode::Silent)` at each call site.
     Silent,
 }
 
@@ -142,8 +137,8 @@ impl StreamingRenderer {
     }
 
     pub fn push_delta(&mut self, delta: &str) -> io::Result<()> {
-        // Short-circuit before any buffering — Silent shouldn't even
-        // accumulate state since `finish` will discard it anyway.
+        // Short-circuit before any buffering — Silent shouldn't even accumulate state since
+        // `finish` will discard it anyway.
         if matches!(self.mode, RenderMode::Silent) {
             return Ok(());
         }
@@ -376,8 +371,8 @@ impl StreamingRenderer {
     }
 }
 
-/// Ensure blank lines after markdown headers and tables when followed by
-/// non-empty content. Skips content inside code fences.
+/// Ensure blank lines after markdown headers and tables when followed by non-empty content. Skips
+/// content inside code fences.
 fn normalize_spacing(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut result = Vec::with_capacity(lines.len());
@@ -409,9 +404,9 @@ fn normalize_spacing(text: &str) -> String {
                 .find(|character: char| character != '#')
                 .is_some_and(|position| trimmed.as_bytes().get(position) == Some(&b' '));
 
-        // Blank line after table rows when next line is clearly not a table row.
-        // A line starting with `|` might be an incomplete table row from streaming,
-        // so only treat lines NOT starting with `|` as table-ending.
+        // Blank line after table rows when next line is clearly not a table row. A line starting
+        // with `|` might be an incomplete table row from streaming, so only treat lines NOT
+        // starting with `|` as table-ending.
         let is_table_end = is_table_line(line)
             && next_line.is_some_and(|next| !next.trim_start().starts_with('|'));
 
@@ -428,11 +423,10 @@ fn normalize_spacing(text: &str) -> String {
     output
 }
 
-/// Holds the expensive-to-load syntect assets — a `SyntaxSet` (~1 MB bincode
-/// blob) and a dark `Theme` — so subsequent highlighting calls can reuse them
-/// without paying the decode cost each time. Session-resume reprint and live
-/// streaming both call `highlight_markdown_line` per line; initializing assets
-/// once per process turns that cost from ~50 ms/call into <1 ms/call.
+/// Holds the expensive-to-load syntect assets — a `SyntaxSet` (~1 MB bincode blob) and a dark
+/// `Theme` — so subsequent highlighting calls can reuse them without paying the decode cost each
+/// time. Session-resume reprint and live streaming both call `highlight_markdown_line` per line;
+/// initializing assets once per process turns that cost from ~50 ms/call into <1 ms/call.
 struct Highlighter {
     syntax_set: SyntaxSet,
     theme: Theme,
@@ -450,15 +444,14 @@ fn highlighter() -> &'static Highlighter {
     })
 }
 
-/// Syntax-highlight a chunk of markdown and write it to stdout with 24-bit
-/// ANSI color escapes. The caller is responsible for any surrounding newlines.
+/// Syntax-highlight a chunk of markdown and write it to stdout with 24-bit ANSI color escapes. The
+/// caller is responsible for any surrounding newlines.
 fn print_highlighted_markdown(text: &str) {
     let output = highlight_markdown_to_string(text);
     print!("{}", output);
 }
 
-/// Returns the ANSI-escaped highlighted text without writing to stdout.
-/// Exposed for testing.
+/// Returns the ANSI-escaped highlighted text without writing to stdout. Exposed for testing.
 fn highlight_markdown_to_string(text: &str) -> String {
     let highlighter = highlighter();
     let syntax = highlighter
@@ -475,8 +468,7 @@ fn highlight_markdown_to_string(text: &str) -> String {
                 out.push_str(&as_24_bit_terminal_escaped(&ranges[..], false));
             }
             Err(error) => {
-                // On parse error, fall back to plain text so we never lose
-                // content.
+                // On parse error, fall back to plain text so we never lose content.
                 tracing::debug!("syntect highlight failed: {}", error);
                 out.push_str(line);
             }
@@ -576,10 +568,9 @@ pub fn render_tool_indicator(
     let display_name = tool_display_name(name);
     let indicator = match resolve_primary_param(name, input, schema) {
         Some(value) => {
-            // Strip ANSI escapes and C0 control chars before display so a
-            // model-supplied command or path can't spoof the permission
-            // prompt, clear the screen, or move the cursor. The LLM-facing
-            // copy keeps the raw bytes.
+            // Strip ANSI escapes and C0 control chars before display so a model-supplied command or
+            // path can't spoof the permission prompt, clear the screen, or move the cursor. The
+            // LLM-facing copy keeps the raw bytes.
             let sanitized = sanitize_for_display(&value.replace('\n', " "));
             let truncated = truncate_display(&sanitized, 80);
             format!("[tool {}(`{}`)]", display_name, truncated)
@@ -589,22 +580,21 @@ pub fn render_tool_indicator(
     eprintln!("{}", indicator.with(Color::DarkCyan));
 }
 
-/// Match ANSI CSI (Control Sequence Introducer) escapes: `ESC [` followed by
-/// parameter bytes (`0x30-0x3F`), optional intermediate bytes (`0x20-0x2F`),
-/// and a final byte (`0x40-0x7E`). This covers the sequences an attacker
-/// would use to clear the screen, move the cursor, or alter colors.
+/// Match ANSI CSI (Control Sequence Introducer) escapes: `ESC [` followed by parameter bytes
+/// (`0x30-0x3F`), optional intermediate bytes (`0x20-0x2F`), and a final byte (`0x40-0x7E`). This
+/// covers the sequences an attacker would use to clear the screen, move the cursor, or alter
+/// colors.
 static CSI_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]").expect("static CSI pattern")
 });
 
-/// Strip ANSI CSI escapes and C0 control characters (except `\n`, `\r`, `\t`)
-/// from a string destined for the user's terminal. Intended for text that
-/// originates in untrusted sources — LLM tool arguments, command output
-/// echoed into indicators/prompts, etc. — so a hostile or broken string
-/// cannot forge UI chrome or corrupt terminal state.
+/// Strip ANSI CSI escapes and C0 control characters (except `\n`, `\r`, `\t`) from a string
+/// destined for the user's terminal. Intended for text that originates in untrusted sources — LLM
+/// tool arguments, command output echoed into indicators/prompts, etc. — so a hostile or broken
+/// string cannot forge UI chrome or corrupt terminal state.
 ///
-/// The sanitized form is for **display only**. The conversation copy sent
-/// back to the LLM keeps full fidelity.
+/// The sanitized form is for **display only**. The conversation copy sent back to the LLM keeps
+/// full fidelity.
 pub fn sanitize_for_display(text: &str) -> String {
     let stripped = CSI_PATTERN.replace_all(text, "");
     stripped
@@ -617,25 +607,21 @@ pub fn render_session_id(label: &str, id: &str) {
     eprintln!("{}", format!("{}: {}", label, id).with(Color::DarkGrey));
 }
 
-/// Format `rows` into a left-aligned, space-padded column layout — the
-/// shared renderer for agsh's CLI list tables (`skill list`, `mcp list`,
-/// `list`, `scratchpad_list`).
+/// Format `rows` into a left-aligned, space-padded column layout — the shared renderer for agsh's
+/// CLI list tables (`skill list`, `mcp list`, `list`, `scratchpad_list`).
 ///
-/// Each column is widened to its longest cell, the matching header
-/// included. Columns are separated by two spaces; the final column is
-/// left unpadded so a long trailing value (a path, a URL, a preview)
-/// doesn't drag a run of trailing whitespace. The returned string has
-/// one trailing newline per line and no extra blank line — the caller
-/// picks the stream (`print!` for stdout list commands, or embed it in
-/// a tool result).
+/// Each column is widened to its longest cell, the matching header included. Columns are separated
+/// by two spaces; the final column is left unpadded so a long trailing value (a path, a URL, a
+/// preview) doesn't drag a run of trailing whitespace. The returned string has one trailing newline
+/// per line and no extra blank line — the caller picks the stream (`print!` for stdout list
+/// commands, or embed it in a tool result).
 ///
-/// (Distinct from the private `format_table`, which lays out *markdown*
-/// pipe tables for the streaming renderer.)
+/// (Distinct from the private `format_table`, which lays out *markdown* pipe tables for the
+/// streaming renderer.)
 ///
-/// Width is measured in `char`s, which is correct for the
-/// ASCII-dominated data agsh tabulates (names, versions, UUIDs,
-/// timestamps); a CJK-heavy cell would pad slightly short — no caller
-/// hits that today.
+/// Width is measured in `char`s, which is correct for the ASCII-dominated data agsh tabulates
+/// (names, versions, UUIDs, timestamps); a CJK-heavy cell would pad slightly short — no caller hits
+/// that today.
 pub fn format_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
     if headers.is_empty() {
         return String::new();
@@ -686,12 +672,11 @@ fn format_token_count(n: u64) -> String {
     }
 }
 
-/// Print a one-line per-turn token-usage summary to stderr in dark grey,
-/// preceded by a blank line so it visually separates from the agent's
-/// response. Format: `[in 12.3k / cache hit 96% / out 1.2k]`. The "in"
-/// column is the total of all three input-token tiers (live, cache-write,
-/// cache-read); the cache-hit % is `cache_read / total_in`. Numbers below
-/// 1k show as raw counts; otherwise as `Nk` with one decimal.
+/// Print a one-line per-turn token-usage summary to stderr in dark grey, preceded by a blank line
+/// so it visually separates from the agent's response. Format: `[in 12.3k / cache hit 96% / out
+/// 1.2k]`. The "in" column is the total of all three input-token tiers (live, cache-write,
+/// cache-read); the cache-hit % is `cache_read / total_in`. Numbers below 1k show as raw counts;
+/// otherwise as `Nk` with one decimal.
 pub fn render_token_usage(usage: &crate::provider::TokenUsage) {
     let total_in = usage
         .input_tokens
@@ -715,8 +700,8 @@ pub fn render_token_usage(usage: &crate::provider::TokenUsage) {
     );
 }
 
-/// Multi-line cumulative session report shown by the `/status` slash
-/// command. Goes to stderr (matches the rest of REPL UI feedback).
+/// Multi-line cumulative session report shown by the `/status` slash command. Goes to stderr
+/// (matches the rest of REPL UI feedback).
 pub fn render_session_status(snap: &crate::stats::SessionStatsSnapshot, message_count: usize) {
     let total_in = snap.total_input_tokens();
     let header = "Session status".with(Color::Cyan);
@@ -750,19 +735,18 @@ pub fn render_error(error: &dyn std::fmt::Display) {
     eprintln!("{} {}", "Error:".with(Color::Red), error);
 }
 
-/// Print the "no provider configured" hint shown when the agent fails to
-/// initialize. Centralized so the wording stays in sync everywhere.
+/// Print the "no provider configured" hint shown when the agent fails to initialize. Centralized so
+/// the wording stays in sync everywhere.
 pub fn render_provider_setup_hint() {
     eprintln!("Configure a provider and model to use agsh.");
     eprintln!("Example: agsh --provider openai-api --model gpt-4o \"hello\"");
     eprintln!("Or set AGSH_PROVIDER, AGSH_MODEL, and OPENAI_API_KEY environment variables.");
 }
 
-/// Walk backwards through `messages` and return the suffix that starts at
-/// the `n`th most recent user turn. A "turn" begins at a User-role message
-/// whose content is not purely `ToolResult` blocks — i.e. an actual user
-/// prompt, not an agent-driven tool result echoed back as a User message.
-/// `n == 0` or no qualifying turns returns an empty slice.
+/// Walk backwards through `messages` and return the suffix that starts at the `n`th most recent
+/// user turn. A "turn" begins at a User-role message whose content is not purely `ToolResult`
+/// blocks — i.e. an actual user prompt, not an agent-driven tool result echoed back as a User
+/// message. `n == 0` or no qualifying turns returns an empty slice.
 pub fn last_n_turns(
     messages: &[crate::provider::Message],
     n: usize,
@@ -770,11 +754,10 @@ pub fn last_n_turns(
     if n == 0 || messages.is_empty() {
         return &[];
     }
-    // Walk backwards, tracking the earliest qualifying boundary seen so
-    // far. If we hit `n` boundaries we stop there; if we exhaust the
-    // slice without reaching `n`, we return everything from the earliest
-    // boundary we did find (so `N=999` on a 2-turn session still returns
-    // both turns, not an empty slice).
+    // Walk backwards, tracking the earliest qualifying boundary seen so far. If we hit `n`
+    // boundaries we stop there; if we exhaust the slice without reaching `n`, we return everything
+    // from the earliest boundary we did find (so `N=999` on a 2-turn session still returns both
+    // turns, not an empty slice).
     let mut seen = 0usize;
     let mut earliest_boundary: Option<usize> = None;
     for (index, message) in messages.iter().enumerate().rev() {
@@ -792,8 +775,8 @@ pub fn last_n_turns(
     }
 }
 
-/// True when `message` is the start of a new turn from the user's
-/// perspective — Role::User with at least one non-`ToolResult` block.
+/// True when `message` is the start of a new turn from the user's perspective — Role::User with at
+/// least one non-`ToolResult` block.
 fn is_user_prompt_boundary(message: &crate::provider::Message) -> bool {
     use crate::provider::{ContentBlock, Role};
     if !matches!(message.role, Role::User) {
@@ -805,41 +788,34 @@ fn is_user_prompt_boundary(message: &crate::provider::Message) -> bool {
         .any(|block| !matches!(block, ContentBlock::ToolResult { .. }))
 }
 
-/// Knobs for [`render_message_history`]. Mirrors the fields the live REPL
-/// reads off `ResolvedConfig` so resumed/dumped history matches what the
-/// user sees during a live turn.
+/// Knobs for [`render_message_history`]. Mirrors the fields the live REPL reads off
+/// `ResolvedConfig` so resumed/dumped history matches what the user sees during a live turn.
 pub struct HistoryRenderOptions {
     pub render_mode: RenderMode,
     pub show_thinking: bool,
     pub input_style: nu_ansi_term::Style,
-    /// Blank line before each user prompt (mirrors
-    /// `[display].newline_before_prompt`).
+    /// Blank line before each user prompt (mirrors `[display].newline_before_prompt`).
     pub newline_before_prompt: bool,
-    /// Blank line after each user prompt (mirrors
-    /// `[display].newline_after_prompt`). Acts as the visual separator
-    /// between the prompt and the agent's first response block.
+    /// Blank line after each user prompt (mirrors `[display].newline_after_prompt`). Acts as the
+    /// visual separator between the prompt and the agent's first response block.
     pub newline_after_prompt: bool,
 }
 
-/// Reprint a slice of historical messages styled to match the live REPL
-/// output. Inter-block spacing flows through [`OutputSpacing`] (the same
-/// state machine the live loop uses) so transitions like
-/// tool-indicator → text get a blank line; user-prompt spacing follows
-/// the `newline_before_prompt` / `newline_after_prompt` config flags
-/// just like the live REPL.
+/// Reprint a slice of historical messages styled to match the live REPL output. Inter-block spacing
+/// flows through [`OutputSpacing`] (the same state machine the live loop uses) so transitions like
+/// tool-indicator → text get a blank line; user-prompt spacing follows the `newline_before_prompt`
+/// / `newline_after_prompt` config flags just like the live REPL.
 pub fn render_message_history(messages: &[crate::provider::Message], opts: &HistoryRenderOptions) {
     use crate::provider::{ContentBlock, Role};
     if messages.is_empty() {
         return;
     }
     let mut spacing = OutputSpacing::new();
-    // The caller (e.g. the `/history` dispatch) is expected to emit the
-    // leading blank — the equivalent of the live REPL's
-    // `newline_after_prompt` — between its own command line and this
-    // rendered history. So the very first user prompt we render must
-    // skip its own `newline_before_prompt` to avoid stacking blanks.
-    // Once anything has been emitted, the inner spacing rules take
-    // over and turn-to-turn transitions get their own blanks naturally.
+    // The caller (e.g. the `/history` dispatch) is expected to emit the leading blank — the
+    // equivalent of the live REPL's `newline_after_prompt` — between its own command line and this
+    // rendered history. So the very first user prompt we render must skip its own
+    // `newline_before_prompt` to avoid stacking blanks. Once anything has been emitted, the inner
+    // spacing rules take over and turn-to-turn transitions get their own blanks naturally.
     let mut emitted_any = false;
     for message in messages {
         for block in &message.content {
@@ -883,11 +859,10 @@ pub fn render_message_history(messages: &[crate::provider::Message], opts: &Hist
                     render_tool_indicator(name, input, None);
                     emitted_any = true;
                 }
-                // Tool results are intentionally hidden — the live REPL
-                // doesn't echo them either, so showing them in history
-                // would be a fidelity regression. The user sees the
-                // tool indicator (above) and whatever the assistant's
-                // next text block says about the result.
+                // Tool results are intentionally hidden — the live REPL doesn't echo them either,
+                // so showing them in history would be a fidelity regression. The user sees the tool
+                // indicator (above) and whatever the assistant's next text block says about the
+                // result.
                 ContentBlock::ToolResult { .. } => {}
             }
         }
@@ -895,9 +870,8 @@ pub fn render_message_history(messages: &[crate::provider::Message], opts: &Hist
 }
 
 fn render_assistant_text(text: &str, render_mode: RenderMode) {
-    // Caller has already emitted the leading blank line (via
-    // `OutputSpacing::before_text`) when needed, and verified the text
-    // is non-empty. We just stream the markdown — no trailing blank,
+    // Caller has already emitted the leading blank line (via `OutputSpacing::before_text`) when
+    // needed, and verified the text is non-empty. We just stream the markdown — no trailing blank,
     // because the next block's `before_*` will add one if appropriate.
     let mut renderer = StreamingRenderer::new(render_mode);
     if let Err(error) = renderer.push_delta(text) {
@@ -908,10 +882,9 @@ fn render_assistant_text(text: &str, render_mode: RenderMode) {
     }
 }
 
-/// Render a user prompt with the cyan `>` gutter plus `input_style`
-/// applied to each line, optionally preceded by a blank line. Returns
-/// `false` when the prompt was empty (after `strip_context_tags`) and
-/// nothing was emitted, so the caller can skip the after-prompt
+/// Render a user prompt with the cyan `>` gutter plus `input_style` applied to each line,
+/// optionally preceded by a blank line. Returns `false` when the prompt was empty (after
+/// `strip_context_tags`) and nothing was emitted, so the caller can skip the after-prompt
 /// blank/state update.
 fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_before: bool) -> bool {
     let stripped = crate::session::strip_context_tags(text);
@@ -971,10 +944,9 @@ pub fn tool_display_name_for_approval(name: &str) -> &str {
     tool_display_name(name)
 }
 
-/// Resolve the summary string shown next to a tool-call indicator and in the
-/// approval prompt. Tries the hardcoded built-in map first; falls back to the
-/// tool's JSON schema `required[0]` when provided (covers MCP tools, whose
-/// schemas are authored upstream and can't be enumerated here).
+/// Resolve the summary string shown next to a tool-call indicator and in the approval prompt. Tries
+/// the hardcoded built-in map first; falls back to the tool's JSON schema `required[0]` when
+/// provided (covers MCP tools, whose schemas are authored upstream and can't be enumerated here).
 pub fn resolve_primary_param(
     name: &str,
     input: &serde_json::Value,
@@ -1010,9 +982,8 @@ fn tool_display_name(name: &str) -> &str {
 }
 
 fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
-    // `render_image` accepts either `from_scratchpad` or inline `base64`.
-    // Show the scratchpad name when present; for inline base64 the payload
-    // is opaque so there's nothing useful to display.
+    // `render_image` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
+    // when present; for inline base64 the payload is opaque so there's nothing useful to display.
     if name == "render_image" {
         if let Some(from) = input.get("from_scratchpad").and_then(|v| v.as_str()) {
             return Some(from.to_string());
@@ -1037,13 +1008,11 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
     input.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
-/// Fallback for tools not covered by the built-in map (MCP tools,
-/// dynamically-registered tools, etc.). Uses the first entry of
-/// `inputSchema.required` as the key into `input` and coerces the value
-/// to a short display string. Returns `None` when the schema offers no
-/// `required` field, the required key is missing from `input`, or the
-/// value type has no sensible string form (e.g. nested objects / binary
-/// blobs).
+/// Fallback for tools not covered by the built-in map (MCP tools, dynamically-registered tools,
+/// etc.). Uses the first entry of `inputSchema.required` as the key into `input` and coerces the
+/// value to a short display string. Returns `None` when the schema offers no `required` field, the
+/// required key is missing from `input`, or the value type has no sensible string form (e.g. nested
+/// objects / binary blobs).
 fn schema_primary_param(schema: &serde_json::Value, input: &serde_json::Value) -> Option<String> {
     let required = schema.get("required")?.as_array()?;
     let key = required.iter().find_map(|v| v.as_str())?;
@@ -1109,8 +1078,8 @@ mod tests {
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 3, "header + 2 rows");
 
-        // The `Name` column widens to "longer-name" (11 chars); the
-        // header and the short row pad to that width.
+        // The `Name` column widens to "longer-name" (11 chars); the header and the short row pad to
+        // that width.
         assert!(lines[0].starts_with("Name         Version  Path"));
         assert!(lines[1].starts_with("a            1.0      /long/path"));
         assert!(lines[2].starts_with("longer-name  12       /p"));
@@ -1150,10 +1119,9 @@ mod tests {
 
     #[test]
     fn test_highlighter_uses_monokai_extended() {
-        // Regression guard: the embedded theme file must parse and identify
-        // as Monokai Extended. Catches accidental theme-file swaps or
-        // corrupted asset bytes at test time.
-        // Force OnceLock init.
+        // Regression guard: the embedded theme file must parse and identify as Monokai Extended.
+        // Catches accidental theme-file swaps or corrupted asset bytes at test time. Force OnceLock
+        // init.
         let _ = highlight_markdown_to_string("");
         let theme = &highlighter().theme;
         assert_eq!(theme.name.as_deref(), Some("Monokai Extended"));
@@ -1349,8 +1317,8 @@ mod tests {
 
     #[test]
     fn test_resolve_primary_param_builtin_takes_precedence_over_schema() {
-        // A tool that happens to share a built-in name: hardcoded map wins
-        // so the display stays consistent with what users know.
+        // A tool that happens to share a built-in name: hardcoded map wins so the display stays
+        // consistent with what users know.
         let schema = serde_json::json!({"required": ["path"]});
         let input = serde_json::json!({"command": "ls -la", "path": "/ignored"});
         assert_eq!(
@@ -1783,8 +1751,7 @@ mod tests {
         let slice = last_n_turns(&messages, 1);
         assert_eq!(slice.len(), 2);
         assert!(matches!(slice[0].role, Role::User));
-        // The "second" prompt is the boundary; both messages after it
-        // belong to that turn.
+        // The "second" prompt is the boundary; both messages after it belong to that turn.
         assert_eq!(
             slice[0].text_content(),
             "second",
@@ -1815,9 +1782,8 @@ mod tests {
 
     #[test]
     fn test_last_n_turns_skips_tool_result_user_messages() {
-        // A User message that's purely ToolResult blocks must not count
-        // as a turn boundary — otherwise N=1 would land on the tool
-        // result echo instead of the user's actual prompt.
+        // A User message that's purely ToolResult blocks must not count as a turn boundary —
+        // otherwise N=1 would land on the tool result echo instead of the user's actual prompt.
         let messages = vec![
             user_prompt("real prompt"),
             assistant_text("calling tool"),
@@ -1831,9 +1797,8 @@ mod tests {
 
     #[test]
     fn test_last_n_turns_no_user_prompt_returns_empty() {
-        // Assistant-only history (rare; only happens if the materialised
-        // view starts mid-conversation) has no turn boundaries — N
-        // doesn't find anything.
+        // Assistant-only history (rare; only happens if the materialised view starts
+        // mid-conversation) has no turn boundaries — N doesn't find anything.
         let messages = vec![assistant_text("orphan reply")];
         assert!(last_n_turns(&messages, 1).is_empty());
     }
@@ -1844,8 +1809,8 @@ mod tests {
         assert!(!is_user_prompt_boundary(&assistant_text("hi")));
         assert!(!is_user_prompt_boundary(&tool_result_message("u", "out")));
 
-        // User message with mixed blocks (rare but possible) is still a
-        // boundary — at least one block is not a ToolResult.
+        // User message with mixed blocks (rare but possible) is still a boundary — at least one
+        // block is not a ToolResult.
         let mixed = Message {
             role: Role::User,
             content: vec![
@@ -1864,8 +1829,8 @@ mod tests {
 
     #[test]
     fn test_render_message_history_does_not_panic_on_all_block_kinds() {
-        // We can't capture stderr/stdout easily from a unit test, so we
-        // settle for "every variant flows through without panicking".
+        // We can't capture stderr/stdout easily from a unit test, so we settle for "every variant
+        // flows through without panicking".
         let messages = vec![
             user_prompt("can you read the file?"),
             Message {
@@ -1906,8 +1871,8 @@ mod tests {
             },
             assistant_text("File starts with `hello`."),
         ];
-        // Show-thinking on. If this panics, the test fails — we don't
-        // assert on captured output (would need a TTY harness).
+        // Show-thinking on. If this panics, the test fails — we don't assert on captured output
+        // (would need a TTY harness).
         let opts_with_thinking = HistoryRenderOptions {
             render_mode: RenderMode::Raw,
             show_thinking: true,

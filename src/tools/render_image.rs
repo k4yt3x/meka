@@ -1,6 +1,5 @@
-//! `render_image` tool: turns base64 image data (provided inline or read
-//! from a scratchpad entry) into a multimodal Image content block so the
-//! provider can view it.
+//! `render_image` tool: turns base64 image data (provided inline or read from a scratchpad entry)
+//! into a multimodal Image content block so the provider can view it.
 
 use std::sync::Arc;
 
@@ -100,8 +99,8 @@ impl Tool for RenderImageTool {
             (None, Some(text)) => text.to_string(),
         };
 
-        // Tools that pipe command output into the scratchpad often include a
-        // trailing newline; tolerate whitespace around the base64 payload.
+        // Tools that pipe command output into the scratchpad often include a trailing newline;
+        // tolerate whitespace around the base64 payload.
         let trimmed = base64_text.trim();
         let bytes = match base64::engine::general_purpose::STANDARD.decode(trimmed) {
             Ok(bytes) => bytes,

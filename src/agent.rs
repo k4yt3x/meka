@@ -1,6 +1,6 @@
-//! Per-turn agent loop: streams provider output, dispatches tool calls, and
-//! persists the resulting messages to the session store. Also handles
-//! mid-conversation auto-compaction when the input-token budget is exceeded.
+//! Per-turn agent loop: streams provider output, dispatches tool calls, and persists the resulting
+//! messages to the session store. Also handles mid-conversation auto-compaction when the
+//! input-token budget is exceeded.
 
 use std::{
     path::PathBuf,
@@ -11,57 +11,47 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Why an [`Agent::run_turn`] invocation finished cleanly. Callers
-/// that drive a user-facing protocol (e.g. the ACP `session/prompt`
-/// response) use this to map to a protocol-level stop reason; REPL
-/// and one-shot callers discard it. `Interrupted` is not represented
-/// here — it surfaces as `Err(AgshError::Interrupted)` so the
-/// success-path return type stays straightforward.
+/// Why an [`Agent::run_turn`] invocation finished cleanly. Callers that drive a user-facing
+/// protocol (e.g. the ACP `session/prompt` response) use this to map to a protocol-level stop
+/// reason; REPL and one-shot callers discard it. `Interrupted` is not represented here — it
+/// surfaces as `Err(AgshError::Interrupted)` so the success-path return type stays straightforward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnOutcome {
-    /// The model returned a natural end-of-turn (or an unrecognised
-    /// stop reason — treated as end-of-turn since we have nothing
-    /// better to surface).
+    /// The model returned a natural end-of-turn (or an unrecognised stop reason — treated as
+    /// end-of-turn since we have nothing better to surface).
     EndTurn,
-    /// The provider stopped because the model hit its maximum output
-    /// tokens. The assistant message may be truncated; clients can
-    /// reflect this in their UI.
+    /// The provider stopped because the model hit its maximum output tokens. The assistant message
+    /// may be truncated; clients can reflect this in their UI.
     MaxTokens,
-    /// The model refused to comply with the request (Claude
-    /// `stop_reason: "refusal"`, OpenAI equivalent). The string
-    /// carries the model's refusal text when available so clients
-    /// can render it instead of a generic "request failed."
+    /// The model refused to comply with the request (Claude `stop_reason: "refusal"`, OpenAI
+    /// equivalent). The string carries the model's refusal text when available so clients can
+    /// render it instead of a generic "request failed."
     Refusal(String),
-    /// The agent loop exceeded its per-turn provider-request cap.
-    /// Surfaces the spec's `max_turn_requests` stop reason so clients
-    /// can offer a retry / continue affordance.
+    /// The agent loop exceeded its per-turn provider-request cap. Surfaces the spec's
+    /// `max_turn_requests` stop reason so clients can offer a retry / continue affordance.
     MaxTurnRequests,
 }
 
-/// Per-session working directory, shared by reference between the agent,
-/// every file-touching tool, the REPL prompt, the `/cd` slash command,
-/// and the per-turn environment-context block. `std::sync::RwLock`
-/// (rather than `tokio::sync::RwLock`) so the synchronous REPL prompt
-/// can read it without entering an async context; reads/writes are
-/// microseconds (a `PathBuf` clone or replace), never held across
-/// `.await`.
+/// Per-session working directory, shared by reference between the agent, every file-touching tool,
+/// the REPL prompt, the `/cd` slash command, and the per-turn environment-context block.
+/// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) so the synchronous REPL prompt can read
+/// it without entering an async context; reads/writes are microseconds (a `PathBuf` clone or
+/// replace), never held across `.await`.
 pub type SharedCwd = Arc<RwLock<PathBuf>>;
 
-/// Read the current value of [`SharedCwd`]. Recovers from a poisoned
-/// lock by extracting the inner value; agsh never panics with the cwd
-/// lock held, so the only way to see a poisoned lock is a separate bug
-/// that already triggered, and falling back to the stored value beats
-/// crashing the agent on every subsequent tool call.
+/// Read the current value of [`SharedCwd`]. Recovers from a poisoned lock by extracting the inner
+/// value; agsh never panics with the cwd lock held, so the only way to see a poisoned lock is a
+/// separate bug that already triggered, and falling back to the stored value beats crashing the
+/// agent on every subsequent tool call.
 pub fn cwd_snapshot(cwd: &SharedCwd) -> PathBuf {
     cwd.read()
         .map(|guard| guard.clone())
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
 }
 
-/// Resolve a tool-input path against the per-session [`SharedCwd`].
-/// Absolute paths pass through unchanged; relative paths are joined to
-/// the current cwd value. Tools use this at the top of their `execute`
-/// methods to decouple from process `cwd`.
+/// Resolve a tool-input path against the per-session [`SharedCwd`]. Absolute paths pass through
+/// unchanged; relative paths are joined to the current cwd value. Tools use this at the top of
+/// their `execute` methods to decouple from process `cwd`.
 pub fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) -> PathBuf {
     let input = input.as_ref();
     if input.is_absolute() {
@@ -71,10 +61,9 @@ pub fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) 
     }
 }
 
-/// Construct a fresh [`SharedCwd`] pointing at the process cwd, for use
-/// in tests that need to instantiate a tool but don't exercise the
-/// per-session cwd resolution path. Tests using absolute paths or
-/// `tempdir()` are unaffected by the value here.
+/// Construct a fresh [`SharedCwd`] pointing at the process cwd, for use in tests that need to
+/// instantiate a tool but don't exercise the per-session cwd resolution path. Tests using absolute
+/// paths or `tempdir()` are unaffected by the value here.
 #[cfg(test)]
 pub fn test_cwd() -> SharedCwd {
     Arc::new(RwLock::new(
@@ -94,68 +83,61 @@ use crate::{
     tools::{ToolRegistry, todo::SharedTodoList},
 };
 
-/// Trigger auto-compaction once a turn's input tokens exceed this fraction of
-/// the configured context window.
+/// Trigger auto-compaction once a turn's input tokens exceed this fraction of the configured
+/// context window.
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
-/// Per-turn configuration knobs for [`Agent`]. Constructed once by `main` from
-/// the [`crate::config::ResolvedConfig`] and held immutably for the agent's
-/// lifetime; mid-session permission cycling and tool loading are handled by
-/// shared state (see [`SharedPermission`] and [`ToolRegistry`]) rather than
-/// by mutating fields here.
+/// Per-turn configuration knobs for [`Agent`]. Constructed once by `main` from the
+/// [`crate::config::ResolvedConfig`] and held immutably for the agent's lifetime; mid-session
+/// permission cycling and tool loading are handled by shared state (see [`SharedPermission`] and
+/// [`ToolRegistry`]) rather than by mutating fields here.
 #[derive(Clone)]
 pub struct AgentOptions {
-    /// When true, assistant responses stream token-by-token via
-    /// `Provider::stream`; otherwise the agent uses the blocking
-    /// `Provider::complete`.
+    /// When true, assistant responses stream token-by-token via `Provider::stream`; otherwise the
+    /// agent uses the blocking `Provider::complete`.
     pub streaming: bool,
-    /// Whether read-mode `execute_command` calls run inside the platform
-    /// sandbox. Forced off when no sandbox backend is available.
+    /// Whether read-mode `execute_command` calls run inside the platform sandbox. Forced off when
+    /// no sandbox backend is available.
     pub sandboxed_shell: bool,
-    /// Cap on messages sent to the provider per turn. `None` = unlimited;
-    /// the agent walks back to a safe boundary so tool-result chains stay
-    /// intact (see `truncate_messages_for_context`).
+    /// Cap on messages sent to the provider per turn. `None` = unlimited; the agent walks back to
+    /// a safe boundary so tool-result chains stay intact (see
+    /// `truncate_messages_for_context`).
     pub context_messages: Option<usize>,
-    /// When true, the agent auto-compacts the conversation once a turn's
-    /// input tokens cross [`AUTO_COMPACT_THRESHOLD_PERCENT`] of
-    /// [`Self::context_window`]. Requires `context_window > 0`.
+    /// When true, the agent auto-compacts the conversation once a turn's input tokens cross
+    /// [`AUTO_COMPACT_THRESHOLD_PERCENT`] of [`Self::context_window`]. Requires `context_window >
+    /// 0`.
     pub auto_compact: bool,
     /// Provider's advertised context window in tokens. Drives auto-compact.
     pub context_window: u64,
-    /// User-authored instructions, surfaced in the system prompt and to
-    /// sub-agents. Per-run `--instructions` overrides the config-file value.
+    /// User-authored instructions, surfaced in the system prompt and to sub-agents. Per-run
+    /// `--instructions` overrides the config-file value.
     pub user_instructions: Option<String>,
-    /// Pre-turn MCP readiness gate. When true, a turn is rejected with
-    /// `AgshError::McpTurnGated` if any enabled server isn't `Connected`
-    /// after [`Self::mcp_grace`].
+    /// Pre-turn MCP readiness gate. When true, a turn is rejected with `AgshError::McpTurnGated`
+    /// if any enabled server isn't `Connected` after [`Self::mcp_grace`].
     pub mcp_strict: bool,
-    /// Max time to wait for still-`Pending` MCP servers to reach
-    /// `Connected` before applying the strict check.
+    /// Max time to wait for still-`Pending` MCP servers to reach `Connected` before applying the
+    /// strict check.
     pub mcp_grace: std::time::Duration,
-    /// When `Some`, `run_turn` uses this string verbatim instead of
-    /// invoking [`crate::context::build_system_prompt`]. Sub-agents set
-    /// this to their stripped-down prompt from
-    /// `build_subagent_system_prompt`. The override is static — it does
-    /// not see per-turn todo updates or permission changes, which is
-    /// fine for one-shot sub-agents whose tool list and permission level
-    /// are fixed at spawn time.
+    /// When `Some`, `run_turn` uses this string verbatim instead of invoking
+    /// [`crate::context::build_system_prompt`]. Sub-agents set this to their stripped-down prompt
+    /// from `build_subagent_system_prompt`. The override is static — it does not see per-turn todo
+    /// updates or permission changes, which is fine for one-shot sub-agents whose tool list and
+    /// permission level are fixed at spawn time.
     pub system_prompt_override: Option<String>,
-    /// Cap on provider requests per turn. A misbehaving tool chain
-    /// (model loops on the same tool, never converges) would
-    /// otherwise spin indefinitely. When the cap is hit, the turn
-    /// resolves as the ACP spec's `max_turn_requests` stop reason.
-    /// Defaults to 100 via `default_max_turn_requests` in `config.rs`.
+    /// Cap on provider requests per turn. A misbehaving tool chain (model loops on the same tool,
+    /// never converges) would otherwise spin indefinitely. When the cap is hit, the turn resolves
+    /// as the ACP spec's `max_turn_requests` stop reason. Defaults to 100 via
+    /// `default_max_turn_requests` in `config.rs`.
     pub max_turn_requests: usize,
 }
 
-/// Driver for a single conversation. One [`Agent`] handles one or more
-/// sequential turns against a single provider, with a shared tool registry,
-/// shared permission state, and a persistent SQLite session. A turn fans
-/// out tool calls (in parallel via `join_all`) and persists every assistant
+/// Driver for a single conversation. One [`Agent`] handles one or more sequential turns against a
+/// single provider, with a shared tool registry, shared permission state, and a persistent SQLite
+/// session. A turn fans out tool calls (in parallel via `join_all`) and persists every assistant
 /// and tool-result message to the session store.
 ///
-/// `Agent` is held across turns but not across providers — switching
-/// providers requires a fresh instance.
+/// `Agent` is held across turns but not across providers — switching providers requires a fresh
+/// instance.
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tool_registry: ToolRegistry,
@@ -164,35 +146,31 @@ pub struct Agent {
     options: AgentOptions,
     todo_list: SharedTodoList,
     shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
-    /// Shared skill cache. Re-checks the on-disk snapshot at the top of
-    /// each turn and re-discovers when something changed, so adds /
-    /// removes / frontmatter edits land without restart. Body-only edits
-    /// take effect even sooner — `load_skill_body` re-reads from disk on
-    /// every invocation regardless of cache state.
+    /// Shared skill cache. Re-checks the on-disk snapshot at the top of each turn and re-discovers
+    /// when something changed, so adds / removes / frontmatter edits land without restart.
+    /// Body-only edits take effect even sooner — `load_skill_body` re-reads from disk on every
+    /// invocation regardless of cache state.
     skills: Arc<SkillCache>,
     /// Where streaming output, todo-list renders, token-usage summaries,
     /// and tool-approval requests flow. Concrete impls today:
     /// [`crate::frontend::ReplFrontend`], [`crate::acp::AcpFrontend`],
-    /// [`SilentFrontend`], and [`crate::frontend::PermissionForwardingFrontend`].
+    /// [`crate::frontend::SilentFrontend`], and [`crate::frontend::PermissionForwardingFrontend`].
     frontend: Arc<dyn Frontend>,
-    /// Per-session working directory. Initialised from
-    /// `std::env::current_dir()` at startup; updated by `/cd`; read by
-    /// the file/shell/find/grep tools, the REPL prompt, the per-turn
-    /// environment-context block, and the MCP `roots/list` handler.
-    /// Process `cwd` is no longer mutated.
+    /// Per-session working directory. Initialised from `std::env::current_dir()` at startup;
+    /// updated by `/cd`; read by the file/shell/find/grep tools, the REPL prompt, the per-turn
+    /// environment-context block, and the MCP `roots/list` handler. Process `cwd` is no longer
+    /// mutated.
     cwd: SharedCwd,
     last_input_tokens: std::sync::atomic::AtomicU64,
-    /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by
-    /// MCP tool adapters so oversized-output persistence uses
-    /// `mcp_<server>_<tool>` instead of the plain tool name. Cleared
-    /// between turns by `persist_oversized_results`.
+    /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by MCP tool adapters so
+    /// oversized-output persistence uses `mcp_<server>_<tool>` instead of the plain tool name.
+    /// Cleared between turns by `persist_oversized_results`.
     scratchpad_hints: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
-    /// Optional MCP client manager; used to read server-supplied
-    /// `InitializeResult.instructions` for inclusion in the system prompt.
+    /// Optional MCP client manager; used to read server-supplied `InitializeResult.instructions`
+    /// for inclusion in the system prompt.
     mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
-    /// Counters surfaced by `/status`. Shared with the Claude providers,
-    /// which increment the redaction-related fields when oversized
-    /// request bodies trigger image-block redaction.
+    /// Counters surfaced by `/status`. Shared with the Claude providers, which increment the
+    /// redaction-related fields when oversized request bodies trigger image-block redaction.
     session_stats: Arc<crate::stats::SessionStats>,
 }
 
@@ -229,47 +207,42 @@ impl Agent {
         }
     }
 
-    /// Swap the provider after construction. Used by the ACP
-    /// integration test path (`AGSH_ACP_MOCK_PROVIDER=1`) so the test
-    /// can drive a scripted [`crate::provider::mock::MockProvider`]
-    /// without going through the credential / HTTP-client setup that
-    /// `create_agent_from_config` performs for real providers. Debug
-    /// builds only — release builds don't include it.
+    /// Swap the provider after construction. Used by the ACP integration test path
+    /// (`AGSH_ACP_MOCK_PROVIDER=1`) so the test can drive a scripted
+    /// [`crate::provider::mock::MockProvider`] without going through the credential / HTTP-client
+    /// setup that `create_agent_from_config` performs for real providers. Debug builds only —
+    /// release builds don't include it.
     #[cfg(debug_assertions)]
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
     }
 
-    /// Shared handle to the agent's session-scoped working directory.
-    /// Public so frontends can observe live cwd changes via the same
-    /// `Arc` the `/cd` handler mutates; currently unused because
-    /// main.rs / acp.rs build the `SharedCwd` themselves and pass it
-    /// in. Kept allow(dead_code) until a frontend reaches for it.
+    /// Shared handle to the agent's session-scoped working directory. Public so frontends can
+    /// observe live cwd changes via the same `Arc` the `/cd` handler mutates; currently unused
+    /// because main.rs / acp.rs build the `SharedCwd` themselves and pass it in. Kept
+    /// allow(dead_code) until a frontend reaches for it.
     #[allow(dead_code)]
     pub fn cwd(&self) -> &SharedCwd {
         &self.cwd
     }
 
-    /// Build an `Agent` configured for sub-agent use: no compaction,
-    /// no MCP readiness gate. Inherits `sandboxed_shell`,
-    /// `context_messages`, and `user_instructions` from the parent's
+    /// Build an `Agent` configured for sub-agent use: no compaction, no MCP readiness gate.
+    /// Inherits `sandboxed_shell`, `context_messages`, and `user_instructions` from the parent's
     /// options.
     ///
-    /// `sub_system_prompt` is the pre-built sub-agent system prompt
-    /// (typically from `build_subagent_system_prompt`); `run_turn` uses
-    /// it verbatim instead of building one dynamically.
+    /// `sub_system_prompt` is the pre-built sub-agent system prompt (typically from
+    /// `build_subagent_system_prompt`); `run_turn` uses it verbatim instead of building one
+    /// dynamically.
     ///
-    /// `frontend` decides where the sub-agent's output and permission
-    /// requests go. The standard caller (the `spawn_agent` tool) uses
-    /// [`crate::frontend::PermissionForwardingFrontend`] wrapping the
-    /// parent's frontend — that drops emits (the sub-agent's report
-    /// flows back via the tool result) but forwards permission
-    /// prompts so the user is asked in their original UI. Tests can
-    /// pass [`SilentFrontend`] for fully-isolated sub-agent runs.
+    /// `frontend` decides where the sub-agent's output and permission requests go. The standard
+    /// caller (the `spawn_agent` tool) uses [`crate::frontend::PermissionForwardingFrontend`]
+    /// wrapping the parent's frontend — that drops emits (the sub-agent's report flows back via the
+    /// tool result) but forwards permission prompts so the user is asked in their original UI.
+    /// Tests can pass [`crate::frontend::SilentFrontend`] for fully-isolated sub-agent runs.
     ///
-    /// Doesn't call `set_mcp_manager`. MCP tool dispatch from the
-    /// sub-agent's registry works without an attached manager because
-    /// the adapters delegate through `Arc<ServerEntry>` directly.
+    /// Doesn't call `set_mcp_manager`. MCP tool dispatch from the sub-agent's registry works
+    /// without an attached manager because the adapters delegate through `Arc<ServerEntry>`
+    /// directly.
     #[allow(clippy::too_many_arguments)]
     pub fn new_subagent(
         provider: Arc<dyn Provider>,
@@ -290,8 +263,8 @@ impl Agent {
             context_messages: parent_options.context_messages,
             user_instructions: parent_options.user_instructions.clone(),
             max_turn_requests: parent_options.max_turn_requests,
-            // Sub-agents run silent + one-shot: no streaming UI, no
-            // auto-compact, no MCP readiness gate.
+            // Sub-agents run silent + one-shot: no streaming UI, no auto-compact, no MCP readiness
+            // gate.
             streaming: false,
             auto_compact: false,
             context_window: 0,
@@ -299,11 +272,10 @@ impl Agent {
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: Some(sub_system_prompt),
         };
-        // Snapshot the parent's cwd at spawn time. The sub-agent has no
-        // `/cd` of its own (no REPL) so this `Arc` is effectively
-        // immutable — but giving the sub-agent its own `Arc` rather than
-        // sharing the parent's prevents a parent `/cd` mid-sub-agent-turn
-        // from changing the sub-agent's resolution mid-flight.
+        // Snapshot the parent's cwd at spawn time. The sub-agent has no `/cd` of its own (no REPL)
+        // so this `Arc` is effectively immutable — but giving the sub-agent its own `Arc` rather
+        // than sharing the parent's prevents a parent `/cd` mid-sub-agent-turn from changing the
+        // sub-agent's resolution mid-flight.
         let parent_path = parent_cwd
             .read()
             .map(|guard| guard.clone())
@@ -324,21 +296,19 @@ impl Agent {
         )
     }
 
-    /// Snapshot of the per-session counters used by `/status`. Called
-    /// from the REPL on demand.
+    /// Snapshot of the per-session counters used by `/status`. Called from the REPL on demand.
     pub fn session_stats_snapshot(&self) -> crate::stats::SessionStatsSnapshot {
         self.session_stats.snapshot()
     }
 
-    /// Shared handle to the auto-refreshing skill cache. The REPL's
-    /// `/skill <name>` dispatch reads from this so the agent's system
-    /// prompt and the user-invocable list never diverge.
+    /// Shared handle to the auto-refreshing skill cache. The REPL's `/skill <name>` dispatch reads
+    /// from this so the agent's system prompt and the user-invocable list never diverge.
     pub fn skills(&self) -> &Arc<SkillCache> {
         &self.skills
     }
 
-    /// Attach the MCP client manager so server-supplied `initialize`
-    /// instructions can be injected into each turn's system prompt.
+    /// Attach the MCP client manager so server-supplied `initialize` instructions can be injected
+    /// into each turn's system prompt.
     pub fn set_mcp_manager(&mut self, manager: Arc<crate::mcp::McpClientManager>) {
         self.mcp_manager = Some(manager);
     }
@@ -363,9 +333,8 @@ impl Agent {
             return self.handle_mcp_not_ready(not_ready);
         }
 
-        // Best-effort grace wait — we re-check readiness below regardless of
-        // whether `await_settled` returned in time. The timeout result is
-        // intentionally discarded.
+        // Best-effort grace wait — we re-check readiness below regardless of whether
+        // `await_settled` returned in time. The timeout result is intentionally discarded.
         let _ = tokio::time::timeout(self.options.mcp_grace, manager.await_settled()).await;
 
         let not_ready = manager.enabled_not_connected().await;
@@ -403,8 +372,8 @@ impl Agent {
         user_input: String,
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome> {
-        // Gate on MCP readiness BEFORE touching session state / message
-        // history so a rejected turn leaves no trace in the conversation.
+        // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
+        // leaves no trace in the conversation.
         self.await_mcp_ready().await?;
 
         if session_id.is_none() {
@@ -425,9 +394,9 @@ impl Agent {
         // Keep the shared session ID in sync so scratchpad tools can access it.
         *self.shared_session_id.write().await = Some(sid);
 
-        // Auto-compact if the last turn's input tokens exceeded the threshold
-        // fraction of the context window. This runs between turns (not
-        // mid-tool-loop) so the stable base_messages invariant is preserved.
+        // Auto-compact if the last turn's input tokens exceeded the threshold fraction of the
+        // context window. This runs between turns (not mid-tool-loop) so the stable base_messages
+        // invariant is preserved.
         if self.options.auto_compact && self.options.context_window > 0 {
             let last_tokens = self
                 .last_input_tokens
@@ -475,9 +444,8 @@ impl Agent {
             )),
         };
 
-        // Wrapped in `Arc` once so the no-tool-progress branch below can
-        // share it with a cheap `Arc::clone` instead of a deep `Vec` clone
-        // on every loop iteration.
+        // Wrapped in `Arc` once so the no-tool-progress branch below can share it with a cheap
+        // `Arc::clone` instead of a deep `Vec` clone on every loop iteration.
         let base_messages: Arc<[Message]> = Arc::from(truncate_messages_for_context(
             messages.as_slice(),
             self.options.context_messages,
@@ -485,16 +453,15 @@ impl Agent {
         let turn_start_len = messages.len();
 
         let mut user_saved = false;
-        // Accumulate token usage across every provider call within this
-        // turn so the per-turn display reflects the whole turn (including
-        // tool-execution loops), not just the final round-trip.
+        // Accumulate token usage across every provider call within this turn so the per-turn
+        // display reflects the whole turn (including tool-execution loops), not just the final
+        // round-trip.
         let mut turn_usage = crate::provider::TokenUsage::default();
 
-        // Per-turn provider-request counter. A misbehaving tool chain
-        // (e.g. the model invokes the same tool repeatedly without
-        // making progress) could otherwise spin the loop indefinitely.
-        // Cap surfaces as the spec's `max_turn_requests` stop reason
-        // so the client can offer a retry / continue affordance.
+        // Per-turn provider-request counter. A misbehaving tool chain (e.g. the model invokes the
+        // same tool repeatedly without making progress) could otherwise spin the loop indefinitely.
+        // Cap surfaces as the spec's `max_turn_requests` stop reason so the client can offer a
+        // retry / continue affordance.
         let max_turn_requests = self.options.max_turn_requests;
         let mut turn_requests: usize = 0;
 
@@ -503,11 +470,9 @@ impl Agent {
                 if cancellation.is_cancelled() {
                     break 'turn Err(AgshError::Interrupted);
                 }
-                // Bail out if the frontend has noticed its client
-                // went away (e.g. ACP stdio disconnect). No point
-                // burning more provider tokens for an audience that
-                // won't see the output. REPL frontends report
-                // `false` here, so this is a no-op for them.
+                // Bail out if the frontend has noticed its client went away (e.g. ACP stdio
+                // disconnect). No point burning more provider tokens for an audience that won't see
+                // the output. REPL frontends report `false` here, so this is a no-op for them.
                 if self.frontend.client_disconnected() {
                     break 'turn Err(AgshError::Interrupted);
                 }
@@ -524,17 +489,15 @@ impl Agent {
                     Arc::clone(&base_messages)
                 };
 
-                // Recompute the active tool set every iteration so a
-                // `load_tool` call earlier in this turn becomes visible to
-                // the model on the very next request — without mutating
-                // any registry state. Append-only growth keeps the tools
-                // array's cache prefix stable.
+                // Recompute the active tool set every iteration so a `load_tool` call earlier in
+                // this turn becomes visible to the model on the very next request — without
+                // mutating any registry state. Append-only growth keeps the tools array's cache
+                // prefix stable.
                 //
-                // Read from events (not the materialized slice) so the
-                // deferred-tool snapshot stored on `Event::CompactBoundary`
-                // survives across compaction; otherwise tools the model
-                // loaded pre-compaction would silently drop out of the
-                // active set on the next turn.
+                // Read from events (not the materialized slice) so the deferred-tool snapshot
+                // stored on `Event::CompactBoundary` survives across compaction; otherwise tools
+                // the model loaded pre-compaction would silently drop out of the active set on the
+                // next turn.
                 let loaded =
                     crate::conversation::extract_loaded_tool_names_from_events(messages.events());
                 let tools: Arc<[ToolDefinition]> =
@@ -584,10 +547,9 @@ impl Agent {
                     break 'turn Err(error);
                 }
 
-                // Thinking blocks are preserved in the conversation
-                // for the Claude API (interleaved-thinking beta). The provider's
-                // build_messages handles stripping trailing thinking from the last
-                // assistant message.
+                // Thinking blocks are preserved in the conversation for the Claude API
+                // (interleaved-thinking beta). The provider's build_messages handles stripping
+                // trailing thinking from the last assistant message.
                 messages.append(assistant_message.clone());
 
                 if cancellation.is_cancelled() {
@@ -612,9 +574,8 @@ impl Agent {
                             tracing::warn!("failed to save explicit scratchpad results: {}", error);
                         }
 
-                        // Take the per-turn hints — this both snapshots them
-                        // for the call below and clears them, so a long
-                        // session doesn't accumulate entries for tool calls
+                        // Take the per-turn hints — this both snapshots them for the call below and
+                        // clears them, so a long session doesn't accumulate entries for tool calls
                         // that already ran. No clone needed.
                         let hints_snapshot =
                             std::mem::take(&mut *self.scratchpad_hints.write().await);
@@ -659,9 +620,9 @@ impl Agent {
         };
 
         if result.is_ok() {
-            // Roll the turn into the session-level counters surfaced by
-            // `/status`. Done here (not inside the inner loop) so a single
-            // `/status` reading reflects whole turns, not partial state.
+            // Roll the turn into the session-level counters surfaced by `/status`. Done here (not
+            // inside the inner loop) so a single `/status` reading reflects whole turns, not
+            // partial state.
             self.session_stats.record_turn(&turn_usage);
             self.frontend
                 .emit(FrontendEvent::TokenUsage(turn_usage))
@@ -693,9 +654,9 @@ impl Agent {
         tools: Arc<[ToolDefinition]>,
         cancellation: CancellationToken,
     ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
-        // Bounded so a provider streaming faster than the renderer consumes
-        // can't grow memory without limit. 1024 is far above any realistic
-        // in-flight backlog, so backpressure effectively never engages.
+        // Bounded so a provider streaming faster than the renderer consumes can't grow memory
+        // without limit. 1024 is far above any realistic in-flight backlog, so backpressure
+        // effectively never engages.
         let (event_sender, mut event_receiver) = mpsc::channel::<StreamEvent>(1024);
 
         let provider = Arc::clone(&self.provider);
@@ -783,12 +744,10 @@ impl Agent {
                     current_tool_input_json.clear();
                 }
                 StreamEvent::ToolCallRejected { id, name, reason } => {
-                    // A malformed tool-call arrived (bad JSON). Emit a
-                    // `ToolUse` block with a sentinel marker so the shape
-                    // of the assistant message stays valid for the API
-                    // round-trip, but `resolve_and_execute_tool` sees the
-                    // marker and surfaces an error back to the model
-                    // rather than running the tool on a silently-empty
+                    // A malformed tool-call arrived (bad JSON). Emit a `ToolUse` block with a
+                    // sentinel marker so the shape of the assistant message stays valid for the API
+                    // round-trip, but `resolve_and_execute_tool` sees the marker and surfaces an
+                    // error back to the model rather than running the tool on a silently-empty
                     // argument object.
                     let marker_input = serde_json::json!({
                         crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
@@ -823,10 +782,8 @@ impl Agent {
                     token_usage = usage;
                 }
                 StreamEvent::Error(error) => {
-                    // Treat as terminal: if the worker emits Error
-                    // then closes the channel with Ok(()), a
-                    // log-and-continue would silently truncate the
-                    // turn to EndTurn.
+                    // Treat as terminal: if the worker emits Error then closes the channel with
+                    // Ok(()), a log-and-continue would silently truncate the turn to EndTurn.
                     tracing::error!("stream error: {}", error);
                     return Err(crate::error::AgshError::Provider(error));
                 }
@@ -840,8 +797,8 @@ impl Agent {
         match stream_handle.await {
             Ok(Ok(())) => {}
             Ok(Err(AgshError::Interrupted)) => {
-                // Interrupted — fall through to return partial content.
-                // The caller detects interruption via the cancellation token.
+                // Interrupted — fall through to return partial content. The caller detects
+                // interruption via the cancellation token.
             }
             Ok(Err(error)) => return Err(error),
             Err(join_error) => {
@@ -865,9 +822,8 @@ impl Agent {
         assistant_message: &Message,
         cancellation: CancellationToken,
     ) -> Vec<ContentBlock> {
-        // Emit tool-call indicators in source order. The streaming
-        // path already emitted these as `ToolUseEnd` events; this
-        // loop only fires for the blocking provider path. Serial so
+        // Emit tool-call indicators in source order. The streaming path already emitted these as
+        // `ToolUseEnd` events; this loop only fires for the blocking provider path. Serial so
         // concurrent execution below can't interleave indicators.
         let mut planned: Vec<(String, String, serde_json::Value)> = Vec::new();
         for block in &assistant_message.content {
@@ -890,16 +846,15 @@ impl Agent {
             }
         }
 
-        // Dispatch concurrently. `join_all` preserves input ordering
-        // so the i-th output corresponds to the i-th planned call.
+        // Dispatch concurrently. `join_all` preserves input ordering so the i-th output corresponds
+        // to the i-th planned call.
         let futures = planned.iter().map(|(_, name, input)| {
             self.resolve_and_execute_tool(name.as_str(), input, cancellation.clone())
         });
         let outputs = futures::future::join_all(futures).await;
 
-        // Serial pass to accumulate scratchpad hints, emit per-tool
-        // completion events in source order, build ToolResult blocks,
-        // and emit a single TodoListUpdated event if any todo_write
+        // Serial pass to accumulate scratchpad hints, emit per-tool completion events in source
+        // order, build ToolResult blocks, and emit a single TodoListUpdated event if any todo_write
         // call landed.
         let mut results = Vec::with_capacity(planned.len());
         let mut todo_write_fired = false;
@@ -910,10 +865,9 @@ impl Agent {
             if let Some(hint) = output.scratchpad_hint.clone() {
                 self.scratchpad_hints.write().await.insert(id.clone(), hint);
             }
-            // Notify the frontend of completion BEFORE building the
-            // ToolResult content block so ACP `tool_call_update`
-            // notifications arrive before the next assistant turn's
-            // text starts streaming.
+            // Notify the frontend of completion BEFORE building the ToolResult content block so ACP
+            // `tool_call_update` notifications arrive before the next assistant turn's text starts
+            // streaming.
             self.frontend
                 .emit(FrontendEvent::ToolCallCompleted {
                     id: id.clone(),
@@ -944,9 +898,8 @@ impl Agent {
         input: &serde_json::Value,
         cancellation: CancellationToken,
     ) -> crate::tools::ToolOutput {
-        // If the stream layer couldn't parse this tool call's JSON
-        // arguments, it marked the input with a sentinel. Bail out with
-        // an error so the model sees the parse failure instead of us
+        // If the stream layer couldn't parse this tool call's JSON arguments, it marked the input
+        // with a sentinel. Bail out with an error so the model sees the parse failure instead of us
         // silently invoking the tool on a default-filled object.
         if let Some(reason) = input
             .get(crate::provider::INVALID_TOOL_ARGS_MARKER)
@@ -959,9 +912,9 @@ impl Agent {
             return crate::tools::ToolOutput::text(format!("Unknown tool: '{}'", name), true);
         };
 
-        // Read the current permission once, at the enforcement site, so a
-        // permission cycle via Shift+Tab during dispatch can't leave us
-        // acting on a stale snapshot captured earlier in the loop.
+        // Read the current permission once, at the enforcement site, so a permission cycle via
+        // Shift+Tab during dispatch can't leave us acting on a stale snapshot captured earlier in
+        // the loop.
         let permission = self.shared_permission.get();
         let required = self
             .tool_registry
@@ -1015,12 +968,10 @@ impl Agent {
         }
     }
 
-    /// Invoke a tool, scoping the per-session cwd into a task-local
-    /// so any MCP `roots/list` callback fired during the call sees
-    /// this session's cwd (rather than the process default seeded
-    /// on [`crate::mcp::McpClientContext`] at startup). Built-in
-    /// tools ignore the task-local — they read cwd directly from
-    /// their own `SharedCwd` field — so the wrap is cheap on those
+    /// Invoke a tool, scoping the per-session cwd into a task-local so any MCP `roots/list`
+    /// callback fired during the call sees this session's cwd (rather than the process default
+    /// seeded on [`crate::mcp::McpClientContext`] at startup). Built-in tools ignore the task-local
+    /// — they read cwd directly from their own `SharedCwd` field — so the wrap is cheap on those
     /// paths.
     async fn run_tool(
         tool: &dyn crate::tools::Tool,
@@ -1069,9 +1020,9 @@ impl Agent {
              5. **Errors and fixes**: Problems encountered and how they were resolved.\n\
              6. **User preferences**: Feedback or corrections about how to work.";
 
-        // Split into messages to summarize vs. recent messages to keep verbatim.
-        // Walk backward from the target split point to find a safe cut that
-        // doesn't orphan tool_use blocks from their tool_result responses.
+        // Split into messages to summarize vs. recent messages to keep verbatim. Walk backward from
+        // the target split point to find a safe cut that doesn't orphan tool_use blocks from their
+        // tool_result responses.
         let view = messages.as_slice();
         let (to_summarize, to_keep) = if view.len() > 6 {
             let mut split = view.len() - 2;
@@ -1094,8 +1045,8 @@ impl Agent {
             (view.to_vec(), Vec::new())
         };
 
-        // Clone and preprocess messages for the summarizer: strip images and
-        // truncate large text blocks to avoid overwhelming the summary call.
+        // Clone and preprocess messages for the summarizer: strip images and truncate large text
+        // blocks to avoid overwhelming the summary call.
         let mut compact_messages = to_summarize;
         for message in &mut compact_messages {
             strip_images_and_truncate(&mut message.content);
@@ -1137,10 +1088,9 @@ impl Agent {
             )
         };
 
-        // Snapshot the deferred-tool active set BEFORE compaction so the
-        // `CompactBoundary` event carries it forward; otherwise tools the
-        // model loaded pre-compaction would silently drop out of the
-        // active set on the next turn.
+        // Snapshot the deferred-tool active set BEFORE compaction so the `CompactBoundary` event
+        // carries it forward; otherwise tools the model loaded pre-compaction would silently drop
+        // out of the active set on the next turn.
         let loaded_tools_snapshot = crate::tools::extract_loaded_tool_names(messages.as_slice());
 
         let summary_user_message = Message::user(&context_message);
@@ -1150,9 +1100,8 @@ impl Agent {
             loaded_tools_snapshot,
         );
 
-        // Persist the new compaction-boundary event and the re-appended
-        // tail. Pre-compaction rows stay in the DB unchanged; the
-        // event log on disk grows append-only.
+        // Persist the new compaction-boundary event and the re-appended tail. Pre-compaction rows
+        // stay in the DB unchanged; the event log on disk grows append-only.
         let boundary_event = messages
             .events()
             .iter()
@@ -1173,14 +1122,13 @@ impl Agent {
                 .await?;
         }
 
-        // Pre-boundary events are now fully superseded and already
-        // persisted; drop them so the in-memory log doesn't grow unbounded
-        // across repeated compactions.
+        // Pre-boundary events are now fully superseded and already persisted; drop them so the
+        // in-memory log doesn't grow unbounded across repeated compactions.
         messages.prune_compacted_events();
 
-        // The model's view of which files it has read is reset by the
-        // summary; drop the read-tracker so `edit_file` re-reads rather
-        // than trusting a pre-compaction read (also bounds its growth).
+        // The model's view of which files it has read is reset by the summary; drop the
+        // read-tracker so `edit_file` re-reads rather than trusting a pre-compaction read (also
+        // bounds its growth).
         self.tool_registry.clear_read_tracker().await;
 
         Ok(())
@@ -1212,10 +1160,9 @@ fn truncate_messages_for_context(
 
     let mut start_index = messages.len().saturating_sub(limit);
 
-    // Walk backward to find a safe cut point: a user message that is NOT a
-    // tool_results message. This avoids splitting assistant(ToolUse) →
-    // user(ToolResult) chains and ensures the first message has role User
-    // (required by Claude API).
+    // Walk backward to find a safe cut point: a user message that is NOT a tool_results message.
+    // This avoids splitting assistant(ToolUse) → user(ToolResult) chains and ensures the first
+    // message has role User (required by Claude API).
     loop {
         if start_index == 0 {
             break;
@@ -1348,9 +1295,8 @@ mod tests {
 
     #[test]
     fn test_resolve_against_cwd_follows_subsequent_writes() {
-        // Confirms multiple sessions in one process would observe their
-        // own cwds: a write to the shared lock is visible on the next
-        // resolve, without touching process cwd.
+        // Confirms multiple sessions in one process would observe their own cwds: a write to the
+        // shared lock is visible on the next resolve, without touching process cwd.
         let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/tmp/a")));
         let first = resolve_against_cwd(&cwd, "foo.txt");
         *cwd.write().expect("cwd lock") = PathBuf::from("/tmp/b");
@@ -1398,8 +1344,8 @@ mod tests {
             tool_result_msg(),
             assistant_msg("final"),
         ];
-        // Limit 3 would naively start at index 3 (assistant_tool_use), but that
-        // splits the tool chain. It should walk back to index 2 (user "second").
+        // Limit 3 would naively start at index 3 (assistant_tool_use), but that splits the tool
+        // chain. It should walk back to index 2 (user "second").
         let result = truncate_messages_for_context(&messages, Some(3));
         assert_eq!(result[0].role, Role::User);
         assert!(!has_tool_results(&result[0].content));
@@ -1430,18 +1376,17 @@ mod tests {
             user_msg("second"),
             assistant_msg("response2"),
         ];
-        // Limit 4 would naively start at index 2 (tool_result_msg), should walk
-        // back to index 0 (user "first")
+        // Limit 4 would naively start at index 2 (tool_result_msg), should walk back to index 0
+        // (user "first")
         let result = truncate_messages_for_context(&messages, Some(4));
         assert_eq!(result[0].role, Role::User);
         assert!(!has_tool_results(&result[0].content));
     }
 
-    // Cache prefix stability tests.
-    // These tests simulate the agent's message-assembly logic (stable base +
-    // appended tool-loop messages) to verify that the prefix sent to the API
-    // remains identical across iterations of the tool-use loop.  This is the
-    // core invariant required for KV cache reuse.
+    // Cache prefix stability tests. These tests simulate the agent's message-assembly logic (stable
+    // base + appended tool-loop messages) to verify that the prefix sent to the API remains
+    // identical across iterations of the tool-use loop.  This is the core invariant required for KV
+    // cache reuse.
 
     fn assistant_tool_use_named(id: &str, name: &str) -> Message {
         Message {
@@ -1467,9 +1412,8 @@ mod tests {
         }
     }
 
-    /// Compares two message slices for semantic equality (same role, same
-    /// content blocks).  This is what determines whether the KV cache prefix
-    /// is reusable.
+    /// Compares two message slices for semantic equality (same role, same content blocks).  This is
+    /// what determines whether the KV cache prefix is reusable.
     fn assert_messages_equal(a: &[Message], b: &[Message], context: &str) {
         assert_eq!(a.len(), b.len(), "{}: length mismatch", context);
         for (i, (ma, mb)) in a.iter().zip(b.iter()).enumerate() {
@@ -1515,9 +1459,9 @@ mod tests {
 
     #[test]
     fn test_stable_base_during_tool_loop() {
-        // Simulate a conversation with history, then a tool loop that adds
-        // 3 tool call/result pairs.  The base prefix (everything before the
-        // tool loop) must be identical across all iterations.
+        // Simulate a conversation with history, then a tool loop that adds 3 tool call/result
+        // pairs.  The base prefix (everything before the tool loop) must be identical across all
+        // iterations.
         let mut messages = vec![
             user_msg("first question"),
             assistant_msg("first answer"),
@@ -1565,10 +1509,9 @@ mod tests {
 
     #[test]
     fn test_truncation_boundary_does_not_shift_during_tool_loop() {
-        // This is the critical test for the fix: when context_messages is set
-        // and we're near the limit, adding tool results within the loop must
-        // NOT cause the truncated prefix to shift.  Before the fix, truncation
-        // was recomputed inside the loop, causing prefix instability.
+        // This is the critical test for the fix: when context_messages is set and we're near the
+        // limit, adding tool results within the loop must NOT cause the truncated prefix to shift.
+        // Before the fix, truncation was recomputed inside the loop, causing prefix instability.
         let limit = Some(6);
 
         // Start with 5 messages (under the limit of 6).
@@ -1590,9 +1533,9 @@ mod tests {
         let api_iter0 = build_api_messages(&messages, &base_messages, turn_start_len);
         assert_eq!(api_iter0.len(), 5);
 
-        // Iteration 1: add tool call + result → 7 messages total, over limit.
-        // With the old code, truncation would kick in and drop messages from
-        // the front.  With the new code, the base is frozen.
+        // Iteration 1: add tool call + result → 7 messages total, over limit. With the old code,
+        // truncation would kick in and drop messages from the front.  With the new code, the base
+        // is frozen.
         messages.push(assistant_tool_use_named("t1", "read_file"));
         messages.push(tool_result_for("t1", "data"));
 
@@ -1618,8 +1561,8 @@ mod tests {
 
     #[test]
     fn test_truncation_with_tool_chain_near_boundary() {
-        // Verify that when the conversation includes a tool chain right at the
-        // truncation boundary, the base is computed correctly and stays stable.
+        // Verify that when the conversation includes a tool chain right at the truncation boundary,
+        // the base is computed correctly and stays stable.
         let limit = Some(4);
 
         let mut messages = vec![
@@ -1635,8 +1578,8 @@ mod tests {
         let base_messages = truncate_messages_for_context(&messages, limit);
         let turn_start_len = messages.len();
 
-        // The truncation should keep a safe cut point; verify it starts with
-        // a user message and doesn't split tool chains.
+        // The truncation should keep a safe cut point; verify it starts with a user message and
+        // doesn't split tool chains.
         assert_eq!(base_messages[0].role, Role::User);
         assert!(!has_tool_results(&base_messages[0].content));
 
@@ -1659,8 +1602,8 @@ mod tests {
 
     #[test]
     fn test_no_limit_produces_full_prefix() {
-        // With no context_messages limit, base_messages includes everything,
-        // and tool loop additions are appended without any truncation.
+        // With no context_messages limit, base_messages includes everything, and tool loop
+        // additions are appended without any truncation.
         let mut messages = vec![user_msg("a"), assistant_msg("b"), user_msg("c")];
 
         let base_messages = truncate_messages_for_context(&messages, None);
@@ -1689,9 +1632,9 @@ mod tests {
 
     #[test]
     fn test_multi_turn_with_truncation_each_turn_gets_stable_base() {
-        // Simulate multiple turns, each computing its own stable base.
-        // Verify that within each turn's tool loop the base stays fixed,
-        // and that across turns the overlapping messages are consistent.
+        // Simulate multiple turns, each computing its own stable base. Verify that within each
+        // turn's tool loop the base stays fixed, and that across turns the overlapping messages are
+        // consistent.
         let limit = Some(6);
 
         // -- Turn 1 --

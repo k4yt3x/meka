@@ -1,6 +1,5 @@
-//! Interactive REPL: reedline-driven prompt loop, slash-command parsing,
-//! `!command` shell pass-through, and the channels that exchange events
-//! between the REPL thread and the agent loop.
+//! Interactive REPL: reedline-driven prompt loop, slash-command parsing, `!command` shell
+//! pass-through, and the channels that exchange events between the REPL thread and the agent loop.
 
 use std::{
     borrow::Cow,
@@ -19,10 +18,9 @@ use crate::{
     relay::RELAY,
 };
 
-/// Reedline highlighter that paints the entire input buffer with a single
-/// style. The final paint reedline emits on submit is what lands in
-/// scrollback, so this is what visually separates user prompts from
-/// assistant output.
+/// Reedline highlighter that paints the entire input buffer with a single style. The final paint
+/// reedline emits on submit is what lands in scrollback, so this is what visually separates user
+/// prompts from assistant output.
 struct UserInputHighlighter {
     style: nu_ansi_term::Style,
 }
@@ -40,9 +38,9 @@ const CYCLE_PERMISSION_SENTINEL: &str = "__cycle_permission__";
 struct AgshPrompt {
     shared_permission: SharedPermission,
     show_path: bool,
-    /// Per-session working directory shared with the agent and the
-    /// `/cd` slash command. Reading the lock per prompt render is cheap
-    /// (microseconds) and bounded — `/cd` is the only writer.
+    /// Per-session working directory shared with the agent and the `/cd` slash command. Reading
+    /// the lock per prompt render is cheap (microseconds) and bounded — `/cd` is the only
+    /// writer.
     cwd: crate::agent::SharedCwd,
 }
 
@@ -135,8 +133,8 @@ pub enum SlashCommand {
     Compact,
     Export,
     Cd(Option<String>),
-    /// `/mcp <server>:<prompt> [args...]` — render an MCP prompt and send
-    /// its messages as the next user turn.
+    /// `/mcp <server>:<prompt> [args...]` — render an MCP prompt and send its messages as the next
+    /// user turn.
     McpPrompt {
         server: String,
         prompt: String,
@@ -158,24 +156,21 @@ pub enum SlashCommand {
     },
     /// `/skill` (no argument) — list installed skills.
     SkillList,
-    /// `/skill <name> [extra...]` — invoke a user-invocable skill directly.
-    /// Anything the user types after the skill name is captured verbatim
-    /// in `extra` and prepended to the rendered skill body before the
-    /// agent turn, so the model reads the user's directive first and
-    /// the skill body as the method. Empty when the user just typed
-    /// `/skill <name>`.
+    /// `/skill <name> [extra...]` — invoke a user-invocable skill directly. Anything the user types
+    /// after the skill name is captured verbatim in `extra` and prepended to the rendered skill
+    /// body before the agent turn, so the model reads the user's directive first and the skill body
+    /// as the method. Empty when the user just typed `/skill <name>`.
     SkillInvoke {
         name: String,
         extra: String,
     },
-    /// `/status` — print cumulative session stats (turns, tokens, cache
-    /// hit ratio, image redactions).
+    /// `/status` — print cumulative session stats (turns, tokens, cache hit ratio, image
+    /// redactions).
     Status,
-    /// `/history [N]` — reprint past conversation in REPL style. Bare
-    /// `/history` dumps every materialised message; `/history N` shows
-    /// the last `N` turns (turn = user prompt + the agent work it
-    /// triggered). Any non-numeric argument (e.g. `all`) falls back to
-    /// the dump-everything path.
+    /// `/history [N]` — reprint past conversation in REPL style. Bare `/history` dumps every
+    /// materialised message; `/history N` shows the last `N` turns (turn = user prompt + the agent
+    /// work it triggered). Any non-numeric argument (e.g. `all`) falls back to the dump-everything
+    /// path.
     History(Option<usize>),
 }
 
@@ -185,14 +180,12 @@ pub enum ReplEvent {
     Exit,
 }
 
-/// Sent from the agent to the REPL when a tool call needs user approval in
-/// Ask mode.
+/// Sent from the agent to the REPL when a tool call needs user approval in Ask mode.
 pub struct ToolApprovalRequest {
     pub tool_name: String,
-    /// Pre-computed summary (first required argument) to show next to the
-    /// tool name in the approval prompt. Resolved agent-side because the
-    /// REPL thread has no access to the tool registry needed for MCP
-    /// schema lookups.
+    /// Pre-computed summary (first required argument) to show next to the tool name in the
+    /// approval prompt. Resolved agent-side because the REPL thread has no access to the tool
+    /// registry needed for MCP schema lookups.
     pub primary_param: Option<String>,
     pub response_sender: tokio::sync::oneshot::Sender<bool>,
 }
@@ -201,8 +194,8 @@ pub struct ToolApprovalRequest {
 pub enum AgentToReplEvent {
     Done,
     ApprovalRequest(ToolApprovalRequest),
-    /// Server-driven elicitation — the REPL prompts the user and replies
-    /// via the embedded responder channel.
+    /// Server-driven elicitation — the REPL prompts the user and replies via the embedded responder
+    /// channel.
     McpElicitation(crate::mcp::elicitation::ElicitationPrompt),
     /// Incremental progress update for a running MCP tool.
     McpProgress(crate::mcp::progress::ProgressUpdate),
@@ -260,9 +253,9 @@ fn parse_mcp_slash(rest: &str) -> Option<SlashCommand> {
     if rest.is_empty() || rest == "list" {
         return Some(SlashCommand::McpList);
     }
-    // `<subcommand> <server>` shapes. Reject bare `reconnect` / `login`
-    // / `logout` with no server argument so users see the "Unknown
-    // command" error instead of silently firing against no target.
+    // `<subcommand> <server>` shapes. Reject bare `reconnect` / `login` / `logout` with no server
+    // argument so users see the "Unknown command" error instead of silently firing against no
+    // target.
     type McpServerCtor = fn(String) -> SlashCommand;
     fn mk_reconnect(s: String) -> SlashCommand {
         SlashCommand::McpReconnect { server: s }
@@ -351,11 +344,10 @@ pub fn run_repl(
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
     cwd: crate::agent::SharedCwd,
 ) {
-    // Install reedline's `ExternalPrinter` on the process-global tracing
-    // writer BEFORE the first `read_line()`. From this point on, log
-    // lines (including async MCP-connect warnings that fire while the
-    // REPL is starting) print *above* the live prompt instead of being
-    // overwritten by reedline's redraw.
+    // Install reedline's `ExternalPrinter` on the process-global tracing writer BEFORE the first
+    // `read_line()`. From this point on, log lines (including async MCP-connect warnings that fire
+    // while the REPL is starting) print *above* the live prompt instead of being overwritten by
+    // reedline's redraw.
     let printer = ExternalPrinter::default();
     RELAY.install(printer.clone());
 
@@ -366,10 +358,9 @@ pub fn run_repl(
         cwd: cwd.clone(),
     };
 
-    // If the caller queued a synthetic first turn (e.g. `--skill` or a bare
-    // positional `[PROMPT]` in interactive mode), drain agent events for
-    // that turn before drawing the first reedline prompt. Otherwise the
-    // prompt indicator and the agent's stdout output collide on screen.
+    // If the caller queued a synthetic first turn (e.g. `--skill` or a bare positional `[PROMPT]`
+    // in interactive mode), drain agent events for that turn before drawing the first reedline
+    // prompt. Otherwise the prompt indicator and the agent's stdout output collide on screen.
     if initial_turn_pending && !wait_for_agent(&agent_event_receiver) {
         return;
     }
@@ -380,12 +371,10 @@ pub fn run_repl(
                 if buffer == CYCLE_PERMISSION_SENTINEL {
                     let new_permission = shared_permission.cycle();
                     tracing::debug!("permission cycled to {}", new_permission);
-                    // Re-emit the "backend unavailable" warn at the moment
-                    // the user enters read mode, so a misconfigured sandbox
-                    // surfaces immediately instead of waiting for the first
-                    // `execute_command` failure. The "stronger sandbox
-                    // available" nudge (Warn 2) intentionally doesn't fire
-                    // here — startup-only, to avoid nagging.
+                    // Re-emit the "backend unavailable" warn at the moment the user enters read
+                    // mode, so a misconfigured sandbox surfaces immediately instead of waiting for
+                    // the first `execute_command` failure. The "stronger sandbox available" nudge
+                    // (Warn 2) intentionally doesn't fire here — startup-only, to avoid nagging.
                     if new_permission == crate::permission::Permission::Read {
                         crate::sandbox::warn_if_sandbox_issues(
                             &sandbox_state,
@@ -550,11 +539,10 @@ pub fn run_repl(
                 }
                 break;
             }
-            // The pinned reedline fork (wtfbbqhax/reedline @ 3a457ff) has
-            // a slimmer `Signal` enum than upstream — no `ExternalBreak`
-            // variant — so this catch-all is currently unreachable. When
-            // we switch back to upstream after #1005 lands in a release,
-            // it'll fire on the unhandled `ExternalBreak`.
+            // The pinned reedline fork (wtfbbqhax/reedline @ 3a457ff) has a slimmer `Signal` enum
+            // than upstream — no `ExternalBreak` variant — so this catch-all is currently
+            // unreachable. When we switch back to upstream after #1005 lands in a release, it'll
+            // fire on the unhandled `ExternalBreak`.
             #[allow(unreachable_patterns)]
             Ok(other) => {
                 tracing::warn!("unexpected reedline signal: {:?}", other);
@@ -574,8 +562,8 @@ pub fn run_repl(
     }
 }
 
-/// Wait for the agent to signal it is done, while also handling tool approval
-/// requests that arrive in Ask mode.
+/// Wait for the agent to signal it is done, while also handling tool approval requests that arrive
+/// in Ask mode.
 fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEvent>) -> bool {
     loop {
         match agent_event_receiver.recv() {
@@ -602,8 +590,8 @@ fn render_progress_update(update: &crate::mcp::progress::ProgressUpdate) {
     let _ = std::io::stderr().flush();
 }
 
-/// Format a progress line. Sanitises server-controlled strings so an MCP
-/// server can't inject ANSI escapes to clear the screen or spoof prompts.
+/// Format a progress line. Sanitises server-controlled strings so an MCP server can't inject ANSI
+/// escapes to clear the screen or spoof prompts.
 fn format_progress_update(update: &crate::mcp::progress::ProgressUpdate) -> String {
     let message = update
         .message
@@ -622,23 +610,21 @@ fn format_progress_update(update: &crate::mcp::progress::ProgressUpdate) -> Stri
             server, tool, update.progress, message
         ),
     };
-    // Pad with a few spaces so the next print clears trailing chars from
-    // any longer previous line.
+    // Pad with a few spaces so the next print clears trailing chars from any longer previous line.
     format!("{}     ", body)
 }
 
-/// Route a structured/url elicitation request to the user. For forms, walks
-/// the JSON Schema one property at a time, collecting input. For URLs, opens
-/// the browser and waits for the user to confirm.
+/// Route a structured/url elicitation request to the user. For forms, walks the JSON Schema one
+/// property at a time, collecting input. For URLs, opens the browser and waits for the user to
+/// confirm.
 fn handle_elicitation_prompt(prompt: crate::mcp::elicitation::ElicitationPrompt) {
     use crate::mcp::{
         elicitation::{ElicitationKind, ElicitationResponse},
         sanitize::sanitize_text,
     };
-    // Server-controlled strings get stripped of control/format codepoints
-    // before they reach the terminal. Without this a malicious server could
-    // ship ANSI escapes to clear the screen or RTL overrides to spoof the
-    // field the user thinks they're filling in.
+    // Server-controlled strings get stripped of control/format codepoints before they reach the
+    // terminal. Without this a malicious server could ship ANSI escapes to clear the screen or RTL
+    // overrides to spoof the field the user thinks they're filling in.
     eprintln!(
         "[mcp elicit: {}] {}",
         sanitize_text(&prompt.server_name),
@@ -660,9 +646,8 @@ fn handle_elicitation_prompt(prompt: crate::mcp::elicitation::ElicitationPrompt)
                 match line.trim().to_ascii_lowercase().as_str() {
                     "" | "y" | "yes" => {
                         if let Err(error) = open::that(url) {
-                            // URL was printed right above; launch
-                            // failure on headless hosts is expected
-                            // noise — diagnostic only.
+                            // URL was printed right above; launch failure on headless hosts is
+                            // expected noise — diagnostic only.
                             tracing::debug!(
                                 "failed to open browser for URL elicitation: {}",
                                 error
@@ -772,9 +757,8 @@ fn shorten_path_with_tilde(path: &Path) -> String {
             return "~".to_string();
         }
         if let Ok(relative) = path.strip_prefix(&home) {
-            // Normalize to forward slashes so the tilde form reads the
-            // same way on every platform (Windows' native `\` looks
-            // jarring next to the `~/` prefix and breaks tests that
+            // Normalize to forward slashes so the tilde form reads the same way on every platform
+            // (Windows' native `\` looks jarring next to the `~/` prefix and breaks tests that
             // compare against a hard-coded literal).
             let relative_str = relative.display().to_string().replace('\\', "/");
             return format!("~/{}", relative_str);
@@ -804,9 +788,8 @@ fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) {
         PathBuf::from(target)
     };
 
-    // Resolve relative inputs against the current per-session cwd so
-    // `/cd subdir` lands inside the agent's current view, then
-    // canonicalize so the prompt and the tools see a clean path.
+    // Resolve relative inputs against the current per-session cwd so `/cd subdir` lands inside the
+    // agent's current view, then canonicalize so the prompt and the tools see a clean path.
     let resolved = crate::agent::resolve_against_cwd(cwd, &raw);
     let canonical = match std::fs::canonicalize(&resolved) {
         Ok(canonical) => canonical,
@@ -831,11 +814,9 @@ mod tests {
 
     #[test]
     fn test_handle_cd_updates_shared_cwd_without_mutating_process_cwd() {
-        // Working directory mutation is per-session now; verify `/cd`
-        // writes to the `SharedCwd` and leaves `std::env::current_dir()`
-        // untouched. Use a tempdir + canonicalize so the assertion is
-        // robust to platform-specific symlinks (e.g. `/tmp` → `/private/tmp`
-        // on macOS).
+        // Working directory mutation is per-session now; verify `/cd` writes to the `SharedCwd` and
+        // leaves `std::env::current_dir()` untouched. Use a tempdir + canonicalize so the assertion
+        // is robust to platform-specific symlinks (e.g. `/tmp` → `/private/tmp` on macOS).
         let temp = tempfile::tempdir().expect("tempdir");
         let target = std::fs::canonicalize(temp.path()).expect("canonicalize tempdir");
         let process_cwd_before = std::env::current_dir().expect("read process cwd before /cd");
@@ -1081,9 +1062,9 @@ mod tests {
 
     #[test]
     fn test_parse_mcp_slash_reconnect_without_server_is_none() {
-        // Bare `reconnect` with no server name: neither the reconnect arm nor
-        // the `<server>:<prompt>` arm matches, so the command is rejected
-        // rather than silently firing against some default.
+        // Bare `reconnect` with no server name: neither the reconnect arm nor the
+        // `<server>:<prompt>` arm matches, so the command is rejected rather than silently firing
+        // against some default.
         assert!(parse_slash_command("/mcp reconnect").is_none());
     }
 
@@ -1165,8 +1146,7 @@ mod tests {
 
     #[test]
     fn test_parse_mcp_slash_multiple_colons_splits_on_first() {
-        // `split_once` returns the first colon, so prompt names can contain
-        // further colons.
+        // `split_once` returns the first colon, so prompt names can contain further colons.
         match parse_slash_command("/mcp srv:ns:prompt") {
             Some(SlashCommand::McpPrompt { server, prompt, .. }) => {
                 assert_eq!(server, "srv");
@@ -1202,10 +1182,9 @@ mod tests {
 
     #[test]
     fn test_parse_skill_slash_captures_free_form_extra() {
-        // The whole remainder after the skill name is captured verbatim
-        // (preserving inner whitespace) and trimmed at the edges. This is
-        // free-form text the user wants prepended to the skill body — no
-        // positional argument parsing.
+        // The whole remainder after the skill name is captured verbatim (preserving inner
+        // whitespace) and trimmed at the edges. This is free-form text the user wants prepended to
+        // the skill body — no positional argument parsing.
         match parse_slash_command("/skill demo only fetch UK news") {
             Some(SlashCommand::SkillInvoke { name, extra }) => {
                 assert_eq!(name, "demo");
@@ -1217,9 +1196,8 @@ mod tests {
 
     #[test]
     fn test_parse_skill_slash_trims_trailing_whitespace() {
-        // Trailing whitespace after the skill name should produce an
-        // empty extra, not a whitespace-padded one — equivalent to the
-        // bare-name invocation.
+        // Trailing whitespace after the skill name should produce an empty extra, not a
+        // whitespace-padded one — equivalent to the bare-name invocation.
         match parse_slash_command("/skill demo   ") {
             Some(SlashCommand::SkillInvoke { name, extra }) => {
                 assert_eq!(name, "demo");
@@ -1231,9 +1209,9 @@ mod tests {
 
     #[test]
     fn test_parse_skill_slash_no_list_keyword() {
-        // The token "list" is treated as a skill name, not a subcommand.
-        // (Bare `/skill` is the listing form; `/skill list` would error
-        // at dispatch with "unknown skill 'list'" if no such skill exists.)
+        // The token "list" is treated as a skill name, not a subcommand. (Bare `/skill` is the
+        // listing form; `/skill list` would error at dispatch with "unknown skill 'list'" if no
+        // such skill exists.)
         match parse_slash_command("/skill list") {
             Some(SlashCommand::SkillInvoke { name, extra }) => {
                 assert_eq!(name, "list");
@@ -1243,9 +1221,8 @@ mod tests {
         }
     }
 
-    /// Short debug label — SlashCommand doesn't implement Debug so we map
-    /// the few variants we care about manually to keep assertion messages
-    /// readable.
+    /// Short debug label — SlashCommand doesn't implement Debug so we map the few variants we care
+    /// about manually to keep assertion messages readable.
     fn option_label(cmd: &Option<SlashCommand>) -> &'static str {
         match cmd {
             None => "None",
@@ -1271,9 +1248,8 @@ mod tests {
 
     #[test]
     fn test_format_progress_update_strips_rtl_override_in_names() {
-        // Defensive: even though server/tool names are normalised at
-        // registration time, this confirms the renderer can't be tricked
-        // by a handler that someday forgets to normalise.
+        // Defensive: even though server/tool names are normalised at registration time, this
+        // confirms the renderer can't be tricked by a handler that someday forgets to normalise.
         let update = crate::mcp::progress::ProgressUpdate {
             server_name: "sv\u{202E}r".to_string(),
             tool_name: "t\u{200B}ool".to_string(),

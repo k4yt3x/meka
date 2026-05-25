@@ -15,11 +15,10 @@ fn config_err(message: impl Into<String>) -> AgshError {
 
 /// Run `agsh mcp list` — print configured servers + their transport/URL.
 ///
-/// When `manager` is `Some`, the output also carries a `state` column
-/// showing each server's live lifecycle state (`pending` / `connected`
-/// / `failed` / `disabled`). The out-of-band `agsh mcp list` CLI doesn't
-/// have a running manager and gets the no-state view; the REPL's
-/// `/mcp list` passes the live manager for the richer output.
+/// When `manager` is `Some`, the output also carries a `state` column showing each server's live
+/// lifecycle state (`pending` / `connected` / `failed` / `disabled`). The out-of-band `agsh mcp
+/// list` CLI doesn't have a running manager and gets the no-state view; the REPL's `/mcp list`
+/// passes the live manager for the richer output.
 pub async fn run_list(
     servers: &[McpServerConfig],
     manager: Option<&std::sync::Arc<crate::mcp::McpClientManager>>,
@@ -29,8 +28,8 @@ pub async fn run_list(
         return Ok(());
     }
 
-    // Resolve state once up front so the table output stays consistent
-    // even if a server connects mid-print.
+    // Resolve state once up front so the table output stays consistent even if a server connects
+    // mid-print.
     let mut states: std::collections::HashMap<&str, &'static str> =
         std::collections::HashMap::new();
     if let Some(manager) = manager {
@@ -43,9 +42,8 @@ pub async fn run_list(
         }
     }
 
-    // The live-manager variant adds a `State` column; both share the
-    // shared column formatter so the table aligns regardless of how
-    // long a server name or target gets.
+    // The live-manager variant adds a `State` column; both share the shared column formatter so the
+    // table aligns regardless of how long a server name or target gets.
     let with_state = manager.is_some();
 
     let rows: Vec<Vec<String>> = servers
@@ -156,13 +154,11 @@ pub async fn run_get(servers: &[McpServerConfig], name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run `agsh mcp reconnect <name>` — connect once as a smoke test, print
-/// `ok` on success and the error otherwise. Does not mutate config.
-/// Run `agsh mcp tools <name>` — connect to the server, list every
-/// advertised tool, resolve permissions, and print a column-aligned
-/// table. Disabled-by-allow/block tools are still shown (marked
-/// `blocked`) so users can edit their config without leaving the
-/// CLI to discover names.
+/// Run `agsh mcp reconnect <name>` — connect once as a smoke test, print `ok` on success and the
+/// error otherwise. Does not mutate config. Run `agsh mcp tools <name>` — connect to the server,
+/// list every advertised tool, resolve permissions, and print a column-aligned table.
+/// Disabled-by-allow/block tools are still shown (marked `blocked`) so users can edit their config
+/// without leaving the CLI to discover names.
 pub async fn run_tools(
     servers: &[McpServerConfig],
     mcp_default: Option<crate::permission::Permission>,
@@ -246,9 +242,8 @@ pub async fn run_tools(
     Ok(())
 }
 
-/// Collapse a (possibly multi-line) description into one short line so
-/// the table stays legible. MCP descriptions can be kilobytes; the
-/// first sentence or ~80 chars is enough for a listing.
+/// Collapse a (possibly multi-line) description into one short line so the table stays legible. MCP
+/// descriptions can be kilobytes; the first sentence or ~80 chars is enough for a listing.
 fn describe_one_line(description: &str) -> String {
     const MAX: usize = 80;
     let mut collapsed = String::with_capacity(description.len().min(MAX + 8));
@@ -288,12 +283,10 @@ pub async fn run_reconnect(
         .clone();
 
     let context = McpClientContext::new();
-    // Per-tool permission resolution uses `[mcp].default_permission`
-    // as its global fallback. `reconnect` is a smoke-test command run
-    // from outside the main agent loop, so we don't have a
-    // `ResolvedConfig` in scope — pass `None` and let resolution fall
-    // through to the hardcoded strict default. Any user-specific
-    // per-server / per-tool config still applies.
+    // Per-tool permission resolution uses `[mcp].default_permission` as its global fallback.
+    // `reconnect` is a smoke-test command run from outside the main agent loop, so we don't have a
+    // `ResolvedConfig` in scope — pass `None` and let resolution fall through to the hardcoded
+    // strict default. Any user-specific per-server / per-tool config still applies.
     let manager = McpClientManager::prepare(
         std::slice::from_ref(&config),
         None,
@@ -329,8 +322,8 @@ pub async fn run_reconnect(
     }
 }
 
-/// Run `agsh mcp logout <name>` — clear any stored OAuth credentials for
-/// the given server, and clear the auth-probe cache entry (if any).
+/// Run `agsh mcp logout <name>` — clear any stored OAuth credentials for the given server, and
+/// clear the auth-probe cache entry (if any).
 pub async fn run_logout(
     servers: &[McpServerConfig],
     token_store: &TokenStore,
@@ -357,12 +350,11 @@ pub async fn run_logout(
 
 /// Run `agsh mcp login <name>` — drive an interactive OAuth flow.
 ///
-/// If the config has an explicit `[auth]` block, it's honoured as-is.
-/// If the server is HTTP with no `auth` set, we assume
-/// `type = "oauth"` (authorization-code grant with dynamic client
-/// registration), run the flow, and on success persist the synthesised
-/// auth block back to `config.toml` so future runs skip the assumption.
-/// stdio servers without `auth` can't be logged in to and error.
+/// If the config has an explicit `[auth]` block, it's honoured as-is. If the server is HTTP with no
+/// `auth` set, we assume `type = "oauth"` (authorization-code grant with dynamic client
+/// registration), run the flow, and on success persist the synthesised auth block back to
+/// `config.toml` so future runs skip the assumption. stdio servers without `auth` can't be logged
+/// in to and error.
 pub async fn run_login(
     servers: &[McpServerConfig],
     token_store: &TokenStore,
@@ -405,8 +397,8 @@ pub async fn run_login(
     token_store.clear_auth_probe(name).await?;
 
     let context = McpClientContext::new();
-    // `login` is also out-of-band from the main agent loop; see the
-    // note in `run_reconnect` for why we pass `None` here.
+    // `login` is also out-of-band from the main agent loop; see the note in `run_reconnect` for why
+    // we pass `None` here.
     let manager = McpClientManager::prepare(
         std::slice::from_ref(&config),
         None,
@@ -438,9 +430,8 @@ pub async fn run_login(
     manager.shutdown_arc().await;
 
     if needs_persist && let Err(error) = persist_auth_block_for(name) {
-        // Login worked — don't fail the whole command if we can't write
-        // the config back, just surface the issue so the user can decide
-        // whether to hand-edit.
+        // Login worked — don't fail the whole command if we can't write the config back, just
+        // surface the issue so the user can decide whether to hand-edit.
         tracing::warn!(
             "'{}' is authorised, but failed to write 'auth = oauth' back to config.toml: {}",
             name,
@@ -452,10 +443,9 @@ pub async fn run_login(
     Ok(())
 }
 
-/// Write `[mcp.servers.auth] type = "oauth"` for a named server if the
-/// entry doesn't already have an `auth` key. Used by [`run_login`] to
-/// make the "assumed OAuth" path a one-time thing rather than silently
-/// reapplying the assumption on every future run.
+/// Write `[mcp.servers.auth] type = "oauth"` for a named server if the entry doesn't already have
+/// an `auth` key. Used by [`run_login`] to make the "assumed OAuth" path a one-time thing rather
+/// than silently reapplying the assumption on every future run.
 fn persist_auth_block_for(name: &str) -> Result<()> {
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
@@ -503,11 +493,10 @@ fn persist_auth_block_for(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Inputs for `agsh mcp add`. Parsed into a [`ResolvedAddArgs`] by
-/// [`resolve_add_args`] which is where transport auto-detection, flag
-/// compatibility, and the `McpAuthKind` → `McpAuthConfig` mapping live.
-/// Keep this struct plain-data so the clap layer in `cli.rs` and the
-/// CLI integration tests can both build one.
+/// Inputs for `agsh mcp add`. Parsed into a [`ResolvedAddArgs`] by [`resolve_add_args`] which is
+/// where transport auto-detection, flag compatibility, and the `McpAuthKind` → `McpAuthConfig`
+/// mapping live. Keep this struct plain-data so the clap layer in `cli.rs` and the CLI integration
+/// tests can both build one.
 pub struct AddArgs {
     pub name: String,
     pub location: Option<String>,
@@ -528,8 +517,8 @@ pub struct AddArgs {
     pub permission: Option<String>,
     pub sampling: bool,
     pub sampling_limit: Option<u32>,
-    /// Skip the auto-login that runs when the probe reports
-    /// auth-required or when `--auth oauth` was explicitly set.
+    /// Skip the auto-login that runs when the probe reports auth-required or when `--auth oauth`
+    /// was explicitly set.
     pub no_login: bool,
     /// Raw tool names to allow-list (only these register).
     pub allow_tool: Vec<String>,
@@ -539,15 +528,14 @@ pub struct AddArgs {
     pub eager_load_tool: Vec<String>,
     /// Raw `NAME=LEVEL` pairs for per-tool permission overrides.
     pub tool_permission: Vec<String>,
-    /// Persist with `disabled = true` so the server is skipped at startup
-    /// until the user runs `agsh mcp enable <name>`.
+    /// Persist with `disabled = true` so the server is skipped at startup until the user runs
+    /// `agsh mcp enable <name>`.
     pub disabled: bool,
 }
 
-/// What `add` looks like after validation: transport is chosen,
-/// mutually-exclusive flag combinations have been rejected, and the
-/// `[auth]` block (if any) has been reduced to an [`McpAuthConfig`]
-/// ready to be serialised into TOML.
+/// What `add` looks like after validation: transport is chosen, mutually-exclusive flag
+/// combinations have been rejected, and the `[auth]` block (if any) has been reduced to an
+/// [`McpAuthConfig`] ready to be serialised into TOML.
 #[cfg_attr(test, derive(Debug))]
 struct ResolvedAddArgs {
     name: String,
@@ -605,9 +593,9 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
 
-    // Propagate every read error except "the file does not exist yet". The
-    // previous `unwrap_or_default()` would happily silently overwrite a
-    // file we merely lacked permission to read.
+    // Propagate every read error except "the file does not exist yet". The previous
+    // `unwrap_or_default()` would happily silently overwrite a file we merely lacked permission to
+    // read.
     let existing = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -655,9 +643,8 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
     tracing::info!("added '{}' to {}", resolved.name, path.display());
 
-    // Decide whether to probe and/or auto-login. Stdio has no auth
-    // surface; HTTP servers with a pre-configured static bearer don't
-    // need one either. Everything else gets the probe. These
+    // Decide whether to probe and/or auto-login. Stdio has no auth surface; HTTP servers with a
+    // pre-configured static bearer don't need one either. Everything else gets the probe. These
     // short-circuits return `Ok(())` before we'd need Ctrl-C protection.
     if resolved.transport != McpTransport::Http {
         return Ok(());
@@ -669,10 +656,9 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
         return Ok(());
     }
 
-    // From here on, anything that goes wrong — natural failure, timeout,
-    // Ctrl-C — should leave config.toml in the "never added" state.
-    // Race the probe + auto-login block against SIGINT so an interrupted
-    // user ends up in exactly the same place as a clean `mcp remove`.
+    // From here on, anything that goes wrong — natural failure, timeout, Ctrl-C — should leave
+    // config.toml in the "never added" state. Race the probe + auto-login block against SIGINT so
+    // an interrupted user ends up in exactly the same place as a clean `mcp remove`.
     let result: Result<()> = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => Err(AgshError::Interrupted),
@@ -703,9 +689,8 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     Ok(())
 }
 
-/// The "everything that can fail post-persist" block: probe, decide
-/// whether to auto-login, and run the OAuth flow when warranted.
-/// Extracted so [`run_add`] can race it against a SIGINT handler and
+/// The "everything that can fail post-persist" block: probe, decide whether to auto-login, and run
+/// the OAuth flow when warranted. Extracted so [`run_add`] can race it against a SIGINT handler and
 /// roll back on either error path from one place.
 async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) -> Result<()> {
     // Caller has already verified HTTP + no auth_token + url.is_some().
@@ -716,8 +701,8 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
 
     let wants_oauth_already = matches!(resolved.auth, Some(McpAuthConfig::OAuth { .. }));
     let should_login = match probe_and_announce(&resolved.name, url).await {
-        // Probe says unauthenticated access works, and the user didn't
-        // explicitly ask for OAuth → nothing to log in to.
+        // Probe says unauthenticated access works, and the user didn't explicitly ask for OAuth →
+        // nothing to log in to.
         ProbeOutcome::Open => wants_oauth_already,
         ProbeOutcome::AuthRequired => true,
         ProbeOutcome::Inconclusive => wants_oauth_already,
@@ -734,8 +719,8 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
         return Ok(());
     }
 
-    // Synthesised server config for the login — equivalent to parsing
-    // the entry we just wrote but without round-tripping through disk.
+    // Synthesised server config for the login — equivalent to parsing the entry we just wrote but
+    // without round-tripping through disk.
     let server_config = resolved_to_server_config(resolved);
     tracing::info!(
         "running OAuth authorisation for '{}' (use --no-login to skip).",
@@ -749,10 +734,9 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
     .await
 }
 
-/// What we need to know about the probe from `run_add`'s perspective.
-/// The full `McpAuthProbe` detail is printed to the user (so they still
-/// see "server reachable" / "couldn't reach …"), but the auto-login
-/// decision only needs the three-state summary.
+/// What we need to know about the probe from `run_add`'s perspective. The full `McpAuthProbe`
+/// detail is printed to the user (so they still see "server reachable" / "couldn't reach …"), but
+/// the auto-login decision only needs the three-state summary.
 #[derive(Debug, PartialEq, Eq)]
 enum ProbeOutcome {
     Open,
@@ -760,8 +744,8 @@ enum ProbeOutcome {
     Inconclusive,
 }
 
-/// Probe the HTTP endpoint, print a one-line hint, and collapse the
-/// probe result into a login-decision summary.
+/// Probe the HTTP endpoint, print a one-line hint, and collapse the probe result into a
+/// login-decision summary.
 async fn probe_and_announce(name: &str, url: &str) -> ProbeOutcome {
     use crate::mcp::auth::McpAuthProbe;
 
@@ -794,12 +778,10 @@ async fn probe_and_announce(name: &str, url: &str) -> ProbeOutcome {
 
 /// Turn the raw CLI [`AddArgs`] into a validated [`ResolvedAddArgs`].
 ///
-/// Auto-detects transport from the positional `location` when
-/// `--transport` is not given (`http[s]://…` → http, anything else →
-/// stdio). Rejects every illegal flag combination (stdio with http-only
-/// flags, `--auth-token` together with `--auth`, OAuth flags without an
-/// OAuth-family auth kind, etc.) at add time so bad configurations
-/// never land in `config.toml`.
+/// Auto-detects transport from the positional `location` when `--transport` is not given
+/// (`http[s]://…` → http, anything else → stdio). Rejects every illegal flag combination (stdio
+/// with http-only flags, `--auth-token` together with `--auth`, OAuth flags without an OAuth-family
+/// auth kind, etc.) at add time so bad configurations never land in `config.toml`.
 fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
     let AddArgs {
         name,
@@ -999,14 +981,12 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
     }
 }
 
-/// Convert the CLI's auth-related flags into an [`McpAuthConfig`] (or
-/// `None` if the user chose static-token / no auth). Validates the
-/// per-variant required fields so "oauth" doesn't silently accept an
-/// unrelated `--signing-key` and ship a malformed config.
+/// Convert the CLI's auth-related flags into an [`McpAuthConfig`] (or `None` if the user chose
+/// static-token / no auth). Validates the per-variant required fields so "oauth" doesn't silently
+/// accept an unrelated `--signing-key` and ship a malformed config.
 ///
-/// The eight inputs are the independent auth-related CLI flags; grouping
-/// them behind a newtype would just shuffle the destructuring burden one
-/// step upstream without adding meaning.
+/// The eight inputs are the independent auth-related CLI flags; grouping them behind a newtype
+/// would just shuffle the destructuring burden one step upstream without adding meaning.
 #[allow(clippy::too_many_arguments)]
 fn resolve_auth_config(
     auth: Option<crate::cli::McpAuthKind>,
@@ -1101,9 +1081,8 @@ fn resolve_auth_config(
     }
 }
 
-/// Parse a list of `KEY=VALUE` strings from the CLI into pairs. Surfaces
-/// the originating flag name in errors so users can tell `--env` and
-/// `--header` apart when both are wrong at once.
+/// Parse a list of `KEY=VALUE` strings from the CLI into pairs. Surfaces the originating flag name
+/// in errors so users can tell `--env` and `--header` apart when both are wrong at once.
 fn parse_kv_pairs(flag: &str, pairs: &[String]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::with_capacity(pairs.len());
     for entry in pairs {
@@ -1121,10 +1100,9 @@ fn parse_kv_pairs(flag: &str, pairs: &[String]) -> Result<Vec<(String, String)>>
     Ok(out)
 }
 
-/// Build an [`McpServerConfig`] equivalent to what parsing the entry
-/// we just wrote into `config.toml` would yield. Lets the auto-login
-/// path in [`run_add`] call into [`run_login`] without round-tripping
-/// through disk.
+/// Build an [`McpServerConfig`] equivalent to what parsing the entry we just wrote into
+/// `config.toml` would yield. Lets the auto-login path in [`run_add`] call into [`run_login`]
+/// without round-tripping through disk.
 fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
     let env = if resolved.env.is_empty() {
         None
@@ -1163,9 +1141,9 @@ fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
     }
 }
 
-/// Serialise a validated [`ResolvedAddArgs`] into a TOML table ready to
-/// push onto `mcp.servers`. Only the fields the user actually supplied
-/// are emitted so hand-edited config files stay readable.
+/// Serialise a validated [`ResolvedAddArgs`] into a TOML table ready to push onto `mcp.servers`.
+/// Only the fields the user actually supplied are emitted so hand-edited config files stay
+/// readable.
 fn build_server_table(resolved: &ResolvedAddArgs) -> toml_edit::Table {
     let mut table = toml_edit::Table::new();
     table.insert("name", toml_edit::value(resolved.name.clone()));
@@ -1337,13 +1315,11 @@ fn insert_string_array(table: &mut toml_edit::Table, key: &str, values: Option<&
     table.insert(key, toml_edit::Item::Value(toml_edit::Value::Array(arr)));
 }
 
-/// Wipe every trace of `name`: the `[[mcp.servers]]` entry in
-/// `config.toml`, any stored OAuth credentials (revoked server-side
-/// via RFC 7009 first, best-effort), the auth-probe cache row, and any
-/// resource-update ledger entries. Silent: callers print their own
-/// user-facing line. Used by both `run_remove` (user-invoked) and
-/// `run_add`'s auto-login rollback path (on OAuth failure after the
-/// config entry has already been written).
+/// Wipe every trace of `name`: the `[[mcp.servers]]` entry in `config.toml`, any stored OAuth
+/// credentials (revoked server-side via RFC 7009 first, best-effort), the auth-probe cache row, and
+/// any resource-update ledger entries. Silent: callers print their own user-facing line. Used by
+/// both `run_remove` (user-invoked) and `run_add`'s auto-login rollback path (on OAuth failure
+/// after the config entry has already been written).
 async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path::PathBuf> {
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
@@ -1374,10 +1350,9 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path:
     crate::config::write_config_atomic(&path, &document.to_string())
         .map_err(|error| config_err(format!("failed to write config: {}", error)))?;
 
-    // Best-effort OAuth token revocation per RFC 7009 before we drop the
-    // local credentials. If the caller is rolling back a never-succeeded
-    // login there won't be any credentials; `revoke_stored_token` early-
-    // returns in that case so the call is safe regardless.
+    // Best-effort OAuth token revocation per RFC 7009 before we drop the local credentials. If the
+    // caller is rolling back a never-succeeded login there won't be any credentials;
+    // `revoke_stored_token` early- returns in that case so the call is safe regardless.
     if let Err(error) = crate::mcp::auth::revoke_stored_token(token_store, name).await {
         tracing::warn!(
             "failed to revoke token at server '{}' during purge: {} (continuing)",
@@ -1392,17 +1367,17 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<std::path:
     Ok(path)
 }
 
-/// Run `agsh mcp remove <name>` — delete the entry from config.toml,
-/// best-effort revoke OAuth tokens at the provider, clear local state.
+/// Run `agsh mcp remove <name>` — delete the entry from config.toml, best-effort revoke OAuth
+/// tokens at the provider, clear local state.
 pub async fn run_remove(name: &str, token_store: &TokenStore) -> Result<()> {
     let path = purge_server(name, token_store).await?;
     tracing::info!("removed '{}' from {}", name, path.display());
     Ok(())
 }
 
-/// Set `disabled = <value>` on a server entry in config.toml, preserving
-/// other fields and formatting. Backs `agsh mcp disable|enable`. Writes
-/// atomically via [`crate::config::write_config_atomic`].
+/// Set `disabled = <value>` on a server entry in config.toml, preserving other fields and
+/// formatting. Backs `agsh mcp disable|enable`. Writes atomically via
+/// [`crate::config::write_config_atomic`].
 async fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::PathBuf> {
     let path = crate::config::config_file_path()
         .ok_or_else(|| config_err("could not determine config directory"))?;
@@ -1427,8 +1402,8 @@ async fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::Pa
     if disabled {
         entry.insert("disabled", toml_edit::value(true));
     } else {
-        // Remove the key entirely rather than setting `false` — keeps
-        // minimal diffs for users who never enabled the flag before.
+        // Remove the key entirely rather than setting `false` — keeps minimal diffs for users who
+        // never enabled the flag before.
         entry.remove("disabled");
     }
 
@@ -1437,17 +1412,15 @@ async fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::Pa
     Ok(path)
 }
 
-/// Run `agsh mcp disable <name>` — set `disabled = true` in config.toml.
-/// The currently-running agsh session (if any) keeps its state; the
-/// change takes effect on the next start.
+/// Run `agsh mcp disable <name>` — set `disabled = true` in config.toml. The currently-running agsh
+/// session (if any) keeps its state; the change takes effect on the next start.
 pub async fn run_disable(name: &str) -> Result<()> {
     let path = set_server_disabled(name, true).await?;
     tracing::info!("disabled '{}' in {}", name, path.display());
     Ok(())
 }
 
-/// Run `agsh mcp enable <name>` — clear `disabled` from the server
-/// entry in config.toml.
+/// Run `agsh mcp enable <name>` — clear `disabled` from the server entry in config.toml.
 pub async fn run_enable(name: &str) -> Result<()> {
     let path = set_server_disabled(name, false).await?;
     tracing::info!("enabled '{}' in {}", name, path.display());
@@ -1632,10 +1605,9 @@ mod tests {
         args.scope = vec!["read".to_string(), "write".to_string()];
         args.redirect_port = Some(8400);
         let resolved = resolve_add_args(args).expect("resolve");
-        // Parse it back through toml to confirm the schema matches what
-        // ResolvedConfig expects — checking the textual rendering is
-        // fragile because toml_edit decides when to emit a standalone
-        // `[mcp.servers.auth]` header.
+        // Parse it back through toml to confirm the schema matches what ResolvedConfig expects —
+        // checking the textual rendering is fragile because toml_edit decides when to emit a
+        // standalone `[mcp.servers.auth]` header.
         let mut doc = toml_edit::DocumentMut::new();
         let mut servers = toml_edit::ArrayOfTables::new();
         servers.push(build_server_table(&resolved));

@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 use super::ToolOutput;
 use crate::error::{AgshError, Result};
 
-/// Default cap for regex-search-mode hits; shared by `read_file` and
-/// `scratchpad_read`.
+/// Default cap for regex-search-mode hits; shared by `read_file` and `scratchpad_read`.
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
 
 pub(super) fn require_str(
@@ -23,10 +22,9 @@ pub(super) fn require_str(
         })
 }
 
-/// Compile an LLM-supplied regex pattern with bounded compile memory so a
-/// pathological pattern like `a{10_000_000}` cannot exhaust the host's RAM
-/// during compilation. The `regex` crate's NFA/DFA engines already avoid
-/// catastrophic backtracking at *match* time; the remaining DoS surface is
+/// Compile an LLM-supplied regex pattern with bounded compile memory so a pathological pattern like
+/// `a{10_000_000}` cannot exhaust the host's RAM during compilation. The `regex` crate's NFA/DFA
+/// engines already avoid catastrophic backtracking at *match* time; the remaining DoS surface is
 /// the one-time cost of building the automaton, which this bounds.
 pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex::Regex> {
     const PATTERN_SIZE_LIMIT: usize = 1 << 20;
@@ -42,19 +40,17 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
         })
 }
 
-/// Resolve the path the LLM provided to a canonical absolute path, with all
-/// symlink components pre-resolved. Used by file tools to close a TOCTOU
-/// window where a symlink in the supplied path could be swapped between the
-/// permission check and the actual I/O. Callers should use the returned
-/// `PathBuf` for every subsequent filesystem operation; never re-open the
-/// original raw string.
+/// Resolve the path the LLM provided to a canonical absolute path, with all symlink components
+/// pre-resolved. Used by file tools to close a TOCTOU window where a symlink in the supplied path
+/// could be swapped between the permission check and the actual I/O. Callers should use the
+/// returned `PathBuf` for every subsequent filesystem operation; never re-open the original raw
+/// string.
 ///
-/// Errors when the path cannot be resolved (target missing, parent not a
-/// directory, permission denied, etc.). For `write_file` where the target
-/// file may not exist yet, callers must canonicalize the *parent* directory
-/// (which they create first) and re-join the filename. Falling back to the
-/// raw path on failure would leave `..`/symlink components in parent
-/// directories unresolved, defeating the TOCTOU protection.
+/// Errors when the path cannot be resolved (target missing, parent not a directory, permission
+/// denied, etc.). For `write_file` where the target file may not exist yet, callers must
+/// canonicalize the *parent* directory (which they create first) and re-join the filename. Falling
+/// back to the raw path on failure would leave `..`/symlink components in parent directories
+/// unresolved, defeating the TOCTOU protection.
 pub(super) async fn canonicalize_for_tool(tool_name: &str, path: &Path) -> Result<PathBuf> {
     tokio::fs::canonicalize(path)
         .await
@@ -64,10 +60,9 @@ pub(super) async fn canonicalize_for_tool(tool_name: &str, path: &Path) -> Resul
         })
 }
 
-/// Run a user-supplied regex against `content` line-by-line, returning
-/// `line_number:line` rows in a `ToolOutput`. Caps results at
-/// [`MAX_SEARCH_MATCHES`] and reports the total when truncated. `tool_name`
-/// is used only for the regex-compile error path.
+/// Run a user-supplied regex against `content` line-by-line, returning `line_number:line` rows in a
+/// `ToolOutput`. Caps results at [`MAX_SEARCH_MATCHES`] and reports the total when truncated.
+/// `tool_name` is used only for the regex-compile error path.
 pub(super) fn search_lines(content: &str, pattern: &str, tool_name: &str) -> Result<ToolOutput> {
     let re = compile_user_regex(pattern, tool_name)?;
 
@@ -118,10 +113,10 @@ pub(super) fn truncate_string(string: &str, max_length: usize) -> &str {
     }
 }
 
-/// Whether the caller is redirecting this tool's output into the scratchpad
-/// via the `scratchpad` parameter. Tools that internally cap result counts or
-/// output length should lift those caps when this returns true, because the
-/// scratchpad is an overflow buffer and truncation defeats its purpose.
+/// Whether the caller is redirecting this tool's output into the scratchpad via the `scratchpad`
+/// parameter. Tools that internally cap result counts or output length should lift those caps when
+/// this returns true, because the scratchpad is an overflow buffer and truncation defeats its
+/// purpose.
 pub(super) fn redirects_to_scratchpad(input: &serde_json::Value) -> bool {
     input
         .get("scratchpad")
@@ -141,8 +136,8 @@ mod tests {
 
     #[test]
     fn test_compile_user_regex_rejects_oversized() {
-        // Pattern that compiles to a gigantic automaton; must be rejected by
-        // the size limit rather than consume host memory.
+        // Pattern that compiles to a gigantic automaton; must be rejected by the size limit rather
+        // than consume host memory.
         let result = compile_user_regex("a{10000000}", "test_tool");
         assert!(result.is_err(), "oversized pattern should be rejected");
     }

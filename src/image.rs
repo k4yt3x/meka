@@ -1,7 +1,6 @@
-//! Image format handling: detects the format of fetched/loaded bytes and,
-//! when needed, transcodes uncommon formats (TIFF, ICO, HDR, EXR, TGA, PNM,
-//! QOI, DDS, Farbfeld) into PNG so providers can accept them as multimodal
-//! input. Also encodes payloads to base64 for the API.
+//! Image format handling: detects the format of fetched/loaded bytes and, when needed, transcodes
+//! uncommon formats (TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS, Farbfeld) into PNG so providers can
+//! accept them as multimodal input. Also encodes payloads to base64 for the API.
 
 use std::io::Cursor;
 
@@ -13,12 +12,12 @@ use crate::{
     tools::ToolOutput,
 };
 
-/// Maximum raw image bytes before base64 encoding. Keeps the resulting
-/// base64 payload under ~5 MB — a safe ceiling across providers.
+/// Maximum raw image bytes before base64 encoding. Keeps the resulting base64 payload under ~5 MB —
+/// a safe ceiling across providers.
 pub(crate) const MAX_IMAGE_RAW_BYTES: usize = 3_750_000;
 
-/// Formats a multimodal provider (Claude, OpenAI) accepts directly in an
-/// `Image` content block. Anything else must be converted to PNG.
+/// Formats a multimodal provider (Claude, OpenAI) accepts directly in an `Image` content block.
+/// Anything else must be converted to PNG.
 const NATIVE_FORMATS: &[ImageFormat] = &[
     ImageFormat::Png,
     ImageFormat::Jpeg,
@@ -49,17 +48,17 @@ fn classify_format(format: ImageFormat) -> ImageHandling {
     }
 }
 
-/// Classify an HTTP `Content-Type` value. Strips `; charset=...` parameters,
-/// normalizes common aliases that the `image` crate doesn't recognize, then
-/// delegates to `ImageFormat::from_mime_type`.
+/// Classify an HTTP `Content-Type` value. Strips `; charset=...` parameters, normalizes common
+/// aliases that the `image` crate doesn't recognize, then delegates to
+/// `ImageFormat::from_mime_type`.
 pub(crate) fn classify_content_type(content_type: &str) -> ImageHandling {
     let Some(primary) = content_type.split(';').next() else {
         return ImageHandling::Unsupported;
     };
     let primary = primary.trim().to_ascii_lowercase();
 
-    // `image::ImageFormat::from_mime_type` only accepts canonical forms, so
-    // fold a handful of widely-used aliases into their canonical equivalents.
+    // `image::ImageFormat::from_mime_type` only accepts canonical forms, so fold a handful of
+    // widely-used aliases into their canonical equivalents.
     let canonical = match primary.as_str() {
         "image/jpg" => "image/jpeg",
         "image/x-ms-bmp" => "image/bmp",
@@ -101,9 +100,9 @@ pub(crate) fn convert_to_png(bytes: &[u8], source: ImageFormat) -> Result<Vec<u8
     Ok(out)
 }
 
-/// Read just the image dimensions without materializing pixel data. Cheap
-/// for native formats that carry W×H in the header (PNG/JPEG/GIF/WebP/BMP).
-/// Used by the Claude provider's per-request downscale path.
+/// Read just the image dimensions without materializing pixel data. Cheap for native formats that
+/// carry W×H in the header (PNG/JPEG/GIF/WebP/BMP). Used by the Claude provider's per-request
+/// downscale path.
 pub(crate) fn read_image_dimensions(
     bytes: &[u8],
     format: ImageFormat,
@@ -114,10 +113,9 @@ pub(crate) fn read_image_dimensions(
         .map_err(|error| format!("failed to read {:?} image dimensions: {}", format, error))
 }
 
-/// Decode `bytes`, downscale (preserving aspect ratio) if either dimension
-/// exceeds `max_dim`, and re-encode as PNG. Provider-agnostic plumbing —
-/// called by the Claude provider, where Anthropic enforces a 2000 px cap
-/// on multi-image requests. Other providers shouldn't need this.
+/// Decode `bytes`, downscale (preserving aspect ratio) if either dimension exceeds `max_dim`, and
+/// re-encode as PNG. Provider-agnostic plumbing — called by the Claude provider, where Anthropic
+/// enforces a 2000 px cap on multi-image requests. Other providers shouldn't need this.
 pub(crate) fn downscale_to_dim_cap(
     bytes: &[u8],
     source: ImageFormat,
@@ -137,12 +135,11 @@ pub(crate) fn downscale_to_dim_cap(
     Ok(out)
 }
 
-/// Run the classification pipeline end-to-end: pass-through native formats,
-/// convert others to PNG, enforce the byte cap. Provider-agnostic — does
-/// NOT enforce per-axis pixel limits (Anthropic's 2000 px multi-image cap
-/// is enforced separately at the Claude provider layer in
-/// `src/provider/claude/shared.rs`, so OpenAI providers don't pay for it).
-/// Returns `(media_type, bytes)`.
+/// Run the classification pipeline end-to-end: pass-through native formats, convert others to PNG,
+/// enforce the byte cap. Provider-agnostic — does NOT enforce per-axis pixel limits (Anthropic's
+/// 2000 px multi-image cap is enforced separately at the Claude provider layer in
+/// `src/provider/claude/shared.rs`, so OpenAI providers don't pay for it). Returns `(media_type,
+/// bytes)`.
 pub(crate) fn prepare_image_payload(
     handling: ImageHandling,
     bytes: &[u8],
@@ -173,10 +170,9 @@ pub(crate) fn prepare_image_payload(
     }
 }
 
-/// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw
-/// image bytes plus a pre-computed classification. Wraps `prepare_image_payload`
-/// so error paths become a text `ToolOutput` with `is_error: true`. Shared by
-/// `fetch_url`, `read_file`, and `render_image`.
+/// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
+/// pre-computed classification. Wraps `prepare_image_payload` so error paths become a text
+/// `ToolOutput` with `is_error: true`. Shared by `fetch_url`, `read_file`, and `render_image`.
 pub(crate) fn build_image_tool_output(
     marker: &str,
     handling: ImageHandling,
@@ -307,9 +303,8 @@ mod tests {
 
     #[test]
     fn test_classify_content_type_disabled_decoder() {
-        // AVIF decoder is not enabled in our Cargo features, so even though
-        // the image crate knows the MIME type, we should report it as
-        // Unsupported rather than trying to decode.
+        // AVIF decoder is not enabled in our Cargo features, so even though the image crate knows
+        // the MIME type, we should report it as Unsupported rather than trying to decode.
         assert_eq!(
             classify_content_type("image/avif"),
             ImageHandling::Unsupported
@@ -441,8 +436,7 @@ mod tests {
 
     #[test]
     fn test_downscale_to_dim_cap_passes_through_dimensions_when_within_cap() {
-        // Always re-encodes as PNG, but dimensions match the input when
-        // already within cap.
+        // Always re-encodes as PNG, but dimensions match the input when already within cap.
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 800, 400);
         let out = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
         let decoded = image::load_from_memory_with_format(&out, ImageFormat::Png).expect("decode");

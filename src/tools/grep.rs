@@ -1,5 +1,5 @@
-//! `search_contents` tool: ripgrep-style content search powered by the
-//! `grep-*` crates. Honors `.gitignore` and supports glob filtering.
+//! `search_contents` tool: ripgrep-style content search powered by the `grep-*` crates. Honors
+//! `.gitignore` and supports glob filtering.
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -14,8 +14,8 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// Inline match cap when the agent isn't redirecting to the scratchpad.
-/// Single source of truth for the description and the runtime cap.
+/// Inline match cap when the agent isn't redirecting to the scratchpad. Single source of truth for
+/// the description and the runtime cap.
 const MAX_INLINE_MATCHES: usize = 100;
 
 pub(super) struct SearchContentsTool {
@@ -77,9 +77,8 @@ impl Tool for SearchContentsTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "search_contents")?;
-        // Resolve the optional `path` against the agent's per-session
-        // cwd so the search runs in the right tree regardless of where
-        // the process was launched.
+        // Resolve the optional `path` against the agent's per-session cwd so the search runs in the
+        // right tree regardless of where the process was launched.
         let search_path = input["path"]
             .as_str()
             .map(|raw| crate::agent::resolve_against_cwd(&self.cwd, raw))
@@ -87,8 +86,8 @@ impl Tool for SearchContentsTool {
             .to_string_lossy()
             .into_owned();
         let file_glob = input["glob"].as_str().map(|s| s.to_string());
-        // Cap match count for inline use; lift it when redirecting output to
-        // the scratchpad so the agent can collect an unbounded result set.
+        // Cap match count for inline use; lift it when redirecting output to the scratchpad so the
+        // agent can collect an unbounded result set.
         let max_results = if redirects_to_scratchpad(&input) {
             usize::MAX
         } else {
@@ -120,8 +119,8 @@ fn search_with_grep(
 ) -> Result<String> {
     use grep_regex::RegexMatcherBuilder;
 
-    // Cap the compiled-regex automaton and DFA cache sizes so an LLM-supplied
-    // pattern like `a{10_000_000}` can't exhaust host memory during compile.
+    // Cap the compiled-regex automaton and DFA cache sizes so an LLM-supplied pattern like
+    // `a{10_000_000}` can't exhaust host memory during compile.
     const PATTERN_SIZE_LIMIT: usize = 1 << 20;
     const DFA_SIZE_LIMIT: usize = 1 << 20;
 
@@ -202,8 +201,8 @@ fn walk_directory(
     glob_pattern: &Option<glob::Pattern>,
     results: &mut Vec<String>,
 ) -> Result<()> {
-    // Iterative traversal via an explicit work-stack: a recursive walk would
-    // overflow the call stack on a pathologically deep directory tree.
+    // Iterative traversal via an explicit work-stack: a recursive walk would overflow the call
+    // stack on a pathologically deep directory tree.
     let mut pending: Vec<std::path::PathBuf> = vec![directory.to_path_buf()];
 
     while let Some(dir) = pending.pop() {
@@ -221,11 +220,10 @@ fn walk_directory(
                 continue;
             }
 
-            // `entry.file_type()` does not follow symlinks: a symlinked
-            // directory reports as a symlink, not a dir, so it is never
-            // descended into. That removes any symlink-cycle risk while
-            // still letting symlinked *files* be searched via the
-            // path-based `is_file()` check below.
+            // `entry.file_type()` does not follow symlinks: a symlinked directory reports as a
+            // symlink, not a dir, so it is never descended into. That removes any symlink-cycle
+            // risk while still letting symlinked *files* be searched via the path-based `is_file()`
+            // check below.
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -280,9 +278,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_contents_deeply_nested_tree() {
-        // Exercises the iterative work-stack traversal: a file buried many
-        // directory levels deep must still be found. A recursive walk would
-        // recurse once per level; the iterative version uses a heap stack.
+        // Exercises the iterative work-stack traversal: a file buried many directory levels deep
+        // must still be found. A recursive walk would recurse once per level; the iterative version
+        // uses a heap stack.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let mut deep = temp_dir.path().to_path_buf();
         for _ in 0..300 {

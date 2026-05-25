@@ -1,8 +1,7 @@
-//! OAuth / JWT authentication and HTTP callback handling for MCP HTTP
-//! transports. Also houses the probe that classifies an unauthenticated
-//! response (RFC 6750 + RFC 9728), the best-effort token revocation path
-//! (RFC 7009), and the SQLite-backed credential store threaded into
-//! `rmcp`'s `AuthorizationManager`.
+//! OAuth / JWT authentication and HTTP callback handling for MCP HTTP transports. Also houses the
+//! probe that classifies an unauthenticated response (RFC 6750 + RFC 9728), the best-effort token
+//! revocation path (RFC 7009), and the SQLite-backed credential store threaded into `rmcp`'s
+//! `AuthorizationManager`.
 
 use async_trait::async_trait;
 use rmcp::{
@@ -20,12 +19,10 @@ use crate::{
     session::TokenStore,
 };
 
-/// Best-effort revoke of a stored OAuth access/refresh token for an MCP
-/// server. Looks up the stored credentials, discovers the provider's
-/// revocation endpoint via the OAuth authorization server metadata, and
-/// posts `token=…&token_type_hint=access_token` per RFC 7009. Errors are
-/// propagated so the caller can log them; local credential cleanup should
-/// run regardless.
+/// Best-effort revoke of a stored OAuth access/refresh token for an MCP server. Looks up the stored
+/// credentials, discovers the provider's revocation endpoint via the OAuth authorization server
+/// metadata, and posts `token=…&token_type_hint=access_token` per RFC 7009. Errors are propagated
+/// so the caller can log them; local credential cleanup should run regardless.
 pub async fn revoke_stored_token(
     token_store: &TokenStore,
     server_name: &str,
@@ -58,16 +55,15 @@ pub async fn revoke_stored_token(
     };
 
     // Discover the revocation endpoint. RFC 8414 says it lives under
-    // /.well-known/oauth-authorization-server; many providers also expose it
-    // under /.well-known/openid-configuration. Try OAuth first.
+    // /.well-known/oauth-authorization-server; many providers also expose it under
+    // /.well-known/openid-configuration. Try OAuth first.
     //
-    // Threat model: the `issuer` URL comes from credentials we stored during
-    // the original auth flow, so we trust the origin. We do NOT trust the
-    // network path or any redirect: reqwest follows redirects by default,
-    // which would let a MITM redirect the metadata fetch to an attacker host
-    // and coax us into POSTing the access token there. Redirects are turned
-    // off, the response body is size-capped, and the returned
-    // `revocation_endpoint` is pinned to the same host as the issuer.
+    // Threat model: the `issuer` URL comes from credentials we stored during the original auth
+    // flow, so we trust the origin. We do NOT trust the network path or any redirect: reqwest
+    // follows redirects by default, which would let a MITM redirect the metadata fetch to an
+    // attacker host and coax us into POSTing the access token there. Redirects are turned off, the
+    // response body is size-capped, and the returned `revocation_endpoint` is pinned to the same
+    // host as the issuer.
     const METADATA_BODY_CAP: usize = 256 * 1024;
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -88,8 +84,8 @@ pub async fn revoke_stored_token(
         if !response.status().is_success() {
             continue;
         }
-        // Read bytes before parsing so we can size-cap: reqwest's own
-        // Content-Length is server-supplied and therefore untrusted.
+        // Read bytes before parsing so we can size-cap: reqwest's own Content-Length is
+        // server-supplied and therefore untrusted.
         let Ok(bytes) = response.bytes().await else {
             continue;
         };
@@ -108,9 +104,8 @@ pub async fn revoke_stored_token(
 
     validate_revocation_endpoint_origin(issuer, &endpoint)?;
 
-    // Build application/x-www-form-urlencoded body manually so we don't need
-    // an extra dependency. `form_urlencoded` uses %-encoded UTF-8, same as
-    // `percent_encoding::NON_ALPHANUMERIC`.
+    // Build application/x-www-form-urlencoded body manually so we don't need an extra dependency.
+    // `form_urlencoded` uses %-encoded UTF-8, same as `percent_encoding::NON_ALPHANUMERIC`.
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     let enc = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
     let mut body = format!("token={}&token_type_hint=access_token", enc(access_token));
@@ -134,8 +129,8 @@ pub async fn revoke_stored_token(
                 crate::error::format_reqwest_error(&error)
             )
         })?;
-    // RFC 7009: successful revocation is 200 OK with an empty body;
-    // unknown tokens also return 200 OK. Non-2xx is a genuine failure.
+    // RFC 7009: successful revocation is 200 OK with an empty body; unknown tokens also return 200
+    // OK. Non-2xx is a genuine failure.
     if !response.status().is_success() {
         return Err(format!(
             "revoke POST returned HTTP {}",
@@ -145,21 +140,19 @@ pub async fn revoke_stored_token(
     Ok(())
 }
 
-/// Classification of an unauthenticated probe to an HTTP MCP endpoint.
-/// The MCP authorization spec (2025-03-26) layers on RFC 6750 +
-/// RFC 9728: a server that requires auth answers unauthenticated
-/// requests with `401` and a `WWW-Authenticate: Bearer …` challenge,
-/// optionally advertising a `resource_metadata` URL we can fetch to
-/// learn which authorization servers + scopes to use.
+/// Classification of an unauthenticated probe to an HTTP MCP endpoint. The MCP authorization spec
+/// (2025-03-26) layers on RFC 6750 + RFC 9728: a server that requires auth answers unauthenticated
+/// requests with `401` and a `WWW-Authenticate: Bearer …` challenge, optionally advertising a
+/// `resource_metadata` URL we can fetch to learn which authorization servers + scopes to use.
 #[derive(Debug, PartialEq, Eq)]
 pub enum McpAuthProbe {
     /// Server answered 2xx — reachable and doesn't require auth.
     Open,
-    /// Server answered 401 / 403 with a `Bearer` challenge. The optional
-    /// URL is the RFC 9728 protected-resource-metadata document.
+    /// Server answered 401 / 403 with a `Bearer` challenge. The optional URL is the RFC 9728
+    /// protected-resource-metadata document.
     AuthRequired { resource_metadata: Option<String> },
-    /// Reachable but some other status (405, 404, …). Record it so the
-    /// caller can surface it without claiming auth is or isn't needed.
+    /// Reachable but some other status (405, 404, …). Record it so the caller can surface it
+    /// without claiming auth is or isn't needed.
     Unexpected { status: u16 },
     /// Couldn't even talk to the server (DNS, TLS, timeout, …).
     Unreachable { message: String },
@@ -167,11 +160,10 @@ pub enum McpAuthProbe {
 
 /// Probe an MCP HTTP endpoint to see whether it requires OAuth.
 ///
-/// Runs an unauthenticated `GET` with a 3 s wall-clock timeout and
-/// redirects disabled; we never follow off-origin so a compromised DNS
-/// can't bait us into treating an attacker host as authoritative about
-/// the real server. The body is ignored — the verdict comes entirely
-/// from the status line and the `WWW-Authenticate` header.
+/// Runs an unauthenticated `GET` with a 3 s wall-clock timeout and redirects disabled; we never
+/// follow off-origin so a compromised DNS can't bait us into treating an attacker host as
+/// authoritative about the real server. The body is ignored — the verdict comes entirely from the
+/// status line and the `WWW-Authenticate` header.
 pub async fn probe_http_auth(url: &str) -> McpAuthProbe {
     let http = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -202,19 +194,17 @@ pub async fn probe_http_auth(url: &str) -> McpAuthProbe {
     classify_probe_response(status, www_authenticate.as_deref())
 }
 
-/// Pure classifier for the probe — takes the status code + optional
-/// `WWW-Authenticate` header and returns the [`McpAuthProbe`] verdict.
-/// Extracted so the RFC-6750 / RFC-9728 parsing can be unit-tested
-/// without a live HTTP server.
+/// Pure classifier for the probe — takes the status code + optional `WWW-Authenticate` header and
+/// returns the [`McpAuthProbe`] verdict. Extracted so the RFC-6750 / RFC-9728 parsing can be
+/// unit-tested without a live HTTP server.
 fn classify_probe_response(status: u16, www_authenticate: Option<&str>) -> McpAuthProbe {
     if (200..300).contains(&status) {
         return McpAuthProbe::Open;
     }
     if status == 401 || status == 403 {
         let header = www_authenticate.unwrap_or("");
-        // RFC 6750 §3: the challenge must start with `Bearer`. Match
-        // case-insensitively; tolerate the scheme with or without any
-        // `key=value` parameters following.
+        // RFC 6750 §3: the challenge must start with `Bearer`. Match case-insensitively; tolerate
+        // the scheme with or without any `key=value` parameters following.
         let first = header.split(',').next().unwrap_or("").trim();
         let is_bearer = first.eq_ignore_ascii_case("Bearer")
             || first
@@ -236,8 +226,7 @@ fn classify_probe_response(status: u16, www_authenticate: Option<&str>) -> McpAu
 /// `key="value"`, `key=value`, trailing commas, mixed whitespace.
 /// Returns `None` if the key isn't present.
 fn extract_bearer_param(header: &str, key: &str) -> Option<String> {
-    // Drop the `Bearer` scheme prefix; everything after is a
-    // comma-separated parameter list.
+    // Drop the `Bearer` scheme prefix; everything after is a comma-separated parameter list.
     let params = match header.find(|c: char| c.is_whitespace()) {
         Some(idx) => &header[idx..],
         None => return None,
@@ -260,10 +249,10 @@ fn extract_bearer_param(header: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Parse an OAuth authorization-server metadata JSON document and return
-/// the `revocation_endpoint` string, if any. Rejects bodies larger than
-/// `max_bytes` and invalid JSON. Split from [`revoke_stored_token`] so the
-/// size-cap and extraction logic are testable without a live HTTP server.
+/// Parse an OAuth authorization-server metadata JSON document and return the `revocation_endpoint`
+/// string, if any. Rejects bodies larger than `max_bytes` and invalid JSON. Split from
+/// [`revoke_stored_token`] so the size-cap and extraction logic are testable without a live HTTP
+/// server.
 fn extract_revocation_endpoint(bytes: &[u8], max_bytes: usize) -> Option<String> {
     if bytes.len() > max_bytes {
         return None;
@@ -275,9 +264,9 @@ fn extract_revocation_endpoint(bytes: &[u8], max_bytes: usize) -> Option<String>
         .map(|s| s.to_string())
 }
 
-/// Verify that `endpoint` has the same scheme, host, and effective port as
-/// `issuer`. Prevents a compromised metadata document from redirecting the
-/// access-token POST to an attacker-controlled host.
+/// Verify that `endpoint` has the same scheme, host, and effective port as `issuer`. Prevents a
+/// compromised metadata document from redirecting the access-token POST to an attacker-controlled
+/// host.
 fn validate_revocation_endpoint_origin(
     issuer: &str,
     endpoint: &str,
@@ -424,10 +413,9 @@ async fn authenticate_client_credentials_jwt(
     scopes: Option<&[String]>,
     resource: Option<&str>,
 ) -> Result<AuthorizationManager> {
-    // Open the key once and check permissions on the open fd to close the
-    // stat-then-read TOCTOU window: a separate `metadata(path)` followed by
-    // `read(path)` could land on a different inode if the path was swapped
-    // between syscalls. `File::metadata` walks the open descriptor.
+    // Open the key once and check permissions on the open fd to close the stat-then-read TOCTOU
+    // window: a separate `metadata(path)` followed by `read(path)` could land on a different inode
+    // if the path was swapped between syscalls. `File::metadata` walks the open descriptor.
     let mut key_file =
         std::fs::File::open(signing_key_path).map_err(|error| AgshError::McpAuth {
             server_name: server_name.to_string(),
@@ -485,14 +473,12 @@ async fn authenticate_client_credentials_jwt(
         })
 }
 
-/// On Unix, refuse to read a JWT signing key that is group- or world-
-/// accessible. Matches the 0600-only policy already applied to the session
-/// DB and config.toml: if the key can be read by another local user, a
-/// local attacker can forge JWTs to the MCP server and impersonate us.
+/// On Unix, refuse to read a JWT signing key that is group- or world- accessible. Matches the
+/// 0600-only policy already applied to the session DB and config.toml: if the key can be read by
+/// another local user, a local attacker can forge JWTs to the MCP server and impersonate us.
 ///
-/// Takes the open `File` so the permission check and the subsequent read
-/// share the same inode — a stat-then-read pair on the path could be
-/// swapped between syscalls.
+/// Takes the open `File` so the permission check and the subsequent read share the same inode — a
+/// stat-then-read pair on the path could be swapped between syscalls.
 ///
 /// No-op on non-Unix: Windows uses ACLs and we don't try to audit them.
 fn require_private_key_permissions_on_fd(
@@ -556,10 +542,10 @@ async fn authenticate_oauth_authorization_code(
     redirect_port: Option<u16>,
     token_store: Option<&TokenStore>,
 ) -> Result<AuthorizationManager> {
-    // Bind the callback listener up-front so we can support a random ephemeral
-    // port (`redirect_port = None` → bind 0) and learn the actual port before
-    // constructing `redirect_uri`. This avoids the "port 8400 already in use"
-    // failure mode and lets multiple concurrent agsh sessions coexist.
+    // Bind the callback listener up-front so we can support a random ephemeral port (`redirect_port
+    // = None` → bind 0) and learn the actual port before constructing `redirect_uri`. This avoids
+    // the "port 8400 already in use" failure mode and lets multiple concurrent agsh sessions
+    // coexist.
     let bind_port = redirect_port.unwrap_or(0);
     let callback_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", bind_port))
         .await
@@ -619,8 +605,8 @@ async fn authenticate_oauth_authorization_code(
         server_name
     );
 
-    // Wrap in OAuthState to use its start_authorization flow which handles
-    // metadata discovery, dynamic client registration, and PKCE setup
+    // Wrap in OAuthState to use its start_authorization flow which handles metadata discovery,
+    // dynamic client registration, and PKCE setup
     let mut oauth_state = OAuthState::Unauthorized(manager);
 
     // If we have a pre-configured client_id, configure it before starting
@@ -697,10 +683,9 @@ async fn authenticate_oauth_authorization_code(
                 message: format!("failed to get authorization URL: {}", error),
             })?;
 
-    // Print the URL exactly once and try to open the browser silently.
-    // Browser-launch failures are expected on headless hosts (SSH, CI,
-    // containers), so they stay at `debug` — the user has the URL and
-    // can copy it either way.
+    // Print the URL exactly once and try to open the browser silently. Browser-launch failures are
+    // expected on headless hosts (SSH, CI, containers), so they stay at `debug` — the user has the
+    // URL and can copy it either way.
     eprintln!("open this URL in your browser to authorize:\n\n{auth_url}\n");
     if let Err(error) = open::that(&auth_url) {
         tracing::debug!("open::that failed to launch browser: {}", error);
@@ -731,27 +716,25 @@ async fn authenticate_oauth_authorization_code(
         })
 }
 
-/// Max bytes we're willing to read from a single HTTP callback request
-/// before giving up. Large enough to handle big `Cookie:` headers (which can
-/// exceed 4 KiB), small enough to cap a resource-exhaustion attempt.
+/// Max bytes we're willing to read from a single HTTP callback request before giving up. Large
+/// enough to handle big `Cookie:` headers (which can exceed 4 KiB), small enough to cap a
+/// resource-exhaustion attempt.
 const CALLBACK_READ_CAP: usize = 64 * 1024;
 /// End-of-headers marker for HTTP/1.x.
 const CRLF_CRLF: &[u8] = b"\r\n\r\n";
 
-/// Overall wall-clock budget for the OAuth callback wait, shared by
-/// both the TCP accept path and the paste-URL fallback.
+/// Overall wall-clock budget for the OAuth callback wait, shared by both the TCP accept path and
+/// the paste-URL fallback.
 const OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Wait for the authorization code.
 ///
-/// The common case is that the OAuth provider redirects the user's
-/// browser to our localhost listener and we pick the code out of the
-/// HTTP request. But when agsh runs on a different host than the
-/// browser — SSH sessions, containers, remote Codespaces — the browser
-/// can't reach back, so we race the TCP accept against a stdin prompt
-/// that lets the user paste the full callback URL (it's visible in
-/// the browser's address bar even when the connection is refused).
-/// Paste mode is only offered when stdin is a TTY.
+/// The common case is that the OAuth provider redirects the user's browser to our localhost
+/// listener and we pick the code out of the HTTP request. But when agsh runs on a different host
+/// than the browser — SSH sessions, containers, remote Codespaces — the browser can't reach back,
+/// so we race the TCP accept against a stdin prompt that lets the user paste the full callback URL
+/// (it's visible in the browser's address bar even when the connection is refused). Paste mode is
+/// only offered when stdin is a TTY.
 async fn await_oauth_callback(
     listener: tokio::net::TcpListener,
 ) -> std::result::Result<(String, String), String> {
@@ -777,10 +760,9 @@ async fn await_oauth_callback(
     }
 }
 
-/// Accept one HTTP request on the bound listener, validate it's the
-/// OAuth callback, extract `code` and `state`, and send back a success
-/// page. Loops past non-callback requests (favicons, preflights) until
-/// the shared deadline elapses.
+/// Accept one HTTP request on the bound listener, validate it's the OAuth callback, extract `code`
+/// and `state`, and send back a success page. Loops past non-callback requests (favicons,
+/// preflights) until the shared deadline elapses.
 async fn accept_http_callback(
     listener: tokio::net::TcpListener,
     overall_deadline: tokio::time::Instant,
@@ -808,10 +790,10 @@ async fn accept_http_callback(
             Ok(Ok(pair)) => pair,
         };
 
-        // Read until we've seen CRLF-CRLF (end of request headers) or hit the
-        // byte cap. Browsers sometimes send favicon / preflight requests to
-        // the callback origin; if the path isn't `/callback?...`, respond
-        // with a minimal 404 so the browser stops retrying and keep waiting.
+        // Read until we've seen CRLF-CRLF (end of request headers) or hit the byte cap. Browsers
+        // sometimes send favicon / preflight requests to the callback origin; if the path isn't
+        // `/callback?...`, respond with a minimal 404 so the browser stops retrying and keep
+        // waiting.
         let mut buffer = Vec::with_capacity(4096);
         let mut temp = [0u8; 4096];
         let headers_complete = loop {
@@ -872,8 +854,8 @@ async fn accept_http_callback(
                 return Ok((code, state));
             }
             Err(CallbackParseError::NotCallbackPath) => {
-                // Almost certainly a browser preflight or favicon request.
-                // Respond 404 and keep waiting for the real callback.
+                // Almost certainly a browser preflight or favicon request. Respond 404 and keep
+                // waiting for the real callback.
                 tracing::debug!("OAuth callback: ignored non-callback request on callback port");
                 let _ = stream
                     .write_all(
@@ -892,10 +874,9 @@ async fn accept_http_callback(
     }
 }
 
-/// Paste-URL fallback for the OAuth callback: prompt on stderr, read a
-/// line from stdin, extract `code` + `state` from the pasted URL. Used
-/// when the browser can't reach back to our bound listener (e.g. agsh
-/// is on an SSH host and the browser is on the user's laptop).
+/// Paste-URL fallback for the OAuth callback: prompt on stderr, read a line from stdin, extract
+/// `code` + `state` from the pasted URL. Used when the browser can't reach back to our bound
+/// listener (e.g. agsh is on an SSH host and the browser is on the user's laptop).
 async fn read_pasted_callback(
     deadline: tokio::time::Instant,
 ) -> std::result::Result<(String, String), String> {
@@ -916,18 +897,16 @@ async fn read_pasted_callback(
             OAUTH_CALLBACK_TIMEOUT.as_secs()
         )),
         Ok(Err(error)) => Err(format!("stdin read failed: {}", error)),
-        // `read_line` returning 0 means EOF — stdin was closed before the
-        // user pasted anything. Don't treat this as a fatal error; let
-        // the TCP branch of the `select!` continue waiting.
+        // `read_line` returning 0 means EOF — stdin was closed before the user pasted anything.
+        // Don't treat this as a fatal error; let the TCP branch of the `select!` continue waiting.
         Ok(Ok(0)) => std::future::pending().await,
         Ok(Ok(_)) => parse_pasted_callback(&line),
     }
 }
 
-/// Extract `(code, state)` from a pasted callback URL. Accepts either
-/// the full URL or just the query string, percent-decodes the values,
-/// and surfaces the `error=…` parameter (sanitised) when the
-/// authorization server declines.
+/// Extract `(code, state)` from a pasted callback URL. Accepts either the full URL or just the
+/// query string, percent-decodes the values, and surfaces the `error=…` parameter (sanitised) when
+/// the authorization server declines.
 fn parse_pasted_callback(input: &str) -> std::result::Result<(String, String), String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -946,9 +925,9 @@ fn parse_pasted_callback(input: &str) -> std::result::Result<(String, String), S
         let Some((key, value)) = pair.split_once('=') else {
             continue;
         };
-        // Strict UTF-8: silently mangling a security-sensitive parameter
-        // (e.g. swapping invalid bytes for U+FFFD) could let a tampered
-        // `state` value match the expected one despite differing bytes.
+        // Strict UTF-8: silently mangling a security-sensitive parameter (e.g. swapping invalid
+        // bytes for U+FFFD) could let a tampered `state` value match the expected one despite
+        // differing bytes.
         let decoded = percent_encoding::percent_decode_str(value)
             .decode_utf8()
             .map_err(|error| {
@@ -997,8 +976,8 @@ fn parse_callback_query(
         .nth(1)
         .ok_or_else(|| CallbackParseError::Malformed("malformed HTTP request line".into()))?;
 
-    // Compare path component only, case-insensitive, anchored to /callback.
-    // `/` or `/favicon.ico` fall through to `NotCallbackPath`.
+    // Compare path component only, case-insensitive, anchored to /callback. `/` or `/favicon.ico`
+    // fall through to `NotCallbackPath`.
     let (path_component, query_string) = match path.split_once('?') {
         Some((p, q)) => (p, q),
         None => (path, ""),
@@ -1039,8 +1018,8 @@ fn parse_callback_query(
     }
 
     if let Some(error) = error_param {
-        // Strip Cc/Cf so a hostile authorization server can't inject ANSI
-        // escapes or RTL overrides through the error message.
+        // Strip Cc/Cf so a hostile authorization server can't inject ANSI escapes or RTL overrides
+        // through the error message.
         return Err(CallbackParseError::Malformed(format!(
             "authorization server returned error: {}",
             crate::mcp::sanitize::sanitize_text(&error)
@@ -1191,9 +1170,9 @@ mod tests {
 
     #[test]
     fn test_parse_callback_query_rejects_invalid_utf8_state() {
-        // %FF and %FE are invalid as UTF-8; lossy decoding would silently
-        // turn them into U+FFFD, which can let a tampered `state` parameter
-        // match a stored one despite differing bytes. Strict mode rejects.
+        // %FF and %FE are invalid as UTF-8; lossy decoding would silently turn them into U+FFFD,
+        // which can let a tampered `state` parameter match a stored one despite differing bytes.
+        // Strict mode rejects.
         let request = "GET /callback?code=abc&state=%FF%FE HTTP/1.1\r\n";
         let err = parse_callback_query(request).expect_err("non-utf8 state must be rejected");
         match err {
@@ -1340,9 +1319,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn require_private_key_permissions_reports_missing_file() {
-        // Missing file errors at `File::open` rather than inside the
-        // permissions check; assert the open-side error message matches the
-        // user-facing wording in `authenticate_client_credentials_jwt`.
+        // Missing file errors at `File::open` rather than inside the permissions check; assert the
+        // open-side error message matches the user-facing wording in
+        // `authenticate_client_credentials_jwt`.
         let err = std::fs::File::open("/nonexistent/key.pem").expect_err("missing file must error");
         let message = format!("{}", err);
         assert!(message.contains("No such file") || message.contains("not found"));
@@ -1362,9 +1341,9 @@ mod tests {
 
     #[test]
     fn test_parse_callback_query_sanitises_oauth_error() {
-        // A malicious authorization server includes an ANSI escape and an
-        // RTL override in its `error` parameter. The resulting error message
-        // must not carry those codepoints to the terminal.
+        // A malicious authorization server includes an ANSI escape and an RTL override in its
+        // `error` parameter. The resulting error message must not carry those codepoints to the
+        // terminal.
         let request = "GET /callback?error=bad%1B%5B2Jstuff%E2%80%AErtl HTTP/1.1\r\n";
         let err = parse_callback_query(request).expect_err("should fail");
         match err {
@@ -1437,8 +1416,8 @@ mod tests {
 
     #[test]
     fn classify_probe_401_without_bearer_is_unexpected() {
-        // A 401 with e.g. Basic / Digest auth is not MCP-spec compliant —
-        // surface it as Unexpected rather than pretending it's OAuth.
+        // A 401 with e.g. Basic / Digest auth is not MCP-spec compliant — surface it as Unexpected
+        // rather than pretending it's OAuth.
         assert_eq!(
             classify_probe_response(401, Some("Basic realm=\"x\"")),
             McpAuthProbe::Unexpected { status: 401 }

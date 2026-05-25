@@ -1,6 +1,6 @@
-//! Tool registry and built-in tool modules. Owns the [`ToolRegistry`] type
-//! that the agent loop consults to resolve tool names to executable handlers,
-//! plus the per-tool submodules (file, find, grep, scratchpad, shell, etc.).
+//! Tool registry and built-in tool modules. Owns the [`ToolRegistry`] type that the agent loop
+//! consults to resolve tool names to executable handlers, plus the per-tool submodules (file, find,
+//! grep, scratchpad, shell, etc.).
 
 mod file;
 mod find;
@@ -29,9 +29,8 @@ use uuid::Uuid;
 
 type DeferredSet = Arc<std::sync::RwLock<HashSet<String>>>;
 
-/// Name of the meta-tool that loads a deferred tool's schema. Calls to this
-/// tool are scanned out of the conversation to compute the per-turn active
-/// tool set; see [`extract_loaded_tool_names`].
+/// Name of the meta-tool that loads a deferred tool's schema. Calls to this tool are scanned out of
+/// the conversation to compute the per-turn active tool set; see [`extract_loaded_tool_names`].
 pub const LOAD_TOOL_NAME: &str = "load_tool";
 
 use crate::{
@@ -41,16 +40,14 @@ use crate::{
     session::SessionManager,
 };
 
-/// Walk the conversation and collect the names of tools that have been
-/// loaded via successful `load_tool` calls. A `load_tool` `tool_use` block
-/// counts only when paired with a non-error `tool_result` whose
-/// `tool_use_id` matches; this excludes errored loads (unknown name,
-/// malformed args) and orphan `tool_use` blocks awaiting their result.
+/// Walk the conversation and collect the names of tools that have been loaded via successful
+/// `load_tool` calls. A `load_tool` `tool_use` block counts only when paired with a non-error
+/// `tool_result` whose `tool_use_id` matches; this excludes errored loads (unknown name, malformed
+/// args) and orphan `tool_use` blocks awaiting their result.
 ///
-/// The active set is a pure function of the message slice, so the tools
-/// array sent to the Claude API is deterministic given the conversation
-/// state. Resumed sessions reconstruct the exact active set their suspend
-/// time had, with no out-of-band state.
+/// The active set is a pure function of the message slice, so the tools array sent to the Claude
+/// API is deterministic given the conversation state. Resumed sessions reconstruct the exact active
+/// set their suspend time had, with no out-of-band state.
 pub fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String> {
     let mut pending: HashMap<String, String> = HashMap::new();
     let mut loaded: HashSet<String> = HashSet::new();
@@ -80,8 +77,8 @@ pub fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String> {
     loaded
 }
 
-/// Built-in tool policy from `[tools]` in `config.toml`. Mirrors the three
-/// knobs [`crate::config::McpServerConfig`] exposes for MCP tools.
+/// Built-in tool policy from `[tools]` in `config.toml`. Mirrors the three knobs
+/// [`crate::config::McpServerConfig`] exposes for MCP tools.
 #[derive(Debug, Clone, Default)]
 pub struct BuiltinToolFilter {
     pub allowed: Option<HashSet<String>>,
@@ -121,8 +118,8 @@ impl BuiltinToolFilter {
     }
 }
 
-/// Canonical built-in names for the stale-entry warning pass. Update when
-/// adding a new built-in in [`ToolRegistry::build_default`].
+/// Canonical built-in names for the stale-entry warning pass. Update when adding a new built-in in
+/// [`ToolRegistry::build_default`].
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "edit_file",
     "execute_command",
@@ -149,8 +146,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "write_file",
 ];
 
-/// Warn (never fail) on `[tools]` entries that don't match any known
-/// built-in. Mirrors MCP's `warn_on_stale_tool_config()`.
+/// Warn (never fail) on `[tools]` entries that don't match any known built-in. Mirrors MCP's
+/// `warn_on_stale_tool_config()`.
 pub fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
     let known: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
     if let Some(allowed) = filter.allowed.as_ref() {
@@ -187,15 +184,13 @@ pub type ReadTracker = Arc<RwLock<HashSet<PathBuf>>>;
 pub struct ToolOutput {
     pub content: Vec<ToolResultContent>,
     pub is_error: bool,
-    /// When `persist_oversized_results` has to spill to the scratchpad, use
-    /// this name instead of the caller-supplied tool name. Set by MCP tool
-    /// adapters so the persisted blob is namespaced as
-    /// `mcp_<server>_<remote_tool>` for easier debugging.
+    /// When `persist_oversized_results` has to spill to the scratchpad, use this name instead of
+    /// the caller-supplied tool name. Set by MCP tool adapters so the persisted blob is namespaced
+    /// as `mcp_<server>_<remote_tool>` for easier debugging.
     pub scratchpad_hint: Option<String>,
-    /// Tool-specific structured side-channel for frontends that know
-    /// how to render it (e.g. ACP's `diff` content block). Tools that
-    /// don't produce extra structure leave this as `None`; the regular
-    /// `content` text remains the source of truth for the model.
+    /// Tool-specific structured side-channel for frontends that know how to render it (e.g. ACP's
+    /// `diff` content block). Tools that don't produce extra structure leave this as `None`; the
+    /// regular `content` text remains the source of truth for the model.
     pub frontend_metadata: Option<crate::frontend::ToolOutputMetadata>,
 }
 
@@ -209,9 +204,8 @@ impl ToolOutput {
         }
     }
 
-    /// Attach structured frontend metadata to an existing output, e.g.
-    /// the pre/post text from a successful `edit_file`. Chains after
-    /// any other builder so the call site reads as
+    /// Attach structured frontend metadata to an existing output, e.g. the pre/post text from a
+    /// successful `edit_file`. Chains after any other builder so the call site reads as
     /// `ToolOutput::text(...).with_metadata(diff)`.
     #[must_use]
     pub fn with_metadata(mut self, metadata: crate::frontend::ToolOutputMetadata) -> Self {
@@ -220,22 +214,19 @@ impl ToolOutput {
     }
 }
 
-/// A callable tool surfaced to the model. Built-in tools live under
-/// `src/tools/`; MCP tools are wrapped at registration time. Implementors
-/// must be safe to invoke concurrently — the dispatch loop runs all tool
-/// calls in a single assistant message in parallel via `join_all`.
+/// A callable tool surfaced to the model. Built-in tools live under `src/tools/`; MCP tools are
+/// wrapped at registration time. Implementors must be safe to invoke concurrently — the dispatch
+/// loop runs all tool calls in a single assistant message in parallel via `join_all`.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Schema surfaced to the model (name + description + JSON-schema for
-    /// parameters). Called once per registry build, not per call.
+    /// Schema surfaced to the model (name + description + JSON-schema for parameters). Called once
+    /// per registry build, not per call.
     fn definition(&self) -> ToolDefinition;
-    /// Lowest permission level that may invoke this tool. The dispatch
-    /// loop short-circuits with a "permission denied" tool error when the
-    /// current level is below this.
+    /// Lowest permission level that may invoke this tool. The dispatch loop short-circuits with a
+    /// "permission denied" tool error when the current level is below this.
     fn required_permission(&self) -> Permission;
-    /// Run the tool. Long-running implementations must observe
-    /// `cancellation` (e.g. via `tokio::select!`) so a user interrupt
-    /// or turn-level abort unblocks promptly.
+    /// Run the tool. Long-running implementations must observe `cancellation` (e.g. via
+    /// `tokio::select!`) so a user interrupt or turn-level abort unblocks promptly.
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -245,34 +236,30 @@ pub trait Tool: Send + Sync {
 
 type ToolSet = Arc<std::sync::RwLock<Vec<Arc<dyn Tool>>>>;
 
-/// Tool registry. Backed by an `Arc<RwLock<Vec<Arc<dyn Tool>>>>` so MCP
-/// notification handlers can swap a server's tools in place on
-/// `tools/list_changed`. Individual registrations only hold the write lock
-/// briefly; dispatch clones the matching `Arc<dyn Tool>` out of the lock
-/// before awaiting `execute`, so no lock is held across `.await`.
+/// Tool registry. Backed by an `Arc<RwLock<Vec<Arc<dyn Tool>>>>` so MCP notification handlers can
+/// swap a server's tools in place on `tools/list_changed`. Individual registrations only hold the
+/// write lock briefly; dispatch clones the matching `Arc<dyn Tool>` out of the lock before awaiting
+/// `execute`, so no lock is held across `.await`.
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: ToolSet,
     deferred: DeferredSet,
-    /// Per-tool overrides from `[tools.tool_permissions]`. Immutable after
-    /// construction so the cached system-prompt prefix stays byte-stable
-    /// across `/permission` toggles.
+    /// Per-tool overrides from `[tools.tool_permissions]`. Immutable after construction so the
+    /// cached system-prompt prefix stays byte-stable across `/permission` toggles.
     permission_overrides: Arc<HashMap<String, Permission>>,
-    /// Built-in allow/block-list. MCP tools have their own per-server
-    /// filtering in `src/mcp.rs` and bypass this.
+    /// Built-in allow/block-list. MCP tools have their own per-server filtering in `src/mcp.rs`
+    /// and bypass this.
     builtin_filter: Arc<BuiltinToolFilter>,
-    /// Files read this session, shared with the file tools so `edit_file`
-    /// can require a prior read. Cleared on conversation compaction.
+    /// Files read this session, shared with the file tools so `edit_file` can require a prior
+    /// read. Cleared on conversation compaction.
     read_tracker: ReadTracker,
 }
 
 impl ToolRegistry {
-    /// Empty registry with the default filter — no built-ins, no MCP
-    /// tools. Used by out-of-band CLI commands that spin up a manager
-    /// for a single RPC (`agsh mcp reconnect`, `agsh mcp tools`) and
-    /// don't need a populated registry. The `dead_code` allow keeps
-    /// the helper available for future CLI subcommands that need a
-    /// throwaway registry.
+    /// Empty registry with the default filter — no built-ins, no MCP tools. Used by out-of-band CLI
+    /// commands that spin up a manager for a single RPC (`agsh mcp reconnect`, `agsh mcp tools`)
+    /// and don't need a populated registry. The `dead_code` allow keeps the helper available for
+    /// future CLI subcommands that need a throwaway registry.
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::new_with_filter(BuiltinToolFilter::default())
@@ -289,26 +276,23 @@ impl ToolRegistry {
         }
     }
 
-    /// Clear the read-tracker. Called on conversation compaction: the
-    /// model's context is reset, so a follow-up `edit_file` should re-read
-    /// the file rather than trust a pre-compaction read.
+    /// Clear the read-tracker. Called on conversation compaction: the model's context is reset, so
+    /// a follow-up `edit_file` should re-read the file rather than trust a pre-compaction read.
     pub async fn clear_read_tracker(&self) {
         self.read_tracker.write().await.clear();
     }
 
-    /// Identity check by inner `Arc` pointer. `ToolRegistry` is `Clone`
-    /// over its inner `Arc<RwLock<Vec<Arc<dyn Tool>>>>`, so cloned
-    /// registries match. Used by
-    /// [`crate::mcp::McpClientManager::detach_registry`] to find the
-    /// right entry when a session closes.
+    /// Identity check by inner `Arc` pointer. `ToolRegistry` is `Clone` over its inner
+    /// `Arc<RwLock<Vec<Arc<dyn Tool>>>>`, so cloned registries match. Used by
+    /// [`crate::mcp::McpClientManager::detach_registry`] to find the right entry when a session
+    /// closes.
     pub fn same_inner(a: &Self, b: &Self) -> bool {
         Arc::ptr_eq(&a.tools, &b.tools)
     }
 
-    /// Register a tool. Returns an error if another tool with the same name
-    /// is already registered. Callers that know the tool is unique (e.g.
-    /// core builtins) may `.expect()` the result; MCP registration should
-    /// log and continue so one bad server can't break startup.
+    /// Register a tool. Returns an error if another tool with the same name is already registered.
+    /// Callers that know the tool is unique (e.g. core builtins) may `.expect()` the result; MCP
+    /// registration should log and continue so one bad server can't break startup.
     pub fn register(&self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.definition().name.clone();
         let mut tools = self.tools.write().expect("tools lock poisoned");
@@ -321,10 +305,9 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Replace every tool whose name starts with `mcp__<server_name>__` with
-    /// the supplied set. Used by `AgshClientHandler::on_tool_list_changed` to
-    /// hot-swap a server's tools without restarting the agent. Deferred
-    /// markers for removed tool names are cleared so the registry's deferred
+    /// Replace every tool whose name starts with `mcp__<server_name>__` with the supplied set. Used
+    /// by `AgshClientHandler::on_tool_list_changed` to hot-swap a server's tools without restarting
+    /// the agent. Deferred markers for removed tool names are cleared so the registry's deferred
     /// set doesn't grow unbounded.
     pub fn replace_server_tools(&self, server_name: &str, new_tools: Vec<Arc<dyn Tool>>) {
         let prefix = format!("mcp__{}__", server_name);
@@ -346,12 +329,11 @@ impl ToolRegistry {
         }
     }
 
-    /// Mark a tool as deferred. Deferred tools live in the registry but are
-    /// hidden from the per-turn tools array until the model explicitly
-    /// loads them via the `load_tool` meta-tool. Discoverability is
-    /// preserved by the `## Tool Discovery` section of the system prompt
-    /// (built from `tool_catalogue()`), and the active set is recomputed
-    /// per turn from the conversation, not from registry state.
+    /// Mark a tool as deferred. Deferred tools live in the registry but are hidden from the
+    /// per-turn tools array until the model explicitly loads them via the `load_tool` meta-tool.
+    /// Discoverability is preserved by the `## Tool Discovery` section of the system prompt (built
+    /// from `tool_catalogue()`), and the active set is recomputed per turn from the conversation,
+    /// not from registry state.
     pub fn mark_deferred(&self, name: &str) {
         self.deferred
             .write()
@@ -368,8 +350,8 @@ impl ToolRegistry {
             .cloned()
     }
 
-    /// Effective required permission: override wins, else the tool's
-    /// hardcoded `Tool::required_permission()`. `None` if not registered.
+    /// Effective required permission: override wins, else the tool's hardcoded
+    /// `Tool::required_permission()`. `None` if not registered.
     pub fn required_permission_for(&self, name: &str) -> Option<Permission> {
         if let Some(permission) = self.permission_overrides.get(name) {
             return Some(*permission);
@@ -377,12 +359,10 @@ impl ToolRegistry {
         self.get(name).map(|tool| tool.required_permission())
     }
 
-    /// Returns tool definitions for the API call, excluding deferred tools.
-    /// Permission-filtered view — used by sub-agents which run at a fixed
-    /// permission. The main agent uses
-    /// [`Self::definitions_active_with_loaded`] so the tools array remains
-    /// byte-identical across mid-session `/permission` toggles, keeping
-    /// the Claude prompt cache warm on subsequent turns.
+    /// Returns tool definitions for the API call, excluding deferred tools. Permission-filtered
+    /// view — used by sub-agents which run at a fixed permission. The main agent uses
+    /// [`Self::definitions_active_with_loaded`] so the tools array remains byte-identical across
+    /// mid-session `/permission` toggles, keeping the Claude prompt cache warm on subsequent turns.
     pub fn definitions_for_permission(&self, permission: Permission) -> Vec<ToolDefinition> {
         let deferred = self.deferred.read().expect("deferred lock poisoned");
         self.tools
@@ -402,29 +382,26 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Slice-based convenience wrapper for tests: composes
-    /// [`extract_loaded_tool_names`] with [`Self::definitions_active_with_loaded`].
-    /// Production code goes through the events-aware path (see
-    /// [`crate::conversation::extract_loaded_tool_names_from_events`]) so
-    /// `Event::CompactBoundary::loaded_tools_snapshot` survives across
-    /// compaction; a slice-only scan loses the snapshot.
+    /// Slice-based convenience wrapper for tests: composes [`extract_loaded_tool_names`] with
+    /// [`Self::definitions_active_with_loaded`]. Production code goes through the events-aware path
+    /// (see [`crate::conversation::extract_loaded_tool_names_from_events`]) so
+    /// `Event::CompactBoundary::loaded_tools_snapshot` survives across compaction; a slice-only
+    /// scan loses the snapshot.
     #[cfg(test)]
     pub fn definitions_active(&self, messages: &[Message]) -> Vec<ToolDefinition> {
         let loaded = extract_loaded_tool_names(messages);
         self.definitions_active_with_loaded(&loaded)
     }
 
-    /// Returns every active tool definition regardless of the caller's
-    /// current permission. The active set is the union of non-deferred
-    /// tools and deferred tools whose schema has been loaded via the
-    /// `load_tool` meta-tool — `loaded` is computed by the caller (via
-    /// [`crate::conversation::extract_loaded_tool_names_from_events`]
-    /// for the agent loop, [`extract_loaded_tool_names`] for tests).
+    /// Returns every active tool definition regardless of the caller's current permission. The
+    /// active set is the union of non-deferred tools and deferred tools whose schema has been
+    /// loaded via the `load_tool` meta-tool — `loaded` is computed by the caller (via
+    /// [`crate::conversation::extract_loaded_tool_names_from_events`] for the agent loop,
+    /// [`extract_loaded_tool_names`] for tests).
     ///
-    /// Blocked calls are rejected at dispatch; keeping the tools array
-    /// permission-independent is what preserves the prompt cache prefix
-    /// across `/permission` toggles (breakpoint 3 in the Claude provider's
-    /// cache layout).
+    /// Blocked calls are rejected at dispatch; keeping the tools array permission-independent is
+    /// what preserves the prompt cache prefix across `/permission` toggles (breakpoint 3 in the
+    /// Claude provider's cache layout).
     pub fn definitions_active_with_loaded(&self, loaded: &HashSet<String>) -> Vec<ToolDefinition> {
         let deferred = self.deferred.read().expect("deferred lock poisoned");
         self.tools
@@ -439,10 +416,10 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Returns (name, description, required_permission, is_deferred) for every
-    /// registered tool. Drives the permission-independent system-prompt tool
-    /// catalogue plus the per-turn `[Permission context]` block that names
-    /// currently-blocked tools. Sorted by (name) for deterministic output.
+    /// Returns (name, description, required_permission, is_deferred) for every registered tool.
+    /// Drives the permission-independent system-prompt tool catalogue plus the per-turn
+    /// `[Permission context]` block that names currently-blocked tools. Sorted by (name) for
+    /// deterministic output.
     pub fn tool_catalogue(&self) -> Vec<(String, String, Permission, bool)> {
         let deferred = self.deferred.read().expect("deferred lock poisoned");
         let mut entries: Vec<(String, String, Permission, bool)> = self
@@ -497,9 +474,8 @@ impl ToolRegistry {
         }));
         self.register_builtin(Arc::new(find::FindFilesTool { cwd: cwd.clone() }));
         self.register_builtin(Arc::new(grep::SearchContentsTool { cwd: cwd.clone() }));
-        // A malformed proxy URL or unreadable CA file surfaces as a
-        // startup error rather than silently falling back to an
-        // unconfigured client (which would ignore the user's intent).
+        // A malformed proxy URL or unreadable CA file surfaces as a startup error rather than
+        // silently falling back to an unconfigured client (which would ignore the user's intent).
         let web_client = web::build_web_client(web_client_config)?;
         self.register_builtin(Arc::new(web::FetchUrlTool {
             client: web_client.clone(),
@@ -517,8 +493,8 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Register a builtin. Collisions panic (programmer error). Tools
-    /// rejected by the `[tools]` filter are silently skipped.
+    /// Register a builtin. Collisions panic (programmer error). Tools rejected by the `[tools]`
+    /// filter are silently skipped.
     fn register_builtin(&self, tool: Arc<dyn Tool>) {
         let name = tool.definition().name;
         if !self.builtin_filter.admits(&name) {
@@ -531,17 +507,14 @@ impl ToolRegistry {
         self.register(tool).expect("builtin tool name collision");
     }
 
-    /// Register the session-scoped tools (load_tool, skill, render_image,
-    /// todo_*, scratchpad_*) on the registry. Shared between
-    /// [`Self::build_default`] and [`Self::build_for_subagent`] so adding
-    /// a new such tool to the parent automatically gives it to sub-agents
-    /// too. Todo-list rendering is the [`crate::frontend::Frontend`]'s
-    /// concern now, not the tool's.
+    /// Register the session-scoped tools (load_tool, skill, render_image, todo_*, scratchpad_*) on
+    /// the registry. Shared between [`Self::build_default`] and [`Self::build_for_subagent`] so
+    /// adding a new such tool to the parent automatically gives it to sub-agents too. Todo-list
+    /// rendering is the [`crate::frontend::Frontend`]'s concern now, not the tool's.
     ///
-    /// `parent_session_id` + `inherited_scratchpad_names` configure
-    /// read-only scratchpad inheritance for sub-agents. Both are
-    /// `None`/empty on the primary agent's registry, so no fallback path
-    /// is taken there.
+    /// `parent_session_id` + `inherited_scratchpad_names` configure read-only scratchpad
+    /// inheritance for sub-agents. Both are `None`/empty on the primary agent's registry, so no
+    /// fallback path is taken there.
     #[allow(clippy::too_many_arguments)]
     fn register_session_scoped_tools(
         &self,
@@ -657,16 +630,14 @@ impl ToolRegistry {
         Ok(registry)
     }
 
-    /// Build a tool registry for sub-agents. Sub-agents get the same
-    /// session-scoped tools as the parent (load_tool, skill, render_image,
-    /// todo_*, scratchpad_*) scoped to their own ephemeral child session.
-    /// `spawn_agent` remains absent — sub-agents cannot recursively spawn
-    /// further sub-agents.
+    /// Build a tool registry for sub-agents. Sub-agents get the same session-scoped tools as the
+    /// parent (load_tool, skill, render_image, todo_*, scratchpad_*) scoped to their own ephemeral
+    /// child session. `spawn_agent` remains absent — sub-agents cannot recursively spawn further
+    /// sub-agents.
     ///
-    /// `parent_session_id` + `inherited_scratchpad_names` enable read-only
-    /// scratchpad inheritance: `scratchpad_read` falls back to the parent
-    /// for allowlisted names, and `scratchpad_list` enumerates them in an
-    /// `(inherited)` section. Pass `None`/`Vec::new()` to opt out.
+    /// `parent_session_id` + `inherited_scratchpad_names` enable read-only scratchpad inheritance:
+    /// `scratchpad_read` falls back to the parent for allowlisted names, and `scratchpad_list`
+    /// enumerates them in an `(inherited)` section. Pass `None`/`Vec::new()` to opt out.
     #[allow(clippy::too_many_arguments)]
     pub fn build_for_subagent(
         web_client_config: crate::config::WebClientConfig,
@@ -714,8 +685,8 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// Test helper: pull the concatenated text content out of a
-    /// `ToolOutput`. Used across every per-tool test module.
+    /// Test helper: pull the concatenated text content out of a `ToolOutput`. Used across every
+    /// per-tool test module.
     pub(crate) fn text_content(output: &ToolOutput) -> String {
         ContentBlock::tool_result_text_content(&output.content)
     }
@@ -786,10 +757,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// A no-op tool used as a deferred-tool fixture: registering it after
-    /// `build_default` and calling `mark_deferred` lets tests exercise the
-    /// load_tool flow against a tool that is genuinely deferred, instead of
-    /// re-deferring a production tool that ships active.
+    /// A no-op tool used as a deferred-tool fixture: registering it after `build_default` and
+    /// calling `mark_deferred` lets tests exercise the load_tool flow against a tool that is
+    /// genuinely deferred, instead of re-deferring a production tool that ships active.
     pub(crate) struct FixtureDeferredTool {
         pub name: String,
     }
@@ -817,8 +787,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Register a deferred fixture tool on the registry. Returns the name
-    /// the test should use when invoking `load_tool`.
+    /// Register a deferred fixture tool on the registry. Returns the name the test should use when
+    /// invoking `load_tool`.
     pub(crate) fn register_deferred_fixture(registry: &ToolRegistry, name: &str) {
         registry
             .register(Arc::new(FixtureDeferredTool {
@@ -878,8 +848,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_extract_loaded_tool_names_malformed_input() {
-        // load_tool called with no `name` field — must not panic, must not
-        // pollute the active set.
+        // load_tool called with no `name` field — must not panic, must not pollute the active set.
         let messages = vec![
             Message {
                 role: Role::Assistant,
@@ -912,9 +881,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_extract_loaded_tool_names_multi_block_message() {
-        // The model can emit several `tool_use` blocks in one assistant
-        // message — the matching `tool_result`s come back as separate
-        // blocks of one user message. Both must be processed.
+        // The model can emit several `tool_use` blocks in one assistant message — the matching
+        // `tool_result`s come back as separate blocks of one user message. Both must be processed.
         let assistant = Message {
             role: Role::Assistant,
             content: vec![
@@ -957,9 +925,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_extract_loaded_tool_names_mismatched_id() {
-        // tool_result references an id that no `load_tool` use claimed.
-        // The result is dropped; the orphan use stays unmatched and is
-        // not added to the active set.
+        // tool_result references an id that no `load_tool` use claimed. The result is dropped; the
+        // orphan use stays unmatched and is not added to the active set.
         let messages = vec![
             load_tool_use("u1", "scratchpad_read"),
             tool_result("u_other", "ok", false),
@@ -969,8 +936,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_extract_loaded_tool_names_interleaved_with_other_tool_calls() {
-        // load_tool calls share the message stream with regular tool calls;
-        // the scanner must pair on tool_use_id, not on positional adjacency.
+        // load_tool calls share the message stream with regular tool calls; the scanner must pair
+        // on tool_use_id, not on positional adjacency.
         let messages = vec![
             Message {
                 role: Role::Assistant,
@@ -1083,8 +1050,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_definitions_active_exposes_loaded_deferred_tool() {
-        // End-to-end: a successful load_tool call in the conversation
-        // promotes the named tool into the active set on the next call.
+        // End-to-end: a successful load_tool call in the conversation promotes the named tool into
+        // the active set on the next call.
         let registry = test_registry().await;
         register_deferred_fixture(&registry, "fixture_alpha");
         register_deferred_fixture(&registry, "fixture_beta");
@@ -1107,9 +1074,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_definitions_active_errored_load_stays_hidden() {
-        // A load_tool call that ended in an error tool_result must NOT
-        // expose the deferred tool — the model's parameter shape was
-        // wrong, the schema was not delivered.
+        // A load_tool call that ended in an error tool_result must NOT expose the deferred tool —
+        // the model's parameter shape was wrong, the schema was not delivered.
         let registry = test_registry().await;
         register_deferred_fixture(&registry, "fixture_alpha");
 
@@ -1123,9 +1089,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_definitions_active_load_tool_itself_always_visible() {
-        // load_tool is the bootstrap meta-tool — it must appear in the
-        // active set for an empty conversation, otherwise the model has
-        // no way to discover deferred tools.
+        // load_tool is the bootstrap meta-tool — it must appear in the active set for an empty
+        // conversation, otherwise the model has no way to discover deferred tools.
         let registry = test_registry().await;
         let active = registry.definitions_active(&[]);
         assert!(active.iter().any(|t| t.name == "load_tool"));
@@ -1133,10 +1098,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_definitions_active_unknown_load_silently_dropped() {
-        // load_tool was called for a tool that isn't registered. The
-        // scanner records the (errored) result as not loaded, and even
-        // if it were loaded, the registry just doesn't contain a tool
-        // by that name — no crash, no spurious entry.
+        // load_tool was called for a tool that isn't registered. The scanner records the (errored)
+        // result as not loaded, and even if it were loaded, the registry just doesn't contain a
+        // tool by that name — no crash, no spurious entry.
         let registry = test_registry().await;
         let messages = vec![
             load_tool_use("u1", "no_such_tool"),
@@ -1177,9 +1141,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_scratchpad_tools_default_to_active() {
-        // Regression: feedback agents kept tripping on the asymmetry
-        // where scratchpad_write was active but _read/_edit/_list/_delete
-        // were deferred behind load_tool. All five must ship default now.
+        // Regression: feedback agents kept tripping on the asymmetry where scratchpad_write was
+        // active but _read/_edit/_list/_delete were deferred behind load_tool. All five must ship
+        // default now.
         let registry = test_registry().await;
         let entries = registry.tool_catalogue();
         for name in [
@@ -1358,8 +1322,7 @@ pub(crate) mod tests {
             registry.required_permission_for("write_file"),
             Some(Permission::Write)
         );
-        // Catalogue must reflect the override too (the system prompt
-        // reads from it).
+        // Catalogue must reflect the override too (the system prompt reads from it).
         let catalogue = registry.tool_catalogue();
         let read_file_required = catalogue
             .iter()
@@ -1375,9 +1338,8 @@ pub(crate) mod tests {
         let filter = BuiltinToolFilter::from_config(None, Vec::new(), overrides);
         let registry = build_test_registry(filter).await;
 
-        // At Read permission, read_file should now be excluded from the
-        // permission-filtered definitions because the override raised it
-        // to Write.
+        // At Read permission, read_file should now be excluded from the permission-filtered
+        // definitions because the override raised it to Write.
         let read_defs = registry.definitions_for_permission(Permission::Read);
         assert!(!read_defs.iter().any(|t| t.name == "read_file"));
 
@@ -1425,9 +1387,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_builtin_tool_names_covers_canonical_set() {
-        // Guard against forgetting to add a new built-in to the canonical
-        // list that drives stale-entry warnings. Update this assertion
-        // deliberately when adding a tool in register_core_tools.
+        // Guard against forgetting to add a new built-in to the canonical list that drives
+        // stale-entry warnings. Update this assertion deliberately when adding a tool in
+        // register_core_tools.
         let names: HashSet<&str> = BUILTIN_TOOL_NAMES.iter().copied().collect();
         for expected in &[
             "read_file",
@@ -1458,10 +1420,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Stub tool that sleeps for a known duration before returning a payload
-    /// derived from its input. Observes the cancellation token via `select!`
-    /// so cancellation tests can assert early exit. Used to verify the
-    /// parent and sub-agent dispatch loops actually run their `join_all`
+    /// Stub tool that sleeps for a known duration before returning a payload derived from its
+    /// input. Observes the cancellation token via `select!` so cancellation tests can assert early
+    /// exit. Used to verify the parent and sub-agent dispatch loops actually run their `join_all`
     /// futures in parallel and propagate cancellation correctly.
     struct SleepTool {
         name: String,
@@ -1509,9 +1470,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Guards against a regression where parallel tool dispatch is replaced
-    /// by sequential `.await`-in-a-loop. Two tools each sleep ~200 ms; the
-    /// total wall-clock must be much less than the sum.
+    /// Guards against a regression where parallel tool dispatch is replaced by sequential
+    /// `.await`-in-a-loop. Two tools each sleep ~200 ms; the total wall-clock must be much less
+    /// than the sum.
     #[tokio::test]
     async fn test_parallel_dispatch_runs_tools_concurrently() {
         let registry = ToolRegistry::new_with_filter(BuiltinToolFilter::default());
@@ -1543,10 +1504,9 @@ pub(crate) mod tests {
         let outputs: Vec<_> = futures::future::join_all(futures).await;
         let elapsed = start.elapsed();
 
-        // 500ms gives ~300ms headroom over the parallel ~200ms baseline while
-        // still being well below the ~400ms serial-dispatch case. The wide
-        // margin absorbs scheduler jitter on slow CI runners without losing
-        // the parallel-vs-sequential discrimination.
+        // 500ms gives ~300ms headroom over the parallel ~200ms baseline while still being well
+        // below the ~400ms serial-dispatch case. The wide margin absorbs scheduler jitter on slow
+        // CI runners without losing the parallel-vs-sequential discrimination.
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "expected parallel execution (<500ms), got {:?}",
@@ -1559,9 +1519,9 @@ pub(crate) mod tests {
         assert_eq!(text_content(second), "done:second");
     }
 
-    /// Verifies that the cancellation token threads through `tool.execute(...)`
-    /// calls when many are in flight. Cancelling mid-batch should cause every
-    /// running tool to observe the cancellation and return early.
+    /// Verifies that the cancellation token threads through `tool.execute(...)` calls when many are
+    /// in flight. Cancelling mid-batch should cause every running tool to observe the cancellation
+    /// and return early.
     #[tokio::test]
     async fn test_parallel_dispatch_respects_cancellation() {
         let registry = ToolRegistry::new_with_filter(BuiltinToolFilter::default());

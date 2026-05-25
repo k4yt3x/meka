@@ -1,8 +1,7 @@
-//! Helpers shared by [`super::api::ClaudeApiProvider`] and
-//! [`super::oauth::ClaudeOAuthProvider`]. Everything in this module is
-//! independent of the authentication scheme: message/tool conversion to
-//! the Claude wire format, SSE streaming, response parsing, per-model
-//! capability detection, and the thinking-override helper.
+//! Helpers shared by [`super::api::ClaudeApiProvider`] and [`super::oauth::ClaudeOAuthProvider`].
+//! Everything in this module is independent of the authentication scheme: message/tool conversion
+//! to the Claude wire format, SSE streaming, response parsing, per-model capability detection, and
+//! the thinking-override helper.
 
 use std::{borrow::Cow, sync::atomic::AtomicI8};
 
@@ -19,37 +18,32 @@ use crate::{
     },
 };
 
-/// Anthropic's hard request-body cap is 32 MiB; we reserve ~2 MiB headroom
-/// for headers, URL, attestation patches, and serialization slack. Bodies
-/// above this threshold are reactively shrunk by [`redact_oldest_images`]
-/// before they're posted.
+/// Anthropic's hard request-body cap is 32 MiB; we reserve ~2 MiB headroom for headers, URL,
+/// attestation patches, and serialization slack. Bodies above this threshold are reactively shrunk
+/// by [`redact_oldest_images`] before they're posted.
 pub(super) const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
 
-/// When redaction fires, drop the body to roughly this size — leaves a
-/// ~6 MiB buffer below [`MAX_REQUEST_BYTES`] so the next several turns
-/// don't re-trigger redaction. Mirrors Claude Code's `apiMicrocompact`
-/// watermark (180k → 140k = ~78% of trigger). Stable cache prefix between
+/// When redaction fires, drop the body to roughly this size — leaves a ~6 MiB buffer below
+/// [`MAX_REQUEST_BYTES`] so the next several turns don't re-trigger redaction. Mirrors Claude
+/// Code's `apiMicrocompact` watermark (180k → 140k = ~78% of trigger). Stable cache prefix between
 /// redactions matters more than minimum-impact redaction per event.
 pub(super) const REDACTION_TARGET_BYTES: usize = 24 * 1024 * 1024;
 
-/// Placeholder text that replaces a `ToolResultContent::Image` payload when
-/// the request body would otherwise exceed [`MAX_REQUEST_BYTES`].
+/// Placeholder text that replaces a `ToolResultContent::Image` payload when the request body would
+/// otherwise exceed [`MAX_REQUEST_BYTES`].
 pub(super) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
 
-/// Anthropic accepts up to 8000 px per axis on a *single*-image request,
-/// but rejects anything over 2000 px on either axis once the request
-/// contains more than one image. We always downscale to fit so a session
-/// can freely accumulate images without tripping the multi-image cap.
-/// This is enforced at the Claude provider layer only — non-Claude
-/// providers don't need it (and shouldn't pay the resize cost).
+/// Anthropic accepts up to 8000 px per axis on a *single*-image request, but rejects anything over
+/// 2000 px on either axis once the request contains more than one image. We always downscale to fit
+/// so a session can freely accumulate images without tripping the multi-image cap. This is enforced
+/// at the Claude provider layer only — non-Claude providers don't need it (and shouldn't pay the
+/// resize cost).
 pub(super) const MAX_IMAGE_DIMENSION_PX: u32 = 2000;
 
-/// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both
-/// the non-streaming response parser and the SSE driver — Anthropic emits
-/// the same shape (`input_tokens`, `output_tokens`,
-/// `cache_creation_input_tokens`, `cache_read_input_tokens`) in both
-/// places. Missing fields default to 0 (older API responses, or providers
-/// that don't surface cache stats).
+/// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both the non-streaming response
+/// parser and the SSE driver — Anthropic emits the same shape (`input_tokens`, `output_tokens`,
+/// `cache_creation_input_tokens`, `cache_read_input_tokens`) in both places. Missing fields default
+/// to 0 (older API responses, or providers that don't surface cache stats).
 pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
     let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     TokenUsage {
@@ -60,10 +54,9 @@ pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
     }
 }
 
-/// Resolves the effective thinking state given the override atomic's raw
-/// value (`-1` = unset, `0` = forced off, `1` = forced on) and the configured
-/// default. Kept separate from the atomic itself so the providers can own
-/// their own `AtomicI8` without duplicating the branching logic.
+/// Resolves the effective thinking state given the override atomic's raw value (`-1` = unset, `0` =
+/// forced off, `1` = forced on) and the configured default. Kept separate from the atomic itself so
+/// the providers can own their own `AtomicI8` without duplicating the branching logic.
 pub(super) fn is_thinking_enabled(override_raw: i8, default: bool) -> bool {
     match override_raw {
         0 => false,
@@ -72,8 +65,8 @@ pub(super) fn is_thinking_enabled(override_raw: i8, default: bool) -> bool {
     }
 }
 
-/// Convenience wrapper that loads the atomic with relaxed ordering and
-/// applies [`is_thinking_enabled`]. Most callers want this form.
+/// Convenience wrapper that loads the atomic with relaxed ordering and applies
+/// [`is_thinking_enabled`]. Most callers want this form.
 pub(super) fn resolve_thinking_enabled(override_atomic: &AtomicI8, default: bool) -> bool {
     is_thinking_enabled(
         override_atomic.load(std::sync::atomic::Ordering::Relaxed),
@@ -81,11 +74,9 @@ pub(super) fn resolve_thinking_enabled(override_atomic: &AtomicI8, default: bool
     )
 }
 
-/// Mirrors Claude Code's `modelSupportsAdaptiveThinking`
-/// (`utils/thinking.ts:113-144`): explicit allowlist for `opus-4-6` /
-/// `sonnet-4-6`, explicit deny for any other named opus/sonnet/haiku
-/// (covers Claude 4.0 / 4.5 and Haiku 4.5), default-true for unknown
-/// 1P model strings.
+/// Mirrors Claude Code's `modelSupportsAdaptiveThinking` (`utils/thinking.ts:113-144`): explicit
+/// allowlist for `opus-4-6` / `sonnet-4-6`, explicit deny for any other named opus/sonnet/haiku
+/// (covers Claude 4.0 / 4.5 and Haiku 4.5), default-true for unknown 1P model strings.
 pub(super) fn model_supports_adaptive_thinking(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
     if lower.contains("opus-4-6") || lower.contains("sonnet-4-6") {
@@ -101,10 +92,9 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
     model.to_ascii_lowercase().contains("haiku")
 }
 
-/// Insert the `max_tokens` + `thinking` fields shared by both Claude
-/// providers' request bodies. Adaptive-thinking models get a fixed 64k
-/// ceiling; others get `max(budget*2, 32k)` with an explicit budget;
-/// thinking-off uses a flat 32k.
+/// Insert the `max_tokens` + `thinking` fields shared by both Claude providers' request bodies.
+/// Adaptive-thinking models get a fixed 64k ceiling; others get `max(budget*2, 32k)` with an
+/// explicit budget; thinking-off uses a flat 32k.
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
     thinking_enabled: bool,
@@ -238,8 +228,7 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
         })
         .collect();
 
-    // Strip trailing thinking blocks from the last assistant message
-    // (Claude API requirement).
+    // Strip trailing thinking blocks from the last assistant message (Claude API requirement).
     if let Some(last_assistant) = claude_messages
         .iter_mut()
         .rev()
@@ -296,11 +285,9 @@ pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
         "end_turn" => StopReason::EndTurn,
         "tool_use" => StopReason::ToolUse,
         "max_tokens" => StopReason::MaxTokens,
-        // Claude does not include the refusal text alongside the
-        // streaming `stop_reason` delta; the model's text content
-        // is what the user sees as the refusal. Surface an empty
-        // refusal payload — the assistant message blocks carry the
-        // human-readable explanation already.
+        // Claude does not include the refusal text alongside the streaming `stop_reason` delta; the
+        // model's text content is what the user sees as the refusal. Surface an empty refusal
+        // payload — the assistant message blocks carry the human-readable explanation already.
         "refusal" => StopReason::Refusal(String::new()),
         other => StopReason::Unknown(other.to_string()),
     }
@@ -459,8 +446,8 @@ pub(super) async fn drive_claude_sse_stream(
                                 if block_type == "thinking" {
                                     in_thinking = true;
                                 } else if block_type == "redacted_thinking" {
-                                    // Emit a stub thinking block so the UI
-                                    // shows something for redacted content.
+                                    // Emit a stub thinking block so the UI shows something for
+                                    // redacted content.
                                     let _ = event_sender
                                         .send(StreamEvent::ThinkingDelta(
                                             "[redacted]".to_string(),
@@ -669,26 +656,23 @@ pub(super) async fn drive_claude_sse_stream(
     Ok(())
 }
 
-/// Stats from a single [`redact_oldest_images`] invocation. Returned to
-/// callers so they can surface a user-visible advisory and increment a
-/// per-session redaction counter.
+/// Stats from a single [`redact_oldest_images`] invocation. Returned to callers so they can surface
+/// a user-visible advisory and increment a per-session redaction counter.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct RedactionStats {
     pub images_redacted: usize,
     pub bytes_freed: usize,
 }
 
-/// Walk `messages` oldest-first and replace `ToolResultContent::Image`
-/// payloads with [`IMAGE_REDACTION_PLACEHOLDER`] until at least
-/// `bytes_to_drop` base64 bytes have been removed. The LAST message is never
-/// touched — it carries the moving `cache_control` breakpoint set in
-/// [`convert_messages_to_claude_content`] and disturbing it would
-/// invalidate the cache for the new turn unnecessarily.
+/// Walk `messages` oldest-first and replace `ToolResultContent::Image` payloads with
+/// [`IMAGE_REDACTION_PLACEHOLDER`] until at least `bytes_to_drop` base64 bytes have been removed.
+/// The LAST message is never touched — it carries the moving `cache_control` breakpoint set in
+/// [`convert_messages_to_claude_content`] and disturbing it would invalidate the cache for the new
+/// turn unnecessarily.
 ///
-/// Returns `Cow::Borrowed` if no work was needed (`bytes_to_drop == 0`).
-/// Otherwise returns `Cow::Owned` with whatever redaction was possible —
-/// even when the budget couldn't be met, the cloned messages are still
-/// returned so the caller can re-serialize and decide whether the body
+/// Returns `Cow::Borrowed` if no work was needed (`bytes_to_drop == 0`). Otherwise returns
+/// `Cow::Owned` with whatever redaction was possible — even when the budget couldn't be met, the
+/// cloned messages are still returned so the caller can re-serialize and decide whether the body
 /// fits.
 pub(super) fn redact_oldest_images(
     messages: &[Message],
@@ -724,18 +708,15 @@ pub(super) fn redact_oldest_images(
     (Cow::Owned(redacted), stats)
 }
 
-/// Walk `messages` and downscale any `ToolResultContent::Image` whose
-/// pixel dimensions exceed [`MAX_IMAGE_DIMENSION_PX`] on either axis.
-/// The body bytes (base64) for those images are replaced with a
-/// re-encoded PNG that fits within the cap; smaller images are left
-/// alone. Returns `Cow::Borrowed` when no work was needed.
+/// Walk `messages` and downscale any `ToolResultContent::Image` whose pixel dimensions exceed
+/// [`MAX_IMAGE_DIMENSION_PX`] on either axis. The body bytes (base64) for those images are replaced
+/// with a re-encoded PNG that fits within the cap; smaller images are left alone. Returns
+/// `Cow::Borrowed` when no work was needed.
 ///
-/// Anthropic-specific: the 2000 px cap only matters for Anthropic's
-/// multi-image requests; this helper is intentionally not applied to
-/// non-Claude providers. Decode/resize cost is incurred per turn for
-/// each oversized image — typical sessions have few oversized images,
-/// and the cheap [`crate::image::read_image_dimensions`] header read
-/// short-circuits the common case.
+/// Anthropic-specific: the 2000 px cap only matters for Anthropic's multi-image requests; this
+/// helper is intentionally not applied to non-Claude providers. Decode/resize cost is incurred per
+/// turn for each oversized image — typical sessions have few oversized images, and the cheap
+/// [`crate::image::read_image_dimensions`] header read short-circuits the common case.
 pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Message]> {
     use base64::Engine;
     use image::ImageFormat;
@@ -744,9 +725,9 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
         ImageFormat::from_mime_type(media_type)
     }
 
-    // First pass: detect whether any image needs downscaling. Cheap —
-    // just base64-decode to peek at header bytes. If nothing's oversized,
-    // skip the clone+rewrite entirely and return Cow::Borrowed.
+    // First pass: detect whether any image needs downscaling. Cheap — just base64-decode to peek at
+    // header bytes. If nothing's oversized, skip the clone+rewrite entirely and return
+    // Cow::Borrowed.
     let needs_work = messages.iter().any(|message| {
         message.content.iter().any(|block| match block {
             ContentBlock::ToolResult { content, .. } => content.iter().any(|item| match item {
@@ -819,19 +800,18 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
     Cow::Owned(owned)
 }
 
-/// Serialize a Claude request body, downscaling oversized images first and
-/// reactively redacting old tool-result image blocks if the serialized JSON
-/// still exceeds [`MAX_REQUEST_BYTES`]. Both Claude providers run this same
-/// redact-and-retry loop; the caller supplies the body builder via `build` so
-/// each provider's thinking / metadata wiring stays in its own file.
+/// Serialize a Claude request body, downscaling oversized images first and reactively redacting old
+/// tool-result image blocks if the serialized JSON still exceeds [`MAX_REQUEST_BYTES`]. Both Claude
+/// providers run this same redact-and-retry loop; the caller supplies the body builder via `build`
+/// so each provider's thinking / metadata wiring stays in its own file.
 ///
-/// `build` takes a `messages` slice (the downscaled-then-maybe-redacted view)
-/// and returns the serialized JSON. It's called once on the original messages
-/// and, if oversized, a second time on the redacted set.
+/// `build` takes a `messages` slice (the downscaled-then-maybe-redacted view) and returns the
+/// serialized JSON. It's called once on the original messages and, if oversized, a second time on
+/// the redacted set.
 ///
-/// On a successful redaction pass, this records the [`RedactionStats`] on
-/// `session_stats` (when provided) and emits a single user-visible
-/// `render::render_hint` line describing what was dropped.
+/// On a successful redaction pass, this records the [`RedactionStats`] on `session_stats` (when
+/// provided) and emits a single user-visible `render::render_hint` line describing what was
+/// dropped.
 pub(super) fn build_body_within_budget<F>(
     messages: &[Message],
     session_stats: Option<&std::sync::Arc<crate::stats::SessionStats>>,
@@ -898,8 +878,8 @@ mod tests {
     fn test_is_thinking_enabled_unset_uses_default() {
         assert!(is_thinking_enabled(-1, true));
         assert!(!is_thinking_enabled(-1, false));
-        // Any non-0/1 value should be treated as "unset" and fall through
-        // to the configured default.
+        // Any non-0/1 value should be treated as "unset" and fall through to the configured
+        // default.
         assert!(is_thinking_enabled(42, true));
         assert!(!is_thinking_enabled(-99, false));
     }
@@ -994,9 +974,8 @@ mod tests {
 
     #[test]
     fn test_redact_drops_oldest_image_first() {
-        // Two images: one in msg[0] (older), one in msg[1] (last). The
-        // helper must only touch the older one — the last message carries
-        // the moving cache_control marker.
+        // Two images: one in msg[0] (older), one in msg[1] (last). The helper must only touch the
+        // older one — the last message carries the moving cache_control marker.
         let payload_a = "A".repeat(1024);
         let payload_b = "B".repeat(1024);
         let messages = vec![
@@ -1034,13 +1013,11 @@ mod tests {
 
     #[test]
     fn test_redact_stops_when_target_reached() {
-        // Three images each 1 KiB. Target = 1500 bytes. Only the FIRST
-        // image should be redacted; the second remains because we hit the
-        // budget after one (1024 >= 1500 is false, but saturating_add gets
-        // us past after the first redaction since we then loop-check
-        // before the second image is considered? — no: the check is
-        // `bytes_dropped >= bytes_to_drop`, so 1024 < 1500 means we
-        // redact the second too). Clarify by setting target = 1024.
+        // Three images each 1 KiB. Target = 1500 bytes. Only the FIRST image should be redacted;
+        // the second remains because we hit the budget after one (1024 >= 1500 is false, but
+        // saturating_add gets us past after the first redaction since we then loop-check before the
+        // second image is considered? — no: the check is `bytes_dropped >= bytes_to_drop`, so 1024
+        // < 1500 means we redact the second too). Clarify by setting target = 1024.
         let payload = "X".repeat(1024);
         let messages = vec![
             user_with_block(image_block("call_a", &payload)),
@@ -1076,8 +1053,7 @@ mod tests {
 
     #[test]
     fn test_redact_preserves_last_message() {
-        // Single image, in the LAST message. Helper must not touch it even
-        // when the budget is huge.
+        // Single image, in the LAST message. Helper must not touch it even when the budget is huge.
         let payload = "P".repeat(8 * 1024);
         let messages = vec![
             assistant_text("setup"),

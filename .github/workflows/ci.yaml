@@ -24,9 +24,6 @@ permissions:
   contents: read
 
 concurrency:
-  # Cancel superseded runs on the same PR (rapid force-pushes / amends),
-  # but let master pushes finish — we don't want a back-to-back master
-  # commit killing CI for the previous one.
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -38,16 +35,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Install nightly before stable so stable stays the default
+      # `cargo +nightly fmt` is needed because `.rustfmt.toml` uses unstable options.
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo +nightly fmt --check
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings

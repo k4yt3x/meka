@@ -1,8 +1,7 @@
 //! End-to-end CLI smoke tests. These shell out to the built `agsh` binary
-//! (`env!("CARGO_BIN_EXE_agsh")`) so they exercise the same entry point
-//! users hit on the command line. They cover surface-level invariants that
-//! unit tests can't reach: argument-parser wiring, `--help` output, and the
-//! exit status of trivial subcommands.
+//! (`env!("CARGO_BIN_EXE_agsh")`) so they exercise the same entry point users hit on the command
+//! line. They cover surface-level invariants that unit tests can't reach: argument-parser wiring,
+//! `--help` output, and the exit status of trivial subcommands.
 
 use std::process::Command;
 
@@ -46,9 +45,8 @@ fn help_flag_lists_subcommands() {
 
 #[test]
 fn acp_subcommand_help_describes_protocol() {
-    // Verifies the `acp` subcommand is wired up. Full JSON-RPC
-    // handshake coverage lives in `tests/acp.rs` against the
-    // mock-provider build; this smoke test stops at `--help`.
+    // Verifies the `acp` subcommand is wired up. Full JSON-RPC handshake coverage lives in
+    // `tests/acp.rs` against the mock-provider build; this smoke test stops at `--help`.
     let output = agsh()
         .args(["acp", "--help"])
         .output()
@@ -80,13 +78,12 @@ fn unknown_subcommand_exits_nonzero() {
     );
 }
 
-/// Run `agsh` with an isolated config + data directory so host state
-/// (e.g. `~/.config/agsh/config.toml`) doesn't leak in, and the test's
-/// writes don't spill out. Sets `AGSH_CONFIG_DIR` and `AGSH_DATA_DIR` —
-/// the only env vars that work on every platform (`dirs::config_dir()`
-/// and `dirs::data_dir()` ignore `XDG_*` on macOS/Windows). Without the
-/// data-dir override, parallel CLI tests collide on a shared
-/// `%APPDATA%/agsh/sessions.db` on Windows and hit SQLite lock contention.
+/// Run `agsh` with an isolated config + data directory so host state (e.g.
+/// `~/.config/agsh/config.toml`) doesn't leak in, and the test's writes don't spill out. Sets
+/// `AGSH_CONFIG_DIR` and `AGSH_DATA_DIR` — the only env vars that work on every platform
+/// (`dirs::config_dir()` and `dirs::data_dir()` ignore `XDG_*` on macOS/Windows). Without the
+/// data-dir override, parallel CLI tests collide on a shared `%APPDATA%/agsh/sessions.db` on
+/// Windows and hit SQLite lock contention.
 fn run_isolated(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     agsh()
         .args(args)
@@ -101,9 +98,9 @@ fn run_isolated(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
-    // Isolate the config dir so the host's real `~/.config/agsh` doesn't
-    // leak into the test. `AGSH_CONFIG_DIR` is the only env var that
-    // works on every platform (see `run_isolated` for details).
+    // Isolate the config dir so the host's real `~/.config/agsh` doesn't leak into the test.
+    // `AGSH_CONFIG_DIR` is the only env var that works on every platform (see `run_isolated` for
+    // details).
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_isolated(dir.path(), &["mcp", "list"]);
     assert!(
@@ -122,10 +119,9 @@ fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
 
 #[test]
 fn mcp_add_http_positional_url_persists_server() {
-    // Notion-style happy path: positional URL, transport auto-detected
-    // from the URL scheme, no --url flag required. `--no-login` keeps
-    // the test hermetic — we just want to confirm `add` wrote the
-    // entry, not that we can drive an end-to-end OAuth flow.
+    // Notion-style happy path: positional URL, transport auto-detected from the URL scheme, no
+    // --url flag required. `--no-login` keeps the test hermetic — we just want to confirm `add`
+    // wrote the entry, not that we can drive an end-to-end OAuth flow.
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_isolated(dir.path(), &[
         "mcp",
@@ -269,11 +265,10 @@ fn mcp_add_http_without_url_fails() {
 
 #[test]
 fn mcp_add_no_login_prints_skip_hint_when_probe_says_auth_required() {
-    // Probing the real Notion endpoint classifies as AuthRequired;
-    // `--no-login` must surface the "run `agsh mcp login` later" hint
-    // rather than entering the OAuth flow. The hint goes to tracing at
-    // info level — default filter is `warn`, so we pass `-v` to lift
-    // the floor and read the message from stderr.
+    // Probing the real Notion endpoint classifies as AuthRequired; `--no-login` must surface the
+    // "run `agsh mcp login` later" hint rather than entering the OAuth flow. The hint goes to
+    // tracing at info level — default filter is `warn`, so we pass `-v` to lift the floor and read
+    // the message from stderr.
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run_isolated(dir.path(), &[
         "-v",
@@ -304,11 +299,10 @@ fn mcp_add_no_login_prints_skip_hint_when_probe_says_auth_required() {
 #[cfg(unix)]
 #[test]
 fn mcp_add_rollback_on_sigint_during_auto_login() {
-    // Reproduces the "user hits Ctrl-C while the OAuth flow is waiting
-    // for the browser callback" scenario: start `agsh mcp add` without
-    // --no-login against a server that requires auth, wait until the
-    // auto-login is clearly in progress, send SIGINT, then confirm
-    // nothing remains in config.toml.
+    // Reproduces the "user hits Ctrl-C while the OAuth flow is waiting for the browser callback"
+    // scenario: start `agsh mcp add` without --no-login against a server that requires auth, wait
+    // until the auto-login is clearly in progress, send SIGINT, then confirm nothing remains in
+    // config.toml.
     use std::{
         io::{BufRead, BufReader},
         process::Stdio,
@@ -316,28 +310,25 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut child = agsh()
-        // `-v` so the `running OAuth authorisation` info log is
-        // visible — we use it as the "auto-login has started" signal
-        // before sending SIGINT.
+        // `-v` so the `running OAuth authorisation` info log is visible — we use it as the
+        // "auto-login has started" signal before sending SIGINT.
         .args(["-v", "mcp", "add", "notion", "https://mcp.notion.com/mcp"])
         .env("AGSH_CONFIG_DIR", dir.path().join("agsh"))
         .env("XDG_CONFIG_HOME", dir.path())
         .env("HOME", dir.path())
         .env("XDG_DATA_HOME", dir.path().join("data"))
-        // Decouple stdin from the test harness so the paste-mode read
-        // doesn't hang waiting on a terminal that isn't there.
+        // Decouple stdin from the test harness so the paste-mode read doesn't hang waiting on a
+        // terminal that isn't there.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn agsh mcp add");
 
-    // Wait until we've seen the "running OAuth authorisation" line so
-    // we know the child is past the write + probe and is inside the
-    // SIGINT-covered post-persist section. The signpost now lives on
-    // stderr (via tracing), not stdout. We drain into `captured` so
-    // the subsequent rollback log lines are preserved across the
-    // SIGINT for the final assertion.
+    // Wait until we've seen the "running OAuth authorisation" line so we know the child is past the
+    // write + probe and is inside the SIGINT-covered post-persist section. The signpost now lives
+    // on stderr (via tracing), not stdout. We drain into `captured` so the subsequent rollback log
+    // lines are preserved across the SIGINT for the final assertion.
     let stderr = child.stderr.take().expect("child stderr");
     let mut reader = BufReader::new(stderr);
     let mut captured = String::new();
@@ -368,8 +359,7 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
     }
 
-    // Drain the rest of stderr until the child exits so we can assert
-    // on the rollback log lines.
+    // Drain the rest of stderr until the child exits so we can assert on the rollback log lines.
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -402,10 +392,9 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
 
 #[test]
 fn mcp_add_tool_filter_and_permission_flags_round_trip() {
-    // --allow-tool, --disable-tool, and --tool-permission should land
-    // as allowed_tools, disabled_tools, and a [tool_permissions] sub-
-    // table on the server entry in config.toml. We also validate one
-    // parse error so the flag is actually enforced at add time.
+    // --allow-tool, --disable-tool, and --tool-permission should land as allowed_tools,
+    // disabled_tools, and a [tool_permissions] sub- table on the server entry in config.toml. We
+    // also validate one parse error so the flag is actually enforced at add time.
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Rejection path: missing '=' in --tool-permission.

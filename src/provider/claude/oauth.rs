@@ -1,6 +1,5 @@
-//! Claude OAuth provider. Uses Claude Code attestation / billing header
-//! machinery to send requests as the official CLI, and manages OAuth
-//! token refresh against the Claude token endpoint.
+//! Claude OAuth provider. Uses Claude Code attestation / billing header machinery to send requests
+//! as the official CLI, and manages OAuth token refresh against the Claude token endpoint.
 
 mod attestation;
 
@@ -52,11 +51,11 @@ pub struct ClaudeOAuthProvider {
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
     thinking_override: AtomicI8,
-    /// Value emitted as `output_config.effort` for effort-capable models.
-    /// Always one of `"low" | "medium" | "high"` (validated by config layer).
+    /// Value emitted as `output_config.effort` for effort-capable models. Always one of `"low" |
+    /// "medium" | "high"` (validated by config layer).
     effort: String,
-    /// When true, request `redacted_thinking` blocks via the
-    /// `redact-thinking-2026-02-12` beta header.
+    /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
+    /// header.
     redact_thinking: bool,
     /// Per-session counters incremented when image-redaction events fire.
     session_stats: Option<Arc<crate::stats::SessionStats>>,
@@ -144,18 +143,15 @@ impl ClaudeOAuthProvider {
         Some(parts.join(","))
     }
 
-    /// Resolve a valid Authorization header, refreshing the OAuth
-    /// token if it's within 5 minutes of expiry.
+    /// Resolve a valid Authorization header, refreshing the OAuth token if it's within 5 minutes of
+    /// expiry.
     ///
-    /// Concurrency contract (relevant under multi-session ACP where
-    /// two sessions may call this in parallel): the `RwLock` on
-    /// `credential` doubles as the refresh gate. Two tasks that both
-    /// observe an expiring token race for the write lock; the loser
-    /// re-reads after acquiring it and finds the winner's fresh
-    /// token via the double-check at the top of the slow path
-    /// (`needs_refresh` block below). Exactly one refresh API call
-    /// fires under contention; both callers return a valid token.
-    /// No separate `Mutex<()>` refresh gate is needed.
+    /// Concurrency contract (relevant under multi-session ACP where two sessions may call this in
+    /// parallel): the `RwLock` on `credential` doubles as the refresh gate. Two tasks that both
+    /// observe an expiring token race for the write lock; the loser re-reads after acquiring it and
+    /// finds the winner's fresh token via the double-check at the top of the slow path
+    /// (`needs_refresh` block below). Exactly one refresh API call fires under contention; both
+    /// callers return a valid token. No separate `Mutex<()>` refresh gate is needed.
     async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
         {
             let credential = self.credential.read().await;
@@ -186,11 +182,10 @@ impl ClaudeOAuthProvider {
         // Token expired — attempt refresh
         let mut credential = self.credential.write().await;
 
-        // Re-read the latest credential from the DB. Refresh tokens rotate on
-        // each successful refresh, and a sibling agsh process (or `agsh mcp
-        // login` flow) may have rotated ours since startup. Without this
-        // re-read we'd POST a stale refresh_token and the OAuth provider
-        // would reject it with `invalid_grant`.
+        // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
+        // refresh, and a sibling agsh process (or `agsh mcp login` flow) may have rotated ours
+        // since startup. Without this re-read we'd POST a stale refresh_token and the OAuth
+        // provider would reject it with `invalid_grant`.
         if let Some(store) = &self.token_store {
             match store.load_oauth_token("claude").await {
                 Ok(Some(latest)) => *credential = latest,
@@ -201,8 +196,8 @@ impl ClaudeOAuthProvider {
             }
         }
 
-        // Double-check after the DB re-read: another process may have already
-        // rotated and persisted a new access token that's still valid.
+        // Double-check after the DB re-read: another process may have already rotated and persisted
+        // a new access token that's still valid.
         if let AuthCredential::OAuthToken {
             access_token,
             expires_at,
@@ -234,8 +229,8 @@ impl ClaudeOAuthProvider {
         let new_credential = self.refresh_oauth_token(&refresh_token).await?;
         let (header_name, header_value) = new_credential.auth_header();
 
-        // Storage key kept as "claude" to preserve existing users' refresh
-        // tokens across the provider rename to "claude-oauth".
+        // Storage key kept as "claude" to preserve existing users' refresh tokens across the
+        // provider rename to "claude-oauth".
         if let Some(store) = &self.token_store
             && let Err(error) = store.save_oauth_token("claude", &new_credential).await
         {
@@ -319,17 +314,16 @@ impl ClaudeOAuthProvider {
         })
         .to_string();
 
-        // `system` must precede `messages` so the billing header's `cch=00000`
-        // is always the first occurrence in the serialized JSON.
+        // `system` must precede `messages` so the billing header's `cch=00000` is always the first
+        // occurrence in the serialized JSON.
         let mut body = serde_json::Map::new();
 
         if !system_prompt.is_empty() {
             let billing_header = attestation::generate_billing_header(messages);
-            // Matches recent Claude Code wire shape: only the user system prompt
-            // carries `cache_control`. Billing header and identity prefix are
-            // unmarked — the source's "boundary mode" (`utils/api.ts:362-409`)
-            // assigns `cacheScope: null` to both. ttl `1h` matches Claude Code's
-            // `getCacheControl` for OAuth subscribers (`claude.ts:358-374`).
+            // Matches recent Claude Code wire shape: only the user system prompt carries
+            // `cache_control`. Billing header and identity prefix are unmarked — the source's
+            // "boundary mode" (`utils/api.ts:362-409`) assigns `cacheScope: null` to both. ttl `1h`
+            // matches Claude Code's `getCacheControl` for OAuth subscribers (`claude.ts:358-374`).
             body.insert(
                 "system".to_string(),
                 serde_json::json!([
@@ -360,10 +354,10 @@ impl ClaudeOAuthProvider {
             self.thinking_budget_tokens,
         );
 
-        // Mirrors `getAPIContextManagement` (`compact/apiMicrocompact.ts:64-92`)
-        // for the OAuth-without-ant-tool-clearing case: when thinking is on
-        // and the model supports context management, preserve thinking
-        // blocks across previous assistant turns via `clear_thinking_20251015`.
+        // Mirrors `getAPIContextManagement` (`compact/apiMicrocompact.ts:64-92`) for the
+        // OAuth-without-ant-tool-clearing case: when thinking is on and the model supports context
+        // management, preserve thinking blocks across previous assistant turns via
+        // `clear_thinking_20251015`.
         if self.is_thinking_enabled() && model_supports_modern_features(&self.model) {
             body.insert(
                 "context_management".to_string(),
@@ -567,14 +561,14 @@ mod tests {
 
         assert_eq!(system[1]["type"], "text");
         assert_eq!(system[1]["text"], CC_SYSTEM_PROMPT_PREFIX);
-        // Identity prefix carries no cache_control — matches recent Claude Code
-        // wire shape (boundary mode in `utils/api.ts:362-409`).
+        // Identity prefix carries no cache_control — matches recent Claude Code wire shape
+        // (boundary mode in `utils/api.ts:362-409`).
         assert!(system[1].get("cache_control").is_none());
 
         assert_eq!(system[2]["type"], "text");
         assert_eq!(system[2]["text"], "system prompt");
-        // User system prompt carries cache_control with ttl=1h (matches
-        // `getCacheControl` for OAuth subscribers).
+        // User system prompt carries cache_control with ttl=1h (matches `getCacheControl` for OAuth
+        // subscribers).
         assert_eq!(
             system[2]["cache_control"],
             serde_json::json!({"type": "ephemeral", "ttl": "1h"})
@@ -1110,8 +1104,8 @@ mod tests {
             "effort beta must be skipped for Haiku models: {}",
             betas
         );
-        // Haiku 4.5 still supports modern features (context management, etc.)
-        // and OAuth + prompt-caching-scope are unconditional.
+        // Haiku 4.5 still supports modern features (context management, etc.) and OAuth +
+        // prompt-caching-scope are unconditional.
         assert!(betas.contains("oauth-2025-04-20"), "{}", betas);
         assert!(betas.contains("context-management-2025-06-27"), "{}", betas);
         assert!(
@@ -1123,8 +1117,8 @@ mod tests {
 
     #[test]
     fn test_betas_adaptive_with_thinking_matches_wire_dump() {
-        // Mirrors the user-supplied wire dump for claude-cli/2.1.41 with
-        // an adaptive-capable model and thinking enabled.
+        // Mirrors the user-supplied wire dump for claude-cli/2.1.41 with an adaptive-capable model
+        // and thinking enabled.
         let provider = provider_with("claude-opus-4-6-20250514", true);
         let betas = provider.compute_betas().unwrap();
         assert_eq!(
@@ -1137,8 +1131,8 @@ mod tests {
 
     #[test]
     fn test_betas_interleaved_for_non_adaptive_with_thinking() {
-        // Sonnet 4.0 supports thinking but NOT adaptive thinking, so the
-        // older interleaved-thinking beta is sent instead of adaptive-thinking.
+        // Sonnet 4.0 supports thinking but NOT adaptive thinking, so the older interleaved-thinking
+        // beta is sent instead of adaptive-thinking.
         let provider = provider_with("claude-sonnet-4-20250514", true);
         let betas = provider.compute_betas().unwrap();
         assert!(
@@ -1258,11 +1252,10 @@ mod tests {
 
     #[test]
     fn test_betas_redact_thinking_omitted_when_thinking_disabled() {
-        // The beta only makes sense when thinking is also enabled — Claude
-        // Code's `getAllModelBetas` gates it on `modelSupportsISP(model)`
-        // (which we collapse into `model_supports_modern_features`) AND we
-        // additionally gate on the thinking toggle since there's no thinking
-        // stream to redact when thinking is off.
+        // The beta only makes sense when thinking is also enabled — Claude Code's
+        // `getAllModelBetas` gates it on `modelSupportsISP(model)` (which we collapse into
+        // `model_supports_modern_features`) AND we additionally gate on the thinking toggle since
+        // there's no thinking stream to redact when thinking is off.
         let provider = provider_full("claude-opus-4-6-20250514", false, "high", true);
         let betas = provider.compute_betas().unwrap();
         assert!(
@@ -1282,9 +1275,9 @@ mod tests {
         );
     }
 
-    /// All `cache_control` markers carry `ttl: "1h"` to match recent
-    /// Claude Code's `getCacheControl` (returns `{type:"ephemeral", ttl:"1h"}`
-    /// for OAuth subscribers via `should1hCacheTTL`).
+    /// All `cache_control` markers carry `ttl: "1h"` to match recent Claude Code's
+    /// `getCacheControl` (returns `{type:"ephemeral", ttl:"1h"}` for OAuth subscribers via
+    /// `should1hCacheTTL`).
     #[test]
     fn test_cache_control_uses_one_hour_ttl_everywhere() {
         let provider = test_provider();
@@ -1329,16 +1322,14 @@ mod tests {
         assert!(ms < 4_102_444_800_000);
     }
 
-    // Cache prefix stability tests.
-    // These tests simulate multi-turn conversations and tool-use loops to
-    // verify that the serialized request bodies share a stable prefix across
-    // successive API calls, which is the fundamental requirement for KV cache
-    // reuse. A "prefix" here means: the system prompt, tool schemas, and all
-    // previously-sent messages must serialize identically (ignoring the
-    // `cache_control` marker, which intentionally moves to the newest tail).
+    // Cache prefix stability tests. These tests simulate multi-turn conversations and tool-use
+    // loops to verify that the serialized request bodies share a stable prefix across successive
+    // API calls, which is the fundamental requirement for KV cache reuse. A "prefix" here means:
+    // the system prompt, tool schemas, and all previously-sent messages must serialize identically
+    // (ignoring the `cache_control` marker, which intentionally moves to the newest tail).
 
-    /// Strips every `cache_control` key from every content block in a message
-    /// so two messages can be compared purely on semantic content.
+    /// Strips every `cache_control` key from every content block in a message so two messages can
+    /// be compared purely on semantic content.
     fn strip_cache_control(message: &serde_json::Value) -> serde_json::Value {
         let mut message = message.clone();
         if let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
@@ -1365,9 +1356,9 @@ mod tests {
             .collect()
     }
 
-    /// Asserts that the first `shared_count` messages in two request bodies
-    /// are semantically identical (ignoring `cache_control` movement), and
-    /// that the system prompt and tool schemas are identical.
+    /// Asserts that the first `shared_count` messages in two request bodies are semantically
+    /// identical (ignoring `cache_control` movement), and that the system prompt and tool schemas
+    /// are identical.
     fn assert_prefix_stable(
         body_a: &serde_json::Value,
         body_b: &serde_json::Value,
@@ -1379,8 +1370,8 @@ mod tests {
             "system prompt diverged between requests"
         );
 
-        // Tool schemas must be identical (content-wise, ignoring cache_control
-        // which is always on the last tool and doesn't affect tokens).
+        // Tool schemas must be identical (content-wise, ignoring cache_control which is always on
+        // the last tool and doesn't affect tokens).
         let tools_a = body_a["tools"].as_array();
         let tools_b = body_b["tools"].as_array();
         match (tools_a, tools_b) {
@@ -1422,8 +1413,8 @@ mod tests {
         }
     }
 
-    /// Counts the total number of `cache_control` markers across all content
-    /// blocks in the messages array.
+    /// Counts the total number of `cache_control` markers across all content blocks in the messages
+    /// array.
     fn count_message_cache_controls(body: &serde_json::Value) -> usize {
         let mut count = 0;
         if let Some(messages) = body["messages"].as_array() {
@@ -1491,13 +1482,11 @@ mod tests {
         assert_prefix_stable(&body_t1, &body_t3, 1);
     }
 
-    /// Simulates a two-turn conversation where the user toggles the
-    /// permission level between turns and verifies that the cacheable
-    /// prefix (system prompt + tools array + historical messages) is
-    /// byte-identical across the toggle. This is the regression guard for
-    /// Option 1 of the higher-permission-visibility work — it proves that
-    /// `/permission <level>` mid-session does not invalidate the Claude
-    /// prompt cache.
+    /// Simulates a two-turn conversation where the user toggles the permission level between turns
+    /// and verifies that the cacheable prefix (system prompt + tools array + historical messages)
+    /// is byte-identical across the toggle. This is the regression guard for Option 1 of the
+    /// higher-permission-visibility work — it proves that `/permission <level>` mid-session does
+    /// not invalidate the Claude prompt cache.
     ///
     /// Covers the full agent request-body assembly:
     ///   - [`ToolRegistry::tool_catalogue`] / [`ToolRegistry::definitions_active`]
@@ -1543,8 +1532,8 @@ mod tests {
 
         let provider = test_provider();
 
-        // The agent fetches these once per turn. None of them take the
-        // current permission — that's the invariant we're testing.
+        // The agent fetches these once per turn. None of them take the current permission — that's
+        // the invariant we're testing.
         let catalogue = registry.tool_catalogue();
         let system = build_system_prompt(&catalogue, true, &[], None, &[]);
         let tools = registry.definitions_active(&[]);
@@ -1556,9 +1545,8 @@ mod tests {
         let messages_t1 = vec![Message::user(&u1_text)];
         let body_t1 = provider.build_request_body(&system, &messages_t1, &tools, true);
 
-        // Simulate a `/permission write` toggle: in real code this
-        // happens on a different thread via `SharedPermission::set`;
-        // here we just re-read the catalogue and rebuild everything to
+        // Simulate a `/permission write` toggle: in real code this happens on a different thread
+        // via `SharedPermission::set`; here we just re-read the catalogue and rebuild everything to
         // prove the outputs don't depend on the live permission state.
 
         let catalogue_t2 = registry.tool_catalogue();
@@ -1603,12 +1591,11 @@ mod tests {
         assert_ne!(u1_text, u2_text);
     }
 
-    /// `load_tool` activation must NOT mutate the cacheable system prompt.
-    /// This is the regression guard for the deferred-tool refactor: when the
-    /// model invokes `load_tool` to expose a deferred tool's schema, the
-    /// system prompt block stays byte-identical (so breakpoint 2 cache
-    /// hits) — the tools array is what grows, append-only, so its prior
-    /// entries also cache (breakpoint 3).
+    /// `load_tool` activation must NOT mutate the cacheable system prompt. This is the regression
+    /// guard for the deferred-tool refactor: when the model invokes `load_tool` to expose a
+    /// deferred tool's schema, the system prompt block stays byte-identical (so breakpoint 2 cache
+    /// hits) — the tools array is what grows, append-only, so its prior entries also cache
+    /// (breakpoint 3).
     ///
     /// Mirrors [`test_permission_toggle_preserves_cache_prefix`] structurally.
     #[tokio::test]
@@ -1649,10 +1636,9 @@ mod tests {
             std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
-        // Register a deferred fixture *after* `build_default` so it lands at
-        // the tail of the tools vector. Loading it later appends to the end
-        // of the API tools array, which is the append-only growth shape
-        // the cache prefix invariant relies on.
+        // Register a deferred fixture *after* `build_default` so it lands at the tail of the tools
+        // vector. Loading it later appends to the end of the API tools array, which is the
+        // append-only growth shape the cache prefix invariant relies on.
         crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
 
         let provider = test_provider();
@@ -1673,8 +1659,8 @@ mod tests {
             "fixture_deferred should be deferred in turn 1"
         );
 
-        // Turn 2: the model has called `load_tool` for fixture_deferred,
-        // so the next request should expose its schema.
+        // Turn 2: the model has called `load_tool` for fixture_deferred, so the next request should
+        // expose its schema.
         let messages_t2 = vec![
             Message::user(&u1_text),
             Message {
@@ -1696,9 +1682,8 @@ mod tests {
                 }],
             },
         ];
-        // System prompt is rebuilt the same way every turn — its content is
-        // a function of the catalogue, not the messages, so it must not
-        // shift when load_tool is invoked.
+        // System prompt is rebuilt the same way every turn — its content is a function of the
+        // catalogue, not the messages, so it must not shift when load_tool is invoked.
         let catalogue_t2 = registry.tool_catalogue();
         let system_t2 = build_system_prompt(&catalogue_t2, true, &[], None, &[]);
         let tools_t2 = registry.definitions_active(&messages_t2);
@@ -1737,11 +1722,10 @@ mod tests {
         }
     }
 
-    /// Compaction must not silently drop the deferred-tool active set.
-    /// Pre-compaction, the model loads a deferred fixture via `load_tool`;
-    /// post-compaction, the `Event::CompactBoundary::loaded_tools_snapshot`
-    /// must keep the loaded tool in the API tools array even though the
-    /// pre-compaction `load_tool` rows have moved below the materialized
+    /// Compaction must not silently drop the deferred-tool active set. Pre-compaction, the model
+    /// loads a deferred fixture via `load_tool`; post-compaction, the
+    /// `Event::CompactBoundary::loaded_tools_snapshot` must keep the loaded tool in the API tools
+    /// array even though the pre-compaction `load_tool` rows have moved below the materialized
     /// view's logical start.
     #[tokio::test]
     async fn test_compaction_preserves_loaded_tools_active_set() {
@@ -1824,8 +1808,8 @@ mod tests {
             "compaction must preserve the loaded-tools active set via the snapshot"
         );
 
-        // The active tool set the agent sends to the API still includes
-        // fixture_deferred post-compaction.
+        // The active tool set the agent sends to the API still includes fixture_deferred
+        // post-compaction.
         let post_tools = registry.definitions_active_with_loaded(&post_loaded);
         assert!(post_tools.iter().any(|t| t.name == "fixture_deferred"));
 
@@ -1845,9 +1829,8 @@ mod tests {
         assert_eq!(append_count, 4);
     }
 
-    /// Same invariant, but exercises every pairwise permission toggle
-    /// (16 combinations). Catches any permission state that sneaks back
-    /// into the cacheable prefix.
+    /// Same invariant, but exercises every pairwise permission toggle (16 combinations). Catches
+    /// any permission state that sneaks back into the cacheable prefix.
     #[tokio::test]
     async fn test_permission_independence_all_levels() {
         use std::path::Path;
@@ -2158,8 +2141,8 @@ mod tests {
             true,
         );
 
-        // Tool schemas (including cache_control on the last tool) must be
-        // identical when the same tools are provided.
+        // Tool schemas (including cache_control on the last tool) must be identical when the same
+        // tools are provided.
         assert_eq!(body1["tools"], body2["tools"]);
     }
 
@@ -2197,8 +2180,8 @@ mod tests {
         let system = "You are a helpful assistant.";
         let tools = test_tools();
 
-        // Build up a 10-turn conversation incrementally and verify each step
-        // preserves the prefix from the previous step.
+        // Build up a 10-turn conversation incrementally and verify each step preserves the prefix
+        // from the previous step.
         let mut messages: Vec<Message> = Vec::new();
         let mut previous: Option<(serde_json::Value, usize)> = None;
 
@@ -2207,8 +2190,7 @@ mod tests {
             let body = provider.build_request_body(system, &messages, &tools, true);
 
             if let Some((prev_body, prev_msg_count)) = &previous {
-                // The shared prefix is exactly the messages that were in the
-                // previous request body.
+                // The shared prefix is exactly the messages that were in the previous request body.
                 assert_prefix_stable(prev_body, &body, *prev_msg_count);
             }
 
@@ -2227,9 +2209,9 @@ mod tests {
         let system = "system";
         let tools = test_tools();
 
-        // Simulate a user request that triggers 4 sequential tool calls.
-        // Each iteration of the loop adds an assistant tool_use + user
-        // tool_result pair. Verify the prefix is stable across all iterations.
+        // Simulate a user request that triggers 4 sequential tool calls. Each iteration of the loop
+        // adds an assistant tool_use + user tool_result pair. Verify the prefix is stable across
+        // all iterations.
         let mut messages: Vec<Message> = vec![Message::user("do several things")];
 
         let mut previous_body: Option<serde_json::Value> = None;
@@ -2291,8 +2273,8 @@ mod tests {
     fn test_cache_control_on_tool_result_block() {
         let provider = test_provider();
 
-        // When the last message is a tool_result, cache_control should still
-        // appear on its last content block.
+        // When the last message is a tool_result, cache_control should still appear on its last
+        // content block.
         let messages = vec![
             Message::user("read file"),
             Message {
@@ -2389,9 +2371,8 @@ mod tests {
         assert!(claude_messages.is_empty());
     }
 
-    /// A minimal in-process OAuth refresh endpoint that counts hits.
-    /// Returns a valid refresh response on every call so the provider
-    /// path completes; the test then asserts the hit count.
+    /// A minimal in-process OAuth refresh endpoint that counts hits. Returns a valid refresh
+    /// response on every call so the provider path completes; the test then asserts the hit count.
     async fn run_mock_refresh_endpoint(
         listener: tokio::net::TcpListener,
         hits: Arc<std::sync::atomic::AtomicUsize>,
@@ -2405,10 +2386,9 @@ mod tests {
             };
             let hits = Arc::clone(&hits);
             tokio::spawn(async move {
-                // Drain enough of the request to know we got a full
-                // POST body. The OAuth endpoint sends a small JSON
-                // body — read until we see two CRLFs (header end)
-                // and then enough bytes to satisfy Content-Length.
+                // Drain enough of the request to know we got a full POST body. The OAuth endpoint
+                // sends a small JSON body — read until we see two CRLFs (header end) and then
+                // enough bytes to satisfy Content-Length.
                 let mut buf = Vec::with_capacity(2048);
                 let mut headers_end: Option<usize> = None;
                 let mut content_length: Option<usize> = None;
@@ -2473,14 +2453,11 @@ mod tests {
         None
     }
 
-    /// When many tasks hit `ensure_valid_credential` against a
-    /// near-expiry credential at the same instant, exactly **one**
-    /// refresh API call must fire. The remaining tasks observe the
-    /// refresh that already happened via the post-write-lock
-    /// re-check inside `ensure_valid_credential` and return the
-    /// fresh token without re-firing the refresh. This is the
-    /// invariant relied on by multi-session ACP where two sessions
-    /// can race the same credential at the same time.
+    /// When many tasks hit `ensure_valid_credential` against a near-expiry credential at the same
+    /// instant, exactly **one** refresh API call must fire. The remaining tasks observe the refresh
+    /// that already happened via the post-write-lock re-check inside `ensure_valid_credential` and
+    /// return the fresh token without re-firing the refresh. This is the invariant relied on by
+    /// multi-session ACP where two sessions can race the same credential at the same time.
     #[tokio::test]
     async fn oauth_refresh_fires_once_under_concurrent_demand() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2490,9 +2467,8 @@ mod tests {
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(run_mock_refresh_endpoint(listener, Arc::clone(&hits)));
 
-        // Credential whose access token already counts as "expiring
-        // soon" (the threshold is 5 minutes / 300_000 ms). Setting
-        // expires_at to "now" forces every caller into the slow path
+        // Credential whose access token already counts as "expiring soon" (the threshold is 5
+        // minutes / 300_000 ms). Setting expires_at to "now" forces every caller into the slow path
         // immediately.
         let credential = AuthCredential::OAuthToken {
             access_token: "stale".to_string(),
@@ -2516,9 +2492,8 @@ mod tests {
             None,
         ));
 
-        // Fire many concurrent callers. The exact count isn't load-
-        // bearing; we just want enough to make a fan-out plausible
-        // if the gate broke.
+        // Fire many concurrent callers. The exact count isn't load- bearing; we just want enough to
+        // make a fan-out plausible if the gate broke.
         let mut handles = Vec::new();
         for _ in 0..16 {
             let provider = Arc::clone(&provider);
@@ -2534,8 +2509,8 @@ mod tests {
             results.push(handle.await.expect("join").expect("ensure_valid"));
         }
 
-        // Every caller must return the same fresh token — proves they
-        // observed the refresh that landed, didn't double-refresh.
+        // Every caller must return the same fresh token — proves they observed the refresh that
+        // landed, didn't double-refresh.
         for header in &results {
             assert_eq!(header, "Bearer fresh-token-xyz", "stale token leaked",);
         }

@@ -1,9 +1,7 @@
-//! Handlers for the `agsh skill <subcommand>` CLI: list, get, show, add,
-//! remove, update. Mirrors the structure of [`crate::mcp::cli`]: each
-//! handler returns `Result<()>`, prints parseable data to stdout (the
-//! user requested it; pipes / scripts read from there) and lifecycle /
-//! diagnostic messages via `tracing` per the project's logging
-//! guidelines.
+//! Handlers for the `agsh skill <subcommand>` CLI: list, get, show, add, remove, update. Mirrors
+//! the structure of [`crate::mcp::cli`]: each handler returns `Result<()>`, prints parseable data
+//! to stdout (the user requested it; pipes / scripts read from there) and lifecycle / diagnostic
+//! messages via `tracing` per the project's logging guidelines.
 
 use std::path::Path;
 
@@ -14,9 +12,8 @@ use crate::{
 
 const DESCRIPTION_TRUNCATE: usize = 40;
 
-/// Argument bag for [`run_add`]. Borrowed so callers don't have to
-/// clone every field out of the clap-derived `cli::SkillAction::Add`
-/// variant.
+/// Argument bag for [`run_add`]. Borrowed so callers don't have to clone every field out of the
+/// clap-derived `cli::SkillAction::Add` variant.
 pub struct AddArgs<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
@@ -28,9 +25,8 @@ pub struct AddArgs<'a> {
     pub edit: bool,
 }
 
-/// `agsh skill list` — print a tab-separated table of every installed
-/// skill. Empty case prints `(no skills installed)` so scripts grepping
-/// the output don't get a confusing zero-byte result.
+/// `agsh skill list` — print a tab-separated table of every installed skill. Empty case prints `(no
+/// skills installed)` so scripts grepping the output don't get a confusing zero-byte result.
 pub async fn run_list() -> Result<()> {
     let skills = skills::discover_skills();
     print_list(&skills);
@@ -81,9 +77,8 @@ pub async fn run_get(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `agsh skill show <name>` — print the rendered body with
-/// `${AGSH_SKILL_DIR}` substituted. `${AGSH_SESSION_ID}` stays literal
-/// because there's no active session in the CLI context.
+/// `agsh skill show <name>` — print the rendered body with `${AGSH_SKILL_DIR}` substituted.
+/// `${AGSH_SESSION_ID}` stays literal because there's no active session in the CLI context.
 pub async fn run_show(name: &str) -> Result<()> {
     let skill = require_skill(name)?;
     let body = skills::load_skill_body(&skill, None)
@@ -179,8 +174,8 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
     }
 }
 
-/// `agsh skill remove <name>` — delete the skill directory. No prompt;
-/// matches `agsh mcp remove`'s convention.
+/// `agsh skill remove <name>` — delete the skill directory. No prompt; matches `agsh mcp remove`'s
+/// convention.
 pub async fn run_remove(name: &str) -> Result<()> {
     skills::validate_skill_name(name).map_err(AgshError::Config)?;
     let dir = skills::skill_dir_for(name)
@@ -202,8 +197,8 @@ pub async fn run_remove(name: &str) -> Result<()> {
 /// Outcome of a single skill re-fetch.
 #[derive(Debug)]
 enum UpdateOutcome {
-    /// Fetched content was byte-identical to what's on disk — nothing
-    /// written (avoids bumping mtime / a spurious skill-cache reload).
+    /// Fetched content was byte-identical to what's on disk — nothing written (avoids bumping mtime
+    /// / a spurious skill-cache reload).
     Unchanged,
     Updated {
         from: Option<String>,
@@ -215,8 +210,8 @@ fn version_label(version: &Option<String>) -> &str {
     version.as_deref().unwrap_or("unversioned")
 }
 
-/// `agsh skill update [<name>] [--all] [--yes]` — re-fetch skills that
-/// declare a `source_url` and replace them on disk.
+/// `agsh skill update [<name>] [--all] [--yes]` — re-fetch skills that declare a `source_url` and
+/// replace them on disk.
 pub async fn run_update(name: Option<&str>, all: bool, yes: bool) -> Result<()> {
     match (name, all) {
         (Some(_), true) => Err(AgshError::Config(
@@ -261,8 +256,8 @@ async fn update_all(yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Dry run: --all without --yes lists what would change and stops.
-    // This is the confirmation gate for a bulk remote fetch.
+    // Dry run: --all without --yes lists what would change and stops. This is the confirmation gate
+    // for a bulk remote fetch.
     if !yes {
         println!("Skills that would be updated (re-run with --yes to apply):");
         for skill in &updatable {
@@ -292,19 +287,17 @@ async fn update_all(yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Fetch a skill's `source_url`, validate the response parses as a
-/// skill, and atomically replace the on-disk `SKILL.md`. A failed fetch
-/// or a malformed response leaves the existing file untouched —
-/// validation happens entirely in memory before any write.
+/// Fetch a skill's `source_url`, validate the response parses as a skill, and atomically replace
+/// the on-disk `SKILL.md`. A failed fetch or a malformed response leaves the existing file
+/// untouched — validation happens entirely in memory before any write.
 async fn fetch_and_replace_skill(skill: &skills::Skill) -> Result<UpdateOutcome> {
     let url = skill
         .source_url
         .as_deref()
         .ok_or_else(|| AgshError::Config(format!("skill '{}' has no source_url", skill.name)))?;
 
-    // Explicit scheme check for a clear error; `https_only(true)` below
-    // is the defense-in-depth that also blocks an http downgrade on a
-    // redirect (GitHub-raw / gist URLs do redirect).
+    // Explicit scheme check for a clear error; `https_only(true)` below is the defense-in-depth
+    // that also blocks an http downgrade on a redirect (GitHub-raw / gist URLs do redirect).
     if !url.starts_with("https://") {
         return Err(AgshError::Config(format!(
             "skill '{}' source_url must be https://, got: {}",
@@ -339,8 +332,8 @@ async fn fetch_and_replace_skill(skill: &skills::Skill) -> Result<UpdateOutcome>
             ))
         })?;
 
-    // Validate in memory — never overwrite the on-disk skill with a 404
-    // page, a non-skill file, or malformed frontmatter.
+    // Validate in memory — never overwrite the on-disk skill with a 404 page, a non-skill file, or
+    // malformed frontmatter.
     let parsed =
         skills::parse_skill_definition(&skill.name, &skill.source_dir, &skill.body_path, &fetched)
             .map_err(|error| {
@@ -400,21 +393,20 @@ fn truncate(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate the global `AGSH_CONFIG_DIR` env var.
-    /// Without this, tokio's parallel test runner causes one test's
-    /// tempdir to be observed by another test's `discover_skills()`.
-    /// `tokio::sync::Mutex` (rather than `std::sync::Mutex`) so the
-    /// guard is awaitable — tests must hold it across `.await` calls.
+    /// Serializes tests that mutate the global `AGSH_CONFIG_DIR` env var. Without this, tokio's
+    /// parallel test runner causes one test's tempdir to be observed by another test's
+    /// `discover_skills()`. `tokio::sync::Mutex` (rather than `std::sync::Mutex`) so the guard is
+    /// awaitable — tests must hold it across `.await` calls.
     static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// Acquire the env-lock and point `AGSH_CONFIG_DIR` at `temp`. The
-    /// returned guard must be held by the caller for the lifetime of
-    /// the test; dropping it releases the lock so the next test can run.
+    /// Acquire the env-lock and point `AGSH_CONFIG_DIR` at `temp`. The returned guard must be held
+    /// by the caller for the lifetime of the test; dropping it releases the lock so the next test
+    /// can run.
     async fn isolate_config_dir(temp: &tempfile::TempDir) -> tokio::sync::MutexGuard<'static, ()> {
         let guard = ENV_LOCK.lock().await;
-        // SAFETY: the mutex makes this access exclusive across tests in
-        // this process; no other code reads the var while the lock is
-        // held. Matches the env-var override at `src/config.rs:462-467`.
+        // SAFETY: the mutex makes this access exclusive across tests in this process; no other code
+        // reads the var while the lock is held. Matches the env-var override at
+        // `src/config.rs:462-467`.
         unsafe { std::env::set_var("AGSH_CONFIG_DIR", temp.path()) };
         guard
     }
@@ -625,8 +617,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_and_replace_rejects_non_https() {
-        // The scheme check fires before any network call, so this needs
-        // no server. A non-https source_url must error and never write.
+        // The scheme check fires before any network call, so this needs no server. A non-https
+        // source_url must error and never write.
         let skill = skills::Skill {
             name: "insecure".to_string(),
             source_dir: std::path::PathBuf::from("/tmp/insecure"),
@@ -654,9 +646,8 @@ mod tests {
         let body = "---\ndescription: x\n---\nDir is ${AGSH_SKILL_DIR}\n";
         std::fs::write(dir.join("SKILL.md"), body).expect("rewrite");
 
-        // run_show prints to stdout; we exercise the loader directly to
-        // assert the substitution since capturing stdout in tests is
-        // brittle.
+        // run_show prints to stdout; we exercise the loader directly to assert the substitution
+        // since capturing stdout in tests is brittle.
         let skill = require_skill("subst").expect("found");
         let rendered = skills::load_skill_body(&skill, None).await.expect("load");
         assert!(rendered.contains(&dir.display().to_string()));

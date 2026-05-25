@@ -1,17 +1,14 @@
-//! [`Conversation`] — append-only-by-default newtype for the agent's
-//! conversation.
+//! [`Conversation`] — append-only-by-default newtype for the agent's conversation.
 //!
-//! Built on an event log: each mutation pushes one or more
-//! [`Event`]s, and the materialized `&[Message]` view consumed by
-//! providers and the scanner is derived from those events. The three
+//! Built on an event log: each mutation pushes one or more [`Event`]s, and the materialized
+//! `&[Message]` view consumed by providers and the scanner is derived from those events. The three
 //! legitimate destructive operations ([`Conversation::pop_unsaved`],
-//! [`Conversation::replace_for_compaction`], [`Conversation::sanitize_orphans`])
-//! remain explicit, named methods — the compiler refuses casual mutation.
+//! [`Conversation::replace_for_compaction`], [`Conversation::sanitize_orphans`]) remain explicit,
+//! named methods — the compiler refuses casual mutation.
 //!
-//! On disk, events are stored row-per-event in the existing `messages`
-//! table (no schema migration); the encoding lives in `session.rs`'s
-//! `encode_event_for_db` / `decode_event_from_row` helpers, behind the
-//! [`crate::session::SessionManager::save_event`] /
+//! On disk, events are stored row-per-event in the existing `messages` table (no schema migration);
+//! the encoding lives in `session.rs`'s `encode_event_for_db` / `decode_event_from_row` helpers,
+//! behind the [`crate::session::SessionManager::save_event`] /
 //! [`crate::session::SessionManager::load_events`] API.
 
 use std::collections::HashSet;
@@ -20,18 +17,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{ContentBlock, Message, Role};
 
-/// One entry in the underlying event log of a [`Conversation`].
-/// Persisted as a single row in the `messages` table.
+/// One entry in the underlying event log of a [`Conversation`]. Persisted as a single row in the
+/// `messages` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     /// Adds a message to the materialized view.
     Append(Message),
-    /// Marks a compaction boundary: when materializing, drop the last
-    /// `replaced_count` materialized messages and push `summary` instead.
-    /// Subsequent `Append` events extend the new tail. Carries the set
-    /// of deferred tools that were active at compaction time so
-    /// `extract_loaded_tool_names` can recover them after the boundary
-    /// (otherwise compaction would silently un-load them).
+    /// Marks a compaction boundary: when materializing, drop the last `replaced_count` materialized
+    /// messages and push `summary` instead. Subsequent `Append` events extend the new tail. Carries
+    /// the set of deferred tools that were active at compaction time so `extract_loaded_tool_names`
+    /// can recover them after the boundary (otherwise compaction would silently un-load them).
     CompactBoundary {
         summary: Message,
         replaced_count: usize,
@@ -39,14 +34,13 @@ pub enum Event {
     },
 }
 
-/// Append-only conversation. Public API matches PR 1's
-/// `Vec<Message>`-backed implementation byte-for-byte; PR 2 swaps the
-/// internals to an event log.
+/// Append-only conversation. Public API matches PR 1's `Vec<Message>`-backed implementation
+/// byte-for-byte; PR 2 swaps the internals to an event log.
 #[derive(Debug, Default, Clone)]
 pub struct Conversation {
     events: Vec<Event>,
-    /// Materialized view kept in lockstep with `events`. Rebuilt by
-    /// `materialize_into` after every mutation; reads are zero-cost.
+    /// Materialized view kept in lockstep with `events`. Rebuilt by `materialize_into` after every
+    /// mutation; reads are zero-cost.
     materialized: Vec<Message>,
 }
 
@@ -55,9 +49,8 @@ impl Conversation {
         Self::default()
     }
 
-    /// Hydrate from a sequence of events (typically loaded from the
-    /// session DB on resume). The materialized view is computed once
-    /// and cached.
+    /// Hydrate from a sequence of events (typically loaded from the session DB on resume). The
+    /// materialized view is computed once and cached.
     pub fn from_events(events: Vec<Event>) -> Self {
         let mut log = Self {
             events,
@@ -67,9 +60,8 @@ impl Conversation {
         log
     }
 
-    /// Hydrate from a flat `Vec<Message>` — every entry becomes an
-    /// `Event::Append`. Used by the resume path until the persistence
-    /// layer is fully event-aware.
+    /// Hydrate from a flat `Vec<Message>` — every entry becomes an `Event::Append`. Used by the
+    /// resume path until the persistence layer is fully event-aware.
     pub fn from_vec(entries: Vec<Message>) -> Self {
         let events = entries.into_iter().map(Event::Append).collect();
         Self::from_events(events)
@@ -80,15 +72,15 @@ impl Conversation {
         &self.events
     }
 
-    /// The only canonical mutation. Push a fully-formed message onto the
-    /// log as a new `Event::Append`.
+    /// The only canonical mutation. Push a fully-formed message onto the log as a new
+    /// `Event::Append`.
     pub fn append(&mut self, message: Message) {
         self.materialized.push(message.clone());
         self.events.push(Event::Append(message));
     }
 
-    /// Read-only borrow of the materialized view. Providers and the
-    /// scanner ([`crate::tools::extract_loaded_tool_names`]) consume this.
+    /// Read-only borrow of the materialized view. Providers and the scanner
+    /// ([`crate::tools::extract_loaded_tool_names`]) consume this.
     pub fn as_slice(&self) -> &[Message] {
         &self.materialized
     }
@@ -109,10 +101,9 @@ impl Conversation {
         self.materialized.iter()
     }
 
-    /// Text content of the most recent `Role::Assistant` message, or `None`
-    /// when no assistant message exists. Walks backward — necessary because
-    /// a turn that ended via tool-use leaves a `Role::User` tool-result
-    /// trailer in the conversation, hiding the assistant's final text from
+    /// Text content of the most recent `Role::Assistant` message, or `None` when no assistant
+    /// message exists. Walks backward — necessary because a turn that ended via tool-use leaves a
+    /// `Role::User` tool-result trailer in the conversation, hiding the assistant's final text from
     /// the plain [`Self::last`].
     pub fn last_assistant_text(&self) -> Option<String> {
         self.materialized
@@ -122,15 +113,13 @@ impl Conversation {
             .map(|message| message.text_content())
     }
 
-    /// Roll back an [`Conversation::append`] that did not reach the
-    /// persistence layer. Used by `Agent::run_turn`'s error path when
-    /// `save_message(user)` fails before any consumer could observe the
-    /// message. Returns the popped message for diagnostics.
+    /// Roll back an [`Conversation::append`] that did not reach the persistence layer. Used by
+    /// `Agent::run_turn`'s error path when `save_message(user)` fails before any consumer could
+    /// observe the message. Returns the popped message for diagnostics.
     ///
-    /// Removes only a trailing `Event::Append`. If the last event is a
-    /// `Event::CompactBoundary` (which can only be true after a successful
-    /// compaction round-trip), this is a programmer error and the call
-    /// returns `None` without mutating the log.
+    /// Removes only a trailing `Event::Append`. If the last event is a `Event::CompactBoundary`
+    /// (which can only be true after a successful compaction round-trip), this is a programmer
+    /// error and the call returns `None` without mutating the log.
     pub fn pop_unsaved(&mut self) -> Option<Message> {
         match self.events.last() {
             Some(Event::Append(_)) => {}
@@ -145,17 +134,15 @@ impl Conversation {
         Some(popped)
     }
 
-    /// Replace the visible window with `summary` followed by `tail`.
-    /// Used by `compact_session`: appends one [`Event::CompactBoundary`]
-    /// (which tells the materializer to truncate the prior tail and push
-    /// the summary), then appends each kept tail message as an
-    /// [`Event::Append`]. The events log itself is *only ever appended to* —
-    /// pre-compaction events stay untouched in the log and on disk.
+    /// Replace the visible window with `summary` followed by `tail`. Used by `compact_session`:
+    /// appends one [`Event::CompactBoundary`] (which tells the materializer to truncate the prior
+    /// tail and push the summary), then appends each kept tail message as an [`Event::Append`]. The
+    /// events log itself is *only ever appended to* — pre-compaction events stay untouched in the
+    /// log and on disk.
     ///
-    /// `loaded_tools_snapshot` is the active deferred-tool set captured
-    /// from the conversation *before* the boundary is appended. Carried so
-    /// `extract_loaded_tool_names_from_events` can recover deferred tools
-    /// after the boundary; otherwise a session that loaded a tool, then
+    /// `loaded_tools_snapshot` is the active deferred-tool set captured from the conversation
+    /// *before* the boundary is appended. Carried so `extract_loaded_tool_names_from_events` can
+    /// recover deferred tools after the boundary; otherwise a session that loaded a tool, then
     /// compacted, would fall back to the deferred state.
     pub fn replace_for_compaction(
         &mut self,
@@ -173,25 +160,23 @@ impl Conversation {
             self.events.push(Event::Append(message));
         }
         self.rebuild_materialized();
-        // Make sure `summary` is referenced even if `tail` is empty —
-        // the boundary's summary alone is the visible head after the
-        // truncate. (Materialization handles this; the let-binding
+        // Make sure `summary` is referenced even if `tail` is empty — the boundary's summary alone
+        // is the visible head after the truncate. (Materialization handles this; the let-binding
         // above only exists to consume `summary`.)
         let _ = summary;
     }
 
     /// Drop every event preceding the most recent `CompactBoundary`.
     ///
-    /// Those events are fully superseded: a `CompactBoundary` truncates all
-    /// materialized messages before it and replaces them with its summary,
-    /// and [`extract_loaded_tool_names_from_events`] reads the boundary's
-    /// `loaded_tools_snapshot` rather than the events preceding it. So the
-    /// materialized view and the recovered tool set are byte-identical
-    /// before and after this call — it only stops the in-memory log from
-    /// growing unbounded across a long-lived, repeatedly-compacted session.
+    /// Those events are fully superseded: a `CompactBoundary` truncates all materialized messages
+    /// before it and replaces them with its summary, and [`extract_loaded_tool_names_from_events`]
+    /// reads the boundary's `loaded_tools_snapshot` rather than the events preceding it. So the
+    /// materialized view and the recovered tool set are byte-identical before and after this call —
+    /// it only stops the in-memory log from growing unbounded across a long-lived,
+    /// repeatedly-compacted session.
     ///
-    /// Persistence is unaffected: every event was already written to its
-    /// own row by `save_event`, so the on-disk log stays complete.
+    /// Persistence is unaffected: every event was already written to its own row by `save_event`,
+    /// so the on-disk log stays complete.
     pub fn prune_compacted_events(&mut self) {
         let last_boundary = self
             .events
@@ -205,16 +190,14 @@ impl Conversation {
         }
     }
 
-    /// Drop assistant messages whose `tool_use` blocks lack matching
-    /// `tool_result`s in the immediately-following user message. Returns
-    /// the dropped messages so callers can log them. Used at session
-    /// resume to repair the log after a crash mid-tool-call (the
-    /// Anthropic API rejects orphaned `tool_use` blocks).
+    /// Drop assistant messages whose `tool_use` blocks lack matching `tool_result`s in the
+    /// immediately-following user message. Returns the dropped messages so callers can log them.
+    /// Used at session resume to repair the log after a crash mid-tool-call (the Anthropic API
+    /// rejects orphaned `tool_use` blocks).
     ///
-    /// Removes the corresponding `Event::Append` entries from the event
-    /// log so future re-materializations stay clean. `Event::CompactBoundary`
-    /// events are never touched (their synthetic summary is a plain user
-    /// message that can't be orphaned).
+    /// Removes the corresponding `Event::Append` entries from the event log so future
+    /// re-materializations stay clean. `Event::CompactBoundary` events are never touched (their
+    /// synthetic summary is a plain user message that can't be orphaned).
     pub fn sanitize_orphans(&mut self) -> Vec<Message> {
         let dropped_indices = orphan_event_indices(&self.events);
         if dropped_indices.is_empty() {
@@ -222,10 +205,9 @@ impl Conversation {
         }
 
         let mut dropped = Vec::with_capacity(dropped_indices.len());
-        // Walk indices in reverse so each `swap_remove`-style remove
-        // doesn't invalidate the rest. Use `remove` (linear) to preserve
-        // ordering; the dropped vector is filled in original order via a
-        // post-sort.
+        // Walk indices in reverse so each `swap_remove`-style remove doesn't invalidate the rest.
+        // Use `remove` (linear) to preserve ordering; the dropped vector is filled in original
+        // order via a post-sort.
         let mut to_remove = dropped_indices.clone();
         to_remove.sort_unstable_by(|a, b| b.cmp(a));
         for idx in to_remove {
@@ -266,17 +248,15 @@ impl<'a> IntoIterator for &'a Conversation {
     }
 }
 
-/// Walk the event log and return the indices of `Event::Append` entries
-/// that carry orphaned assistant `tool_use` blocks (i.e. no matching
-/// `tool_result` in the next materialized message). The check uses the
-/// *materialized* view so a `CompactBoundary` between an orphan and its
-/// would-be result correctly counts as orphaned.
+/// Walk the event log and return the indices of `Event::Append` entries that carry orphaned
+/// assistant `tool_use` blocks (i.e. no matching `tool_result` in the next materialized message).
+/// The check uses the *materialized* view so a `CompactBoundary` between an orphan and its would-be
+/// result correctly counts as orphaned.
 fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
-    // Build (event_idx, &Message) pairs in materialization order so we
-    // can scan adjacency and report orphan event indices, not just
-    // materialized indices. Skip the "previous Append is gone" case
-    // (the event was truncated by a CompactBoundary) since the
-    // materialized view never sees that orphan.
+    // Build (event_idx, &Message) pairs in materialization order so we can scan adjacency and
+    // report orphan event indices, not just materialized indices. Skip the "previous Append is
+    // gone" case (the event was truncated by a CompactBoundary) since the materialized view never
+    // sees that orphan.
     let mut pairs: Vec<(usize, &Message)> = Vec::new();
     for (idx, event) in events.iter().enumerate() {
         match event {
@@ -284,9 +264,8 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
             Event::CompactBoundary { replaced_count, .. } => {
                 let truncate_to = pairs.len().saturating_sub(*replaced_count);
                 pairs.truncate(truncate_to);
-                // The synthetic summary is not a real Append event, so
-                // we don't push a (idx, …) pair for it; sanitization
-                // only removes Append events anyway.
+                // The synthetic summary is not a real Append event, so we don't push a (idx, …)
+                // pair for it; sanitization only removes Append events anyway.
             }
         }
     }
@@ -329,14 +308,12 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
     orphan
 }
 
-/// Walk events and collect the names of tools loaded via successful
-/// `load_tool` calls — same contract as
-/// [`crate::tools::extract_loaded_tool_names`] but events-aware so it
-/// can absorb [`Event::CompactBoundary::loaded_tools_snapshot`] when it
-/// crosses a boundary. Pending uses inside the summarized window are
-/// cleared at the boundary (the actual tool_use/tool_result rows for
-/// those uses are still in the log on disk, but they're below the
-/// materialized view's "logical start" so the model can't act on them).
+/// Walk events and collect the names of tools loaded via successful `load_tool` calls — same
+/// contract as [`crate::tools::extract_loaded_tool_names`] but events-aware so it can absorb
+/// [`Event::CompactBoundary::loaded_tools_snapshot`] when it crosses a boundary. Pending uses
+/// inside the summarized window are cleared at the boundary (the actual tool_use/tool_result rows
+/// for those uses are still in the log on disk, but they're below the materialized view's "logical
+/// start" so the model can't act on them).
 pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> HashSet<String> {
     use std::collections::HashMap;
     let mut loaded: HashSet<String> = HashSet::new();
@@ -373,9 +350,8 @@ pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> HashSet<String
                 loaded_tools_snapshot,
                 ..
             } => {
-                // Pending uses inside the summarized window are gone
-                // from the model's view; their would-be results are
-                // also gone. Drop them and absorb the snapshot.
+                // Pending uses inside the summarized window are gone from the model's view; their
+                // would-be results are also gone. Drop them and absorb the snapshot.
                 pending.clear();
                 loaded.extend(loaded_tools_snapshot.iter().cloned());
             }
@@ -455,10 +431,9 @@ mod tests {
 
     #[test]
     fn test_last_assistant_text_walks_past_tool_results() {
-        // Sub-agent turn shape after a tool-use round: assistant emits a
-        // tool_use, then the loop appends the matching tool_result as a
-        // Role::User trailer. `last()` would return that trailer, not the
-        // assistant's text — the helper has to walk backward.
+        // Sub-agent turn shape after a tool-use round: assistant emits a tool_use, then the loop
+        // appends the matching tool_result as a Role::User trailer. `last()` would return that
+        // trailer, not the assistant's text — the helper has to walk backward.
         let mut log = Conversation::new();
         log.append(Message::user("kick off"));
         log.append(Message::assistant_text("final assistant answer"));
@@ -576,9 +551,8 @@ mod tests {
 
     #[test]
     fn test_events_are_append_only_after_compaction() {
-        // After replace_for_compaction, the prior Append events MUST
-        // still be present in the events log, even though the
-        // materialized view has truncated them. This is the structural
+        // After replace_for_compaction, the prior Append events MUST still be present in the events
+        // log, even though the materialized view has truncated them. This is the structural
         // invariant: events in the log only ever grow.
         let mut log = Conversation::new();
         log.append(Message::user("m1"));
@@ -635,9 +609,8 @@ mod tests {
 
     #[test]
     fn test_extract_loaded_tool_names_recovers_snapshot_across_boundary() {
-        // Pre-boundary: load_tool(scratchpad_read) succeeds.
-        // After the boundary swallows it, the snapshot must restore
-        // scratchpad_read in the active set.
+        // Pre-boundary: load_tool(scratchpad_read) succeeds. After the boundary swallows it, the
+        // snapshot must restore scratchpad_read in the active set.
         let mut log = Conversation::new();
         log.append(load_tool_use("u1", "scratchpad_read"));
         log.append(load_tool_result("u1", false));
@@ -701,9 +674,8 @@ mod tests {
 
     #[test]
     fn test_extract_loaded_tool_names_pending_use_wiped_at_boundary() {
-        // load_tool tool_use lives on one side of the boundary, its
-        // tool_result on the other — both vanish from the materialized
-        // view, so the scanner must NOT count the pending pair across
+        // load_tool tool_use lives on one side of the boundary, its tool_result on the other — both
+        // vanish from the materialized view, so the scanner must NOT count the pending pair across
         // the boundary.
         let mut log = Conversation::new();
         log.append(load_tool_use("u1", "scratchpad_read"));
@@ -720,9 +692,8 @@ mod tests {
 
     #[test]
     fn test_pop_unsaved_only_removes_trailing_append() {
-        // After a CompactBoundary, the next legal call is `append`. A
-        // failed-save rollback after that should remove the failed
-        // append, not the boundary.
+        // After a CompactBoundary, the next legal call is `append`. A failed-save rollback after
+        // that should remove the failed append, not the boundary.
         let mut log = Conversation::new();
         log.append(Message::user("pre"));
         log.replace_for_compaction(Message::user("[summary]"), Vec::new(), HashSet::new());

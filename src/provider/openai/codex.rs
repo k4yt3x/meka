@@ -1,9 +1,8 @@
 //! OpenAI Codex (ChatGPT subscription) provider.
 //!
-//! Talks the Responses API to `chatgpt.com/backend-api/codex/responses`,
-//! authenticated by the bearer token + `ChatGPT-Account-ID` header issued
-//! by the Codex OAuth flow. Mirrors how OpenAI's own first-party Codex CLI
-//! authenticates so the wire shape matches.
+//! Talks the Responses API to `chatgpt.com/backend-api/codex/responses`, authenticated by the
+//! bearer token + `ChatGPT-Account-ID` header issued by the Codex OAuth flow. Mirrors how OpenAI's
+//! own first-party Codex CLI authenticates so the wire shape matches.
 
 mod auth;
 mod responses;
@@ -31,15 +30,15 @@ use crate::{
 /// Identifier persisted in `oauth_tokens.provider` for the Codex token row.
 pub(crate) const STORAGE_KEY: &str = "openai-codex";
 
-/// Default endpoint for OpenAI Codex subscription requests. The path
-/// `/backend-api/codex/responses` is appended at request time.
+/// Default endpoint for OpenAI Codex subscription requests. The path `/backend-api/codex/responses`
+/// is appended at request time.
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com";
 
 /// Default OAuth token endpoint. Refresh requests POST here as JSON.
 const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-/// `originator` request header value. Mirrors Codex's `codex_cli_rs` slot
-/// — flagged as the calling tool so OpenAI can attribute traffic.
+/// `originator` request header value. Mirrors Codex's `codex_cli_rs` slot — flagged as the calling
+/// tool so OpenAI can attribute traffic.
 const ORIGINATOR: &str = "agsh_cli";
 
 fn now_epoch_millis() -> i64 {
@@ -57,9 +56,8 @@ pub struct OpenAiCodexProvider {
     client_id: String,
     oauth_token_url: String,
     token_store: Option<Arc<TokenStore>>,
-    /// `low` / `medium` / `high` for reasoning models (gpt-5, o-series).
-    /// Forwarded as `reasoning.effort` in the request body. `None` skips
-    /// the reasoning block entirely.
+    /// `low` / `medium` / `high` for reasoning models (gpt-5, o-series). Forwarded as
+    /// `reasoning.effort` in the request body. `None` skips the reasoning block entirely.
     reasoning_effort: Option<String>,
     user_agent: String,
 }
@@ -74,8 +72,8 @@ impl OpenAiCodexProvider {
         token_store: Option<Arc<TokenStore>>,
         reasoning_effort: Option<String>,
     ) -> Result<Self> {
-        // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets
-        // bot-clearance cookies (e.g. `__cf_bm`) persist across requests.
+        // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets bot-clearance cookies
+        // (e.g. `__cf_bm`) persist across requests.
         let client = reqwest::Client::builder()
             .cookie_store(true)
             .build()
@@ -104,11 +102,10 @@ impl OpenAiCodexProvider {
         })
     }
 
-    /// Returns the URL the request POSTs to. Codex's own client appends
-    /// `/backend-api` automatically when the base URL is one of the
-    /// chatgpt.com domains, but we keep the path explicit so users
-    /// pointing `--base-url` at a custom proxy don't need to know the
-    /// rewrite rule.
+    /// Returns the URL the request POSTs to. Codex's own client appends `/backend-api`
+    /// automatically when the base URL is one of the chatgpt.com domains, but we keep the path
+    /// explicit so users pointing `--base-url` at a custom proxy don't need to know the rewrite
+    /// rule.
     fn responses_url(&self) -> String {
         let trimmed = self.base_url.trim_end_matches('/');
         if trimmed.contains("/backend-api") || trimmed.contains("/codex") {
@@ -118,10 +115,9 @@ impl OpenAiCodexProvider {
         }
     }
 
-    /// Returns `(bearer_token, account_id)`, refreshing the access token
-    /// first if it's within 5 minutes of expiry. The account_id is
-    /// `Option<String>` because free-tier accounts may not have one
-    /// (Codex's auth/manager.rs treats the missing claim as non-fatal).
+    /// Returns `(bearer_token, account_id)`, refreshing the access token first if it's within 5
+    /// minutes of expiry. The account_id is `Option<String>` because free-tier accounts may not
+    /// have one (Codex's auth/manager.rs treats the missing claim as non-fatal).
     async fn ensure_valid_credential(&self) -> Result<(String, Option<String>)> {
         {
             let credential = self.credential.read().await;
@@ -145,10 +141,9 @@ impl OpenAiCodexProvider {
 
         let mut credential = self.credential.write().await;
 
-        // Re-read the latest credential from the DB. Refresh tokens rotate on
-        // each successful refresh, and a sibling agsh process may have
-        // rotated ours since startup. Without this re-read we'd POST a stale
-        // refresh_token and the OAuth provider would reject it with
+        // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
+        // refresh, and a sibling agsh process may have rotated ours since startup. Without this
+        // re-read we'd POST a stale refresh_token and the OAuth provider would reject it with
         // `invalid_grant`.
         if let Some(store) = &self.token_store {
             match store.load_oauth_token(STORAGE_KEY).await {
@@ -163,9 +158,8 @@ impl OpenAiCodexProvider {
             }
         }
 
-        // Double-check after the DB re-read: another caller (in this process
-        // or a sibling agsh) may already have rotated to a still-valid
-        // access token.
+        // Double-check after the DB re-read: another caller (in this process or a sibling agsh) may
+        // already have rotated to a still-valid access token.
         if let AuthCredential::OAuthToken {
             access_token,
             expires_at,
@@ -256,8 +250,8 @@ impl OpenAiCodexProvider {
             AgshError::Provider("Codex refresh response missing access_token".to_string())
         })?;
 
-        // Re-extract `chatgpt_account_id` from the new id_token if the
-        // server returned one — the workspace association can change.
+        // Re-extract `chatgpt_account_id` from the new id_token if the server returned one — the
+        // workspace association can change.
         let account_id = match data.id_token.as_deref() {
             Some(id_token) => extract_account_id(id_token).ok().flatten(),
             None => None,
@@ -306,9 +300,8 @@ impl Provider for OpenAiCodexProvider {
         _messages: &[Message],
         _tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason, TokenUsage)> {
-        // The Responses API on chatgpt.com only ever returns SSE; there is
-        // no non-streaming JSON response shape to parse. The agent layer
-        // calls `stream` for openai-codex.
+        // The Responses API on chatgpt.com only ever returns SSE; there is no non-streaming JSON
+        // response shape to parse. The agent layer calls `stream` for openai-codex.
         Err(AgshError::Provider(
             "openai-codex does not support non-streaming completion; use streaming mode"
                 .to_string(),
@@ -485,9 +478,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_returns_unsupported_error() {
-        // openai-codex is streaming-only; complete() must error explicitly
-        // rather than silently fall back to a non-streaming code path that
-        // doesn't exist for this endpoint.
+        // openai-codex is streaming-only; complete() must error explicitly rather than silently
+        // fall back to a non-streaming code path that doesn't exist for this endpoint.
         let provider = test_provider();
         let result = provider.complete("", &[], &[]).await;
         assert!(matches!(result, Err(AgshError::Provider(_))));

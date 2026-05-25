@@ -1,11 +1,9 @@
-//! LLM provider abstraction. Defines the [`Provider`] trait, the shared
-//! message/content/tool types, and the [`ProviderBuilder`] that returns
-//! a concrete Claude or OpenAI-compatible implementation.
+//! LLM provider abstraction. Defines the [`Provider`] trait, the shared message/content/tool types,
+//! and the [`ProviderBuilder`] that returns a concrete Claude or OpenAI-compatible implementation.
 
 mod claude;
-/// Scripted provider used by the ACP integration test. Available in
-/// debug builds only — release builds don't pay the binary-size cost.
-/// Activated by the `AGSH_ACP_MOCK_PROVIDER` env var inside
+/// Scripted provider used by the ACP integration test. Available in debug builds only — release
+/// builds don't pay the binary-size cost. Activated by the `AGSH_ACP_MOCK_PROVIDER` env var inside
 /// `acp::run_acp`; never reachable from production paths otherwise.
 #[cfg(debug_assertions)]
 pub(crate) mod mock;
@@ -27,8 +25,8 @@ use crate::{
 
 pub(crate) const DEFAULT_CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-/// Codex's hardcoded OpenAI OAuth client ID. Mirrors the value used by the
-/// first-party CLI at `temp/codex/codex-rs/login/src/auth/manager.rs:869`.
+/// Codex's hardcoded OpenAI OAuth client ID. Mirrors the value used by the first-party CLI at
+/// `temp/codex/codex-rs/login/src/auth/manager.rs:869`.
 pub(crate) const DEFAULT_OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 pub const SUPPORTED_PROVIDERS: &[&str] =
@@ -41,11 +39,9 @@ pub enum AuthCredential {
         access_token: String,
         refresh_token: Option<String>,
         expires_at: Option<i64>,
-        /// Provider-flavoured identity carried alongside the bearer token.
-        /// Currently only `openai-codex` populates this — the
-        /// `chatgpt_account_id` extracted from the id_token JWT, sent on
-        /// every request as `ChatGPT-Account-ID`. Claude OAuth leaves it
-        /// `None`.
+        /// Provider-flavoured identity carried alongside the bearer token. Currently only
+        /// `openai-codex` populates this — the `chatgpt_account_id` extracted from the id_token
+        /// JWT, sent on every request as `ChatGPT-Account-ID`. Claude OAuth leaves it `None`.
         account_id: Option<String>,
     },
 }
@@ -106,8 +102,8 @@ pub enum ContentBlock {
     },
 }
 
-/// Deserializes ToolResult content from either a string (legacy format) or
-/// an array of ToolResultContent (new format).
+/// Deserializes ToolResult content from either a string (legacy format) or an array of
+/// ToolResultContent (new format).
 fn deserialize_tool_result_content<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<ToolResultContent>, D::Error>
@@ -187,27 +183,25 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-    /// Human-readable title for the tool, optionally set by MCP servers.
-    /// Providers may render this in UIs instead of the machine name.
+    /// Human-readable title for the tool, optionally set by MCP servers. Providers may render this
+    /// in UIs instead of the machine name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// MCP `tool.annotations`: hints such as `readOnlyHint`,
-    /// `destructiveHint`, `openWorldHint`. Passed through verbatim as JSON;
-    /// providers that don't recognise the field ignore it.
+    /// MCP `tool.annotations`: hints such as `readOnlyHint`, `destructiveHint`, `openWorldHint`.
+    /// Passed through verbatim as JSON; providers that don't recognise the field ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<serde_json::Value>,
-    /// MCP `tool.meta` payload, forwarded verbatim so permission heuristics
-    /// and audit logs can access it.
+    /// MCP `tool.meta` payload, forwarded verbatim so permission heuristics and audit logs can
+    /// access it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
 impl ToolDefinition {
-    /// Test-only convenience constructor. Production code builds
-    /// `ToolDefinition` as a struct literal and explicitly sets the
-    /// MCP-specific `title`/`annotations`/`meta` fields; this helper just
-    /// keeps test fixtures terse.
+    /// Test-only convenience constructor. Production code builds `ToolDefinition` as a struct
+    /// literal and explicitly sets the MCP-specific `title`/`annotations`/`meta` fields; this
+    /// helper just keeps test fixtures terse.
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -239,10 +233,9 @@ pub enum StreamEvent {
     ToolUseEnd {
         input: serde_json::Value,
     },
-    /// Emitted in lieu of `ToolUseEnd` when the accumulated tool-call
-    /// arguments fail to parse as JSON. The agent layer must not execute
-    /// the tool; it should surface the parse error back to the model as
-    /// a `ToolResult { is_error: true }` instead.
+    /// Emitted in lieu of `ToolUseEnd` when the accumulated tool-call arguments fail to parse as
+    /// JSON. The agent layer must not execute the tool; it should surface the parse error back to
+    /// the model as a `ToolResult { is_error: true }` instead.
     ToolCallRejected {
         id: String,
         name: String,
@@ -255,10 +248,9 @@ pub enum StreamEvent {
     Error(String),
 }
 
-/// Sentinel key inserted into `ToolUse::input` when the upstream tool-call
-/// arguments failed to parse. `resolve_and_execute_tool` checks for this
-/// and short-circuits to an error result instead of invoking the tool
-/// with a potentially surprising default-filled object.
+/// Sentinel key inserted into `ToolUse::input` when the upstream tool-call arguments failed to
+/// parse. `resolve_and_execute_tool` checks for this and short-circuits to an error result instead
+/// of invoking the tool with a potentially surprising default-filled object.
 pub(crate) const INVALID_TOOL_ARGS_MARKER: &str = "_agsh_invalid_arguments";
 
 #[derive(Debug, Clone, Default)]
@@ -266,12 +258,11 @@ pub(crate) const INVALID_TOOL_ARGS_MARKER: &str = "_agsh_invalid_arguments";
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// Tokens billed at the cache-write tier (content newly cached this
-    /// turn). Anthropic-only; OpenAI providers leave this at 0.
+    /// Tokens billed at the cache-write tier (content newly cached this turn). Anthropic-only;
+    /// OpenAI providers leave this at 0.
     pub cache_creation_input_tokens: u64,
-    /// Tokens served from the prompt cache (cache-read tier). Anthropic
-    /// returns this in `usage.cache_read_input_tokens`; OpenAI providers
-    /// leave it at 0 today.
+    /// Tokens served from the prompt cache (cache-read tier). Anthropic returns this in
+    /// `usage.cache_read_input_tokens`; OpenAI providers leave it at 0 today.
     pub cache_read_input_tokens: u64,
 }
 
@@ -280,23 +271,20 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
-    /// The model declined to comply with the request. Claude's API
-    /// surfaces this as `stop_reason: "refusal"`; OpenAI's responses
-    /// API has the equivalent. The string carries the model's
+    /// The model declined to comply with the request. Claude's API surfaces this as `stop_reason:
+    /// "refusal"`; OpenAI's responses API has the equivalent. The string carries the model's
     /// refusal text when the provider includes one — empty otherwise.
     Refusal(String),
     Unknown(String),
 }
 
-/// Abstraction over an LLM provider (Claude API/OAuth, OpenAI, etc.).
-/// Implementors are held behind `Arc<dyn Provider>` and shared across
-/// concurrent tool dispatch — calls must be safe to make in parallel from
-/// multiple sub-agents in one turn.
+/// Abstraction over an LLM provider (Claude API/OAuth, OpenAI, etc.). Implementors are held behind
+/// `Arc<dyn Provider>` and shared across concurrent tool dispatch — calls must be safe to make in
+/// parallel from multiple sub-agents in one turn.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// Single round-trip request. Returns the assistant message plus
-    /// stop-reason and token-usage metadata. No streaming; the agent
-    /// awaits the full response.
+    /// Single round-trip request. Returns the assistant message plus stop-reason and token-usage
+    /// metadata. No streaming; the agent awaits the full response.
     async fn complete(
         &self,
         system_prompt: &str,
@@ -304,9 +292,8 @@ pub trait Provider: Send + Sync {
         tools: &[ToolDefinition],
     ) -> Result<(Message, StopReason, TokenUsage)>;
 
-    /// Streaming variant. The provider pushes `StreamEvent`s onto
-    /// `event_sender` as they arrive. Cancellation is observed via
-    /// `cancellation` — implementors must check the token and abort
+    /// Streaming variant. The provider pushes `StreamEvent`s onto `event_sender` as they arrive.
+    /// Cancellation is observed via `cancellation` — implementors must check the token and abort
     /// in-flight HTTP work when it fires.
     async fn stream(
         &self,
@@ -320,10 +307,9 @@ pub trait Provider: Send + Sync {
     #[allow(dead_code)]
     fn name(&self) -> &str;
 
-    /// Override thinking for the next API call. `Some(false)` disables,
-    /// `Some(true)` enables, `None` restores the default. Default impl is
-    /// a silent no-op — providers that don't support thinking should leave
-    /// it that way; providers that do must override.
+    /// Override thinking for the next API call. `Some(false)` disables, `Some(true)` enables,
+    /// `None` restores the default. Default impl is a silent no-op — providers that don't support
+    /// thinking should leave it that way; providers that do must override.
     fn set_thinking_override(&self, _enabled: Option<bool>) {}
 }
 
@@ -389,12 +375,10 @@ async fn finalize_tool_call_accumulators(
     has_tools
 }
 
-/// Constructs a concrete [`Provider`] (Claude API, Claude OAuth, or
-/// OpenAI-compatible) from a bag of provider-specific settings. Each
-/// setter documents which provider(s) consume it; unused settings are
-/// silently ignored by providers that don't need them. The only
-/// required inputs are the provider name, the credential, and the
-/// model — everything else has a sensible default.
+/// Constructs a concrete [`Provider`] (Claude API, Claude OAuth, or OpenAI-compatible) from a bag
+/// of provider-specific settings. Each setter documents which provider(s) consume it; unused
+/// settings are silently ignored by providers that don't need them. The only required inputs are
+/// the provider name, the credential, and the model — everything else has a sensible default.
 pub struct ProviderBuilder {
     provider_name: String,
     credential: AuthCredential,
@@ -436,8 +420,8 @@ impl ProviderBuilder {
         }
     }
 
-    /// Override the HTTP endpoint. Applies to every provider variant;
-    /// defaults to the Claude or OpenAI production URL.
+    /// Override the HTTP endpoint. Applies to every provider variant; defaults to the Claude or
+    /// OpenAI production URL.
     pub fn base_url(mut self, value: Option<String>) -> Self {
         self.base_url = value;
         self
@@ -455,15 +439,14 @@ impl ProviderBuilder {
         self
     }
 
-    /// Sink for refreshed OAuth tokens. Only consumed by `claude-oauth`;
-    /// when `None`, refreshed tokens are held in memory only.
+    /// Sink for refreshed OAuth tokens. Only consumed by `claude-oauth`; when `None`, refreshed
+    /// tokens are held in memory only.
     pub fn token_store(mut self, value: Option<Arc<TokenStore>>) -> Self {
         self.token_store = value;
         self
     }
 
-    /// Claude-only: turn on extended thinking with the given budget cap.
-    /// Ignored by `openai-api`.
+    /// Claude-only: turn on extended thinking with the given budget cap. Ignored by `openai-api`.
     pub fn thinking(mut self, enabled: bool, budget_tokens: u64) -> Self {
         self.thinking_enabled = enabled;
         self.thinking_budget_tokens = budget_tokens;
@@ -476,15 +459,14 @@ impl ProviderBuilder {
         self
     }
 
-    /// Stable device identity embedded in `metadata.user_id`. Only
-    /// consumed by `claude-oauth`.
+    /// Stable device identity embedded in `metadata.user_id`. Only consumed by `claude-oauth`.
     pub fn device_id(mut self, value: String) -> Self {
         self.device_id = value;
         self
     }
 
-    /// Claude Code `output_config.effort` (`low` / `medium` / `high`).
-    /// Only consumed by `claude-oauth`.
+    /// Claude Code `output_config.effort` (`low` / `medium` / `high`). Only consumed by
+    /// `claude-oauth`.
     pub fn effort(mut self, value: String) -> Self {
         self.effort = value;
         self
@@ -496,8 +478,8 @@ impl ProviderBuilder {
         self
     }
 
-    /// Per-session counters incremented when image-redaction events fire.
-    /// Currently consumed only by `claude-oauth` and `claude-api`.
+    /// Per-session counters incremented when image-redaction events fire. Currently consumed only
+    /// by `claude-oauth` and `claude-api`.
     pub fn session_stats(mut self, value: Option<Arc<crate::stats::SessionStats>>) -> Self {
         self.session_stats = value;
         self
@@ -591,11 +573,10 @@ impl ProviderBuilder {
 mod tests {
     use super::*;
 
-    /// Regression test for the "silent `{}` fallback" bug: a tool call with
-    /// unparseable JSON arguments must be rejected via
-    /// [`StreamEvent::ToolCallRejected`] rather than replayed with an
-    /// empty input object (which would run the tool on whatever defaults
-    /// it happens to tolerate).
+    /// Regression test for the "silent `{}` fallback" bug: a tool call with unparseable JSON
+    /// arguments must be rejected via [`StreamEvent::ToolCallRejected`] rather than replayed with
+    /// an empty input object (which would run the tool on whatever defaults it happens to
+    /// tolerate).
     #[tokio::test]
     async fn test_finalize_tool_call_accumulators_rejects_invalid_json() {
         let mut accumulators = std::collections::HashMap::new();

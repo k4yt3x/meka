@@ -1,6 +1,6 @@
-//! OpenAI-compatible provider. Targets the Chat Completions API and works
-//! with any compatible endpoint (vLLM, Together, Groq, local proxies, etc.)
-//! by way of the `--base-url` flag and `OPENAI_API_KEY`.
+//! OpenAI-compatible provider. Targets the Chat Completions API and works with any compatible
+//! endpoint (vLLM, Together, Groq, local proxies, etc.) by way of the `--base-url` flag and
+//! `OPENAI_API_KEY`.
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -70,21 +70,15 @@ impl OpenAiProvider {
                                 is_error,
                             } = block
                             {
-                                // Chat Completions deliberately restricts the
-                                // `tool` role's content to text-only — the
-                                // Chat reference defines
-                                // `ChatCompletionToolMessageParam.content`
-                                // as `string | array of
-                                // ChatCompletionContentPartText` and notes
-                                // "for tool messages, only type `text` is
-                                // supported." Vision is on `user`-role
-                                // messages only. So we collapse any image
-                                // blocks to the literal "[Image]" via
-                                // `tool_result_text_content` here. The
-                                // Responses API (used by `openai-codex`)
-                                // does accept `input_image` content blocks
-                                // in `function_call_output.output`, and
-                                // we emit those there.
+                                // Chat Completions deliberately restricts the `tool` role's content
+                                // to text-only — the Chat reference defines
+                                // `ChatCompletionToolMessageParam.content` as `string | array of
+                                // ChatCompletionContentPartText` and notes "for tool messages, only
+                                // type `text` is supported." Vision is on `user`-role messages
+                                // only. So we collapse any image blocks to the literal "[Image]"
+                                // via `tool_result_text_content` here. The Responses API (used by
+                                // `openai-codex`) does accept `input_image` content blocks in
+                                // `function_call_output.output`, and we emit those there.
                                 let text = ContentBlock::tool_result_text_content(content);
                                 let mut tool_msg = serde_json::json!({
                                     "role": "tool",
@@ -236,10 +230,9 @@ impl OpenAiProvider {
                 let input: serde_json::Value = match serde_json::from_str(arguments_str) {
                     Ok(value) => value,
                     Err(error) => {
-                        // Mirror the streaming path: surface the parse
-                        // failure via the sentinel so the dispatch loop
-                        // rejects the call instead of silently running the
-                        // tool with empty arguments.
+                        // Mirror the streaming path: surface the parse failure via the sentinel so
+                        // the dispatch loop rejects the call instead of silently running the tool
+                        // with empty arguments.
                         tracing::warn!(
                             "rejecting tool call with unparseable JSON arguments: {}",
                             error
@@ -891,8 +884,8 @@ mod tests {
         );
         assert!(openai_tools[0]["function"].get("parameters").is_some());
 
-        // Top-level name/description/parameters must NOT be present to avoid
-        // triggering Responses API strict validation on OpenAI/OpenRouter
+        // Top-level name/description/parameters must NOT be present to avoid triggering Responses
+        // API strict validation on OpenAI/OpenRouter
         assert!(openai_tools[0].get("name").is_none());
         assert!(openai_tools[0].get("description").is_none());
         assert!(openai_tools[0].get("parameters").is_none());

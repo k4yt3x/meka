@@ -1,6 +1,6 @@
-//! Direct Claude Messages API provider. Uses `x-api-key` auth without the
-//! Claude Code fingerprinting / attestation machinery that `claude-oauth`
-//! requires. Intended for users bringing their own `CLAUDE_API_KEY`.
+//! Direct Claude Messages API provider. Uses `x-api-key` auth without the Claude Code
+//! fingerprinting / attestation machinery that `claude-oauth` requires. Intended for users bringing
+//! their own `CLAUDE_API_KEY`.
 
 use std::sync::{
     Arc,

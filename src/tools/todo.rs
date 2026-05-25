@@ -1,6 +1,5 @@
-//! `todo_write` tool and the shared todo list state. Lets the agent track
-//! multi-step plans and surface their progress in the system prompt and the
-//! REPL display.
+//! `todo_write` tool and the shared todo list state. Lets the agent track multi-step plans and
+//! surface their progress in the system prompt and the REPL display.
 
 use std::sync::Arc;
 

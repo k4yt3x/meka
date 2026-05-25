@@ -1,7 +1,6 @@
 //! In-memory ledger of resources that have been reported as changed via
-//! `notifications/resources/updated`. The agent can query this via the
-//! `list_mcp_resource_updates` builtin tool to see which resources need
-//! refreshing without subscribing again.
+//! `notifications/resources/updated`. The agent can query this via the `list_mcp_resource_updates`
+//! builtin tool to see which resources need refreshing without subscribing again.
 
 use std::{
     collections::HashMap,
@@ -27,8 +26,8 @@ pub fn record(server_name: &str, uri: &str) {
     }
 }
 
-/// Snapshot every recorded update. Returned entries are sorted by server
-/// name then URI for stable output.
+/// Snapshot every recorded update. Returned entries are sorted by server name then URI for stable
+/// output.
 pub fn snapshot() -> Vec<(String, String, u64)> {
     let Ok(state) = ledger().lock() else {
         return Vec::new();
@@ -41,8 +40,8 @@ pub fn snapshot() -> Vec<(String, String, u64)> {
     out
 }
 
-/// Drop every entry for a given server — used when the server is
-/// disconnected or removed via `agsh mcp remove`.
+/// Drop every entry for a given server — used when the server is disconnected or removed via `agsh
+/// mcp remove`.
 pub fn clear_for_server(server_name: &str) {
     if let Ok(mut state) = ledger().lock() {
         state.retain(|(name, _), _| name != server_name);

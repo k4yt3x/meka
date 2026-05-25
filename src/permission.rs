@@ -1,7 +1,6 @@
-//! Permission state machine governing what tools the agent may invoke.
-//! Levels: `none` (read-only, no env info), `read` (filesystem reads),
-//! `ask` (writes prompt the user), `write` (writes go through). The level is
-//! held in an [`AtomicU8`] so the REPL can mutate it concurrently with the
+//! Permission state machine governing what tools the agent may invoke. Levels: `none` (read-only,
+//! no env info), `read` (filesystem reads), `ask` (writes prompt the user), `write` (writes go
+//! through). The level is held in an [`AtomicU8`] so the REPL can mutate it concurrently with the
 //! agent loop.
 
 use std::{
@@ -52,8 +51,7 @@ impl Permission {
         }
     }
 
-    /// Returns true if this permission level allows using a tool that requires
-    /// `required`.
+    /// Returns true if this permission level allows using a tool that requires `required`.
     pub fn allows(self, required: Permission) -> bool {
         match self {
             Permission::None => required == Permission::None,
@@ -90,19 +88,18 @@ impl FromStr for Permission {
     }
 }
 
-/// Set of permission modes the user is allowed to switch into at runtime.
-/// Backed by a `u8` bitmask indexed by [`Permission`]'s `repr(u8)` discriminant.
-/// Constructed via [`EnabledPermissions::from_modes`] (or the constants); the
-/// constructor guarantees the set is non-empty so [`Self::lowest`] is always
-/// well-defined.
+/// Set of permission modes the user is allowed to switch into at runtime. Backed by a `u8` bitmask
+/// indexed by [`Permission`]'s `repr(u8)` discriminant. Constructed via
+/// [`EnabledPermissions::from_modes`] (or the constants); the constructor guarantees the set is
+/// non-empty so [`Self::lowest`] is always well-defined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnabledPermissions {
     bits: u8,
 }
 
 impl EnabledPermissions {
-    /// Every mode enabled. Used by test fixtures that don't care about
-    /// the runtime gate; production code constructs the set from config.
+    /// Every mode enabled. Used by test fixtures that don't care about the runtime gate; production
+    /// code constructs the set from config.
     #[cfg(test)]
     pub const ALL: Self = Self { bits: 0b1111 };
     /// `none / read / write` — `ask` is opt-in.
@@ -112,11 +109,10 @@ impl EnabledPermissions {
             | (1 << Permission::Write as u8),
     };
 
-    /// Build an `EnabledPermissions` from any iterable of [`Permission`]s.
-    /// Returns `None` if the iterator yields no items — an empty enabled
-    /// set is meaningless (agsh would have no level to start in), so the
-    /// caller has to handle that case explicitly (typically by falling
-    /// back to [`Self::DEFAULT`]).
+    /// Build an `EnabledPermissions` from any iterable of [`Permission`]s. Returns `None` if the
+    /// iterator yields no items — an empty enabled set is meaningless (agsh would have no level to
+    /// start in), so the caller has to handle that case explicitly (typically by falling back to
+    /// [`Self::DEFAULT`]).
     pub fn from_modes<I: IntoIterator<Item = Permission>>(iter: I) -> Option<Self> {
         let mut bits: u8 = 0;
         for mode in iter {
@@ -140,8 +136,8 @@ impl EnabledPermissions {
         ORDER.into_iter().filter(move |&p| self.is_enabled(p))
     }
 
-    /// Lowest-discriminant enabled mode. The constructor guarantees the
-    /// set is non-empty, so this never panics in practice.
+    /// Lowest-discriminant enabled mode. The constructor guarantees the set is non-empty, so this
+    /// never panics in practice.
     pub fn lowest(self) -> Permission {
         self.iter()
             .next()
@@ -153,11 +149,10 @@ impl EnabledPermissions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisabledMode(pub Permission);
 
-/// Lock-free shared handle to the current [`Permission`] level. Cloned
-/// freely across agent, REPL, and tool-dispatch tasks. The REPL mutates
-/// this when the user cycles permission via `Shift+Tab` or `/permission`;
-/// the dispatch loop reads it once at the enforcement site so mid-turn
-/// cycling can't leave a tool acting on a stale snapshot.
+/// Lock-free shared handle to the current [`Permission`] level. Cloned freely across agent, REPL,
+/// and tool-dispatch tasks. The REPL mutates this when the user cycles permission via `Shift+Tab`
+/// or `/permission`; the dispatch loop reads it once at the enforcement site so mid-turn cycling
+/// can't leave a tool acting on a stale snapshot.
 #[derive(Clone)]
 pub struct SharedPermission {
     inner: Arc<AtomicU8>,
@@ -186,9 +181,8 @@ impl SharedPermission {
         }
     }
 
-    /// Switch to `mode`. Returns `Err(DisabledMode(mode))` if the caller
-    /// requested a mode that isn't in [`Self::enabled`]; the current level
-    /// is left unchanged in that case.
+    /// Switch to `mode`. Returns `Err(DisabledMode(mode))` if the caller requested a mode that
+    /// isn't in [`Self::enabled`]; the current level is left unchanged in that case.
     pub fn try_set(&self, mode: Permission) -> Result<(), DisabledMode> {
         if !self.enabled.is_enabled(mode) {
             return Err(DisabledMode(mode));
@@ -197,17 +191,15 @@ impl SharedPermission {
         Ok(())
     }
 
-    /// Low-level setter that bypasses the enabled-set check. Used
-    /// by `try_set` / `cycle` and by tests that need to construct
-    /// edge cases.
+    /// Low-level setter that bypasses the enabled-set check. Used by `try_set` / `cycle` and by
+    /// tests that need to construct edge cases.
     pub(crate) fn set_unchecked(&self, mode: Permission) {
         self.inner.store(mode as u8, Ordering::Relaxed);
     }
 
-    /// Advance to the next enabled mode in `none → read → ask → write → ...`
-    /// order, skipping any disabled modes. If only one mode is enabled the
-    /// cycle is a visual no-op (returns the current mode without changing
-    /// it). Bounded to 4 iterations so it can never spin forever.
+    /// Advance to the next enabled mode in `none → read → ask → write → ...` order, skipping any
+    /// disabled modes. If only one mode is enabled the cycle is a visual no-op (returns the current
+    /// mode without changing it). Bounded to 4 iterations so it can never spin forever.
     pub fn cycle(&self) -> Permission {
         let mut next = self.get();
         for _ in 0..4 {
@@ -217,9 +209,8 @@ impl SharedPermission {
                 return next;
             }
         }
-        // Unreachable when the constructor invariant holds (set non-empty),
-        // because the loop walks through all four variants. Return current
-        // for safety instead of panicking.
+        // Unreachable when the constructor invariant holds (set non-empty), because the loop walks
+        // through all four variants. Return current for safety instead of panicking.
         self.get()
     }
 }
@@ -405,8 +396,8 @@ mod tests {
 
     #[test]
     fn test_shared_permission_set_unchecked_bypasses_enabled() {
-        // Used by tests that need to construct edge cases regardless of
-        // the configured enabled set (e.g. prompt-cache invariance tests).
+        // Used by tests that need to construct edge cases regardless of the configured enabled set
+        // (e.g. prompt-cache invariance tests).
         let shared = SharedPermission::new(Permission::Read, EnabledPermissions::DEFAULT);
         shared.set_unchecked(Permission::Ask);
         assert_eq!(shared.get(), Permission::Ask);

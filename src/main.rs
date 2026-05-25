@@ -1,10 +1,9 @@
-//! `agsh` — an agentic shell where you describe what you want in natural
-//! language and an LLM-backed agent decides which tools to run.
+//! `agsh` — an agentic shell where you describe what you want in natural language and an LLM-backed
+//! agent decides which tools to run.
 //!
-//! The binary wires together: a [`provider`] (Claude or OpenAI), a [`session`]
-//! store backed by SQLite, a [`tools`] registry, an MCP client manager, and a
-//! [`repl`] input loop. The [`agent`] module owns the per-turn loop that streams
-//! provider output and dispatches tool calls.
+//! The binary wires together: a [`provider`] (Claude or OpenAI), a [`session`] store backed by
+//! SQLite, a [`tools`] registry, an MCP client manager, and a [`repl`] input loop. The [`agent`]
+//! module owns the per-turn loop that streams provider output and dispatches tool calls.
 
 mod acp;
 mod agent;
@@ -52,11 +51,10 @@ fn main() -> anyhow::Result<()> {
         2 => "debug",
         _ => "trace",
     };
-    // Route tracing through `relay::RELAY` so the REPL can later install
-    // a reedline `ExternalPrinter` and have warnings printed *above* the
-    // live prompt instead of racing reedline's redraw. Without a printer
-    // installed (non-interactive subcommands, pre-REPL startup window)
-    // the relay falls back to plain stderr.
+    // Route tracing through `relay::RELAY` so the REPL can later install a reedline
+    // `ExternalPrinter` and have warnings printed *above* the live prompt instead of racing
+    // reedline's redraw. Without a printer installed (non-interactive subcommands, pre-REPL startup
+    // window) the relay falls back to plain stderr.
     let rust_log = std::env::var("RUST_LOG").ok();
     tracing_subscriber::fmt()
         .with_env_filter(build_log_filter(rust_log.as_deref(), log_level))
@@ -65,20 +63,17 @@ fn main() -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     let result = run_on_runtime(&runtime, cli);
-    // Detach any lingering blocking threads instead of joining them on
-    // drop. `tokio::io::stdin()` (used by the OAuth paste fallback)
-    // spawns a blocking worker that sits on a `read()` syscall until
-    // stdin has bytes or EOF; when the user Ctrl-Cs during the wait,
-    // the future is dropped but that worker can't be cancelled from
-    // the outside. Without this the default `Runtime::drop` joins that
-    // thread and hangs the process after a clean rollback.
+    // Detach any lingering blocking threads instead of joining them on drop. `tokio::io::stdin()`
+    // (used by the OAuth paste fallback) spawns a blocking worker that sits on a `read()` syscall
+    // until stdin has bytes or EOF; when the user Ctrl-Cs during the wait, the future is dropped
+    // but that worker can't be cancelled from the outside. Without this the default `Runtime::drop`
+    // joins that thread and hangs the process after a clean rollback.
     runtime.shutdown_background();
 
-    // User-initiated interrupts are already acknowledged by the rollback
-    // warn log ("interrupted — rolling back …") and the shell typically
-    // echoes `^C` itself; anyhow's default "Error: agent interrupted by
-    // user" on top of that is just noise. Exit with the conventional
-    // SIGINT code (128 + 2) silently instead.
+    // User-initiated interrupts are already acknowledged by the rollback warn log ("interrupted —
+    // rolling back …") and the shell typically echoes `^C` itself; anyhow's default "Error: agent
+    // interrupted by user" on top of that is just noise. Exit with the conventional SIGINT code
+    // (128 + 2) silently instead.
     if let Err(error) = &result
         && let Some(crate::error::AgshError::Interrupted) =
             error.downcast_ref::<crate::error::AgshError>()
@@ -89,9 +84,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::Result<()> {
-    // `agsh acp` is heavyweight (needs the full config + credential
-    // resolution + MCP setup) so it routes through `async_main`
-    // rather than the lightweight subcommand block below.
+    // `agsh acp` is heavyweight (needs the full config + credential resolution + MCP setup) so it
+    // routes through `async_main` rather than the lightweight subcommand block below.
     let acp_mode = matches!(cli.command, Some(cli::Command::Acp));
 
     // Handle subcommands that don't need full config resolution.
@@ -141,10 +135,9 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         ));
     }
 
-    // If --skill is set, validate and render the body upfront so an invalid
-    // name fails fast — before any session/MCP setup. The combined string
-    // (extra + body, mirroring the REPL's `/skill <name> [extra...]`) then
-    // takes the place of cli.prompt as the first-turn input.
+    // If --skill is set, validate and render the body upfront so an invalid name fails fast —
+    // before any session/MCP setup. The combined string (extra + body, mirroring the REPL's `/skill
+    // <name> [extra...]`) then takes the place of cli.prompt as the first-turn input.
     let skill_prompt = runtime.block_on(build_skill_prompt(&cli))?;
 
     let mut config = ResolvedConfig::from_cli(&cli);
@@ -154,22 +147,19 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     runtime.block_on(async_main(config, acp_mode))
 }
 
-/// Render a `--skill <name>` invocation into the user-message string that
-/// drives the first turn. Returns `Ok(None)` when `--skill` is not set so
-/// callers can leave `cli.prompt` untouched.
+/// Render a `--skill <name>` invocation into the user-message string that drives the first turn.
+/// Returns `Ok(None)` when `--skill` is not set so callers can leave `cli.prompt` untouched.
 ///
-/// Mirrors the REPL handler at `SlashCommand::SkillInvoke` — same lookup,
-/// same `user_invocable` gate, same `format!("{extra}\n\n{body}")` order
-/// when the positional `[PROMPT]` is supplied.
+/// Mirrors the REPL handler at `SlashCommand::SkillInvoke` — same lookup, same `user_invocable`
+/// gate, same `format!("{extra}\n\n{body}")` order when the positional `[PROMPT]` is supplied.
 async fn build_skill_prompt(cli: &cli::Cli) -> anyhow::Result<Option<String>> {
     let Some(name) = cli.skill.as_deref() else {
         return Ok(None);
     };
     let skill = skills::cli::require_skill(name)?;
-    // Pass `None` for session_id: the session is created lazily on the
-    // first turn, so `${AGSH_SESSION_ID}` would be unresolvable here.
-    // This matches the REPL's first-turn `/skill` behaviour, where
-    // session_id is also None until run_turn populates it.
+    // Pass `None` for session_id: the session is created lazily on the first turn, so
+    // `${AGSH_SESSION_ID}` would be unresolvable here. This matches the REPL's first-turn `/skill`
+    // behaviour, where session_id is also None until run_turn populates it.
     let body = skills::load_skill_body(&skill, None)
         .await
         .map_err(|error| anyhow::anyhow!("failed to load skill '{}': {}", name, error))?;
@@ -188,14 +178,11 @@ async fn build_skill_prompt(cli: &cli::Cli) -> anyhow::Result<Option<String>> {
 /// add a single directive that downgrades rmcp's SSE-reconnect warning
 /// to `error`:
 ///
-/// MCP servers behind a CDN / edge (Cloudflare, Fastly, …) close idle
-/// HTTP streams after ~100 s, which trips
-/// `rmcp::transport::common::client_side_sse`'s `warn!("sse stream
-/// error: …")` before rmcp transparently reconnects via `Last-Event-ID`.
-/// The warn fires on every expected reconnect; the real failure mode
-/// (`"max retry times reached"`) is emitted at `error!` from the same
-/// module, so an `=error` floor keeps the useful signal and drops the
-/// noise. Verified against rmcp 1.5.
+/// MCP servers behind a CDN / edge (Cloudflare, Fastly, …) close idle HTTP streams after ~100 s,
+/// which trips `rmcp::transport::common::client_side_sse`'s `warn!("sse stream error: …")` before
+/// rmcp transparently reconnects via `Last-Event-ID`. The warn fires on every expected reconnect;
+/// the real failure mode (`"max retry times reached"`) is emitted at `error!` from the same module,
+/// so an `=error` floor keeps the useful signal and drops the noise. Verified against rmcp 1.5.
 fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
     if let Some(value) = rust_log
@@ -211,15 +198,14 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
 }
 
 async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Result<()> {
-    // Validate provider name and model before opening the session store or
-    // resolving credentials so the user sees a clear "not configured" or
-    // "invalid value" message instead of the downstream credential error.
+    // Validate provider name and model before opening the session store or resolving credentials so
+    // the user sees a clear "not configured" or "invalid value" message instead of the downstream
+    // credential error.
     config.validate()?;
 
-    // Warn once at startup about an unusable configured sandbox backend
-    // or an auto-fallback to landlock that the user could improve by
-    // installing bubblewrap. Re-emitted at read-mode entry boundaries
-    // below.
+    // Warn once at startup about an unusable configured sandbox backend or an auto-fallback to
+    // landlock that the user could improve by installing bubblewrap. Re-emitted at read-mode entry
+    // boundaries below.
     crate::sandbox::warn_if_sandbox_issues(
         &crate::sandbox::SandboxState::from_config(&config),
         crate::sandbox::WarnContext::Startup,
@@ -238,9 +224,8 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
     }
 
     if let Some(max_bytes) = config.max_storage_bytes {
-        // Startup eviction: no sessions are opened yet, so the
-        // active set is empty. The signature is still required for
-        // mid-run callers that want to protect live sessions.
+        // Startup eviction: no sessions are opened yet, so the active set is empty. The signature
+        // is still required for mid-run callers that want to protect live sessions.
         let active: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deleted = session_manager
             .enforce_storage_limit(max_bytes, &active)
@@ -250,9 +235,9 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
         }
     }
 
-    // If no credential from env/config, try loading from database.
-    // Storage key stays "claude" across the rename to "claude-oauth" so existing
-    // users keep their tokens; "openai-codex" matches the provider name.
+    // If no credential from env/config, try loading from database. Storage key stays "claude"
+    // across the rename to "claude-oauth" so existing users keep their tokens; "openai-codex"
+    // matches the provider name.
     let oauth_storage_key = match config.provider_name.as_deref() {
         Some("claude-oauth") => Some("claude"),
         Some("openai-codex") => Some(crate::provider::openai::codex::STORAGE_KEY),
@@ -273,8 +258,8 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
         }
     }
 
-    // Save OAuth token from env/config to database for future use, so the
-    // refresh path has a place to land updated tokens.
+    // Save OAuth token from env/config to database for future use, so the refresh path has a place
+    // to land updated tokens.
     if let Some(credential @ AuthCredential::OAuthToken { .. }) = &config.auth_credential
         && let Some(storage_key) = oauth_storage_key
         && let Err(error) = token_store.save_oauth_token(storage_key, credential).await
@@ -297,16 +282,15 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
         None
     };
 
-    // `agsh acp` reuses every step above (credential resolution, MCP
-    // setup, session-manager housekeeping) and then enters the
-    // JSON-RPC stdio loop instead of the REPL.
+    // `agsh acp` reuses every step above (credential resolution, MCP setup, session-manager
+    // housekeeping) and then enters the JSON-RPC stdio loop instead of the REPL.
     if acp_mode {
         return acp::run_acp(config, session_manager, mcp_manager, mcp_context).await;
     }
 
-    // `--oneshot` runs a single turn and exits; the prompt is required (validated
-    // at startup). Without `--oneshot`, any provided prompt/skill becomes the
-    // first-turn input but the REPL stays open afterwards.
+    // `--oneshot` runs a single turn and exits; the prompt is required (validated at startup).
+    // Without `--oneshot`, any provided prompt/skill becomes the first-turn input but the REPL
+    // stays open afterwards.
     if config.oneshot {
         let prompt = config
             .prompt
@@ -335,15 +319,12 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
     .await
 }
 
-/// Process-wide dependencies that every ACP session shares. Built
-/// once at `agsh acp` startup by [`build_acp_shared_deps`]; sessions
-/// hold an [`Arc<SharedDeps>`] and read fields by reference. Cheap to
-/// clone (every field is either an `Arc`, an owned-but-small value,
-/// or a clonable handle).
+/// Process-wide dependencies that every ACP session shares. Built once at `agsh acp` startup by
+/// [`build_acp_shared_deps`]; sessions hold an [`Arc<SharedDeps>`] and read fields by reference.
+/// Cheap to clone (every field is either an `Arc`, an owned-but-small value, or a clonable handle).
 ///
-/// The REPL / oneshot paths don't use this — they go through
-/// [`create_agent_from_config`] which bundles shared + per-session
-/// work into one call.
+/// The REPL / oneshot paths don't use this — they go through [`create_agent_from_config`] which
+/// bundles shared + per-session work into one call.
 #[derive(Clone)]
 pub struct SharedDeps {
     pub config: Arc<ResolvedConfig>,
@@ -359,15 +340,13 @@ pub struct SharedDeps {
     pub session_stats: Arc<stats::SessionStats>,
 }
 
-/// Build the process-wide [`SharedDeps`] for `agsh acp`. Sets up the
-/// provider, MCP wiring, skill cache, sandbox capability probe, and
-/// the shared `agent_options` template. Each ACP session later calls
-/// [`build_acp_session_agent`] against the resulting struct to spin
-/// up its own per-session `Agent` + `ToolRegistry`.
+/// Build the process-wide [`SharedDeps`] for `agsh acp`. Sets up the provider, MCP wiring, skill
+/// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
+/// calls [`build_acp_session_agent`] against the resulting struct to spin up its own per-session
+/// `Agent` + `ToolRegistry`.
 ///
-/// `mcp_context.set_provider(...)` is called here so MCP sampling
-/// callbacks can reach the provider. Per-session cwd routing happens
-/// at MCP tool dispatch time (Phase 3 task-local cwd).
+/// `mcp_context.set_provider(...)` is called here so MCP sampling callbacks can reach the provider.
+/// Per-session cwd routing happens at MCP tool dispatch time (Phase 3 task-local cwd).
 pub async fn build_acp_shared_deps(
     config: ResolvedConfig,
     session_manager: SessionManager,
@@ -442,16 +421,13 @@ pub async fn build_acp_shared_deps(
         system_prompt_override: None,
     };
 
-    // Publish the provider on the MCP client context so sampling
-    // callbacks can reach it. Registry plumbing now flows through
-    // `McpClientManager::attach_registry` per session.
+    // Publish the provider on the MCP client context so sampling callbacks can reach it. Registry
+    // plumbing now flows through `McpClientManager::attach_registry` per session.
     mcp_context.set_provider(Arc::clone(&provider));
 
-    // Kick off the MCP background connector once for the whole
-    // process. The connector writes tool discoveries through
-    // `update_server_tools`, which fans them out to every
-    // attached registry — so per-session registries built later
-    // via `build_acp_session_agent` see the tools as servers
+    // Kick off the MCP background connector once for the whole process. The connector writes tool
+    // discoveries through `update_server_tools`, which fans them out to every attached registry —
+    // so per-session registries built later via `build_acp_session_agent` see the tools as servers
     // come online. Idempotent on second call.
     if let Some(manager) = &mcp_manager {
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(&config));
@@ -472,11 +448,9 @@ pub async fn build_acp_shared_deps(
     })
 }
 
-/// Inputs both `build_acp_session_agent` and `create_agent_from_config`
-/// hand into the unified [`assemble_agent`] helper. Bundling them in
-/// a struct keeps the assembly call below readable and lets both
-/// callers express "everything I built; turn it into an Agent" in one
-/// line.
+/// Inputs both `build_acp_session_agent` and `create_agent_from_config` hand into the unified
+/// [`assemble_agent`] helper. Bundling them in a struct keeps the assembly call below readable and
+/// lets both callers express "everything I built; turn it into an Agent" in one line.
 struct AgentAssembly<'a> {
     web_client: crate::config::WebClientConfig,
     sandbox_enabled: bool,
@@ -493,20 +467,16 @@ struct AgentAssembly<'a> {
     session_stats: Arc<stats::SessionStats>,
 }
 
-/// Per-session agent assembly used by both the ACP session builder
-/// and the REPL's `create_agent_from_config`. Builds the shared
-/// todo list / scratchpad cell, the tool registry (with the
-/// session's cwd / permission / frontend baked into the builtins),
-/// registers `spawn_agent` and the MCP resource meta-tools, attaches
-/// the registry to the MCP manager, and finally constructs the
-/// `Agent` itself.
+/// Per-session agent assembly used by both the ACP session builder and the REPL's
+/// `create_agent_from_config`. Builds the shared todo list / scratchpad cell, the tool registry
+/// (with the session's cwd / permission / frontend baked into the builtins), registers
+/// `spawn_agent` and the MCP resource meta-tools, attaches the registry to the MCP manager, and
+/// finally constructs the `Agent` itself.
 ///
-/// **MCP attach-before-connector invariant**: the caller is expected
-/// to either (a) already have run `start_connector` (ACP path —
-/// `build_acp_shared_deps` does this once) or (b) call
-/// `start_connector` *after* this returns (REPL path). Either way,
-/// the registry must be attached before any connector activity, so
-/// initial tool-list discoveries reach this session's registry.
+/// **MCP attach-before-connector invariant**: the caller is expected to either (a) already have run
+/// `start_connector` (ACP path — `build_acp_shared_deps` does this once) or (b) call
+/// `start_connector` *after* this returns (REPL path). Either way, the registry must be attached
+/// before any connector activity, so initial tool-list discoveries reach this session's registry.
 async fn assemble_agent(
     bundle: AgentAssembly<'_>,
     shared_permission: SharedPermission,
@@ -559,14 +529,13 @@ async fn assemble_agent(
     }
 
     if let Some(manager) = bundle.mcp_manager {
-        // Register MCP resource meta-tools upfront — they delegate
-        // through `ServerEntry::require_connected` so they tolerate
-        // Pending / Failed servers until a specific one is called.
+        // Register MCP resource meta-tools upfront — they delegate through
+        // `ServerEntry::require_connected` so they tolerate Pending / Failed servers until a
+        // specific one is called.
         crate::tools::mcp_resources::register_all(&tool_registry, Arc::clone(manager));
-        // Attach this session's registry so the MCP connector and
-        // tools/list_changed handler propagate updates into it.
-        // Must happen before the connector kicks off — otherwise
-        // initial server-state updates miss the registry.
+        // Attach this session's registry so the MCP connector and tools/list_changed handler
+        // propagate updates into it. Must happen before the connector kicks off — otherwise initial
+        // server-state updates miss the registry.
         manager.attach_registry(tool_registry.clone()).await;
     }
 
@@ -590,17 +559,13 @@ async fn assemble_agent(
     Ok((agent, tool_registry))
 }
 
-/// Build a per-session `Agent` + `ToolRegistry` from the
-/// already-prepared [`SharedDeps`]. Each ACP session gets a fresh
-/// todo list, scratchpad slot, tool registry (with the session's
-/// cwd / permission / frontend baked into its builtin tools), and an
-/// Agent that owns those.
+/// Build a per-session `Agent` + `ToolRegistry` from the already-prepared [`SharedDeps`]. Each ACP
+/// session gets a fresh todo list, scratchpad slot, tool registry (with the session's cwd /
+/// permission / frontend baked into its builtin tools), and an Agent that owns those.
 ///
-/// The returned `ToolRegistry` is the one already attached to the
-/// MCP manager — callers (the ACP `session/new` handler) keep a
-/// handle so they can pass it to
-/// [`crate::mcp::McpClientManager::detach_registry`] on
-/// `session/close`.
+/// The returned `ToolRegistry` is the one already attached to the MCP manager — callers (the ACP
+/// `session/new` handler) keep a handle so they can pass it to
+/// [`crate::mcp::McpClientManager::detach_registry`] on `session/close`.
 pub async fn build_acp_session_agent(
     shared: &SharedDeps,
     shared_permission: SharedPermission,
@@ -625,10 +590,9 @@ pub async fn build_acp_session_agent(
     assemble_agent(bundle, shared_permission, frontend, cwd).await
 }
 
-// Top-level entry point for assembling the agent; splitting its inputs
-// further would force callers to pre-bundle unrelated collaborators
-// (config, session manager, permission mode, credential, MCP plumbing,
-// frontend) just to appease the arg-count lint.
+// Top-level entry point for assembling the agent; splitting its inputs further would force callers
+// to pre-bundle unrelated collaborators (config, session manager, permission mode, credential, MCP
+// plumbing, frontend) just to appease the arg-count lint.
 #[allow(clippy::too_many_arguments)]
 async fn create_agent_from_config(
     config: &ResolvedConfig,
@@ -681,12 +645,11 @@ async fn create_agent_from_config(
             crate::sandbox::SandboxCapability::Unavailable
         );
 
-    // Discover skills once at startup. Any malformed `SKILL.md` emits its
-    // `tracing::warn!` here (tracing is already initialized), so the user
-    // sees parse errors above the first prompt rather than interleaved with
-    // their first turn's output. The cache also drives mid-session auto-
-    // reload — `SkillCache::current()` re-snapshots on each turn and
-    // re-discovers only when the on-disk state changes.
+    // Discover skills once at startup. Any malformed `SKILL.md` emits its `tracing::warn!` here
+    // (tracing is already initialized), so the user sees parse errors above the first prompt rather
+    // than interleaved with their first turn's output. The cache also drives mid-session auto-
+    // reload — `SkillCache::current()` re-snapshots on each turn and re-discovers only when the
+    // on-disk state changes.
     let skills = crate::skills::SkillCache::discover();
 
     let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
@@ -695,9 +658,9 @@ async fn create_agent_from_config(
         config.builtin_tool_permissions.clone(),
     );
 
-    // Build the parent's `AgentOptions` up-front so it can be cloned into
-    // `ToolBuilderParams` for sub-agents to inherit `sandboxed_shell` /
-    // `context_messages` / `user_instructions` via `Agent::new_subagent`.
+    // Build the parent's `AgentOptions` up-front so it can be cloned into `ToolBuilderParams` for
+    // sub-agents to inherit `sandboxed_shell` / `context_messages` / `user_instructions` via
+    // `Agent::new_subagent`.
     let agent_options = AgentOptions {
         streaming: config.streaming,
         sandboxed_shell,
@@ -714,8 +677,8 @@ async fn create_agent_from_config(
         user_instructions: config.user_instructions.clone(),
         mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
-        // Parent builds its system prompt dynamically per-turn via
-        // context::build_system_prompt. Sub-agents override.
+        // Parent builds its system prompt dynamically per-turn via context::build_system_prompt.
+        // Sub-agents override.
         system_prompt_override: None,
     };
 
@@ -740,20 +703,17 @@ async fn create_agent_from_config(
     crate::tools::warn_on_stale_builtin_tool_config(&builtin_filter);
 
     if let Some(manager) = mcp_manager {
-        // Kick off the background connector. Each server's adapters
-        // are pushed through `manager.update_server_tools` and then
-        // fan out to every attached registry. Safe to call after any
-        // number of `attach_registry`s; idempotent on second call.
-        // (The ACP path does this once in `build_acp_shared_deps`;
-        // the REPL path does it here, after `assemble_agent` has
-        // attached the single registry.)
+        // Kick off the background connector. Each server's adapters are pushed through
+        // `manager.update_server_tools` and then fan out to every attached registry. Safe to call
+        // after any number of `attach_registry`s; idempotent on second call. (The ACP path does
+        // this once in `build_acp_shared_deps`; the REPL path does it here, after `assemble_agent`
+        // has attached the single registry.)
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(config));
     }
 
-    // Now that provider exists, publish it on the MCP client context
-    // so sampling callbacks (`sampling/createMessage`) can reach it.
-    // The MCP-side tool registry plumbing now lives on the manager
-    // (see `attach_registry` above); no `set_registry` call here.
+    // Now that provider exists, publish it on the MCP client context so sampling callbacks
+    // (`sampling/createMessage`) can reach it. The MCP-side tool registry plumbing now lives on the
+    // manager (see `attach_registry` above); no `set_registry` call here.
     if let Some(context) = mcp_context {
         context.set_provider(Arc::clone(&provider));
         context.set_cwd(Arc::clone(&cwd));
@@ -762,13 +722,11 @@ async fn create_agent_from_config(
     Ok(agent)
 }
 
-/// Run one agent turn with Ctrl+C wired to a fresh cancellation token.
-/// Spawns a `ctrl_c()` listener for the turn's duration and aborts it
-/// afterward, so a SIGINT during the turn cancels it (and every tool
-/// and sub-agent it spawned), while a SIGINT between turns is not
-/// consumed by a leaked listener. Every `run_turn` callsite in the
-/// REPL / CLI path must go through here — a bare `CancellationToken`
-/// with no signal source silently swallows Ctrl+C.
+/// Run one agent turn with Ctrl+C wired to a fresh cancellation token. Spawns a `ctrl_c()` listener
+/// for the turn's duration and aborts it afterward, so a SIGINT during the turn cancels it (and
+/// every tool and sub-agent it spawned), while a SIGINT between turns is not consumed by a leaked
+/// listener. Every `run_turn` callsite in the REPL / CLI path must go through here — a bare
+/// `CancellationToken` with no signal source silently swallows Ctrl+C.
 async fn run_turn_interruptible(
     agent: &Agent,
     session_id: &mut Option<uuid::Uuid>,
@@ -788,8 +746,8 @@ async fn run_turn_interruptible(
         .run_turn(session_id, messages, input, cancellation)
         .await;
     signal_handle.abort();
-    // REPL / `agsh -p` callers don't surface a stop reason — they
-    // only care whether the turn succeeded. Drop the `TurnOutcome`.
+    // REPL / `agsh -p` callers don't surface a stop reason — they only care whether the turn
+    // succeeded. Drop the `TurnOutcome`.
     result.map(|_| ())
 }
 
@@ -810,11 +768,10 @@ async fn run_oneshot(
     }
     let credential = resolve_credential(&config)?;
     let session_stats = Arc::new(stats::SessionStats::default());
-    // Oneshot has no REPL, so approval requests can't reach a human.
-    // The channel below is intentionally disconnected on the receiver
-    // side: `ReplFrontend::request_permission`'s `send` will fail, and
-    // the agent surfaces a `cancelled` tool result — same end behavior
-    // as the pre-refactor `None` approval sender.
+    // Oneshot has no REPL, so approval requests can't reach a human. The channel below is
+    // intentionally disconnected on the receiver side: `ReplFrontend::request_permission`'s `send`
+    // will fail, and the agent surfaces a `cancelled` tool result — same end behavior as the
+    // pre-refactor `None` approval sender.
     let (noninteractive_sender, _) = std::sync::mpsc::channel::<repl::AgentToReplEvent>();
     let oneshot_frontend: Arc<dyn frontend::Frontend> =
         Arc::new(frontend::ReplFrontend::new(frontend::ReplFrontendConfig {
@@ -878,10 +835,9 @@ async fn run_interactive(
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
-    // Per-session working directory, initialised from process cwd at
-    // startup. Shared by reference between the REPL (prompt + `/cd`)
-    // and the agent (file/shell/find/grep tools + environment-context
-    // block). Process cwd is no longer mutated.
+    // Per-session working directory, initialised from process cwd at startup. Shared by reference
+    // between the REPL (prompt + `/cd`) and the agent (file/shell/find/grep tools +
+    // environment-context block). Process cwd is no longer mutated.
     let cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
         std::env::current_dir().unwrap_or_else(|error| {
             tracing::warn!("could not read process cwd at startup: {}", error);
@@ -897,8 +853,8 @@ async fn run_interactive(
         );
     }
 
-    // Resolve session resumption BEFORE spawning the REPL so the
-    // "Resuming session" message appears before the first prompt.
+    // Resolve session resumption BEFORE spawning the REPL so the "Resuming session" message appears
+    // before the first prompt.
     let (mut session_id, mut messages, mut session_lock) =
         resolve_session_resume(&session_manager, &config).await?;
 
@@ -909,9 +865,8 @@ async fn run_interactive(
                     render::last_n_turns(messages.as_slice(), n),
                     &history_render_options(&config),
                 );
-                // Match the live-turn-end convention: blank line
-                // between the rendered content and the first REPL
-                // prompt. `reprint_last_message` does the same.
+                // Match the live-turn-end convention: blank line between the rendered content and
+                // the first REPL prompt. `reprint_last_message` does the same.
                 if config.newline_before_prompt {
                     eprintln!();
                 }
@@ -922,13 +877,11 @@ async fn run_interactive(
 
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ReplEvent>();
 
-    // If a prompt or skill was given without `--oneshot`, queue it as a
-    // synthetic user input so the first turn runs immediately. The REPL
-    // takes over afterwards for follow-up turns. The send cannot fail —
-    // the receiver was just constructed above. Tracking the flag separately
-    // tells the REPL to wait for the synthetic turn's events before drawing
-    // its first prompt — otherwise reedline's prompt collides with the
-    // agent's output.
+    // If a prompt or skill was given without `--oneshot`, queue it as a synthetic user input so the
+    // first turn runs immediately. The REPL takes over afterwards for follow-up turns. The send
+    // cannot fail — the receiver was just constructed above. Tracking the flag separately tells the
+    // REPL to wait for the synthetic turn's events before drawing its first prompt — otherwise
+    // reedline's prompt collides with the agent's output.
     let initial_turn_pending = initial_prompt.is_some();
     if let Some(prompt) = initial_prompt {
         input_sender
@@ -937,9 +890,8 @@ async fn run_interactive(
     }
     let (agent_event_sender, agent_event_receiver) =
         std::sync::mpsc::channel::<repl::AgentToReplEvent>();
-    // The REPL frontend forwards approval requests to the same channel
-    // the REPL thread already reads from for `Done` / MCP elicitation /
-    // MCP progress events.
+    // The REPL frontend forwards approval requests to the same channel the REPL thread already
+    // reads from for `Done` / MCP elicitation / MCP progress events.
     let repl_frontend: Arc<dyn frontend::Frontend> =
         Arc::new(frontend::ReplFrontend::new(frontend::ReplFrontendConfig {
             render_mode: config.render_mode,
@@ -951,8 +903,8 @@ async fn run_interactive(
             agent_event_sender: agent_event_sender.clone(),
         }));
 
-    // Wire progress/elicitation notifications from MCP handlers through the
-    // same agent→shell channel so the REPL can render them inline.
+    // Wire progress/elicitation notifications from MCP handlers through the same agent→shell
+    // channel so the REPL can render them inline.
     {
         let sender_for_progress = agent_event_sender.clone();
         mcp::progress::set_ui_sink(Box::new(move |update| {
@@ -1047,9 +999,8 @@ async fn run_interactive(
                     }
                 }
 
-                // The first turn creates the session if one wasn't resumed;
-                // claim the file lock as soon as the ID is known so a second
-                // agsh invocation can't attach to it.
+                // The first turn creates the session if one wasn't resumed; claim the file lock as
+                // soon as the ID is known so a second agsh invocation can't attach to it.
                 if session_lock.is_none()
                     && let Some(id) = session_id
                 {
@@ -1134,8 +1085,8 @@ async fn run_interactive(
                                 );
                                 continue;
                             };
-                            // Map positional args to declared prompt argument
-                            // names (lookup via prompts/list).
+                            // Map positional args to declared prompt argument names (lookup via
+                            // prompts/list).
                             let arg_names = match mcp::list_prompts(&entry).await {
                                 Ok(prompts) => prompts
                                     .into_iter()
@@ -1166,9 +1117,8 @@ async fn run_interactive(
                             }
                             match mcp::get_prompt(&entry, prompt_name.clone(), arguments).await {
                                 Ok(result) => {
-                                    // Render the prompt messages as a single
-                                    // user turn — same shape as the
-                                    // `get_mcp_prompt` tool output.
+                                    // Render the prompt messages as a single user turn — same shape
+                                    // as the `get_mcp_prompt` tool output.
                                     let mut body = String::new();
                                     for message in &result.messages {
                                         let role = match message.role {
@@ -1216,13 +1166,10 @@ async fn run_interactive(
                         }
                     }
                     repl::SlashCommand::SkillInvoke { name, extra } => 'invoke: {
-                        // Labeled block so the early-exit error paths can
-                        // `break 'invoke` out of the arm body without
-                        // skipping the `AgentToReplEvent::Done` send below
-                        // — `continue` would short-circuit the outer
-                        // `while let`, leaving the REPL stuck in
-                        // `wait_for_agent` and never drawing the next
-                        // prompt.
+                        // Labeled block so the early-exit error paths can `break 'invoke` out of
+                        // the arm body without skipping the `AgentToReplEvent::Done` send below —
+                        // `continue` would short-circuit the outer `while let`, leaving the REPL
+                        // stuck in `wait_for_agent` and never drawing the next prompt.
                         let installed = agent.skills().current().await;
                         let Some(skill) = installed.iter().find(|s| s.name == name) else {
                             let available: Vec<&str> =
@@ -1245,12 +1192,10 @@ async fn run_interactive(
                                     break 'invoke;
                                 }
                             };
-                        // Prepend the user's free-form directive to the
-                        // skill body when present. The blank-line
-                        // separator gives the model a visual cue that
-                        // the first paragraph is the user's "do this
-                        // skill, but with this twist" and the rest is
-                        // the skill's static body.
+                        // Prepend the user's free-form directive to the skill body when present.
+                        // The blank-line separator gives the model a visual cue that the first
+                        // paragraph is the user's "do this skill, but with this twist" and the rest
+                        // is the skill's static body.
                         let body = if extra.is_empty() {
                             body
                         } else {
@@ -1276,13 +1221,11 @@ async fn run_interactive(
                             Some(n) => render::last_n_turns(materialised, n),
                             None => materialised,
                         };
-                        // Bracket the rendered history with the same
-                        // blank-line spacing the live REPL puts around
-                        // a regular turn: a `newline_after_prompt`
-                        // blank between the user's `/history` line and
-                        // the rendered content, plus a
-                        // `newline_before_prompt` blank between the
-                        // content and the next REPL prompt.
+                        // Bracket the rendered history with the same blank-line spacing the live
+                        // REPL puts around a regular turn: a `newline_after_prompt` blank between
+                        // the user's `/history` line and the rendered content, plus a
+                        // `newline_before_prompt` blank between the content and the next REPL
+                        // prompt.
                         if config.newline_after_prompt {
                             eprintln!();
                         }
@@ -1315,8 +1258,8 @@ async fn run_interactive(
     {
         render::render_session_id("Leaving session", &id.to_string());
     }
-    // Drop after the "Leaving session" message so the lock is held until the
-    // very end; the OS releases the underlying flock when the FD closes.
+    // Drop after the "Leaving session" message so the lock is held until the very end; the OS
+    // releases the underlying flock when the FD closes.
     drop(session_lock);
 
     if let Some(manager) = mcp_manager {
@@ -1326,9 +1269,9 @@ async fn run_interactive(
     Ok(())
 }
 
-/// Unwrap the shared MCP manager and drive its shutdown. The manager is held
-/// behind an `Arc` because resource/prompt tools keep clones of it; once the
-/// agent and tool registry have been dropped, try_unwrap should succeed.
+/// Unwrap the shared MCP manager and drive its shutdown. The manager is held behind an `Arc`
+/// because resource/prompt tools keep clones of it; once the agent and tool registry have been
+/// dropped, try_unwrap should succeed.
 async fn shutdown_mcp_manager(manager: Arc<mcp::McpClientManager>) {
     match Arc::try_unwrap(manager) {
         Ok(manager) => manager.shutdown().await,
@@ -1485,8 +1428,8 @@ async fn run_tools_subcommand(
             );
             crate::tools::warn_on_stale_builtin_tool_config(&filter);
 
-            // Build with no filter so the catalogue carries every tool's
-            // hardcoded level; overlay the real filter for status/source.
+            // Build with no filter so the catalogue carries every tool's hardcoded level; overlay
+            // the real filter for status/source.
             let session_manager = SessionManager::open(None).await?;
             let shared_permission =
                 SharedPermission::new(config.permission, config.enabled_permissions);
@@ -1508,8 +1451,8 @@ async fn run_tools_subcommand(
                 todo_list,
                 session_manager,
                 shared_session_id,
-                // `agsh tools list` only prints the tool catalogue; skill
-                // metadata isn't read, so skip the filesystem walk.
+                // `agsh tools list` only prints the tool catalogue; skill metadata isn't read, so
+                // skip the filesystem walk.
                 crate::skills::SkillCache::for_root(None),
                 crate::tools::BuiltinToolFilter::default(),
                 std::sync::Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("."))),
@@ -1643,8 +1586,8 @@ async fn delete_sessions(
         if session_manager.delete_session(*session_id).await? {
             deleted += 1;
         } else {
-            // User-facing error: they asked to delete a specific ID and
-            // we couldn't find it, so stderr (not silent) is right.
+            // User-facing error: they asked to delete a specific ID and we couldn't find it, so
+            // stderr (not silent) is right.
             eprintln!("Session not found: {}", session_id);
         }
     }
@@ -1672,9 +1615,8 @@ fn format_session_as_markdown(
     for message in messages {
         match message.role {
             provider::Role::User => {
-                // A "user" message can be either a plain user turn or a
-                // tool_results envelope. Inspect content blocks rather
-                // than role to decide.
+                // A "user" message can be either a plain user turn or a tool_results envelope.
+                // Inspect content blocks rather than role to decide.
                 let has_tool_results = message
                     .content
                     .iter()
@@ -1749,10 +1691,9 @@ fn resolve_large_output_tags(
     .into_owned()
 }
 
-/// Translate the live-REPL display config into the options that
-/// [`render::render_message_history`] consumes. Keeps the spacing /
-/// styling rules between live output and history rendering in sync from
-/// a single source of truth.
+/// Translate the live-REPL display config into the options that [`render::render_message_history`]
+/// consumes. Keeps the spacing / styling rules between live output and history rendering in sync
+/// from a single source of truth.
 fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptions {
     render::HistoryRenderOptions {
         render_mode: config.render_mode,
@@ -1844,9 +1785,9 @@ async fn resolve_session_resume(
     }
 }
 
-/// Resolve `agsh -c <value>` (where `value` is not "last") to a single
-/// session UUID. Tries a full-UUID parse first; if that fails, falls back
-/// to a prefix lookup so users can type just the leading hex chars.
+/// Resolve `agsh -c <value>` (where `value` is not "last") to a single session UUID. Tries a
+/// full-UUID parse first; if that fails, falls back to a prefix lookup so users can type just the
+/// leading hex chars.
 ///
 /// Errors out cleanly when the prefix matches zero or multiple sessions.
 async fn resolve_session_id(
@@ -1880,16 +1821,14 @@ async fn load_session_messages(
     session_manager: &SessionManager,
     session_id: uuid::Uuid,
 ) -> anyhow::Result<conversation::Conversation> {
-    // Hydrate the event log directly. Legacy databases (rows predating
-    // the event-log refactor) decode their `user`/`assistant`/`tool_results`
-    // rows as `Event::Append` so resume is forward- and backward-
-    // compatible without a schema migration.
+    // Hydrate the event log directly. Legacy databases (rows predating the event-log refactor)
+    // decode their `user`/`assistant`/`tool_results` rows as `Event::Append` so resume is forward-
+    // and backward- compatible without a schema migration.
     let events = session_manager.load_events(session_id).await?;
     let mut log = conversation::Conversation::from_events(events);
 
-    // Drop assistant messages whose tool_use blocks lack matching
-    // tool_result blocks in the next message. Anthropic's API rejects
-    // orphans; this sanitizes the log after a crash mid-tool-call.
+    // Drop assistant messages whose tool_use blocks lack matching tool_result blocks in the next
+    // message. Anthropic's API rejects orphans; this sanitizes the log after a crash mid-tool-call.
     let dropped = log.sanitize_orphans();
     for message in &dropped {
         let tool_use_ids: Vec<String> = message
@@ -2034,9 +1973,9 @@ mod tests {
 
     // -- log filter --
 
-    /// The default filter (no `RUST_LOG`) floors rmcp's SSE-reconnect
-    /// module at `error`. Guards against a future refactor silently
-    /// dropping the directive and letting the noisy warning back in.
+    /// The default filter (no `RUST_LOG`) floors rmcp's SSE-reconnect module at `error`. Guards
+    /// against a future refactor silently dropping the directive and letting the noisy warning back
+    /// in.
     #[test]
     fn default_log_filter_downgrades_rmcp_sse_warns() {
         let rendered = format!("{}", build_log_filter(None, "warn"));
@@ -2048,9 +1987,8 @@ mod tests {
         );
     }
 
-    /// When the user sets `RUST_LOG` we honour it verbatim — no hidden
-    /// directive overlay — so debugging rmcp internals with e.g.
-    /// `RUST_LOG=rmcp=debug` works as expected.
+    /// When the user sets `RUST_LOG` we honour it verbatim — no hidden directive overlay — so
+    /// debugging rmcp internals with e.g. `RUST_LOG=rmcp=debug` works as expected.
     #[test]
     fn explicit_rust_log_is_not_overridden() {
         let rendered = format!("{}", build_log_filter(Some("rmcp=debug"), "warn"));

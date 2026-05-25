@@ -1,7 +1,7 @@
-//! Scratchpad: session-scoped, persisted key/value text store. Oversized
-//! tool outputs are automatically redirected here and replaced inline with a
-//! preview + handle, keeping the conversation context bounded. Provides
-//! write/read/edit/list/delete operations plus a regex search mode.
+//! Scratchpad: session-scoped, persisted key/value text store. Oversized tool outputs are
+//! automatically redirected here and replaced inline with a preview + handle, keeping the
+//! conversation context bounded. Provides write/read/edit/list/delete operations plus a regex
+//! search mode.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -21,8 +21,8 @@ use crate::{
     session::{SessionManager, ToolOutputSummary},
 };
 
-/// Tool result text blocks larger than this (in bytes) are persisted to the
-/// database and replaced with a preview + handle in the conversation context.
+/// Tool result text blocks larger than this (in bytes) are persisted to the database and replaced
+/// with a preview + handle in the conversation context.
 pub const MAX_INLINE_RESULT_BYTES: usize = 30_000;
 
 /// Number of bytes included in the inline preview.
@@ -54,8 +54,8 @@ async fn resolve_session_id(
         })
 }
 
-/// Build a map from tool_use_id to (tool_name, input) for the ToolUse blocks
-/// in an assistant message.
+/// Build a map from tool_use_id to (tool_name, input) for the ToolUse blocks in an assistant
+/// message.
 fn build_tool_use_map(assistant_message: &Message) -> HashMap<String, (String, serde_json::Value)> {
     let mut map = HashMap::new();
     for block in &assistant_message.content {
@@ -101,9 +101,8 @@ fn build_large_output_preview(name: &str, text: &str) -> String {
     replacement
 }
 
-/// Save tool results to the scratchpad when the agent explicitly requested it
-/// via the `scratchpad` parameter on a tool call. Replaces the inline result
-/// with a brief reference.
+/// Save tool results to the scratchpad when the agent explicitly requested it via the `scratchpad`
+/// parameter on a tool call. Replaces the inline result with a brief reference.
 pub async fn save_explicit_scratchpad_results(
     session_manager: &SessionManager,
     session_id: Uuid,
@@ -146,11 +145,10 @@ pub async fn save_explicit_scratchpad_results(
     Ok(())
 }
 
-/// Check each text block in tool results. If oversized, persist to DB
-/// and replace with a preview + handle. Names are derived from the tool
-/// call's `scratchpad_hint` (MCP adapters) or the tool name otherwise, with
-/// a numeric suffix on collision. `hints` is typically the per-turn map
-/// owned by the agent — empty is fine.
+/// Check each text block in tool results. If oversized, persist to DB and replace with a preview +
+/// handle. Names are derived from the tool call's `scratchpad_hint` (MCP adapters) or the tool name
+/// otherwise, with a numeric suffix on collision. `hints` is typically the per-turn map owned by
+/// the agent — empty is fine.
 pub async fn persist_oversized_results(
     session_manager: &SessionManager,
     session_id: Uuid,
@@ -199,9 +197,8 @@ pub async fn persist_oversized_results(
 pub(super) struct ScratchpadWriteTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
-    /// Names the parent has lent this sub-agent read-only. Writing to
-    /// any of these is rejected so the child can't silently shadow the
-    /// parent's copy. Empty on the primary agent's registry.
+    /// Names the parent has lent this sub-agent read-only. Writing to any of these is rejected so
+    /// the child can't silently shadow the parent's copy. Empty on the primary agent's registry.
     pub inherited_names: Vec<String>,
 }
 
@@ -298,13 +295,12 @@ impl Tool for ScratchpadWriteTool {
 pub(super) struct ScratchpadReadTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
-    /// Sub-agent fallback: when the read misses the active (child)
-    /// session, retry against this parent session for names listed in
-    /// [`Self::inherited_names`]. `None` on the primary agent's
+    /// Sub-agent fallback: when the read misses the active (child) session, retry against this
+    /// parent session for names listed in [`Self::inherited_names`]. `None` on the primary agent's
     /// registry — no fallback path is taken.
     pub parent_session_id: Option<Uuid>,
-    /// Allowlist of parent-scoped scratchpad names the sub-agent is
-    /// permitted to read. Empty on the primary agent.
+    /// Allowlist of parent-scoped scratchpad names the sub-agent is permitted to read. Empty on
+    /// the primary agent.
     pub inherited_names: Vec<String>,
 }
 
@@ -377,10 +373,9 @@ impl Tool for ScratchpadReadTool {
             .load_tool_output(session_id, name)
             .await?;
 
-        // Sub-agent inheritance: fall back to the parent's scratchpad if
-        // the child miss matches an allowlisted name. Read-only — writes
-        // still target the child session, so the parent's audit trail is
-        // untouched.
+        // Sub-agent inheritance: fall back to the parent's scratchpad if the child miss matches an
+        // allowlisted name. Read-only — writes still target the child session, so the parent's
+        // audit trail is untouched.
         if content.is_none()
             && let Some(parent_sid) = self.parent_session_id
             && self.inherited_names.iter().any(|n| n == name)
@@ -589,12 +584,12 @@ impl Tool for ScratchpadEditTool {
 pub(super) struct ScratchpadListTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
-    /// Sub-agent fallback: list also enumerates parent entries filtered
-    /// by [`Self::inherited_names`], rendered in a trailing `(inherited)`
-    /// section. `None` on the primary agent.
+    /// Sub-agent fallback: list also enumerates parent entries filtered by
+    /// [`Self::inherited_names`], rendered in a trailing `(inherited)` section. `None` on the
+    /// primary agent.
     pub parent_session_id: Option<Uuid>,
-    /// Allowlist of parent-scoped scratchpad names visible to this
-    /// sub-agent. Empty on the primary agent.
+    /// Allowlist of parent-scoped scratchpad names visible to this sub-agent. Empty on the primary
+    /// agent.
     pub inherited_names: Vec<String>,
 }
 
@@ -628,8 +623,8 @@ impl Tool for ScratchpadListTool {
 
         let own = self.session_manager.list_tool_outputs(session_id).await?;
 
-        // Inherited (parent) entries — filtered to the allowlist so the
-        // sub-agent never sees parent state it wasn't explicitly granted.
+        // Inherited (parent) entries — filtered to the allowlist so the sub-agent never sees parent
+        // state it wasn't explicitly granted.
         let mut rows: Vec<(ToolOutputSummary, &'static str)> =
             own.into_iter().map(|entry| (entry, "own")).collect();
         if let Some(parent_sid) = self.parent_session_id
@@ -670,12 +665,11 @@ impl Tool for ScratchpadListTool {
 pub(super) struct ScratchpadMergeTool {
     pub session_manager: SessionManager,
     pub session_id: Arc<RwLock<Option<Uuid>>>,
-    /// See [`ScratchpadReadTool::parent_session_id`] — sources may be
-    /// inherited from the parent's scratchpad.
+    /// See [`ScratchpadReadTool::parent_session_id`] — sources may be inherited from the parent's
+    /// scratchpad.
     pub parent_session_id: Option<Uuid>,
-    /// See [`ScratchpadWriteTool::inherited_names`] — the `target` is
-    /// blocked if listed here; sources are also matched against this set
-    /// for the parent-fallback read.
+    /// See [`ScratchpadWriteTool::inherited_names`] — the `target` is blocked if listed here;
+    /// sources are also matched against this set for the parent-fallback read.
     pub inherited_names: Vec<String>,
 }
 
@@ -763,10 +757,9 @@ impl Tool for ScratchpadMergeTool {
 
         let session_id = resolve_session_id(&self.session_id, "scratchpad_merge").await?;
 
-        // Resolve each source. Inheritance-aware: child first, then
-        // parent if the name is allowlisted — same fallback path as
-        // ScratchpadReadTool. Any missing source aborts the merge so we
-        // never partially write the target.
+        // Resolve each source. Inheritance-aware: child first, then parent if the name is
+        // allowlisted — same fallback path as ScratchpadReadTool. Any missing source aborts the
+        // merge so we never partially write the target.
         let mut loaded: Vec<(String, String)> = Vec::with_capacity(sources.len());
         for name in &sources {
             let mut content = self
@@ -975,11 +968,10 @@ impl Tool for ScratchpadRenameTool {
                 message: "missing 'new' parameter".to_string(),
             })?;
 
-        // Block both ends. Renaming away from an inherited source would
-        // be a no-op against the parent's row but implies the sub-agent
-        // owns the name; renaming to an inherited target would create a
-        // child shadow. Either way: reject early with the same error
-        // text the other mutators use, naming the offending entry.
+        // Block both ends. Renaming away from an inherited source would be a no-op against the
+        // parent's row but implies the sub-agent owns the name; renaming to an inherited target
+        // would create a child shadow. Either way: reject early with the same error text the other
+        // mutators use, naming the offending entry.
         if is_inherited(&self.inherited_names, old) {
             return inherited_write_error(old);
         }
@@ -1094,11 +1086,10 @@ impl Tool for ScratchpadLoadFileTool {
             super::util::canonicalize_for_tool("scratchpad_load_file", std::path::Path::new(&path))
                 .await?;
 
-        // We read the file as raw bytes (rather than directly as a String)
-        // so that on a UTF-8 failure we can run a single content sniff and
-        // tell the model what kind of binary it just tried to load. The
-        // happy path then incurs one extra allocation; for the sizes this
-        // tool is meant for (tens of MB), that's negligible.
+        // We read the file as raw bytes (rather than directly as a String) so that on a UTF-8
+        // failure we can run a single content sniff and tell the model what kind of binary it just
+        // tried to load. The happy path then incurs one extra allocation; for the sizes this tool
+        // is meant for (tens of MB), that's negligible.
         let bytes = super::file::read_file_bytes(&canonical)
             .await
             .map_err(|error| AgshError::ToolExecution {
@@ -1203,9 +1194,8 @@ impl Tool for ScratchpadSaveFileTool {
 
         let session_id = resolve_session_id(&self.session_id, "scratchpad_save_file").await?;
 
-        // Inherited-fallback read: mirror ScratchpadReadTool. Lets a sub-
-        // agent flush a parent's allowlisted entry to disk without having
-        // to first copy it into its own scratchpad.
+        // Inherited-fallback read: mirror ScratchpadReadTool. Lets a sub- agent flush a parent's
+        // allowlisted entry to disk without having to first copy it into its own scratchpad.
         let mut content = self
             .session_manager
             .load_tool_output(session_id, name)
@@ -1224,10 +1214,9 @@ impl Tool for ScratchpadSaveFileTool {
             message: format!("scratchpad entry \"{}\" not found", name),
         })?;
 
-        // Path resolution mirrors `write_file`: canonicalize the parent
-        // dir (creating it if necessary) and re-join the filename so the
-        // O_NOFOLLOW open at the leaf closes the canonicalize→open TOCTOU
-        // window for symlink-swap attacks. See src/tools/file.rs for the
+        // Path resolution mirrors `write_file`: canonicalize the parent dir (creating it if
+        // necessary) and re-join the filename so the O_NOFOLLOW open at the leaf closes the
+        // canonicalize→open TOCTOU window for symlink-swap attacks. See src/tools/file.rs for the
         // original rationale.
         let file_path = std::path::PathBuf::from(&path);
         let file_name = file_path
@@ -1456,10 +1445,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_explicit_scratchpad_ignores_non_scratchpad_keys() {
-        // Regression test for the `render_image` clobber bug: when a tool uses
-        // `from_scratchpad` (as an input-source param) instead of `scratchpad`
-        // (the output-destination convention), the agent-layer save must not
-        // touch the pre-existing scratchpad entry.
+        // Regression test for the `render_image` clobber bug: when a tool uses `from_scratchpad`
+        // (as an input-source param) instead of `scratchpad` (the output-destination convention),
+        // the agent-layer save must not touch the pre-existing scratchpad entry.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create");
 
@@ -1985,8 +1973,8 @@ mod tests {
             .await
             .expect("seed parent");
 
-        // allowlist only mentions a different name; the parent's "secret"
-        // entry must stay invisible.
+        // allowlist only mentions a different name; the parent's "secret" entry must stay
+        // invisible.
         let tool = ScratchpadReadTool {
             session_manager: manager,
             session_id: test_session_id(child),
@@ -2045,8 +2033,8 @@ mod tests {
             "non-allowlisted parent entry must not appear, got: {}",
             text
         );
-        // Unified-table contract: one Origin header, one totals line, no
-        // separate "inherited from parent" section.
+        // Unified-table contract: one Origin header, one totals line, no separate "inherited from
+        // parent" section.
         assert_eq!(text.matches("Origin").count(), 1);
         assert!(text.contains("2 entries total"));
         assert!(!text.contains("inherited from parent"));
@@ -2054,8 +2042,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_inherited_scratchpad_list_handles_child_only_when_empty_allowlist() {
-        // When no inheritance is configured, the list behaves exactly as
-        // before: no extra section, no parent enumeration.
+        // When no inheritance is configured, the list behaves exactly as before: no extra section,
+        // no parent enumeration.
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
@@ -2247,11 +2235,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_to_unlisted_name_succeeds_without_touching_parent() {
-        // Even when the parent has a same-named entry, if it isn't on the
-        // sub-agent's inherit allowlist the child still writes its own
-        // independent row. (The block fires only on names the parent
-        // actually granted; otherwise child sessions stay free to use any
-        // name.) Parent's row is untouched.
+        // Even when the parent has a same-named entry, if it isn't on the sub-agent's inherit
+        // allowlist the child still writes its own independent row. (The block fires only on names
+        // the parent actually granted; otherwise child sessions stay free to use any name.)
+        // Parent's row is untouched.
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
         let child = manager
@@ -2526,8 +2513,8 @@ mod tests {
         let session_id = manager.create_session(None).await.expect("create");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("pic.png");
-        // Minimal PNG signature + IHDR chunk bytes — enough for `infer`
-        // to fingerprint without needing a syntactically valid image.
+        // Minimal PNG signature + IHDR chunk bytes — enough for `infer` to fingerprint without
+        // needing a syntactically valid image.
         let png_bytes: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
             0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk header
