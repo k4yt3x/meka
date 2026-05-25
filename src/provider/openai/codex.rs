@@ -15,16 +15,18 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::session::TokenStore;
-
-use crate::provider::{
-    AuthCredential, DEFAULT_OPENAI_CODEX_CLIENT_ID, Message, Provider, StopReason, StreamEvent,
-    TokenUsage, ToolDefinition,
+use self::{
+    auth::{extract_account_id, extract_expiration_seconds},
+    responses::{build_request_body, drive_responses_sse_stream},
 };
-
-use self::auth::{extract_account_id, extract_expiration_seconds};
-use self::responses::{build_request_body, drive_responses_sse_stream};
+use crate::{
+    error::{AgshError, Result},
+    provider::{
+        AuthCredential, DEFAULT_OPENAI_CODEX_CLIENT_ID, Message, Provider, StopReason, StreamEvent,
+        TokenUsage, ToolDefinition,
+    },
+    session::TokenStore,
+};
 
 /// Identifier persisted in `oauth_tokens.provider` for the Codex token row.
 pub(crate) const STORAGE_KEY: &str = "openai-codex";

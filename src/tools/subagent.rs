@@ -9,15 +9,16 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::agent::{Agent, AgentOptions};
-use crate::context::build_environment_context;
-use crate::conversation::Conversation;
-use crate::error::{AgshError, Result};
-use crate::permission::{Permission, SharedPermission};
-use crate::provider::{Provider, ToolDefinition};
-use crate::session::SessionManager;
-
 use super::{BuiltinToolFilter, Tool, ToolOutput, ToolRegistry};
+use crate::{
+    agent::{Agent, AgentOptions},
+    context::build_environment_context,
+    conversation::Conversation,
+    error::{AgshError, Result},
+    permission::{Permission, SharedPermission},
+    provider::{Provider, ToolDefinition},
+    session::SessionManager,
+};
 
 /// Parameters needed to build a fresh ToolRegistry for sub-agents.
 #[derive(Clone)]
@@ -39,7 +40,14 @@ pub struct ToolBuilderParams {
     /// freshly-built sub-agent registry so sub-agents see the same MCP
     /// resource meta-tools and per-server adapters as the parent.
     /// `None` is the no-MCP-configured case.
-    pub mcp_manager: Option<Arc<crate::mcp::McpClientManager>>,
+    ///
+    /// Stored as a `Weak` to break the strong reference cycle that
+    /// would otherwise form: `McpClientManager.attached_registries`
+    /// holds each session's `ToolRegistry`, which holds this
+    /// `SpawnAgentTool`, which holds the manager. Without a `Weak`,
+    /// a session that drops without `session/close` calling
+    /// `detach_registry` leaks the entire chain until process exit.
+    pub mcp_manager: Option<std::sync::Weak<crate::mcp::McpClientManager>>,
     /// Shared `SessionManager` so sub-agents can create their own DB
     /// session at spawn time and persist their conversation under it.
     pub session_manager: SessionManager,
@@ -56,6 +64,17 @@ pub struct ToolBuilderParams {
     /// (`sandboxed_shell`, `context_messages`, `user_instructions`) inside
     /// [`Agent::new_subagent`].
     pub parent_options: AgentOptions,
+    /// Parent's per-session working directory. Sub-agents snapshot the
+    /// current value at spawn time so a parent `/cd` mid-sub-agent-turn
+    /// can't change the sub-agent's path resolution mid-flight.
+    pub parent_cwd: crate::agent::SharedCwd,
+    /// Parent's frontend. Sub-agents wrap it in a
+    /// [`crate::frontend::PermissionForwardingFrontend`] so their
+    /// permission prompts surface in the parent's UI (REPL line or
+    /// ACP `session/request_permission`). Without this, sub-agents
+    /// have no human to ask and would have to refuse Ask-mode tools
+    /// outright.
+    pub parent_frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
 pub struct SpawnAgentTool {
@@ -192,17 +211,10 @@ impl Tool for SpawnAgentTool {
             })
             .unwrap_or_default();
 
-        // Snapshot the parent's permission. Demote `Ask` to `Read`: the
-        // sub-agent runs with `approval_sender: None`, so every Ask-mode
-        // tool dispatch would otherwise fail with the
-        // "Ask mode requires interactive shell for tool approval" error
-        // (see `Agent::execute_with_approval`). Read keeps the sub-agent
-        // useful for the common research/exploration case; forwarding
-        // approvals through the parent's REPL is future work.
-        let sub_perm = match self.parent_permission.get() {
-            Permission::Ask => Permission::Read,
-            other => other,
-        };
+        // Inherit the parent's permission level directly. Ask-mode
+        // prompts route through `PermissionForwardingFrontend` so
+        // they surface in the parent's UI.
+        let sub_perm = self.parent_permission.get();
 
         // Resolve parent session ID. By the time a tool runs,
         // `Agent::run_turn` has already written `shared_session_id` before
@@ -225,7 +237,12 @@ impl Tool for SpawnAgentTool {
         let sub_session_id = self
             .tool_builder_params
             .session_manager
-            .create_child_session(parent_sid)
+            .create_child_session(
+                parent_sid,
+                Some(crate::agent::cwd_snapshot(
+                    &self.tool_builder_params.parent_cwd,
+                )),
+            )
             .await
             .map_err(|error| AgshError::ToolExecution {
                 tool_name: "spawn_agent".to_string(),
@@ -262,6 +279,20 @@ impl Tool for SpawnAgentTool {
         let sub_shared_perm = SharedPermission::new(sub_perm, self.parent_permission.enabled());
         let sub_todo_list: super::todo::SharedTodoList =
             Arc::new(tokio::sync::RwLock::new(Vec::new()));
+        // Snapshot the parent's cwd at sub-agent build time so a parent
+        // `/cd` mid-sub-agent execution can't shift the sub-agent's path
+        // resolution mid-flight. The sub-agent's tool registry sees this
+        // snapshot; `Agent::new_subagent` makes the same snapshot for
+        // `Agent::cwd()`.
+        let sub_cwd: crate::agent::SharedCwd = {
+            let parent_path = self
+                .tool_builder_params
+                .parent_cwd
+                .read()
+                .map(|guard| guard.clone())
+                .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+            Arc::new(std::sync::RwLock::new(parent_path))
+        };
         let sub_registry = ToolRegistry::build_for_subagent(
             self.tool_builder_params.web_client.clone(),
             sub_shared_perm.clone(),
@@ -280,6 +311,8 @@ impl Tool for SpawnAgentTool {
                 Some(parent_sid)
             },
             inherited_scratchpad.clone(),
+            sub_cwd,
+            Arc::clone(&self.tool_builder_params.parent_frontend),
         )
         .map_err(|error| AgshError::ToolExecution {
             tool_name: "spawn_agent".to_string(),
@@ -290,8 +323,13 @@ impl Tool for SpawnAgentTool {
         // manager is attached (no servers configured) or when the parent's
         // servers are still Pending / Failed at spawn time. `install_tools_on`
         // is non-spawning and idempotent — see `src/mcp.rs:install_tools_on`.
-        if let Some(manager) = self.tool_builder_params.mcp_manager.as_ref() {
-            manager.install_tools_on(&sub_registry).await;
+        if let Some(weak) = self.tool_builder_params.mcp_manager.as_ref() {
+            // Upgrade only if the manager is still alive. If the
+            // parent's `agsh acp` process is mid-shutdown, the Arc
+            // may already be gone — skip silently.
+            if let Some(manager) = weak.upgrade() {
+                manager.install_tools_on(&sub_registry).await;
+            }
         }
 
         // Build the sub-agent's system prompt against the fully-loaded
@@ -315,8 +353,17 @@ impl Tool for SpawnAgentTool {
                     message: "spawn_agent requires 'prompt', 'skill', or both".to_string(),
                 }
             })?;
-        let environment_context = build_environment_context(sub_perm);
+        let sub_cwd_snapshot = crate::agent::cwd_snapshot(&self.tool_builder_params.parent_cwd);
+        let environment_context = build_environment_context(sub_perm, &sub_cwd_snapshot);
         let augmented_prompt = format!("{}\n{}", environment_context, task);
+
+        // Wrap so permission prompts surface in the parent's UI
+        // while emits stay silent (sub-agent output flows back via
+        // the spawn_agent tool result, not as live notifications).
+        let sub_frontend: Arc<dyn crate::frontend::Frontend> =
+            Arc::new(crate::frontend::PermissionForwardingFrontend::new(
+                Arc::clone(&self.tool_builder_params.parent_frontend),
+            ));
 
         let sub_agent = Agent::new_subagent(
             Arc::clone(&self.provider),
@@ -328,6 +375,8 @@ impl Tool for SpawnAgentTool {
             sub_todo_list,
             sub_shared_session_id,
             self.tool_builder_params.skills.clone(),
+            &self.tool_builder_params.parent_cwd,
+            sub_frontend,
             self.tool_builder_params.session_stats.clone(),
         );
 
@@ -520,8 +569,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_subagent_registry_has_independent_todo_list() {
-        use crate::sandbox::{BackendProbe, SandboxCapability};
-        use crate::tools::BuiltinToolFilter;
+        use crate::{
+            sandbox::{BackendProbe, SandboxCapability},
+            tools::BuiltinToolFilter,
+        };
 
         let parent_list: super::super::todo::SharedTodoList =
             Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -544,6 +595,8 @@ mod tests {
             crate::skills::SkillCache::for_root(None),
             None,
             Vec::new(),
+            crate::agent::test_cwd(),
+            Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("subagent registry should build");
 

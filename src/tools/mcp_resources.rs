@@ -8,14 +8,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::mcp::sanitize::sanitize_text;
-use crate::mcp::{MAX_MCP_DESCRIPTION_LENGTH, McpClientManager, truncate};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-
-use super::util::require_str;
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolOutput, util::require_str};
+use crate::{
+    error::{AgshError, Result},
+    mcp::{MAX_MCP_DESCRIPTION_LENGTH, McpClientManager, sanitize::sanitize_text, truncate},
+    permission::Permission,
+    provider::ToolDefinition,
+};
 
 /// Cap on total bytes returned by `read_mcp_resource` across all content
 /// chunks from a single server response. Mirrors `MAX_MCP_IMAGE_BYTES`:
@@ -698,8 +697,9 @@ impl Tool for ListMcpResourceUpdatesTool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rmcp::model::ResourceContents;
+
+    use super::*;
 
     fn text_contents(uri: &str, mime: Option<&str>, body: &str) -> ResourceContents {
         ResourceContents::TextResourceContents {
@@ -816,9 +816,11 @@ mod tests {
     /// see seven extra tool schemas in its tools array on the first turn.
     #[tokio::test]
     async fn test_mcp_resource_tools_remain_deferred() {
-        use crate::config::{McpServerConfig, McpTransport};
-        use crate::mcp::{McpClientContext, McpClientManager};
-        use crate::tools::ToolRegistry;
+        use crate::{
+            config::{McpServerConfig, McpTransport},
+            mcp::{McpClientContext, McpClientManager},
+            tools::ToolRegistry,
+        };
 
         let server_config = McpServerConfig {
             name: "fixture-srv".to_string(),

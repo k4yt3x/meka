@@ -4,16 +4,20 @@
 
 use std::sync::Arc;
 
-use super::handler::{AgshClientHandler, McpToolAdapter, SamplingPolicy};
-use super::transport::{build_http_transport_config, build_stdio_command};
 use super::{
-    MAX_MCP_DESCRIPTION_LENGTH, McpClientContext, McpRunningService, McpRuntimeConfig, ServerEntry,
-    ServerState, resolve_tool_permission, tool_is_allowed, truncate, warn_on_stale_tool_config,
+    MAX_MCP_DESCRIPTION_LENGTH, McpClientContext, McpClientManager, McpRunningService,
+    McpRuntimeConfig, ServerEntry, ServerState,
+    handler::{AgshClientHandler, McpToolAdapter, SamplingPolicy},
+    resolve_tool_permission, tool_is_allowed,
+    transport::{build_http_transport_config, build_stdio_command},
+    truncate, warn_on_stale_tool_config,
 };
-use crate::config::{McpServerConfig, McpTransport};
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::session::TokenStore;
+use crate::{
+    config::{McpServerConfig, McpTransport},
+    error::{AgshError, Result},
+    permission::Permission,
+    session::TokenStore,
+};
 
 /// Drive the actual connect work for every `Pending` entry, split into a
 /// stdio stream and an HTTP stream, each bounded by its own concurrency
@@ -24,7 +28,7 @@ use crate::session::TokenStore;
 /// can short-circuit.
 pub(super) async fn run_connector(
     pending: Vec<Arc<ServerEntry>>,
-    tool_registry: crate::tools::ToolRegistry,
+    manager: Arc<McpClientManager>,
     mcp_default_permission: Option<Permission>,
     runtime: McpRuntimeConfig,
     settled: tokio::sync::watch::Sender<bool>,
@@ -40,17 +44,17 @@ pub(super) async fn run_connector(
         .into_iter()
         .partition(|entry| matches!(entry.config.transport, McpTransport::Stdio));
 
-    let stdio_registry = tool_registry.clone();
-    let http_registry = tool_registry;
     let stdio_limit = runtime.stdio_concurrency.max(1);
     let http_limit = runtime.http_concurrency.max(1);
     let timeout = runtime.connect_timeout;
+    let stdio_manager = Arc::clone(&manager);
+    let http_manager = manager;
 
     let stdio_stream = futures::stream::iter(stdio_entries)
         .map(move |entry| {
-            let registry = stdio_registry.clone();
+            let manager = Arc::clone(&stdio_manager);
             async move {
-                connect_one(entry, registry, mcp_default_permission, timeout).await;
+                connect_one(entry, manager, mcp_default_permission, timeout).await;
             }
         })
         .buffer_unordered(stdio_limit)
@@ -58,9 +62,9 @@ pub(super) async fn run_connector(
 
     let http_stream = futures::stream::iter(http_entries)
         .map(move |entry| {
-            let registry = http_registry.clone();
+            let manager = Arc::clone(&http_manager);
             async move {
-                connect_one(entry, registry, mcp_default_permission, timeout).await;
+                connect_one(entry, manager, mcp_default_permission, timeout).await;
             }
         })
         .buffer_unordered(http_limit)
@@ -77,7 +81,7 @@ pub(super) async fn run_connector(
 /// reflected in [`ServerState::Failed`] so the turn gate can surface them.
 async fn connect_one(
     entry: Arc<ServerEntry>,
-    tool_registry: crate::tools::ToolRegistry,
+    manager: Arc<McpClientManager>,
     mcp_default_permission: Option<Permission>,
     connect_timeout: std::time::Duration,
 ) {
@@ -172,7 +176,7 @@ async fn connect_one(
     // Discover + register tools. Any error here doesn't undo the
     // Connected state — the server is reachable, just its tool list
     // failed. Surface it as a warn and leave tool set empty.
-    match discover_and_register_tools(&entry, mcp_default_permission, &tool_registry).await {
+    match discover_and_register_tools(&entry, mcp_default_permission, &manager).await {
         Ok(count) => {
             tracing::info!("MCP server '{}' registered {} tool(s)", server_name, count);
         }
@@ -186,14 +190,15 @@ async fn connect_one(
     }
 }
 
-/// Fetch `list_tools` from a just-connected server and install the
-/// resulting adapters in `tool_registry` via `replace_server_tools` +
-/// `mark_deferred`. Shares the adapter-construction path with
-/// [`super::McpClientManager::discover_tools_for_server`] via `build_mcp_adapters`.
+/// Fetch `list_tools` from a just-connected server and route the
+/// resulting adapters through [`McpClientManager::update_server_tools`]
+/// so every attached per-session registry receives them. The deferred
+/// marker on tools that ship lazily is still applied via the manager's
+/// attached registries.
 async fn discover_and_register_tools(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,
-    tool_registry: &crate::tools::ToolRegistry,
+    manager: &Arc<McpClientManager>,
 ) -> Result<usize> {
     use crate::tools::Tool as _;
     let adapters = build_mcp_adapters(entry, mcp_default_permission).await?;
@@ -212,9 +217,11 @@ async fn discover_and_register_tools(
         .into_iter()
         .map(|a| Arc::new(a) as Arc<dyn crate::tools::Tool>)
         .collect();
-    tool_registry.replace_server_tools(&entry.server_name, arc_adapters);
-    for name in &deferred_names {
-        tool_registry.mark_deferred(name);
+    manager
+        .update_server_tools(&entry.server_name, arc_adapters)
+        .await;
+    if !deferred_names.is_empty() {
+        manager.mark_deferred_on_attached(&deferred_names).await;
     }
     Ok(registered_count)
 }
@@ -511,9 +518,16 @@ mod tests {
             instructions: OnceLock::new(),
         });
 
+        // The test never reaches tool discovery (the connect itself
+        // times out), so the manager isn't observed; build a minimal
+        // one just to satisfy the signature.
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(&[], None, None, context)
+            .await
+            .expect("empty manager");
         connect_one(
             Arc::clone(&entry),
-            crate::tools::ToolRegistry::new(),
+            manager,
             None,
             std::time::Duration::from_millis(50),
         )

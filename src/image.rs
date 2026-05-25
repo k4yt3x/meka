@@ -8,8 +8,10 @@ use std::io::Cursor;
 use base64::Engine;
 use image::ImageFormat;
 
-use crate::provider::{ImageSource, ToolResultContent};
-use crate::tools::ToolOutput;
+use crate::{
+    provider::{ImageSource, ToolResultContent},
+    tools::ToolOutput,
+};
 
 /// Maximum raw image bytes before base64 encoding. Keeps the resulting
 /// base64 payload under ~5 MB — a safe ceiling across providers.
@@ -204,13 +206,15 @@ pub(crate) fn build_image_tool_output(
         ],
         is_error: false,
         scratchpad_hint: None,
+        frontend_metadata: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use image::RgbaImage;
+
+    use super::*;
 
     fn synthesize_image_bytes(format: ImageFormat) -> Vec<u8> {
         let img = RgbaImage::from_pixel(4, 4, image::Rgba([128, 64, 200, 255]));

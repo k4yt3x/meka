@@ -6,11 +6,12 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-
-use crate::provider::{
-    ContentBlock, Message, Provider, Role, StopReason, StreamEvent, TokenUsage,
-    ToolCallAccumulator, ToolDefinition, finalize_tool_call_accumulators,
+use crate::{
+    error::{AgshError, Result},
+    provider::{
+        ContentBlock, Message, Provider, Role, StopReason, StreamEvent, TokenUsage,
+        ToolCallAccumulator, ToolDefinition, finalize_tool_call_accumulators,
+    },
 };
 
 pub struct OpenAiProvider {
@@ -712,7 +713,7 @@ mod tests {
             }]
         });
 
-        let (message, _, _) = provider
+        let (message, ..) = provider
             .parse_non_streaming_response(&response)
             .expect("envelope should parse even with bad tool args");
 

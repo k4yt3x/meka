@@ -58,6 +58,14 @@ pub enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Run agsh as an ACP (Agent Client Protocol) agent over stdio.
+    ///
+    /// Speaks newline-framed JSON-RPC on stdin/stdout so ACP clients
+    /// (Zed, JetBrains, Neovim, VS Code via the ACP extension, etc.)
+    /// can drive agsh turns directly. Diagnostic output stays on
+    /// stderr; stdout is reserved for the protocol.
+    #[command(verbatim_doc_comment)]
+    Acp,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -408,13 +416,10 @@ mod tests {
             "--eager-load-tool",
             "github:create_issue",
         ]);
-        assert_eq!(
-            cli.eager_load_tool,
-            vec![
-                "notion:search".to_string(),
-                "github:create_issue".to_string()
-            ]
-        );
+        assert_eq!(cli.eager_load_tool, vec![
+            "notion:search".to_string(),
+            "github:create_issue".to_string()
+        ]);
     }
 
     #[test]

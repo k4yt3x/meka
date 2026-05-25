@@ -4,8 +4,10 @@
 
 mod attestation;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicI8, Ordering},
+};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -13,18 +15,18 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::error::{AgshError, Result};
-use crate::session::TokenStore;
-
-use crate::provider::{
-    AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, Message, Provider, StopReason, StreamEvent,
-    TokenUsage, ToolDefinition,
-};
-
 use super::shared::{
     self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
     drive_claude_sse_stream, model_is_haiku, model_supports_adaptive_thinking,
     model_supports_effort, model_supports_modern_features, parse_non_streaming_response,
+};
+use crate::{
+    error::{AgshError, Result},
+    provider::{
+        AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, Message, Provider, StopReason, StreamEvent,
+        TokenUsage, ToolDefinition,
+    },
+    session::TokenStore,
 };
 
 /// Claude Code system prompt prefix.
@@ -142,6 +144,18 @@ impl ClaudeOAuthProvider {
         Some(parts.join(","))
     }
 
+    /// Resolve a valid Authorization header, refreshing the OAuth
+    /// token if it's within 5 minutes of expiry.
+    ///
+    /// Concurrency contract (relevant under multi-session ACP where
+    /// two sessions may call this in parallel): the `RwLock` on
+    /// `credential` doubles as the refresh gate. Two tasks that both
+    /// observe an expiring token race for the write lock; the loser
+    /// re-reads after acquiring it and finds the winner's fresh
+    /// token via the double-check at the top of the slow path
+    /// (`needs_refresh` block below). Exactly one refresh API call
+    /// fires under contention; both callers return a valid token.
+    /// No separate `Mutex<()>` refresh gate is needed.
     async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
         {
             let credential = self.credential.read().await;
@@ -510,8 +524,7 @@ impl Provider for ClaudeOAuthProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::attestation::CC_VERSION;
-    use super::*;
+    use super::{attestation::CC_VERSION, *};
     use crate::provider::{ContentBlock, Role, ToolResultContent};
 
     fn test_provider() -> ClaudeOAuthProvider {
@@ -976,7 +989,7 @@ mod tests {
             "content": [],
             "stop_reason": "end_turn"
         });
-        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
+        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
         assert!(message.content.is_empty());
         assert_eq!(message.text_content(), "");
     }
@@ -993,7 +1006,7 @@ mod tests {
             ],
             "stop_reason": "end_turn"
         });
-        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
+        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
         assert_eq!(message.content.len(), 2);
         assert!(
             matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "hmm...")
@@ -1013,7 +1026,7 @@ mod tests {
             ],
             "stop_reason": "end_turn"
         });
-        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
+        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
         assert_eq!(message.content.len(), 1);
         assert_eq!(message.text_content(), "answer");
     }
@@ -1031,7 +1044,7 @@ mod tests {
             }],
             "stop_reason": "tool_use"
         });
-        let (message, _, _) = parse_non_streaming_response(&response).expect("should parse");
+        let (message, ..) = parse_non_streaming_response(&response).expect("should parse");
         if let ContentBlock::ToolUse { input, .. } = &message.content[0] {
             assert_eq!(*input, serde_json::json!({}));
         } else {
@@ -1495,10 +1508,12 @@ mod tests {
     async fn test_permission_toggle_preserves_cache_prefix() {
         use std::path::Path;
 
-        use crate::context::{build_system_prompt, build_turn_context};
-        use crate::permission::{Permission, SharedPermission};
-        use crate::session::SessionManager;
-        use crate::tools::ToolRegistry;
+        use crate::{
+            context::{build_system_prompt, build_turn_context},
+            permission::{Permission, SharedPermission},
+            session::SessionManager,
+            tools::ToolRegistry,
+        };
 
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
@@ -1521,6 +1536,8 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
+            crate::agent::test_cwd(),
+            std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
 
@@ -1533,7 +1550,7 @@ mod tests {
         let tools = registry.definitions_active(&[]);
 
         let u1_text = {
-            let block = build_turn_context(Permission::Read, &[]);
+            let block = build_turn_context(Permission::Read, &[], std::path::Path::new("."));
             format!("{}\n\n{}", block, "list files under /tmp")
         };
         let messages_t1 = vec![Message::user(&u1_text)];
@@ -1549,7 +1566,7 @@ mod tests {
         let tools_t2 = registry.definitions_active(&[]);
 
         let u2_text = {
-            let block = build_turn_context(Permission::Write, &[]);
+            let block = build_turn_context(Permission::Write, &[], std::path::Path::new("."));
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
         };
         let messages_t2 = vec![
@@ -1565,14 +1582,13 @@ mod tests {
             "system prompt diverged across /permission toggle — cache prefix invalidated"
         );
 
-        // 2. The tools array is identical. (Breakpoint 3 cache-hit.)
-        //    Reuse the existing helper which tolerates cache_control
-        //    movement between the last-tool position across requests.
+        // 2. The tools array is identical. (Breakpoint 3 cache-hit.) Reuse the existing helper
+        //    which tolerates cache_control movement between the last-tool position across requests.
         assert_prefix_stable(&body_t1, &body_t2, 1);
 
-        // 3. The turn-1 user message is preserved verbatim in turn-2's
-        //    history — historical messages must never mutate on toggle,
-        //    otherwise breakpoint 4 (messages cache) cascades.
+        // 3. The turn-1 user message is preserved verbatim in turn-2's history — historical
+        //    messages must never mutate on toggle, otherwise breakpoint 4 (messages cache)
+        //    cascades.
         let t1_msg = strip_cache_control(&body_t1["messages"][0]);
         let t2_msg0 = strip_cache_control(&body_t2["messages"][0]);
         assert_eq!(
@@ -1580,8 +1596,8 @@ mod tests {
             "turn-1 user message changed after permission toggle"
         );
 
-        // 4. Sanity: the two user messages do differ in their permission
-        //    context (fresh content on each turn, not cached yet).
+        // 4. Sanity: the two user messages do differ in their permission context (fresh content on
+        //    each turn, not cached yet).
         assert!(u1_text.contains("Current permission level: read"));
         assert!(u2_text.contains("Current permission level: write"));
         assert_ne!(u1_text, u2_text);
@@ -1599,10 +1615,12 @@ mod tests {
     async fn test_load_tool_preserves_system_prompt_cache() {
         use std::path::Path;
 
-        use crate::context::{build_system_prompt, build_turn_context};
-        use crate::permission::{Permission, SharedPermission};
-        use crate::session::SessionManager;
-        use crate::tools::ToolRegistry;
+        use crate::{
+            context::{build_system_prompt, build_turn_context},
+            permission::{Permission, SharedPermission},
+            session::SessionManager,
+            tools::ToolRegistry,
+        };
 
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
@@ -1627,6 +1645,8 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
+            crate::agent::test_cwd(),
+            std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
         // Register a deferred fixture *after* `build_default` so it lands at
@@ -1641,7 +1661,7 @@ mod tests {
 
         // Turn 1: empty history, fixture_deferred not yet exposed.
         let u1_text = {
-            let block = build_turn_context(Permission::Write, &[]);
+            let block = build_turn_context(Permission::Write, &[], std::path::Path::new("."));
             format!("{}\n\n{}", block, "investigate scratchpad")
         };
         let messages_t1 = vec![Message::user(&u1_text)];
@@ -1701,9 +1721,9 @@ mod tests {
             "tools array should grow by exactly one entry after load_tool"
         );
 
-        // 3. The prior tools (turn-1 set) are present in turn-2 in the same
-        //    relative order — i.e., the prefix is preserved. Stripping
-        //    cache_control because the marker moves to the new last tool.
+        // 3. The prior tools (turn-1 set) are present in turn-2 in the same relative order — i.e.,
+        //    the prefix is preserved. Stripping cache_control because the marker moves to the new
+        //    last tool.
         let tools_arr_t1 =
             strip_tool_cache_control(body_t1["tools"].as_array().expect("tools array in body_t1"));
         let tools_arr_t2 =
@@ -1727,10 +1747,12 @@ mod tests {
     async fn test_compaction_preserves_loaded_tools_active_set() {
         use std::path::Path;
 
-        use crate::conversation::{Conversation, Event, extract_loaded_tool_names_from_events};
-        use crate::permission::{Permission, SharedPermission};
-        use crate::session::SessionManager;
-        use crate::tools::ToolRegistry;
+        use crate::{
+            conversation::{Conversation, Event, extract_loaded_tool_names_from_events},
+            permission::{Permission, SharedPermission},
+            session::SessionManager,
+            tools::ToolRegistry,
+        };
 
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
@@ -1755,6 +1777,8 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
+            crate::agent::test_cwd(),
+            std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
         crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
@@ -1828,10 +1852,12 @@ mod tests {
     async fn test_permission_independence_all_levels() {
         use std::path::Path;
 
-        use crate::context::build_system_prompt;
-        use crate::permission::{Permission, SharedPermission};
-        use crate::session::SessionManager;
-        use crate::tools::ToolRegistry;
+        use crate::{
+            context::build_system_prompt,
+            permission::{Permission, SharedPermission},
+            session::SessionManager,
+            tools::ToolRegistry,
+        };
 
         let session_manager = SessionManager::open(Some(Path::new(":memory:")))
             .await
@@ -1854,6 +1880,8 @@ mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             crate::tools::BuiltinToolFilter::default(),
+            crate::agent::test_cwd(),
+            std::sync::Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
 
@@ -2359,5 +2387,164 @@ mod tests {
         let body = provider.build_request_body("system", &[], &[], false);
         let claude_messages = body["messages"].as_array().unwrap();
         assert!(claude_messages.is_empty());
+    }
+
+    /// A minimal in-process OAuth refresh endpoint that counts hits.
+    /// Returns a valid refresh response on every call so the provider
+    /// path completes; the test then asserts the hit count.
+    async fn run_mock_refresh_endpoint(
+        listener: tokio::net::TcpListener,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let hits = Arc::clone(&hits);
+            tokio::spawn(async move {
+                // Drain enough of the request to know we got a full
+                // POST body. The OAuth endpoint sends a small JSON
+                // body — read until we see two CRLFs (header end)
+                // and then enough bytes to satisfy Content-Length.
+                let mut buf = Vec::with_capacity(2048);
+                let mut headers_end: Option<usize> = None;
+                let mut content_length: Option<usize> = None;
+                while headers_end.is_none() {
+                    let mut chunk = [0u8; 1024];
+                    let n = match socket.read(&mut chunk).await {
+                        Ok(0) => return,
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(idx) = find_crlf_crlf(&buf) {
+                        headers_end = Some(idx);
+                        content_length = parse_content_length(&buf[..idx]);
+                    }
+                }
+                if let (Some(end), Some(len)) = (headers_end, content_length) {
+                    let body_start = end + 4;
+                    while buf.len() < body_start + len {
+                        let mut chunk = [0u8; 1024];
+                        let n = match socket.read(&mut chunk).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let body = serde_json::json!({
+                    "access_token": "fresh-token-xyz",
+                    "refresh_token": "fresh-refresh",
+                    "expires_in": 3600,
+                })
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    }
+
+    fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn parse_content_length(headers: &[u8]) -> Option<usize> {
+        let headers = std::str::from_utf8(headers).ok()?;
+        for line in headers.split("\r\n") {
+            if let Some((name, value)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case("content-length")
+            {
+                return value.trim().parse().ok();
+            }
+        }
+        None
+    }
+
+    /// When many tasks hit `ensure_valid_credential` against a
+    /// near-expiry credential at the same instant, exactly **one**
+    /// refresh API call must fire. The remaining tasks observe the
+    /// refresh that already happened via the post-write-lock
+    /// re-check inside `ensure_valid_credential` and return the
+    /// fresh token without re-firing the refresh. This is the
+    /// invariant relied on by multi-session ACP where two sessions
+    /// can race the same credential at the same time.
+    #[tokio::test]
+    async fn oauth_refresh_fires_once_under_concurrent_demand() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock OAuth endpoint");
+        let local = listener.local_addr().expect("local addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(run_mock_refresh_endpoint(listener, Arc::clone(&hits)));
+
+        // Credential whose access token already counts as "expiring
+        // soon" (the threshold is 5 minutes / 300_000 ms). Setting
+        // expires_at to "now" forces every caller into the slow path
+        // immediately.
+        let credential = AuthCredential::OAuthToken {
+            access_token: "stale".to_string(),
+            refresh_token: Some("rt".to_string()),
+            expires_at: Some(now_epoch_millis()),
+            account_id: None,
+        };
+
+        let provider = Arc::new(ClaudeOAuthProvider::new(
+            credential,
+            "claude-sonnet-4-20250514".to_string(),
+            None,
+            None,
+            Some(format!("http://{}/", local)),
+            None,
+            false,
+            10000,
+            "a".repeat(64),
+            "high".to_string(),
+            false,
+            None,
+        ));
+
+        // Fire many concurrent callers. The exact count isn't load-
+        // bearing; we just want enough to make a fan-out plausible
+        // if the gate broke.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let provider = Arc::clone(&provider);
+            handles.push(tokio::spawn(async move {
+                provider
+                    .ensure_valid_credential()
+                    .await
+                    .map(|(_, value)| value)
+            }));
+        }
+        let mut results = Vec::with_capacity(handles.len());
+        for handle in handles {
+            results.push(handle.await.expect("join").expect("ensure_valid"));
+        }
+
+        // Every caller must return the same fresh token — proves they
+        // observed the refresh that landed, didn't double-refresh.
+        for header in &results {
+            assert_eq!(header, "Bearer fresh-token-xyz", "stale token leaked",);
+        }
+
+        let observed_hits = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            observed_hits, 1,
+            "exactly one refresh API call must fire under concurrent demand; got {}",
+            observed_hits,
+        );
     }
 }

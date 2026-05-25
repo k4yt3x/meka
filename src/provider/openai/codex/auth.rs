@@ -1,10 +1,9 @@
 //! Decoders for the JWT `id_token` returned by `auth.openai.com`.
 //!
 //! We extract two values:
-//! - `chatgpt_account_id` — sent on every Codex request as the
-//!   `ChatGPT-Account-ID` header (required for subscription auth).
-//! - The `exp` claim from the `access_token` — used to schedule refresh
-//!   before the token expires.
+//! - `chatgpt_account_id` — sent on every Codex request as the `ChatGPT-Account-ID` header
+//!   (required for subscription auth).
+//! - The `exp` claim from the `access_token` — used to schedule refresh before the token expires.
 //!
 //! The id_token's payload nests ChatGPT-specific claims under the
 //! namespaced key `https://api.openai.com/auth`, matching Codex's own
@@ -15,8 +14,7 @@
 //! token on every request. Local validation would only catch tampering
 //! by a process that already has full access to our memory.
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 
 use crate::error::{AgshError, Result};

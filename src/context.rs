@@ -9,10 +9,12 @@
 //! `<context>` block instead, which keeps the expensive message-history
 //! cache (Claude breakpoint 4) warm across toggles.
 
-use crate::permission::Permission;
-use crate::session::ToolOutputSummary;
-use crate::skills::Skill;
-use crate::tools::todo::{self, TodoItem};
+use crate::{
+    permission::Permission,
+    session::ToolOutputSummary,
+    skills::Skill,
+    tools::todo::{self, TodoItem},
+};
 
 /// A tool's entry in the catalogue rendered into the system prompt. Tuple:
 /// `(name, description, required_permission, is_deferred)`. Produced by
@@ -367,16 +369,16 @@ pub fn build_permission_context(permission: Permission) -> String {
 
 /// Build the per-turn environment context block (pwd, date).
 /// Returns an empty string in `None` permission mode so system info isn't leaked.
-pub fn build_environment_context(permission: Permission) -> String {
+/// The `cwd` argument is the agent's per-session working directory; passing
+/// it explicitly (rather than reading process state) lets multiple sessions
+/// in one process report their own cwds correctly.
+pub fn build_environment_context(permission: Permission, cwd: &std::path::Path) -> String {
     if permission == Permission::None {
         return String::new();
     }
 
     let mut context = String::from("[Environment context]\n");
-
-    if let Ok(cwd) = std::env::current_dir() {
-        context.push_str(&format!("Working directory: {}\n", cwd.display()));
-    }
+    context.push_str(&format!("Working directory: {}\n", cwd.display()));
 
     let now = chrono::Local::now().to_rfc2822();
     context.push_str(&format!("Date: {}\n", now));
@@ -388,7 +390,11 @@ pub fn build_environment_context(permission: Permission) -> String {
 /// with permission state, the active todo list, and environment info. The
 /// `[Permission context]` section is always included so the model sees the
 /// current level on every turn.
-pub fn build_turn_context(permission: Permission, todos: &[TodoItem]) -> String {
+pub fn build_turn_context(
+    permission: Permission,
+    todos: &[TodoItem],
+    cwd: &std::path::Path,
+) -> String {
     let mut sections = Vec::new();
 
     sections.push(build_permission_context(permission));
@@ -397,7 +403,7 @@ pub fn build_turn_context(permission: Permission, todos: &[TodoItem]) -> String 
         sections.push(todo::format_todo_for_context(todos));
     }
 
-    let environment_context = build_environment_context(permission);
+    let environment_context = build_environment_context(permission, cwd);
     if !environment_context.is_empty() {
         sections.push(environment_context);
     }
@@ -412,10 +418,11 @@ pub fn build_post_compact_context(
     permission: Permission,
     todos: &[TodoItem],
     scratchpad_entries: &[ToolOutputSummary],
+    cwd: &std::path::Path,
 ) -> String {
     let mut parts = Vec::new();
 
-    let env = build_environment_context(permission);
+    let env = build_environment_context(permission, cwd);
     if !env.is_empty() {
         parts.push(env);
     }
@@ -856,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_environment_context() {
-        let context = build_environment_context(Permission::Read);
+        let context = build_environment_context(Permission::Read, std::path::Path::new("."));
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("Working directory:"));
         assert!(context.contains("Date:"));
@@ -864,13 +871,13 @@ mod tests {
 
     #[test]
     fn test_environment_context_none_mode() {
-        let context = build_environment_context(Permission::None);
+        let context = build_environment_context(Permission::None, std::path::Path::new("."));
         assert!(context.is_empty());
     }
 
     #[test]
     fn test_turn_context_always_has_permission_context() {
-        let context = build_turn_context(Permission::None, &[]);
+        let context = build_turn_context(Permission::None, &[], std::path::Path::new("."));
         assert!(context.starts_with("<context>\n"));
         assert!(context.ends_with("</context>"));
         assert!(context.contains("[Permission context]"));
@@ -878,7 +885,7 @@ mod tests {
 
     #[test]
     fn test_turn_context_has_environment_in_read_mode() {
-        let context = build_turn_context(Permission::Read, &[]);
+        let context = build_turn_context(Permission::Read, &[], std::path::Path::new("."));
         assert!(context.contains("[Permission context]"));
         assert!(context.contains("[Environment context]"));
     }
@@ -890,7 +897,7 @@ mod tests {
             "write tests",
             todo::TodoStatus::InProgress,
         )];
-        let context = build_turn_context(Permission::Read, &todos);
+        let context = build_turn_context(Permission::Read, &todos, std::path::Path::new("."));
         assert!(context.contains("write tests"));
         assert!(context.contains("[Environment context]"));
         assert!(context.contains("[Permission context]"));
@@ -899,7 +906,7 @@ mod tests {
     #[test]
     fn test_turn_context_none_mode_omits_environment() {
         let todos = vec![sample_todo("1", "do a thing", todo::TodoStatus::Pending)];
-        let context = build_turn_context(Permission::None, &todos);
+        let context = build_turn_context(Permission::None, &todos, std::path::Path::new("."));
         assert!(context.contains("do a thing"));
         assert!(context.contains("[Permission context]"));
         assert!(!context.contains("[Environment context]"));
@@ -907,7 +914,8 @@ mod tests {
 
     #[test]
     fn test_post_compact_context_empty_in_none_mode_no_state() {
-        let result = build_post_compact_context(Permission::None, &[], &[]);
+        let result =
+            build_post_compact_context(Permission::None, &[], &[], std::path::Path::new("."));
         assert!(result.is_empty());
     }
 
@@ -915,7 +923,12 @@ mod tests {
     fn test_post_compact_context_includes_env_todos_scratchpad() {
         let todos = vec![sample_todo("1", "keep working", todo::TodoStatus::Pending)];
         let entries = vec![sample_scratchpad_entry("notes", 1024)];
-        let result = build_post_compact_context(Permission::Read, &todos, &entries);
+        let result = build_post_compact_context(
+            Permission::Read,
+            &todos,
+            &entries,
+            std::path::Path::new("."),
+        );
         assert!(result.contains("[Environment context]"));
         assert!(result.contains("keep working"));
         assert!(result.contains("[Scratchpad entries]"));
@@ -925,7 +938,8 @@ mod tests {
     #[test]
     fn test_post_compact_context_scratchpad_only() {
         let entries = vec![sample_scratchpad_entry("log", 500)];
-        let result = build_post_compact_context(Permission::None, &[], &entries);
+        let result =
+            build_post_compact_context(Permission::None, &[], &entries, std::path::Path::new("."));
         assert!(result.contains("[Scratchpad entries]"));
         assert!(result.contains("\"log\""));
         assert!(!result.contains("[Environment context]"));

@@ -18,6 +18,7 @@
 
 - [Interactive Mode](./usage/interactive-mode.md)
 - [One-Shot Mode](./usage/one-shot-mode.md)
+- [ACP](./usage/acp.md)
 - [Permissions](./usage/permissions.md)
 - [Sessions](./usage/sessions.md)
 - [Skills](./usage/skills.md)

@@ -12,10 +12,9 @@ pub const RESERVED_SERVER_NAMES: &[&str] = &["agsh", "ide"];
 /// used as homograph-style attacks on users reviewing tool output:
 ///
 /// - Unicode category **Cc** (C0/C1 controls) except `\n`, `\t`, `\r`.
-/// - Unicode category **Cf** (formatters: RTL/LTR overrides, zero-width
-///   joiners, byte-order marks, language tags).
-/// - Unpaired surrogate code units (already impossible in a valid `&str`,
-///   noted for completeness).
+/// - Unicode category **Cf** (formatters: RTL/LTR overrides, zero-width joiners, byte-order marks,
+///   language tags).
+/// - Unpaired surrogate code units (already impossible in a valid `&str`, noted for completeness).
 ///
 /// Emoji, CJK, combining marks, and all other printable Unicode pass through
 /// unchanged.

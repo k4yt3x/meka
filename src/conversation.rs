@@ -258,8 +258,8 @@ impl Conversation {
 }
 
 impl<'a> IntoIterator for &'a Conversation {
-    type Item = &'a Message;
     type IntoIter = std::slice::Iter<'a, Message>;
+    type Item = &'a Message;
 
     fn into_iter(self) -> Self::IntoIter {
         self.materialized.iter()

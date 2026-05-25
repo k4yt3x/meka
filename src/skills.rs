@@ -6,10 +6,12 @@
 
 pub mod cli;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -203,7 +205,6 @@ impl SkillCache {
                 _ => return self.state.lock().await.skills.clone(),
             }
         };
-        // Snapshot unchanged: serve the cache without re-discovering.
         if self.state.lock().await.snapshot == now {
             return self.state.lock().await.skills.clone();
         }

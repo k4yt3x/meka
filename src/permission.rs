@@ -4,10 +4,14 @@
 //! held in an [`AtomicU8`] so the REPL can mutate it concurrently with the
 //! agent loop.
 
-use std::fmt;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use crossterm::style::Color;
 
@@ -49,8 +53,7 @@ impl Permission {
     }
 
     /// Returns true if this permission level allows using a tool that requires
-    /// `required`. Ask and Write both allow all tools; Read allows Read and
-    /// None; None allows only None.
+    /// `required`.
     pub fn allows(self, required: Permission) -> bool {
         match self {
             Permission::None => required == Permission::None,
@@ -102,7 +105,6 @@ impl EnabledPermissions {
     /// the runtime gate; production code constructs the set from config.
     #[cfg(test)]
     pub const ALL: Self = Self { bits: 0b1111 };
-
     /// `none / read / write` — `ask` is opt-in.
     pub const DEFAULT: Self = Self {
         bits: (1 << Permission::None as u8)
@@ -195,11 +197,9 @@ impl SharedPermission {
         Ok(())
     }
 
-    /// Low-level setter that bypasses the enabled-set check. Used by
-    /// [`Self::try_set`] and [`Self::cycle`] internally, and by tests
-    /// that need to construct edge cases (e.g. verifying the system
-    /// prompt is identical across all four modes regardless of which
-    /// are enabled at runtime).
+    /// Low-level setter that bypasses the enabled-set check. Used
+    /// by `try_set` / `cycle` and by tests that need to construct
+    /// edge cases.
     pub(crate) fn set_unchecked(&self, mode: Permission) {
         self.inner.store(mode as u8, Ordering::Relaxed);
     }
@@ -320,15 +320,12 @@ mod tests {
     fn test_enabled_permissions_iter_order() {
         let all = EnabledPermissions::ALL;
         let order: Vec<Permission> = all.iter().collect();
-        assert_eq!(
-            order,
-            vec![
-                Permission::None,
-                Permission::Read,
-                Permission::Ask,
-                Permission::Write,
-            ]
-        );
+        assert_eq!(order, vec![
+            Permission::None,
+            Permission::Read,
+            Permission::Ask,
+            Permission::Write,
+        ]);
     }
 
     #[test]

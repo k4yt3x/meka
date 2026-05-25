@@ -7,23 +7,23 @@
 //! permission check and the I/O cannot redirect the operation onto an
 //! unintended target.
 
-use std::path::{Path, PathBuf};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
+use base64::Engine;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use base64::Engine;
-
-use crate::error::{AgshError, Result};
-use crate::image::{ImageHandling, classify_extension, prepare_image_payload};
-use crate::permission::Permission;
-use crate::provider::{ImageSource, ToolDefinition, ToolResultContent};
-
-use super::util::{
-    MAX_SEARCH_MATCHES, canonicalize_for_tool, require_str, search_lines, truncate_string,
+use super::{
+    ReadTracker, Tool, ToolOutput,
+    util::{MAX_SEARCH_MATCHES, canonicalize_for_tool, require_str, search_lines, truncate_string},
 };
-use super::{ReadTracker, Tool, ToolOutput};
+use crate::{
+    error::{AgshError, Result},
+    image::{ImageHandling, classify_extension, prepare_image_payload},
+    permission::Permission,
+    provider::{ImageSource, ToolDefinition, ToolResultContent},
+};
 
 /// Open a file for reading, refusing to follow a symlink on Unix. Callers
 /// pass a canonicalized `PathBuf` so the check closes the
@@ -118,6 +118,13 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
 
 pub(super) struct ReadFileTool {
     pub read_tracker: ReadTracker,
+    pub cwd: crate::agent::SharedCwd,
+    /// When the connected ACP client advertises `fs.read_text_file`,
+    /// plain-text reads are delegated to the editor's hosted
+    /// filesystem so it can serve the in-buffer view of the file
+    /// rather than the on-disk bytes. `None` from the frontend
+    /// means "fall back to local read".
+    pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
 #[async_trait]
@@ -190,7 +197,8 @@ impl Tool for ReadFileTool {
             })?
             .to_string();
 
-        let canonical = canonicalize_for_tool("read_file", Path::new(&path)).await?;
+        let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
+        let canonical = canonicalize_for_tool("read_file", &resolved).await?;
 
         // Detect image files and return multimodal content, converting
         // non-native formats (TIFF, ICO, etc.) to PNG along the way.
@@ -242,6 +250,7 @@ impl Tool for ReadFileTool {
                 ],
                 is_error: false,
                 scratchpad_hint: None,
+                frontend_metadata: None,
             });
         }
 
@@ -254,6 +263,38 @@ impl Tool for ReadFileTool {
             .as_u64()
             .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
         let regex = input.get("regex").and_then(|v| v.as_str());
+
+        // Plain text reads delegate to the editor when it offers
+        // `fs.read_text_file` (in-buffer view wins over on-disk).
+        // Regex / image reads have no `fs/*` analogue — always local.
+        if regex.is_none() {
+            let delegate_line =
+                offset.map(|o| u32::try_from(o.saturating_add(1)).unwrap_or(u32::MAX));
+            // Mirror the local fallback's `DEFAULT_LINE_LIMIT` so the
+            // delegate path can't accidentally pull an unbounded file
+            // into the agent's context when the caller passed no
+            // limit. Without this, an `fs.read_text_file`-capable
+            // client (e.g. Zed) returns the whole file while the
+            // local path would cap at 2000 lines with a truncation
+            // marker — divergent behavior + context-window risk.
+            let delegate_limit = Some(
+                limit
+                    .map(|l| u32::try_from(l).unwrap_or(u32::MAX))
+                    .unwrap_or(DEFAULT_LINE_LIMIT as u32),
+            );
+            if let Some(result) = self
+                .frontend
+                .delegate_fs_read(&canonical, delegate_line, delegate_limit)
+                .await
+            {
+                let content = result.map_err(|error| AgshError::ToolExecution {
+                    tool_name: "read_file".to_string(),
+                    message: format!("failed to read '{}': {}", path, error),
+                })?;
+                self.read_tracker.write().await.insert(canonical);
+                return Ok(ToolOutput::text(content, false));
+            }
+        }
 
         let content =
             read_file_to_string(&canonical)
@@ -296,6 +337,11 @@ impl Tool for ReadFileTool {
 
 pub(super) struct EditFileTool {
     pub read_tracker: ReadTracker,
+    pub cwd: crate::agent::SharedCwd,
+    /// Read + write both go through the frontend so the editor can
+    /// apply the edit in-buffer (Zed's apply-diff UI). `None` from
+    /// the frontend means "fall back to local I/O".
+    pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
 #[async_trait]
@@ -411,7 +457,8 @@ impl Tool for EditFileTool {
         // Canonicalize once. All subsequent I/O goes through this path so a
         // symlink swap between the tracker check and the actual read/write
         // can't redirect us onto a different file.
-        let canonical = canonicalize_for_tool("edit_file", Path::new(&path)).await?;
+        let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
+        let canonical = canonicalize_for_tool("edit_file", &resolved).await?;
 
         if !force && !self.read_tracker.read().await.contains(&canonical) {
             return Ok(ToolOutput::text(
@@ -424,13 +471,26 @@ impl Tool for EditFileTool {
             ));
         }
 
+        // Prefer the editor's in-buffer view when offered. A
+        // delegate error short-circuits — silently reading on-disk
+        // bytes risks diffing a different document than the one
+        // the editor will apply against.
         let content =
-            read_file_to_string(&canonical)
-                .await
-                .map_err(|error| AgshError::ToolExecution {
-                    tool_name: "edit_file".to_string(),
-                    message: format!("failed to read '{}': {}", path, error),
-                })?;
+            match self.frontend.delegate_fs_read(&canonical, None, None).await {
+                Some(Ok(text)) => text,
+                Some(Err(error)) => {
+                    return Err(AgshError::ToolExecution {
+                        tool_name: "edit_file".to_string(),
+                        message: format!("failed to read '{}': {}", path, error),
+                    });
+                }
+                None => read_file_to_string(&canonical).await.map_err(|error| {
+                    AgshError::ToolExecution {
+                        tool_name: "edit_file".to_string(),
+                        message: format!("failed to read '{}': {}", path, error),
+                    }
+                })?,
+            };
 
         if !content.contains(&old_string) {
             return Ok(ToolOutput::text(
@@ -456,12 +516,30 @@ impl Tool for EditFileTool {
             (content.replacen(&old_string, &effective_new_string, 1), 1)
         };
 
-        write_file_bytes(&canonical, new_content.as_bytes())
+        // Same delegate-or-local fork as `write_file`'s write step.
+        // A delegate error short-circuits to keep our view aligned
+        // with the editor's.
+        match self
+            .frontend
+            .delegate_fs_write(&canonical, &new_content)
             .await
-            .map_err(|error| AgshError::ToolExecution {
-                tool_name: "edit_file".to_string(),
-                message: format!("failed to write '{}': {}", path, error),
-            })?;
+        {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                return Err(AgshError::ToolExecution {
+                    tool_name: "edit_file".to_string(),
+                    message: format!("failed to write '{}': {}", path, error),
+                });
+            }
+            None => {
+                write_file_bytes(&canonical, new_content.as_bytes())
+                    .await
+                    .map_err(|error| AgshError::ToolExecution {
+                        tool_name: "edit_file".to_string(),
+                        message: format!("failed to write '{}': {}", path, error),
+                    })?;
+            }
+        }
 
         let snippet = build_context_snippet(&new_content, first_match_byte, 3);
         let trailer = if count > 1 {
@@ -476,7 +554,12 @@ impl Tool for EditFileTool {
                 path, count, trailer, snippet,
             ),
             false,
-        ))
+        )
+        .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
+            path: canonical.clone(),
+            old_text: Some(content),
+            new_text: new_content,
+        }))
     }
 }
 
@@ -513,6 +596,12 @@ pub(super) struct WriteFileTool {
     /// `force: true` — the agent obviously knows the content it just
     /// wrote.
     pub read_tracker: ReadTracker,
+    pub cwd: crate::agent::SharedCwd,
+    /// Write step is delegated to the editor's filesystem so the
+    /// apply-diff UI sees the new content alongside the
+    /// `tool_call_update`'s diff. `None` from the frontend means
+    /// "fall back to local write".
+    pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
 #[async_trait]
@@ -561,7 +650,7 @@ impl Tool for WriteFileTool {
         // where a symlink-pointing-at-a-parent swap could redirect the
         // write. The per-file `O_NOFOLLOW` in `write_file_bytes` then
         // prevents a last-component symlink swap.
-        let file_path = PathBuf::from(&path);
+        let file_path = crate::agent::resolve_against_cwd(&self.cwd, &path);
         let file_name = file_path
             .file_name()
             .ok_or_else(|| AgshError::ToolExecution {
@@ -591,29 +680,90 @@ impl Tool for WriteFileTool {
         let canonical_parent = canonicalize_for_tool("write_file", parent_for_create).await?;
         let target = canonical_parent.join(file_name);
 
-        write_file_bytes(&target, content.as_bytes())
-            .await
-            .map_err(|error| AgshError::ToolExecution {
-                tool_name: "write_file".to_string(),
-                message: format!("failed to write '{}': {}", path, error),
-            })?;
+        // Snapshot the existing content (if any) so frontends can render
+        // a proper diff. `None` means the file did not exist (this is a
+        // create); we use the `not_found` ErrorKind to distinguish from
+        // a permissions error so the latter surfaces normally.
+        //
+        // When the client offers `fs.read_text_file`, ask the editor
+        // for its view first — buffers with unsaved changes give a
+        // more accurate `old_text` than the on-disk bytes. A delegate
+        // error is non-fatal here (diff metadata is informational),
+        // so we fall back to the local read on `Some(Err(_))` too.
+        //
+        // Some clients return `Ok("")` for files that don't exist
+        // (rather than an error). To avoid reporting `old_text:
+        // Some("")` for what is actually a fresh-file create, we
+        // probe local metadata: if the file is absent on disk AND
+        // the delegate returned an empty string, treat it as "new
+        // file" (`None`). The probe is one stat; cost is negligible
+        // and the heuristic is conservative — a truly-empty existing
+        // file still loses `old_text`, but the diff content is
+        // identical either way.
+        let old_text = match self.frontend.delegate_fs_read(&target, None, None).await {
+            Some(Ok(text)) => {
+                if text.is_empty() && !target.exists() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            _ => match read_file_to_string(&target).await {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    tracing::debug!(
+                        "write_file: pre-read of '{}' failed ({}); diff metadata will omit old_text",
+                        target.display(),
+                        error,
+                    );
+                    None
+                }
+            },
+        };
+
+        // Delegate the write when the editor offers `fs.write_text_file`.
+        // A delegate error surfaces verbatim — silently falling back
+        // to a local write would diverge from the editor's view of
+        // the file.
+        match self.frontend.delegate_fs_write(&target, &content).await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                return Err(AgshError::ToolExecution {
+                    tool_name: "write_file".to_string(),
+                    message: format!("failed to write '{}': {}", path, error),
+                });
+            }
+            None => {
+                write_file_bytes(&target, content.as_bytes())
+                    .await
+                    .map_err(|error| AgshError::ToolExecution {
+                        tool_name: "write_file".to_string(),
+                        message: format!("failed to write '{}': {}", path, error),
+                    })?;
+            }
+        }
 
         // Record the canonical path so subsequent `edit_file` calls
         // accept it without `force: true`. We just produced the content,
         // so the "must read first" safety check has nothing to gain.
-        self.read_tracker.write().await.insert(target);
+        self.read_tracker.write().await.insert(target.clone());
 
         Ok(ToolOutput::text(
             format!("Successfully wrote {} bytes to '{}'", content.len(), path),
             false,
-        ))
+        )
+        .with_metadata(crate::frontend::ToolOutputMetadata::Diff {
+            path: target,
+            old_text,
+            new_text: content.to_string(),
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
     use tokio::sync::RwLock;
 
@@ -632,6 +782,8 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -654,6 +806,8 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -681,6 +835,8 @@ mod tests {
 
         let write_tool = WriteFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let write_result = write_tool
             .execute(
@@ -713,6 +869,8 @@ mod tests {
 
         let write_tool = WriteFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = write_tool
             .execute(
@@ -745,6 +903,8 @@ mod tests {
 
         let write_tool = WriteFileTool {
             read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         write_tool
             .execute(
@@ -759,6 +919,8 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let edit_result = edit_tool
             .execute(
@@ -791,6 +953,8 @@ mod tests {
         // Read the file first to satisfy read-before-edit
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
             .execute(
@@ -802,6 +966,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -828,6 +994,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -857,6 +1025,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -885,6 +1055,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -911,6 +1083,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -936,6 +1110,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -965,6 +1141,8 @@ mod tests {
 
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
             .execute(
@@ -976,6 +1154,8 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = edit_tool
             .execute(
@@ -1012,6 +1192,8 @@ mod tests {
 
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
             .execute(
@@ -1027,6 +1209,8 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = edit_tool
             .execute(
@@ -1069,6 +1253,8 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1097,6 +1283,8 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1121,6 +1309,8 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1147,6 +1337,8 @@ mod tests {
 
         let tool = ReadFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1175,6 +1367,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1202,6 +1396,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1229,6 +1425,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1256,6 +1454,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1283,6 +1483,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1316,6 +1518,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1349,6 +1553,8 @@ mod tests {
 
         let tool = EditFileTool {
             read_tracker: test_tracker(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -1382,6 +1588,8 @@ mod tests {
 
         let read_tool = ReadFileTool {
             read_tracker: tracker.clone(),
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         read_tool
             .execute(
@@ -1393,6 +1601,8 @@ mod tests {
 
         let edit_tool = EditFileTool {
             read_tracker: tracker,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = edit_tool
             .execute(

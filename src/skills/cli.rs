@@ -7,8 +7,10 @@
 
 use std::path::Path;
 
-use crate::error::{AgshError, Result};
-use crate::skills;
+use crate::{
+    error::{AgshError, Result},
+    skills,
+};
 
 const DESCRIPTION_TRUNCATE: usize = 40;
 

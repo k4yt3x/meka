@@ -4,14 +4,15 @@
 
 use std::io::{self, Write};
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngExt;
 use sha2::{Digest, Sha256};
 
-use crate::config;
-use crate::provider::{AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, DEFAULT_OPENAI_CODEX_CLIENT_ID};
-use crate::session::TokenStore;
+use crate::{
+    config,
+    provider::{AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, DEFAULT_OPENAI_CODEX_CLIENT_ID},
+    session::TokenStore,
+};
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 const TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
@@ -156,15 +157,12 @@ fn prompt_choice(prompt: &str, options: &[&str]) -> io::Result<usize> {
 pub async fn run_setup(token_store: &TokenStore) -> anyhow::Result<()> {
     eprintln!("Welcome to agsh! Let's set up your configuration.\n");
 
-    let provider_index = prompt_choice(
-        "Select a provider:",
-        &[
-            "claude-oauth (Claude Code OAuth login)",
-            "claude-api (Claude API key)",
-            "openai-codex (ChatGPT subscription login)",
-            "openai-api (OpenAI API key)",
-        ],
-    )?;
+    let provider_index = prompt_choice("Select a provider:", &[
+        "claude-oauth (Claude Code OAuth login)",
+        "claude-api (Claude API key)",
+        "openai-codex (ChatGPT subscription login)",
+        "openai-api (OpenAI API key)",
+    ])?;
     let provider_name = match provider_index {
         0 => "claude-oauth",
         1 => "claude-api",
@@ -265,13 +263,11 @@ async fn run_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
 
 /// Driver for the `openai-codex` PKCE + authorization-code flow against
 /// `auth.openai.com`. Differs from `run_oauth_login` (Claude) in that:
-/// 1. The redirect URI is `http://localhost:1455/auth/callback` — a real
-///    localhost listener, not a paste-the-code-back-in flow. Matches the
-///    first-party Codex CLI.
+/// 1. The redirect URI is `http://localhost:1455/auth/callback` — a real localhost listener, not a
+///    paste-the-code-back-in flow. Matches the first-party Codex CLI.
 /// 2. The token exchange is form-urlencoded (Claude uses JSON).
-/// 3. The id_token JWT is decoded post-exchange to pull
-///    `chatgpt_account_id`, which is sent on every Codex request as the
-///    `ChatGPT-Account-ID` header.
+/// 3. The id_token JWT is decoded post-exchange to pull `chatgpt_account_id`, which is sent on
+///    every Codex request as the `ChatGPT-Account-ID` header.
 async fn run_codex_oauth_login(token_store: &TokenStore) -> anyhow::Result<()> {
     let client_id = codex_client_id();
     let (code_verifier, code_challenge) = generate_pkce_pair();

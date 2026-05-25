@@ -4,8 +4,7 @@
 //! user. Declines unanswered (or timed-out) requests by default so a
 //! misbehaving server can't stall the session.
 
-use std::sync::mpsc::SyncSender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc::SyncSender};
 
 use rmcp::model::{CreateElicitationResult, ElicitationAction};
 

@@ -1,0 +1,30 @@
+# Name: rustfmt config
+# Author: K4YT3X
+# Date Created: June 29, 2021
+# Last Modified: May 25, 2026
+# Docs: https://rust-lang.github.io/rustfmt/
+
+# Parsing & style baseline
+edition = "2024"
+style_edition = "2024"
+
+# Imports
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+
+# Idiomatic shorthand transforms
+use_field_init_shorthand = true
+use_try_shorthand = true
+condense_wildcard_suffixes = true
+
+# Comment & doc normalization
+wrap_comments = true
+comment_width = 100
+normalize_comments = true
+normalize_doc_attributes = true
+format_code_in_doc_comments = true
+
+# Structural consistency
+reorder_impl_items = true
+overflow_delimited_expr = true
+format_macro_matchers = true

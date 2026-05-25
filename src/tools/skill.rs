@@ -9,13 +9,13 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-use crate::skills::{self, Skill, SkillCache};
-
-use super::util::require_str;
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolOutput, util::require_str};
+use crate::{
+    error::{AgshError, Result},
+    permission::Permission,
+    provider::ToolDefinition,
+    skills::{self, Skill, SkillCache},
+};
 
 pub(super) struct SkillTool {
     pub session_id: Arc<RwLock<Option<Uuid>>>,

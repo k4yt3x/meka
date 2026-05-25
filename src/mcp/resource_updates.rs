@@ -3,9 +3,11 @@
 //! `list_mcp_resource_updates` builtin tool to see which resources need
 //! refreshing without subscribing again.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 type Ledger = HashMap<(String /* server */, String /* uri */), u64>;
 
@@ -63,6 +65,6 @@ mod tests {
         record("srv-clear", "file:///b");
         clear_for_server("srv-clear");
         let snap = snapshot();
-        assert!(!snap.iter().any(|(s, _, _)| s == "srv-clear"));
+        assert!(!snap.iter().any(|(s, ..)| s == "srv-clear"));
     }
 }

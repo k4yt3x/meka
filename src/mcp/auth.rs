@@ -5,18 +5,20 @@
 //! `rmcp`'s `AuthorizationManager`.
 
 use async_trait::async_trait;
-use rmcp::ServiceExt;
-use rmcp::transport::auth::OAuthState;
-use rmcp::transport::{
-    AuthClient, AuthError, AuthorizationManager, ClientCredentialsConfig, CredentialStore,
-    StoredCredentials,
+use rmcp::{
+    ServiceExt,
+    transport::{
+        AuthClient, AuthError, AuthorizationManager, ClientCredentialsConfig, CredentialStore,
+        StoredCredentials, auth::OAuthState,
+    },
 };
 
-use super::McpRunningService;
-use super::handler::AgshClientHandler;
-use crate::config::McpAuthConfig;
-use crate::error::{AgshError, Result};
-use crate::session::TokenStore;
+use super::{McpRunningService, handler::AgshClientHandler};
+use crate::{
+    config::McpAuthConfig,
+    error::{AgshError, Result},
+    session::TokenStore,
+};
 
 /// Best-effort revoke of a stored OAuth access/refresh token for an MCP
 /// server. Looks up the stored credentials, discovers the provider's
@@ -1295,8 +1297,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn require_private_key_permissions_rejects_world_readable() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
+        use std::{io::Write, os::unix::fs::PermissionsExt};
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("key.pem");
         let mut f = std::fs::File::create(&key_path).expect("create key");
@@ -1323,8 +1324,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn require_private_key_permissions_accepts_0600() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
+        use std::{io::Write, os::unix::fs::PermissionsExt};
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("key.pem");
         let mut f = std::fs::File::create(&key_path).expect("create key");

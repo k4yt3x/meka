@@ -2,19 +2,22 @@
 //! Claude Code fingerprinting / attestation machinery that `claude-oauth`
 //! requires. Intended for users bringing their own `CLAUDE_API_KEY`.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicI8, Ordering},
+};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::provider::{Message, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition};
-
 use super::shared::{
     self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
     drive_claude_sse_stream, parse_non_streaming_response,
+};
+use crate::{
+    error::{AgshError, Result},
+    provider::{Message, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
 };
 
 pub struct ClaudeApiProvider {

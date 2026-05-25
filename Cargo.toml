@@ -1,12 +1,13 @@
 [package]
 name = "agsh"
-version = "0.26.2"
+version = "0.27.0"
 edition = "2024"
 license = "MIT"
 description = "A general-purpose AI agent runtime"
 repository = "https://github.com/k4yt3x/agsh"
 
 [dependencies]
+agent-client-protocol = "0.12.1"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"

@@ -11,8 +11,10 @@
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::error::{AgshError, Result};
-use crate::provider::{ContentBlock, Message, Role};
+use crate::{
+    error::{AgshError, Result},
+    provider::{ContentBlock, Message, Role},
+};
 
 /// Claude Code version string. Single source of truth defined in `build.rs`.
 pub(super) const CC_VERSION: &str = env!("CC_VERSION");

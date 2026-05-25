@@ -3,15 +3,19 @@
 //! one-off CLI status/error messages. Owns the embedded Monokai Extended
 //! theme used for code blocks.
 
-use std::io::{self, Write};
-use std::sync::{LazyLock, OnceLock};
+use std::{
+    io::{self, Write},
+    sync::{LazyLock, OnceLock},
+};
 
 use crossterm::style::{Color, Stylize};
 use regex::Regex;
-use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
-use syntect::util::{LinesWithEndings, as_24_bit_terminal_escaped};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{Theme, ThemeSet},
+    parsing::SyntaxSet,
+    util::{LinesWithEndings, as_24_bit_terminal_escaped},
+};
 use termimad::MadSkin;
 
 /// Monokai Extended theme, vendored from bat's `sharkdp/sublime-monokai-extended` (MIT).
@@ -1094,17 +1098,14 @@ mod tests {
 
     #[test]
     fn test_format_columns_aligns_and_leaves_last_unpadded() {
-        let table = format_columns(
-            &["Name", "Version", "Path"],
-            &[
-                vec!["a".to_string(), "1.0".to_string(), "/long/path".to_string()],
-                vec![
-                    "longer-name".to_string(),
-                    "12".to_string(),
-                    "/p".to_string(),
-                ],
+        let table = format_columns(&["Name", "Version", "Path"], &[
+            vec!["a".to_string(), "1.0".to_string(), "/long/path".to_string()],
+            vec![
+                "longer-name".to_string(),
+                "12".to_string(),
+                "/p".to_string(),
             ],
-        );
+        ]);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 3, "header + 2 rows");
 

@@ -16,9 +16,11 @@ pub(crate) mod todo;
 mod util;
 mod web;
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -32,10 +34,12 @@ type DeferredSet = Arc<std::sync::RwLock<HashSet<String>>>;
 /// tool set; see [`extract_loaded_tool_names`].
 pub const LOAD_TOOL_NAME: &str = "load_tool";
 
-use crate::error::Result;
-use crate::permission::Permission;
-use crate::provider::{ContentBlock, Message, ToolDefinition, ToolResultContent};
-use crate::session::SessionManager;
+use crate::{
+    error::Result,
+    permission::Permission,
+    provider::{ContentBlock, Message, ToolDefinition, ToolResultContent},
+    session::SessionManager,
+};
 
 /// Walk the conversation and collect the names of tools that have been
 /// loaded via successful `load_tool` calls. A `load_tool` `tool_use` block
@@ -188,6 +192,11 @@ pub struct ToolOutput {
     /// adapters so the persisted blob is namespaced as
     /// `mcp_<server>_<remote_tool>` for easier debugging.
     pub scratchpad_hint: Option<String>,
+    /// Tool-specific structured side-channel for frontends that know
+    /// how to render it (e.g. ACP's `diff` content block). Tools that
+    /// don't produce extra structure leave this as `None`; the regular
+    /// `content` text remains the source of truth for the model.
+    pub frontend_metadata: Option<crate::frontend::ToolOutputMetadata>,
 }
 
 impl ToolOutput {
@@ -196,7 +205,18 @@ impl ToolOutput {
             content: vec![ToolResultContent::Text { text: content }],
             is_error,
             scratchpad_hint: None,
+            frontend_metadata: None,
         }
+    }
+
+    /// Attach structured frontend metadata to an existing output, e.g.
+    /// the pre/post text from a successful `edit_file`. Chains after
+    /// any other builder so the call site reads as
+    /// `ToolOutput::text(...).with_metadata(diff)`.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: crate::frontend::ToolOutputMetadata) -> Self {
+        self.frontend_metadata = Some(metadata);
+        self
     }
 }
 
@@ -250,7 +270,10 @@ impl ToolRegistry {
     /// Empty registry with the default filter — no built-ins, no MCP
     /// tools. Used by out-of-band CLI commands that spin up a manager
     /// for a single RPC (`agsh mcp reconnect`, `agsh mcp tools`) and
-    /// don't need a populated registry.
+    /// don't need a populated registry. The `dead_code` allow keeps
+    /// the helper available for future CLI subcommands that need a
+    /// throwaway registry.
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::new_with_filter(BuiltinToolFilter::default())
     }
@@ -271,6 +294,15 @@ impl ToolRegistry {
     /// the file rather than trust a pre-compaction read.
     pub async fn clear_read_tracker(&self) {
         self.read_tracker.write().await.clear();
+    }
+
+    /// Identity check by inner `Arc` pointer. `ToolRegistry` is `Clone`
+    /// over its inner `Arc<RwLock<Vec<Arc<dyn Tool>>>>`, so cloned
+    /// registries match. Used by
+    /// [`crate::mcp::McpClientManager::detach_registry`] to find the
+    /// right entry when a session closes.
+    pub fn same_inner(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.tools, &b.tools)
     }
 
     /// Register a tool. Returns an error if another tool with the same name
@@ -444,17 +476,27 @@ impl ToolRegistry {
         sandbox_capability: crate::sandbox::SandboxCapability,
         sandbox_backend: crate::config::SandboxBackend,
         backend_probe: crate::sandbox::BackendProbe,
+        cwd: crate::agent::SharedCwd,
+        frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<()> {
         let read_tracker = self.read_tracker.clone();
         self.register_builtin(Arc::new(file::ReadFileTool {
             read_tracker: read_tracker.clone(),
+            cwd: cwd.clone(),
+            frontend: Arc::clone(&frontend),
         }));
         self.register_builtin(Arc::new(file::EditFileTool {
             read_tracker: read_tracker.clone(),
+            cwd: cwd.clone(),
+            frontend: Arc::clone(&frontend),
         }));
-        self.register_builtin(Arc::new(file::WriteFileTool { read_tracker }));
-        self.register_builtin(Arc::new(find::FindFilesTool));
-        self.register_builtin(Arc::new(grep::SearchContentsTool));
+        self.register_builtin(Arc::new(file::WriteFileTool {
+            read_tracker,
+            cwd: cwd.clone(),
+            frontend: Arc::clone(&frontend),
+        }));
+        self.register_builtin(Arc::new(find::FindFilesTool { cwd: cwd.clone() }));
+        self.register_builtin(Arc::new(grep::SearchContentsTool { cwd: cwd.clone() }));
         // A malformed proxy URL or unreadable CA file surfaces as a
         // startup error rather than silently falling back to an
         // unconfigured client (which would ignore the user's intent).
@@ -469,6 +511,8 @@ impl ToolRegistry {
             backend_probe,
             shared_permission,
             sandbox_enabled,
+            cwd,
+            frontend,
         }));
         Ok(())
     }
@@ -491,8 +535,8 @@ impl ToolRegistry {
     /// todo_*, scratchpad_*) on the registry. Shared between
     /// [`Self::build_default`] and [`Self::build_for_subagent`] so adding
     /// a new such tool to the parent automatically gives it to sub-agents
-    /// too. `render_visible_todos` distinguishes the two paths: the parent
-    /// renders todo updates to the user's stderr, sub-agents stay silent.
+    /// too. Todo-list rendering is the [`crate::frontend::Frontend`]'s
+    /// concern now, not the tool's.
     ///
     /// `parent_session_id` + `inherited_scratchpad_names` configure
     /// read-only scratchpad inheritance for sub-agents. Both are
@@ -505,7 +549,6 @@ impl ToolRegistry {
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         todo_list: todo::SharedTodoList,
         skills: Arc<crate::skills::SkillCache>,
-        render_visible_todos: bool,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
     ) {
@@ -523,7 +566,6 @@ impl ToolRegistry {
         }));
         self.register_builtin(Arc::new(todo::TodoWriteTool {
             todo_list: todo_list.clone(),
-            render_visible: render_visible_todos,
         }));
         self.register_builtin(Arc::new(todo::TodoReadTool { todo_list }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadWriteTool {
@@ -590,6 +632,8 @@ impl ToolRegistry {
         shared_session_id: Arc<RwLock<Option<Uuid>>>,
         skills: Arc<crate::skills::SkillCache>,
         builtin_filter: BuiltinToolFilter,
+        cwd: crate::agent::SharedCwd,
+        frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
         registry.register_core_tools(
@@ -599,13 +643,14 @@ impl ToolRegistry {
             sandbox_capability,
             sandbox_backend,
             backend_probe,
+            cwd.clone(),
+            frontend,
         )?;
         registry.register_session_scoped_tools(
             session_manager,
             shared_session_id,
             todo_list,
             skills,
-            true,
             None,
             Vec::new(),
         );
@@ -637,6 +682,8 @@ impl ToolRegistry {
         skills: Arc<crate::skills::SkillCache>,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
+        cwd: crate::agent::SharedCwd,
+        frontend: Arc<dyn crate::frontend::Frontend>,
     ) -> Result<Self> {
         let registry = Self::new_with_filter(builtin_filter);
         registry.register_core_tools(
@@ -646,13 +693,14 @@ impl ToolRegistry {
             sandbox_capability,
             sandbox_backend,
             backend_probe,
+            cwd.clone(),
+            frontend,
         )?;
         registry.register_session_scoped_tools(
             session_manager,
             shared_session_id,
             todo_list,
             skills,
-            false,
             parent_session_id,
             inherited_scratchpad_names,
         );
@@ -706,6 +754,8 @@ pub(crate) mod tests {
             shared_session_id,
             crate::skills::SkillCache::for_root(None),
             filter,
+            crate::agent::test_cwd(),
+            Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly")
     }
@@ -753,9 +803,11 @@ pub(crate) mod tests {
                 serde_json::json!({"type": "object", "properties": {}}),
             )
         }
+
         fn required_permission(&self) -> Permission {
             Permission::Read
         }
+
         async fn execute(
             &self,
             _input: serde_json::Value,
@@ -1100,8 +1152,7 @@ pub(crate) mod tests {
         register_deferred_fixture(&registry, "fixture_alpha");
 
         let entries = registry.tool_catalogue();
-        let names: std::collections::HashSet<_> =
-            entries.iter().map(|(n, _, _, _)| n.clone()).collect();
+        let names: std::collections::HashSet<_> = entries.iter().map(|(n, ..)| n.clone()).collect();
         assert!(names.contains("write_file"));
         assert!(names.contains("scratchpad_read"));
         assert!(names.contains("fixture_alpha"));
@@ -1144,7 +1195,7 @@ pub(crate) mod tests {
         ] {
             let entry = entries
                 .iter()
-                .find(|(n, _, _, _)| n == name)
+                .find(|(n, ..)| n == name)
                 .unwrap_or_else(|| panic!("{} missing from catalogue", name));
             assert!(
                 !entry.3,
@@ -1158,7 +1209,7 @@ pub(crate) mod tests {
     async fn test_tool_catalogue_is_sorted() {
         let registry = test_registry().await;
         let entries = registry.tool_catalogue();
-        let names: Vec<_> = entries.iter().map(|(n, _, _, _)| n.clone()).collect();
+        let names: Vec<_> = entries.iter().map(|(n, ..)| n.clone()).collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "tool_catalogue must return sorted entries");
@@ -1176,9 +1227,11 @@ pub(crate) mod tests {
                     serde_json::json!({}),
                 )
             }
+
             fn required_permission(&self) -> Permission {
                 Permission::Read
             }
+
             async fn execute(
                 &self,
                 _input: serde_json::Value,
@@ -1310,7 +1363,7 @@ pub(crate) mod tests {
         let catalogue = registry.tool_catalogue();
         let read_file_required = catalogue
             .iter()
-            .find(|(name, _, _, _)| name == "read_file")
+            .find(|(name, ..)| name == "read_file")
             .map(|(_, _, perm, _)| *perm);
         assert_eq!(read_file_required, Some(Permission::Write));
     }
@@ -1359,6 +1412,8 @@ pub(crate) mod tests {
             crate::skills::SkillCache::for_root(None),
             None,
             Vec::new(),
+            crate::agent::test_cwd(),
+            Arc::new(crate::frontend::SilentFrontend),
         )
         .expect("default web client config should build cleanly");
         assert!(registry.get("read_file").is_some());

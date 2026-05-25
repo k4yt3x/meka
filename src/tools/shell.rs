@@ -2,15 +2,17 @@
 //! the platform sandbox (Landlock/sandbox-exec) when permissions are
 //! read-only, and streams stdout/stderr back to the agent.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-
-use super::util::require_str;
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolOutput, util::require_str};
+use crate::{
+    error::{AgshError, Result},
+    permission::Permission,
+    provider::ToolDefinition,
+};
 
 /// Default `timeout_ms` applied when the caller doesn't pass one.
 /// Single source of truth for both the parameter unwrap and the
@@ -33,6 +35,12 @@ pub(super) struct ExecuteCommandTool {
     pub backend_probe: crate::sandbox::BackendProbe,
     pub shared_permission: crate::permission::SharedPermission,
     pub sandbox_enabled: bool,
+    pub cwd: crate::agent::SharedCwd,
+    /// Non-`Read` modes delegate to the editor's hosted terminal
+    /// (ACP `terminal/*`) when the client advertises support.
+    /// `Read` mode bypasses delegation to keep the local
+    /// Landlock / bwrap / sandbox-exec / Low-Integrity jail.
+    pub frontend: Arc<dyn crate::frontend::Frontend>,
 }
 
 #[async_trait]
@@ -128,6 +136,29 @@ impl Tool for ExecuteCommandTool {
                     tool_name: "execute_command".to_string(),
                     message,
                 });
+            }
+        }
+
+        // Delegate to the editor's hosted terminal when offered.
+        // `Read` mode skips delegation to preserve the local sandbox
+        // jail — the editor's terminal has no equivalent.
+        if !matches!(permission, Permission::Read) {
+            let (program, args) = shell_invocation(&command);
+            let spec = crate::frontend::DelegatedExecSpec {
+                command: program,
+                args,
+                env: Vec::new(),
+                cwd: Some(crate::agent::cwd_snapshot(&self.cwd)),
+                timeout: Some(std::time::Duration::from_millis(timeout_ms)),
+                output_byte_limit: Some(2_000_000),
+                cancellation: cancellation.clone(),
+            };
+            if let Some(result) = self.frontend.delegate_execute(spec).await {
+                let output = result.map_err(|error| AgshError::ToolExecution {
+                    tool_name: "execute_command".to_string(),
+                    message: format!("delegated execute failed: {}", error),
+                })?;
+                return Ok(assemble_delegated_output(output));
             }
         }
 
@@ -285,6 +316,11 @@ impl Tool for ExecuteCommandTool {
             command_builder.env_clear();
             command_builder.envs(crate::sandbox::sandbox_child_env());
         }
+
+        // Resolve commands against the agent's per-session cwd, not
+        // the process cwd. `/cd` mutates the agent's cwd; this is how
+        // it actually reaches the child.
+        command_builder.current_dir(crate::agent::cwd_snapshot(&self.cwd));
 
         let mut child = command_builder
             .stdin(std::process::Stdio::null())
@@ -474,8 +510,7 @@ async fn run_windows_low_integrity(
     timeout_ms: u64,
     cancellation: CancellationToken,
 ) -> Result<ToolOutput> {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     // Bound the post-kill cleanup wait so a stuck `TerminateProcess` or a
     // drain task that somehow fails to reach EOF can't hang the tool
@@ -626,6 +661,64 @@ fn append_drain_truncation_note(
     }
 }
 
+/// Build the `(program, args)` pair an ACP `terminal/create` should
+/// run for the user-supplied shell command. Mirrors the platform
+/// choices the local spawn makes (`sh -c …` on Unix, PowerShell with
+/// the UTF-8 prelude on Windows) so a delegated command behaves like
+/// the local one.
+fn shell_invocation(command: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let wrapped = crate::sandbox::wrap_command_with_utf8_output(command);
+        ("powershell.exe".to_string(), vec![
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            wrapped,
+        ])
+    }
+    #[cfg(not(windows))]
+    {
+        ("sh".to_string(), vec![
+            "-c".to_string(),
+            command.to_string(),
+        ])
+    }
+}
+
+/// Assemble a [`ToolOutput`] from a [`crate::frontend::DelegatedExecOutput`].
+/// Matches the local execute_command's final-string shape so the model
+/// can't tell whether the command ran locally or in the editor's
+/// terminal: stdout (combined output here, since ACP returns one
+/// stream) + an "Exit code: N" trailer for non-zero exits + a
+/// truncation note when the editor dropped output.
+fn assemble_delegated_output(output: crate::frontend::DelegatedExecOutput) -> ToolOutput {
+    let mut text = output.output.clone();
+    let exit_code = output.exit_code.unwrap_or(0);
+    let is_error = exit_code != 0 || output.signal.is_some();
+    if let Some(signal) = output.signal.as_deref() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("Terminated by signal: {}", signal));
+    } else if exit_code != 0 {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("Exit code: {}", exit_code));
+    }
+    if output.truncated {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(
+            "(output truncated by the editor's terminal-buffer cap; rerun with a narrower \
+             scope or pipe to a file for the full output)",
+        );
+    }
+    ToolOutput::text(text, is_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +748,8 @@ mod tests {
             backend_probe,
             shared_permission,
             sandbox_enabled,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         }
     }
 
@@ -751,6 +846,8 @@ mod tests {
             },
             shared_permission: read_only_perm,
             sandbox_enabled: true,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -800,6 +897,8 @@ mod tests {
             },
             shared_permission: write_perm,
             sandbox_enabled: true,
+            cwd: crate::agent::test_cwd(),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
         };
         let result = tool
             .execute(
@@ -908,6 +1007,7 @@ mod tests {
                 backend_probe,
                 shared_permission,
                 sandbox_enabled: true,
+                cwd: crate::agent::test_cwd(),
             }
         }
 

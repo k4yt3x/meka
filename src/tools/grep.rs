@@ -4,18 +4,23 @@
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-
-use super::util::{redirects_to_scratchpad, require_str};
-use super::{Tool, ToolOutput};
+use super::{
+    Tool, ToolOutput,
+    util::{redirects_to_scratchpad, require_str},
+};
+use crate::{
+    error::{AgshError, Result},
+    permission::Permission,
+    provider::ToolDefinition,
+};
 
 /// Inline match cap when the agent isn't redirecting to the scratchpad.
 /// Single source of truth for the description and the runtime cap.
 const MAX_INLINE_MATCHES: usize = 100;
 
-pub(super) struct SearchContentsTool;
+pub(super) struct SearchContentsTool {
+    pub cwd: crate::agent::SharedCwd,
+}
 
 #[async_trait]
 impl Tool for SearchContentsTool {
@@ -72,7 +77,15 @@ impl Tool for SearchContentsTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "search_contents")?;
-        let search_path = input["path"].as_str().unwrap_or(".").to_string();
+        // Resolve the optional `path` against the agent's per-session
+        // cwd so the search runs in the right tree regardless of where
+        // the process was launched.
+        let search_path = input["path"]
+            .as_str()
+            .map(|raw| crate::agent::resolve_against_cwd(&self.cwd, raw))
+            .unwrap_or_else(|| crate::agent::cwd_snapshot(&self.cwd))
+            .to_string_lossy()
+            .into_owned();
         let file_glob = input["glob"].as_str().map(|s| s.to_string());
         // Cap match count for inline use; lift it when redirecting output to
         // the scratchpad so the agent can collect an unbounded result set.
@@ -161,8 +174,7 @@ fn search_file(
     path: &std::path::Path,
     results: &mut Vec<String>,
 ) -> Result<()> {
-    use grep_searcher::Searcher;
-    use grep_searcher::sinks::UTF8;
+    use grep_searcher::{Searcher, sinks::UTF8};
 
     let mut searcher = Searcher::new();
     if let Err(error) = searcher.search_path(
@@ -247,7 +259,9 @@ mod tests {
         )
         .expect("failed");
 
-        let tool = SearchContentsTool;
+        let tool = SearchContentsTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
@@ -277,7 +291,9 @@ mod tests {
         std::fs::create_dir_all(&deep).expect("create nested tree");
         std::fs::write(deep.join("buried.txt"), "needle here\n").expect("write");
 
-        let tool = SearchContentsTool;
+        let tool = SearchContentsTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
@@ -300,7 +316,9 @@ mod tests {
         let content = (0..150).map(|_| "match\n").collect::<String>();
         std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
 
-        let tool = SearchContentsTool;
+        let tool = SearchContentsTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
@@ -320,7 +338,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp_dir.path().join("a.txt"), "match").expect("write");
 
-        let tool = SearchContentsTool;
+        let tool = SearchContentsTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let err = tool
             .execute(
                 serde_json::json!({
@@ -346,7 +366,9 @@ mod tests {
         let content = (0..150).map(|_| "match\n").collect::<String>();
         std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
 
-        let tool = SearchContentsTool;
+        let tool = SearchContentsTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({

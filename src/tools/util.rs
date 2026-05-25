@@ -2,9 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::error::{AgshError, Result};
-
 use super::ToolOutput;
+use crate::error::{AgshError, Result};
 
 /// Default cap for regex-search-mode hits; shared by `read_file` and
 /// `scratchpad_read`.

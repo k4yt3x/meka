@@ -3,19 +3,24 @@
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-
-use super::util::{redirects_to_scratchpad, require_str};
-use super::{Tool, ToolOutput};
+use super::{
+    Tool, ToolOutput,
+    util::{redirects_to_scratchpad, require_str},
+};
+use crate::{
+    error::{AgshError, Result},
+    permission::Permission,
+    provider::ToolDefinition,
+};
 
 /// Default inline result cap when the agent isn't redirecting to the
 /// scratchpad and didn't pass an explicit `limit`. Single source of truth
 /// for the description and the runtime default.
 const DEFAULT_INLINE_RESULTS: usize = 500;
 
-pub(super) struct FindFilesTool;
+pub(super) struct FindFilesTool {
+    pub cwd: crate::agent::SharedCwd,
+}
 
 #[async_trait]
 impl Tool for FindFilesTool {
@@ -79,17 +84,23 @@ impl Tool for FindFilesTool {
         _cancellation: CancellationToken,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "find_files")?;
-        let base_path = input["path"].as_str().map(|s| s.to_string());
-
-        let full_pattern = match &base_path {
-            Some(base) => format!("{}/{}", base.trim_end_matches('/'), pattern),
-            None => pattern.clone(),
-        };
+        // Resolve the optional `path` against the agent's per-session
+        // cwd so the search runs in the right tree regardless of where
+        // the process was launched. Absolute paths pass through unchanged.
+        let base_path = input["path"]
+            .as_str()
+            .map(|raw| crate::agent::resolve_against_cwd(&self.cwd, raw))
+            .unwrap_or_else(|| crate::agent::cwd_snapshot(&self.cwd));
+        let full_pattern = format!(
+            "{}/{}",
+            base_path.to_string_lossy().trim_end_matches('/'),
+            pattern,
+        );
 
         // Cap precedence:
         //   1. explicit `limit` parameter — honoured verbatim
-        //   2. no limit + `scratchpad` set — unbounded (preserves the
-        //      "collect everything" escape hatch)
+        //   2. no limit + `scratchpad` set — unbounded (preserves the "collect everything" escape
+        //      hatch)
         //   3. otherwise — DEFAULT_INLINE_RESULTS
         let explicit_limit = input
             .get("limit")
@@ -172,7 +183,9 @@ mod tests {
         std::fs::write(temp_dir.path().join("b.txt"), "").expect("failed");
         std::fs::write(temp_dir.path().join("c.rs"), "").expect("failed");
 
-        let tool = FindFilesTool;
+        let tool = FindFilesTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
@@ -197,7 +210,9 @@ mod tests {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
         }
 
-        let tool = FindFilesTool;
+        let tool = FindFilesTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
@@ -224,7 +239,9 @@ mod tests {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
         }
 
-        let tool = FindFilesTool;
+        let tool = FindFilesTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
@@ -251,7 +268,9 @@ mod tests {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
         }
 
-        let tool = FindFilesTool;
+        let tool = FindFilesTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({
@@ -288,7 +307,9 @@ mod tests {
             std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
         }
 
-        let tool = FindFilesTool;
+        let tool = FindFilesTool {
+            cwd: crate::agent::test_cwd(),
+        };
         let result = tool
             .execute(
                 serde_json::json!({

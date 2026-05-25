@@ -197,10 +197,11 @@ mod tests {
     fn multiple_vars_same_missing_dedup() {
         let (_out, missing) = expand_env_vars("${X} ${X} ${Y}", fixed(&[]));
         // Not deduped at this layer — caller dedupes across fields.
-        assert_eq!(
-            missing,
-            vec!["X".to_string(), "X".to_string(), "Y".to_string()]
-        );
+        assert_eq!(missing, vec![
+            "X".to_string(),
+            "X".to_string(),
+            "Y".to_string()
+        ]);
     }
 
     #[test]

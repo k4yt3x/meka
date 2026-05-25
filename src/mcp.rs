@@ -14,26 +14,29 @@ pub mod resource_updates;
 pub mod sanitize;
 pub mod transport;
 
-pub use handler::McpToolAdapter;
-
-use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::sync::{Arc, Weak};
-
-use rmcp::model::{
-    GetPromptRequestParams, GetPromptResult, Prompt, ReadResourceRequestParams, ReadResourceResult,
-    Resource,
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock, Weak},
 };
-use rmcp::service::ServiceError;
-use rmcp::{Peer, RoleClient};
+
+pub use handler::McpToolAdapter;
+use rmcp::{
+    Peer, RoleClient,
+    model::{
+        GetPromptRequestParams, GetPromptResult, Prompt, ReadResourceRequestParams,
+        ReadResourceResult, Resource,
+    },
+    service::ServiceError,
+};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{McpServerConfig, McpTransport};
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::provider::Provider;
-use crate::session::TokenStore;
-use crate::tools::ToolRegistry;
+use crate::{
+    config::{McpServerConfig, McpTransport},
+    error::{AgshError, Result},
+    permission::Permission,
+    provider::Provider,
+    session::TokenStore,
+};
 
 /// Cap MCP-provided text (tool descriptions, resource/prompt descriptions) to
 /// this many characters so a chatty server can't blow up the system prompt.
@@ -66,6 +69,43 @@ pub const MCP_AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_se
 pub(crate) type McpRunningService =
     rmcp::service::RunningService<RoleClient, handler::AgshClientHandler>;
 
+tokio::task_local! {
+    /// Per-task override for the cwd reported in MCP `roots/list`.
+    /// When an agent dispatches an MCP tool from a multi-session ACP
+    /// process, the dispatch wraps the tool's `execute` future in
+    /// [`with_session_cwd`] so any `roots/list` callback fired
+    /// *during* the tool call sees the calling session's cwd —
+    /// rather than the process default the MCP context was seeded
+    /// with at startup.
+    ///
+    /// `roots/list` queries outside a tool call (e.g. the
+    /// connection-establishment handshake before any session
+    /// exists) fall back to the process default via
+    /// [`current_roots_cwd`].
+    static SESSION_CWD: crate::agent::SharedCwd;
+}
+
+/// Read the cwd MCP should report for `roots/list`. Returns the
+/// task-local override if set (active tool call from a session) or
+/// the supplied `default` otherwise (connection-time queries,
+/// REPL/oneshot paths where there's a single process-wide cwd).
+pub(crate) fn current_roots_cwd(default: &crate::agent::SharedCwd) -> std::path::PathBuf {
+    SESSION_CWD
+        .try_with(crate::agent::cwd_snapshot)
+        .unwrap_or_else(|_| crate::agent::cwd_snapshot(default))
+}
+
+/// Scope `cwd` as the task-local override for the duration of
+/// `fut`. Used by MCP tool dispatch so a session's cwd reaches the
+/// `roots/list` handler without explicit threading through the
+/// rmcp callback API (which doesn't carry session context).
+pub async fn with_session_cwd<F, T>(cwd: crate::agent::SharedCwd, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SESSION_CWD.scope(cwd, fut).await
+}
+
 pub struct McpClientManager {
     servers: HashMap<String, Arc<ServerEntry>>,
     /// Global fallback permission from `[mcp].default_permission`.
@@ -84,11 +124,23 @@ pub struct McpClientManager {
     /// a no-op; avoids re-spawning the connector if a test or the REPL
     /// re-enters the same manager.
     pending_entries: std::sync::Mutex<Option<Vec<Arc<ServerEntry>>>>,
+    /// Live snapshot of every connected server's currently-registered
+    /// tools. The connector writes here as each server reaches
+    /// `Connected`, and `on_tool_list_changed` writes here on dynamic
+    /// updates. New sessions read this snapshot at
+    /// [`Self::attach_registry`] time to backfill MCP tools into
+    /// their fresh per-session registry.
+    tools_snapshot: tokio::sync::RwLock<HashMap<String, Vec<Arc<dyn crate::tools::Tool>>>>,
+    /// Registries currently observing MCP tool updates. Sessions
+    /// attach at `session/new` (or REPL startup) and detach at
+    /// `session/close`. Updates from the connector or notification
+    /// handler propagate to every entry.
+    attached_registries: tokio::sync::RwLock<Vec<crate::tools::ToolRegistry>>,
 }
 
 /// Lifecycle state of a single MCP server. Transitions:
-/// - Built as `Disabled` (config says so) or `Pending` (will be
-///   connected by the background connector).
+/// - Built as `Disabled` (config says so) or `Pending` (will be connected by the background
+///   connector).
 /// - `Pending` → `Connected` on successful `initialize` + `list_tools`.
 /// - `Pending` → `Failed` on connect error or connect-timeout.
 /// - `Connected` → `Connected` (with a new `service` Arc) on reconnect.
@@ -323,17 +375,16 @@ fn resolve_concurrency_env(env_var: &str, default: usize) -> usize {
 impl McpClientManager {
     /// Validate configs and build a manager with every non-empty entry
     /// in `Disabled` or `Pending` state. Does NOT spawn any network /
-    /// process work — that happens in [`Self::start_connector`] once
-    /// the caller has built the [`crate::tools::ToolRegistry`]. Callers
-    /// typically:
+    /// process work — that happens in [`Self::start_connector`].
+    /// Callers typically:
     /// 1. `let manager = McpClientManager::prepare(...).await?;`
     /// 2. Register the manager on the `McpClientContext`.
-    /// 3. Build the tool registry.
-    /// 4. `manager.start_connector(registry, runtime);`
+    /// 3. Build the tool registry and call `manager.attach_registry(registry.clone()).await`.
+    /// 4. `manager.start_connector(runtime);`
     ///
     /// The split exists so the connector can register MCP tools into
-    /// the registry as each server comes online, without forcing the
-    /// registry to exist before config validation.
+    /// attached registries as each server comes online, without
+    /// forcing any registry to exist before config validation.
     pub async fn prepare(
         configs: &[McpServerConfig],
         mcp_default_permission: Option<Permission>,
@@ -438,37 +489,107 @@ impl McpClientManager {
             mcp_default_permission,
             settled: settled_tx,
             pending_entries: std::sync::Mutex::new(Some(pending)),
+            tools_snapshot: tokio::sync::RwLock::new(HashMap::new()),
+            attached_registries: tokio::sync::RwLock::new(Vec::new()),
         });
         Ok(manager)
+    }
+
+    /// Update the live snapshot for one server's tools and propagate
+    /// the change to every attached registry. Called by the connector
+    /// when a server reaches `Connected` and by `on_tool_list_changed`
+    /// when a server signals a dynamic update.
+    ///
+    /// The snapshot is what new sessions read at attach time; the
+    /// propagation keeps existing sessions in sync without requiring
+    /// them to re-attach.
+    pub async fn update_server_tools(
+        &self,
+        server_name: &str,
+        tools: Vec<Arc<dyn crate::tools::Tool>>,
+    ) {
+        self.tools_snapshot
+            .write()
+            .await
+            .insert(server_name.to_string(), tools.clone());
+        let registries = self.attached_registries.read().await;
+        for registry in registries.iter() {
+            registry.replace_server_tools(server_name, tools.clone());
+        }
+    }
+
+    /// Attach a per-session registry to receive live MCP tool updates.
+    /// Pushes the registry into the attached list *before* backfilling
+    /// from the snapshot so any concurrent [`Self::update_server_tools`]
+    /// either fans out to the new registry (push happened first) or has
+    /// its result observed by the subsequent backfill (push happened
+    /// second). The opposite ordering — read snapshot, then push — has
+    /// a window where an update can land between the snapshot read and
+    /// the push, with the registry missing it forever.
+    ///
+    /// `replace_server_tools` is idempotent, so the double-write when
+    /// both paths fire is harmless.
+    ///
+    /// Sessions call this at `session/new` (after building their
+    /// per-session [`crate::tools::ToolRegistry`]) and pair it with
+    /// [`Self::detach_registry`] at `session/close`.
+    pub async fn attach_registry(&self, registry: crate::tools::ToolRegistry) {
+        self.attached_registries
+            .write()
+            .await
+            .push(registry.clone());
+        let snapshot = self.tools_snapshot.read().await;
+        for (server_name, tools) in snapshot.iter() {
+            registry.replace_server_tools(server_name, tools.clone());
+        }
+    }
+
+    /// Detach a registry from MCP tool updates. Identity is by inner
+    /// `Arc` pointer (see [`crate::tools::ToolRegistry::same_inner`])
+    /// so clones of the same registry match. No-op if not attached.
+    pub async fn detach_registry(&self, registry: &crate::tools::ToolRegistry) {
+        let mut registries = self.attached_registries.write().await;
+        registries.retain(|other| !crate::tools::ToolRegistry::same_inner(other, registry));
+    }
+
+    /// Mark a batch of tool names as deferred across every attached
+    /// registry. Called after [`Self::update_server_tools`] when some
+    /// of the newly-registered adapters are lazy-load only — the
+    /// agent's tools-array build then skips them until they're
+    /// explicitly requested.
+    pub async fn mark_deferred_on_attached(&self, tool_names: &[String]) {
+        let registries = self.attached_registries.read().await;
+        for registry in registries.iter() {
+            for name in tool_names {
+                registry.mark_deferred(name);
+            }
+        }
     }
 
     /// Spawn the background connector. Consumes the `Pending` entry list
     /// stashed by [`Self::prepare`] so subsequent calls are no-ops. Safe
     /// to call on managers with no pending entries.
-    pub fn start_connector(
-        self: &Arc<Self>,
-        tool_registry: crate::tools::ToolRegistry,
-        runtime: McpRuntimeConfig,
-    ) {
+    ///
+    /// The connector writes tool discoveries through
+    /// [`Self::update_server_tools`], which fans out to every
+    /// registry attached via [`Self::attach_registry`]. The caller
+    /// does not pass a specific registry — attach yours first, then
+    /// start the connector.
+    pub fn start_connector(self: &Arc<Self>, runtime: McpRuntimeConfig) {
         let Some(pending) = self
             .pending_entries
             .lock()
-            .expect("pending_entries lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         else {
             return;
         };
+        let manager = Arc::clone(self);
         let settled = self.settled.clone();
         let mcp_default_permission = self.mcp_default_permission;
         tokio::spawn(async move {
-            connector::run_connector(
-                pending,
-                tool_registry,
-                mcp_default_permission,
-                runtime,
-                settled,
-            )
-            .await;
+            connector::run_connector(pending, manager, mcp_default_permission, runtime, settled)
+                .await;
         });
     }
 
@@ -935,8 +1056,7 @@ pub(crate) fn warn_on_stale_tool_config(
 ///
 /// 1. `server.tool_permissions[tool]` — per-tool user override.
 /// 2. `server.permission` — server-level user override.
-/// 3. `tool.annotations.readOnlyHint` advertised by the server:
-///    `true` → Read, `false` → Write.
+/// 3. `tool.annotations.readOnlyHint` advertised by the server: `true` → Read, `false` → Write.
 /// 4. `mcp.default_permission` — global fallback when no hint exists.
 /// 5. Hardcoded `Write` — ultimate strict fallback.
 ///
@@ -1080,11 +1200,15 @@ pub struct McpClientContext {
     /// LLM provider used to serve `sampling/createMessage` requests. Only
     /// consulted when a server has `sampling = true` in its config.
     provider: OnceLock<Arc<dyn Provider>>,
-    /// Tool registry to hot-swap when a server emits `tools/list_changed`.
-    registry: OnceLock<ToolRegistry>,
     /// Weak reference to the MCP manager so the notification callback can
     /// rediscover tools without creating an Arc cycle through the handler.
+    /// Tool registry updates flow through the manager's attached
+    /// registries — no per-context registry slot is needed.
     manager: OnceLock<Weak<McpClientManager>>,
+    /// Per-session working directory shared with the agent. Read by the
+    /// `roots/list` handler so the path reported to MCP servers tracks
+    /// `/cd` rather than the process cwd at startup.
+    cwd: OnceLock<crate::agent::SharedCwd>,
 }
 
 impl McpClientContext {
@@ -1098,24 +1222,24 @@ impl McpClientContext {
         }
     }
 
-    pub fn set_registry(&self, registry: ToolRegistry) {
-        if self.registry.set(registry).is_err() {
-            tracing::warn!("MCP client context: registry already set");
-        }
-    }
-
     pub fn set_manager(&self, manager: Weak<McpClientManager>) {
         if self.manager.set(manager).is_err() {
             tracing::warn!("MCP client context: manager already set");
         }
     }
 
-    pub(crate) fn provider(&self) -> Option<Arc<dyn Provider>> {
-        self.provider.get().cloned()
+    pub fn set_cwd(&self, cwd: crate::agent::SharedCwd) {
+        if self.cwd.set(cwd).is_err() {
+            tracing::warn!("MCP client context: cwd already set");
+        }
     }
 
-    pub(crate) fn registry(&self) -> Option<ToolRegistry> {
-        self.registry.get().cloned()
+    pub(crate) fn cwd(&self) -> Option<&crate::agent::SharedCwd> {
+        self.cwd.get()
+    }
+
+    pub(crate) fn provider(&self) -> Option<Arc<dyn Provider>> {
+        self.provider.get().cloned()
     }
 
     pub(crate) fn manager(&self) -> Option<Weak<McpClientManager>> {
@@ -1767,14 +1891,11 @@ mod tests {
             .expect("prepare should succeed");
         assert!(!manager.all_ready());
 
-        manager.start_connector(
-            crate::tools::ToolRegistry::new(),
-            McpRuntimeConfig {
-                connect_timeout: std::time::Duration::from_secs(2),
-                stdio_concurrency: 1,
-                http_concurrency: 1,
-            },
-        );
+        manager.start_connector(McpRuntimeConfig {
+            connect_timeout: std::time::Duration::from_secs(2),
+            stdio_concurrency: 1,
+            http_concurrency: 1,
+        });
 
         let res =
             tokio::time::timeout(std::time::Duration::from_secs(5), manager.await_settled()).await;
@@ -1847,5 +1968,193 @@ mod tests {
             registry.get("list_mcp_resources").is_none(),
             "no MCP meta-tools should land on the registry when no servers configured"
         );
+    }
+
+    /// Two concurrent tasks each scoping a different cwd through
+    /// [`with_session_cwd`] must each observe their own cwd from
+    /// [`current_roots_cwd`], not each other's and not the default.
+    /// This is the property that lets MCP `roots/list` callbacks fired
+    /// during a per-session tool invocation report the right roots
+    /// even when many sessions race tool calls in parallel.
+    #[tokio::test]
+    async fn current_roots_cwd_is_isolated_per_task_scope() {
+        use std::sync::Arc;
+
+        use tokio::sync::Barrier;
+
+        let cwd_a: crate::agent::SharedCwd =
+            Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("/tmp/a")));
+        let cwd_b: crate::agent::SharedCwd =
+            Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("/tmp/b")));
+        let default: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
+            std::path::PathBuf::from("/tmp/default"),
+        ));
+
+        // Force overlapping task lifetimes so the task-local can't
+        // accidentally "win" by being set, run to completion, and
+        // unset before the other task starts.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let task_a = {
+            let cwd_a = cwd_a.clone();
+            let default = default.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                with_session_cwd(cwd_a, async move {
+                    // Both tasks reach the barrier inside the scope so
+                    // their task-locals coexist before the read.
+                    barrier.wait().await;
+                    current_roots_cwd(&default)
+                })
+                .await
+            })
+        };
+        let task_b = {
+            let cwd_b = cwd_b.clone();
+            let default = default.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                with_session_cwd(cwd_b, async move {
+                    barrier.wait().await;
+                    current_roots_cwd(&default)
+                })
+                .await
+            })
+        };
+
+        let observed_a = task_a.await.expect("task A");
+        let observed_b = task_b.await.expect("task B");
+
+        assert_eq!(
+            observed_a,
+            std::path::PathBuf::from("/tmp/a"),
+            "task A must see its own cwd"
+        );
+        assert_eq!(
+            observed_b,
+            std::path::PathBuf::from("/tmp/b"),
+            "task B must see its own cwd — not A's, not the default"
+        );
+
+        // Outside any `with_session_cwd` scope, the fallback path
+        // must report the process default.
+        let unscoped = current_roots_cwd(&default);
+        assert_eq!(unscoped, std::path::PathBuf::from("/tmp/default"));
+    }
+
+    /// `update_server_tools` racing against `attach_registry` must
+    /// not lose updates: every published tool list must reach every
+    /// session that attaches before or during the publish, with no
+    /// silent miss window. Regression guard for the race fixed in
+    /// [`McpClientManager::attach_registry`] where the original
+    /// "read snapshot → push registry" order let updates land in the
+    /// gap.
+    #[tokio::test]
+    async fn attach_registry_races_with_update_without_losing_tools() {
+        use std::sync::Arc;
+
+        use crate::{
+            permission::Permission,
+            provider::ToolDefinition,
+            tools::{Tool, ToolOutput},
+        };
+
+        // Minimal fixture so each server publishes a distinctively-
+        // named tool — empty Vec to `replace_server_tools` is a no-op
+        // and wouldn't actually exercise the propagation path.
+        struct FixtureTool {
+            name: String,
+        }
+        #[async_trait::async_trait]
+        impl Tool for FixtureTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition::new(
+                    self.name.clone(),
+                    "race fixture".to_string(),
+                    serde_json::json!({"type": "object", "properties": {}}),
+                )
+            }
+
+            fn required_permission(&self) -> Permission {
+                Permission::Read
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _cancellation: tokio_util::sync::CancellationToken,
+            ) -> crate::error::Result<ToolOutput> {
+                Ok(ToolOutput::text("ok".to_string(), false))
+            }
+        }
+
+        // Empty config — we don't need real servers to exercise the
+        // snapshot/registry plumbing, just the manager methods.
+        let context = McpClientContext::new();
+        let manager = McpClientManager::prepare(&[], None, None, context)
+            .await
+            .expect("prepare");
+
+        let server_names: Vec<String> = (0..4).map(|index| format!("srv-{}", index)).collect();
+        let registry_count = 8;
+        let registries: Vec<crate::tools::ToolRegistry> = (0..registry_count)
+            .map(|_| crate::tools::ToolRegistry::new())
+            .collect();
+
+        // Each updater publishes one tool named mcp__<server>__ping.
+        let mut update_handles = Vec::new();
+        for name in &server_names {
+            let manager = Arc::clone(&manager);
+            let name = name.clone();
+            update_handles.push(tokio::spawn(async move {
+                let tool: Arc<dyn Tool> = Arc::new(FixtureTool {
+                    name: format!("mcp__{}__ping", name),
+                });
+                manager.update_server_tools(&name, vec![tool]).await;
+            }));
+        }
+        let mut attach_handles = Vec::new();
+        for registry in &registries {
+            let manager = Arc::clone(&manager);
+            let registry = registry.clone();
+            attach_handles.push(tokio::spawn(async move {
+                manager.attach_registry(registry).await;
+            }));
+        }
+
+        for handle in update_handles {
+            handle.await.expect("update task");
+        }
+        for handle in attach_handles {
+            handle.await.expect("attach task");
+        }
+
+        // The snapshot is the source of truth for "what got
+        // published". Every server's update must land there, and
+        // every registry must hold every server's tool. If the
+        // pre-fix race regressed, some registry would be missing at
+        // least one server.
+        let snapshot_keys: std::collections::HashSet<String> = manager
+            .tools_snapshot
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            snapshot_keys.len(),
+            server_names.len(),
+            "every update_server_tools call should land in the snapshot",
+        );
+        for registry in &registries {
+            for server in &server_names {
+                let tool_name = format!("mcp__{}__ping", server);
+                assert!(
+                    registry.get(&tool_name).is_some(),
+                    "registry missing '{}' after concurrent attach/update — race regressed",
+                    tool_name,
+                );
+            }
+        }
     }
 }

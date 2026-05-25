@@ -6,12 +6,14 @@
 //! [`repl`] input loop. The [`agent`] module owns the per-turn loop that streams
 //! provider output and dispatches tool calls.
 
+mod acp;
 mod agent;
 mod cli;
 mod config;
 mod context;
 mod conversation;
 mod error;
+mod frontend;
 mod image;
 mod mcp;
 mod permission;
@@ -26,18 +28,20 @@ mod skills;
 mod stats;
 mod tools;
 
+use std::sync::Arc;
+
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
-use std::sync::Arc;
-
-use crate::agent::{Agent, AgentOptions};
-use crate::config::ResolvedConfig;
-use crate::permission::SharedPermission;
-use crate::provider::{AuthCredential, ProviderBuilder};
-use crate::repl::ReplEvent;
-use crate::session::{SessionManager, TokenStore};
-use crate::tools::ToolRegistry;
+use crate::{
+    agent::{Agent, AgentOptions},
+    config::ResolvedConfig,
+    permission::SharedPermission,
+    provider::{AuthCredential, ProviderBuilder},
+    repl::ReplEvent,
+    session::{SessionManager, TokenStore},
+    tools::ToolRegistry,
+};
 
 fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -85,8 +89,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::Result<()> {
+    // `agsh acp` is heavyweight (needs the full config + credential
+    // resolution + MCP setup) so it routes through `async_main`
+    // rather than the lightweight subcommand block below.
+    let acp_mode = matches!(cli.command, Some(cli::Command::Acp));
+
     // Handle subcommands that don't need full config resolution.
-    if cli.command.is_some() {
+    if cli.command.is_some() && !acp_mode {
         let cli_ref = &cli;
         return runtime.block_on(async move {
             let session_manager = SessionManager::open(None).await?;
@@ -111,6 +120,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
                 cli::Command::Skill { action } => run_skill_subcommand(action).await,
+                cli::Command::Acp => unreachable!("Acp routes through async_main above"),
             }
         });
     }
@@ -141,7 +151,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     if let Some(prompt) = skill_prompt {
         config.prompt = Some(prompt);
     }
-    runtime.block_on(async_main(config))
+    runtime.block_on(async_main(config, acp_mode))
 }
 
 /// Render a `--skill <name>` invocation into the user-message string that
@@ -200,7 +210,7 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
     )
 }
 
-async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
+async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Result<()> {
     // Validate provider name and model before opening the session store or
     // resolving credentials so the user sees a clear "not configured" or
     // "invalid value" message instead of the downstream credential error.
@@ -228,7 +238,13 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
     }
 
     if let Some(max_bytes) = config.max_storage_bytes {
-        let deleted = session_manager.enforce_storage_limit(max_bytes).await?;
+        // Startup eviction: no sessions are opened yet, so the
+        // active set is empty. The signature is still required for
+        // mid-run callers that want to protect live sessions.
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let deleted = session_manager
+            .enforce_storage_limit(max_bytes, &active)
+            .await?;
         if deleted > 0 {
             tracing::info!("deleted {} sessions to enforce storage limit", deleted);
         }
@@ -281,6 +297,13 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
         None
     };
 
+    // `agsh acp` reuses every step above (credential resolution, MCP
+    // setup, session-manager housekeeping) and then enters the
+    // JSON-RPC stdio loop instead of the REPL.
+    if acp_mode {
+        return acp::run_acp(config, session_manager, mcp_manager, mcp_context).await;
+    }
+
     // `--oneshot` runs a single turn and exits; the prompt is required (validated
     // at startup). Without `--oneshot`, any provided prompt/skill becomes the
     // first-turn input but the REPL stays open afterwards.
@@ -312,10 +335,300 @@ async fn async_main(mut config: ResolvedConfig) -> anyhow::Result<()> {
     .await
 }
 
+/// Process-wide dependencies that every ACP session shares. Built
+/// once at `agsh acp` startup by [`build_acp_shared_deps`]; sessions
+/// hold an [`Arc<SharedDeps>`] and read fields by reference. Cheap to
+/// clone (every field is either an `Arc`, an owned-but-small value,
+/// or a clonable handle).
+///
+/// The REPL / oneshot paths don't use this — they go through
+/// [`create_agent_from_config`] which bundles shared + per-session
+/// work into one call.
+#[derive(Clone)]
+pub struct SharedDeps {
+    pub config: Arc<ResolvedConfig>,
+    pub session_manager: SessionManager,
+    pub provider: Arc<dyn provider::Provider>,
+    pub mcp_manager: Option<Arc<mcp::McpClientManager>>,
+    pub mcp_context: Arc<mcp::McpClientContext>,
+    pub skills: Arc<skills::SkillCache>,
+    pub builtin_filter: crate::tools::BuiltinToolFilter,
+    pub sandbox_capability: crate::sandbox::SandboxCapability,
+    pub sandboxed_shell: bool,
+    pub agent_options: AgentOptions,
+    pub session_stats: Arc<stats::SessionStats>,
+}
+
+/// Build the process-wide [`SharedDeps`] for `agsh acp`. Sets up the
+/// provider, MCP wiring, skill cache, sandbox capability probe, and
+/// the shared `agent_options` template. Each ACP session later calls
+/// [`build_acp_session_agent`] against the resulting struct to spin
+/// up its own per-session `Agent` + `ToolRegistry`.
+///
+/// `mcp_context.set_provider(...)` is called here so MCP sampling
+/// callbacks can reach the provider. Per-session cwd routing happens
+/// at MCP tool dispatch time (Phase 3 task-local cwd).
+pub async fn build_acp_shared_deps(
+    config: ResolvedConfig,
+    session_manager: SessionManager,
+    credential: AuthCredential,
+    mcp_manager: Option<Arc<mcp::McpClientManager>>,
+    mcp_context: Arc<mcp::McpClientContext>,
+) -> anyhow::Result<SharedDeps> {
+    config.validate()?;
+
+    let provider_name = config
+        .provider_name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("provider_name missing after validation"))?;
+    let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
+    let token_store = session_manager.token_store();
+
+    let model = config
+        .model
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("model missing after validation"))?;
+    let session_stats = Arc::new(stats::SessionStats::default());
+    let provider = ProviderBuilder::new(provider_name, credential, model)
+        .base_url(config.base_url.clone())
+        .client_id(config.client_id.clone())
+        .oauth_token_url(config.oauth_token_url.clone())
+        .token_store(if needs_token_store {
+            Some(Arc::new(token_store))
+        } else {
+            None
+        })
+        .thinking(config.thinking_enabled, config.thinking_budget_tokens)
+        .reasoning_effort(config.reasoning_effort.clone())
+        .device_id(config.device_id.clone())
+        .effort(config.effort.clone())
+        .redact_thinking(config.redact_thinking)
+        .session_stats(Some(Arc::clone(&session_stats)))
+        .build()?;
+
+    let sandbox_capability: crate::sandbox::SandboxCapability = match &config.backend_probe {
+        crate::sandbox::BackendProbe::Ok(capability) => capability.clone(),
+        _ => crate::sandbox::SandboxCapability::Unavailable,
+    };
+    let sandboxed_shell = config.sandbox
+        && !matches!(
+            sandbox_capability,
+            crate::sandbox::SandboxCapability::Unavailable
+        );
+
+    let skills = crate::skills::SkillCache::discover();
+    let builtin_filter = crate::tools::BuiltinToolFilter::from_config(
+        config.builtin_allowed_tools.clone(),
+        config.builtin_disabled_tools.clone(),
+        config.builtin_tool_permissions.clone(),
+    );
+
+    let agent_options = AgentOptions {
+        streaming: config.streaming,
+        sandboxed_shell,
+        context_messages: config.context_messages,
+        auto_compact: config.auto_compact,
+        context_window: config.context_window.unwrap_or_else(|| {
+            config
+                .model
+                .as_deref()
+                .map(crate::config::context_window_for_model)
+                .unwrap_or(128_000)
+        }),
+        max_turn_requests: config.max_turn_requests,
+        user_instructions: config.user_instructions.clone(),
+        mcp_strict: config.mcp_strict,
+        mcp_grace: config.mcp_grace,
+        system_prompt_override: None,
+    };
+
+    // Publish the provider on the MCP client context so sampling
+    // callbacks can reach it. Registry plumbing now flows through
+    // `McpClientManager::attach_registry` per session.
+    mcp_context.set_provider(Arc::clone(&provider));
+
+    // Kick off the MCP background connector once for the whole
+    // process. The connector writes tool discoveries through
+    // `update_server_tools`, which fans them out to every
+    // attached registry — so per-session registries built later
+    // via `build_acp_session_agent` see the tools as servers
+    // come online. Idempotent on second call.
+    if let Some(manager) = &mcp_manager {
+        manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(&config));
+    }
+
+    Ok(SharedDeps {
+        config: Arc::new(config),
+        session_manager,
+        provider,
+        mcp_manager,
+        mcp_context,
+        skills,
+        builtin_filter,
+        sandbox_capability,
+        sandboxed_shell,
+        agent_options,
+        session_stats,
+    })
+}
+
+/// Inputs both `build_acp_session_agent` and `create_agent_from_config`
+/// hand into the unified [`assemble_agent`] helper. Bundling them in
+/// a struct keeps the assembly call below readable and lets both
+/// callers express "everything I built; turn it into an Agent" in one
+/// line.
+struct AgentAssembly<'a> {
+    web_client: crate::config::WebClientConfig,
+    sandbox_enabled: bool,
+    sandbox_capability: crate::sandbox::SandboxCapability,
+    sandbox_backend: crate::config::SandboxBackend,
+    backend_probe: crate::sandbox::BackendProbe,
+    user_instructions: Option<String>,
+    session_manager: SessionManager,
+    provider: Arc<dyn provider::Provider>,
+    mcp_manager: Option<&'a Arc<mcp::McpClientManager>>,
+    skills: Arc<skills::SkillCache>,
+    builtin_filter: crate::tools::BuiltinToolFilter,
+    agent_options: AgentOptions,
+    session_stats: Arc<stats::SessionStats>,
+}
+
+/// Per-session agent assembly used by both the ACP session builder
+/// and the REPL's `create_agent_from_config`. Builds the shared
+/// todo list / scratchpad cell, the tool registry (with the
+/// session's cwd / permission / frontend baked into the builtins),
+/// registers `spawn_agent` and the MCP resource meta-tools, attaches
+/// the registry to the MCP manager, and finally constructs the
+/// `Agent` itself.
+///
+/// **MCP attach-before-connector invariant**: the caller is expected
+/// to either (a) already have run `start_connector` (ACP path —
+/// `build_acp_shared_deps` does this once) or (b) call
+/// `start_connector` *after* this returns (REPL path). Either way,
+/// the registry must be attached before any connector activity, so
+/// initial tool-list discoveries reach this session's registry.
+async fn assemble_agent(
+    bundle: AgentAssembly<'_>,
+    shared_permission: SharedPermission,
+    frontend: Arc<dyn frontend::Frontend>,
+    cwd: crate::agent::SharedCwd,
+) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
+    let todo_list: crate::tools::todo::SharedTodoList =
+        std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let shared_session_id: std::sync::Arc<tokio::sync::RwLock<Option<uuid::Uuid>>> =
+        std::sync::Arc::new(tokio::sync::RwLock::new(None));
+
+    let tool_registry = ToolRegistry::build_default(
+        bundle.web_client.clone(),
+        shared_permission.clone(),
+        bundle.sandbox_enabled,
+        bundle.sandbox_capability.clone(),
+        bundle.sandbox_backend,
+        bundle.backend_probe.clone(),
+        todo_list.clone(),
+        bundle.session_manager.clone(),
+        shared_session_id.clone(),
+        bundle.skills.clone(),
+        bundle.builtin_filter.clone(),
+        cwd.clone(),
+        Arc::clone(&frontend),
+    )?;
+
+    if bundle.builtin_filter.admits("spawn_agent") {
+        tool_registry.register(Arc::new(crate::tools::subagent::SpawnAgentTool {
+            provider: Arc::clone(&bundle.provider),
+            parent_permission: shared_permission.clone(),
+            tool_builder_params: crate::tools::subagent::ToolBuilderParams {
+                web_client: bundle.web_client.clone(),
+                sandbox_enabled: bundle.sandbox_enabled,
+                sandbox_capability: bundle.sandbox_capability.clone(),
+                sandbox_backend: bundle.sandbox_backend,
+                backend_probe: bundle.backend_probe.clone(),
+                builtin_filter: bundle.builtin_filter.clone(),
+                skills: bundle.skills.clone(),
+                mcp_manager: bundle.mcp_manager.map(Arc::downgrade),
+                session_manager: bundle.session_manager.clone(),
+                parent_shared_session_id: shared_session_id.clone(),
+                session_stats: Arc::clone(&bundle.session_stats),
+                parent_options: bundle.agent_options.clone(),
+                parent_cwd: Arc::clone(&cwd),
+                parent_frontend: Arc::clone(&frontend),
+            },
+            user_instructions: bundle.user_instructions.clone(),
+        }))?;
+    }
+
+    if let Some(manager) = bundle.mcp_manager {
+        // Register MCP resource meta-tools upfront — they delegate
+        // through `ServerEntry::require_connected` so they tolerate
+        // Pending / Failed servers until a specific one is called.
+        crate::tools::mcp_resources::register_all(&tool_registry, Arc::clone(manager));
+        // Attach this session's registry so the MCP connector and
+        // tools/list_changed handler propagate updates into it.
+        // Must happen before the connector kicks off — otherwise
+        // initial server-state updates miss the registry.
+        manager.attach_registry(tool_registry.clone()).await;
+    }
+
+    let mut agent = Agent::new(
+        Arc::clone(&bundle.provider),
+        tool_registry.clone(),
+        bundle.session_manager.clone(),
+        shared_permission,
+        bundle.agent_options.clone(),
+        todo_list,
+        shared_session_id,
+        bundle.skills.clone(),
+        frontend,
+        cwd,
+        Arc::clone(&bundle.session_stats),
+    );
+    if let Some(manager) = bundle.mcp_manager {
+        agent.set_mcp_manager(Arc::clone(manager));
+    }
+
+    Ok((agent, tool_registry))
+}
+
+/// Build a per-session `Agent` + `ToolRegistry` from the
+/// already-prepared [`SharedDeps`]. Each ACP session gets a fresh
+/// todo list, scratchpad slot, tool registry (with the session's
+/// cwd / permission / frontend baked into its builtin tools), and an
+/// Agent that owns those.
+///
+/// The returned `ToolRegistry` is the one already attached to the
+/// MCP manager — callers (the ACP `session/new` handler) keep a
+/// handle so they can pass it to
+/// [`crate::mcp::McpClientManager::detach_registry`] on
+/// `session/close`.
+pub async fn build_acp_session_agent(
+    shared: &SharedDeps,
+    shared_permission: SharedPermission,
+    frontend: Arc<dyn frontend::Frontend>,
+    cwd: crate::agent::SharedCwd,
+) -> anyhow::Result<(Agent, crate::tools::ToolRegistry)> {
+    let bundle = AgentAssembly {
+        web_client: shared.config.web_client.clone(),
+        sandbox_enabled: shared.config.sandbox,
+        sandbox_capability: shared.sandbox_capability.clone(),
+        sandbox_backend: shared.config.sandbox_backend,
+        backend_probe: shared.config.backend_probe.clone(),
+        user_instructions: shared.config.user_instructions.clone(),
+        session_manager: shared.session_manager.clone(),
+        provider: Arc::clone(&shared.provider),
+        mcp_manager: shared.mcp_manager.as_ref(),
+        skills: shared.skills.clone(),
+        builtin_filter: shared.builtin_filter.clone(),
+        agent_options: shared.agent_options.clone(),
+        session_stats: Arc::clone(&shared.session_stats),
+    };
+    assemble_agent(bundle, shared_permission, frontend, cwd).await
+}
+
 // Top-level entry point for assembling the agent; splitting its inputs
 // further would force callers to pre-bundle unrelated collaborators
 // (config, session manager, permission mode, credential, MCP plumbing,
-// approval channel) just to appease the arg-count lint.
+// frontend) just to appease the arg-count lint.
 #[allow(clippy::too_many_arguments)]
 async fn create_agent_from_config(
     config: &ResolvedConfig,
@@ -325,7 +638,8 @@ async fn create_agent_from_config(
     credential: AuthCredential,
     mcp_manager: Option<&Arc<mcp::McpClientManager>>,
     mcp_context: Option<&Arc<mcp::McpClientContext>>,
-    approval_sender: Option<std::sync::mpsc::Sender<repl::AgentToReplEvent>>,
+    frontend: Arc<dyn frontend::Frontend>,
+    cwd: crate::agent::SharedCwd,
     session_stats: Arc<stats::SessionStats>,
 ) -> anyhow::Result<Agent> {
     config.validate()?;
@@ -367,12 +681,6 @@ async fn create_agent_from_config(
             crate::sandbox::SandboxCapability::Unavailable
         );
 
-    let todo_list: crate::tools::todo::SharedTodoList =
-        std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
-
-    let shared_session_id: std::sync::Arc<tokio::sync::RwLock<Option<uuid::Uuid>>> =
-        std::sync::Arc::new(tokio::sync::RwLock::new(None));
-
     // Discover skills once at startup. Any malformed `SKILL.md` emits its
     // `tracing::warn!` here (tracing is already initialized), so the user
     // sees parse errors above the first prompt rather than interleaved with
@@ -387,31 +695,12 @@ async fn create_agent_from_config(
         config.builtin_tool_permissions.clone(),
     );
 
-    let tool_registry = ToolRegistry::build_default(
-        config.web_client.clone(),
-        shared_permission.clone(),
-        config.sandbox,
-        sandbox_capability.clone(),
-        config.sandbox_backend,
-        config.backend_probe.clone(),
-        todo_list.clone(),
-        session_manager.clone(),
-        shared_session_id.clone(),
-        skills.clone(),
-        builtin_filter.clone(),
-    )?;
-
     // Build the parent's `AgentOptions` up-front so it can be cloned into
     // `ToolBuilderParams` for sub-agents to inherit `sandboxed_shell` /
     // `context_messages` / `user_instructions` via `Agent::new_subagent`.
     let agent_options = AgentOptions {
         streaming: config.streaming,
-        newline_before_prompt: config.newline_before_prompt,
-        newline_after_prompt: config.newline_after_prompt,
-        show_session_id_on_create: config.show_session_id_on_create,
-        show_token_usage: config.show_token_usage,
         sandboxed_shell,
-        render_mode: config.render_mode,
         context_messages: config.context_messages,
         auto_compact: config.auto_compact,
         context_window: config.context_window.unwrap_or_else(|| {
@@ -421,7 +710,7 @@ async fn create_agent_from_config(
                 .map(crate::config::context_window_for_model)
                 .unwrap_or(128_000)
         }),
-        thinking_show_content: config.thinking_show_content,
+        max_turn_requests: config.max_turn_requests,
         user_instructions: config.user_instructions.clone(),
         mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
@@ -430,69 +719,46 @@ async fn create_agent_from_config(
         system_prompt_override: None,
     };
 
-    // Register the sub-agent tool with access to the provider
-    if builtin_filter.admits("spawn_agent") {
-        tool_registry.register(Arc::new(crate::tools::subagent::SpawnAgentTool {
-            provider: Arc::clone(&provider),
-            parent_permission: shared_permission.clone(),
-            tool_builder_params: crate::tools::subagent::ToolBuilderParams {
-                web_client: config.web_client.clone(),
-                sandbox_enabled: config.sandbox,
-                sandbox_capability,
-                sandbox_backend: config.sandbox_backend,
-                backend_probe: config.backend_probe.clone(),
-                builtin_filter: builtin_filter.clone(),
-                skills: skills.clone(),
-                mcp_manager: mcp_manager.cloned(),
-                session_manager: session_manager.clone(),
-                parent_shared_session_id: shared_session_id.clone(),
-                session_stats: Arc::clone(&session_stats),
-                parent_options: agent_options.clone(),
-            },
-            user_instructions: config.user_instructions.clone(),
-        }))?;
-    }
+    let bundle = AgentAssembly {
+        web_client: config.web_client.clone(),
+        sandbox_enabled: config.sandbox,
+        sandbox_capability,
+        sandbox_backend: config.sandbox_backend,
+        backend_probe: config.backend_probe.clone(),
+        user_instructions: config.user_instructions.clone(),
+        session_manager: session_manager.clone(),
+        provider: Arc::clone(&provider),
+        mcp_manager,
+        skills: skills.clone(),
+        builtin_filter: builtin_filter.clone(),
+        agent_options: agent_options.clone(),
+        session_stats: Arc::clone(&session_stats),
+    };
+    let (agent, _tool_registry) =
+        assemble_agent(bundle, shared_permission, frontend, Arc::clone(&cwd)).await?;
 
     crate::tools::warn_on_stale_builtin_tool_config(&builtin_filter);
 
     if let Some(manager) = mcp_manager {
-        // Register MCP resource meta-tools upfront — they delegate through
-        // `ServerEntry::require_connected` so they tolerate Pending /
-        // Failed servers until a specific one is called.
-        crate::tools::mcp_resources::register_all(&tool_registry, Arc::clone(manager));
-        // Kick off the background connector. Each server's adapters are
-        // installed into `tool_registry` via `replace_server_tools` +
-        // `mark_deferred` as it reaches `Connected`. The REPL is free to
-        // paint while this runs in the background.
-        manager.start_connector(
-            tool_registry.clone(),
-            crate::mcp::McpRuntimeConfig::from_config(config),
-        );
+        // Kick off the background connector. Each server's adapters
+        // are pushed through `manager.update_server_tools` and then
+        // fan out to every attached registry. Safe to call after any
+        // number of `attach_registry`s; idempotent on second call.
+        // (The ACP path does this once in `build_acp_shared_deps`;
+        // the REPL path does it here, after `assemble_agent` has
+        // attached the single registry.)
+        manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(config));
     }
 
-    // Now that provider and registry exist, publish them on the MCP client
-    // context so notification handlers (`tools/list_changed`) and sampling
-    // callbacks (`sampling/createMessage`) can reach them.
+    // Now that provider exists, publish it on the MCP client context
+    // so sampling callbacks (`sampling/createMessage`) can reach it.
+    // The MCP-side tool registry plumbing now lives on the manager
+    // (see `attach_registry` above); no `set_registry` call here.
     if let Some(context) = mcp_context {
         context.set_provider(Arc::clone(&provider));
-        context.set_registry(tool_registry.clone());
+        context.set_cwd(Arc::clone(&cwd));
     }
 
-    let mut agent = Agent::new(
-        provider,
-        tool_registry,
-        session_manager,
-        shared_permission,
-        agent_options,
-        todo_list,
-        shared_session_id,
-        skills,
-        approval_sender,
-        session_stats,
-    );
-    if let Some(manager) = mcp_manager {
-        agent.set_mcp_manager(Arc::clone(manager));
-    }
     Ok(agent)
 }
 
@@ -522,7 +788,9 @@ async fn run_turn_interruptible(
         .run_turn(session_id, messages, input, cancellation)
         .await;
     signal_handle.abort();
-    result
+    // REPL / `agsh -p` callers don't surface a stop reason — they
+    // only care whether the turn succeeded. Drop the `TurnOutcome`.
+    result.map(|_| ())
 }
 
 async fn run_oneshot(
@@ -542,6 +810,28 @@ async fn run_oneshot(
     }
     let credential = resolve_credential(&config)?;
     let session_stats = Arc::new(stats::SessionStats::default());
+    // Oneshot has no REPL, so approval requests can't reach a human.
+    // The channel below is intentionally disconnected on the receiver
+    // side: `ReplFrontend::request_permission`'s `send` will fail, and
+    // the agent surfaces a `cancelled` tool result — same end behavior
+    // as the pre-refactor `None` approval sender.
+    let (noninteractive_sender, _) = std::sync::mpsc::channel::<repl::AgentToReplEvent>();
+    let oneshot_frontend: Arc<dyn frontend::Frontend> =
+        Arc::new(frontend::ReplFrontend::new(frontend::ReplFrontendConfig {
+            render_mode: config.render_mode,
+            newline_before_prompt: config.newline_before_prompt,
+            newline_after_prompt: config.newline_after_prompt,
+            show_session_id_on_create: config.show_session_id_on_create,
+            show_token_usage: config.show_token_usage,
+            thinking_show_content: config.thinking_show_content,
+            agent_event_sender: noninteractive_sender,
+        }));
+    let cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
+        std::env::current_dir().unwrap_or_else(|error| {
+            tracing::warn!("could not read process cwd at startup: {}", error);
+            std::path::PathBuf::from(".")
+        }),
+    ));
     let agent = create_agent_from_config(
         &config,
         session_manager,
@@ -550,7 +840,8 @@ async fn run_oneshot(
         credential,
         mcp_manager.as_ref(),
         Some(&mcp_context),
-        None,
+        oneshot_frontend,
+        cwd,
         Arc::clone(&session_stats),
     )
     .await?;
@@ -587,6 +878,17 @@ async fn run_interactive(
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
+    // Per-session working directory, initialised from process cwd at
+    // startup. Shared by reference between the REPL (prompt + `/cd`)
+    // and the agent (file/shell/find/grep tools + environment-context
+    // block). Process cwd is no longer mutated.
+    let cwd: crate::agent::SharedCwd = Arc::new(std::sync::RwLock::new(
+        std::env::current_dir().unwrap_or_else(|error| {
+            tracing::warn!("could not read process cwd at startup: {}", error);
+            std::path::PathBuf::from(".")
+        }),
+    ));
+
     let shared_permission = SharedPermission::new(config.permission, config.enabled_permissions);
     if config.permission == crate::permission::Permission::Read {
         crate::sandbox::warn_if_sandbox_issues(
@@ -635,7 +937,19 @@ async fn run_interactive(
     }
     let (agent_event_sender, agent_event_receiver) =
         std::sync::mpsc::channel::<repl::AgentToReplEvent>();
-    let approval_sender = agent_event_sender.clone();
+    // The REPL frontend forwards approval requests to the same channel
+    // the REPL thread already reads from for `Done` / MCP elicitation /
+    // MCP progress events.
+    let repl_frontend: Arc<dyn frontend::Frontend> =
+        Arc::new(frontend::ReplFrontend::new(frontend::ReplFrontendConfig {
+            render_mode: config.render_mode,
+            newline_before_prompt: config.newline_before_prompt,
+            newline_after_prompt: config.newline_after_prompt,
+            show_session_id_on_create: config.show_session_id_on_create,
+            show_token_usage: config.show_token_usage,
+            thinking_show_content: config.thinking_show_content,
+            agent_event_sender: agent_event_sender.clone(),
+        }));
 
     // Wire progress/elicitation notifications from MCP handlers through the
     // same agent→shell channel so the REPL can render them inline.
@@ -664,6 +978,7 @@ async fn run_interactive(
     let show_path_in_prompt = config.show_path_in_prompt;
     let input_style = config.input_style;
     let repl_sandbox_state = crate::sandbox::SandboxState::from_config(&config);
+    let repl_cwd = Arc::clone(&cwd);
     let repl_handle = tokio::task::spawn_blocking(move || {
         repl::run_repl(
             repl_permission,
@@ -673,6 +988,7 @@ async fn run_interactive(
             repl_sandbox_state,
             input_sender,
             agent_event_receiver,
+            repl_cwd,
         );
     });
 
@@ -696,7 +1012,8 @@ async fn run_interactive(
         credential,
         mcp_manager.as_ref(),
         Some(&mcp_context),
-        Some(approval_sender),
+        Arc::clone(&repl_frontend),
+        Arc::clone(&cwd),
         Arc::clone(&session_stats),
     )
     .await
@@ -1195,6 +1512,8 @@ async fn run_tools_subcommand(
                 // metadata isn't read, so skip the filesystem walk.
                 crate::skills::SkillCache::for_root(None),
                 crate::tools::BuiltinToolFilter::default(),
+                std::sync::Arc::new(std::sync::RwLock::new(std::path::PathBuf::from("."))),
+                std::sync::Arc::new(crate::frontend::SilentFrontend),
             )?;
 
             let catalogue = reference.tool_catalogue();
@@ -1277,8 +1596,8 @@ async fn list_sessions(
     limit: u32,
     include_children: bool,
 ) -> anyhow::Result<()> {
-    let sessions = session_manager
-        .list_sessions(limit, include_children)
+    let (sessions, _next_cursor) = session_manager
+        .list_sessions(limit, include_children, None, None)
         .await?;
 
     if sessions.is_empty() {

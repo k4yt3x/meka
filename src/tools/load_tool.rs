@@ -5,18 +5,16 @@
 //! the description and schema as `tool_result` text — it never mutates the
 //! registry.
 
-use std::collections::HashSet;
-use std::sync::{RwLock, Weak};
+use std::{
+    collections::HashSet,
+    sync::{RwLock, Weak},
+};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Result;
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-
-use super::util::require_str;
-use super::{LOAD_TOOL_NAME, Tool, ToolOutput};
+use super::{LOAD_TOOL_NAME, Tool, ToolOutput, util::require_str};
+use crate::{error::Result, permission::Permission, provider::ToolDefinition};
 
 /// Meta-tool that makes a deferred tool's schema visible for use. Held by
 /// the [`super::ToolRegistry`] like any other tool, so the same `Arc`
@@ -143,9 +141,11 @@ mod tests {
                 ..Default::default()
             }
         }
+
         fn required_permission(&self) -> Permission {
             Permission::Read
         }
+
         async fn execute(
             &self,
             _input: serde_json::Value,

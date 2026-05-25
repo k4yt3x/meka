@@ -9,17 +9,21 @@
 //! persisted OAuth tokens, MCP credentials, and conversation content
 //! aren't readable by other local users regardless of the user's umask.
 
-use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use fd_lock::{RwLock as FdRwLock, RwLockWriteGuard as FdRwLockWriteGuard};
 use serde::{Deserialize, Serialize};
 use tokio_rusqlite::Connection;
 use uuid::Uuid;
 
-use crate::error::{AgshError, Result};
-use crate::provider::AuthCredential;
+use crate::{
+    error::{AgshError, Result},
+    provider::AuthCredential,
+};
 
 /// Raw row from the `messages` table — the on-disk shape of a single
 /// [`crate::conversation::Event`]. Internal to the session module: only
@@ -38,6 +42,10 @@ pub struct SessionSummary {
     pub id: Uuid,
     pub updated_at: String,
     pub preview: String,
+    /// Working directory captured at `create_session` time. `None`
+    /// for legacy rows from before the `cwd` column was added;
+    /// ACP-facing code falls back to the process cwd for display.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,7 +275,8 @@ impl SessionManager {
                         id TEXT PRIMARY KEY,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
-                        parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE
+                        parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                        cwd TEXT
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
@@ -387,6 +396,25 @@ impl SessionManager {
                          ON sessions(parent_session_id)",
                 )?;
 
+                // Migration: add `sessions.cwd` so ACP's
+                // `session/list` can report each session's working
+                // directory and `session/load` has a stored cwd to
+                // validate the client's request against. Existing
+                // rows get NULL; the ACP handlers fall back to the
+                // process cwd for those entries so legacy sessions
+                // stay listable.
+                let has_cwd_col: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'cwd'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_cwd_col {
+                    connection.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT")?;
+                }
+
                 // Migration: drop the legacy `sessions.metadata` column. It
                 // was reserved for future use but never populated by any
                 // codepath, so it's pure schema noise.
@@ -437,10 +465,11 @@ impl SessionManager {
                                  id TEXT PRIMARY KEY,
                                  created_at TEXT NOT NULL,
                                  updated_at TEXT NOT NULL,
-                                 parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE
+                                 parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+                                 cwd TEXT
                              );
-                             INSERT INTO sessions_new(id, created_at, updated_at, parent_session_id)
-                                 SELECT id, created_at, updated_at, parent_session_id FROM sessions;
+                             INSERT INTO sessions_new(id, created_at, updated_at, parent_session_id, cwd)
+                                 SELECT id, created_at, updated_at, parent_session_id, cwd FROM sessions;
                              DROP TABLE sessions;
                              ALTER TABLE sessions_new RENAME TO sessions;
                              CREATE INDEX idx_sessions_updated_at ON sessions(updated_at);
@@ -483,15 +512,23 @@ impl SessionManager {
             .map_err(|error| AgshError::Database(format!("failed to initialize schema: {}", error)))
     }
 
-    pub async fn create_session(&self) -> Result<Uuid> {
+    /// Create a new session, optionally recording its working
+    /// directory. `cwd` is persisted as an absolute path string; pass
+    /// `None` only for code paths that genuinely have no cwd context
+    /// (legacy/test fixtures, `agsh tools list`). Production paths
+    /// (the REPL and `agsh acp`) pass the agent's current cwd so
+    /// `session/list` can surface it later.
+    pub async fn create_session(&self, cwd: Option<std::path::PathBuf>) -> Result<Uuid> {
         let session_id = Uuid::new_v4();
         let now = chrono::Utc::now().to_rfc3339();
+        let cwd_string = cwd.map(|path| path.display().to_string());
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO sessions (id, created_at, updated_at) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![session_id.to_string(), now, now],
+                    "INSERT INTO sessions (id, created_at, updated_at, cwd)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![session_id.to_string(), now, now, cwd_string],
                 )?;
                 Ok(())
             })
@@ -504,17 +541,29 @@ impl SessionManager {
     /// Create a session whose `parent_session_id` references an existing
     /// session — used by `spawn_agent` so sub-agent conversations persist
     /// as children of the parent for auditing. Cascades on parent delete
-    /// (see [`Self::delete_session`]).
-    pub async fn create_child_session(&self, parent: Uuid) -> Result<Uuid> {
+    /// (see [`Self::delete_session`]). The optional `cwd` is the
+    /// parent's cwd snapshot at spawn time.
+    pub async fn create_child_session(
+        &self,
+        parent: Uuid,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<Uuid> {
         let session_id = Uuid::new_v4();
         let now = chrono::Utc::now().to_rfc3339();
+        let cwd_string = cwd.map(|path| path.display().to_string());
 
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO sessions (id, created_at, updated_at, parent_session_id)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session_id.to_string(), now, now, parent.to_string()],
+                    "INSERT INTO sessions (id, created_at, updated_at, parent_session_id, cwd)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        now,
+                        now,
+                        parent.to_string(),
+                        cwd_string,
+                    ],
                 )?;
                 Ok(())
             })
@@ -649,11 +698,10 @@ impl SessionManager {
     /// Persist a single event from the conversation log. Events are
     /// encoded into the existing `messages(role, content, …)` table:
     ///
-    /// - `Event::Append(message)` writes one row with the message's
-    ///   role (`user` / `assistant` / `tool_results`).
-    /// - `Event::CompactBoundary { … }` writes one row with the
-    ///   pseudo-role `compact_boundary` and a JSON-serialized envelope
-    ///   in `content`.
+    /// - `Event::Append(message)` writes one row with the message's role (`user` / `assistant` /
+    ///   `tool_results`).
+    /// - `Event::CompactBoundary { … }` writes one row with the pseudo-role `compact_boundary` and
+    ///   a JSON-serialized envelope in `content`.
     ///
     /// No schema migration: legacy databases (predating this commit) only
     /// contain `Event::Append` rows; loading them via [`Self::load_events`]
@@ -836,20 +884,54 @@ impl SessionManager {
     /// — they're persisted for audit/debug but shouldn't clutter the user's
     /// view of their own conversations. Set to `true` to surface them, e.g.
     /// via `agsh list --include-children`.
+    ///
+    /// `cwd_filter`, if `Some`, restricts the result set to sessions whose
+    /// persisted `cwd` matches the given path (rows with NULL `cwd` are
+    /// excluded — legacy rows can't be filtered by cwd they never recorded).
+    ///
+    /// `cursor`, if `Some`, is a previous `next_cursor` value from this
+    /// method; rows are returned strictly *after* the cursor in
+    /// `(updated_at, id) DESC` order. Returns `(rows, next_cursor)` —
+    /// `next_cursor` is `Some` iff there is at least one more row past
+    /// `limit`. Invalid cursors are rejected with [`AgshError::Database`].
     pub async fn list_sessions(
         &self,
         limit: u32,
         include_children: bool,
-    ) -> Result<Vec<SessionSummary>> {
+        cwd_filter: Option<&Path>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<SessionSummary>, Option<String>)> {
+        let cursor_decoded = match cursor {
+            Some(token) => Some(decode_list_cursor(token)?),
+            None => None,
+        };
+        let cwd_filter_string = cwd_filter.map(|path| path.display().to_string());
+
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                let parent_filter = if include_children {
-                    ""
+                let mut clauses: Vec<&str> = Vec::new();
+                if !include_children {
+                    clauses.push("s.parent_session_id IS NULL");
+                }
+                if cwd_filter_string.is_some() {
+                    clauses.push("s.cwd = :cwd");
+                }
+                if cursor_decoded.is_some() {
+                    // Keyset on (updated_at, id) DESC: strictly past the
+                    // cursor row. Tie-break on id keeps pagination stable
+                    // when multiple sessions share an updated_at.
+                    clauses.push(
+                        "(s.updated_at < :cursor_updated_at \
+                          OR (s.updated_at = :cursor_updated_at AND s.id < :cursor_id))",
+                    );
+                }
+                let where_clause = if clauses.is_empty() {
+                    String::new()
                 } else {
-                    "WHERE s.parent_session_id IS NULL"
+                    format!("WHERE {}", clauses.join(" AND "))
                 };
                 let query = format!(
-                    "SELECT s.id, s.updated_at,
+                    "SELECT s.id, s.updated_at, s.cwd,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -858,38 +940,106 @@ impl SessionManager {
                             ) AS preview
                      FROM sessions s
                      {}
-                     ORDER BY s.updated_at DESC
-                     LIMIT ?1",
-                    parent_filter,
+                     ORDER BY s.updated_at DESC, s.id DESC
+                     LIMIT :limit",
+                    where_clause,
                 );
                 let mut statement = connection.prepare(&query)?;
 
-                let rows = statement.query_map(rusqlite::params![limit], |row| {
+                // Fetch one extra row to detect whether a next page exists
+                // without a second COUNT query.
+                let fetch_limit: i64 = i64::from(limit).saturating_add(1);
+                let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+                params.push((":limit", &fetch_limit));
+                if let Some(ref cwd) = cwd_filter_string {
+                    params.push((":cwd", cwd));
+                }
+                if let Some((ref updated_at, ref id)) = cursor_decoded {
+                    params.push((":cursor_updated_at", updated_at));
+                    params.push((":cursor_id", id));
+                }
+
+                let rows = statement.query_map(params.as_slice(), |row| {
                     let id_str: String = row.get(0)?;
                     let updated_at: String = row.get(1)?;
-                    let preview: String = row.get(2)?;
-                    Ok((id_str, updated_at, preview))
+                    let cwd: Option<String> = row.get(2)?;
+                    let preview: String = row.get(3)?;
+                    Ok((id_str, updated_at, cwd, preview))
                 })?;
 
                 let mut summaries = Vec::new();
                 for row in rows {
-                    let (id_str, updated_at, preview) = row?;
+                    let (id_str, updated_at, cwd, preview) = row?;
                     let id = Uuid::parse_str(&id_str).map_err(|error| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
                     })?;
-
                     let preview = truncate_preview(&preview, 80);
-
                     summaries.push(SessionSummary {
                         id,
                         updated_at,
                         preview,
+                        cwd: cwd.map(PathBuf::from),
                     });
                 }
                 Ok(summaries)
             })
             .await
+            .map(|mut rows| {
+                let next_cursor = if rows.len() > limit as usize {
+                    rows.truncate(limit as usize);
+                    rows.last()
+                        .map(|row| encode_list_cursor(&row.updated_at, &row.id.to_string()))
+                } else {
+                    None
+                };
+                (rows, next_cursor)
+            })
             .map_err(|error| AgshError::Database(format!("failed to list sessions: {}", error)))
+    }
+
+    /// Fetch a single session by id without scanning the full list. Returns
+    /// `Ok(None)` if the session doesn't exist. Used by ACP's `session/load`
+    /// to verify the requested session exists and to surface its persisted
+    /// cwd back to the client.
+    pub async fn session_info(&self, id: Uuid) -> Result<Option<SessionSummary>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let mut statement = connection.prepare(
+                    "SELECT s.id, s.updated_at, s.cwd,
+                            COALESCE(
+                              (SELECT content FROM messages
+                               WHERE session_id = s.id AND role = 'user'
+                               ORDER BY id ASC LIMIT 1),
+                              ''
+                            ) AS preview
+                     FROM sessions s
+                     WHERE s.id = ?1",
+                )?;
+                let mut rows = statement.query_map(rusqlite::params![id.to_string()], |row| {
+                    let id_str: String = row.get(0)?;
+                    let updated_at: String = row.get(1)?;
+                    let cwd: Option<String> = row.get(2)?;
+                    let preview: String = row.get(3)?;
+                    Ok((id_str, updated_at, cwd, preview))
+                })?;
+                match rows.next() {
+                    Some(row) => {
+                        let (id_str, updated_at, cwd, preview) = row?;
+                        let id = Uuid::parse_str(&id_str).map_err(|error| {
+                            rusqlite::Error::InvalidParameterName(error.to_string())
+                        })?;
+                        Ok(Some(SessionSummary {
+                            id,
+                            updated_at,
+                            preview: truncate_preview(&preview, 80),
+                            cwd: cwd.map(PathBuf::from),
+                        }))
+                    }
+                    None => Ok(None),
+                }
+            })
+            .await
+            .map_err(|error| AgshError::Database(format!("failed to fetch session: {}", error)))
     }
 
     pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<u64> {
@@ -921,6 +1071,33 @@ impl SessionManager {
             })?;
         self.prune_orphan_lock_files().await;
         Ok(deleted)
+    }
+
+    /// Update the persisted cwd for an existing session. Called by
+    /// the ACP `session/load` / `session/resume` handlers when the
+    /// client's `cwd` differs from the persisted value — the client
+    /// wins so future `session/list` results reflect the live state.
+    /// `cwd` is stored as the path's `to_string_lossy()` form (UTF-8
+    /// is the only column type SQLite has). Returns the number of
+    /// rows updated (0 if the session id doesn't exist).
+    pub async fn update_session_cwd(
+        &self,
+        session_id: Uuid,
+        cwd: &std::path::Path,
+    ) -> Result<usize> {
+        let cwd_string = cwd.to_string_lossy().into_owned();
+        let id_string = session_id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET cwd = ?1 WHERE id = ?2",
+                    rusqlite::params![cwd_string, id_string],
+                )
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to update session cwd: {}", error))
+            })
     }
 
     #[cfg(test)]
@@ -955,10 +1132,10 @@ impl SessionManager {
                 // `tool_outputs.session_id`, and `sessions.parent_session_id`
                 // sweeps own-session rows + any sub-agent children + their
                 // messages/tool_outputs in a single statement.
-                let deleted = connection.execute(
-                    "DELETE FROM sessions WHERE id = ?1",
-                    rusqlite::params![session_id.to_string()],
-                )?;
+                let deleted = connection
+                    .execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![
+                        session_id.to_string()
+                    ])?;
                 Ok(deleted > 0)
             })
             .await
@@ -1153,7 +1330,22 @@ impl SessionManager {
             .map_err(|error| AgshError::Database(format!("failed to load tool outputs: {}", error)))
     }
 
-    pub async fn enforce_storage_limit(&self, max_bytes: u64) -> Result<u64> {
+    /// Delete the oldest sessions until total `messages.content` size is
+    /// at or below `max_bytes`. `active_ids` is the set of session ids
+    /// the caller knows to be currently in use — they are excluded
+    /// from the eviction sweep so the caller's in-flight `save_event`
+    /// calls don't trip on foreign-key violations after a deletion.
+    /// Pass an empty set when there are no live sessions (typical at
+    /// startup, when this is called before any session is opened).
+    pub async fn enforce_storage_limit(
+        &self,
+        max_bytes: u64,
+        active_ids: &std::collections::HashSet<String>,
+    ) -> Result<u64> {
+        // Take the caller's snapshot once and move it into the
+        // blocking task so the SQL closure can match against it
+        // without re-locking anything.
+        let active: Vec<String> = active_ids.iter().cloned().collect();
         let deleted = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1170,11 +1362,25 @@ impl SessionManager {
                         break;
                     }
 
-                    let oldest_id: std::result::Result<String, _> = connection.query_row(
-                        "SELECT id FROM sessions ORDER BY updated_at ASC LIMIT 1",
-                        [],
-                        |row| row.get(0),
-                    );
+                    // Build the `NOT IN (?, ?, ...)` placeholder list
+                    // dynamically. SQLite's parameter index uses 1-based
+                    // values; we feed each id positionally below.
+                    let placeholders = (1..=active.len())
+                        .map(|index| format!("?{}", index))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = if placeholders.is_empty() {
+                        "SELECT id FROM sessions ORDER BY updated_at ASC LIMIT 1".to_string()
+                    } else {
+                        format!(
+                            "SELECT id FROM sessions WHERE id NOT IN ({}) \
+                             ORDER BY updated_at ASC LIMIT 1",
+                            placeholders
+                        )
+                    };
+                    let params = rusqlite::params_from_iter(active.iter());
+                    let oldest_id: std::result::Result<String, _> =
+                        connection.query_row(&query, params, |row| row.get(0));
 
                     match oldest_id {
                         Ok(session_id) => {
@@ -1186,6 +1392,10 @@ impl SessionManager {
                             )?;
                             deleted += 1;
                         }
+                        // No eligible row left — either the DB is
+                        // empty, or every remaining session is in the
+                        // active set. Either way, we can't reclaim
+                        // more without touching live state.
                         Err(rusqlite::Error::QueryReturnedNoRows) => break,
                         Err(error) => return Err(error),
                     }
@@ -1461,8 +1671,10 @@ const COMPACT_BOUNDARY_ROLE: &str = "compact_boundary";
 fn encode_event_for_db(
     event: &crate::conversation::Event,
 ) -> std::result::Result<(String, String), serde_json::Error> {
-    use crate::conversation::Event;
-    use crate::provider::{ContentBlock, Role};
+    use crate::{
+        conversation::Event,
+        provider::{ContentBlock, Role},
+    };
 
     match event {
         Event::Append(message) => {
@@ -1495,8 +1707,10 @@ fn encode_event_for_db(
 fn decode_event_from_row(
     row: &StoredMessage,
 ) -> std::result::Result<Option<crate::conversation::Event>, serde_json::Error> {
-    use crate::conversation::Event;
-    use crate::provider::{ContentBlock, Message, Role};
+    use crate::{
+        conversation::Event,
+        provider::{ContentBlock, Message, Role},
+    };
 
     match row.role.as_str() {
         "user" => Ok(Some(Event::Append(Message::user(&row.content)))),
@@ -1523,6 +1737,39 @@ fn decode_event_from_row(
         }
         _ => Ok(None),
     }
+}
+
+/// Pagination cursor for [`SessionManager::list_sessions`]: encodes the
+/// `(updated_at, id)` of the last row in a page as base64-url JSON. The
+/// shape is opaque to clients — they only round-trip it back as
+/// `next_cursor`.
+#[derive(Serialize, Deserialize)]
+struct ListSessionsCursor {
+    #[serde(rename = "u")]
+    updated_at: String,
+    #[serde(rename = "i")]
+    id: String,
+}
+
+fn encode_list_cursor(updated_at: &str, id: &str) -> String {
+    use base64::Engine;
+    let payload = ListSessionsCursor {
+        updated_at: updated_at.to_string(),
+        id: id.to_string(),
+    };
+    let json = serde_json::to_vec(&payload)
+        .expect("ListSessionsCursor is two owned Strings; serialization cannot fail");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+}
+
+fn decode_list_cursor(token: &str) -> Result<(String, String)> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|error| AgshError::Database(format!("invalid list cursor: {}", error)))?;
+    let cursor: ListSessionsCursor = serde_json::from_slice(&bytes)
+        .map_err(|error| AgshError::Database(format!("invalid list cursor: {}", error)))?;
+    Ok((cursor.updated_at, cursor.id))
 }
 
 fn truncate_preview(text: &str, max_chars: usize) -> String {
@@ -1554,11 +1801,13 @@ mod tests {
     async fn test_save_and_load_events_round_trip() {
         use std::collections::HashSet;
 
-        use crate::conversation::Event;
-        use crate::provider::{ContentBlock, Message, Role, ToolResultContent};
+        use crate::{
+            conversation::Event,
+            provider::{ContentBlock, Message, Role, ToolResultContent},
+        };
 
         let manager = test_manager().await;
-        let sid = manager.create_session().await.expect("create session");
+        let sid = manager.create_session(None).await.expect("create session");
 
         let user_event = Event::Append(Message::user("hello"));
         let assistant_event = Event::Append(Message {
@@ -1648,7 +1897,7 @@ mod tests {
         use crate::conversation::Event;
 
         let manager = test_manager().await;
-        let sid = manager.create_session().await.expect("create session");
+        let sid = manager.create_session(None).await.expect("create session");
 
         // Simulate a pre-PR-2 session by writing rows the legacy way.
         manager
@@ -1675,7 +1924,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_events_skips_unknown_role() {
         let manager = test_manager().await;
-        let sid = manager.create_session().await.expect("create session");
+        let sid = manager.create_session(None).await.expect("create session");
         manager
             .save_message(sid, "user", "real")
             .await
@@ -1742,7 +1991,7 @@ mod tests {
     async fn test_create_session() {
         let manager = test_manager().await;
         let session_id = manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
         assert!(
@@ -1757,7 +2006,7 @@ mod tests {
     async fn test_save_and_load_messages() {
         let manager = test_manager().await;
         let session_id = manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
 
@@ -1788,7 +2037,7 @@ mod tests {
         assert!(manager.last_session_id().await.expect("failed").is_none());
 
         let session_id = manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
         let last = manager
@@ -1812,7 +2061,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_unique_match() {
         let manager = test_manager().await;
         let id = manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
         // First 8 hex chars (before the first dash) — guaranteed unique
@@ -1829,7 +2078,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_no_match() {
         let manager = test_manager().await;
         manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
         let matches = manager
@@ -1845,7 +2094,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_rejects_non_hex_chars() {
         let manager = test_manager().await;
         manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
         // SQL `%` and `_` wildcards must not slip through as prefix chars.
@@ -1866,7 +2115,7 @@ mod tests {
     async fn test_find_sessions_by_prefix_empty_prefix_matches_nothing() {
         let manager = test_manager().await;
         manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
         let matches = manager
@@ -1883,7 +2132,7 @@ mod tests {
     async fn test_session_locking_acquire_and_release() {
         let manager = test_manager().await;
         let session_id = manager
-            .create_session()
+            .create_session(None)
             .await
             .expect("failed to create session");
 
@@ -1907,7 +2156,7 @@ mod tests {
     #[tokio::test]
     async fn test_prune_orphan_lock_files() {
         let manager = test_manager().await;
-        let live = manager.create_session().await.expect("create");
+        let live = manager.create_session(None).await.expect("create");
 
         let live_lock = manager.lock_dir.join(format!("{}.lock", live));
         let orphan_lock = manager.lock_dir.join(format!("{}.lock", Uuid::new_v4()));
@@ -1926,7 +2175,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_session_removes_lock_file() {
         let manager = test_manager().await;
-        let session = manager.create_session().await.expect("create");
+        let session = manager.create_session(None).await.expect("create");
         let lock_path = manager.lock_dir.join(format!("{}.lock", session));
         std::fs::write(&lock_path, "").expect("write lock");
 
@@ -1971,8 +2220,8 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_sessions() {
         let manager = test_manager().await;
-        let session1 = manager.create_session().await.expect("failed");
-        let session2 = manager.create_session().await.expect("failed");
+        let session1 = manager.create_session(None).await.expect("failed");
+        let session2 = manager.create_session(None).await.expect("failed");
 
         manager
             .save_message(session1, "user", "msg1")
@@ -1995,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_expired_sessions() {
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("failed");
+        let session_id = manager.create_session(None).await.expect("failed");
         manager
             .save_message(session_id, "user", "hello")
             .await
@@ -2029,8 +2278,8 @@ mod tests {
     #[tokio::test]
     async fn test_delete_expired_sessions_keeps_recent() {
         let manager = test_manager().await;
-        let old_session = manager.create_session().await.expect("failed");
-        let new_session = manager.create_session().await.expect("failed");
+        let old_session = manager.create_session(None).await.expect("failed");
+        let new_session = manager.create_session(None).await.expect("failed");
 
         manager
             .save_message(old_session, "user", "old")
@@ -2067,7 +2316,7 @@ mod tests {
     #[tokio::test]
     async fn test_enforce_storage_limit() {
         let manager = test_manager().await;
-        let session1 = manager.create_session().await.expect("failed");
+        let session1 = manager.create_session(None).await.expect("failed");
 
         // Add enough content to exceed a small limit
         let large_content = "x".repeat(1000);
@@ -2090,15 +2339,16 @@ mod tests {
             .await
             .expect("failed to backdate");
 
-        let session2 = manager.create_session().await.expect("failed");
+        let session2 = manager.create_session(None).await.expect("failed");
         manager
             .save_message(session2, "user", "small")
             .await
             .expect("failed");
 
         // Set a limit smaller than the total, but larger than session2 alone
+        let no_active: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deleted = manager
-            .enforce_storage_limit(500)
+            .enforce_storage_limit(500, &no_active)
             .await
             .expect("failed to enforce");
         assert_eq!(deleted, 1);
@@ -2109,7 +2359,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear_messages() {
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("failed");
+        let session_id = manager.create_session(None).await.expect("failed");
 
         manager
             .save_message(session_id, "user", "hello")
@@ -2187,8 +2437,7 @@ mod tests {
     // then call `list_sessions` and assert the preview matches the
     // raw user prompt. Any future change to:
     //   - `context::build_turn_context`'s output shape
-    //   - `agent::Agent::run_turn`'s "prefix block, then user input"
-    //     format
+    //   - `agent::Agent::run_turn`'s "prefix block, then user input" format
     //   - `save_message` storage
     //   - `list_sessions`'s SQL / preview rendering
     //   - `strip_context_tags` / `truncate_preview`
@@ -2206,7 +2455,7 @@ mod tests {
         permission: crate::permission::Permission,
         user_input: &str,
     ) -> String {
-        let block = crate::context::build_turn_context(permission, &[]);
+        let block = crate::context::build_turn_context(permission, &[], std::path::Path::new("."));
         format!("{}\n\n{}", block, user_input)
     }
 
@@ -2216,7 +2465,7 @@ mod tests {
         // `agsh list` must show the prompt — not `<context>`, not the
         // permission/environment metadata.
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create_session");
+        let session_id = manager.create_session(None).await.expect("create_session");
 
         let user_prompt = "find all Rust files under src/";
         let stored = mock_run_turn_user_message(crate::permission::Permission::Read, user_prompt);
@@ -2225,8 +2474,8 @@ mod tests {
             .await
             .expect("save_message");
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let summary = summaries
@@ -2263,7 +2512,7 @@ mod tests {
             ("ask", crate::permission::Permission::Ask),
             ("write", crate::permission::Permission::Write),
         ] {
-            let session_id = manager.create_session().await.expect("create_session");
+            let session_id = manager.create_session(None).await.expect("create_session");
             let prompt = format!("ask at {} level", label);
             let stored = mock_run_turn_user_message(*permission, &prompt);
             manager
@@ -2271,8 +2520,8 @@ mod tests {
                 .await
                 .expect("save_message");
 
-            let summaries = manager
-                .list_sessions(100, false)
+            let (summaries, _next_cursor) = manager
+                .list_sessions(100, false, None, None)
                 .await
                 .expect("list_sessions");
             let summary = summaries
@@ -2292,7 +2541,7 @@ mod tests {
         // Long prompts are capped at 80 chars with a trailing ellipsis.
         // The cap must apply to the user's prompt, not the wrapper.
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create_session");
+        let session_id = manager.create_session(None).await.expect("create_session");
 
         let long_prompt = "a".repeat(150);
         let stored = mock_run_turn_user_message(crate::permission::Permission::Read, &long_prompt);
@@ -2301,8 +2550,8 @@ mod tests {
             .await
             .expect("save_message");
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -2326,7 +2575,7 @@ mod tests {
         // user prompt, not a later one. `ORDER BY id ASC LIMIT 1`
         // guarantees this; guard against that being changed.
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create_session");
+        let session_id = manager.create_session(None).await.expect("create_session");
 
         for (i, prompt) in ["first prompt", "second prompt", "third prompt"]
             .iter()
@@ -2344,8 +2593,8 @@ mod tests {
                 .expect("save_message");
         }
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -2357,7 +2606,7 @@ mod tests {
         // Multi-line user prompts collapse to the first line in the
         // list view. The remaining lines are not leaked.
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create_session");
+        let session_id = manager.create_session(None).await.expect("create_session");
 
         let stored = mock_run_turn_user_message(
             crate::permission::Permission::Read,
@@ -2368,8 +2617,8 @@ mod tests {
             .await
             .expect("save_message");
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -2381,9 +2630,9 @@ mod tests {
         // Each session's preview is its own first user turn — no
         // cross-contamination from neighbour sessions.
         let manager = test_manager().await;
-        let a = manager.create_session().await.expect("create_session");
-        let b = manager.create_session().await.expect("create_session");
-        let c = manager.create_session().await.expect("create_session");
+        let a = manager.create_session(None).await.expect("create_session");
+        let b = manager.create_session(None).await.expect("create_session");
+        let c = manager.create_session(None).await.expect("create_session");
 
         for (sid, prompt) in [(a, "alpha"), (b, "beta"), (c, "gamma")] {
             let stored = mock_run_turn_user_message(crate::permission::Permission::Read, prompt);
@@ -2393,8 +2642,8 @@ mod tests {
                 .expect("save_message");
         }
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let preview_of = |id: uuid::Uuid| {
@@ -2415,10 +2664,10 @@ mod tests {
         // before first dispatch) falls back to an empty string — it
         // should not panic or render `<no user msg>` scaffolding.
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create_session");
+        let session_id = manager.create_session(None).await.expect("create_session");
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -2433,7 +2682,7 @@ mod tests {
         // no `<context>` wrapper; `list_sessions` should surface the
         // summary's first line, not an empty preview.
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create_session");
+        let session_id = manager.create_session(None).await.expect("create_session");
 
         let summary_msg = "[Conversation summary from session compaction]\n\nSummary text here\n\n\
              [Post-compaction context]\n\n…";
@@ -2442,8 +2691,8 @@ mod tests {
             .await
             .expect("save_message");
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -2460,14 +2709,14 @@ mod tests {
         // at all — the stored string IS the prompt, and the preview
         // equals it.
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create_session");
+        let session_id = manager.create_session(None).await.expect("create_session");
         manager
             .save_message(session_id, "user", "legacy prompt without any wrapper")
             .await
             .expect("save_message");
 
-        let summaries = manager
-            .list_sessions(10, false)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(10, false, None, None)
             .await
             .expect("list_sessions");
         let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
@@ -2477,18 +2726,66 @@ mod tests {
     #[tokio::test]
     async fn test_enforce_storage_limit_no_deletion_needed() {
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("failed");
+        let session_id = manager.create_session(None).await.expect("failed");
         manager
             .save_message(session_id, "user", "small")
             .await
             .expect("failed");
 
+        let no_active: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deleted = manager
-            .enforce_storage_limit(1_000_000)
+            .enforce_storage_limit(1_000_000, &no_active)
             .await
             .expect("failed to enforce");
         assert_eq!(deleted, 0);
         assert!(manager.session_exists(session_id).await.expect("failed"));
+    }
+
+    /// Active sessions must survive eviction even when they're the
+    /// oldest by `updated_at`. The eviction loop should walk
+    /// through younger eligible rows and only stop when the budget
+    /// is met or no inactive sessions remain.
+    #[tokio::test]
+    async fn test_enforce_storage_limit_skips_active_sessions() {
+        let manager = test_manager().await;
+        let oldest = manager.create_session(None).await.expect("create oldest");
+        let large = "x".repeat(1000);
+        manager
+            .save_message(oldest, "user", &large)
+            .await
+            .expect("save oldest");
+
+        // Bump a younger session to also push the budget over.
+        let younger = manager.create_session(None).await.expect("create younger");
+        manager
+            .save_message(younger, "user", &large)
+            .await
+            .expect("save younger");
+
+        // Mark the oldest as active — it must be skipped even though
+        // it would otherwise be the natural eviction target.
+        let mut active = std::collections::HashSet::new();
+        active.insert(oldest.to_string());
+
+        let deleted = manager
+            .enforce_storage_limit(500, &active)
+            .await
+            .expect("enforce");
+        assert_eq!(deleted, 1);
+        assert!(
+            manager
+                .session_exists(oldest)
+                .await
+                .expect("session_exists"),
+            "active session must not be evicted",
+        );
+        assert!(
+            !manager
+                .session_exists(younger)
+                .await
+                .expect("session_exists"),
+            "inactive younger session should have been evicted",
+        );
     }
 
     // Regression: upgrading a pre-0.24 on-disk DB (no parent_session_id
@@ -2632,15 +2929,15 @@ mod tests {
     #[tokio::test]
     async fn test_create_child_session_writes_parent_id() {
         let manager = test_manager().await;
-        let parent = manager.create_session().await.expect("create parent");
+        let parent = manager.create_session(None).await.expect("create parent");
         let child = manager
-            .create_child_session(parent)
+            .create_child_session(parent, None)
             .await
             .expect("create child");
 
         // Cross-check the column via list_sessions(include_children=true).
-        let summaries = manager
-            .list_sessions(100, true)
+        let (summaries, _next_cursor) = manager
+            .list_sessions(100, true, None, None)
             .await
             .expect("list_sessions");
         let ids: Vec<_> = summaries.iter().map(|s| s.id).collect();
@@ -2651,27 +2948,163 @@ mod tests {
     #[tokio::test]
     async fn test_list_sessions_default_hides_children() {
         let manager = test_manager().await;
-        let parent = manager.create_session().await.expect("create parent");
+        let parent = manager.create_session(None).await.expect("create parent");
         let _child = manager
-            .create_child_session(parent)
+            .create_child_session(parent, None)
             .await
             .expect("create child");
 
-        let default_view = manager.list_sessions(10, false).await.expect("list");
+        let (default_view, _) = manager
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list");
         let ids: Vec<_> = default_view.iter().map(|s| s.id).collect();
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&parent), "parent should still be visible");
 
-        let full_view = manager.list_sessions(10, true).await.expect("list");
+        let (full_view, _) = manager
+            .list_sessions(10, true, None, None)
+            .await
+            .expect("list");
         assert_eq!(full_view.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_round_trips_cwd_through_session_info() {
+        let manager = test_manager().await;
+        let cwd = PathBuf::from("/home/agent/proj-a");
+        let sid = manager
+            .create_session(Some(cwd.clone()))
+            .await
+            .expect("create");
+
+        let info = manager
+            .session_info(sid)
+            .await
+            .expect("session_info")
+            .expect("present");
+        assert_eq!(info.cwd, Some(cwd));
+    }
+
+    #[tokio::test]
+    async fn test_session_info_returns_none_for_unknown_id() {
+        let manager = test_manager().await;
+        let absent = manager
+            .session_info(Uuid::new_v4())
+            .await
+            .expect("session_info");
+        assert!(absent.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_filters_by_cwd() {
+        let manager = test_manager().await;
+        let cwd_a = PathBuf::from("/home/agent/proj-a");
+        let cwd_b = PathBuf::from("/home/agent/proj-b");
+        let a = manager
+            .create_session(Some(cwd_a.clone()))
+            .await
+            .expect("create a");
+        let _b = manager
+            .create_session(Some(cwd_b.clone()))
+            .await
+            .expect("create b");
+
+        let (only_a, next) = manager
+            .list_sessions(10, false, Some(&cwd_a), None)
+            .await
+            .expect("list filtered");
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].id, a);
+        assert!(
+            next.is_none(),
+            "single result must not advertise a next page"
+        );
+
+        let (all, _) = manager
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list unfiltered");
+        assert_eq!(all.len(), 2, "unfiltered must include both sessions");
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_cwd_filter_excludes_legacy_null_rows() {
+        // Sessions created via `create_session(None)` simulate legacy
+        // rows: they can't match any cwd filter (NULL is never equal to
+        // a TEXT value in SQL).
+        let manager = test_manager().await;
+        let cwd = PathBuf::from("/home/agent/proj");
+        let with_cwd = manager
+            .create_session(Some(cwd.clone()))
+            .await
+            .expect("create with cwd");
+        let _legacy = manager.create_session(None).await.expect("create legacy");
+
+        let (filtered, _) = manager
+            .list_sessions(10, false, Some(&cwd), None)
+            .await
+            .expect("list");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, with_cwd);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_pagination_cursor_round_trips() {
+        let manager = test_manager().await;
+        // Create five sessions; cap each page at 2. Walking forward
+        // must visit all five exactly once with monotonically older
+        // updated_at.
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let id = manager.create_session(None).await.expect("create");
+            // `created_at`/`updated_at` use chrono::Utc::now() — pause to
+            // ensure each row's timestamp is strictly newer (RFC3339
+            // millisecond resolution).
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            ids.push(id);
+        }
+
+        let mut walked = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, next) = manager
+                .list_sessions(2, false, None, cursor.as_deref())
+                .await
+                .expect("list");
+            for summary in &page {
+                walked.push(summary.id);
+            }
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+            assert!(walked.len() <= 5, "infinite pagination loop");
+        }
+        // The walk emits sessions newest-first; the creation order is
+        // oldest-first, so reverse to compare.
+        ids.reverse();
+        assert_eq!(walked, ids, "pagination must visit every row in order");
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_invalid_cursor_returns_error() {
+        let manager = test_manager().await;
+        let result = manager
+            .list_sessions(10, false, None, Some("not_base64_at_all!!"))
+            .await;
+        assert!(
+            result.is_err(),
+            "garbage cursor must be rejected rather than silently ignored"
+        );
     }
 
     #[tokio::test]
     async fn test_delete_session_cascades_to_children() {
         let manager = test_manager().await;
-        let parent = manager.create_session().await.expect("create parent");
+        let parent = manager.create_session(None).await.expect("create parent");
         let child = manager
-            .create_child_session(parent)
+            .create_child_session(parent, None)
             .await
             .expect("create child");
 

@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-use crate::render;
-
 use super::{Tool, ToolOutput};
+use crate::{
+    error::{AgshError, Result},
+    permission::Permission,
+    provider::ToolDefinition,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,10 +35,6 @@ pub type SharedTodoList = Arc<RwLock<Vec<TodoItem>>>;
 
 pub(super) struct TodoWriteTool {
     pub todo_list: SharedTodoList,
-    /// Whether `render::render_todo_list` should be invoked after a successful
-    /// write. Parent agents render to the user's stderr; sub-agents do not,
-    /// since the rest of the sub-agent loop is silent.
-    pub render_visible: bool,
 }
 
 #[async_trait]
@@ -106,11 +102,7 @@ impl Tool for TodoWriteTool {
             })?;
 
         let count = tasks.len();
-        *self.todo_list.write().await = tasks.clone();
-
-        if self.render_visible {
-            render::render_todo_list(&tasks);
-        }
+        *self.todo_list.write().await = tasks;
 
         Ok(ToolOutput::text(
             format!("Task list updated ({} tasks)", count),
@@ -186,7 +178,6 @@ mod tests {
         let list = test_list();
         let tool = TodoWriteTool {
             todo_list: list.clone(),
-            render_visible: false,
         };
 
         let result = tool
@@ -216,7 +207,6 @@ mod tests {
         let list = test_list();
         let tool = TodoWriteTool {
             todo_list: list.clone(),
-            render_visible: false,
         };
 
         let result = tool
@@ -240,7 +230,6 @@ mod tests {
         let list = test_list();
         let tool = TodoWriteTool {
             todo_list: list.clone(),
-            render_visible: false,
         };
 
         tool.execute(
@@ -293,7 +282,6 @@ mod tests {
         let list = test_list();
         let writer = TodoWriteTool {
             todo_list: list.clone(),
-            render_visible: false,
         };
         let reader = TodoReadTool {
             todo_list: list.clone(),

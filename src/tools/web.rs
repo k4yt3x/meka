@@ -9,14 +9,17 @@ use futures::StreamExt;
 use html2md::rewrite_html;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{MinTlsVersion, WebClientConfig};
-use crate::error::{AgshError, Result};
-use crate::image::{ImageHandling, build_image_tool_output, classify_content_type};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-
-use super::util::{compile_user_regex, redirects_to_scratchpad, require_str};
-use super::{Tool, ToolOutput};
+use super::{
+    Tool, ToolOutput,
+    util::{compile_user_regex, redirects_to_scratchpad, require_str},
+};
+use crate::{
+    config::{MinTlsVersion, WebClientConfig},
+    error::{AgshError, Result},
+    image::{ImageHandling, build_image_tool_output, classify_content_type},
+    permission::Permission,
+    provider::ToolDefinition,
+};
 
 /// Build the shared `reqwest::Client` for `fetch_url` + `web_search`
 /// from the resolved [`WebClientConfig`]. Errors propagate so startup
@@ -559,12 +562,11 @@ fn clip_snippet(text: &str, max_chars: usize) -> String {
 /// both; any match filters the block out. Confirmed in
 /// `tests/fixtures/ddg_with_ad.html`:
 ///
-/// 1. **Wrapper class** — ads carry `result--ad` on the outer
-///    `<div class="result …">`. Organic results use `web-result`.
-/// 2. **Resolved link target** — after decoding DDG's `/l/?uddg=…`
-///    redirect, the ad's destination is `duckduckgo.com/y.js?ad_domain=…`
-///    (their ad-click tracker). This catches ads even if DDG drops
-///    the `result--ad` class without warning.
+/// 1. **Wrapper class** — ads carry `result--ad` on the outer `<div class="result …">`. Organic
+///    results use `web-result`.
+/// 2. **Resolved link target** — after decoding DDG's `/l/?uddg=…` redirect, the ad's destination
+///    is `duckduckgo.com/y.js?ad_domain=…` (their ad-click tracker). This catches ads even if DDG
+///    drops the `result--ad` class without warning.
 fn is_ad_result(block: scraper::ElementRef<'_>, resolved_url: Option<&str>) -> bool {
     if block.value().classes().any(|c| c == "result--ad") {
         return true;

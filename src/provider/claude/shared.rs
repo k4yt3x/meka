@@ -4,19 +4,19 @@
 //! the Claude wire format, SSE streaming, response parsing, per-model
 //! capability detection, and the thinking-override helper.
 
-use std::sync::atomic::AtomicI8;
+use std::{borrow::Cow, sync::atomic::AtomicI8};
 
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use std::borrow::Cow;
-
-use crate::error::{AgshError, Result};
-use crate::provider::{
-    ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
-    ToolResultContent,
+use crate::{
+    error::{AgshError, Result},
+    provider::{
+        ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        ToolResultContent,
+    },
 };
 
 /// Anthropic's hard request-body cap is 32 MiB; we reserve ~2 MiB headroom
@@ -296,6 +296,12 @@ pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
         "end_turn" => StopReason::EndTurn,
         "tool_use" => StopReason::ToolUse,
         "max_tokens" => StopReason::MaxTokens,
+        // Claude does not include the refusal text alongside the
+        // streaming `stop_reason` delta; the model's text content
+        // is what the user sees as the refusal. Surface an empty
+        // refusal payload — the assistant message blocks carry the
+        // human-readable explanation already.
+        "refusal" => StopReason::Refusal(String::new()),
         other => StopReason::Unknown(other.to_string()),
     }
 }
@@ -1115,9 +1121,10 @@ mod tests {
     }
 
     fn synthesize_png_base64(width: u32, height: u32) -> String {
+        use std::io::Cursor;
+
         use base64::Engine;
         use image::{ImageFormat, RgbaImage};
-        use std::io::Cursor;
         let img = RgbaImage::from_pixel(width, height, image::Rgba([100, 150, 200, 255]));
         let mut bytes = Vec::new();
         img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)

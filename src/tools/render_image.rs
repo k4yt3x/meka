@@ -10,13 +10,14 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::error::{AgshError, Result};
-use crate::image::{build_image_tool_output, classify_bytes};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-use crate::session::SessionManager;
-
 use super::{Tool, ToolOutput};
+use crate::{
+    error::{AgshError, Result},
+    image::{build_image_tool_output, classify_bytes},
+    permission::Permission,
+    provider::ToolDefinition,
+    session::SessionManager,
+};
 
 pub(super) struct RenderImageTool {
     pub session_id: Arc<RwLock<Option<Uuid>>>,
@@ -124,14 +125,12 @@ impl Tool for RenderImageTool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::path::Path;
+    use std::{io::Cursor, path::Path};
 
     use image::{ImageFormat, RgbaImage};
 
     use super::*;
-    use crate::provider::ToolResultContent;
-    use crate::tools::tests::text_content;
+    use crate::{provider::ToolResultContent, tools::tests::text_content};
 
     async fn test_manager() -> SessionManager {
         SessionManager::open(Some(Path::new(":memory:")))
@@ -205,7 +204,7 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
 
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create session");
+        let session_id = manager.create_session(None).await.expect("create session");
         // Trailing newline mimics how command-pipe output typically lands in the scratchpad.
         manager
             .save_tool_output(session_id, "frame", &format!("{}\n", encoded))
@@ -228,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn test_render_image_missing_scratchpad_entry() {
         let manager = test_manager().await;
-        let session_id = manager.create_session().await.expect("create session");
+        let session_id = manager.create_session(None).await.expect("create session");
         let tool = build_tool(manager, Some(session_id));
 
         let result = tool

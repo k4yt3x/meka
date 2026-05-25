@@ -5,8 +5,10 @@
 //! notification handler can route updates to the correct in-flight tool
 //! call, with cleanup on drop to avoid leaks when calls time out or error.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 
 use rmcp::model::{NumberOrString, ProgressNotificationParam, ProgressToken};
 
@@ -74,20 +76,14 @@ pub fn register(
         .entries
         .lock()
         .expect("progress mutex poisoned")
-        .insert(
-            token_str.clone(),
-            Entry {
-                server_name,
-                tool_name,
-                tool_use_id,
-            },
-        );
-    (
-        token,
-        ProgressGuard {
-            key: Some(token_str),
-        },
-    )
+        .insert(token_str.clone(), Entry {
+            server_name,
+            tool_name,
+            tool_use_id,
+        });
+    (token, ProgressGuard {
+        key: Some(token_str),
+    })
 }
 
 /// RAII guard that removes the progress-token entry when dropped.

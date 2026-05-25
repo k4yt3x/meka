@@ -2,8 +2,10 @@
 //! `!command` shell pass-through, and the channels that exchange events
 //! between the REPL thread and the agent loop.
 
-use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use crossterm::style::{Color, Stylize};
 use reedline::{
@@ -12,8 +14,10 @@ use reedline::{
     Signal, StyledText, default_emacs_keybindings,
 };
 
-use crate::permission::{EnabledPermissions, SharedPermission};
-use crate::relay::RELAY;
+use crate::{
+    permission::{EnabledPermissions, SharedPermission},
+    relay::RELAY,
+};
 
 /// Reedline highlighter that paints the entire input buffer with a single
 /// style. The final paint reedline emits on submit is what lands in
@@ -36,15 +40,17 @@ const CYCLE_PERMISSION_SENTINEL: &str = "__cycle_permission__";
 struct AgshPrompt {
     shared_permission: SharedPermission,
     show_path: bool,
+    /// Per-session working directory shared with the agent and the
+    /// `/cd` slash command. Reading the lock per prompt render is cheap
+    /// (microseconds) and bounded — `/cd` is the only writer.
+    cwd: crate::agent::SharedCwd,
 }
 
 impl Prompt for AgshPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         if self.show_path {
-            let cwd = std::env::current_dir()
-                .map(|path| shorten_path_with_tilde(&path))
-                .unwrap_or_else(|_| "?".to_string());
-            Cow::Owned(format!("agsh {} ", cwd))
+            let path = crate::agent::cwd_snapshot(&self.cwd);
+            Cow::Owned(format!("agsh {} ", shorten_path_with_tilde(&path)))
         } else {
             Cow::Borrowed("agsh ")
         }
@@ -202,7 +208,7 @@ pub enum AgentToReplEvent {
     McpProgress(crate::mcp::progress::ProgressUpdate),
 }
 
-fn parse_slash_command(input: &str) -> Option<SlashCommand> {
+pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     let input = input.strip_prefix('/')?;
     let mut parts = input.splitn(2, char::is_whitespace);
     let command = parts.next()?;
@@ -231,13 +237,11 @@ fn parse_slash_command(input: &str) -> Option<SlashCommand> {
 
 /// Parse the argument to `/skill …`.
 ///
-/// - Empty argument (bare `/skill`) → list installed skills. There is
-///   no `list` keyword: that token would be treated as a skill name to
-///   invoke.
-/// - Otherwise: first whitespace-separated token is the skill name;
-///   the remainder (if any) is free-form extra context that gets
-///   prepended to the skill body before the agent turn. The remainder
-///   is trimmed so trailing whitespace doesn't bloat the body.
+/// - Empty argument (bare `/skill`) → list installed skills. There is no `list` keyword: that token
+///   would be treated as a skill name to invoke.
+/// - Otherwise: first whitespace-separated token is the skill name; the remainder (if any) is
+///   free-form extra context that gets prepended to the skill body before the agent turn. The
+///   remainder is trimmed so trailing whitespace doesn't bloat the body.
 fn parse_skill_slash(rest: &str) -> SlashCommand {
     let rest = rest.trim();
     if rest.is_empty() {
@@ -336,6 +340,7 @@ fn print_help() {
     eprintln!("  Ctrl+D        Exit the shell");
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_repl(
     shared_permission: SharedPermission,
     show_path_in_prompt: bool,
@@ -344,6 +349,7 @@ pub fn run_repl(
     sandbox_state: crate::sandbox::SandboxState,
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
+    cwd: crate::agent::SharedCwd,
 ) {
     // Install reedline's `ExternalPrinter` on the process-global tracing
     // writer BEFORE the first `read_line()`. From this point on, log
@@ -357,6 +363,7 @@ pub fn run_repl(
     let prompt = AgshPrompt {
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
+        cwd: cwd.clone(),
     };
 
     // If the caller queued a synthetic first turn (e.g. `--skill` or a bare
@@ -451,7 +458,7 @@ pub fn run_repl(
                             continue;
                         }
                         Some(SlashCommand::Cd(argument)) => {
-                            handle_cd(argument.as_deref().unwrap_or(""));
+                            handle_cd(&cwd, argument.as_deref().unwrap_or(""));
                             continue;
                         }
                         Some(
@@ -624,8 +631,10 @@ fn format_progress_update(update: &crate::mcp::progress::ProgressUpdate) -> Stri
 /// the JSON Schema one property at a time, collecting input. For URLs, opens
 /// the browser and waits for the user to confirm.
 fn handle_elicitation_prompt(prompt: crate::mcp::elicitation::ElicitationPrompt) {
-    use crate::mcp::elicitation::{ElicitationKind, ElicitationResponse};
-    use crate::mcp::sanitize::sanitize_text;
+    use crate::mcp::{
+        elicitation::{ElicitationKind, ElicitationResponse},
+        sanitize::sanitize_text,
+    };
     // Server-controlled strings get stripped of control/format codepoints
     // before they reach the terminal. Without this a malicious server could
     // ship ANSI escapes to clear the screen or RTL overrides to spoof the
@@ -774,8 +783,8 @@ fn shorten_path_with_tilde(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn handle_cd(target: &str) {
-    let path = if target.is_empty() || target == "~" {
+fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) {
+    let raw = if target.is_empty() || target == "~" {
         match dirs::home_dir() {
             Some(home) => home,
             None => {
@@ -795,14 +804,55 @@ fn handle_cd(target: &str) {
         PathBuf::from(target)
     };
 
-    if let Err(error) = std::env::set_current_dir(&path) {
-        eprintln!("cd: {}: {}", path.display(), error);
+    // Resolve relative inputs against the current per-session cwd so
+    // `/cd subdir` lands inside the agent's current view, then
+    // canonicalize so the prompt and the tools see a clean path.
+    let resolved = crate::agent::resolve_against_cwd(cwd, &raw);
+    let canonical = match std::fs::canonicalize(&resolved) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            eprintln!("cd: {}: {}", raw.display(), error);
+            return;
+        }
+    };
+    if !canonical.is_dir() {
+        eprintln!("cd: {}: not a directory", canonical.display());
+        return;
+    }
+    match cwd.write() {
+        Ok(mut guard) => *guard = canonical,
+        Err(poisoned) => *poisoned.into_inner() = canonical,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_handle_cd_updates_shared_cwd_without_mutating_process_cwd() {
+        // Working directory mutation is per-session now; verify `/cd`
+        // writes to the `SharedCwd` and leaves `std::env::current_dir()`
+        // untouched. Use a tempdir + canonicalize so the assertion is
+        // robust to platform-specific symlinks (e.g. `/tmp` → `/private/tmp`
+        // on macOS).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = std::fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let process_cwd_before = std::env::current_dir().expect("read process cwd before /cd");
+
+        let cwd: crate::agent::SharedCwd = std::sync::Arc::new(std::sync::RwLock::new(
+            std::path::PathBuf::from("/this/path/does/not/exist"),
+        ));
+        handle_cd(&cwd, target.to_str().expect("utf-8 tempdir"));
+
+        let stored = cwd.read().expect("cwd lock").clone();
+        assert_eq!(stored, target, "shared cwd must point at the new directory");
+        let process_cwd_after = std::env::current_dir().expect("read process cwd after /cd");
+        assert_eq!(
+            process_cwd_after, process_cwd_before,
+            "process cwd must NOT be mutated by /cd",
+        );
+    }
 
     #[test]
     fn test_user_input_highlighter_default_preset_preserves_literal() {

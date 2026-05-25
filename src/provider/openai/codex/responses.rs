@@ -15,10 +15,12 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::provider::{
-    ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
-    ToolResultContent,
+use crate::{
+    error::{AgshError, Result},
+    provider::{
+        ContentBlock, Message, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        ToolResultContent,
+    },
 };
 
 /// Build the JSON body POSTed to `/responses`. Translates the agsh internal
@@ -726,12 +728,9 @@ mod tests {
             StreamEvent::ToolUseEnd { input } => assert_eq!(input["path"], "/tmp/x"),
             other => panic!("expected ToolUseEnd, got {:?}", other),
         }
-        assert!(matches!(
-            events[4],
-            StreamEvent::MessageEnd {
-                stop_reason: StopReason::EndTurn
-            }
-        ));
+        assert!(matches!(events[4], StreamEvent::MessageEnd {
+            stop_reason: StopReason::EndTurn
+        }));
     }
 
     #[test]
@@ -842,12 +841,13 @@ mod tests {
             &mut state,
         )
         .expect("ok");
-        assert!(events.iter().any(|event| matches!(
-            event,
-            StreamEvent::MessageEnd {
-                stop_reason: StopReason::MaxTokens
-            }
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd {
+                    stop_reason: StopReason::MaxTokens
+                }))
+        );
     }
 
     #[test]
@@ -948,17 +948,14 @@ mod tests {
         // End-to-end: build_request_body wires build_tool_result_output via
         // encode_user_message; confirm the function_call_output's `output`
         // field is the array form when an image is present.
-        let mut messages = vec![
-            Message::user("look at this"),
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "call_1".to_string(),
-                    name: "screenshot".to_string(),
-                    input: serde_json::json!({}),
-                }],
-            },
-        ];
+        let mut messages = vec![Message::user("look at this"), Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "screenshot".to_string(),
+                input: serde_json::json!({}),
+            }],
+        }];
         messages.push(Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {

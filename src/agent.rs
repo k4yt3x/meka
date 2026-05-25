@@ -2,24 +2,97 @@
 //! persists the resulting messages to the session store. Also handles
 //! mid-conversation auto-compaction when the input-token budget is exceeded.
 
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::context;
-use crate::conversation::Conversation;
-use crate::error::{AgshError, Result};
-use crate::permission::SharedPermission;
-use crate::provider::{
-    ContentBlock, Message, Provider, Role, StopReason, StreamEvent, ToolDefinition,
+/// Why an [`Agent::run_turn`] invocation finished cleanly. Callers
+/// that drive a user-facing protocol (e.g. the ACP `session/prompt`
+/// response) use this to map to a protocol-level stop reason; REPL
+/// and one-shot callers discard it. `Interrupted` is not represented
+/// here — it surfaces as `Err(AgshError::Interrupted)` so the
+/// success-path return type stays straightforward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// The model returned a natural end-of-turn (or an unrecognised
+    /// stop reason — treated as end-of-turn since we have nothing
+    /// better to surface).
+    EndTurn,
+    /// The provider stopped because the model hit its maximum output
+    /// tokens. The assistant message may be truncated; clients can
+    /// reflect this in their UI.
+    MaxTokens,
+    /// The model refused to comply with the request (Claude
+    /// `stop_reason: "refusal"`, OpenAI equivalent). The string
+    /// carries the model's refusal text when available so clients
+    /// can render it instead of a generic "request failed."
+    Refusal(String),
+    /// The agent loop exceeded its per-turn provider-request cap.
+    /// Surfaces the spec's `max_turn_requests` stop reason so clients
+    /// can offer a retry / continue affordance.
+    MaxTurnRequests,
+}
+
+/// Per-session working directory, shared by reference between the agent,
+/// every file-touching tool, the REPL prompt, the `/cd` slash command,
+/// and the per-turn environment-context block. `std::sync::RwLock`
+/// (rather than `tokio::sync::RwLock`) so the synchronous REPL prompt
+/// can read it without entering an async context; reads/writes are
+/// microseconds (a `PathBuf` clone or replace), never held across
+/// `.await`.
+pub type SharedCwd = Arc<RwLock<PathBuf>>;
+
+/// Read the current value of [`SharedCwd`]. Recovers from a poisoned
+/// lock by extracting the inner value; agsh never panics with the cwd
+/// lock held, so the only way to see a poisoned lock is a separate bug
+/// that already triggered, and falling back to the stored value beats
+/// crashing the agent on every subsequent tool call.
+pub fn cwd_snapshot(cwd: &SharedCwd) -> PathBuf {
+    cwd.read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+}
+
+/// Resolve a tool-input path against the per-session [`SharedCwd`].
+/// Absolute paths pass through unchanged; relative paths are joined to
+/// the current cwd value. Tools use this at the top of their `execute`
+/// methods to decouple from process `cwd`.
+pub fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) -> PathBuf {
+    let input = input.as_ref();
+    if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        cwd_snapshot(cwd).join(input)
+    }
+}
+
+/// Construct a fresh [`SharedCwd`] pointing at the process cwd, for use
+/// in tests that need to instantiate a tool but don't exercise the
+/// per-session cwd resolution path. Tests using absolute paths or
+/// `tempdir()` are unaffected by the value here.
+#[cfg(test)]
+pub fn test_cwd() -> SharedCwd {
+    Arc::new(RwLock::new(
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    ))
+}
+
+use crate::{
+    context,
+    conversation::Conversation,
+    error::{AgshError, Result},
+    frontend::{Frontend, FrontendEvent, PermissionOutcome, PermissionRequest},
+    permission::SharedPermission,
+    provider::{ContentBlock, Message, Provider, Role, StopReason, StreamEvent, ToolDefinition},
+    session::SessionManager,
+    skills::SkillCache,
+    tools::{ToolRegistry, todo::SharedTodoList},
 };
-use crate::render::{self, StreamingRenderer};
-use crate::session::SessionManager;
-use crate::skills::SkillCache;
-use crate::tools::ToolRegistry;
-use crate::tools::todo::SharedTodoList;
 
 /// Trigger auto-compaction once a turn's input tokens exceed this fraction of
 /// the configured context window.
@@ -36,14 +109,9 @@ pub struct AgentOptions {
     /// `Provider::stream`; otherwise the agent uses the blocking
     /// `Provider::complete`.
     pub streaming: bool,
-    pub newline_before_prompt: bool,
-    pub newline_after_prompt: bool,
-    pub show_session_id_on_create: bool,
-    pub show_token_usage: bool,
     /// Whether read-mode `execute_command` calls run inside the platform
     /// sandbox. Forced off when no sandbox backend is available.
     pub sandboxed_shell: bool,
-    pub render_mode: crate::render::RenderMode,
     /// Cap on messages sent to the provider per turn. `None` = unlimited;
     /// the agent walks back to a safe boundary so tool-result chains stay
     /// intact (see `truncate_messages_for_context`).
@@ -54,7 +122,6 @@ pub struct AgentOptions {
     pub auto_compact: bool,
     /// Provider's advertised context window in tokens. Drives auto-compact.
     pub context_window: u64,
-    pub thinking_show_content: bool,
     /// User-authored instructions, surfaced in the system prompt and to
     /// sub-agents. Per-run `--instructions` overrides the config-file value.
     pub user_instructions: Option<String>,
@@ -73,6 +140,12 @@ pub struct AgentOptions {
     /// fine for one-shot sub-agents whose tool list and permission level
     /// are fixed at spawn time.
     pub system_prompt_override: Option<String>,
+    /// Cap on provider requests per turn. A misbehaving tool chain
+    /// (model loops on the same tool, never converges) would
+    /// otherwise spin indefinitely. When the cap is hit, the turn
+    /// resolves as the ACP spec's `max_turn_requests` stop reason.
+    /// Defaults to 100 via `default_max_turn_requests` in `config.rs`.
+    pub max_turn_requests: usize,
 }
 
 /// Driver for a single conversation. One [`Agent`] handles one or more
@@ -97,7 +170,17 @@ pub struct Agent {
     /// take effect even sooner — `load_skill_body` re-reads from disk on
     /// every invocation regardless of cache state.
     skills: Arc<SkillCache>,
-    approval_sender: Option<std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>>,
+    /// Where streaming output, todo-list renders, token-usage summaries,
+    /// and tool-approval requests flow. Concrete impls today:
+    /// [`crate::frontend::ReplFrontend`], [`crate::acp::AcpFrontend`],
+    /// [`SilentFrontend`], and [`crate::frontend::PermissionForwardingFrontend`].
+    frontend: Arc<dyn Frontend>,
+    /// Per-session working directory. Initialised from
+    /// `std::env::current_dir()` at startup; updated by `/cd`; read by
+    /// the file/shell/find/grep tools, the REPL prompt, the per-turn
+    /// environment-context block, and the MCP `roots/list` handler.
+    /// Process `cwd` is no longer mutated.
+    cwd: SharedCwd,
     last_input_tokens: std::sync::atomic::AtomicU64,
     /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by
     /// MCP tool adapters so oversized-output persistence uses
@@ -124,7 +207,8 @@ impl Agent {
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         skills: Arc<SkillCache>,
-        approval_sender: Option<std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>>,
+        frontend: Arc<dyn Frontend>,
+        cwd: SharedCwd,
         session_stats: Arc<crate::stats::SessionStats>,
     ) -> Self {
         Self {
@@ -136,7 +220,8 @@ impl Agent {
             todo_list,
             shared_session_id,
             skills,
-            approval_sender,
+            frontend,
+            cwd,
             last_input_tokens: std::sync::atomic::AtomicU64::new(0),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             mcp_manager: None,
@@ -144,16 +229,43 @@ impl Agent {
         }
     }
 
-    /// Build an `Agent` configured for sub-agent use: silent rendering,
-    /// no compaction, no approval round-trip, no MCP readiness gate.
-    /// Inherits `sandboxed_shell`, `context_messages`, and
-    /// `user_instructions` from the parent's options so the sub-agent
-    /// sees the same shell sandbox decision, message-cap policy, and
-    /// user-authored instructions.
+    /// Swap the provider after construction. Used by the ACP
+    /// integration test path (`AGSH_ACP_MOCK_PROVIDER=1`) so the test
+    /// can drive a scripted [`crate::provider::mock::MockProvider`]
+    /// without going through the credential / HTTP-client setup that
+    /// `create_agent_from_config` performs for real providers. Debug
+    /// builds only — release builds don't include it.
+    #[cfg(debug_assertions)]
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+
+    /// Shared handle to the agent's session-scoped working directory.
+    /// Public so frontends can observe live cwd changes via the same
+    /// `Arc` the `/cd` handler mutates; currently unused because
+    /// main.rs / acp.rs build the `SharedCwd` themselves and pass it
+    /// in. Kept allow(dead_code) until a frontend reaches for it.
+    #[allow(dead_code)]
+    pub fn cwd(&self) -> &SharedCwd {
+        &self.cwd
+    }
+
+    /// Build an `Agent` configured for sub-agent use: no compaction,
+    /// no MCP readiness gate. Inherits `sandboxed_shell`,
+    /// `context_messages`, and `user_instructions` from the parent's
+    /// options.
     ///
     /// `sub_system_prompt` is the pre-built sub-agent system prompt
     /// (typically from `build_subagent_system_prompt`); `run_turn` uses
     /// it verbatim instead of building one dynamically.
+    ///
+    /// `frontend` decides where the sub-agent's output and permission
+    /// requests go. The standard caller (the `spawn_agent` tool) uses
+    /// [`crate::frontend::PermissionForwardingFrontend`] wrapping the
+    /// parent's frontend — that drops emits (the sub-agent's report
+    /// flows back via the tool result) but forwards permission
+    /// prompts so the user is asked in their original UI. Tests can
+    /// pass [`SilentFrontend`] for fully-isolated sub-agent runs.
     ///
     /// Doesn't call `set_mcp_manager`. MCP tool dispatch from the
     /// sub-agent's registry works without an attached manager because
@@ -169,28 +281,34 @@ impl Agent {
         todo_list: SharedTodoList,
         shared_session_id: Arc<tokio::sync::RwLock<Option<uuid::Uuid>>>,
         skills: Arc<SkillCache>,
+        parent_cwd: &SharedCwd,
+        frontend: Arc<dyn Frontend>,
         session_stats: Arc<crate::stats::SessionStats>,
     ) -> Self {
         let options = AgentOptions {
-            // Inherited from parent: same sandbox decision, message
-            // truncation cap, and user instructions.
             sandboxed_shell: parent_options.sandboxed_shell,
             context_messages: parent_options.context_messages,
             user_instructions: parent_options.user_instructions.clone(),
-            // Sub-agent overrides: silent, one-shot.
+            max_turn_requests: parent_options.max_turn_requests,
+            // Sub-agents run silent + one-shot: no streaming UI, no
+            // auto-compact, no MCP readiness gate.
             streaming: false,
-            newline_before_prompt: false,
-            newline_after_prompt: false,
-            show_session_id_on_create: false,
-            show_token_usage: false,
-            render_mode: crate::render::RenderMode::Silent,
             auto_compact: false,
             context_window: 0,
-            thinking_show_content: false,
             mcp_strict: false,
             mcp_grace: std::time::Duration::ZERO,
             system_prompt_override: Some(sub_system_prompt),
         };
+        // Snapshot the parent's cwd at spawn time. The sub-agent has no
+        // `/cd` of its own (no REPL) so this `Arc` is effectively
+        // immutable — but giving the sub-agent its own `Arc` rather than
+        // sharing the parent's prevents a parent `/cd` mid-sub-agent-turn
+        // from changing the sub-agent's resolution mid-flight.
+        let parent_path = parent_cwd
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        let sub_cwd: SharedCwd = Arc::new(RwLock::new(parent_path));
         Self::new(
             provider,
             tool_registry,
@@ -200,7 +318,8 @@ impl Agent {
             todo_list,
             shared_session_id,
             skills,
-            None,
+            frontend,
+            sub_cwd,
             session_stats,
         )
     }
@@ -209,15 +328,6 @@ impl Agent {
     /// from the REPL on demand.
     pub fn session_stats_snapshot(&self) -> crate::stats::SessionStatsSnapshot {
         self.session_stats.snapshot()
-    }
-
-    /// True when this agent's render mode is [`crate::render::RenderMode::Silent`]
-    /// — sub-agents and any other in-process agent that shouldn't leak
-    /// to the user's terminal. `run_turn` gates every direct `render::*`
-    /// / `eprintln!` callsite on `!self.is_silent()` so a silent agent
-    /// produces zero output.
-    fn is_silent(&self) -> bool {
-        matches!(self.options.render_mode, crate::render::RenderMode::Silent)
     }
 
     /// Shared handle to the auto-refreshing skill cache. The REPL's
@@ -292,25 +402,23 @@ impl Agent {
         messages: &mut Conversation,
         user_input: String,
         cancellation: CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<TurnOutcome> {
         // Gate on MCP readiness BEFORE touching session state / message
         // history so a rejected turn leaves no trace in the conversation.
         self.await_mcp_ready().await?;
 
         if session_id.is_none() {
-            let id = self.session_manager.create_session().await?;
+            let id = self
+                .session_manager
+                .create_session(Some(cwd_snapshot(&self.cwd)))
+                .await?;
             *session_id = Some(id);
-            if self.options.show_session_id_on_create && !self.is_silent() {
-                crate::render::render_session_id("Creating new session", &id.to_string());
-            }
+            self.frontend
+                .emit(FrontendEvent::SessionStarted { id })
+                .await;
         }
 
-        let mut spacing = render::OutputSpacing::new();
-
-        if self.options.newline_after_prompt && !self.is_silent() {
-            eprintln!();
-            spacing.after_prompt();
-        }
+        self.frontend.emit(FrontendEvent::TurnStarted).await;
 
         let sid = session_id.ok_or(AgshError::Config("session_id not set".into()))?;
 
@@ -332,8 +440,6 @@ impl Agent {
                     AUTO_COMPACT_THRESHOLD_PERCENT,
                     self.options.context_window
                 );
-                // Automatic lifecycle signpost — hidden at default
-                // verbosity, surface with `-v` / `RUST_LOG`.
                 tracing::info!("auto-compacting conversation");
                 if let Err(error) = self.compact_session(session_id, messages).await {
                     tracing::warn!("auto-compact failed: {}", error);
@@ -346,7 +452,8 @@ impl Agent {
         let catalogue = self.tool_registry.tool_catalogue();
         let augmented_input = {
             let todos = self.todo_list.read().await;
-            let block = context::build_turn_context(permission, &todos);
+            let cwd_snapshot = cwd_snapshot(&self.cwd);
+            let block = context::build_turn_context(permission, &todos, &cwd_snapshot);
             format!("{}\n\n{}", block, user_input)
         };
         let user_message = Message::user(&augmented_input);
@@ -383,11 +490,31 @@ impl Agent {
         // tool-execution loops), not just the final round-trip.
         let mut turn_usage = crate::provider::TokenUsage::default();
 
-        let result: Result<()> = 'turn: {
+        // Per-turn provider-request counter. A misbehaving tool chain
+        // (e.g. the model invokes the same tool repeatedly without
+        // making progress) could otherwise spin the loop indefinitely.
+        // Cap surfaces as the spec's `max_turn_requests` stop reason
+        // so the client can offer a retry / continue affordance.
+        let max_turn_requests = self.options.max_turn_requests;
+        let mut turn_requests: usize = 0;
+
+        let result: Result<TurnOutcome> = 'turn: {
             loop {
                 if cancellation.is_cancelled() {
                     break 'turn Err(AgshError::Interrupted);
                 }
+                // Bail out if the frontend has noticed its client
+                // went away (e.g. ACP stdio disconnect). No point
+                // burning more provider tokens for an audience that
+                // won't see the output. REPL frontends report
+                // `false` here, so this is a no-op for them.
+                if self.frontend.client_disconnected() {
+                    break 'turn Err(AgshError::Interrupted);
+                }
+                if turn_requests >= max_turn_requests {
+                    break 'turn Ok(TurnOutcome::MaxTurnRequests);
+                }
+                turn_requests += 1;
 
                 let api_messages: Arc<[Message]> = if messages.len() > turn_start_len {
                     let mut combined = base_messages.to_vec();
@@ -419,7 +546,6 @@ impl Agent {
                         api_messages,
                         tools,
                         cancellation.clone(),
-                        &mut spacing,
                     )
                     .await
                 } else {
@@ -471,11 +597,7 @@ impl Agent {
                 match stop_reason {
                     StopReason::ToolUse => {
                         let mut tool_results = self
-                            .execute_tool_calls(
-                                &assistant_message,
-                                cancellation.clone(),
-                                &mut spacing,
-                            )
+                            .execute_tool_calls(&assistant_message, cancellation.clone())
                             .await;
 
                         if let Err(error) =
@@ -523,8 +645,14 @@ impl Agent {
 
                         messages.append(result_message);
                     }
-                    StopReason::EndTurn | StopReason::MaxTokens | StopReason::Unknown(_) => {
-                        break 'turn Ok(());
+                    StopReason::MaxTokens => {
+                        break 'turn Ok(TurnOutcome::MaxTokens);
+                    }
+                    StopReason::Refusal(text) => {
+                        break 'turn Ok(TurnOutcome::Refusal(text));
+                    }
+                    StopReason::EndTurn | StopReason::Unknown(_) => {
+                        break 'turn Ok(TurnOutcome::EndTurn);
                     }
                 }
             }
@@ -535,13 +663,10 @@ impl Agent {
             // `/status`. Done here (not inside the inner loop) so a single
             // `/status` reading reflects whole turns, not partial state.
             self.session_stats.record_turn(&turn_usage);
-            if self.options.show_token_usage && !self.is_silent() {
-                crate::render::render_token_usage(&turn_usage);
-            }
-        }
-
-        if result.is_ok() && self.options.newline_before_prompt && !self.is_silent() {
-            eprintln!();
+            self.frontend
+                .emit(FrontendEvent::TokenUsage(turn_usage))
+                .await;
+            self.frontend.emit(FrontendEvent::TurnFinished).await;
         }
 
         match &result {
@@ -567,7 +692,6 @@ impl Agent {
         messages: Arc<[Message]>,
         tools: Arc<[ToolDefinition]>,
         cancellation: CancellationToken,
-        spacing: &mut render::OutputSpacing,
     ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
         // Bounded so a provider streaming faster than the renderer consumes
         // can't grow memory without limit. 1024 is far above any realistic
@@ -589,7 +713,6 @@ impl Agent {
                 .await
         });
 
-        let mut renderer = StreamingRenderer::new(self.options.render_mode);
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
         let mut current_text = String::new();
         let mut current_thinking = String::new();
@@ -598,7 +721,6 @@ impl Agent {
         let mut current_tool_input_json = String::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut token_usage = crate::provider::TokenUsage::default();
-        let show_thinking = self.options.thinking_show_content;
 
         while let Some(event) = event_receiver.recv().await {
             match event {
@@ -607,27 +729,26 @@ impl Agent {
                 }
                 StreamEvent::ThinkingComplete { signature } => {
                     if !current_thinking.is_empty() {
-                        if spacing.before_thinking() && !self.is_silent() {
-                            eprintln!();
-                        }
-                        if !self.is_silent() {
-                            render::render_thinking_block(&current_thinking, show_thinking);
-                        }
+                        let content = std::mem::take(&mut current_thinking);
+                        self.frontend
+                            .emit(FrontendEvent::ThinkingBlock {
+                                content: content.clone(),
+                                signature: signature.clone(),
+                            })
+                            .await;
                         content_blocks.push(ContentBlock::Thinking {
-                            thinking: std::mem::take(&mut current_thinking),
+                            thinking: content,
                             signature,
                         });
                     }
                 }
                 StreamEvent::TextDelta(text) => {
-                    if !renderer.started && spacing.before_text() && !self.is_silent() {
-                        eprintln!();
-                    }
                     current_text.push_str(&text);
-                    renderer.push_delta(&text)?;
+                    self.frontend
+                        .emit(FrontendEvent::AssistantTextDelta(text))
+                        .await;
                 }
                 StreamEvent::ToolUseStart { id, name } => {
-                    // Flush any accumulated text
                     if !current_text.is_empty() {
                         content_blocks.push(ContentBlock::Text {
                             text: std::mem::take(&mut current_text),
@@ -641,17 +762,18 @@ impl Agent {
                     current_tool_input_json.push_str(&delta);
                 }
                 StreamEvent::ToolUseEnd { input } => {
-                    renderer.finish()?;
-                    if spacing.before_tool_indicator() && !self.is_silent() {
-                        eprintln!();
-                    }
                     let schema = self
                         .tool_registry
                         .get(&current_tool_name)
                         .map(|t| t.definition().parameters);
-                    if !self.is_silent() {
-                        render::render_tool_indicator(&current_tool_name, &input, schema.as_ref());
-                    }
+                    self.frontend
+                        .emit(FrontendEvent::ToolCallStarted {
+                            id: current_tool_id.clone(),
+                            name: current_tool_name.clone(),
+                            input: input.clone(),
+                            schema,
+                        })
+                        .await;
 
                     content_blocks.push(ContentBlock::ToolUse {
                         id: std::mem::take(&mut current_tool_id),
@@ -668,10 +790,6 @@ impl Agent {
                     // marker and surfaces an error back to the model
                     // rather than running the tool on a silently-empty
                     // argument object.
-                    renderer.finish()?;
-                    if spacing.before_tool_indicator() && !self.is_silent() {
-                        eprintln!();
-                    }
                     let marker_input = serde_json::json!({
                         crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
                     });
@@ -679,9 +797,14 @@ impl Agent {
                         .tool_registry
                         .get(&name)
                         .map(|t| t.definition().parameters);
-                    if !self.is_silent() {
-                        render::render_tool_indicator(&name, &marker_input, schema.as_ref());
-                    }
+                    self.frontend
+                        .emit(FrontendEvent::ToolCallStarted {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: marker_input.clone(),
+                            schema,
+                        })
+                        .await;
                     content_blocks.push(ContentBlock::ToolUse {
                         id,
                         name,
@@ -700,18 +823,20 @@ impl Agent {
                     token_usage = usage;
                 }
                 StreamEvent::Error(error) => {
+                    // Treat as terminal: if the worker emits Error
+                    // then closes the channel with Ok(()), a
+                    // log-and-continue would silently truncate the
+                    // turn to EndTurn.
                     tracing::error!("stream error: {}", error);
+                    return Err(crate::error::AgshError::Provider(error));
                 }
             }
         }
 
-        // Flush remaining text
         if !current_text.is_empty() {
             content_blocks.push(ContentBlock::Text { text: current_text });
         }
-        renderer.finish()?;
 
-        // Wait for the stream task to complete
         match stream_handle.await {
             Ok(Ok(())) => {}
             Ok(Err(AgshError::Interrupted)) => {
@@ -739,39 +864,43 @@ impl Agent {
         &self,
         assistant_message: &Message,
         cancellation: CancellationToken,
-        spacing: &mut render::OutputSpacing,
     ) -> Vec<ContentBlock> {
-        // Pass 1 (serial): render indicators in source order and collect the
-        // plan. Rendering must happen before any await so concurrent tool
-        // execution can't interleave indicator lines on stderr.
+        // Emit tool-call indicators in source order. The streaming
+        // path already emitted these as `ToolUseEnd` events; this
+        // loop only fires for the blocking provider path. Serial so
+        // concurrent execution below can't interleave indicators.
         let mut planned: Vec<(String, String, serde_json::Value)> = Vec::new();
         for block in &assistant_message.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                if !self.options.streaming && !self.is_silent() {
-                    if spacing.before_tool_indicator() {
-                        eprintln!();
-                    }
+                if !self.options.streaming {
                     let schema = self
                         .tool_registry
                         .get(name)
                         .map(|t| t.definition().parameters);
-                    render::render_tool_indicator(name, input, schema.as_ref());
+                    self.frontend
+                        .emit(FrontendEvent::ToolCallStarted {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                            schema,
+                        })
+                        .await;
                 }
                 planned.push((id.clone(), name.clone(), input.clone()));
             }
         }
 
-        // Pass 2 (concurrent): dispatch every tool in this assistant message
-        // in parallel. `join_all` preserves the input ordering so the i-th
-        // output corresponds to the i-th planned tool call.
+        // Dispatch concurrently. `join_all` preserves input ordering
+        // so the i-th output corresponds to the i-th planned call.
         let futures = planned.iter().map(|(_, name, input)| {
             self.resolve_and_execute_tool(name.as_str(), input, cancellation.clone())
         });
         let outputs = futures::future::join_all(futures).await;
 
-        // Pass 3 (serial): accumulate scratchpad hints, build ToolResult
-        // blocks in source order, and run the spacing update once after all
-        // tools have settled.
+        // Serial pass to accumulate scratchpad hints, emit per-tool
+        // completion events in source order, build ToolResult blocks,
+        // and emit a single TodoListUpdated event if any todo_write
+        // call landed.
         let mut results = Vec::with_capacity(planned.len());
         let mut todo_write_fired = false;
         for ((id, name, _), output) in planned.into_iter().zip(outputs) {
@@ -781,6 +910,18 @@ impl Agent {
             if let Some(hint) = output.scratchpad_hint.clone() {
                 self.scratchpad_hints.write().await.insert(id.clone(), hint);
             }
+            // Notify the frontend of completion BEFORE building the
+            // ToolResult content block so ACP `tool_call_update`
+            // notifications arrive before the next assistant turn's
+            // text starts streaming.
+            self.frontend
+                .emit(FrontendEvent::ToolCallCompleted {
+                    id: id.clone(),
+                    is_error: output.is_error,
+                    content: output.content.clone(),
+                    metadata: output.frontend_metadata.clone(),
+                })
+                .await;
             results.push(ContentBlock::ToolResult {
                 tool_use_id: id,
                 content: output.content,
@@ -788,7 +929,10 @@ impl Agent {
             });
         }
         if todo_write_fired {
-            spacing.after_todo_list();
+            let items = self.todo_list.read().await.clone();
+            self.frontend
+                .emit(FrontendEvent::TodoListUpdated(items))
+                .await;
         }
 
         results
@@ -840,7 +984,7 @@ impl Agent {
                 .await;
         }
 
-        Self::run_tool(&*tool, input, cancellation).await
+        Self::run_tool(&*tool, input, cancellation, &self.cwd).await
     }
 
     async fn execute_with_approval(
@@ -850,60 +994,53 @@ impl Agent {
         input: &serde_json::Value,
         cancellation: CancellationToken,
     ) -> crate::tools::ToolOutput {
-        let Some(sender) = &self.approval_sender else {
-            return crate::tools::ToolOutput::text(
-                "Ask mode requires interactive shell for tool approval.".to_string(),
-                true,
-            );
-        };
-
-        let (response_sender, response_receiver) = tokio::sync::oneshot::channel::<bool>();
         let schema = tool.definition().parameters;
         let primary_param = crate::render::resolve_primary_param(name, input, Some(&schema));
-        let request = crate::repl::ToolApprovalRequest {
-            tool_name: name.to_string(),
-            primary_param,
-            response_sender,
-        };
-
-        if sender
-            .send(crate::repl::AgentToReplEvent::ApprovalRequest(request))
-            .is_err()
-        {
-            return crate::tools::ToolOutput::text(
-                "Failed to request approval (shell disconnected)".to_string(),
-                true,
-            );
-        }
-
-        // Awaiting the oneshot receiver (rather than a blocking
-        // `SyncReceiver::recv()`) keeps the executor thread free, so multiple
-        // parallel tool calls in Ask mode each suspend cleanly while waiting
-        // for the user's Y/n.
-        match response_receiver.await {
-            Ok(true) => Self::run_tool(tool, input, cancellation).await,
-            Ok(false) => {
+        let outcome = self
+            .frontend
+            .request_permission(PermissionRequest {
+                tool_name: name.to_string(),
+                primary_param,
+                cancellation: cancellation.clone(),
+            })
+            .await;
+        match outcome {
+            PermissionOutcome::Allow => Self::run_tool(tool, input, cancellation, &self.cwd).await,
+            PermissionOutcome::Deny => {
                 crate::tools::ToolOutput::text("User denied tool execution.".to_string(), true)
             }
-            Err(_) => crate::tools::ToolOutput::text(
-                "Failed to receive approval response.".to_string(),
-                true,
-            ),
+            PermissionOutcome::Cancelled => {
+                crate::tools::ToolOutput::text("Approval request was cancelled.".to_string(), true)
+            }
         }
     }
 
+    /// Invoke a tool, scoping the per-session cwd into a task-local
+    /// so any MCP `roots/list` callback fired during the call sees
+    /// this session's cwd (rather than the process default seeded
+    /// on [`crate::mcp::McpClientContext`] at startup). Built-in
+    /// tools ignore the task-local — they read cwd directly from
+    /// their own `SharedCwd` field — so the wrap is cheap on those
+    /// paths.
     async fn run_tool(
         tool: &dyn crate::tools::Tool,
         input: &serde_json::Value,
         cancellation: CancellationToken,
+        cwd: &SharedCwd,
     ) -> crate::tools::ToolOutput {
-        match tool.execute(input.clone(), cancellation).await {
-            Ok(output) => output,
-            Err(AgshError::Interrupted) => {
-                crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
+        let input = input.clone();
+        crate::mcp::with_session_cwd(cwd.clone(), async move {
+            match tool.execute(input, cancellation).await {
+                Ok(output) => output,
+                Err(AgshError::Interrupted) => {
+                    crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
+                }
+                Err(error) => {
+                    crate::tools::ToolOutput::text(format!("Tool error: {}", error), true)
+                }
             }
-            Err(error) => crate::tools::ToolOutput::text(format!("Tool error: {}", error), true),
-        }
+        })
+        .await
     }
 
     pub async fn compact_session(
@@ -1057,7 +1194,7 @@ impl Agent {
             .list_tool_outputs(session_id)
             .await
             .unwrap_or_default();
-        context::build_post_compact_context(permission, &todos, &entries)
+        context::build_post_compact_context(permission, &todos, &entries, &cwd_snapshot(&self.cwd))
     }
 }
 
@@ -1192,6 +1329,34 @@ mod tests {
                 is_error: false,
             }],
         }
+    }
+
+    #[test]
+    fn test_resolve_against_cwd_passes_absolute_paths_through() {
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/home/agent")));
+        let absolute = std::path::Path::new("/etc/hosts");
+        let resolved = resolve_against_cwd(&cwd, absolute);
+        assert_eq!(resolved, PathBuf::from("/etc/hosts"));
+    }
+
+    #[test]
+    fn test_resolve_against_cwd_joins_relative_paths_to_session_cwd() {
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/home/agent/project")));
+        let resolved = resolve_against_cwd(&cwd, "src/main.rs");
+        assert_eq!(resolved, PathBuf::from("/home/agent/project/src/main.rs"));
+    }
+
+    #[test]
+    fn test_resolve_against_cwd_follows_subsequent_writes() {
+        // Confirms multiple sessions in one process would observe their
+        // own cwds: a write to the shared lock is visible on the next
+        // resolve, without touching process cwd.
+        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/tmp/a")));
+        let first = resolve_against_cwd(&cwd, "foo.txt");
+        *cwd.write().expect("cwd lock") = PathBuf::from("/tmp/b");
+        let second = resolve_against_cwd(&cwd, "foo.txt");
+        assert_eq!(first, PathBuf::from("/tmp/a/foo.txt"));
+        assert_eq!(second, PathBuf::from("/tmp/b/foo.txt"));
     }
 
     #[test]

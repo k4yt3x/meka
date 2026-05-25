@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `agsh acp` lets editors that speak the Agent Client Protocol run agsh as their backing agent.
+- A single `agsh acp` process hosts multiple editor sessions in parallel with independent state.
+- File and shell tools flow through the editor's apply-diff UI and hosted terminal when supported.
+- Installed skills appear in the editor's slash-command palette and run as the next prompt.
+- Editor-side cancel, mode switch, and session close take effect promptly, even mid-turn.
+- New `[agent].max_turn_requests` config caps tool rounds per turn (default 100).
+- Model refusals now surface as a distinct `refusal` stop reason instead of a generic error.
+
 ## [0.26.2] - 2026-05-22
 
 ### Added

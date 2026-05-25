@@ -128,13 +128,11 @@ pub enum WarnContext {
 /// Emit any relevant sandbox warnings for the configured backend
 /// state.
 ///
-/// * **Warn 1** (backend unavailable): probe failed and `sandbox =
-///   true`. Read-mode shell commands will hard-error at use time, so
-///   we tell the user up front. Re-emitted at every lifecycle
+/// * **Warn 1** (backend unavailable): probe failed and `sandbox = true`. Read-mode shell commands
+///   will hard-error at use time, so we tell the user up front. Re-emitted at every lifecycle
 ///   boundary.
-/// * **Warn 2** (could be stronger): the user has not pinned a
-///   backend and we auto-resolved to landlock because bubblewrap
-///   wasn't usable. Nudges them once toward installing bwrap, with an
+/// * **Warn 2** (could be stronger): the user has not pinned a backend and we auto-resolved to
+///   landlock because bubblewrap wasn't usable. Nudges them once toward installing bwrap, with an
 ///   explicit escape hatch (pin landlock to suppress). Startup only.
 pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
     if !state.enabled {
@@ -303,8 +301,7 @@ fn bwrap_on_path() -> Option<std::path::PathBuf> {
 /// though production keeps the host network namespace.
 #[cfg(target_os = "linux")]
 fn smoke_test_bwrap(bwrap_path: &std::path::Path, timeout: std::time::Duration) -> SmokeResult {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
+    use std::{io::Read, os::fd::AsRawFd};
 
     let mut child = match std::process::Command::new(bwrap_path)
         .args([
@@ -655,16 +652,14 @@ pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 /// policy), which is itself inspired by Chrome's renderer sandbox.
 ///
 /// Threat-model parity with Linux Bubblewrap:
-/// - Filesystem read-only — `(deny default)` denies writes; only `/dev/null`
-///   and PTY device nodes get write access for legitimate shell behavior.
-/// - IPC mutation blocked — `mach-lookup` is denied by default; only a
-///   curated allow-list of safe Mach services is whitelisted. Mutation
-///   services (`com.apple.launchd`, `com.apple.pasteboard.1`,
-///   `com.apple.launchservicesd`, the cfprefsd *write* path via
+/// - Filesystem read-only — `(deny default)` denies writes; only `/dev/null` and PTY device nodes
+///   get write access for legitimate shell behavior.
+/// - IPC mutation blocked — `mach-lookup` is denied by default; only a curated allow-list of safe
+///   Mach services is whitelisted. Mutation services (`com.apple.launchd`,
+///   `com.apple.pasteboard.1`, `com.apple.launchservicesd`, the cfprefsd *write* path via
 ///   `user-preference-write`) are NOT in the allow-list.
-/// - Network allowed — outbound BSD sockets, DNS resolution, TLS trust
-///   evaluation, and proxy/network configuration reads are explicitly
-///   permitted.
+/// - Network allowed — outbound BSD sockets, DNS resolution, TLS trust evaluation, and
+///   proxy/network configuration reads are explicitly permitted.
 #[cfg(target_os = "macos")]
 pub const SANDBOX_PROFILE_READONLY: &str = r#"
 ; Vendored from Codex (Apache 2.0 License):
@@ -1097,40 +1092,43 @@ pub use windows_impl::spawn_low_integrity_command;
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
-    use std::fs::File;
-    use std::mem;
-    use std::os::windows::io::FromRawHandle;
-    use std::os::windows::process::ExitStatusExt;
-    use std::process::ExitStatus;
-    use std::ptr;
+    use std::{
+        fs::File,
+        mem,
+        os::windows::{io::FromRawHandle, process::ExitStatusExt},
+        process::ExitStatus,
+        ptr,
+    };
 
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_PRIVILEGE_NOT_HELD, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
-        INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, TRUE, WAIT_OBJECT_0,
-    };
-    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
-    use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, DuplicateTokenEx, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
-        SecurityAnonymous, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES,
-        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-        TokenIntegrityLevel, TokenPrimary,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
-    };
-    use windows_sys::Win32::System::Pipes::CreatePipe;
-    use windows_sys::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-        CreateProcessWithTokenW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-        GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-        LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
-        TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, ERROR_PRIVILEGE_NOT_HELD, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
+            INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, TRUE, WAIT_OBJECT_0,
+        },
+        Security::{
+            AdjustTokenPrivileges, Authorization::ConvertStringSidToSidW, DuplicateTokenEx,
+            SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SecurityAnonymous, SetTokenInformation,
+            TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+            TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
+        },
+        Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+            },
+            Pipes::CreatePipe,
+            Threading::{
+                CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+                CreateProcessAsUserW, CreateProcessWithTokenW, DeleteProcThreadAttributeList,
+                EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+                InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread,
+                STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+                UpdateProcThreadAttribute, WaitForSingleObject,
+            },
+        },
     };
 
     // SE_GROUP_INTEGRITY isn't exported by the `Win32_Security` feature in
@@ -1285,9 +1283,8 @@ mod windows_impl {
         // Pipe handles transfer ownership into the spawned child (for the
         // write ends) or into the returned `File` (for the read ends).
         unsafe {
-            // 1. Open our own process token and duplicate it as a primary
-            //    token we can modify. The duplicate is what we'll drop to
-            //    Low integrity — we must NOT mutate our own token.
+            // 1. Open our own process token and duplicate it as a primary token we can modify. The
+            //    duplicate is what we'll drop to Low integrity — we must NOT mutate our own token.
             let mut self_token: HANDLE = ptr::null_mut();
             if OpenProcessToken(
                 GetCurrentProcess(),
@@ -1322,13 +1319,12 @@ mod windows_impl {
             }
             let low_token = OwnedHandle(low_token);
 
-            // 2. Strip all privileges from the duplicate before anything
-            //    else touches it. Integrity-level enforcement already makes
-            //    most privileges inert against Medium+ resources, but
-            //    defense-in-depth: a Low-integrity token that still claims
-            //    (say) `SeShutdownPrivilege` is a sharper edge than one
-            //    that has none at all. Passing DisableAllPrivileges=TRUE
-            //    with a NULL NewState disables every privilege on the token.
+            // 2. Strip all privileges from the duplicate before anything else touches it.
+            //    Integrity-level enforcement already makes most privileges inert against Medium+
+            //    resources, but defense-in-depth: a Low-integrity token that still claims (say)
+            //    `SeShutdownPrivilege` is a sharper edge than one that has none at all. Passing
+            //    DisableAllPrivileges=TRUE with a NULL NewState disables every privilege on the
+            //    token.
             if AdjustTokenPrivileges(
                 low_token.as_raw(),
                 TRUE,
@@ -1341,9 +1337,9 @@ mod windows_impl {
                 return Err(std::io::Error::last_os_error());
             }
 
-            // 3. Build the Low-integrity SID via ConvertStringSidToSidW and
-            //    point a TOKEN_MANDATORY_LABEL at it. The SID buffer is
-            //    allocated by the OS and must be released via LocalFree.
+            // 3. Build the Low-integrity SID via ConvertStringSidToSidW and point a
+            //    TOKEN_MANDATORY_LABEL at it. The SID buffer is allocated by the OS and must be
+            //    released via LocalFree.
             let sid_str: Vec<u16> = "S-1-16-4096\0".encode_utf16().collect();
             let mut low_sid: *mut core::ffi::c_void = ptr::null_mut();
             if ConvertStringSidToSidW(sid_str.as_ptr(), &mut low_sid) == 0 {
@@ -1368,14 +1364,12 @@ mod windows_impl {
                 return Err(std::io::Error::last_os_error());
             }
 
-            // 4. Create two anonymous pipes with **non-inheritable** handles.
-            //    We use `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (step 6) to
-            //    narrow inheritance to exactly the three handles our child
-            //    needs — the inherit flag is only flipped to TRUE briefly
-            //    on those three handles, not the read ends, which eliminates
-            //    the classic CreatePipe→SetHandleInformation→CreateProcess
-            //    race where a concurrent CreateProcess in the same process
-            //    could leak the read ends to an unrelated child.
+            // 4. Create two anonymous pipes with **non-inheritable** handles. We use
+            //    `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (step 6) to narrow inheritance to exactly the
+            //    three handles our child needs — the inherit flag is only flipped to TRUE briefly
+            //    on those three handles, not the read ends, which eliminates the classic
+            //    CreatePipe→SetHandleInformation→CreateProcess race where a concurrent
+            //    CreateProcess in the same process could leak the read ends to an unrelated child.
             let sa_noninherit = SECURITY_ATTRIBUTES {
                 nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: ptr::null_mut(),
@@ -1385,13 +1379,13 @@ mod windows_impl {
             let (stdout_read, stdout_write) = create_pipe(&sa_noninherit)?;
             let (stderr_read, stderr_write) = create_pipe(&sa_noninherit)?;
 
-            // 5. Open NUL as the child's stdin. Non-inheritable; inherit
-            //    flag flipped on just before CreateProcess.
+            // 5. Open NUL as the child's stdin. Non-inheritable; inherit flag flipped on just
+            //    before CreateProcess.
             let nul_stdin = open_nul_read(&sa_noninherit)?;
 
             // 6. Promote the three child-bound handles to inheritable. The
-            //    PROC_THREAD_ATTRIBUTE_HANDLE_LIST filter (step 7) requires
-            //    each listed handle to have HANDLE_FLAG_INHERIT set.
+            //    PROC_THREAD_ATTRIBUTE_HANDLE_LIST filter (step 7) requires each listed handle to
+            //    have HANDLE_FLAG_INHERIT set.
             if SetHandleInformation(
                 stdout_write.as_raw(),
                 HANDLE_FLAG_INHERIT,
@@ -1411,10 +1405,9 @@ mod windows_impl {
                 return Err(std::io::Error::last_os_error());
             }
 
-            // 7. Build a STARTUPINFOEXW with PROC_THREAD_ATTRIBUTE_HANDLE_LIST
-            //    naming exactly the three handles we want the child to see.
-            //    With bInheritHandles=TRUE and EXTENDED_STARTUPINFO_PRESENT,
-            //    the child inherits *only* the listed handles even if
+            // 7. Build a STARTUPINFOEXW with PROC_THREAD_ATTRIBUTE_HANDLE_LIST naming exactly the
+            //    three handles we want the child to see. With bInheritHandles=TRUE and
+            //    EXTENDED_STARTUPINFO_PRESENT, the child inherits *only* the listed handles even if
             //    other inheritable handles exist in this process.
             let child_handles: [HANDLE; 3] = [
                 nul_stdin.as_raw(),
@@ -1433,18 +1426,16 @@ mod windows_impl {
 
             let mut proc_info: PROCESS_INFORMATION = mem::zeroed();
 
-            // 8. Create a Job Object with `KILL_ON_JOB_CLOSE` BEFORE spawning,
-            //    so the child can be assigned to it while still suspended.
-            //    When `SandboxedChild` drops, the job handle drops too — that
-            //    automatic close cascades to every assigned process,
-            //    eliminating grandchild leaks on normal exit, kill, or panic.
+            // 8. Create a Job Object with `KILL_ON_JOB_CLOSE` BEFORE spawning, so the child can be
+            //    assigned to it while still suspended. When `SandboxedChild` drops, the job handle
+            //    drops too — that automatic close cascades to every assigned process, eliminating
+            //    grandchild leaks on normal exit, kill, or panic.
             let job = create_kill_on_close_job()?;
 
-            // 9. Spawn SUSPENDED. We assign the child to the job before any
-            //    of its code runs; otherwise the child could spawn a
-            //    grandchild outside the job in the gap between create and
-            //    assign. With `CREATE_SUSPENDED` set, the main thread is
-            //    created suspended and we manually resume it after assignment.
+            // 9. Spawn SUSPENDED. We assign the child to the job before any of its code runs;
+            //    otherwise the child could spawn a grandchild outside the job in the gap between
+            //    create and assign. With `CREATE_SUSPENDED` set, the main thread is created
+            //    suspended and we manually resume it after assignment.
             let spawn_result = create_process_low_integrity(
                 low_token.as_raw(),
                 &cmd_line,

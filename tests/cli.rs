@@ -34,7 +34,7 @@ fn help_flag_lists_subcommands() {
     let output = agsh().arg("--help").output().expect("failed to spawn agsh");
     assert!(output.status.success(), "agsh --help exited non-zero");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in ["setup", "export", "delete", "list"] {
+    for expected in ["setup", "export", "delete", "list", "acp"] {
         assert!(
             stdout.contains(expected),
             "--help output missing subcommand '{}':\n{}",
@@ -42,6 +42,30 @@ fn help_flag_lists_subcommands() {
             stdout
         );
     }
+}
+
+#[test]
+fn acp_subcommand_help_describes_protocol() {
+    // Verifies the `acp` subcommand is wired up. Full JSON-RPC
+    // handshake coverage lives in `tests/acp.rs` against the
+    // mock-provider build; this smoke test stops at `--help`.
+    let output = agsh()
+        .args(["acp", "--help"])
+        .output()
+        .expect("failed to spawn agsh acp --help");
+    assert!(
+        output.status.success(),
+        "agsh acp --help exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ACP")
+            || stdout.contains("Agent Client Protocol")
+            || stdout.contains("stdio"),
+        "agsh acp --help should mention the protocol or transport:\n{}",
+        stdout,
+    );
 }
 
 #[test]
@@ -103,16 +127,13 @@ fn mcp_add_http_positional_url_persists_server() {
     // the test hermetic — we just want to confirm `add` wrote the
     // entry, not that we can drive an end-to-end OAuth flow.
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = run_isolated(
-        dir.path(),
-        &[
-            "mcp",
-            "add",
-            "notion",
-            "https://mcp.notion.com/mcp",
-            "--no-login",
-        ],
-    );
+    let output = run_isolated(dir.path(), &[
+        "mcp",
+        "add",
+        "notion",
+        "https://mcp.notion.com/mcp",
+        "--no-login",
+    ]);
     assert!(
         output.status.success(),
         "agsh mcp add failed: {}\n{}",
@@ -133,17 +154,14 @@ fn mcp_add_http_positional_url_persists_server() {
 #[test]
 fn mcp_add_stdio_positional_command_and_args() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = run_isolated(
-        dir.path(),
-        &[
-            "mcp",
-            "add",
-            "pg",
-            "npx",
-            "-y",
-            "@modelcontextprotocol/server-postgres",
-        ],
-    );
+    let output = run_isolated(dir.path(), &[
+        "mcp",
+        "add",
+        "pg",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+    ]);
     assert!(
         output.status.success(),
         "stdio add should succeed: {}",
@@ -164,10 +182,14 @@ fn mcp_add_stdio_positional_command_and_args() {
 #[test]
 fn mcp_disable_sets_disabled_flag() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let add = run_isolated(
-        dir.path(),
-        &["mcp", "add", "flaky", "npx", "-y", "mcp-flaky"],
-    );
+    let add = run_isolated(dir.path(), &[
+        "mcp",
+        "add",
+        "flaky",
+        "npx",
+        "-y",
+        "mcp-flaky",
+    ]);
     assert!(
         add.status.success(),
         "add: {}",
@@ -206,17 +228,14 @@ fn mcp_disable_sets_disabled_flag() {
 #[test]
 fn mcp_add_with_disabled_flag_persists() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = run_isolated(
-        dir.path(),
-        &[
-            "mcp",
-            "add",
-            "staging",
-            "https://mcp.example.com/mcp",
-            "--no-login",
-            "--disabled",
-        ],
-    );
+    let output = run_isolated(dir.path(), &[
+        "mcp",
+        "add",
+        "staging",
+        "https://mcp.example.com/mcp",
+        "--no-login",
+        "--disabled",
+    ]);
     assert!(
         output.status.success(),
         "add --disabled: {}",
@@ -256,17 +275,14 @@ fn mcp_add_no_login_prints_skip_hint_when_probe_says_auth_required() {
     // info level — default filter is `warn`, so we pass `-v` to lift
     // the floor and read the message from stderr.
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = run_isolated(
-        dir.path(),
-        &[
-            "-v",
-            "mcp",
-            "add",
-            "notion",
-            "https://mcp.notion.com/mcp",
-            "--no-login",
-        ],
-    );
+    let output = run_isolated(dir.path(), &[
+        "-v",
+        "mcp",
+        "add",
+        "notion",
+        "https://mcp.notion.com/mcp",
+        "--no-login",
+    ]);
     assert!(
         output.status.success(),
         "mcp add should succeed even when probe says auth required: {}",
@@ -293,8 +309,10 @@ fn mcp_add_rollback_on_sigint_during_auto_login() {
     // --no-login against a server that requires auth, wait until the
     // auto-login is clearly in progress, send SIGINT, then confirm
     // nothing remains in config.toml.
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
+    use std::{
+        io::{BufRead, BufReader},
+        process::Stdio,
+    };
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut child = agsh()
@@ -391,18 +409,15 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Rejection path: missing '=' in --tool-permission.
-    let bad = run_isolated(
-        dir.path(),
-        &[
-            "mcp",
-            "add",
-            "broken",
-            "https://mcp.example.com/mcp",
-            "--no-login",
-            "--tool-permission",
-            "just-a-name",
-        ],
-    );
+    let bad = run_isolated(dir.path(), &[
+        "mcp",
+        "add",
+        "broken",
+        "https://mcp.example.com/mcp",
+        "--no-login",
+        "--tool-permission",
+        "just-a-name",
+    ]);
     assert!(
         !bad.status.success(),
         "bad --tool-permission should reject: {}",
@@ -410,26 +425,23 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
     );
 
     // Happy path: all three fields populate correctly.
-    let output = run_isolated(
-        dir.path(),
-        &[
-            "mcp",
-            "add",
-            "notion",
-            "https://mcp.notion.com/mcp",
-            "--no-login",
-            "--allow-tool",
-            "notion-search",
-            "--allow-tool",
-            "notion-fetch",
-            "--disable-tool",
-            "notion-delete-pages",
-            "--tool-permission",
-            "notion-create-pages=write",
-            "--tool-permission",
-            "notion-update-page=write",
-        ],
-    );
+    let output = run_isolated(dir.path(), &[
+        "mcp",
+        "add",
+        "notion",
+        "https://mcp.notion.com/mcp",
+        "--no-login",
+        "--allow-tool",
+        "notion-search",
+        "--allow-tool",
+        "notion-fetch",
+        "--disable-tool",
+        "notion-delete-pages",
+        "--tool-permission",
+        "notion-create-pages=write",
+        "--tool-permission",
+        "notion-update-page=write",
+    ]);
     assert!(
         output.status.success(),
         "mcp add should succeed: {}",
@@ -470,22 +482,19 @@ fn mcp_add_tool_filter_and_permission_flags_round_trip() {
 #[test]
 fn mcp_add_oauth_writes_auth_block() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = run_isolated(
-        dir.path(),
-        &[
-            "mcp",
-            "add",
-            "notion",
-            "https://mcp.notion.com/mcp",
-            "--auth",
-            "oauth",
-            "--scope",
-            "read",
-            "--scope",
-            "write",
-            "--no-login",
-        ],
-    );
+    let output = run_isolated(dir.path(), &[
+        "mcp",
+        "add",
+        "notion",
+        "https://mcp.notion.com/mcp",
+        "--auth",
+        "oauth",
+        "--scope",
+        "read",
+        "--scope",
+        "write",
+        "--no-login",
+    ]);
     assert!(
         output.status.success(),
         "oauth add should succeed: {}",

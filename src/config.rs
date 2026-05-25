@@ -2,15 +2,19 @@
 //! and environment variables on top, and produces a [`ResolvedConfig`] that
 //! the rest of the binary consumes.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
-use crate::cli::Cli;
-use crate::permission::{EnabledPermissions, Permission};
-use crate::provider::AuthCredential;
-use crate::render::RenderMode;
+use crate::{
+    cli::Cli,
+    permission::{EnabledPermissions, Permission},
+    provider::AuthCredential,
+    render::RenderMode,
+};
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes
 /// into its own sub-struct; missing sections fall back to `Default`. This is
@@ -28,6 +32,16 @@ pub struct ConfigFile {
     pub prompt: Option<PromptConfig>,
     pub tools: Option<ToolsConfig>,
     pub permissions: Option<PermissionsConfig>,
+    pub agent: Option<AgentConfig>,
+}
+
+/// `[agent]` table: agent-loop knobs that don't belong to any of the
+/// other domain-specific sections. Currently only `max_turn_requests`.
+#[derive(Debug, Deserialize, Default)]
+pub struct AgentConfig {
+    /// Cap on provider requests per turn. Surfaces as ACP
+    /// `max_turn_requests` stop reason when exceeded. Default 100.
+    pub max_turn_requests: Option<usize>,
 }
 
 /// `[permissions]` table: choose which modes are reachable at runtime
@@ -434,6 +448,11 @@ pub struct ResolvedConfig {
     pub permission: Permission,
     pub enabled_permissions: EnabledPermissions,
     pub streaming: bool,
+    /// Cap on provider requests per turn. When the agent loop makes
+    /// this many calls without finishing, the turn resolves as the
+    /// ACP `max_turn_requests` stop reason. Defaults to 100 — generous
+    /// for legitimate tool chains, low enough to bound a runaway model.
+    pub max_turn_requests: usize,
     pub continue_session: Option<String>,
     pub prompt: Option<String>,
     pub oneshot: bool,
@@ -1095,6 +1114,11 @@ impl ResolvedConfig {
             permission,
             enabled_permissions,
             streaming: !cli.no_stream,
+            max_turn_requests: config_file
+                .agent
+                .as_ref()
+                .and_then(|a| a.max_turn_requests)
+                .unwrap_or(100),
             continue_session: cli.continue_session.clone(),
             prompt: cli.prompt.clone(),
             oneshot: cli.oneshot,

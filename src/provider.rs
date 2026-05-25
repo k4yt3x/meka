@@ -3,20 +3,27 @@
 //! a concrete Claude or OpenAI-compatible implementation.
 
 mod claude;
+/// Scripted provider used by the ACP integration test. Available in
+/// debug builds only — release builds don't pay the binary-size cost.
+/// Activated by the `AGSH_ACP_MOCK_PROVIDER` env var inside
+/// `acp::run_acp`; never reachable from production paths otherwise.
+#[cfg(debug_assertions)]
+pub(crate) mod mock;
 pub(crate) mod openai;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+pub use claude::{ClaudeApiProvider, ClaudeOAuthProvider};
+pub use openai::{OpenAiCodexProvider, OpenAiProvider};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{AgshError, Result};
-use crate::session::TokenStore;
-
-pub use claude::{ClaudeApiProvider, ClaudeOAuthProvider};
-pub use openai::{OpenAiCodexProvider, OpenAiProvider};
+use crate::{
+    error::{AgshError, Result},
+    session::TokenStore,
+};
 
 pub(crate) const DEFAULT_CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
@@ -273,6 +280,11 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// The model declined to comply with the request. Claude's API
+    /// surfaces this as `stop_reason: "refusal"`; OpenAI's responses
+    /// API has the equivalent. The string carries the model's
+    /// refusal text when the provider includes one — empty otherwise.
+    Refusal(String),
     Unknown(String),
 }
 
@@ -587,14 +599,11 @@ mod tests {
     #[tokio::test]
     async fn test_finalize_tool_call_accumulators_rejects_invalid_json() {
         let mut accumulators = std::collections::HashMap::new();
-        accumulators.insert(
-            0,
-            ToolCallAccumulator {
-                id: "call-1".to_string(),
-                name: "read_file".to_string(),
-                arguments: "{not json".to_string(),
-            },
-        );
+        accumulators.insert(0, ToolCallAccumulator {
+            id: "call-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{not json".to_string(),
+        });
 
         let (sender, mut receiver) = mpsc::channel::<StreamEvent>(16);
         let has_tools = finalize_tool_call_accumulators(&mut accumulators, &sender).await;
@@ -626,14 +635,11 @@ mod tests {
     #[tokio::test]
     async fn test_finalize_tool_call_accumulators_passes_valid_json() {
         let mut accumulators = std::collections::HashMap::new();
-        accumulators.insert(
-            0,
-            ToolCallAccumulator {
-                id: "call-2".to_string(),
-                name: "read_file".to_string(),
-                arguments: r#"{"path": "/tmp/x"}"#.to_string(),
-            },
-        );
+        accumulators.insert(0, ToolCallAccumulator {
+            id: "call-2".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path": "/tmp/x"}"#.to_string(),
+        });
 
         let (sender, mut receiver) = mpsc::channel::<StreamEvent>(16);
         finalize_tool_call_accumulators(&mut accumulators, &sender).await;

@@ -4,8 +4,10 @@
 
 use tokio::process::Command;
 
-use crate::config::McpServerConfig;
-use crate::error::{AgshError, Result};
+use crate::{
+    config::McpServerConfig,
+    error::{AgshError, Result},
+};
 
 /// Build a [`Command`] for a stdio MCP server, wrapping shell shims in
 /// `cmd /c` on Windows so `npx`, `*.cmd`, and `*.bat` executables can be
@@ -223,8 +225,9 @@ fn parse_header_lines(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::ffi::OsStr;
+
+    use super::*;
 
     #[test]
     fn parse_header_lines_basic() {
@@ -283,9 +286,10 @@ mod tests {
         let std_cmd = cmd.as_std();
         assert_eq!(std_cmd.get_program(), OsStr::new("cmd"));
         let collected: Vec<_> = std_cmd.get_args().collect();
-        assert_eq!(
-            collected,
-            vec![OsStr::new("/c"), OsStr::new("npx"), OsStr::new("my-pkg")]
-        );
+        assert_eq!(collected, vec![
+            OsStr::new("/c"),
+            OsStr::new("npx"),
+            OsStr::new("my-pkg")
+        ]);
     }
 }

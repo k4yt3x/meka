@@ -12,8 +12,10 @@
 //! stderr so the non-interactive paths (`agsh export`, `agsh list`, etc.)
 //! and the pre-REPL startup window still see logs.
 
-use std::io::{self, Write};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::{
+    io::{self, Write},
+    sync::{Arc, LazyLock, RwLock},
+};
 
 use reedline::ExternalPrinter;
 use tracing_subscriber::fmt::MakeWriter;

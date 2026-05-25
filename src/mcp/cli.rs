@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
-use crate::config::{McpAuthConfig, McpServerConfig, McpTransport};
-use crate::error::{AgshError, Result};
-use crate::mcp::{McpClientContext, McpClientManager};
-use crate::session::TokenStore;
+use crate::{
+    config::{McpAuthConfig, McpServerConfig, McpTransport},
+    error::{AgshError, Result},
+    mcp::{McpClientContext, McpClientManager},
+    session::TokenStore,
+};
 
 fn config_err(message: impl Into<String>) -> AgshError {
     AgshError::Config(message.into())
@@ -102,13 +104,10 @@ pub async fn run_get(servers: &[McpServerConfig], name: &str) -> Result<()> {
         .find(|c| c.name == name)
         .ok_or_else(|| config_err(format!("no MCP server named '{}'", name)))?;
     println!("name:        {}", config.name);
-    println!(
-        "transport:   {}",
-        match config.transport {
-            McpTransport::Stdio => "stdio",
-            McpTransport::Http => "http",
-        }
-    );
+    println!("transport:   {}", match config.transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Http => "http",
+    });
     println!(
         "permission:  {}",
         config.permission.as_deref().unwrap_or("read")
@@ -184,14 +183,11 @@ pub async fn run_tools(
         Arc::clone(&context),
     )
     .await?;
-    manager.start_connector(
-        crate::tools::ToolRegistry::new(),
-        crate::mcp::McpRuntimeConfig {
-            connect_timeout: std::time::Duration::from_secs(30),
-            stdio_concurrency: 1,
-            http_concurrency: 1,
-        },
-    );
+    manager.start_connector(crate::mcp::McpRuntimeConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        stdio_concurrency: 1,
+        http_concurrency: 1,
+    });
     manager.await_settled().await;
 
     let connected = if let Some(entry) = manager.server_entry(&config.name) {
@@ -305,14 +301,11 @@ pub async fn run_reconnect(
         Arc::clone(&context),
     )
     .await?;
-    manager.start_connector(
-        crate::tools::ToolRegistry::new(),
-        crate::mcp::McpRuntimeConfig {
-            connect_timeout: std::time::Duration::from_secs(30),
-            stdio_concurrency: 1,
-            http_concurrency: 1,
-        },
-    );
+    manager.start_connector(crate::mcp::McpRuntimeConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        stdio_concurrency: 1,
+        http_concurrency: 1,
+    });
     manager.await_settled().await;
 
     let connected = if let Some(entry) = manager.server_entry(&config.name) {
@@ -421,14 +414,11 @@ pub async fn run_login(
         context,
     )
     .await?;
-    manager.start_connector(
-        crate::tools::ToolRegistry::new(),
-        crate::mcp::McpRuntimeConfig {
-            connect_timeout: std::time::Duration::from_secs(30),
-            stdio_concurrency: 1,
-            http_concurrency: 1,
-        },
-    );
+    manager.start_connector(crate::mcp::McpRuntimeConfig {
+        connect_timeout: std::time::Duration::from_secs(30),
+        stdio_concurrency: 1,
+        http_concurrency: 1,
+    });
     manager.await_settled().await;
 
     let connected = if let Some(entry) = manager.server_entry(&config.name) {
@@ -588,14 +578,12 @@ struct ResolvedAddArgs {
 /// Run `agsh mcp add …`.
 ///
 /// Persists the server into `config.toml`, then for HTTP servers:
-///   1. Probes the endpoint (RFC 6750 / RFC 9728) to see if auth is
-///      required.
-///   2. If the probe says auth is required — or the user explicitly
-///      passed `--auth oauth` — and `--no-login` wasn't set, runs the
-///      OAuth authorization_code flow immediately so the whole setup
-///      is "add + authorise" in a single command.
-///   3. If that OAuth flow fails, rolls back by purging the entry we
-///      just wrote. The CLI exit is non-zero.
+///   1. Probes the endpoint (RFC 6750 / RFC 9728) to see if auth is required.
+///   2. If the probe says auth is required — or the user explicitly passed `--auth oauth` — and
+///      `--no-login` wasn't set, runs the OAuth authorization_code flow immediately so the whole
+///      setup is "add + authorise" in a single command.
+///   3. If that OAuth flow fails, rolls back by purging the entry we just wrote. The CLI exit is
+///      non-zero.
 pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     use crate::mcp::sanitize::{is_reserved_server_name, normalize_server_name};
 

@@ -4,31 +4,36 @@
 //! remote tool list into the `crate::tools` trait so the provider loop
 //! can call them like any other tool.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 use async_trait::async_trait;
-use rmcp::ErrorData as McpError;
-use rmcp::handler::client::ClientHandler;
-use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
-    CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
-    CreateMessageResult, ErrorCode, ListRootsResult, Meta, ProgressNotificationParam, Role, Root,
-    SamplingMessage, SamplingMessageContent, ServerResult,
+use rmcp::{
+    ErrorData as McpError, Peer, RoleClient,
+    handler::client::ClientHandler,
+    model::{
+        CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
+        CreateElicitationRequestParams, CreateElicitationResult, CreateMessageRequestParams,
+        CreateMessageResult, ErrorCode, ListRootsResult, Meta, ProgressNotificationParam, Role,
+        Root, SamplingMessage, SamplingMessageContent, ServerResult,
+    },
+    service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError},
 };
-use rmcp::service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError};
-use rmcp::{Peer, RoleClient};
 use tokio_util::sync::CancellationToken;
 
 use super::{
     ALLOWED_IMAGE_MIME_TYPES, MAX_MCP_IMAGE_BYTES, MCP_SAMPLING_PROVIDER_TIMEOUT, McpClientContext,
     ServerEntry,
 };
-use crate::config::McpServerConfig;
-use crate::error::{AgshError, Result};
-use crate::permission::Permission;
-use crate::provider::ToolDefinition;
-use crate::tools::{Tool, ToolOutput};
+use crate::{
+    config::McpServerConfig,
+    error::{AgshError, Result},
+    permission::Permission,
+    provider::ToolDefinition,
+    tools::{Tool, ToolOutput},
+};
 
 /// Permission for each server to issue sampling requests. Mirrors the
 /// `sampling` / `sampling_limit` fields on `McpServerConfig`.
@@ -81,13 +86,12 @@ impl ClientHandler for AgshClientHandler {
     ) -> impl Future<Output = ()> + Send + '_ {
         let server_name: String = self.server_name.as_ref().to_string();
         let manager = self.context.manager().and_then(|weak| weak.upgrade());
-        let registry = self.context.registry();
 
         async move {
             tracing::info!("MCP server '{}' sent tools/list_changed", server_name);
-            let (Some(manager), Some(registry)) = (manager, registry) else {
+            let Some(manager) = manager else {
                 tracing::debug!(
-                    "tool list refresh skipped — context not yet wired for '{}'",
+                    "tool list refresh skipped — manager not yet wired for '{}'",
                     server_name
                 );
                 return;
@@ -117,9 +121,11 @@ impl ClientHandler for AgshClientHandler {
                         .into_iter()
                         .map(|a| Arc::new(a) as Arc<dyn Tool>)
                         .collect();
-                    registry.replace_server_tools(&server_name, new_tools);
-                    for name in deferred_names {
-                        registry.mark_deferred(&name);
+                    // Routes through every attached registry so all
+                    // active sessions observe the updated tool set.
+                    manager.update_server_tools(&server_name, new_tools).await;
+                    if !deferred_names.is_empty() {
+                        manager.mark_deferred_on_attached(&deferred_names).await;
                     }
                     tracing::info!("MCP server '{}' tool registry refreshed", server_name);
                 }
@@ -208,9 +214,17 @@ impl ClientHandler for AgshClientHandler {
         _context: RequestContext<RoleClient>,
     ) -> impl Future<Output = std::result::Result<ListRootsResult, McpError>> + Send + '_ {
         async move {
-            let cwd = std::env::current_dir().map_err(|error| {
-                McpError::internal_error(format!("current dir unavailable: {}", error), None)
-            })?;
+            // Task-local override wins: when an MCP tool runs inside
+            // `with_session_cwd(session.cwd, …)`, this query reads
+            // that session's cwd. Outside such a scope (connection-
+            // time queries, REPL paths) the process default seeded
+            // on the context applies.
+            let cwd = match self.context.cwd() {
+                Some(default) => crate::mcp::current_roots_cwd(default),
+                None => std::env::current_dir().map_err(|error| {
+                    McpError::internal_error(format!("current dir unavailable: {}", error), None)
+                })?,
+            };
             let uri = url::Url::from_directory_path(&cwd).map_err(|_| {
                 McpError::internal_error(
                     format!("failed to convert {:?} to file:// URL", cwd),
@@ -739,6 +753,7 @@ impl Tool for McpToolAdapter {
                 self.entry.server_name(),
                 self.remote_tool_name
             )),
+            frontend_metadata: None,
         })
     }
 }
