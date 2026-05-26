@@ -182,7 +182,7 @@ impl ClientHandler for AgshClientHandler {
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
         async move {
-            crate::mcp::progress::dispatch(params);
+            crate::mcp::progress::dispatch(params).await;
         }
     }
 
@@ -261,36 +261,48 @@ impl ClientHandler for AgshClientHandler {
                 }
             };
 
-            // 60-second user-response timeout so a distracted user can't stall an MCP tool call
-            // forever. Matches the elicitation deadline used for the ToolApprovalRequest channel in
-            // shell.rs.
-            let (responder, receiver) = std::sync::mpsc::sync_channel::<ElicitationResponse>(1);
             let prompt = ElicitationPrompt {
                 server_name: server.as_ref().to_string(),
                 kind,
                 message,
-                responder,
             };
 
-            if !crate::mcp::elicitation::send_prompt(prompt) {
+            // Correlate the elicitation back to the in-flight call's frontend via the per-server
+            // lookup on the progress registry. When no call from `server` is in flight (the server
+            // elicited outside of a tool call, or the progress guard already dropped), there's no
+            // human to ask — auto-decline matches the safe pre-refactor "no shell sink installed"
+            // behaviour.
+            let frontend = crate::mcp::progress::find_frontend_for_server(server.as_ref());
+            let Some(frontend) = frontend else {
                 tracing::warn!(
-                    "MCP server '{}' requested elicitation but no shell sink is installed; declining",
+                    "MCP server '{}' requested elicitation but no in-flight call's frontend was \
+                     registered; declining",
                     server
                 );
                 return Ok(ElicitationResponse::Decline.into_result());
-            }
+            };
 
-            // Elicitations are standard MCP *requests*, so a `Decline` response IS how the server
-            // learns the user didn't answer — no separate `notifications/cancelled` is appropriate
-            // here (cancellation notifications are for long-running requests we started, not for
-            // server-initiated elicitations).
-            let response = tokio::task::spawn_blocking(move || {
-                receiver
-                    .recv_timeout(std::time::Duration::from_secs(60))
-                    .unwrap_or(ElicitationResponse::Decline)
-            })
+            // 60-second user-response timeout so a distracted user can't stall an MCP tool call
+            // forever. Matches the elicitation deadline used for the ToolApprovalRequest channel in
+            // shell.rs. Elicitations are standard MCP *requests*, so a `Decline` response IS how
+            // the server learns the user didn't answer — no separate `notifications/cancelled` is
+            // appropriate here (cancellation notifications are for long-running requests we
+            // started, not for server-initiated elicitations).
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                frontend.handle_elicitation(prompt),
+            )
             .await
-            .unwrap_or(ElicitationResponse::Decline);
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    tracing::warn!(
+                        "MCP server '{}' elicitation timed out after 60s; declining",
+                        server
+                    );
+                    ElicitationResponse::Decline
+                }
+            };
 
             Ok(response.into_result())
         }
@@ -366,8 +378,17 @@ impl ClientHandler for AgshClientHandler {
             )
             .await;
 
+            // MCP sampling has no user-facing frontend in scope here; provider notices are logged
+            // at info level so they're at least visible with `-v`. Item #5 in the front-end
+            // refactor plan will plumb a per-session frontend through the task-local so this path
+            // can route them too.
             let (assistant_message, _stop_reason, _usage) = match completion {
-                Ok(Ok(result)) => result,
+                Ok(Ok((message, stop_reason, usage, notices))) => {
+                    for notice in notices {
+                        tracing::info!("mcp sampling: provider notice: {}", notice.text);
+                    }
+                    (message, stop_reason, usage)
+                }
                 Ok(Err(error)) => {
                     // Provider returned an error before the timeout elapsed — no quota was really
                     // consumed on our side, so hand the sampling slot back.
@@ -520,11 +541,17 @@ impl McpToolAdapter {
         tool_use_id: Option<String>,
     ) -> std::result::Result<rmcp::model::CallToolResult, ServiceError> {
         // Per-call progress token: allows the server to emit `notifications/progress` updates that
-        // route back to our shell UI.
+        // route back to our shell UI. The frontend snapshot is taken from the task-local installed
+        // by `Agent::run_tool` and stored on the registry entry so the rmcp notification handler
+        // (which runs on a separately-spawned task — see `rmcp::service::spawn_service_task`) can
+        // look it up by token. `None` outside an agent-driven call site falls through to a debug
+        // log in `dispatch`.
+        let frontend_for_progress = crate::mcp::current_session_frontend();
         let (progress_token, _progress_guard) = crate::mcp::progress::register(
             self.entry.server_name().to_string(),
             self.remote_tool_name.clone(),
             tool_use_id.clone(),
+            frontend_for_progress,
         );
         let mut meta = Meta::new();
         meta.set_progress_token(progress_token);

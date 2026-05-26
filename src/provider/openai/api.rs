@@ -280,7 +280,12 @@ impl Provider for OpenAiProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage)> {
+    ) -> Result<(
+        Message,
+        StopReason,
+        TokenUsage,
+        Vec<crate::provider::Notice>,
+    )> {
         let body = self.build_request_body(system_prompt, messages, tools, false);
 
         let response = self
@@ -313,7 +318,8 @@ impl Provider for OpenAiProvider {
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|error| AgshError::Provider(format!("invalid JSON response: {}", error)))?;
 
-        self.parse_non_streaming_response(&response_json)
+        let (message, stop_reason, usage) = self.parse_non_streaming_response(&response_json)?;
+        Ok((message, stop_reason, usage, Vec::new()))
     }
 
     async fn stream(

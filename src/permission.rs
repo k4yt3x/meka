@@ -136,8 +136,11 @@ impl EnabledPermissions {
         ORDER.into_iter().filter(move |&p| self.is_enabled(p))
     }
 
-    /// Lowest-discriminant enabled mode. The constructor guarantees the set is non-empty, so this
-    /// never panics in practice.
+    /// Lowest-discriminant enabled mode. Every constructor ([`Self::from_modes`] returns `None`
+    /// on empty input, [`Self::DEFAULT`] is non-empty by definition) refuses an empty set, so
+    /// `iter().next()` always yields `Some` — the `expect` documents the invariant rather than
+    /// checking it.
+    #[allow(clippy::expect_used)]
     pub fn lowest(self) -> Permission {
         self.iter()
             .next()

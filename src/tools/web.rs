@@ -141,16 +141,23 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
 }
 
 // Static CSS selectors for search result parsing (parsed once, reused on every call).
+// `expect()` is correct here: the selector strings are compile-time literals, so a parse failure
+// would mean we shipped a typo — caught on the first test run, not in production.
+#[allow(clippy::expect_used)]
 static DDG_RESULT: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result").expect("static CSS selector"));
+#[allow(clippy::expect_used)]
 static DDG_LINK: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse("a.result__a").expect("static CSS selector"));
+#[allow(clippy::expect_used)]
 static DDG_URL: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result__url").expect("static CSS selector"));
+#[allow(clippy::expect_used)]
 static DDG_SNIPPET: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result__snippet").expect("static CSS selector"));
 /// DDG's bot-challenge modal uses this id (and also a `data-testid` of the same value). Either
 /// marker being present in the DOM means the endpoint gated us rather than returning results.
+#[allow(clippy::expect_used)]
 static DDG_CAPTCHA: LazyLock<scraper::Selector> = LazyLock::new(|| {
     scraper::Selector::parse("#anomaly-modal, [data-testid=\"anomaly-modal\"]")
         .expect("static CSS selector")
@@ -510,7 +517,10 @@ fn render_snippet(snippet_el: scraper::ElementRef<'_>) -> String {
             Node::Element(element) => {
                 // Collect the inner text and wrap in `**` iff this is a `<b>` or `<strong>`. Other
                 // elements (rare — e.g. `<a>` inside snippets) fall through as plain text so we
-                // don't miss content.
+                // don't miss content. `ElementRef::wrap` returns `Some` for any node whose
+                // `value()` is `Node::Element` — which is exactly the arm we're in, so the
+                // `expect` documents an unconditionally-true invariant rather than a runtime check.
+                #[allow(clippy::expect_used)]
                 let inner_el =
                     scraper::ElementRef::wrap(node).expect("element node wraps element ref");
                 let inner_text: String = inner_el.text().collect();

@@ -22,8 +22,8 @@ use super::shared::{
 use crate::{
     error::{AgshError, Result},
     provider::{
-        AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, Message, Provider, StopReason, StreamEvent,
-        TokenUsage, ToolDefinition,
+        AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, Message, Notice, Provider, StopReason,
+        StreamEvent, TokenUsage, ToolDefinition,
     },
     session::TokenStore,
 };
@@ -402,8 +402,8 @@ impl Provider for ClaudeOAuthProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage)> {
-        let body_json =
+    ) -> Result<(Message, StopReason, TokenUsage, Vec<Notice>)> {
+        let (body_json, redaction_notice) =
             shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
                 serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, false))
                     .map_err(|error| {
@@ -453,7 +453,9 @@ impl Provider for ClaudeOAuthProvider {
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|error| AgshError::Provider(format!("invalid JSON response: {}", error)))?;
 
-        parse_non_streaming_response(&response_json)
+        let (message, stop_reason, usage) = parse_non_streaming_response(&response_json)?;
+        let notices = redaction_notice.into_iter().collect();
+        Ok((message, stop_reason, usage, notices))
     }
 
     async fn stream(
@@ -464,13 +466,20 @@ impl Provider for ClaudeOAuthProvider {
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let body_json =
+        let (body_json, redaction_notice) =
             shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
                 serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, true))
                     .map_err(|error| {
                         AgshError::Provider(format!("failed to serialize body: {}", error))
                     })
             })?;
+        // Surface the redaction notice ahead of any provider text. See the mirror in
+        // `provider/claude/api.rs::stream` for the rationale.
+        if let Some(notice) = redaction_notice
+            && let Err(error) = event_sender.send(StreamEvent::Notice(notice)).await
+        {
+            tracing::debug!("failed to forward redaction notice into stream: {}", error);
+        }
         let body_json = if !system_prompt.is_empty() {
             attestation::patch_request_body(&body_json)?
         } else {

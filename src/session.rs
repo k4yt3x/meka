@@ -1705,6 +1705,9 @@ fn encode_list_cursor(updated_at: &str, id: &str) -> String {
         updated_at: updated_at.to_string(),
         id: id.to_string(),
     };
+    // `ListSessionsCursor` is two owned `String`s; `serde_json::to_vec` on a struct of plain
+    // strings cannot fail. The `expect` documents the invariant.
+    #[allow(clippy::expect_used)]
     let json = serde_json::to_vec(&payload)
         .expect("ListSessionsCursor is two owned Strings; serialization cannot fail");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)

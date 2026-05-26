@@ -491,6 +491,11 @@ impl Tool for GetMcpPromptTool {
     }
 }
 
+// `expect()` on each registration: a collision means two builtins share a name — a coding bug,
+// not a runtime condition. We want the first build to fail loudly rather than silently dropping
+// the second registration. Scoped to this function because the same justification applies to every
+// `.register(...).expect(...)` site below.
+#[allow(clippy::expect_used)]
 pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClientManager>) {
     // Skip registration if no servers are configured — these tools rely on the manager and there's
     // nothing useful to do without at least one.

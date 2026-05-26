@@ -17,7 +17,7 @@ use super::shared::{
 };
 use crate::{
     error::{AgshError, Result},
-    provider::{Message, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
+    provider::{Message, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
 };
 
 pub struct ClaudeApiProvider {
@@ -122,8 +122,8 @@ impl Provider for ClaudeApiProvider {
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage)> {
-        let body_json =
+    ) -> Result<(Message, StopReason, TokenUsage, Vec<Notice>)> {
+        let (body_json, redaction_notice) =
             shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
                 serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, false))
                     .map_err(|error| {
@@ -159,7 +159,9 @@ impl Provider for ClaudeApiProvider {
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|error| AgshError::Provider(format!("invalid JSON response: {}", error)))?;
 
-        parse_non_streaming_response(&response_json)
+        let (message, stop_reason, usage) = parse_non_streaming_response(&response_json)?;
+        let notices = redaction_notice.into_iter().collect();
+        Ok((message, stop_reason, usage, notices))
     }
 
     async fn stream(
@@ -170,13 +172,22 @@ impl Provider for ClaudeApiProvider {
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let body_json =
+        let (body_json, redaction_notice) =
             shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
                 serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, true))
                     .map_err(|error| {
                         AgshError::Provider(format!("failed to serialize body: {}", error))
                     })
             })?;
+        // Surface the redaction notice as the first stream event so the frontend renders it before
+        // any provider text appears. The agent's `run_streaming` translates it to
+        // `FrontendEvent::Notice`. Send-error here means the consumer hung up between this call
+        // and now — `drive_claude_sse_stream` will surface that on its own.
+        if let Some(notice) = redaction_notice
+            && let Err(error) = event_sender.send(StreamEvent::Notice(notice)).await
+        {
+            tracing::debug!("failed to forward redaction notice into stream: {}", error);
+        }
         let body_size_mib = body_json.len() / 1_048_576;
         let request = self
             .apply_headers(

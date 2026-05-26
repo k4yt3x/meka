@@ -1,20 +1,23 @@
 //! MCP `elicitation/create` handling. When a server asks for user input (either a structured form
-//! or a URL-consent flow), we route the request through the shell's existing approval channel so
-//! the TUI can prompt the user. Declines unanswered (or timed-out) requests by default so a
-//! misbehaving server can't stall the session.
-
-use std::sync::{Mutex, OnceLock, mpsc::SyncSender};
+//! or a URL-consent flow), we route the request through the per-session
+//! [`crate::frontend::Frontend`] that initiated the in-flight tool call so the right UI (REPL
+//! prompt, ACP form, etc.) gets to drive the response. The correlation goes through
+//! [`crate::mcp::progress::find_frontend_for_server`] because rmcp dispatches the handler on a
+//! separately-spawned task (see `rmcp::service::spawn_service_task`), so a task-local on the
+//! agent's caller task isn't visible here.
+//!
+//! When no in-flight call from the originating server is registered (the server somehow elicited
+//! outside of a tool call, or the call's progress guard already dropped), the request is auto-
+//! declined — the safe default, matching the pre-refactor "no shell sink installed" behaviour.
 
 use rmcp::model::{CreateElicitationResult, ElicitationAction};
 
-pub type ElicitationSink = Box<dyn Fn(ElicitationPrompt) + Send + Sync + 'static>;
-
-/// User-facing payload the shell renders.
+/// User-facing payload the frontend renders.
+#[derive(Debug)]
 pub struct ElicitationPrompt {
     pub server_name: String,
     pub kind: ElicitationKind,
     pub message: String,
-    pub responder: SyncSender<ElicitationResponse>,
 }
 
 #[derive(Debug)]
@@ -26,7 +29,7 @@ pub enum ElicitationKind {
     Url { url: String },
 }
 
-/// Shell's response back to the MCP handler.
+/// Frontend's response back to the MCP handler.
 #[derive(Debug, Clone)]
 pub enum ElicitationResponse {
     Accept { content: Option<serde_json::Value> },
@@ -56,35 +59,6 @@ impl ElicitationResponse {
     }
 }
 
-/// Callback for forwarding elicitation prompts to the shell. Set once at startup by the agent loop;
-/// if unset (non-interactive mode), elicitation requests are auto-declined.
-static SINK: OnceLock<Mutex<Option<ElicitationSink>>> = OnceLock::new();
-
-fn sink_slot() -> &'static Mutex<Option<ElicitationSink>> {
-    SINK.get_or_init(|| Mutex::new(None))
-}
-
-/// Install the shell sink. Later calls replace the sink, which is useful when the TUI is
-/// re-initialised mid-process.
-pub fn set_shell_sink(sink: Option<ElicitationSink>) {
-    if let Ok(mut guard) = sink_slot().lock() {
-        *guard = sink;
-    }
-}
-
-/// Forward a prompt to the shell. Returns `false` if no sink is installed (caller should
-/// auto-decline).
-pub fn send_prompt(prompt: ElicitationPrompt) -> bool {
-    let Ok(guard) = sink_slot().lock() else {
-        return false;
-    };
-    let Some(sink) = guard.as_ref() else {
-        return false;
-    };
-    sink(prompt);
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,29 +80,5 @@ mod tests {
         .into_result();
         assert!(matches!(result.action, ElicitationAction::Accept));
         assert_eq!(result.content, Some(content));
-    }
-
-    #[test]
-    fn cancel_maps_to_cancel_action_with_no_content() {
-        let result = ElicitationResponse::Cancel.into_result();
-        assert!(matches!(result.action, ElicitationAction::Cancel));
-        assert!(result.content.is_none());
-        assert!(result.meta.is_none());
-    }
-
-    #[test]
-    fn send_prompt_without_sink_returns_false() {
-        // Don't install sink; result should be false (unless a prior test installed one that
-        // outlives this test — OnceLock is not resettable, so be tolerant).
-        let (responder, _rx) = std::sync::mpsc::sync_channel(1);
-        let prompt = ElicitationPrompt {
-            server_name: "srv".into(),
-            kind: ElicitationKind::Url {
-                url: "https://example.com".into(),
-            },
-            message: "msg".into(),
-            responder,
-        };
-        let _ = send_prompt(prompt);
     }
 }

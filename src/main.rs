@@ -5,6 +5,13 @@
 //! SQLite, a [`tools`] registry, an MCP client manager, and a [`repl`] input loop. The [`agent`]
 //! module owns the per-turn loop that streams provider output and dispatches tool calls.
 
+// Production code shouldn't panic on unexpected input — the `Cargo.toml` `[lints.clippy]` block
+// enforces that with `unwrap_used` / `expect_used` / `panic` at warn level (CI promotes warnings to
+// errors). Tests use `.unwrap()` and `.expect()` heavily on purpose: a failed test should panic
+// with a clear message rather than thread `Result` through every fixture. The cfg_attr below scopes
+// the relaxation to test builds only.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 mod acp;
 mod agent;
 mod cli;
@@ -89,11 +96,12 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     let acp_mode = matches!(cli.command, Some(cli::Command::Acp));
 
     // Handle subcommands that don't need full config resolution.
-    if cli.command.is_some() && !acp_mode {
+    if let Some(command) = cli.command.as_ref()
+        && !acp_mode
+    {
         let cli_ref = &cli;
         return runtime.block_on(async move {
             let session_manager = SessionManager::open(None).await?;
-            let command = cli_ref.command.as_ref().expect("checked above");
             match command {
                 cli::Command::Setup => {
                     let token_store = session_manager.token_store();
@@ -190,11 +198,13 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
     {
         return filter;
     }
-    EnvFilter::new(log_level).add_directive(
-        "rmcp::transport::common::client_side_sse=error"
-            .parse()
-            .expect("valid tracing directive"),
-    )
+    // The directive string is a compile-time literal in a known-good shape; `.parse()` failing
+    // would mean we shipped a malformed directive, caught on first test.
+    #[allow(clippy::expect_used)]
+    let directive = "rmcp::transport::common::client_side_sse=error"
+        .parse()
+        .expect("valid tracing directive");
+    EnvFilter::new(log_level).add_directive(directive)
 }
 
 async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Result<()> {
@@ -292,10 +302,12 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
     // Without `--oneshot`, any provided prompt/skill becomes the first-turn input but the REPL
     // stays open afterwards.
     if config.oneshot {
-        let prompt = config
-            .prompt
-            .clone()
-            .expect("validated at startup: --oneshot requires a prompt argument or --skill");
+        // `Cli` validation at startup rejects `--oneshot` without a prompt or `--skill`, so the
+        // `Some` arm is the only reachable one here. `let-else { unreachable!() }` documents the
+        // invariant in code rather than relying on a brittle string-tagged `expect`.
+        let Some(prompt) = config.prompt.clone() else {
+            unreachable!("--oneshot requires a prompt or --skill; rejected by Cli validation");
+        };
         return run_oneshot(
             config,
             session_manager,
@@ -774,7 +786,7 @@ async fn run_oneshot(
     // pre-refactor `None` approval sender.
     let (noninteractive_sender, _) = std::sync::mpsc::channel::<repl::AgentToReplEvent>();
     let oneshot_frontend: Arc<dyn frontend::Frontend> =
-        Arc::new(frontend::ReplFrontend::new(frontend::ReplFrontendConfig {
+        Arc::new(repl::ReplFrontend::new(repl::ReplFrontendConfig {
             render_mode: config.render_mode,
             newline_before_prompt: config.newline_before_prompt,
             newline_after_prompt: config.newline_after_prompt,
@@ -884,6 +896,9 @@ async fn run_interactive(
     // reedline's prompt collides with the agent's output.
     let initial_turn_pending = initial_prompt.is_some();
     if let Some(prompt) = initial_prompt {
+        // Channel was constructed two lines above and the receiver is still live (we own it in
+        // `input_receiver` below) — `send` cannot fail under any runtime condition.
+        #[allow(clippy::expect_used)]
         input_sender
             .send(ReplEvent::UserInput(prompt))
             .expect("freshly created input channel must accept first send");
@@ -893,7 +908,7 @@ async fn run_interactive(
     // The REPL frontend forwards approval requests to the same channel the REPL thread already
     // reads from for `Done` / MCP elicitation / MCP progress events.
     let repl_frontend: Arc<dyn frontend::Frontend> =
-        Arc::new(frontend::ReplFrontend::new(frontend::ReplFrontendConfig {
+        Arc::new(repl::ReplFrontend::new(repl::ReplFrontendConfig {
             render_mode: config.render_mode,
             newline_before_prompt: config.newline_before_prompt,
             newline_after_prompt: config.newline_after_prompt,
@@ -903,28 +918,13 @@ async fn run_interactive(
             agent_event_sender: agent_event_sender.clone(),
         }));
 
-    // Wire progress/elicitation notifications from MCP handlers through the same agent→shell
-    // channel so the REPL can render them inline.
-    {
-        let sender_for_progress = agent_event_sender.clone();
-        mcp::progress::set_ui_sink(Box::new(move |update| {
-            if sender_for_progress
-                .send(repl::AgentToReplEvent::McpProgress(update))
-                .is_err()
-            {
-                tracing::debug!("MCP progress dropped (REPL disconnected)");
-            }
-        }));
-        let sender_for_elicitation = agent_event_sender.clone();
-        mcp::elicitation::set_shell_sink(Some(Box::new(move |prompt| {
-            if sender_for_elicitation
-                .send(repl::AgentToReplEvent::McpElicitation(prompt))
-                .is_err()
-            {
-                tracing::debug!("MCP elicitation dropped (REPL disconnected)");
-            }
-        })));
-    }
+    // MCP progress / elicitation events now flow through the per-session `Frontend` trait, not the
+    // process-global sinks they used to be wired through here. Progress:
+    // `ReplFrontend::emit(McpProgress)` and the matching ACP impl carry the event to the right
+    // UI. Elicitation: `Frontend::handle_elicitation` runs the round-trip on whichever frontend
+    // the in-flight call's `progress::register` recorded. The agent_event_sender is still the
+    // bridge between `ReplFrontend` (on the agent's task) and the blocking REPL thread; that
+    // wiring happens inside `ReplFrontend` itself.
 
     let repl_permission = shared_permission.clone();
     let show_path_in_prompt = config.show_path_in_prompt;

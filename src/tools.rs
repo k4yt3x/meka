@@ -295,7 +295,10 @@ impl ToolRegistry {
     /// registration should log and continue so one bad server can't break startup.
     pub fn register(&self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.definition().name.clone();
-        let mut tools = self.tools.write().expect("tools lock poisoned");
+        let mut tools = self
+            .tools
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if tools.iter().any(|t| t.definition().name == name) {
             return Err(crate::error::AgshError::ToolRegistration {
                 message: format!("tool name '{}' is already registered", name),
@@ -311,7 +314,10 @@ impl ToolRegistry {
     /// set doesn't grow unbounded.
     pub fn replace_server_tools(&self, server_name: &str, new_tools: Vec<Arc<dyn Tool>>) {
         let prefix = format!("mcp__{}__", server_name);
-        let mut tools = self.tools.write().expect("tools lock poisoned");
+        let mut tools = self
+            .tools
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let removed: Vec<String> = tools
             .iter()
             .filter(|t| t.definition().name.starts_with(&prefix))
@@ -322,7 +328,10 @@ impl ToolRegistry {
         drop(tools);
 
         if !removed.is_empty() {
-            let mut deferred = self.deferred.write().expect("deferred lock poisoned");
+            let mut deferred = self
+                .deferred
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for name in &removed {
                 deferred.remove(name);
             }
@@ -337,14 +346,14 @@ impl ToolRegistry {
     pub fn mark_deferred(&self, name: &str) {
         self.deferred
             .write()
-            .expect("deferred lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(name.to_string());
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools
             .read()
-            .expect("tools lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .find(|tool| tool.definition().name == name)
             .cloned()
@@ -364,10 +373,13 @@ impl ToolRegistry {
     /// [`Self::definitions_active_with_loaded`] so the tools array remains byte-identical across
     /// mid-session `/permission` toggles, keeping the Claude prompt cache warm on subsequent turns.
     pub fn definitions_for_permission(&self, permission: Permission) -> Vec<ToolDefinition> {
-        let deferred = self.deferred.read().expect("deferred lock poisoned");
+        let deferred = self
+            .deferred
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.tools
             .read()
-            .expect("tools lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .filter(|tool| {
                 let definition = tool.definition();
@@ -403,10 +415,13 @@ impl ToolRegistry {
     /// what preserves the prompt cache prefix across `/permission` toggles (breakpoint 3 in the
     /// Claude provider's cache layout).
     pub fn definitions_active_with_loaded(&self, loaded: &HashSet<String>) -> Vec<ToolDefinition> {
-        let deferred = self.deferred.read().expect("deferred lock poisoned");
+        let deferred = self
+            .deferred
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.tools
             .read()
-            .expect("tools lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .filter(|tool| {
                 let name = tool.definition().name;
@@ -421,11 +436,14 @@ impl ToolRegistry {
     /// `[Permission context]` block that names currently-blocked tools. Sorted by (name) for
     /// deterministic output.
     pub fn tool_catalogue(&self) -> Vec<(String, String, Permission, bool)> {
-        let deferred = self.deferred.read().expect("deferred lock poisoned");
+        let deferred = self
+            .deferred
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut entries: Vec<(String, String, Permission, bool)> = self
             .tools
             .read()
-            .expect("tools lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .map(|tool| {
                 let def = tool.definition();
@@ -504,6 +522,10 @@ impl ToolRegistry {
             );
             return;
         }
+        // A collision here means two builtin tools share a name — a coding bug, not a runtime
+        // condition. Panic so the test suite catches it on the first build instead of letting the
+        // second registration silently fail.
+        #[allow(clippy::expect_used)]
         self.register(tool).expect("builtin tool name collision");
     }
 

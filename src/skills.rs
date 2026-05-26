@@ -327,6 +327,9 @@ pub fn validate_skill_name(name: &str) -> Result<(), String> {
         ));
     }
     let mut chars = name.chars();
+    // `name.is_empty()` was checked at the top of this function (and returned an error), so
+    // `chars.next()` always yields `Some` here. The `expect` documents the invariant.
+    #[allow(clippy::expect_used)]
     let first = chars.next().expect("non-empty checked above");
     if !first.is_ascii_alphanumeric() {
         return Err(format!(

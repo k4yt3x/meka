@@ -3,15 +3,25 @@
 //! `Agent::run_turn` emits its user-facing output (streamed assistant text, thinking blocks,
 //! tool-call indicators, todo lists, token usage) and its tool-approval requests through `Arc<dyn
 //! Frontend>` instead of calling `render::*` and `std::sync::mpsc` directly. The REPL today is one
-//! impl ([`ReplFrontend`]); ACP, a Telegram bridge, or a web UI become additional impls without
-//! touching the agent core.
+//! impl ([`crate::repl::ReplFrontend`]); ACP, a Telegram bridge, or a web UI become additional
+//! impls without touching the agent core.
+//!
+//! This module owns the trait, the event/permission types, and the two UI-agnostic impls
+//! ([`SilentFrontend`], [`PermissionForwardingFrontend`]). Concrete UI impls live with their UI —
+//! `ReplFrontend` in `crate::repl`, `AcpFrontend` in `crate::acp` — so the abstraction layer never
+//! depends on a specific frontend by name.
 //!
 //! The event-based shape mirrors ACP's `session/update` notification — one channel for every kind
 //! of agent-emitted output, discriminated by the [`FrontendEvent`] variant.
 
+// `Mutex` is consumed only by the `#[cfg(test)] mod testing` block below — gating its import
+// keeps non-test builds warning-clean now that `ReplFrontend` (the production user of
+// `std::sync::Mutex`) has moved into `crate::repl`.
+#[cfg(test)]
+use std::sync::Mutex;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -19,11 +29,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
-    provider::TokenUsage,
-    render::{self, OutputSpacing, RenderMode, StreamingRenderer},
-    tools::todo::TodoItem,
-};
+use crate::{provider::TokenUsage, tools::todo::TodoItem};
 
 /// Trait the agent loop talks through to surface output and ask the user to approve tool calls.
 /// Implementations are responsible for rendering mode, newline spacing, and any inter-event
@@ -85,6 +91,23 @@ pub trait Frontend: Send + Sync {
     /// for them.
     fn client_disconnected(&self) -> bool {
         false
+    }
+
+    /// Handle an MCP `elicitation/create` request: the server asked the user for input (either a
+    /// structured form or a URL-consent flow). The frontend is responsible for prompting the user
+    /// and returning their response. The default impl declines — the safe behavior when no human
+    /// is reachable (non-interactive subcommands, sub-agents under `PermissionForwardingFrontend`,
+    /// `SilentFrontend`, the test-only `RecordingFrontend`).
+    ///
+    /// Called via the task-local installed in `Agent::run_tool`; see
+    /// [`crate::mcp::current_session_frontend`]. Concrete impls today:
+    /// [`crate::repl::ReplFrontend`] (routes through the REPL thread), `crate::acp::AcpFrontend`
+    /// (auto-declines with a warn — no ACP protocol primitive for forms yet).
+    async fn handle_elicitation(
+        &self,
+        _prompt: crate::mcp::elicitation::ElicitationPrompt,
+    ) -> crate::mcp::elicitation::ElicitationResponse {
+        crate::mcp::elicitation::ElicitationResponse::Decline
     }
 }
 
@@ -175,15 +198,17 @@ pub enum FrontendEvent {
         #[allow(dead_code)]
         signature: Option<String>,
     },
-    /// A tool call is about to be dispatched. `schema` is the tool's `parameters` JSON Schema
-    /// (cloned from its `ToolDefinition`) when available, used for primary-param rendering. `id` is
-    /// the `tool_use_id` assigned by the provider — frontends use it to correlate this announcement
-    /// with the matching [`Self::ToolCallCompleted`].
+    /// A tool call is about to be dispatched. `id` is the `tool_use_id` assigned by the provider —
+    /// frontends use it to correlate this announcement with the matching
+    /// [`Self::ToolCallCompleted`]. `display_summary` is the agent-resolved primary argument for
+    /// display (e.g. the path for `read_file`, the command for `execute_command`), pre-computed via
+    /// [`crate::render::resolve_primary_param`] so frontends don't need the tool's JSON Schema to
+    /// render the indicator. `None` means "no obvious primary arg" — render the bare tool name.
     ToolCallStarted {
         id: String,
         name: String,
         input: serde_json::Value,
-        schema: Option<serde_json::Value>,
+        display_summary: Option<String>,
     },
     /// A previously-announced tool call has finished. Emitted once per tool in source order after
     /// the parallel dispatch settles. The REPL impl ignores this today (tool results render through
@@ -204,6 +229,17 @@ pub enum FrontendEvent {
     TodoListUpdated(Vec<TodoItem>),
     /// End-of-turn token-usage summary.
     TokenUsage(TokenUsage),
+    /// User-visible advisory surfaced by the provider layer (e.g. image redaction when the request
+    /// body would exceed the API limit). `ReplFrontend` renders via [`crate::render::render_hint`];
+    /// `AcpFrontend` forwards as an `AgentMessageChunk` with a `[agsh] ` prefix so the editor's
+    /// transcript records the side-effect. `SilentFrontend` drops them.
+    Notice(crate::provider::Notice),
+    /// Incremental progress from an in-flight MCP tool (`notifications/progress`). Routed
+    /// per-session via the task-local frontend installed in `Agent::run_tool` — see
+    /// [`crate::mcp::current_session_frontend`]. `ReplFrontend` renders an inline status line
+    /// (carriage-return overwrite); `AcpFrontend` logs at `info!` today (no protocol primitive
+    /// yet). `SilentFrontend` drops them.
+    McpProgress(crate::mcp::progress::ProgressUpdate),
 }
 
 /// Structured side-channel a tool can attach to its [`crate::tools::ToolOutput`] for frontends that
@@ -245,10 +281,11 @@ pub enum PermissionOutcome {
 }
 
 /// Frontend wrapper used by sub-agents when the parent is interactive enough to host permission
-/// prompts. `emit` is a no-op (sub-agents don't stream output to the user — their final report
-/// flows back through the parent's `spawn_agent` tool result), but `request_permission` is
-/// forwarded to the held delegate so the user is prompted in their original UI (REPL approval line
-/// / ACP `session/request_permission`).
+/// prompts. Streaming output (text, tool indicators, todos, token usage) is dropped — sub-agents'
+/// final reports flow back through the parent's `spawn_agent` tool result, not through this
+/// frontend. The exceptions are `Notice` (provider-side advisories that the user should still see
+/// — e.g. a redaction during a sub-agent's turn) and `request_permission` (forwarded so the user
+/// is prompted in their original UI: REPL approval line or ACP `session/request_permission`).
 ///
 /// Constructed in [`crate::tools::subagent::SpawnAgentTool`] with the parent agent's frontend as
 /// the delegate.
@@ -264,7 +301,14 @@ impl PermissionForwardingFrontend {
 
 #[async_trait]
 impl Frontend for PermissionForwardingFrontend {
-    async fn emit(&self, _event: FrontendEvent) {}
+    async fn emit(&self, event: FrontendEvent) {
+        // Forward Notice — provider advisories about the sub-agent's request belong in the user's
+        // primary UI. Everything else (text deltas, thinking, tool indicators, todos, token usage,
+        // session lifecycle) is sub-agent chrome that the user shouldn't see.
+        if matches!(event, FrontendEvent::Notice(_)) {
+            self.delegate.emit(event).await;
+        }
+    }
 
     fn client_disconnected(&self) -> bool {
         // Sub-agents must observe the parent's disconnect so their own run_turn loop short-circuits
@@ -315,166 +359,6 @@ impl Frontend for SilentFrontend {
     async fn request_permission(&self, _request: PermissionRequest) -> PermissionOutcome {
         // No human to ask — safest default.
         PermissionOutcome::Deny
-    }
-}
-
-/// Construction-time configuration for [`ReplFrontend`]. These fields used to live on
-/// `AgentOptions`; they are UI concerns and now belong to the frontend impl.
-pub struct ReplFrontendConfig {
-    pub render_mode: RenderMode,
-    pub newline_before_prompt: bool,
-    pub newline_after_prompt: bool,
-    pub show_session_id_on_create: bool,
-    pub show_token_usage: bool,
-    pub thinking_show_content: bool,
-    /// Sender for the REPL's `AgentToReplEvent` channel, used to forward approval requests to the
-    /// blocking REPL thread.
-    pub agent_event_sender: std::sync::mpsc::Sender<crate::repl::AgentToReplEvent>,
-}
-
-/// REPL-side [`Frontend`] impl. Owns the [`StreamingRenderer`] and [`OutputSpacing`] state that
-/// used to be threaded through `Agent::run_turn` / `run_streaming`, and forwards approval requests
-/// over the existing mpsc to the blocking REPL thread.
-pub struct ReplFrontend {
-    config: ReplFrontendConfig,
-    state: Mutex<ReplFrontendState>,
-}
-
-struct ReplFrontendState {
-    spacing: OutputSpacing,
-    /// Open across consecutive `AssistantTextDelta` events; closed by any non-text event (or
-    /// `TurnFinished`).
-    renderer: Option<StreamingRenderer>,
-}
-
-impl ReplFrontend {
-    pub fn new(config: ReplFrontendConfig) -> Self {
-        Self {
-            config,
-            state: Mutex::new(ReplFrontendState {
-                spacing: OutputSpacing::new(),
-                renderer: None,
-            }),
-        }
-    }
-
-    /// Flush and drop any open streaming renderer. Called before any non-text event so block types
-    /// don't interleave on stderr.
-    fn close_text_run(state: &mut ReplFrontendState) {
-        if let Some(mut renderer) = state.renderer.take() {
-            // Rendering errors here are typically a broken stderr pipe; log and move on rather than
-            // panicking inside `emit`.
-            if let Err(error) = renderer.finish() {
-                tracing::debug!("frontend renderer finish failed: {}", error);
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl Frontend for ReplFrontend {
-    async fn emit(&self, event: FrontendEvent) {
-        // Held briefly across synchronous render calls. The agent loop emits events serially per
-        // turn, so contention is effectively zero; the lock is purely a `Send + Sync` discipline
-        // check.
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        match event {
-            FrontendEvent::SessionStarted { id } => {
-                if self.config.show_session_id_on_create {
-                    render::render_session_id("Creating new session", &id.to_string());
-                }
-            }
-            FrontendEvent::TurnStarted => {
-                if self.config.newline_after_prompt {
-                    eprintln!();
-                    state.spacing.after_prompt();
-                }
-            }
-            FrontendEvent::TurnFinished => {
-                Self::close_text_run(&mut state);
-                if self.config.newline_before_prompt {
-                    eprintln!();
-                }
-            }
-            FrontendEvent::AssistantTextDelta(text) => {
-                if state.renderer.is_none() {
-                    if state.spacing.before_text() {
-                        eprintln!();
-                    }
-                    state.renderer = Some(StreamingRenderer::new(self.config.render_mode));
-                }
-                if let Some(renderer) = state.renderer.as_mut()
-                    && let Err(error) = renderer.push_delta(&text)
-                {
-                    tracing::debug!("frontend renderer push_delta failed: {}", error);
-                }
-            }
-            FrontendEvent::ThinkingBlock {
-                content,
-                signature: _,
-            } => {
-                Self::close_text_run(&mut state);
-                if state.spacing.before_thinking() {
-                    eprintln!();
-                }
-                render::render_thinking_block(&content, self.config.thinking_show_content);
-            }
-            FrontendEvent::ToolCallStarted {
-                id: _,
-                name,
-                input,
-                schema,
-            } => {
-                Self::close_text_run(&mut state);
-                if state.spacing.before_tool_indicator() {
-                    eprintln!();
-                }
-                render::render_tool_indicator(&name, &input, schema.as_ref());
-            }
-            // The REPL renders tool results inline through the agent's own message-history path
-            // (the next assistant turn). No additional UI is needed at completion time — the
-            // model's response that follows already summarizes what happened.
-            FrontendEvent::ToolCallCompleted { .. } => {}
-            FrontendEvent::TodoListUpdated(items) => {
-                Self::close_text_run(&mut state);
-                render::render_todo_list(&items);
-                state.spacing.after_todo_list();
-            }
-            FrontendEvent::TokenUsage(usage) => {
-                Self::close_text_run(&mut state);
-                if self.config.show_token_usage {
-                    render::render_token_usage(&usage);
-                }
-            }
-        }
-    }
-
-    async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
-        let (response_sender, response_receiver) = tokio::sync::oneshot::channel::<bool>();
-        let approval = crate::repl::ToolApprovalRequest {
-            tool_name: request.tool_name,
-            primary_param: request.primary_param,
-            response_sender,
-        };
-        if self
-            .config
-            .agent_event_sender
-            .send(crate::repl::AgentToReplEvent::ApprovalRequest(approval))
-            .is_err()
-        {
-            // REPL thread is gone — there is no human to ask. Treat as cancellation rather than
-            // denial so the caller's ToolOutput message is honest about the cause.
-            return PermissionOutcome::Cancelled;
-        }
-        match response_receiver.await {
-            Ok(true) => PermissionOutcome::Allow,
-            Ok(false) => PermissionOutcome::Deny,
-            Err(_) => PermissionOutcome::Cancelled,
-        }
     }
 }
 
@@ -569,6 +453,41 @@ mod tests {
         assert!(matches!(events[2], FrontendEvent::TurnFinished));
     }
 
+    /// Locks in the contract for the `display_summary` field on
+    /// [`FrontendEvent::ToolCallStarted`]: the agent loop is expected to pre-resolve the primary
+    /// argument via [`crate::render::resolve_primary_param`] and ship the resulting `String` (or
+    /// `None`) on the event. Frontends rely on this so they never need the tool's JSON Schema
+    /// themselves.
+    ///
+    /// This test exercises both the helper that the agent calls and the event shape that carries
+    /// the result, so a future refactor that changes either side is caught here. End-to-end
+    /// emission from `Agent::run_turn` is covered by `tests/acp.rs`.
+    #[tokio::test]
+    async fn test_tool_call_started_carries_resolved_display_summary() {
+        let recorder = RecordingFrontend::new();
+        let input = serde_json::json!({"path": "/etc/hosts"});
+        let display_summary = crate::render::resolve_primary_param("read_file", &input, None);
+        assert_eq!(display_summary.as_deref(), Some("/etc/hosts"));
+        recorder
+            .emit(FrontendEvent::ToolCallStarted {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: input.clone(),
+                display_summary: display_summary.clone(),
+            })
+            .await;
+        let events = recorder.events();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            FrontendEvent::ToolCallStarted {
+                display_summary, ..
+            } => {
+                assert_eq!(display_summary.as_deref(), Some("/etc/hosts"));
+            }
+            other => panic!("expected ToolCallStarted; got {:?}", other),
+        }
+    }
+
     #[tokio::test]
     async fn test_recording_frontend_returns_configured_permission_outcome() {
         let frontend = RecordingFrontend::with_permission(PermissionOutcome::Deny);
@@ -583,9 +502,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_drops_emits() {
-        // Keep a typed handle alongside the trait-object Arc so we can inspect the delegate's
-        // recorded events after the wrapper drops the emits.
+    async fn test_permission_forwarding_frontend_drops_sub_agent_chrome() {
+        // Sub-agent chrome (text, lifecycle, tool indicators) must NOT bubble up to the parent's
+        // UI — the sub-agent's report flows back via the spawn_agent tool result instead.
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate);
@@ -597,8 +516,33 @@ mod tests {
 
         assert!(
             recorder.events().is_empty(),
-            "emit must not forward to the delegate",
+            "sub-agent chrome must not forward to the delegate",
         );
+    }
+
+    /// Notices are the one event that *does* forward through `PermissionForwardingFrontend`. Image
+    /// redaction during a sub-agent's provider call is a side-effect the *user* needs to see — the
+    /// sub-agent's report has no place to surface it, and silent redaction without operator
+    /// awareness is exactly the bypass this whole refactor is meant to close.
+    #[tokio::test]
+    async fn test_permission_forwarding_frontend_forwards_notice() {
+        let recorder = Arc::new(RecordingFrontend::new());
+        let delegate: Arc<dyn Frontend> = recorder.clone();
+        let forwarder = PermissionForwardingFrontend::new(delegate);
+        forwarder
+            .emit(FrontendEvent::Notice(crate::provider::Notice::info(
+                "redacted 2 images",
+            )))
+            .await;
+        let events = recorder.events();
+        assert_eq!(events.len(), 1, "exactly one event should forward");
+        match &events[0] {
+            FrontendEvent::Notice(notice) => {
+                assert_eq!(notice.text, "redacted 2 images");
+                assert_eq!(notice.level, crate::provider::NoticeLevel::Info);
+            }
+            other => panic!("expected Notice, got {:?}", other),
+        }
     }
 
     #[tokio::test]

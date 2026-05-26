@@ -434,6 +434,9 @@ struct Highlighter {
 
 static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
 
+// The `expect()` below loads a compile-time `include_bytes!()` of the bundled theme; a parse
+// failure would mean we shipped a corrupt `.tmTheme` resource, caught on the first build/test.
+#[allow(clippy::expect_used)]
 fn highlighter() -> &'static Highlighter {
     HIGHLIGHTER.get_or_init(|| {
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -560,13 +563,17 @@ fn format_table(lines: &[String]) -> Vec<String> {
     result
 }
 
+/// Render the live "[tool X(`arg`)]" indicator line on stderr. The agent loop computes
+/// `display_summary` (via [`resolve_primary_param`] over the tool's JSON Schema) and passes it
+/// pre-resolved so the frontend layer no longer needs the schema at all — see
+/// `FrontendEvent::ToolCallStarted` in `crate::frontend`.
 pub fn render_tool_indicator(
     name: &str,
-    input: &serde_json::Value,
-    schema: Option<&serde_json::Value>,
+    _input: &serde_json::Value,
+    display_summary: Option<&str>,
 ) {
     let display_name = tool_display_name(name);
-    let indicator = match resolve_primary_param(name, input, schema) {
+    let indicator = match display_summary {
         Some(value) => {
             // Strip ANSI escapes and C0 control chars before display so a model-supplied command or
             // path can't spoof the permission prompt, clear the screen, or move the cursor. The
@@ -584,6 +591,9 @@ pub fn render_tool_indicator(
 /// (`0x30-0x3F`), optional intermediate bytes (`0x20-0x2F`), and a final byte (`0x40-0x7E`). This
 /// covers the sequences an attacker would use to clear the screen, move the cursor, or alter
 /// colors.
+// Compile-time regex literal; a `Regex::new` failure here means we shipped a typo in the pattern,
+// caught on first build.
+#[allow(clippy::expect_used)]
 static CSI_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]").expect("static CSI pattern")
 });

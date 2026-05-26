@@ -1,3 +1,8 @@
+// Integration-test files are their own crate, so the `#![cfg_attr(test, allow(...))]` in
+// `src/main.rs` doesn't reach here. Mirror it explicitly: tests rely on `.unwrap()` / `.expect()`
+// for clear panic-on-failure semantics, and asserting against panics is the standard idiom.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! End-to-end ACP integration tests. Spawn the real `agsh acp` binary with
 //! `AGSH_ACP_MOCK_PROVIDER=1` so a scripted [`crate::provider::mock::MockProvider`] drives
 //! deterministic `session/prompt` round-trips. Tests verify the tool-call lifecycle, permission

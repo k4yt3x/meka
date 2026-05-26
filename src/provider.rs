@@ -245,7 +245,47 @@ pub enum StreamEvent {
         stop_reason: StopReason,
     },
     Usage(TokenUsage),
+    /// User-visible advisory from the provider layer (e.g. "redacted N old images to fit the
+    /// 32 MiB request limit"). The agent translates this into
+    /// [`crate::frontend::FrontendEvent::Notice`] so every frontend renders it consistently.
+    /// Distinct from `Error` — the request itself is proceeding successfully; the notice
+    /// describes a side-effect the user should know about.
+    Notice(Notice),
     Error(String),
+}
+
+/// Severity hint for a provider-emitted [`Notice`]. Frontends can map these to per-level styling
+/// (a dim hint for `Info`, a warn-colored line for `Warn`). Today only `Info` is used by the
+/// image-redaction path; `Warn` is reserved for future provider-side recoverable conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Warn,
+}
+
+/// User-visible advisory surfaced by a provider during a request. Carries no structured data
+/// beyond the level and the message — frontends format it themselves.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub level: NoticeLevel,
+    pub text: String,
+}
+
+impl Notice {
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            level: NoticeLevel::Info,
+            text: text.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn warn(text: impl Into<String>) -> Self {
+        Self {
+            level: NoticeLevel::Warn,
+            text: text.into(),
+        }
+    }
 }
 
 /// Sentinel key inserted into `ToolUse::input` when the upstream tool-call arguments failed to
@@ -283,14 +323,17 @@ pub enum StopReason {
 /// parallel from multiple sub-agents in one turn.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// Single round-trip request. Returns the assistant message plus stop-reason and token-usage
-    /// metadata. No streaming; the agent awaits the full response.
+    /// Single round-trip request. Returns the assistant message, stop-reason, token-usage metadata,
+    /// and any user-visible notices that arose during the request (e.g. the redaction hint from
+    /// `claude::shared::build_body_within_budget`). The caller is expected to forward each notice
+    /// to the active frontend; an empty `Vec` means nothing to surface. No streaming; the agent
+    /// awaits the full response.
     async fn complete(
         &self,
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage)>;
+    ) -> Result<(Message, StopReason, TokenUsage, Vec<Notice>)>;
 
     /// Streaming variant. The provider pushes `StreamEvent`s onto `event_sender` as they arrive.
     /// Cancellation is observed via `cancellation` — implementors must check the token and abort

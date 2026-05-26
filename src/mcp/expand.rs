@@ -30,6 +30,9 @@ where
             // `ch.len_utf8()` below or jump to `end + 1` (the byte after a `}` — ASCII, always a
             // boundary).
             let rest = &input[i..];
+            // The outer `while i < bytes.len()` guard ensures `rest` is non-empty, so
+            // `chars().next()` always yields `Some`. `expect()` documents the invariant.
+            #[allow(clippy::expect_used)]
             let ch = rest.chars().next().expect("non-empty slice");
             out.push(ch);
             i += ch.len_utf8();

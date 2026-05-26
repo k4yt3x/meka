@@ -67,7 +67,9 @@ impl Tool for LoadToolTool {
         };
 
         let definition = {
-            let guard = tools.read().expect("tools lock poisoned");
+            let guard = tools
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard
                 .iter()
                 .find(|t| t.definition().name == name)
@@ -91,7 +93,11 @@ impl Tool for LoadToolTool {
         let is_deferred = self
             .deferred
             .upgrade()
-            .map(|d| d.read().expect("deferred lock poisoned").contains(&name))
+            .map(|d| {
+                d.read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(&name)
+            })
             .unwrap_or(false);
 
         if !is_deferred {

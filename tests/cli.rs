@@ -1,3 +1,7 @@
+// See the matching allow in `tests/acp.rs` for the rationale: integration tests panic on failure
+// by design.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! End-to-end CLI smoke tests. These shell out to the built `agsh` binary
 //! (`env!("CARGO_BIN_EXE_agsh")`) so they exercise the same entry point users hit on the command
 //! line. They cover surface-level invariants that unit tests can't reach: argument-parser wiring,

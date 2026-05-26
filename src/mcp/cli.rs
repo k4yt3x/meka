@@ -693,11 +693,12 @@ pub async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
 /// the OAuth flow when warranted. Extracted so [`run_add`] can race it against a SIGINT handler and
 /// roll back on either error path from one place.
 async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) -> Result<()> {
-    // Caller has already verified HTTP + no auth_token + url.is_some().
-    let url = resolved
-        .url
-        .as_deref()
-        .expect("caller gated on url.is_some()");
+    // Caller has already verified HTTP + no auth_token + url.is_some(). Use let-else with an
+    // explicit `unreachable!` so the caller-contract invariant is documented in code, not just
+    // hidden behind an `expect` string.
+    let Some(url) = resolved.url.as_deref() else {
+        unreachable!("probe_then_login caller must verify url.is_some()");
+    };
 
     let wants_oauth_already = matches!(resolved.auth, Some(McpAuthConfig::OAuth { .. }));
     let should_login = match probe_and_announce(&resolved.name, url).await {

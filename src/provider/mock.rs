@@ -113,7 +113,12 @@ impl Provider for MockProvider {
         _system_prompt: &str,
         _messages: &[Message],
         _tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage)> {
+    ) -> Result<(
+        Message,
+        StopReason,
+        TokenUsage,
+        Vec<crate::provider::Notice>,
+    )> {
         // Tests only drive the streaming path; `complete` is reached only via auto-compaction,
         // which the ACP test suite doesn't exercise. If a future test needs it, populate the rounds
         // queue the same way and add a matching impl here.
@@ -131,7 +136,10 @@ impl Provider for MockProvider {
         cancellation: CancellationToken,
     ) -> Result<()> {
         let events = {
-            let mut rounds = self.rounds.lock().expect("mock provider rounds poisoned");
+            let mut rounds = self
+                .rounds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             rounds.pop_front().unwrap_or_default()
         };
         for event in events {

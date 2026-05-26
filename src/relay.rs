@@ -42,14 +42,20 @@ impl Relay {
     /// instead of racing reedline's redraw. Caller keeps a clone of the same printer to hand to
     /// [`reedline::Reedline::with_external_printer`].
     pub fn install(&self, printer: ExternalPrinter<String>) {
-        *self.printer.write().expect("relay lock poisoned") = Some(printer);
+        *self
+            .printer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(printer);
     }
 
     /// Drop the registered printer. Called on REPL teardown so tracing reverts to plain stderr
     /// (e.g. interrupt handlers that fire after reedline has exited).
     #[allow(dead_code)]
     pub fn clear(&self) {
-        *self.printer.write().expect("relay lock poisoned") = None;
+        *self
+            .printer
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 

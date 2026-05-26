@@ -152,11 +152,17 @@ pub struct AcpFrontend {
     always_allowed: std::sync::Mutex<std::collections::HashSet<String>>,
     never_allowed: std::sync::Mutex<std::collections::HashSet<String>>,
     client_state: SharedClientState,
-    /// Process-wide disconnect latch, shared across every per-session `AcpFrontend` so that *one*
-    /// failed `send_notification` short-circuits all sibling sessions' agent loops on their next
-    /// iteration. Per-session ownership would let other sessions keep burning provider tokens
-    /// until their own next emit failed.
-    client_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    /// Stdio-level "transport is dead" latch, shared across every per-session `AcpFrontend` in the
+    /// process. When `send_notification` fails on any session, we set the latch so every other
+    /// session's agent loop short-circuits on its next iteration instead of burning provider
+    /// tokens until its own emit also fails.
+    ///
+    /// This is correct *for stdio*: one closed pipe affects every session in the process, so the
+    /// global signal carries no false positives. When a per-session transport (e.g. WebSocket-ACP
+    /// or a TCP-multiplexed successor) lands, this field needs a per-session sibling — read both
+    /// in `client_disconnected()` and OR them — so a single session's drop doesn't take the
+    /// process down with it. Grep for `transport_dead` to find the migration points.
+    transport_dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AcpFrontend {
@@ -165,7 +171,7 @@ impl AcpFrontend {
         session_id: SessionId,
         cwd: SharedCwd,
         client_state: SharedClientState,
-        client_disconnected: Arc<std::sync::atomic::AtomicBool>,
+        transport_dead: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             connection,
@@ -174,14 +180,15 @@ impl AcpFrontend {
             always_allowed: std::sync::Mutex::new(std::collections::HashSet::new()),
             never_allowed: std::sync::Mutex::new(std::collections::HashSet::new()),
             client_state,
-            client_disconnected,
+            transport_dead,
         }
     }
 
-    /// Mark the client as gone. Called from `emit` and the `session/load` replay loop whenever
-    /// `send_notification` reports an error. Idempotent.
-    fn mark_client_disconnected(&self) {
-        self.client_disconnected
+    /// Mark the stdio transport as dead. Called from `emit` and the `session/load` replay loop
+    /// whenever `send_notification` reports an error. Idempotent. The trait-level
+    /// `client_disconnected()` read below surfaces the same flag back to the agent loop.
+    fn mark_transport_dead(&self) {
+        self.transport_dead
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -233,7 +240,9 @@ impl Frontend for AcpFrontend {
                 id,
                 name,
                 input,
-                schema: _,
+                // `display_summary` is REPL-facing chrome; ACP clients render their own tool-call
+                // title from `raw_input` and `locations`.
+                display_summary: _,
             } => {
                 // No separate `pending` state in the agent loop, so the in-progress emit is the
                 // first one the client sees.
@@ -262,6 +271,36 @@ impl Frontend for AcpFrontend {
                     .content(acp_content);
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
             }
+            FrontendEvent::Notice(notice) => {
+                // No dedicated ACP primitive for advisories; surface inline as an assistant-message
+                // chunk with an `[agsh]` prefix so editor transcripts record the side-effect and
+                // clients can filter or style by that prefix. `notice.level` is unused on the wire
+                // today — when ACP grows a typed notice variant, branch on it here.
+                let text = format!("[agsh] {}", notice.text);
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                    agent_client_protocol::schema::TextContent::new(text),
+                )))
+            }
+            FrontendEvent::McpProgress(update) => {
+                // ACP has no protocol primitive for tool-progress streams. The REPL renders these
+                // inline as a carriage-return-overwrite status line; in the ACP world the editor
+                // already has its own visibility into MCP server activity (or can subscribe to the
+                // stderr log stream of the spawned agent). Log at info so `-v` users can still see
+                // them; don't pollute the assistant-message transcript with per-tick status text.
+                tracing::info!(
+                    "MCP '{}' {} progress: {}{}{}",
+                    update.server_name,
+                    update.tool_name,
+                    update.progress,
+                    update.total.map(|t| format!("/{}", t)).unwrap_or_default(),
+                    update
+                        .message
+                        .as_deref()
+                        .map(|m| format!(" — {}", m))
+                        .unwrap_or_default()
+                );
+                return;
+            }
             // REPL-specific signage (todos, token usage, lifecycle).
             _ => return,
         };
@@ -270,12 +309,12 @@ impl Frontend for AcpFrontend {
             connection.send_notification(SessionNotification::new(session_id, update))
         {
             tracing::debug!("AcpFrontend send_notification failed: {}", error);
-            self.mark_client_disconnected();
+            self.mark_transport_dead();
         }
     }
 
     fn client_disconnected(&self) -> bool {
-        self.client_disconnected
+        self.transport_dead
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -341,7 +380,7 @@ impl Frontend for AcpFrontend {
                     // intentionally don't do this: those paths legitimately receive JSON-RPC error
                     // responses (e.g. terminal/create denied), which would produce false-positive
                     // disconnects.
-                    self.mark_client_disconnected();
+                    self.mark_transport_dead();
                     return PermissionOutcome::Deny;
                 }
             },
@@ -418,6 +457,30 @@ impl Frontend for AcpFrontend {
         let connection = self.connection.clone();
         let session_id = self.session_id.clone();
         Some(run_delegated_execute(connection, session_id, spec).await)
+    }
+
+    async fn handle_elicitation(
+        &self,
+        prompt: crate::mcp::elicitation::ElicitationPrompt,
+    ) -> crate::mcp::elicitation::ElicitationResponse {
+        // ACP has no protocol primitive for arbitrary server forms. The pragmatic stance until one
+        // lands is to auto-decline with an info-level log so editor users can see in their agent
+        // stderr that an elicitation arrived and was passed back to the server. A future per-ACP
+        // path could synthesize a `session/request_permission` round-trip (the only existing
+        // round-trip primitive) by mapping form fields to permission options — but that conflates
+        // tool approval and form input, which is the kind of overload the protocol is likely to
+        // rule out as it grows a proper elicitation surface.
+        tracing::warn!(
+            "ACP session received MCP elicitation from '{}' ({}); auto-declining (no ACP \
+             primitive for form/URL prompts yet): {}",
+            prompt.server_name,
+            match &prompt.kind {
+                crate::mcp::elicitation::ElicitationKind::Form { .. } => "form",
+                crate::mcp::elicitation::ElicitationKind::Url { .. } => "url",
+            },
+            prompt.message,
+        );
+        crate::mcp::elicitation::ElicitationResponse::Decline
     }
 }
 
@@ -1006,8 +1069,8 @@ struct ServerState {
     client_state: SharedClientState,
     sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, SessionEntry>>>,
     /// Shared with every per-session `AcpFrontend`; see the field on `AcpFrontend` for the
-    /// why-process-wide rationale.
-    client_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    /// stdio-level rationale.
+    transport_dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Per-session map entry. Most fields live outside `runtime` so the cancel / set_mode / close
@@ -1102,12 +1165,12 @@ pub async fn run_acp(
     };
 
     let client_state = SharedClientState::default();
-    let client_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let transport_dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = Arc::new(ServerState {
         shared: Arc::clone(&shared),
         client_state: client_state.clone(),
         sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        client_disconnected,
+        transport_dead,
     });
 
     let acp_result = AcpAgentRole
@@ -1228,7 +1291,7 @@ pub async fn run_acp(
                     let runtime = match build_session_runtime(
                         &state.shared,
                         &state.client_state,
-                        &state.client_disconnected,
+                        &state.transport_dead,
                         cx.clone(),
                         session_id.clone(),
                         session_id_str.clone(),
@@ -1662,7 +1725,7 @@ async fn handle_load_session(
     let runtime = match build_session_runtime(
         &state.shared,
         &state.client_state,
-        &state.client_disconnected,
+        &state.transport_dead,
         cx.clone(),
         session_id.clone(),
         session_id_str.clone(),
@@ -1841,7 +1904,7 @@ async fn handle_resume_session(
     let runtime = match build_session_runtime(
         &state.shared,
         &state.client_state,
-        &state.client_disconnected,
+        &state.transport_dead,
         cx.clone(),
         session_id.clone(),
         session_id_str.clone(),
@@ -1971,7 +2034,7 @@ async fn handle_set_session_mode(
 async fn build_session_runtime(
     shared: &Arc<crate::SharedDeps>,
     client_state: &SharedClientState,
-    client_disconnected: &Arc<std::sync::atomic::AtomicBool>,
+    transport_dead: &Arc<std::sync::atomic::AtomicBool>,
     connection: ConnectionTo<Client>,
     session_id: SessionId,
     session_id_str: String,
@@ -1988,7 +2051,7 @@ async fn build_session_runtime(
         session_id,
         Arc::clone(&cwd),
         client_state.clone(),
-        Arc::clone(client_disconnected),
+        Arc::clone(transport_dead),
     ));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 

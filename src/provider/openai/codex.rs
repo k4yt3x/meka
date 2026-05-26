@@ -299,7 +299,12 @@ impl Provider for OpenAiCodexProvider {
         _system_prompt: &str,
         _messages: &[Message],
         _tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage)> {
+    ) -> Result<(
+        Message,
+        StopReason,
+        TokenUsage,
+        Vec<crate::provider::Notice>,
+    )> {
         // The Responses API on chatgpt.com only ever returns SSE; there is no non-streaming JSON
         // response shape to parse. The agent layer calls `stream` for openai-codex.
         Err(AgshError::Provider(

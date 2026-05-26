@@ -4,8 +4,10 @@
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
+use async_trait::async_trait;
 use crossterm::style::{Color, Stylize};
 use reedline::{
     EditCommand, Emacs, ExternalPrinter, Highlighter, KeyCode, KeyModifiers, Prompt,
@@ -14,8 +16,10 @@ use reedline::{
 };
 
 use crate::{
+    frontend::{Frontend, FrontendEvent, PermissionOutcome, PermissionRequest},
     permission::{EnabledPermissions, SharedPermission},
     relay::RELAY,
+    render::{self, OutputSpacing, RenderMode, StreamingRenderer},
 };
 
 /// Reedline highlighter that paints the entire input buffer with a single style. The final paint
@@ -194,9 +198,13 @@ pub struct ToolApprovalRequest {
 pub enum AgentToReplEvent {
     Done,
     ApprovalRequest(ToolApprovalRequest),
-    /// Server-driven elicitation — the REPL prompts the user and replies via the embedded responder
-    /// channel.
-    McpElicitation(crate::mcp::elicitation::ElicitationPrompt),
+    /// Server-driven elicitation — the REPL prompts the user, then sends the response back via the
+    /// embedded oneshot. `ReplFrontend::handle_elicitation` is the producer; the await on the
+    /// matching receiver carries the response into the agent's task.
+    McpElicitation {
+        prompt: crate::mcp::elicitation::ElicitationPrompt,
+        responder: tokio::sync::oneshot::Sender<crate::mcp::elicitation::ElicitationResponse>,
+    },
     /// Incremental progress update for a running MCP tool.
     McpProgress(crate::mcp::progress::ProgressUpdate),
 }
@@ -571,8 +579,8 @@ fn wait_for_agent(agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEv
             Ok(AgentToReplEvent::ApprovalRequest(request)) => {
                 handle_approval_request(request);
             }
-            Ok(AgentToReplEvent::McpElicitation(prompt)) => {
-                handle_elicitation_prompt(prompt);
+            Ok(AgentToReplEvent::McpElicitation { prompt, responder }) => {
+                handle_elicitation_prompt(prompt, responder);
             }
             Ok(AgentToReplEvent::McpProgress(update)) => {
                 render_progress_update(&update);
@@ -616,8 +624,12 @@ fn format_progress_update(update: &crate::mcp::progress::ProgressUpdate) -> Stri
 
 /// Route a structured/url elicitation request to the user. For forms, walks the JSON Schema one
 /// property at a time, collecting input. For URLs, opens the browser and waits for the user to
-/// confirm.
-fn handle_elicitation_prompt(prompt: crate::mcp::elicitation::ElicitationPrompt) {
+/// confirm. The response is sent back via the oneshot the agent's
+/// `ReplFrontend::handle_elicitation` is awaiting.
+fn handle_elicitation_prompt(
+    prompt: crate::mcp::elicitation::ElicitationPrompt,
+    responder: tokio::sync::oneshot::Sender<crate::mcp::elicitation::ElicitationResponse>,
+) {
     use crate::mcp::{
         elicitation::{ElicitationKind, ElicitationResponse},
         sanitize::sanitize_text,
@@ -714,7 +726,9 @@ fn handle_elicitation_prompt(prompt: crate::mcp::elicitation::ElicitationPrompt)
             }
         }
     };
-    let _ = prompt.responder.send(response);
+    // Receiver-dropped means the agent's `handle_elicitation` future has been cancelled (turn
+    // interrupt, session close, etc.). Nothing to recover; the agent already cleaned up.
+    let _ = responder.send(response);
 }
 
 fn handle_approval_request(request: ToolApprovalRequest) {
@@ -805,6 +819,217 @@ fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) {
     match cwd.write() {
         Ok(mut guard) => *guard = canonical,
         Err(poisoned) => *poisoned.into_inner() = canonical,
+    }
+}
+
+/// Construction-time configuration for [`ReplFrontend`]. These fields used to live on
+/// `AgentOptions`; they are UI concerns and now belong to the frontend impl.
+pub struct ReplFrontendConfig {
+    pub render_mode: RenderMode,
+    pub newline_before_prompt: bool,
+    pub newline_after_prompt: bool,
+    pub show_session_id_on_create: bool,
+    pub show_token_usage: bool,
+    pub thinking_show_content: bool,
+    /// Sender for the REPL's `AgentToReplEvent` channel, used to forward approval requests to the
+    /// blocking REPL thread.
+    pub agent_event_sender: std::sync::mpsc::Sender<AgentToReplEvent>,
+}
+
+/// REPL-side [`Frontend`] impl. Owns the [`StreamingRenderer`] and [`OutputSpacing`] state that
+/// used to be threaded through `Agent::run_turn` / `run_streaming`, and forwards approval requests
+/// over the existing mpsc to the blocking REPL thread.
+///
+/// Lives in `crate::repl` (alongside the REPL thread it talks to) rather than in `crate::frontend`,
+/// so the trait module stays free of concrete UI types — see the module docs in `crate::frontend`.
+pub struct ReplFrontend {
+    config: ReplFrontendConfig,
+    state: Mutex<ReplFrontendState>,
+}
+
+struct ReplFrontendState {
+    spacing: OutputSpacing,
+    /// Open across consecutive `AssistantTextDelta` events; closed by any non-text event (or
+    /// `TurnFinished`).
+    renderer: Option<StreamingRenderer>,
+}
+
+impl ReplFrontend {
+    pub fn new(config: ReplFrontendConfig) -> Self {
+        Self {
+            config,
+            state: Mutex::new(ReplFrontendState {
+                spacing: OutputSpacing::new(),
+                renderer: None,
+            }),
+        }
+    }
+
+    /// Flush and drop any open streaming renderer. Called before any non-text event so block types
+    /// don't interleave on stderr.
+    fn close_text_run(state: &mut ReplFrontendState) {
+        if let Some(mut renderer) = state.renderer.take() {
+            // Rendering errors here are typically a broken stderr pipe; log and move on rather than
+            // panicking inside `emit`.
+            if let Err(error) = renderer.finish() {
+                tracing::debug!("frontend renderer finish failed: {}", error);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Frontend for ReplFrontend {
+    async fn emit(&self, event: FrontendEvent) {
+        // Held briefly across synchronous render calls. The agent loop emits events serially per
+        // turn, so contention is effectively zero; the lock is purely a `Send + Sync` discipline
+        // check. `clippy::await_holding_lock` (deny-level, see Cargo.toml) enforces that no
+        // `.await` appears between the lock acquisition and its drop.
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        match event {
+            FrontendEvent::SessionStarted { id } => {
+                if self.config.show_session_id_on_create {
+                    render::render_session_id("Creating new session", &id.to_string());
+                }
+            }
+            FrontendEvent::TurnStarted => {
+                if self.config.newline_after_prompt {
+                    eprintln!();
+                    state.spacing.after_prompt();
+                }
+            }
+            FrontendEvent::TurnFinished => {
+                Self::close_text_run(&mut state);
+                if self.config.newline_before_prompt {
+                    eprintln!();
+                }
+            }
+            FrontendEvent::AssistantTextDelta(text) => {
+                if state.renderer.is_none() {
+                    if state.spacing.before_text() {
+                        eprintln!();
+                    }
+                    state.renderer = Some(StreamingRenderer::new(self.config.render_mode));
+                }
+                if let Some(renderer) = state.renderer.as_mut()
+                    && let Err(error) = renderer.push_delta(&text)
+                {
+                    tracing::debug!("frontend renderer push_delta failed: {}", error);
+                }
+            }
+            FrontendEvent::ThinkingBlock {
+                content,
+                signature: _,
+            } => {
+                Self::close_text_run(&mut state);
+                if state.spacing.before_thinking() {
+                    eprintln!();
+                }
+                render::render_thinking_block(&content, self.config.thinking_show_content);
+            }
+            FrontendEvent::ToolCallStarted {
+                id: _,
+                name,
+                input,
+                display_summary,
+            } => {
+                Self::close_text_run(&mut state);
+                if state.spacing.before_tool_indicator() {
+                    eprintln!();
+                }
+                render::render_tool_indicator(&name, &input, display_summary.as_deref());
+            }
+            // The REPL renders tool results inline through the agent's own message-history path
+            // (the next assistant turn). No additional UI is needed at completion time — the
+            // model's response that follows already summarizes what happened.
+            FrontendEvent::ToolCallCompleted { .. } => {}
+            FrontendEvent::TodoListUpdated(items) => {
+                Self::close_text_run(&mut state);
+                render::render_todo_list(&items);
+                state.spacing.after_todo_list();
+            }
+            FrontendEvent::TokenUsage(usage) => {
+                Self::close_text_run(&mut state);
+                if self.config.show_token_usage {
+                    render::render_token_usage(&usage);
+                }
+            }
+            FrontendEvent::Notice(notice) => {
+                // Close any in-flight text run so the hint lands on its own line. Level is unused
+                // by `render_hint` today (it always paints DarkGrey) — future styling can branch
+                // on `notice.level` when there's a need.
+                Self::close_text_run(&mut state);
+                render::render_hint(&notice.text);
+            }
+            FrontendEvent::McpProgress(update) => {
+                // Forward through the existing REPL channel so the blocking REPL thread renders
+                // the inline status line (carriage-return overwrite via `render_progress_update`).
+                // If the REPL is gone the send is a no-op; we don't want to block the agent's
+                // streaming loop on UI delivery.
+                if self
+                    .config
+                    .agent_event_sender
+                    .send(AgentToReplEvent::McpProgress(update))
+                    .is_err()
+                {
+                    tracing::debug!("MCP progress dropped (REPL disconnected)");
+                }
+            }
+        }
+    }
+
+    async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
+        let (response_sender, response_receiver) = tokio::sync::oneshot::channel::<bool>();
+        let approval = ToolApprovalRequest {
+            tool_name: request.tool_name,
+            primary_param: request.primary_param,
+            response_sender,
+        };
+        if self
+            .config
+            .agent_event_sender
+            .send(AgentToReplEvent::ApprovalRequest(approval))
+            .is_err()
+        {
+            // REPL thread is gone — there is no human to ask. Treat as cancellation rather than
+            // denial so the caller's ToolOutput message is honest about the cause.
+            return PermissionOutcome::Cancelled;
+        }
+        match response_receiver.await {
+            Ok(true) => PermissionOutcome::Allow,
+            Ok(false) => PermissionOutcome::Deny,
+            Err(_) => PermissionOutcome::Cancelled,
+        }
+    }
+
+    async fn handle_elicitation(
+        &self,
+        prompt: crate::mcp::elicitation::ElicitationPrompt,
+    ) -> crate::mcp::elicitation::ElicitationResponse {
+        // Forward to the blocking REPL thread through the existing agent→shell channel. The thread
+        // renders the prompt, collects user input, and pushes the response back via the oneshot
+        // sender so this `.await` resolves.
+        let (responder, receiver) =
+            tokio::sync::oneshot::channel::<crate::mcp::elicitation::ElicitationResponse>();
+        if self
+            .config
+            .agent_event_sender
+            .send(AgentToReplEvent::McpElicitation { prompt, responder })
+            .is_err()
+        {
+            // REPL thread is gone — no human to ask. Decline so the server learns the elicitation
+            // wasn't answered. (Same posture as the agent-disconnected case in
+            // `request_permission`.)
+            tracing::debug!("MCP elicitation dropped (REPL disconnected); declining");
+            return crate::mcp::elicitation::ElicitationResponse::Decline;
+        }
+        receiver
+            .await
+            .unwrap_or(crate::mcp::elicitation::ElicitationResponse::Decline)
     }
 }
 

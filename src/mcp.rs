@@ -75,6 +75,22 @@ tokio::task_local! {
     /// `roots/list` queries outside a tool call (e.g. the connection-establishment handshake before
     /// any session exists) fall back to the process default via [`current_roots_cwd`].
     static SESSION_CWD: crate::agent::SharedCwd;
+    /// Per-task override for the frontend that should receive MCP-originated UI events fired
+    /// during the in-flight tool call. Scoped by [`with_session_frontend`] from the agent dispatch
+    /// site (same place that scopes [`SESSION_CWD`]).
+    ///
+    /// **Important**: rmcp's notification / server-request callbacks run on *separately spawned*
+    /// handler tasks (see `rmcp::service::spawn_service_task`), so this task-local is NOT visible
+    /// from those callbacks directly. Instead, the [`crate::mcp::handler::McpToolAdapter`]
+    /// snapshots [`current_session_frontend`] at its call site and stashes the value on the
+    /// per-call progress-registry entry; the rmcp dispatch path then looks it up by token. So
+    /// this task-local exists to source the frontend at the agent-driven call site only — the
+    /// progress registry is what carries it across the rmcp task boundary.
+    ///
+    /// Outside any `with_session_frontend` scope (connection-time handshakes, REPL startup probes,
+    /// `sampling/createMessage` callbacks) [`current_session_frontend`] returns `None` and the
+    /// caller falls back to either auto-decline (elicitation) or a tracing log (progress).
+    static SESSION_FRONTEND: std::sync::Arc<dyn crate::frontend::Frontend>;
 }
 
 /// Read the cwd MCP should report for `roots/list`. Returns the task-local override if set (active
@@ -94,6 +110,29 @@ where
     F: std::future::Future<Output = T>,
 {
     SESSION_CWD.scope(cwd, fut).await
+}
+
+/// Read the per-session frontend currently in scope, if any. Returns `None` outside a
+/// [`with_session_frontend`] block — callers must treat that as "no UI available" rather than
+/// hitting a panic, because MCP callbacks can legitimately fire before any session exists
+/// (connection-time handshakes) or under code paths that intentionally aren't session-scoped
+/// (e.g. the `sampling/createMessage` handler in this module).
+pub(crate) fn current_session_frontend() -> Option<std::sync::Arc<dyn crate::frontend::Frontend>> {
+    SESSION_FRONTEND.try_with(|frontend| frontend.clone()).ok()
+}
+
+/// Scope `frontend` as the task-local override for the duration of `fut`. The agent dispatch site
+/// installs this alongside [`with_session_cwd`] so MCP-originated UI events (progress, elicitation)
+/// route through the calling session's `AcpFrontend` / `ReplFrontend` instead of through a
+/// process-global sink.
+pub async fn with_session_frontend<F, T>(
+    frontend: std::sync::Arc<dyn crate::frontend::Frontend>,
+    fut: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    SESSION_FRONTEND.scope(frontend, fut).await
 }
 
 pub struct McpClientManager {

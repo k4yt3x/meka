@@ -153,7 +153,7 @@ pub struct Agent {
     skills: Arc<SkillCache>,
     /// Where streaming output, todo-list renders, token-usage summaries,
     /// and tool-approval requests flow. Concrete impls today:
-    /// [`crate::frontend::ReplFrontend`], [`crate::acp::AcpFrontend`],
+    /// [`crate::repl::ReplFrontend`], [`crate::acp::AcpFrontend`],
     /// [`crate::frontend::SilentFrontend`], and [`crate::frontend::PermissionForwardingFrontend`].
     frontend: Arc<dyn Frontend>,
     /// Per-session working directory. Initialised from `std::env::current_dir()` at startup;
@@ -503,21 +503,37 @@ impl Agent {
                 let tools: Arc<[ToolDefinition]> =
                     Arc::from(self.tool_registry.definitions_active_with_loaded(&loaded));
 
-                let (assistant_message, stop_reason, usage) = match if self.options.streaming {
-                    self.run_streaming(
-                        Arc::clone(&system_prompt),
-                        api_messages,
-                        tools,
-                        cancellation.clone(),
-                    )
-                    .await
+                // Streaming and blocking paths converge on `(Message, StopReason, TokenUsage)`. The
+                // blocking provider call surfaces notices in its return tuple (no event channel);
+                // we forward them to the frontend here so the user sees the same advisories the
+                // streaming path emits inline via `StreamEvent::Notice`.
+                let (assistant_message, stop_reason, usage) = if self.options.streaming {
+                    match self
+                        .run_streaming(
+                            Arc::clone(&system_prompt),
+                            api_messages,
+                            tools,
+                            cancellation.clone(),
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => break 'turn Err(error),
+                    }
                 } else {
-                    self.provider
+                    match self
+                        .provider
                         .complete(&system_prompt, &api_messages, &tools)
                         .await
-                } {
-                    Ok(value) => value,
-                    Err(error) => break 'turn Err(error),
+                    {
+                        Ok((message, stop_reason, usage, notices)) => {
+                            for notice in notices {
+                                self.frontend.emit(FrontendEvent::Notice(notice)).await;
+                            }
+                            (message, stop_reason, usage)
+                        }
+                        Err(error) => break 'turn Err(error),
+                    }
                 };
 
                 self.last_input_tokens
@@ -727,12 +743,17 @@ impl Agent {
                         .tool_registry
                         .get(&current_tool_name)
                         .map(|t| t.definition().parameters);
+                    let display_summary = crate::render::resolve_primary_param(
+                        &current_tool_name,
+                        &input,
+                        schema.as_ref(),
+                    );
                     self.frontend
                         .emit(FrontendEvent::ToolCallStarted {
                             id: current_tool_id.clone(),
                             name: current_tool_name.clone(),
                             input: input.clone(),
-                            schema,
+                            display_summary,
                         })
                         .await;
 
@@ -756,12 +777,14 @@ impl Agent {
                         .tool_registry
                         .get(&name)
                         .map(|t| t.definition().parameters);
+                    let display_summary =
+                        crate::render::resolve_primary_param(&name, &marker_input, schema.as_ref());
                     self.frontend
                         .emit(FrontendEvent::ToolCallStarted {
                             id: id.clone(),
                             name: name.clone(),
                             input: marker_input.clone(),
-                            schema,
+                            display_summary,
                         })
                         .await;
                     content_blocks.push(ContentBlock::ToolUse {
@@ -780,6 +803,12 @@ impl Agent {
                 }
                 StreamEvent::Usage(usage) => {
                     token_usage = usage;
+                }
+                StreamEvent::Notice(notice) => {
+                    // Forward provider-side advisories (image redaction, etc.) to the frontend
+                    // alongside the stream. Emitted inline so the user sees them in order with the
+                    // assistant text that follows.
+                    self.frontend.emit(FrontendEvent::Notice(notice)).await;
                 }
                 StreamEvent::Error(error) => {
                     // Treat as terminal: if the worker emits Error then closes the channel with
@@ -833,12 +862,14 @@ impl Agent {
                         .tool_registry
                         .get(name)
                         .map(|t| t.definition().parameters);
+                    let display_summary =
+                        crate::render::resolve_primary_param(name, input, schema.as_ref());
                     self.frontend
                         .emit(FrontendEvent::ToolCallStarted {
                             id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
-                            schema,
+                            display_summary,
                         })
                         .await;
                 }
@@ -937,7 +968,7 @@ impl Agent {
                 .await;
         }
 
-        Self::run_tool(&*tool, input, cancellation, &self.cwd).await
+        Self::run_tool(&*tool, input, cancellation, &self.cwd, &self.frontend).await
     }
 
     async fn execute_with_approval(
@@ -958,7 +989,9 @@ impl Agent {
             })
             .await;
         match outcome {
-            PermissionOutcome::Allow => Self::run_tool(tool, input, cancellation, &self.cwd).await,
+            PermissionOutcome::Allow => {
+                Self::run_tool(tool, input, cancellation, &self.cwd, &self.frontend).await
+            }
             PermissionOutcome::Deny => {
                 crate::tools::ToolOutput::text("User denied tool execution.".to_string(), true)
             }
@@ -968,28 +1001,34 @@ impl Agent {
         }
     }
 
-    /// Invoke a tool, scoping the per-session cwd into a task-local so any MCP `roots/list`
-    /// callback fired during the call sees this session's cwd (rather than the process default
-    /// seeded on [`crate::mcp::McpClientContext`] at startup). Built-in tools ignore the task-local
-    /// — they read cwd directly from their own `SharedCwd` field — so the wrap is cheap on those
-    /// paths.
+    /// Invoke a tool, scoping the per-session cwd and frontend into task-locals so MCP-originated
+    /// callbacks fired during the call (`roots/list`, `notifications/progress`,
+    /// `elicitation/create`) reach the calling session's UI rather than the process default.
+    /// Built-in tools ignore both task-locals — they read cwd from their own `SharedCwd` field and
+    /// never produce MCP callbacks — so the wrap is cheap on those paths.
     async fn run_tool(
         tool: &dyn crate::tools::Tool,
         input: &serde_json::Value,
         cancellation: CancellationToken,
         cwd: &SharedCwd,
+        frontend: &Arc<dyn Frontend>,
     ) -> crate::tools::ToolOutput {
         let input = input.clone();
+        let frontend = Arc::clone(frontend);
         crate::mcp::with_session_cwd(cwd.clone(), async move {
-            match tool.execute(input, cancellation).await {
-                Ok(output) => output,
-                Err(AgshError::Interrupted) => {
-                    crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
+            crate::mcp::with_session_frontend(frontend, async move {
+                match tool.execute(input, cancellation).await {
+                    Ok(output) => output,
+                    Err(AgshError::Interrupted) => crate::tools::ToolOutput::text(
+                        "Tool execution interrupted.".to_string(),
+                        true,
+                    ),
+                    Err(error) => {
+                        crate::tools::ToolOutput::text(format!("Tool error: {}", error), true)
+                    }
                 }
-                Err(error) => {
-                    crate::tools::ToolOutput::text(format!("Tool error: {}", error), true)
-                }
-            }
+            })
+            .await
         })
         .await
     }
@@ -1063,7 +1102,13 @@ impl Agent {
             .complete(system_prompt, &compact_messages, &[])
             .await;
         self.provider.set_thinking_override(None);
-        let (summary_message, _stop_reason, _usage) = compact_result?;
+        let (summary_message, _stop_reason, _usage, notices) = compact_result?;
+        // Surface any provider notices from the summary call (e.g. image redaction on a very large
+        // compaction window). Rare in practice; emitting before we mutate the conversation keeps
+        // the user-facing order stable.
+        for notice in notices {
+            self.frontend.emit(FrontendEvent::Notice(notice)).await;
+        }
 
         let summary_text = summary_message.text_content();
         if summary_text.is_empty() {

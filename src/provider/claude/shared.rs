@@ -809,14 +809,16 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
 /// serialized JSON. It's called once on the original messages and, if oversized, a second time on
 /// the redacted set.
 ///
-/// On a successful redaction pass, this records the [`RedactionStats`] on `session_stats` (when
-/// provided) and emits a single user-visible `render::render_hint` line describing what was
-/// dropped.
+/// Returns the serialized body plus an optional [`crate::provider::Notice`]: on a successful
+/// redaction pass, the notice describes what was dropped so the caller can forward it to the active
+/// frontend (REPL renders via `render_hint`; ACP surfaces in the session/update stream). On the
+/// happy path (no redaction needed), the notice is `None`. The function also records
+/// [`RedactionStats`] on `session_stats` when one is provided.
 pub(super) fn build_body_within_budget<F>(
     messages: &[Message],
     session_stats: Option<&std::sync::Arc<crate::stats::SessionStats>>,
     mut build: F,
-) -> Result<String>
+) -> Result<(String, Option<crate::provider::Notice>)>
 where
     F: FnMut(&[Message]) -> Result<String>,
 {
@@ -824,7 +826,7 @@ where
     let body_json = build(prepared.as_ref())?;
 
     if body_json.len() <= MAX_REQUEST_BYTES {
-        return Ok(body_json);
+        return Ok((body_json, None));
     }
 
     let bytes_to_drop = body_json.len() - REDACTION_TARGET_BYTES;
@@ -843,18 +845,18 @@ where
     if let Some(session_stats) = session_stats {
         session_stats.record_redaction(stats.images_redacted as u64, stats.bytes_freed as u64);
     }
-    crate::render::render_hint(&format!(
+    let notice_text = format!(
         "Redacted {} old image{} (~{} MiB freed). Cache prefix invalidated for those messages.",
         stats.images_redacted,
         if stats.images_redacted == 1 { "" } else { "s" },
         stats.bytes_freed / 1_048_576,
-    ));
+    );
     tracing::warn!(
         "redacted {} old tool-result image(s); body now {} MiB",
         stats.images_redacted,
         body_json.len() / 1_048_576,
     );
-    Ok(body_json)
+    Ok((body_json, Some(crate::provider::Notice::info(notice_text))))
 }
 
 #[cfg(test)]
@@ -1179,5 +1181,60 @@ mod tests {
             },
             _ => unreachable!(),
         }
+    }
+
+    /// Locks in the contract that `build_body_within_budget` returns a user-visible
+    /// [`crate::provider::Notice`] (rather than printing to stderr directly) when redaction kicks
+    /// in. The agent loop then forwards it through `Frontend::emit`, which is how ACP clients see
+    /// the redaction signal that used to silently bypass them.
+    #[test]
+    fn test_build_body_within_budget_returns_notice_on_redaction() {
+        use std::cell::Cell;
+
+        // Two messages, the first containing an oversized image and the second a small one. The
+        // redactor only touches non-last messages, so the older image is the one that gets
+        // dropped.
+        let big_payload = "X".repeat(2 * 1024 * 1024);
+        let messages = vec![
+            user_with_block(image_block("call_a", &big_payload)),
+            user_with_block(image_block("call_b", "BBB")),
+            assistant_text("ack"),
+        ];
+
+        let call_count: Cell<usize> = Cell::new(0);
+        let build = |_msgs: &[Message]| -> Result<String> {
+            let n = call_count.get();
+            call_count.set(n + 1);
+            if n == 0 {
+                // First serialization: oversize. Use a slim payload so the test stays cheap; the
+                // function only cares about `.len() > MAX_REQUEST_BYTES`.
+                Ok("X".repeat(MAX_REQUEST_BYTES + 1024))
+            } else {
+                Ok("{}".to_string())
+            }
+        };
+
+        let (body, notice) =
+            build_body_within_budget(&messages, None, build).expect("redaction should succeed");
+        assert_eq!(body, "{}");
+        let notice = notice.expect("redaction must surface a Notice");
+        assert_eq!(notice.level, crate::provider::NoticeLevel::Info);
+        assert!(
+            notice.text.starts_with("Redacted "),
+            "notice text should describe the redaction: {:?}",
+            notice.text,
+        );
+        assert_eq!(call_count.get(), 2, "build closure called twice");
+    }
+
+    /// On the happy path (no redaction needed), the function returns `None` for the notice. Locks
+    /// the contract: frontends never see a no-op advisory.
+    #[test]
+    fn test_build_body_within_budget_no_notice_when_within_budget() {
+        let messages = vec![assistant_text("hi")];
+        let build = |_msgs: &[Message]| -> Result<String> { Ok("{}".to_string()) };
+        let (body, notice) = build_body_within_budget(&messages, None, build).expect("happy path");
+        assert_eq!(body, "{}");
+        assert!(notice.is_none());
     }
 }
