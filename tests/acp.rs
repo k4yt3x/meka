@@ -4323,51 +4323,6 @@ fn acp_session_prompt_rejects_concurrent_prompt_same_session() {
     assert_eq!(response_a["result"]["stopReason"], "end_turn");
 }
 
-/// `MaxTurnRequests` cap surfaces as the spec's stop reason rather than running forever or
-/// erroring. Constructed by scripting a tool-use round that the agent loops on; the cap fires after
-/// N iterations.
-#[test]
-fn acp_session_prompt_max_turn_requests_stop_reason() {
-    // Drop the cap to a small number so the test stays fast on slow CI (Windows in particular
-    // takes ~3s per IPC round-trip, which would blow past the 15s harness deadline at the default
-    // cap of 100).
-    let config = r#"
-[provider]
-name = "claude-api"
-model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
-
-[agent]
-max_turn_requests = 5
-"#;
-    // Use a platform-aware path so resolve_against_cwd accepts it on Windows too. The file doesn't
-    // need to exist — the read failing produces a tool_result that drives the next loop iteration
-    // just as well as a successful read.
-    let path_value = std::env::temp_dir()
-        .join("agsh-acp-test-mtr-target.txt")
-        .to_string_lossy()
-        .into_owned();
-    let mut rounds: Vec<serde_json::Value> = Vec::new();
-    for i in 0..10 {
-        rounds.push(serde_json::json!([
-            { "kind": "text", "text": format!("round {}", i) },
-            { "kind": "tool_use_start", "id": format!("call_{}", i), "name": "read_file" },
-            { "kind": "tool_use_end", "input": { "path": path_value } },
-            { "kind": "message_end", "stop_reason": "tool_use" }
-        ]));
-    }
-    let script = serde_json::Value::Array(rounds);
-    let mut harness = AcpTestHarness::spawn(config, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "spin");
-    let response = harness.await_response(id);
-    assert_eq!(
-        response["result"]["stopReason"], "max_turn_requests",
-        "loop exceeding cap must surface as max_turn_requests: {}",
-        response,
-    );
-}
-
 /// Refusal stop reason — Claude `stop_reason: "refusal"` is mapped to `MockStopReason::Refusal` and
 /// surfaces as the spec's `refusal` stop reason in the response. Mock needs the variant; add it.
 #[test]

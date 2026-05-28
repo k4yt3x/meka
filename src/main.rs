@@ -28,6 +28,7 @@ mod relay;
 mod render;
 mod repl;
 mod sandbox;
+mod server;
 mod session;
 mod setup;
 mod skills;
@@ -91,13 +92,16 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::Result<()> {
-    // `agsh acp` is heavyweight (needs the full config + credential resolution + MCP setup) so it
-    // routes through `async_main` rather than the lightweight subcommand block below.
+    // `agsh acp` and `agsh serve` are heavyweight (full config + credential resolution + MCP
+    // setup) so they route through `async_main` rather than the lightweight subcommand block
+    // below.
     let acp_mode = matches!(cli.command, Some(cli::Command::Acp));
+    let serve_mode = matches!(cli.command, Some(cli::Command::Serve { .. }));
 
     // Handle subcommands that don't need full config resolution.
     if let Some(command) = cli.command.as_ref()
         && !acp_mode
+        && !serve_mode
     {
         let cli_ref = &cli;
         return runtime.block_on(async move {
@@ -122,7 +126,9 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
                 cli::Command::Skill { action } => run_skill_subcommand(action).await,
-                cli::Command::Acp => unreachable!("Acp routes through async_main above"),
+                cli::Command::Acp | cli::Command::Serve { .. } => {
+                    unreachable!("Acp / Serve route through async_main above");
+                }
             }
         });
     }
@@ -152,7 +158,12 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
     if let Some(prompt) = skill_prompt {
         config.prompt = Some(prompt);
     }
-    runtime.block_on(async_main(config, acp_mode))
+    // `--bind` on `agsh serve` overrides the config-file `[serve].bind`. Apply here so
+    // `async_main` sees a single resolved binding without re-parsing the CLI.
+    if let Some(cli::Command::Serve { bind: Some(bind) }) = cli.command.as_ref() {
+        config.serve_bind_override = Some(bind.clone());
+    }
+    runtime.block_on(async_main(config, acp_mode, serve_mode))
 }
 
 /// Render a `--skill <name>` invocation into the user-message string that drives the first turn.
@@ -207,7 +218,11 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
     EnvFilter::new(log_level).add_directive(directive)
 }
 
-async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Result<()> {
+async fn async_main(
+    mut config: ResolvedConfig,
+    acp_mode: bool,
+    serve_mode: bool,
+) -> anyhow::Result<()> {
     // Validate provider name and model before opening the session store or resolving credentials so
     // the user sees a clear "not configured" or "invalid value" message instead of the downstream
     // credential error.
@@ -292,8 +307,12 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
         None
     };
 
-    // `agsh acp` reuses every step above (credential resolution, MCP setup, session-manager
-    // housekeeping) and then enters the JSON-RPC stdio loop instead of the REPL.
+    // `agsh acp` and `agsh serve` reuse every step above (credential resolution, MCP setup,
+    // session-manager housekeeping) and then enter their respective transport loops instead of
+    // the REPL.
+    if serve_mode {
+        return server::run_serve(config, session_manager, mcp_manager, mcp_context).await;
+    }
     if acp_mode {
         return acp::run_acp(config, session_manager, mcp_manager, mcp_context).await;
     }
@@ -332,7 +351,7 @@ async fn async_main(mut config: ResolvedConfig, acp_mode: bool) -> anyhow::Resul
 }
 
 /// Process-wide dependencies that every ACP session shares. Built once at `agsh acp` startup by
-/// [`build_acp_shared_deps`]; sessions hold an [`Arc<SharedDeps>`] and read fields by reference.
+/// [`build_shared_deps`]; sessions hold an [`Arc<SharedDeps>`] and read fields by reference.
 /// Cheap to clone (every field is either an `Arc`, an owned-but-small value, or a clonable handle).
 ///
 /// The REPL / oneshot paths don't use this — they go through [`create_agent_from_config`] which
@@ -354,12 +373,12 @@ pub struct SharedDeps {
 
 /// Build the process-wide [`SharedDeps`] for `agsh acp`. Sets up the provider, MCP wiring, skill
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
-/// calls [`build_acp_session_agent`] against the resulting struct to spin up its own per-session
+/// calls [`build_session_agent`] against the resulting struct to spin up its own per-session
 /// `Agent` + `ToolRegistry`.
 ///
 /// `mcp_context.set_provider(...)` is called here so MCP sampling callbacks can reach the provider.
-/// Per-session cwd routing happens at MCP tool dispatch time (Phase 3 task-local cwd).
-pub async fn build_acp_shared_deps(
+/// Per-session cwd routing happens at MCP tool dispatch time (task-local cwd).
+pub async fn build_shared_deps(
     config: ResolvedConfig,
     session_manager: SessionManager,
     credential: AuthCredential,
@@ -426,7 +445,6 @@ pub async fn build_acp_shared_deps(
                 .map(crate::config::context_window_for_model)
                 .unwrap_or(128_000)
         }),
-        max_turn_requests: config.max_turn_requests,
         user_instructions: config.user_instructions.clone(),
         mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
@@ -439,7 +457,7 @@ pub async fn build_acp_shared_deps(
 
     // Kick off the MCP background connector once for the whole process. The connector writes tool
     // discoveries through `update_server_tools`, which fans them out to every attached registry —
-    // so per-session registries built later via `build_acp_session_agent` see the tools as servers
+    // so per-session registries built later via `build_session_agent` see the tools as servers
     // come online. Idempotent on second call.
     if let Some(manager) = &mcp_manager {
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(&config));
@@ -460,7 +478,7 @@ pub async fn build_acp_shared_deps(
     })
 }
 
-/// Inputs both `build_acp_session_agent` and `create_agent_from_config` hand into the unified
+/// Inputs both `build_session_agent` and `create_agent_from_config` hand into the unified
 /// [`assemble_agent`] helper. Bundling them in a struct keeps the assembly call below readable and
 /// lets both callers express "everything I built; turn it into an Agent" in one line.
 struct AgentAssembly<'a> {
@@ -486,7 +504,7 @@ struct AgentAssembly<'a> {
 /// finally constructs the `Agent` itself.
 ///
 /// **MCP attach-before-connector invariant**: the caller is expected to either (a) already have run
-/// `start_connector` (ACP path — `build_acp_shared_deps` does this once) or (b) call
+/// `start_connector` (ACP path — `build_shared_deps` does this once) or (b) call
 /// `start_connector` *after* this returns (REPL path). Either way, the registry must be attached
 /// before any connector activity, so initial tool-list discoveries reach this session's registry.
 async fn assemble_agent(
@@ -578,7 +596,7 @@ async fn assemble_agent(
 /// The returned `ToolRegistry` is the one already attached to the MCP manager — callers (the ACP
 /// `session/new` handler) keep a handle so they can pass it to
 /// [`crate::mcp::McpClientManager::detach_registry`] on `session/close`.
-pub async fn build_acp_session_agent(
+pub async fn build_session_agent(
     shared: &SharedDeps,
     shared_permission: SharedPermission,
     frontend: Arc<dyn frontend::Frontend>,
@@ -685,7 +703,6 @@ async fn create_agent_from_config(
                 .map(crate::config::context_window_for_model)
                 .unwrap_or(128_000)
         }),
-        max_turn_requests: config.max_turn_requests,
         user_instructions: config.user_instructions.clone(),
         mcp_strict: config.mcp_strict,
         mcp_grace: config.mcp_grace,
@@ -718,7 +735,7 @@ async fn create_agent_from_config(
         // Kick off the background connector. Each server's adapters are pushed through
         // `manager.update_server_tools` and then fan out to every attached registry. Safe to call
         // after any number of `attach_registry`s; idempotent on second call. (The ACP path does
-        // this once in `build_acp_shared_deps`; the REPL path does it here, after `assemble_agent`
+        // this once in `build_shared_deps`; the REPL path does it here, after `assemble_agent`
         // has attached the single registry.)
         manager.start_connector(crate::mcp::McpRuntimeConfig::from_config(config));
     }
@@ -1602,7 +1619,7 @@ fn format_timestamp(rfc3339: &str) -> String {
         .unwrap_or_else(|_| rfc3339.to_string())
 }
 
-fn format_session_as_markdown(
+pub(crate) fn format_session_as_markdown(
     session_id: uuid::Uuid,
     messages: &[provider::Message],
     tool_outputs: &std::collections::HashMap<String, String>,

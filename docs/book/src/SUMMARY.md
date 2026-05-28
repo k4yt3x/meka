@@ -19,6 +19,7 @@
 - [Interactive Mode](./usage/interactive-mode.md)
 - [One-Shot Mode](./usage/one-shot-mode.md)
 - [ACP](./usage/acp.md)
+- [HTTP API](./usage/http-api.md)
 - [Permissions](./usage/permissions.md)
 - [Sessions](./usage/sessions.md)
 - [Skills](./usage/skills.md)
@@ -39,3 +40,4 @@
 - [Web](./tools/web.md)
 - [Shell](./tools/shell.md)
 - [Scratchpad](./tools/scratchpad.md)
+

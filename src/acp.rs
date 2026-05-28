@@ -1129,7 +1129,7 @@ pub async fn run_acp(
     // Build process-wide shared deps once. Sessions hold an `Arc<SharedDeps>` and read fields by
     // reference; no work happens here that needs to be re-run per session.
     let shared = Arc::new(
-        super::build_acp_shared_deps(
+        super::build_shared_deps(
             config,
             session_manager,
             credential,
@@ -1613,7 +1613,6 @@ async fn run_prompt_turn(
         Ok(crate::agent::TurnOutcome::EndTurn) => StopReason::EndTurn,
         Ok(crate::agent::TurnOutcome::MaxTokens) => StopReason::MaxTokens,
         Ok(crate::agent::TurnOutcome::Refusal(_)) => StopReason::Refusal,
-        Ok(crate::agent::TurnOutcome::MaxTurnRequests) => StopReason::MaxTurnRequests,
         Err(AgshError::Interrupted) => StopReason::Cancelled,
         Err(error) => {
             if cancel_probe.is_cancelled() {
@@ -2027,8 +2026,8 @@ async fn handle_set_session_mode(
 /// and `session/resume` — each follows the same shape:
 /// 1. Construct the per-session `AcpFrontend` bound to this connection + session id.
 /// 2. Build a per-session `SharedPermission` cell seeded from config defaults.
-/// 3. Build the per-session `Agent` + `ToolRegistry` via [`crate::build_acp_session_agent`], which
-///    also attaches the registry to the MCP manager.
+/// 3. Build the per-session `Agent` + `ToolRegistry` via [`crate::build_session_agent`], which also
+///    attaches the registry to the MCP manager.
 /// 4. Bundle everything into a `SessionRuntime`.
 #[allow(clippy::too_many_arguments)]
 async fn build_session_runtime(
@@ -2056,8 +2055,7 @@ async fn build_session_runtime(
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
     let (agent, tool_registry) =
-        crate::build_acp_session_agent(shared, permission.clone(), frontend, Arc::clone(&cwd))
-            .await?;
+        crate::build_session_agent(shared, permission.clone(), frontend, Arc::clone(&cwd)).await?;
 
     Ok(SessionRuntime {
         session_id_str,

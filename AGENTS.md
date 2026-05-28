@@ -83,7 +83,8 @@ Clap `///` doc-comments must render within 80 columns when shown via `-h`. Verif
 ## Build & Formatting Commands
 
 - Always run `cargo +nightly fmt` and `cargo sort -w` after editing code.
-- Always run `cargo build` after completing all tasks
+- Always run `cargo build` after completing all tasks.
+- Always run `cargo doc --no-deps --document-private-items` after completing all tasks.
 
 ## Changelog
 

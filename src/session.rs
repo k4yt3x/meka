@@ -34,14 +34,41 @@ struct StoredMessage {
     created_at: String,
 }
 
+/// Result of [`SessionManager::create_session_with_metadata`]. Carries the canonical RFC 3339
+/// `created_at` so the caller's in-memory state shares one timestamp with the DB row — without
+/// this, the handler's `SessionEntry.created_at` and the DB `sessions.created_at` would each
+/// capture `Utc::now()` independently and drift by a few ms. Re-attach reads the DB value,
+/// so the in-memory value has to match for round-trip tests to be deterministic.
+#[derive(Debug, Clone)]
+pub struct CreatedSession {
+    pub id: Uuid,
+    /// RFC 3339 timestamp written to both `sessions.created_at` and `sessions.updated_at`.
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: Uuid,
+    /// RFC 3339 timestamp the session row was first written. Surfaced alongside `updated_at`
+    /// so re-attach can restore the original creation time rather than stamping a fresh
+    /// `Utc::now()` on every reconstruction.
+    pub created_at: String,
     pub updated_at: String,
     pub preview: String,
     /// Working directory captured at `create_session` time. `None` for legacy rows from before the
     /// `cwd` column was added; ACP-facing code falls back to the process cwd for display.
     pub cwd: Option<std::path::PathBuf>,
+    /// Permission level captured at session creation, or `None` for legacy rows / sessions created
+    /// without a per-session permission (the REPL and ACP paths derive permission from process
+    /// config, not per-session). The HTTP API persists this so `POST /v1/sessions` with an
+    /// explicit `permission` field survives GC-eviction + re-attach.
+    pub permission: Option<String>,
+    /// JSON-encoded per-session capability flags (currently just
+    /// `{"supports_reasoning_stream": bool}`). Same NULL-for-legacy semantics as `permission`.
+    pub capabilities_json: Option<String>,
+    /// SHA-256 fingerprint of the bearer token that created this session. `None` for legacy
+    /// rows and for sessions not created via the HTTP API.
+    pub token_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,7 +290,10 @@ impl SessionManager {
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
                         parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
-                        cwd TEXT
+                        cwd TEXT,
+                        permission TEXT,
+                        capabilities_json TEXT,
+                        token_id TEXT
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
@@ -483,6 +513,54 @@ impl SessionManager {
                     migration_result?;
                 }
 
+                // Migration: add `sessions.permission` and `sessions.capabilities_json`. Both back
+                // the HTTP API's per-session permission / capability flags so a GC-evicted session
+                // can be re-attached with the same shape the client originally created it with.
+                // Legacy rows (REPL / ACP / pre-0.27 HTTP) get NULL, and the re-attach helper falls
+                // back to the process default. Runs after the cascade-FK rebuild because the
+                // rebuild's `sessions_new` schema doesn't include these columns — the ALTER ADD
+                // here applies to both fresh DBs (no-op) and rebuilt DBs alike.
+                let has_permission_col: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'permission'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_permission_col {
+                    connection
+                        .execute_batch("ALTER TABLE sessions ADD COLUMN permission TEXT")?;
+                }
+                let has_capabilities_col: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'capabilities_json'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_capabilities_col {
+                    connection.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN capabilities_json TEXT",
+                    )?;
+                }
+
+                // Migration: add `sessions.token_id` to attribute HTTP-created sessions back
+                // to their creating bearer token. NULL for legacy rows and for REPL/ACP
+                // sessions.
+                let has_token_id_col: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'token_id'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_token_id_col {
+                    connection.execute_batch("ALTER TABLE sessions ADD COLUMN token_id TEXT")?;
+                }
+
                 Ok(())
             })
             .await
@@ -494,23 +572,52 @@ impl SessionManager {
     /// (legacy/test fixtures, `agsh tools list`). Production paths (the REPL and `agsh acp`) pass
     /// the agent's current cwd so `session/list` can surface it later.
     pub async fn create_session(&self, cwd: Option<std::path::PathBuf>) -> Result<Uuid> {
+        self.create_session_with_metadata(cwd, None, None, None)
+            .await
+            .map(|created| created.id)
+    }
+
+    /// Like [`Self::create_session`] but also persists the HTTP API's per-session metadata
+    /// (`permission` level, `capabilities_json` blob, and `token_id` fingerprint). The REPL
+    /// and ACP paths derive permission from process config and don't have a bearer token, so
+    /// they keep calling the unparameterised `create_session`; only the HTTP server's
+    /// `POST /v1/sessions` handler reaches for this overload.
+    pub async fn create_session_with_metadata(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        permission: Option<String>,
+        capabilities_json: Option<String>,
+        token_id: Option<String>,
+    ) -> Result<CreatedSession> {
         let session_id = Uuid::new_v4();
-        let now = chrono::Utc::now().to_rfc3339();
+        let created_at = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
 
+        let created_at_for_db = created_at.clone();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO sessions (id, created_at, updated_at, cwd)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session_id.to_string(), now, now, cwd_string],
+                    "INSERT INTO sessions (id, created_at, updated_at, cwd, permission, capabilities_json, token_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        created_at_for_db,
+                        created_at_for_db,
+                        cwd_string,
+                        permission,
+                        capabilities_json,
+                        token_id,
+                    ],
                 )?;
                 Ok(())
             })
             .await
             .map_err(|error| AgshError::Database(format!("failed to create session: {}", error)))?;
 
-        Ok(session_id)
+        Ok(CreatedSession {
+            id: session_id,
+            created_at,
+        })
     }
 
     /// Create a session whose `parent_session_id` references an existing session — used by
@@ -685,6 +792,59 @@ impl SessionManager {
         self.save_message(session_id, &role, &content).await
     }
 
+    /// Persist a batch of events atomically in one SQLite transaction.  The agent loop
+    /// uses this to save the assistant message + the matching tool-results message
+    /// together.  Without the transaction, a failure on the tool-results row would leave
+    /// the assistant message persisted with `tool_use` blocks but no matching tool
+    /// results, corrupting the conversation for subsequent turns.  The transaction
+    /// guarantees either both rows commit or neither does.
+    ///
+    /// `events` MUST be non-empty; an empty batch is a no-op. `updated_at` is bumped once
+    /// at the end of the batch (not once per row) so the row reflects the batch's commit
+    /// time rather than the order events were appended.
+    pub async fn save_events_atomic(
+        &self,
+        session_id: Uuid,
+        events: Vec<crate::conversation::Event>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        // Encode all events upfront so a serialization failure aborts before any DB I/O.
+        let mut encoded: Vec<(String, String)> = Vec::with_capacity(events.len());
+        for event in &events {
+            let pair = encode_event_for_db(event).map_err(|error| {
+                AgshError::Database(format!("failed to encode event: {}", error))
+            })?;
+            encoded.push(pair);
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let session_id_str = session_id.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let txn = connection.transaction()?;
+                {
+                    let mut insert = txn.prepare(
+                        "INSERT INTO messages (session_id, role, content, created_at) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )?;
+                    for (role, content) in &encoded {
+                        insert.execute(rusqlite::params![session_id_str, role, content, now])?;
+                    }
+                }
+                txn.execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, session_id_str],
+                )?;
+                txn.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to save event batch atomically: {}", error))
+            })
+    }
+
     /// Load every event for a session in chronological order. Legacy rows (role ∈ {`user`,
     /// `assistant`, `tool_results`}) are reconstructed as `Event::Append`; rows with role
     /// `compact_boundary` are deserialized from the JSON envelope. Unknown roles are skipped with a
@@ -695,6 +855,34 @@ impl SessionManager {
         for row in stored {
             match decode_event_from_row(&row) {
                 Ok(Some(event)) => events.push(event),
+                Ok(None) => {
+                    tracing::warn!("dropping unparseable session row (role={})", row.role);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to decode session row (role={}): {}",
+                        row.role,
+                        error
+                    );
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    /// Variant of [`Self::load_events`] that also returns the persisted `created_at` timestamp for
+    /// each event. Used by the HTTP `GET /v1/sessions/{id}/messages` endpoint to surface
+    /// per-message creation timestamps on `MessageView` per the spec's resource model.
+    /// Order matches `load_events` exactly: chronological by insert id.
+    pub async fn load_events_with_timestamps(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<(String, crate::conversation::Event)>> {
+        let stored = self.load_messages(session_id).await?;
+        let mut events = Vec::with_capacity(stored.len());
+        for row in stored {
+            match decode_event_from_row(&row) {
+                Ok(Some(event)) => events.push((row.created_at, event)),
                 Ok(None) => {
                     tracing::warn!("dropping unparseable session row (role={})", row.role);
                 }
@@ -895,7 +1083,7 @@ impl SessionManager {
                     format!("WHERE {}", clauses.join(" AND "))
                 };
                 let query = format!(
-                    "SELECT s.id, s.updated_at, s.cwd,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.token_id,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -925,24 +1113,50 @@ impl SessionManager {
 
                 let rows = statement.query_map(params.as_slice(), |row| {
                     let id_str: String = row.get(0)?;
-                    let updated_at: String = row.get(1)?;
-                    let cwd: Option<String> = row.get(2)?;
-                    let preview: String = row.get(3)?;
-                    Ok((id_str, updated_at, cwd, preview))
+                    let created_at: String = row.get(1)?;
+                    let updated_at: String = row.get(2)?;
+                    let cwd: Option<String> = row.get(3)?;
+                    let permission: Option<String> = row.get(4)?;
+                    let capabilities_json: Option<String> = row.get(5)?;
+                    let token_id: Option<String> = row.get(6)?;
+                    let preview: String = row.get(7)?;
+                    Ok((
+                        id_str,
+                        created_at,
+                        updated_at,
+                        cwd,
+                        permission,
+                        capabilities_json,
+                        token_id,
+                        preview,
+                    ))
                 })?;
 
                 let mut summaries = Vec::new();
                 for row in rows {
-                    let (id_str, updated_at, cwd, preview) = row?;
+                    let (
+                        id_str,
+                        created_at,
+                        updated_at,
+                        cwd,
+                        permission,
+                        capabilities_json,
+                        token_id,
+                        preview,
+                    ) = row?;
                     let id = Uuid::parse_str(&id_str).map_err(|error| {
                         rusqlite::Error::InvalidParameterName(error.to_string())
                     })?;
                     let preview = truncate_preview(&preview, 80);
                     summaries.push(SessionSummary {
                         id,
+                        created_at,
                         updated_at,
                         preview,
                         cwd: cwd.map(PathBuf::from),
+                        permission,
+                        capabilities_json,
+                        token_id,
                     });
                 }
                 Ok(summaries)
@@ -968,7 +1182,7 @@ impl SessionManager {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT s.id, s.updated_at, s.cwd,
+                    "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.token_id,
                             COALESCE(
                               (SELECT content FROM messages
                                WHERE session_id = s.id AND role = 'user'
@@ -980,22 +1194,48 @@ impl SessionManager {
                 )?;
                 let mut rows = statement.query_map(rusqlite::params![id.to_string()], |row| {
                     let id_str: String = row.get(0)?;
-                    let updated_at: String = row.get(1)?;
-                    let cwd: Option<String> = row.get(2)?;
-                    let preview: String = row.get(3)?;
-                    Ok((id_str, updated_at, cwd, preview))
+                    let created_at: String = row.get(1)?;
+                    let updated_at: String = row.get(2)?;
+                    let cwd: Option<String> = row.get(3)?;
+                    let permission: Option<String> = row.get(4)?;
+                    let capabilities_json: Option<String> = row.get(5)?;
+                    let token_id: Option<String> = row.get(6)?;
+                    let preview: String = row.get(7)?;
+                    Ok((
+                        id_str,
+                        created_at,
+                        updated_at,
+                        cwd,
+                        permission,
+                        capabilities_json,
+                        token_id,
+                        preview,
+                    ))
                 })?;
                 match rows.next() {
                     Some(row) => {
-                        let (id_str, updated_at, cwd, preview) = row?;
+                        let (
+                            id_str,
+                            created_at,
+                            updated_at,
+                            cwd,
+                            permission,
+                            capabilities_json,
+                            token_id,
+                            preview,
+                        ) = row?;
                         let id = Uuid::parse_str(&id_str).map_err(|error| {
                             rusqlite::Error::InvalidParameterName(error.to_string())
                         })?;
                         Ok(Some(SessionSummary {
                             id,
+                            created_at,
                             updated_at,
                             preview: truncate_preview(&preview, 80),
                             cwd: cwd.map(PathBuf::from),
+                            permission,
+                            capabilities_json,
+                            token_id,
                         }))
                     }
                     None => Ok(None),
@@ -1003,6 +1243,20 @@ impl SessionManager {
             })
             .await
             .map_err(|error| AgshError::Database(format!("failed to fetch session: {}", error)))
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` to flush the SQLite write-ahead log into the main
+    /// database file. Called from `agsh serve`'s graceful-shutdown path so a `SIGTERM` followed
+    /// by a fresh `agsh` process invocation doesn't see a long WAL replay on open. Errors are
+    /// non-fatal: SQLite recovers from an unflushed WAL on next open, so we log and continue.
+    pub async fn checkpoint(&self) -> Result<()> {
+        self.connection
+            .call(|connection| -> rusqlite::Result<_> {
+                connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| AgshError::Database(format!("WAL checkpoint failed: {}", error)))
     }
 
     pub async fn delete_expired_sessions(&self, retention_days: u64) -> Result<u64> {
@@ -1040,6 +1294,52 @@ impl SessionManager {
     /// client wins so future `session/list` results reflect the live state. `cwd` is stored as the
     /// path's `to_string_lossy()` form (UTF-8 is the only column type SQLite has). Returns the
     /// number of rows updated (0 if the session id doesn't exist).
+    ///
+    /// Apply both `permission` and `cwd` updates in a single SQLite transaction so a DB
+    /// failure between the two writes can't leave a half-applied state on disk.  Either
+    /// column may be `None` to skip that field.  `updated_at` is recomputed inside the
+    /// transaction so the timestamp matches the commit, not the call.  The individual
+    /// `update_session_cwd` / `update_session_permission` methods remain for callers
+    /// that only need a single-column write.
+    pub async fn update_session_metadata_atomic(
+        &self,
+        session_id: Uuid,
+        new_permission: Option<String>,
+        new_cwd: Option<std::path::PathBuf>,
+    ) -> Result<()> {
+        if new_permission.is_none() && new_cwd.is_none() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let id_string = session_id.to_string();
+        let cwd_string = new_cwd.map(|cwd| cwd.to_string_lossy().into_owned());
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let txn = connection.transaction()?;
+                if let Some(ref permission) = new_permission {
+                    txn.execute(
+                        "UPDATE sessions SET permission = ?1, updated_at = ?2 WHERE id = ?3",
+                        rusqlite::params![permission, now, id_string],
+                    )?;
+                }
+                if let Some(ref cwd) = cwd_string {
+                    txn.execute(
+                        "UPDATE sessions SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
+                        rusqlite::params![cwd, now, id_string],
+                    )?;
+                }
+                txn.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!(
+                    "failed to update session metadata atomically: {}",
+                    error
+                ))
+            })
+    }
+
     pub async fn update_session_cwd(
         &self,
         session_id: Uuid,
@@ -1047,16 +1347,73 @@ impl SessionManager {
     ) -> Result<usize> {
         let cwd_string = cwd.to_string_lossy().into_owned();
         let id_string = session_id.to_string();
+        // Bump `updated_at` alongside the target column so a re-attach after GC eviction
+        // sees the post-PATCH timestamp instead of regressing to the stale pre-PATCH
+        // value.
+        let updated_at = chrono::Utc::now().to_rfc3339();
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "UPDATE sessions SET cwd = ?1 WHERE id = ?2",
-                    rusqlite::params![cwd_string, id_string],
+                    "UPDATE sessions SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![cwd_string, updated_at, id_string],
                 )
             })
             .await
             .map_err(|error| {
                 AgshError::Database(format!("failed to update session cwd: {}", error))
+            })
+    }
+
+    /// Update the persisted permission level for a session. Called by the HTTP API's
+    /// `PATCH /v1/sessions/{id}` so a permission flip survives GC-eviction + re-attach. Returns
+    /// the number of rows updated (0 if the session id doesn't exist).
+    pub async fn update_session_permission(
+        &self,
+        session_id: Uuid,
+        permission: &str,
+    ) -> Result<usize> {
+        let permission = permission.to_string();
+        let id_string = session_id.to_string();
+        // Bump `updated_at` alongside the target column — see `update_session_cwd`.
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET permission = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![permission, updated_at, id_string],
+                )
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to update session permission: {}", error))
+            })
+    }
+
+    /// Update the persisted capabilities JSON blob for a session. Symmetric counterpart to
+    /// [`Self::update_session_permission`]. The blob's internal shape isn't validated here — the
+    /// HTTP handler is the only writer and serialises a `SessionCapabilities` value.
+    #[allow(
+        dead_code,
+        reason = "wired for future PATCH support; capability flips are rare"
+    )]
+    pub async fn update_session_capabilities(
+        &self,
+        session_id: Uuid,
+        capabilities_json: &str,
+    ) -> Result<usize> {
+        let capabilities_json = capabilities_json.to_string();
+        let id_string = session_id.to_string();
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET capabilities_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![capabilities_json, updated_at, id_string],
+                )
+            })
+            .await
+            .map_err(|error| {
+                AgshError::Database(format!("failed to update session capabilities: {}", error))
             })
     }
 
@@ -2859,6 +3216,66 @@ mod tests {
             tool_outputs_cascade, 1,
             "tool_outputs FK should carry ON DELETE CASCADE"
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_metadata_round_trips() {
+        let manager = test_manager().await;
+
+        // Legacy path: `create_session` leaves permission + capabilities NULL so the re-attach
+        // helper falls back to the process default.
+        let legacy = manager
+            .create_session(Some(std::path::PathBuf::from("/tmp/legacy")))
+            .await
+            .expect("create legacy");
+        let legacy_info = manager
+            .session_info(legacy)
+            .await
+            .expect("session_info")
+            .expect("legacy row");
+        assert_eq!(legacy_info.permission, None);
+        assert_eq!(legacy_info.capabilities_json, None);
+
+        // Metadata path: persisted permission + capabilities + token_id round-trip verbatim.
+        let with_meta = manager
+            .create_session_with_metadata(
+                Some(std::path::PathBuf::from("/tmp/meta")),
+                Some("read".to_string()),
+                Some(r#"{"supports_reasoning_stream":true}"#.to_string()),
+                Some("token_fp_1234".to_string()),
+            )
+            .await
+            .expect("create with metadata");
+        let meta_info = manager
+            .session_info(with_meta.id)
+            .await
+            .expect("session_info")
+            .expect("meta row");
+        assert_eq!(meta_info.permission.as_deref(), Some("read"));
+        assert_eq!(
+            meta_info.capabilities_json.as_deref(),
+            Some(r#"{"supports_reasoning_stream":true}"#)
+        );
+        assert_eq!(
+            meta_info.token_id.as_deref(),
+            Some("token_fp_1234"),
+            "token_id round-trips through the DB"
+        );
+        // The DB-returned `created_at` matches what session_info reads back.
+        assert_eq!(meta_info.created_at, with_meta.created_at);
+
+        // `update_session_permission` flips the persisted value.
+        let updated = manager
+            .update_session_permission(with_meta.id, "write")
+            .await
+            .expect("update permission");
+        assert_eq!(updated, 1);
+        let after_flip = manager
+            .session_info(with_meta.id)
+            .await
+            .expect("session_info")
+            .expect("post-flip row");
+        assert_eq!(after_flip.permission.as_deref(), Some("write"));
     }
 
     // Child-session tests: parent→sub-agent linkage, cascade-on-delete, and `agsh list` filter

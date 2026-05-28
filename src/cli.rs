@@ -62,6 +62,17 @@ pub enum Command {
     /// stderr; stdout is reserved for the protocol.
     #[command(verbatim_doc_comment)]
     Acp,
+    /// Run agsh as a long-lived HTTP service.
+    ///
+    /// Exposes the agent over HTTP+JSON for programmatic clients (bots, scripts, web UIs).
+    /// See the HTTP API docs for the full spec. Auth, session GC, and SSE streaming are configured
+    /// under `[serve]` in config.toml.
+    #[command(verbatim_doc_comment)]
+    Serve {
+        /// Override the `[serve].bind` config value (e.g. `0.0.0.0:8080`).
+        #[arg(long)]
+        bind: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

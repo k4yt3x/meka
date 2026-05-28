@@ -1,0 +1,355 @@
+//! `agsh serve` subcommand entry point. Exposes the agent over HTTP+JSON for programmatic
+//! clients (bots, scripts, web UIs). See the HTTP API docs for the full wire
+//! specification; this module owns the implementation.
+//!
+//! The HTTP transport is a third [`crate::frontend::Frontend`] impl alongside
+//! [`crate::repl::ReplFrontend`] and [`crate::acp::AcpFrontend`]. The agent core, MCP plumbing,
+//! session DB, permission model, and tool dispatch are all reused unchanged.
+
+pub(crate) mod auth;
+pub(crate) mod errors;
+pub(crate) mod gc;
+pub(crate) mod handlers;
+pub(crate) mod http_frontend;
+pub(crate) mod idempotency;
+pub(crate) mod openapi;
+pub(crate) mod poisoned;
+pub(crate) mod reattach;
+pub(crate) mod sse;
+pub(crate) mod state;
+
+use std::sync::Arc;
+
+use axum::{
+    Router, middleware,
+    response::IntoResponse,
+    routing::{delete, get, patch, post},
+};
+use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+
+use crate::{
+    config::{ResolvedConfig, ResolvedServeConfig},
+    mcp,
+    server::{
+        auth::AuthRegistry,
+        errors::{ErrorKind, ProblemDetail},
+        state::ServerState,
+    },
+    session::SessionManager,
+};
+
+/// Run agsh as an HTTP server until the listener stops accepting (e.g. on SIGTERM after the
+/// graceful-shutdown drain completes). The signature mirrors [`crate::acp::run_acp`] for
+/// consistency with the existing dispatch in `main::async_main`.
+pub async fn run_serve(
+    mut config: ResolvedConfig,
+    session_manager: SessionManager,
+    mcp_manager: Option<Arc<mcp::McpClientManager>>,
+    mcp_context: Arc<mcp::McpClientContext>,
+) -> anyhow::Result<()> {
+    let mut serve = ResolvedServeConfig::resolve(config.serve.take())
+        .map_err(|error| anyhow::anyhow!("invalid [serve] config: {}", error))?;
+    if let Some(bind_override) = config.serve_bind_override.take() {
+        serve.bind = bind_override;
+    }
+    if serve.tokens.is_empty() {
+        anyhow::bail!(
+            "[serve] is configured but has no tokens; add at least one `[[serve.tokens]]` \
+             entry with `scopes` so callers can authenticate"
+        );
+    }
+    for token in &serve.tokens {
+        if matches!(token.source, crate::config::TokenSource::Inline) {
+            tracing::warn!(
+                description = token.description.as_deref().unwrap_or("(no description)"),
+                "inline plaintext token configured; prefer ${{ENV_VAR}} or token_file for production",
+            );
+        }
+    }
+
+    let max_body_bytes = serve.max_body_bytes;
+    let bind_addr = serve.bind.clone();
+
+    let credential = config
+        .auth_credential
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("agsh serve requires a configured provider credential"))?;
+
+    let shared = Arc::new(
+        crate::build_shared_deps(
+            config,
+            session_manager,
+            credential,
+            mcp_manager,
+            mcp_context,
+        )
+        .await?,
+    );
+
+    #[cfg(debug_assertions)]
+    let shared = if std::env::var("AGSH_ACP_MOCK_PROVIDER").as_deref() == Ok("1") {
+        let rounds = crate::provider::mock::load_script_from_env()
+            .map_err(|error| anyhow::anyhow!("load mock provider script: {}", error))?
+            .unwrap_or_default();
+        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds));
+        let new_inner = crate::SharedDeps {
+            provider: mock,
+            ..(*shared).clone()
+        };
+        new_inner
+            .mcp_context
+            .set_provider(Arc::clone(&new_inner.provider));
+        tracing::info!("AGSH_ACP_MOCK_PROVIDER=1 — using scripted mock provider");
+        Arc::new(new_inner)
+    } else {
+        shared
+    };
+
+    let auth = AuthRegistry::new(serve.tokens.clone());
+    let serve_arc = Arc::new(serve);
+    let idempotency_cache = idempotency::IdempotencyCache::standard();
+    let shutdown_drain_timeout = serve_arc.shutdown_drain_timeout;
+    let state = ServerState::new(shared, serve_arc, idempotency_cache.clone());
+
+    let gc_handle = gc::spawn(state.clone());
+    let pruner_handle = idempotency_cache.spawn_pruner();
+
+    let router = build_router(state.clone(), auth, max_body_bytes);
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to bind {}: {}", bind_addr, error))?;
+    let local = listener.local_addr()?;
+    tracing::info!("agsh serve: listening on {}", local);
+
+    // The timeout wraps only the post-signal drain, not the entire serve future.
+    // Wrapping the whole future would start the timer at construction, causing the
+    // server to exit after `shutdown_drain_timeout` of total uptime.
+    let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_future = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            // Signal-watch + drain orchestration runs outside this closure so the
+            // timeout can wrap it independently of the accept loop's lifetime.
+            let _ = drain_rx.await;
+        })
+        .into_future();
+    let serve_handle = tokio::spawn(serve_future);
+
+    shutdown_signal().await;
+    tracing::info!("agsh serve: drain begin");
+    state.shutdown.cancel();
+    drain_active_sessions(&state).await;
+    let _ = drain_tx.send(());
+
+    let drain_result = tokio::time::timeout(shutdown_drain_timeout, serve_handle).await;
+    gc_handle.abort();
+    pruner_handle.abort();
+    // Flush the SQLite WAL before exit so a quick restart doesn't pay WAL-replay cost.
+    // Best-effort — SQLite recovers from an unflushed WAL automatically.
+    if let Err(error) = state.shared.session_manager.checkpoint().await {
+        tracing::warn!("agsh serve: WAL checkpoint on shutdown failed: {}", error);
+    } else {
+        tracing::info!("agsh serve: WAL checkpoint complete");
+    }
+    match drain_result {
+        Ok(join_result) => join_result
+            .map_err(|error| anyhow::anyhow!("server task panicked: {}", error))?
+            .map_err(|error| anyhow::anyhow!("server error: {}", error))?,
+        Err(_elapsed) => {
+            tracing::warn!(
+                "agsh serve: drain exceeded {}s — forcing exit",
+                shutdown_drain_timeout.as_secs()
+            );
+            // Non-zero exit so systemd / container orchestrators can distinguish forced
+            // abort from a clean drain. Same semantics as `agsh acp`.
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Fire every session's cancellation token during a graceful drain. The SSE handler also
+/// watches `state.shutdown` directly; this ensures the *blocking* path's agent loop unwinds.
+async fn drain_active_sessions(state: &ServerState) {
+    let sessions = state.sessions.read().await;
+    for entry in sessions.values() {
+        let token =
+            crate::server::poisoned::read(&entry.cancellation, "drain::session_cancel").clone();
+        token.cancel();
+    }
+}
+
+fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -> Router {
+    let authenticated = Router::new()
+        .route("/v1/sessions", post(handlers::sessions::create_session))
+        .route("/v1/sessions", get(handlers::sessions::list_sessions))
+        .route("/v1/sessions/{id}", get(handlers::sessions::get_session))
+        .route(
+            "/v1/sessions/{id}",
+            patch(handlers::sessions::patch_session),
+        )
+        .route(
+            "/v1/sessions/{id}",
+            delete(handlers::sessions::delete_session),
+        )
+        .route(
+            "/v1/sessions/{id}/messages",
+            get(handlers::messages::list_messages),
+        )
+        .route("/v1/sessions/{id}/turn", post(handlers::turn::submit_turn))
+        .route(
+            "/v1/sessions/{id}/cancel",
+            post(handlers::turn::cancel_turn),
+        )
+        .route(
+            "/v1/sessions/{id}/responses/{request_id}",
+            post(handlers::responses::respond),
+        )
+        .route("/v1/info", get(handlers::info::info))
+        .route("/v1/skills", get(handlers::info::skills))
+        .route("/v1/mcp", get(handlers::info::mcp))
+        .layer(middleware::from_fn_with_state(
+            auth.clone(),
+            crate::server::auth::bearer_auth,
+        ));
+
+    let public = Router::new()
+        .route("/v1/health/live", get(handlers::discovery::live))
+        .route("/v1/health/ready", get(handlers::discovery::ready));
+
+    authenticated
+        .merge(public)
+        .merge(openapi::router())
+        .layer(RequestBodyLimitLayer::new(max_body_bytes))
+        .layer(middleware::from_fn_with_state(
+            max_body_bytes,
+            rewrite_payload_too_large,
+        ))
+        .layer(middleware::from_fn(inject_problem_instance))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// Convert tower-http's plain-text 413 response to a Problem Detail. Runs as a middleware so the
+/// rewrite happens once for every layered route — handlers themselves never produce 413, so any
+/// 413 the middleware observes came from the body-limit layer.
+async fn rewrite_payload_too_large(
+    axum::extract::State(max_body_bytes): axum::extract::State<usize>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    if response.status() != axum::http::StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    // Don't double-wrap if a handler somehow returned 413 with the spec content-type already.
+    let already_problem = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/problem+json"));
+    if already_problem {
+        return response;
+    }
+    ProblemDetail::new(
+        ErrorKind::PayloadTooLarge,
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "request body exceeds the configured limit of {} bytes",
+            max_body_bytes,
+        ),
+    )
+    .instance(path)
+    .with("max_body_bytes", serde_json::Value::from(max_body_bytes))
+    .into_response()
+}
+
+/// Inject RFC 9457's `instance` member into every Problem Detail response body that doesn't
+/// already have one. Handled as middleware rather than per-handler to avoid threading a
+/// `RequestPath` extractor through every error site.
+async fn inject_problem_instance(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+    let is_problem = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/problem+json"));
+    if !is_problem {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    // Strip the stale Content-Length so hyper recomputes it for the rewritten body,
+    // which is longer than the original due to the injected `instance` field.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    // Problem Details are sub-KB in practice; the 64 KB cap is a safety net.
+    // On failure (body exceeds the limit or the stream errors), we return
+    // the status + headers with an empty body — the original stream is already
+    // consumed and can't be replayed. This is acceptable because agsh never
+    // produces a Problem Detail anywhere near this size.
+    const PROBLEM_DETAIL_BUFFER_LIMIT: usize = 64 * 1024;
+    let bytes = match axum::body::to_bytes(body, PROBLEM_DETAIL_BUFFER_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!("inject_problem_instance: failed to buffer body: {}", error);
+            return axum::response::Response::from_parts(parts, axum::body::Body::empty());
+        }
+    };
+    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            // Body claimed `application/problem+json` but isn't valid JSON; pass through
+            // untouched rather than mangle the response.
+            return axum::response::Response::from_parts(parts, axum::body::Body::from(bytes));
+        }
+    };
+    if let Some(object) = value.as_object_mut()
+        && !object.contains_key("instance")
+    {
+        object.insert("instance".to_string(), serde_json::Value::String(path));
+    }
+    let rewritten = match serde_json::to_vec(&value) {
+        Ok(bytes) => axum::body::Body::from(bytes),
+        Err(error) => {
+            tracing::warn!(
+                "inject_problem_instance: failed to re-serialize body: {}",
+                error
+            );
+            axum::body::Body::from(bytes)
+        }
+    };
+    axum::response::Response::from_parts(parts, rewritten)
+}
+
+/// Wait for SIGTERM / SIGINT, then return so `axum::serve(...).with_graceful_shutdown(...)`
+/// can begin draining. On Windows, only Ctrl+C is observed.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to install SIGTERM handler: {}; relying on Ctrl+C only",
+                        error
+                    );
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, draining"),
+            _ = term.recv() => tracing::info!("SIGTERM received, draining"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl+C received, draining");
+    }
+}

@@ -76,7 +76,6 @@ The response carries a final `stopReason`:
 | `max_tokens` | The provider stopped because the model hit its maximum output tokens. The assistant message may be truncated. |
 | `cancelled` | `session/cancel` interrupted the turn — including the case where the cancel caused an exception in an underlying operation. agsh probes the per-session cancellation token after `run_turn`; any error returned while the token has fired surfaces as `cancelled` rather than a generic JSON-RPC error. |
 | `refusal` | The model declined to comply (Claude `stop_reason: "refusal"` and the OpenAI equivalent). The assistant message contains the refusal text. |
-| `max_turn_requests` | The agent loop made more provider calls in one turn than `[agent].max_turn_requests` allows. Configure the cap via `config.toml` (default: 100). |
 
 ## Permission modes
 

@@ -27,9 +27,6 @@ pub enum TurnOutcome {
     /// equivalent). The string carries the model's refusal text when available so clients can
     /// render it instead of a generic "request failed."
     Refusal(String),
-    /// The agent loop exceeded its per-turn provider-request cap. Surfaces the spec's
-    /// `max_turn_requests` stop reason so clients can offer a retry / continue affordance.
-    MaxTurnRequests,
 }
 
 /// Per-session working directory, shared by reference between the agent, every file-touching tool,
@@ -124,11 +121,6 @@ pub struct AgentOptions {
     /// updates or permission changes, which is fine for one-shot sub-agents whose tool list and
     /// permission level are fixed at spawn time.
     pub system_prompt_override: Option<String>,
-    /// Cap on provider requests per turn. A misbehaving tool chain (model loops on the same tool,
-    /// never converges) would otherwise spin indefinitely. When the cap is hit, the turn resolves
-    /// as the ACP spec's `max_turn_requests` stop reason. Defaults to 100 via
-    /// `default_max_turn_requests` in `config.rs`.
-    pub max_turn_requests: usize,
 }
 
 /// Driver for a single conversation. One [`Agent`] handles one or more sequential turns against a
@@ -262,7 +254,6 @@ impl Agent {
             sandboxed_shell: parent_options.sandboxed_shell,
             context_messages: parent_options.context_messages,
             user_instructions: parent_options.user_instructions.clone(),
-            max_turn_requests: parent_options.max_turn_requests,
             // Sub-agents run silent + one-shot: no streaming UI, no auto-compact, no MCP readiness
             // gate.
             streaming: false,
@@ -427,6 +418,23 @@ impl Agent {
         };
         let user_message = Message::user(&augmented_input);
         messages.append(user_message);
+        // Persist the user message eagerly, before the first provider call.  A crash
+        // during the provider roundtrip would otherwise lose it from disk.  On transient
+        // DB failure the lazy save path below retries; `user_eagerly_saved` suppresses
+        // double-writes on the happy path.
+        let user_event =
+            crate::conversation::Event::Append(Message::user(augmented_input.as_str()));
+        let user_eagerly_saved = match self.session_manager.save_event(sid, &user_event).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to persist user message eagerly: {}; falling back to lazy \
+                     persist on the first provider response",
+                    error,
+                );
+                false
+            }
+        };
         let skills = self.skills.current().await;
         let mcp_instructions = self
             .mcp_manager
@@ -452,18 +460,11 @@ impl Agent {
         ));
         let turn_start_len = messages.len();
 
-        let mut user_saved = false;
+        let mut user_saved = user_eagerly_saved;
         // Accumulate token usage across every provider call within this turn so the per-turn
         // display reflects the whole turn (including tool-execution loops), not just the final
         // round-trip.
         let mut turn_usage = crate::provider::TokenUsage::default();
-
-        // Per-turn provider-request counter. A misbehaving tool chain (e.g. the model invokes the
-        // same tool repeatedly without making progress) could otherwise spin the loop indefinitely.
-        // Cap surfaces as the spec's `max_turn_requests` stop reason so the client can offer a
-        // retry / continue affordance.
-        let max_turn_requests = self.options.max_turn_requests;
-        let mut turn_requests: usize = 0;
 
         let result: Result<TurnOutcome> = 'turn: {
             loop {
@@ -476,10 +477,6 @@ impl Agent {
                 if self.frontend.client_disconnected() {
                     break 'turn Err(AgshError::Interrupted);
                 }
-                if turn_requests >= max_turn_requests {
-                    break 'turn Ok(TurnOutcome::MaxTurnRequests);
-                }
-                turn_requests += 1;
 
                 let api_messages: Arc<[Message]> = if messages.len() > turn_start_len {
                     let mut combined = base_messages.to_vec();
@@ -558,19 +555,20 @@ impl Agent {
                     user_saved = true;
                 }
 
-                let assistant_event = crate::conversation::Event::Append(assistant_message.clone());
-                if let Err(error) = self.session_manager.save_event(sid, &assistant_event).await {
-                    break 'turn Err(error);
-                }
-
-                // Thinking blocks are preserved in the conversation for the Claude API
-                // (interleaved-thinking beta). The provider's build_messages handles stripping
-                // trailing thinking from the last assistant message.
+                // Defer the assistant-message save until we know whether this
+                // iteration ends in tool_use.  On tool_use the assistant + the
+                // following tool-results message are persisted in one transaction so a
+                // mid-write failure can't leave the conversation with an unmatched
+                // tool_use head.  On any other stop reason the assistant message stands
+                // alone and is saved on its own.  The in-memory append happens
+                // immediately so the provider sees the full state on the next iteration.
                 messages.append(assistant_message.clone());
 
                 if cancellation.is_cancelled() {
                     break 'turn Err(AgshError::Interrupted);
                 }
+
+                let assistant_event = crate::conversation::Event::Append(assistant_message.clone());
 
                 match stop_reason {
                     StopReason::ToolUse => {
@@ -612,24 +610,41 @@ impl Agent {
                             content: tool_results,
                         };
 
+                        // Save assistant + tool-results together in one transaction.
+                        // Both rows commit or neither does — no dangling assistant-with-
+                        // tool_use that the provider would reject on the next iteration.
                         let result_event =
                             crate::conversation::Event::Append(result_message.clone());
-                        if let Err(error) =
-                            self.session_manager.save_event(sid, &result_event).await
+                        if let Err(error) = self
+                            .session_manager
+                            .save_events_atomic(sid, vec![assistant_event, result_event])
+                            .await
                         {
                             break 'turn Err(error);
                         }
 
                         messages.append(result_message);
                     }
-                    StopReason::MaxTokens => {
-                        break 'turn Ok(TurnOutcome::MaxTokens);
-                    }
-                    StopReason::Refusal(text) => {
-                        break 'turn Ok(TurnOutcome::Refusal(text));
-                    }
-                    StopReason::EndTurn | StopReason::Unknown(_) => {
-                        break 'turn Ok(TurnOutcome::EndTurn);
+                    StopReason::MaxTokens
+                    | StopReason::Refusal(_)
+                    | StopReason::EndTurn
+                    | StopReason::Unknown(_) => {
+                        // Assistant message stands alone (no tool_use follow-up).
+                        // Save it before breaking so the persistent log includes it.
+                        // A single-event batch uses the same atomic path as the
+                        // tool-use branch for consistency.
+                        if let Err(error) = self
+                            .session_manager
+                            .save_events_atomic(sid, vec![assistant_event])
+                            .await
+                        {
+                            break 'turn Err(error);
+                        }
+                        break 'turn match stop_reason {
+                            StopReason::MaxTokens => Ok(TurnOutcome::MaxTokens),
+                            StopReason::Refusal(text) => Ok(TurnOutcome::Refusal(text)),
+                            _ => Ok(TurnOutcome::EndTurn),
+                        };
                     }
                 }
             }

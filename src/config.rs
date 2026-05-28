@@ -30,16 +30,59 @@ pub struct ConfigFile {
     pub prompt: Option<PromptConfig>,
     pub tools: Option<ToolsConfig>,
     pub permissions: Option<PermissionsConfig>,
-    pub agent: Option<AgentConfig>,
+    pub serve: Option<ServeConfig>,
 }
 
-/// `[agent]` table: agent-loop knobs that don't belong to any of the other domain-specific
-/// sections. Currently only `max_turn_requests`.
+/// `[serve]` table: HTTP server config for `agsh serve`. All fields optional with sensible
+/// defaults, but at least one `[[serve.tokens]]` entry is required — the server refuses to
+/// start without one.
 #[derive(Debug, Deserialize, Default)]
-pub struct AgentConfig {
-    /// Cap on provider requests per turn. Surfaces as ACP `max_turn_requests` stop reason when
-    /// exceeded. Default 100.
-    pub max_turn_requests: Option<usize>,
+pub struct ServeConfig {
+    /// Listen address. Default `127.0.0.1:8080` — bind to loopback so a fresh deploy isn't
+    /// accidentally world-reachable. Operators front with a reverse proxy (nginx, caddy) for
+    /// TLS termination and put a public address there.
+    pub bind: Option<String>,
+    /// Idle-timeout for session eviction. Sessions with no turn activity for this long are
+    /// dropped from the in-memory map by the GC scanner. Accepts humantime strings like
+    /// `"24h"`, `"30m"`, `"86400s"`. Default `"24h"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub idle_timeout: Option<std::time::Duration>,
+    /// How often the GC scanner sweeps the session map. Accepts humantime strings like
+    /// `"5m"`, `"300s"`. Default `"5m"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub gc_scan_interval: Option<std::time::Duration>,
+    /// When true, GC also deletes the SQLite row for idle sessions; default false (keep the
+    /// row so a future request with the same session ID can re-attach, mirroring ACP's
+    /// `session/load`).
+    pub delete_on_idle: Option<bool>,
+    /// On SIGTERM / SIGINT, wait at most this long for in-flight turns to finish before
+    /// forcibly aborting. Accepts humantime strings like `"30s"`, `"1m"`. Default `"30s"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub shutdown_drain_timeout: Option<std::time::Duration>,
+    /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
+    /// (default). Returns 429 with `concurrency-limit` when exceeded.
+    pub max_concurrent_turns: Option<usize>,
+    /// Request body size limit (bytes). Default 10 MiB.
+    pub max_body_bytes: Option<usize>,
+    /// Bearer tokens configured for this deployment. An empty list means no caller can
+    /// authenticate — the server runs but every request is rejected with 401.
+    pub tokens: Option<Vec<ServeTokenConfig>>,
+}
+
+/// One entry in `[serve.tokens]`. Tokens identify callers; scopes gate what they can do. See
+/// the Auth section of the HTTP API docs for the full scope catalogue.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServeTokenConfig {
+    /// Inline token value. Supports `${ENV_VAR}` substitution at config-load time. Mutually
+    /// exclusive with `token_file`.
+    pub token: Option<String>,
+    /// Path to a file whose contents (trimmed) are the token. chmod 0600 recommended.
+    pub token_file: Option<std::path::PathBuf>,
+    /// Free-form description, surfaced in startup logs. Operators use it to remember which
+    /// caller a token belongs to (e.g. "telegram bridge", "ci debug").
+    pub description: Option<String>,
+    /// Scopes granted to this token. See the HTTP API docs for the catalogue.
+    pub scopes: Vec<String>,
 }
 
 /// `[permissions]` table: choose which modes are reachable at runtime and which mode the session
@@ -425,10 +468,6 @@ pub struct ResolvedConfig {
     pub permission: Permission,
     pub enabled_permissions: EnabledPermissions,
     pub streaming: bool,
-    /// Cap on provider requests per turn. When the agent loop makes this many calls without
-    /// finishing, the turn resolves as the ACP `max_turn_requests` stop reason. Defaults to 100 —
-    /// generous for legitimate tool chains, low enough to bound a runaway model.
-    pub max_turn_requests: usize,
     pub continue_session: Option<String>,
     pub prompt: Option<String>,
     pub oneshot: bool,
@@ -488,6 +527,253 @@ pub struct ResolvedConfig {
     pub mcp_grace: std::time::Duration,
     /// Per-server connect+initialize timeout.
     pub mcp_connect_timeout: std::time::Duration,
+    /// Raw `[serve]` section. Resolved (defaults filled, env vars substituted, token files
+    /// read) at `agsh serve` startup by [`ResolvedServeConfig::resolve`], not here, so
+    /// `from_cli` can stay infallible.
+    pub serve: Option<ServeConfig>,
+    /// CLI-flag override for `[serve].bind` (`agsh serve --bind ...`). Wins over the config
+    /// file when set.
+    pub serve_bind_override: Option<String>,
+}
+
+/// Validated, defaults-filled view of [`ServeConfig`]. Constructed at config-load time by
+/// [`ResolvedServeConfig::resolve`].
+// Individual fields mirror [`ServeConfig`]; see its per-field documentation.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ResolvedServeConfig {
+    pub bind: String,
+    pub idle_timeout: std::time::Duration,
+    pub gc_scan_interval: std::time::Duration,
+    pub delete_on_idle: bool,
+    pub shutdown_drain_timeout: std::time::Duration,
+    pub max_concurrent_turns: Option<usize>,
+    pub max_body_bytes: usize,
+    pub tokens: Vec<ResolvedServeToken>,
+}
+
+/// Validated token entry. The `token` field carries the final secret value with `${ENV}`
+/// substitution applied and `token_file` contents loaded — call sites compare against this
+/// directly via constant-time equality.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct ResolvedServeToken {
+    pub token: String,
+    pub description: Option<String>,
+    pub scopes: Vec<String>,
+    /// Where the token value originated, used at startup to nudge operators away from inline
+    /// plaintext. See [`TokenSource`]. Not security-sensitive itself.
+    pub source: TokenSource,
+}
+
+impl std::fmt::Debug for ResolvedServeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedServeToken")
+            .field(
+                "token",
+                &format_args!("[REDACTED len={}]", self.token.len()),
+            )
+            .field("description", &self.description)
+            .field("scopes", &self.scopes)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Provenance of a configured token. Determines whether `agsh serve` emits a `warn!` at startup
+/// (inline plaintext) or file-backed.
+#[derive(Debug, Clone)]
+pub enum TokenSource {
+    /// Literal value in `token = "..."` with no `${ENV}` markers — discouraged outside
+    /// development.
+    Inline,
+    /// `token = "${ENV_VAR}"` substituted at config-load time.
+    EnvVar,
+    /// `token_file = "/path/to/token"` read at config-load time.
+    File {
+        #[allow(dead_code)]
+        path: std::path::PathBuf,
+    },
+}
+
+impl ResolvedServeConfig {
+    /// Resolve a [`ServeConfig`] (or its absence) into a [`ResolvedServeConfig`] with all
+    /// defaults filled and tokens read from disk / env. Errors are returned for caller
+    /// configuration problems (both `token` and `token_file` set, env var unset, file missing).
+    pub fn resolve(raw: Option<ServeConfig>) -> Result<Self, String> {
+        let raw = raw.unwrap_or_default();
+        // Reject zero-value `max_*` knobs at config time:
+        //   - `max_concurrent_turns = 0` would 429 every turn
+        //   - `max_body_bytes = 0` would 413 every request
+        // Operators wanting "unbounded" omit the field instead.
+        if let Some(0) = raw.max_concurrent_turns {
+            return Err(
+                "[serve] `max_concurrent_turns = 0` would block every turn. Omit the field \
+                 to disable the cap, or set a positive integer."
+                    .into(),
+            );
+        }
+        if let Some(0) = raw.max_body_bytes {
+            return Err(
+                "[serve] `max_body_bytes = 0` would reject every request body. Omit the \
+                 field to use the default (10 MiB), or set a positive integer."
+                    .into(),
+            );
+        }
+        let tokens = raw
+            .tokens
+            .unwrap_or_default()
+            .into_iter()
+            .map(ResolvedServeToken::resolve)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            bind: raw.bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+            idle_timeout: raw
+                .idle_timeout
+                .unwrap_or(std::time::Duration::from_secs(24 * 60 * 60)),
+            gc_scan_interval: raw
+                .gc_scan_interval
+                .unwrap_or(std::time::Duration::from_secs(5 * 60)),
+            delete_on_idle: raw.delete_on_idle.unwrap_or(false),
+            shutdown_drain_timeout: raw
+                .shutdown_drain_timeout
+                .unwrap_or(std::time::Duration::from_secs(30)),
+            max_concurrent_turns: raw.max_concurrent_turns,
+            max_body_bytes: raw.max_body_bytes.unwrap_or(10 * 1024 * 1024),
+            tokens,
+        })
+    }
+}
+
+impl ResolvedServeToken {
+    fn resolve(raw: ServeTokenConfig) -> Result<Self, String> {
+        let (token, source) = match (raw.token, raw.token_file) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "[serve.tokens] entry has both `token` and `token_file`; pick one".into(),
+                );
+            }
+            (Some(inline), None) => {
+                let (resolved, substituted) = substitute_env(&inline)?;
+                let source = if substituted {
+                    TokenSource::EnvVar
+                } else {
+                    TokenSource::Inline
+                };
+                (resolved, source)
+            }
+            (None, Some(path)) => {
+                let resolved = std::fs::read_to_string(&path)
+                    .map(|s| s.trim().to_string())
+                    .map_err(|error| {
+                        format!("failed to read `token_file` {}: {}", path.display(), error)
+                    })?;
+                warn_if_world_readable(&path);
+                (resolved, TokenSource::File { path })
+            }
+            (None, None) => {
+                return Err("[serve.tokens] entry must set either `token` or `token_file`".into());
+            }
+        };
+        if token.is_empty() {
+            return Err("[serve.tokens] resolved token is empty".into());
+        }
+        Ok(Self {
+            token,
+            description: raw.description,
+            scopes: raw.scopes,
+            source,
+        })
+    }
+}
+
+/// Log a warning if `path` is readable by group or others on Unix. No-op on non-Unix.
+/// Matches the advisory guidance ("chmod 0600 recommended") without
+/// refusing to start — the file has already been read successfully, so we just nudge.
+fn warn_if_world_readable(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "token_file '{}' has permissions {:04o}; recommend chmod 0600 to prevent \
+                     other users from reading the bearer token",
+                    path.display(),
+                    mode,
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Deserialize an optional humantime duration string (e.g. `"24h"`, `"5m"`, `"30s"`).
+/// `serde(deserialize_with)` on `Option<Duration>` requires this wrapper because
+/// `humantime_serde` only provides a `deserialize` for `Duration`, not `Option<Duration>`.
+fn deserialize_optional_duration<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::time::Duration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(s) => humantime_serde::re::humantime::parse_duration(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+/// Replace `${VAR}` occurrences with the corresponding environment variable. `$$` is an escape
+/// for a literal `$`. Unknown variables return an error rather than expanding to empty — silent
+/// expansion to empty would produce a runtime auth-bypass-shaped configuration.
+///
+/// Returns the substituted string plus a boolean indicating whether at least one `${VAR}`
+/// expansion happened — callers use this to classify token provenance (`TokenSource::EnvVar`
+/// vs `TokenSource::Inline`) for the startup warning.
+fn substitute_env(input: &str) -> Result<(String, bool), String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut substituted = false;
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(inner);
+                }
+                if !closed {
+                    return Err("unclosed `${` in token value".into());
+                }
+                let value = std::env::var(&name)
+                    .map_err(|_| format!("env var `{}` referenced in token is unset", name))?;
+                out.push_str(&value);
+                substituted = true;
+            }
+            _ => out.push('$'),
+        }
+    }
+    Ok((out, substituted))
 }
 
 /// Default input style: bold, white-ish foreground, slate-blue background. Uses truecolor RGB (not
@@ -1062,11 +1348,6 @@ impl ResolvedConfig {
             permission,
             enabled_permissions,
             streaming: !cli.no_stream,
-            max_turn_requests: config_file
-                .agent
-                .as_ref()
-                .and_then(|a| a.max_turn_requests)
-                .unwrap_or(100),
             continue_session: cli.continue_session.clone(),
             prompt: cli.prompt.clone(),
             oneshot: cli.oneshot,
@@ -1122,6 +1403,8 @@ impl ResolvedConfig {
             mcp_strict,
             mcp_grace,
             mcp_connect_timeout,
+            serve: config_file.serve,
+            serve_bind_override: None,
         }
     }
 

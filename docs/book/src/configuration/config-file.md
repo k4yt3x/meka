@@ -947,3 +947,124 @@ disabled_tools = ["web_search", "fetch_url"]
 ```
 
 Sub-agents spawned via `spawn_agent` inherit the same filter — a disabled built-in is disabled everywhere. Run `agsh tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
+
+## `[serve]`
+
+Configuration for `agsh serve`, the HTTP API server. See the [HTTP API](../usage/http-api.md) usage guide for a full walkthrough.
+
+### `serve.bind`
+
+Address and port the HTTP server listens on.
+
+| Type | Default |
+|------|---------|
+| `string` | `"127.0.0.1:8080"` |
+
+```toml
+[serve]
+bind = "0.0.0.0:8080"
+```
+
+> **Security:** Binding to `0.0.0.0` exposes the server on all interfaces. In production, keep `127.0.0.1` and front with a TLS-terminating reverse proxy.
+
+### `serve.max_body_bytes`
+
+Maximum request body size in bytes. Requests exceeding this limit are rejected with `413 Payload Too Large`.
+
+| Type | Default |
+|------|---------|
+| `integer` | `10485760` (10 MiB) |
+
+### `serve.max_concurrent_turns`
+
+Process-wide cap on in-flight turns across all sessions. When the cap is reached, new turn submissions return `429 Too Many Requests` with a `Retry-After` header. Unset or `0` means no limit.
+
+| Type | Default |
+|------|---------|
+| `integer` | unbounded |
+
+### `serve.idle_timeout`
+
+How long a session can sit idle (no turns submitted) before the GC evicts it from memory. Accepts duration strings like `"24h"`, `"30m"`, `"7d"`. Set to `"0"` to disable idle GC.
+
+| Type | Default |
+|------|---------|
+| `string` (duration) | `"24h"` |
+
+Eviction drops the in-memory runtime but **preserves the SQLite row** — a later request transparently re-attaches. See `delete_on_idle` to also remove the DB row.
+
+### `serve.gc_scan_interval`
+
+How often the background GC scanner runs. Accepts duration strings.
+
+| Type | Default |
+|------|---------|
+| `string` (duration) | `"5m"` |
+
+### `serve.delete_on_idle`
+
+When `true`, idle-evicted sessions also have their SQLite row deleted. When `false` (default), only the in-memory state is dropped and the session can be re-attached later.
+
+| Type | Default |
+|------|---------|
+| `bool` | `false` |
+
+### `serve.shutdown_drain_timeout`
+
+Maximum time to wait for in-flight turns and tasks to finish during graceful shutdown (`SIGTERM` / `SIGINT`). After this timeout, remaining tasks are aborted and the process exits.
+
+| Type | Default |
+|------|---------|
+| `string` (duration) | `"30s"` |
+
+### `[[serve.tokens]]`
+
+An array of bearer tokens for API authentication. At least one token is required.
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `token` | Yes* | The bearer token value. Supports `${ENV_VAR}` substitution. Mutually exclusive with `token_file`. |
+| `token_file` | Yes* | Path to a file containing the token (one line, trimmed). Mutually exclusive with `token`. A startup warning is logged if the file is world-readable. |
+| `description` | No | Human-readable label for this token (appears in logs). |
+| `scopes` | Yes | Array of scope strings: `"sessions:r"`, `"sessions:w"`, `"skills:r"`, `"mcp:r"`. |
+
+\* Exactly one of `token` or `token_file` must be set.
+
+Inline plaintext tokens log a startup warning — use `${ENV_VAR}` or `token_file` for production.
+
+#### Examples
+
+Development token (inline):
+
+```toml
+[[serve.tokens]]
+token = "sk_dev_test123"
+scopes = ["sessions:r", "sessions:w"]
+```
+
+Production token (environment variable):
+
+```toml
+[[serve.tokens]]
+token = "${AGSH_BRIDGE_TOKEN}"
+description = "telegram bridge"
+scopes = ["sessions:r", "sessions:w"]
+```
+
+Production token (file-based):
+
+```toml
+[[serve.tokens]]
+token_file = "/etc/agsh/bridge.token"
+description = "telegram bridge"
+scopes = ["sessions:r", "sessions:w"]
+```
+
+Admin token with all read scopes:
+
+```toml
+[[serve.tokens]]
+token = "${AGSH_ADMIN_TOKEN}"
+description = "operator"
+scopes = ["sessions:r", "sessions:w", "mcp:r", "skills:r"]
+```

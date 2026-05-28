@@ -2094,9 +2094,8 @@ mod tests {
             handle.await.expect("attach task");
         }
 
-        // The snapshot is the source of truth for "what got published". Every server's update must
-        // land there, and every registry must hold every server's tool. If the pre-fix race
-        // regressed, some registry would be missing at least one server.
+        // The snapshot is the source of truth for "what got published".  Every server's
+        // update must land there, and every registry must hold every server's tool.
         let snapshot_keys: std::collections::HashSet<String> = manager
             .tools_snapshot
             .read()

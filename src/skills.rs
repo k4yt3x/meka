@@ -235,7 +235,7 @@ pub fn parse_skill_definition(
     let (frontmatter_str, _body) =
         split_frontmatter(content).ok_or_else(|| "missing YAML frontmatter".to_string())?;
 
-    let frontmatter: Frontmatter = serde_yaml::from_str(frontmatter_str)
+    let frontmatter: Frontmatter = serde_norway::from_str(frontmatter_str)
         .map_err(|error| format!("invalid frontmatter: {}", error))?;
 
     let description = frontmatter
