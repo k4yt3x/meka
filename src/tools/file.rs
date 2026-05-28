@@ -340,13 +340,16 @@ impl Tool for EditFileTool {
         ToolDefinition {
             name: "edit_file".to_string(),
             description: "Modify a file. Two modes: (1) Replace — provide \
-                          'new_string' to swap 'old_string' for it. (2) Insert — provide \
+                          'new_string' to swap 'old_string' for it (an empty \
+                          'new_string' deletes 'old_string'). (2) Insert — provide \
                           'insert_before' or 'insert_after' to place content adjacent to \
                           'old_string' while preserving the anchor itself; useful when you \
                           only need to add lines without rewriting surrounding context. \
                           Exactly one of 'new_string', 'insert_before', 'insert_after' \
                           must be set. 'replace_all' applies the operation to every \
-                          occurrence; defaults to first only. The file must have been \
+                          occurrence; if it is omitted and 'old_string' matches more than \
+                          once, the edit is rejected so you can add context to disambiguate \
+                          or set 'replace_all' deliberately. The file must have been \
                           read with read_file first unless 'force' is set to true. On \
                           success the response includes a small ±3-line snippet around \
                           the first edited site so you can confirm the change landed."
@@ -364,7 +367,7 @@ impl Tool for EditFileTool {
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "Replace mode: the replacement string. Mutually exclusive with insert_before/insert_after."
+                        "description": "Replace mode: the replacement string (an empty string deletes old_string). Mutually exclusive with insert_before/insert_after."
                     },
                     "insert_before": {
                         "type": "string",
@@ -376,7 +379,7 @@ impl Tool for EditFileTool {
                     },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "If true, apply to every occurrence instead of just the first. Defaults to false."
+                        "description": "If true, apply to every occurrence. If false (default) and old_string matches more than once, the edit is rejected as ambiguous."
                     },
                     "force": {
                         "type": "boolean",
@@ -491,14 +494,33 @@ impl Tool for EditFileTool {
             ));
         }
 
+        // Reject an ambiguous single-occurrence edit: silently editing the first of several
+        // matches is almost never intended. Surface the count so the caller can add surrounding
+        // context to disambiguate, or set `replace_all` to change every occurrence on purpose.
+        let match_count = content.matches(&old_string).count();
+        if !replace_all && match_count > 1 {
+            return Ok(ToolOutput::text(
+                format!(
+                    "Error: '{}' matches {} times in '{}'; add surrounding context to make \
+                     old_string unique, or set replace_all=true to change every occurrence",
+                    truncate_string(&old_string, 100),
+                    match_count,
+                    path
+                ),
+                true,
+            ));
+        }
+
         // Record the byte offset of the first match in the *original* content; since `replacen` /
         // `replace` only mutate at-or-after this point, the byte offset is stable in the new
         // content and locates the first edit site for the response snippet.
         let first_match_byte = content.find(&old_string).unwrap_or(0);
 
         let (new_content, count) = if replace_all {
-            let count = content.matches(&old_string).count();
-            (content.replace(&old_string, &effective_new_string), count)
+            (
+                content.replace(&old_string, &effective_new_string),
+                match_count,
+            )
         } else {
             (content.replacen(&old_string, &effective_new_string, 1), 1)
         };
@@ -996,7 +1018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_edit_file_replace_all_default_false() {
+    async fn test_edit_file_ambiguous_match_without_replace_all_errors() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let file_path = temp_dir.path().join("edit.txt");
         std::fs::write(&file_path, "foo bar foo baz foo").expect("failed to write");
@@ -1019,10 +1041,15 @@ mod tests {
             .await
             .expect("should succeed");
 
-        assert!(!result.is_error);
-        assert!(text_content(&result).contains("1 occurrence(s)"));
+        assert!(result.is_error);
+        assert!(
+            text_content(&result).contains("matches 3 times"),
+            "got: {}",
+            text_content(&result)
+        );
+        // The file must be untouched when an ambiguous edit is rejected.
         let content = std::fs::read_to_string(&file_path).expect("failed to read");
-        assert_eq!(content, "qux bar foo baz foo");
+        assert_eq!(content, "foo bar foo baz foo");
     }
 
     #[tokio::test]

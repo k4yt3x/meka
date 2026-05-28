@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `serde_yaml` (unmaintained) replaced with the maintained `serde_norway` fork.
+- `edit_file` now rejects an ambiguous `old_string` (multiple matches without `replace_all`).
 
 ### Removed
 

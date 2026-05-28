@@ -62,10 +62,10 @@ Modify a file. Supports two modes: **replace** (swap `old_string` for `new_strin
 |------|------|----------|-------------|
 | `path` | string | yes | The file path to edit |
 | `old_string` | string | yes | The exact string to find (acts as anchor in insert modes) |
-| `new_string` | string | one of three | Replace mode: replacement for `old_string` |
+| `new_string` | string | one of three | Replace mode: replacement for `old_string` (an empty string deletes it) |
 | `insert_before` | string | one of three | Insert mode: text inserted immediately before `old_string` (anchor preserved) |
 | `insert_after` | string | one of three | Insert mode: text inserted immediately after `old_string` (anchor preserved) |
-| `replace_all` | boolean | no | Apply to every occurrence (default: false) |
+| `replace_all` | boolean | no | Apply to every occurrence (default: false). If false and `old_string` matches more than once, the edit is rejected as ambiguous |
 | `force` | boolean | no | Bypass read-before-edit requirement (default: false) |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
@@ -73,7 +73,8 @@ Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided
 
 ### Behavior
 
-- By default, only the **first** occurrence of `old_string` is affected. Set `replace_all` to apply to every occurrence.
+- If `old_string` matches more than once and `replace_all` is not set, the edit is **rejected** — add surrounding context to make the anchor unique, or set `replace_all` to change every occurrence.
+- To delete text, use replace mode with an empty `new_string`.
 - The file must have been previously read with `read_file` on the same path. This prevents blind edits. Set `force` to bypass this requirement.
 - If `old_string` is not found, the tool returns an error (without modifying the file).
 - On success, the response includes a small ±3-line snippet (with line numbers, lines truncated at 200 chars) around the first edited site so you can confirm the change landed without re-reading the file.
