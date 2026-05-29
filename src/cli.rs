@@ -386,7 +386,7 @@ pub struct Cli {
     #[arg(long = "permission", value_parser = parse_permission)]
     pub permission: Option<Permission>,
 
-    /// Provider profile to use this run (name from [providers.<name>])
+    /// Provider profile to use this run (overrides default_provider)
     #[arg(long = "provider")]
     pub provider: Option<String>,
 

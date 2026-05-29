@@ -96,6 +96,12 @@ Clap `///` doc-comments must render within 80 columns when shown via `-h`. Verif
 - Always run `cargo build` after completing all tasks.
 - Always run `cargo doc --no-deps --document-private-items` after completing all tasks.
 
+CI's `lint` job denies warnings on both clippy and rustdoc, so the bare commands above can pass locally yet fail CI. Reproduce the exact gate before declaring done:
+
+- `cargo clippy --all-targets -- -D warnings` (note `--all-targets`: covers tests/benches, which plain `cargo clippy` skips).
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items`. Watch for `rustdoc::invalid_html_tags`: a bare `<word>` in a doc comment (e.g. `<name>`) is parsed as an unclosed HTML tag and fails the build. Wrap such tokens in backticks, but if the doc comment is also a clap `///` help string (backticks render literally in `-h`), rephrase to drop the angle brackets instead.
+- `cargo +nightly fmt --check` is what CI runs; `cargo +nightly fmt` (no `--check`) fixes it.
+
 ## Changelog
 
 - Update `CHANGELOG.md` after every meaningful change (new features, bug fixes, breaking changes, deprecations, removals)

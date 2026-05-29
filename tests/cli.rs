@@ -37,7 +37,7 @@ fn help_flag_lists_subcommands() {
     let output = meka().arg("--help").output().expect("failed to spawn meka");
     assert!(output.status.success(), "meka --help exited non-zero");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for expected in ["setup", "export", "delete", "list", "acp"] {
+    for expected in ["provider", "export", "delete", "list", "acp"] {
         assert!(
             stdout.contains(expected),
             "--help output missing subcommand '{}':\n{}",

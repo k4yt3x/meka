@@ -80,10 +80,9 @@ impl ServeTestHarness {
             // `idle_timeout`, etc. without colliding with the per-token block.
             let config = format!(
                 r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "write"

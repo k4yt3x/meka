@@ -492,10 +492,9 @@ fn acp_tool_call_lifecycle_round_trips_through_mock_provider() {
     // Fake config + credential so `create_agent_from_config` builds a real provider stack. The
     // mock swap inside `run_acp` then replaces the provider before any HTTP call is attempted.
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -575,10 +574,9 @@ fn run_permission_scenario(answer: PermissionAnswer) {
     // [permissions].default = "ask" puts the agent in Ask mode, so write_file's Write requirement
     // triggers the round-trip we want to exercise.
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "ask"
@@ -691,10 +689,9 @@ fn acp_session_load_replays_persisted_turn() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
 
@@ -927,10 +924,9 @@ fn acp_session_list_filters_by_cwd() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
 
@@ -1099,10 +1095,9 @@ fn acp_session_resume_adopts_without_replay() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
 
@@ -1352,10 +1347,9 @@ fn acp_session_new_advertises_skills_and_modes() {
     // Provider stub + a non-default enabled set so we can assert exactly which modes get
     // advertised.
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "read"
@@ -1439,10 +1433,9 @@ enabled = ["read", "ask", "write"]
 #[test]
 fn acp_session_prompt_invokes_skill_by_slash_name() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -1565,10 +1558,9 @@ fn acp_session_prompt_skill_body_unreadable_is_internal_error() {
 #[test]
 fn acp_session_set_mode_flips_permission_and_emits_update() {
     const CONFIG: &str = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "read"
@@ -1633,10 +1625,9 @@ enabled = ["read", "ask"]
 #[test]
 fn acp_fs_read_text_file_is_delegated_when_capability_offered() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -1701,10 +1692,9 @@ fn acp_fs_write_text_file_is_delegated_when_capability_offered() {
     // `write` mode so the agent's permission gate doesn't refuse `write_file` before we even reach
     // the delegation seam.
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "write"
@@ -1794,10 +1784,9 @@ enabled = ["read", "write"]
 fn acp_write_file_falls_back_to_local_when_no_capability() {
     let content_to_write = "wrote locally";
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "write"
@@ -1851,10 +1840,9 @@ enabled = ["read", "write"]
 fn acp_execute_command_is_delegated_when_terminal_capability_offered() {
     // Force the agent into `write` mode so the sandbox carve-out doesn't kick in.
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "write"
@@ -1939,10 +1927,9 @@ enabled = ["read", "write"]
 #[test]
 fn acp_read_mode_keeps_local_sandbox_for_execute_command() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "read"
@@ -1995,10 +1982,9 @@ fn acp_session_cancel_interrupts_running_prompt() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
 
@@ -2131,10 +2117,9 @@ api_key = "fake-for-mock-only"
 #[test]
 fn acp_edit_file_delegates_when_both_fs_capabilities_offered() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "write"
@@ -2229,10 +2214,9 @@ enabled = ["read", "write"]
 #[test]
 fn acp_subagent_permission_forwards_to_parent_client() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "ask"
@@ -2317,10 +2301,9 @@ fn acp_session_list_paginates_across_cursor_boundary() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
 
@@ -2524,10 +2507,9 @@ api_key = "fake-for-mock-only"
 #[test]
 fn acp_permission_allow_always_skips_second_prompt() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "ask"
@@ -2675,10 +2657,9 @@ fn acp_multi_session_parallel_prompts_dont_serialize() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
     std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
 
@@ -2846,10 +2827,9 @@ api_key = "fake-for-mock-only"
 #[test]
 fn acp_multi_session_set_mode_isolated() {
     const CONFIG: &str = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "read"
@@ -3090,10 +3070,9 @@ fn assert_invalid_params(response: &serde_json::Value, context: &str) {
 }
 
 const ACP_INVALID_PARAMS_CONFIG: &str = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 "#;
 
 /// `session/prompt` against an unknown `sessionId` must error with `InvalidParams`. Non-text
@@ -3206,10 +3185,9 @@ fn acp_session_resume_rejects_malformed_uuid_unknown_and_already_loaded() {
 #[test]
 fn acp_session_set_mode_rejects_unknown_and_disabled() {
     let config = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "read"
@@ -3477,10 +3455,9 @@ fn acp_session_prompt_surfaces_provider_error_as_jsonrpc_error() {
 #[test]
 fn acp_session_prompt_request_permission_failure_marks_disconnect() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "ask"
@@ -3538,10 +3515,9 @@ enabled = ["read", "ask", "write"]
 // in the failure modes.
 
 const ACP_TERMINAL_CONFIG: &str = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "write"
@@ -4124,10 +4100,9 @@ fn acp_session_set_mode_during_long_prompt_does_not_block() {
         { "kind": "message_end", "stop_reason": "end_turn" }
     ]]);
     const CONFIG: &str = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "read"
@@ -4168,10 +4143,9 @@ enabled = ["read", "write"]
 #[test]
 fn acp_session_request_permission_cancelled_by_session_cancel() {
     let config_toml = r#"
-[provider]
-name = "claude-api"
+[providers.mock]
+type = "claude-api"
 model = "claude-sonnet-4-5"
-api_key = "fake-for-mock-only"
 
 [permissions]
 default = "ask"

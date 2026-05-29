@@ -2075,6 +2075,14 @@ async fn resolve_credential_for_acp(
     config: &ResolvedConfig,
     token_store: &crate::session::TokenStore,
 ) -> anyhow::Result<AuthCredential> {
+    // Debug-only: when the integration harness sets `MEKA_ACP_MOCK_PROVIDER=1`, `run_acp` swaps in
+    // a scripted provider and discards the real one built from this credential. Return a
+    // placeholder so the harness needn't seed a credential into the database.
+    #[cfg(debug_assertions)]
+    if std::env::var("MEKA_ACP_MOCK_PROVIDER").as_deref() == Ok("1") {
+        return Ok(AuthCredential::ApiKey("mock-acp-provider".to_string()));
+    }
+
     let Some(profile) = config.active_profile.as_deref() else {
         anyhow::bail!("meka acp requires a configured provider; run `meka provider add <name>`");
     };
