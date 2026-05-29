@@ -52,6 +52,14 @@ meka [w] > install and start nginx
 
 See the [documentation](https://docs.meka.so) for the full usage guide.
 
+## Interfaces
+
+The same agent core is available through several interfaces:
+
+- **CLI REPL**: an interactive prompt in your terminal.
+- **ACP**: makes meka work inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
+- **HTTP API**: embed meka as an agent backend in your own apps, bots, and services.
+
 ## Tools
 
 The agent has access to the following built-in tools:
@@ -62,8 +70,8 @@ The agent has access to the following built-in tools:
 - **SearchContents**: search file contents with regex (powered by ripgrep)
 - **FetchUrl**: fetch and read web page content
 - **WebSearch**: search the web for up-to-date information
-- **Scratchpad**: session-scoped working memory (write, read, edit, list, delete)
-- **TodoWrite**: structured task tracking for multi-step work
+- **Scratchpad**: session-scoped working memory for intermediate results
+- **Todo**: structured task tracking (read and write) for multi-step work
 - **SpawnAgent**: delegate research tasks to a read-only sub-agent
 - **Skill**: load reusable prompt templates on demand
 - **RenderImage**: render an image into the conversation for vision-capable models
@@ -76,7 +84,7 @@ Long-output tools support an optional `scratchpad` parameter to save output dire
 The prompt indicator shows the current permission mode. Press **Shift+Tab** to cycle between modes:
 
 - `[n]` **none**: no tools available, text-only responses
-- `[r]` **read**: read-only tools (file reading, searching, web, sandboxed shell); cannot modify anything
+- `[r]` **read**: read-only tools (file reading, searching, web, sandboxed shell)
 - `[a]` **ask**: all tools available, but each call requires user approval
 - `[w]` **write**: all tools enabled, including shell execution and file writes
 
@@ -87,6 +95,7 @@ Conversations are persisted in a local SQLite database and can be resumed:
 - `meka -c` continues the last session
 - `meka -c <UUID>` resumes a specific session by ID
 - `meka list` lists past sessions
+- `meka delete <UUID>` deletes sessions
 - `meka export <UUID>` exports a session as Markdown
 - `/export` exports the current session from within the shell
 - `/compact` summarizes and compacts the session history
