@@ -1019,6 +1019,9 @@ pub(super) struct ScratchpadLoadFileTool {
     pub session_id: Arc<RwLock<Option<Uuid>>>,
     /// See [`ScratchpadWriteTool::inherited_names`].
     pub inherited_names: Vec<String>,
+    /// Per-session cwd, so a relative `path` resolves the same way `read_file` does (against the
+    /// agent's `/cd` directory, not the process cwd).
+    pub cwd: crate::agent::SharedCwd,
 }
 
 #[async_trait]
@@ -1082,9 +1085,11 @@ impl Tool for ScratchpadLoadFileTool {
 
         let session_id = resolve_session_id(&self.session_id, "scratchpad_load_file").await?;
 
+        // Resolve a relative path against the session cwd before canonicalizing, so `/cd` is
+        // honoured (canonicalize alone would resolve relative to the process cwd).
+        let resolved = crate::agent::resolve_against_cwd(&self.cwd, &path);
         let canonical =
-            super::util::canonicalize_for_tool("scratchpad_load_file", std::path::Path::new(&path))
-                .await?;
+            super::util::canonicalize_for_tool("scratchpad_load_file", &resolved).await?;
 
         // We read the file as raw bytes (rather than directly as a String) so that on a UTF-8
         // failure we can run a single content sniff and tell the model what kind of binary it just
@@ -1138,6 +1143,9 @@ pub(super) struct ScratchpadSaveFileTool {
     pub parent_session_id: Option<Uuid>,
     /// See [`ScratchpadReadTool::inherited_names`].
     pub inherited_names: Vec<String>,
+    /// Per-session cwd, so a relative `path` resolves the same way `write_file` does (against the
+    /// agent's `/cd` directory, not the process cwd).
+    pub cwd: crate::agent::SharedCwd,
 }
 
 #[async_trait]
@@ -1214,11 +1222,12 @@ impl Tool for ScratchpadSaveFileTool {
             message: format!("scratchpad entry \"{}\" not found", name),
         })?;
 
-        // Path resolution mirrors `write_file`: canonicalize the parent dir (creating it if
+        // Path resolution mirrors `write_file`: resolve a relative path against the session cwd (so
+        // `/cd` is honoured, not the process cwd), then canonicalize the parent dir (creating it if
         // necessary) and re-join the filename so the O_NOFOLLOW open at the leaf closes the
         // canonicalize→open TOCTOU window for symlink-swap attacks. See src/tools/file.rs for the
         // original rationale.
-        let file_path = std::path::PathBuf::from(&path);
+        let file_path = crate::agent::resolve_against_cwd(&self.cwd, &path);
         let file_name = file_path
             .file_name()
             .ok_or_else(|| MekaError::ToolExecution {
@@ -2447,6 +2456,7 @@ mod tests {
             .expect("write input");
 
         let tool = ScratchpadLoadFileTool {
+            cwd: crate::agent::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(session_id),
             inherited_names: Vec::new(),
@@ -2469,6 +2479,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scratchpad_load_file_resolves_relative_path_against_cwd() {
+        // Regression: a relative path must resolve against the session cwd (like `read_file`), not
+        // the process cwd, so `scratchpad_load_file` tracks `/cd`.
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create");
+        let dir = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(dir.path().join("rel.txt"), "relative contents")
+            .await
+            .expect("write input");
+        let cwd: crate::agent::SharedCwd =
+            std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf()));
+
+        let tool = ScratchpadLoadFileTool {
+            cwd,
+            session_manager: manager.clone(),
+            session_id: test_session_id(session_id),
+            inherited_names: Vec::new(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"path": "rel.txt", "name": "loaded"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("load");
+
+        assert!(!result.is_error, "got: {}", text_content(&result));
+        assert_eq!(
+            manager
+                .load_tool_output(session_id, "loaded")
+                .await
+                .expect("load_tool_output")
+                .as_deref(),
+            Some("relative contents"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_save_file_resolves_relative_path_against_cwd() {
+        // Regression: a relative save path must land under the session cwd, not the process cwd.
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create");
+        manager
+            .save_tool_output(session_id, "report", "final analysis")
+            .await
+            .expect("seed");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd: crate::agent::SharedCwd =
+            std::sync::Arc::new(std::sync::RwLock::new(dir.path().to_path_buf()));
+
+        let tool = ScratchpadSaveFileTool {
+            cwd,
+            session_manager: manager,
+            session_id: test_session_id(session_id),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({"name": "report", "path": "out.txt"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("save");
+
+        assert!(!result.is_error, "got: {}", text_content(&result));
+        let written = tokio::fs::read_to_string(dir.path().join("out.txt"))
+            .await
+            .expect("read back");
+        assert_eq!(written, "final analysis");
+    }
+
+    #[tokio::test]
     async fn test_scratchpad_load_file_rejects_inherited_name() {
         let manager = test_manager().await;
         let parent = manager.create_session(None).await.expect("parent");
@@ -2483,6 +2566,7 @@ mod tests {
             .expect("write input");
 
         let tool = ScratchpadLoadFileTool {
+            cwd: crate::agent::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(child),
             inherited_names: vec!["captured".to_string()],
@@ -2525,6 +2609,7 @@ mod tests {
         tokio::fs::write(&path, png_bytes).await.expect("write png");
 
         let tool = ScratchpadLoadFileTool {
+            cwd: crate::agent::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(session_id),
             inherited_names: Vec::new(),
@@ -2560,6 +2645,7 @@ mod tests {
             .expect("write blob");
 
         let tool = ScratchpadLoadFileTool {
+            cwd: crate::agent::test_cwd(),
             session_manager: manager.clone(),
             session_id: test_session_id(session_id),
             inherited_names: Vec::new(),
@@ -2595,6 +2681,7 @@ mod tests {
         let path = dir.path().join("subdir").join("out.txt");
 
         let tool = ScratchpadSaveFileTool {
+            cwd: crate::agent::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(session_id),
             parent_session_id: None,
@@ -2630,6 +2717,7 @@ mod tests {
         let path = dir.path().join("log.txt");
 
         let tool = ScratchpadSaveFileTool {
+            cwd: crate::agent::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(child),
             parent_session_id: Some(parent),
@@ -2656,6 +2744,7 @@ mod tests {
         let path = dir.path().join("out.txt");
 
         let tool = ScratchpadSaveFileTool {
+            cwd: crate::agent::test_cwd(),
             session_manager: manager,
             session_id: test_session_id(session_id),
             parent_session_id: None,

@@ -545,6 +545,7 @@ impl ToolRegistry {
         skills: Arc<crate::skills::SkillCache>,
         parent_session_id: Option<Uuid>,
         inherited_scratchpad_names: Vec<String>,
+        cwd: crate::agent::SharedCwd,
     ) {
         self.register_builtin(Arc::new(load_tool::LoadToolTool {
             tools: Arc::downgrade(&self.tools),
@@ -601,12 +602,14 @@ impl ToolRegistry {
             session_manager: session_manager.clone(),
             session_id: shared_session_id.clone(),
             inherited_names: inherited_scratchpad_names.clone(),
+            cwd: cwd.clone(),
         }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadSaveFileTool {
             session_manager,
             session_id: shared_session_id,
             parent_session_id,
             inherited_names: inherited_scratchpad_names,
+            cwd,
         }));
     }
 
@@ -644,6 +647,7 @@ impl ToolRegistry {
             skills,
             None,
             Vec::new(),
+            cwd,
         );
         Ok(registry)
     }
@@ -692,6 +696,7 @@ impl ToolRegistry {
             skills,
             parent_session_id,
             inherited_scratchpad_names,
+            cwd,
         );
         Ok(registry)
     }

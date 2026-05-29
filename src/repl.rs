@@ -554,16 +554,22 @@ pub fn run_repl(
                     if shell_command.is_empty() {
                         continue;
                     }
+                    // Run in the session's working directory so `!` commands track `/cd`. `/cd`
+                    // updates the `SharedCwd` (not the process cwd), so without this `!pwd` would
+                    // report the original launch directory.
+                    let working_dir = crate::agent::cwd_snapshot(&cwd);
                     #[cfg(windows)]
                     let status = std::process::Command::new("powershell")
                         .arg("-Command")
                         .arg(shell_command)
+                        .current_dir(&working_dir)
                         .status();
 
                     #[cfg(not(windows))]
                     let status = std::process::Command::new("sh")
                         .arg("-c")
                         .arg(shell_command)
+                        .current_dir(&working_dir)
                         .status();
                     match status {
                         Ok(exit_status) => {
