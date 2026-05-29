@@ -5,20 +5,6 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- `/status` shows live context-window usage (tokens / window, percent used, tokens left).
-- Cumulative `/status` stats now persist per session and continue across resume.
-- `display.show_context_in_prompt` shows a live context gauge in the REPL prompt (opt-in).
-
-### Fixed
-
-- OpenAI streaming now requests token usage (`stream_options.include_usage`); it previously reported zero.
-- Claude streaming usage is merged across `message_start`/`message_delta` instead of last-event-wins.
-- Auto-compact now measures total context tokens (all tiers + output), correct with Claude caching.
-
 ## [0.27.0] - 2026-05-29
 
 ### Added
@@ -30,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend`; mekabox uses it to pin Landlock.
 - `--sandbox-backend` flag, so the backend is settable via config, env, and CLI consistently.
 - `MEKA_RENDER_MODE` overrides `[display].render_mode` for CI / non-TTY runs.
+- `/status` shows live context-window usage (tokens / window, percent used, tokens left).
+- Cumulative `/status` stats now persist per session and continue across resume.
+- `display.show_context_in_prompt` shows a live context gauge in the REPL prompt (opt-in).
 
 ### Changed
 
@@ -48,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - User message persists eagerly so a crash mid-turn no longer loses it.
+- OpenAI streaming now requests token usage (`stream_options.include_usage`); it previously reported zero.
+- Claude streaming usage is merged across `message_start`/`message_delta` instead of last-event-wins.
+- Auto-compact now measures total context tokens (all tiers + output), correct with Claude caching.
 
 ## [0.26.2] - 2026-05-22
 
