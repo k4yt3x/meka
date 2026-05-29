@@ -1372,10 +1372,11 @@ impl ResolvedConfig {
             file_permissions.enabled.as_deref(),
         );
 
-        // Compute device_id before the struct literal so we can borrow `provider_name` here without
-        // conflicting with the `provider_name` field move below.
+        // Compute device_id before the struct literal so we can borrow `provider_name` and
+        // `active_profile` here without conflicting with the field moves below.
         let device_id = device_id::resolve(
             provider_name.as_deref(),
+            active_profile.as_deref(),
             active.and_then(|profile| profile.device_id.as_deref()),
         );
         let effort = effort::resolve(active.and_then(|profile| profile.effort.as_deref()));
@@ -1540,31 +1541,22 @@ mod device_id {
 
     use super::{config_file_path, write_config_atomic};
 
-    /// Lookup order: configured → persisted → Claude Code's `~/.claude.json` userID → freshly
-    /// generated. The claude.json fallback lets meka and Claude Code on the same machine share a
-    /// device identity.
-    pub(super) fn resolve(provider_name: Option<&str>, configured: Option<&str>) -> String {
-        if provider_name != Some("claude-oauth") {
+    /// Lookup order: configured → Claude Code's `~/.claude.json` userID → freshly generated. The
+    /// claude.json fallback lets meka and Claude Code on the same machine share a device identity.
+    /// A freshly seeded value is persisted into the active profile's `[providers.<name>].device_id`
+    /// so it stays stable across runs.
+    pub(super) fn resolve(
+        backend: Option<&str>,
+        profile_name: Option<&str>,
+        configured: Option<&str>,
+    ) -> String {
+        if backend != Some("claude-oauth") {
             return String::new();
         }
 
+        // A configured value (the active profile's `device_id`, already deserialized for us) wins;
+        // no need to re-read the file for it.
         if let Some(id) = configured
-            && !id.is_empty()
-        {
-            return id.to_string();
-        }
-
-        let path = match config_file_path() {
-            Some(path) => path,
-            None => return read_claude_code_user_id().unwrap_or_else(generate),
-        };
-
-        if let Ok(contents) = std::fs::read_to_string(&path)
-            && let Ok(doc) = contents.parse::<toml_edit::DocumentMut>()
-            && let Some(id) = doc
-                .get("provider")
-                .and_then(|t| t.get("device_id"))
-                .and_then(|v| v.as_str())
             && !id.is_empty()
         {
             return id.to_string();
@@ -1575,7 +1567,13 @@ mod device_id {
             None => (generate(), "random"),
         };
         tracing::info!("seeded claude-oauth device_id from {}", source);
-        if let Err(error) = persist(&path, &id) {
+
+        // Persist into the active profile's table. Skip quietly when we can't locate the config
+        // path or the profile name; the id is still returned and used for this run, just
+        // not saved.
+        if let (Some(profile), Some(path)) = (profile_name, config_file_path())
+            && let Err(error) = persist(&path, profile, &id)
+        {
             tracing::warn!("failed to persist device_id: {}", error);
         }
         id
@@ -1614,22 +1612,29 @@ mod device_id {
         Some(id.to_string())
     }
 
-    fn persist(path: &Path, id: &str) -> std::io::Result<()> {
+    pub(super) fn persist(path: &Path, profile: &str, id: &str) -> std::io::Result<()> {
         let contents = std::fs::read_to_string(path).unwrap_or_default();
         let mut doc: toml_edit::DocumentMut = contents
             .parse()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
-        if !doc.contains_key("provider") {
-            doc["provider"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["provider"]["device_id"] = toml_edit::value(id);
+        // The active profile's table already exists (it's how the profile was selected); update its
+        // `device_id` in place. Bail quietly rather than synthesize a malformed inline table if the
+        // structure isn't what we expect.
+        let Some(table) = doc
+            .get_mut("providers")
+            .and_then(|item| item.get_mut(profile))
+            .and_then(|item| item.as_table_mut())
+        else {
+            return Ok(());
+        };
+        table.insert("device_id", toml_edit::value(id));
 
         write_config_atomic(path, &doc.to_string())
     }
 }
 
-/// `[provider].effort` normalisation for Claude Code's `output_config.effort`.
+/// `[providers.<name>].effort` normalisation for Claude Code's `output_config.effort`.
 mod effort {
     /// Resolves to one of `"low" | "medium" | "high"`, falling back to `"high"` for missing or
     /// unrecognised values (with a warn log for the latter so a typo isn't silently lost).
@@ -1643,7 +1648,7 @@ mod effort {
             "low" | "medium" | "high" => trimmed.to_ascii_lowercase(),
             other => {
                 tracing::warn!(
-                    "ignoring [provider].effort = {:?}: expected one of \"low\", \"medium\", \"high\"; \
+                    "ignoring effort = {:?}: expected one of \"low\", \"medium\", \"high\"; \
                      falling back to \"{}\"",
                     other,
                     DEFAULT,
@@ -2059,21 +2064,75 @@ type = "claude-oauth"
     fn test_resolve_device_id_returns_empty_for_non_claude_oauth() {
         // Should not generate / persist anything when the provider doesn't need a device_id. Empty
         // string flows through but is ignored by non-claude-oauth providers.
-        assert_eq!(device_id::resolve(Some("openai-api"), None), "");
-        assert_eq!(device_id::resolve(Some("claude-api"), None), "");
-        assert_eq!(device_id::resolve(None, None), "");
+        assert_eq!(
+            device_id::resolve(Some("openai-api"), Some("work"), None),
+            ""
+        );
+        assert_eq!(
+            device_id::resolve(Some("claude-api"), Some("work"), None),
+            ""
+        );
+        assert_eq!(device_id::resolve(None, None, None), "");
         // Even an explicit configured value is suppressed when the provider isn't claude-oauth;
         // the field is provider-scoped.
-        assert_eq!(device_id::resolve(Some("openai-api"), Some("explicit")), "");
+        assert_eq!(
+            device_id::resolve(Some("openai-api"), Some("work"), Some("explicit")),
+            ""
+        );
     }
 
     #[test]
     fn test_resolve_device_id_uses_configured_value_for_claude_oauth() {
+        // A configured value returns before the persist branch, so this never touches the FS.
         let id = "deadbeef".repeat(8);
         assert_eq!(
-            device_id::resolve(Some("claude-oauth"), Some(&id)),
+            device_id::resolve(Some("claude-oauth"), Some("work"), Some(&id)),
             id,
             "configured value must be used verbatim for claude-oauth"
+        );
+    }
+
+    #[test]
+    fn test_persist_device_id_writes_into_profile_table() {
+        // Regression: device_id must land in `[providers.<name>].device_id`, not the dead singular
+        // `[provider]` table, under the named-profiles model.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_provider = \"work\"\n\n[providers.work]\ntype = \"claude-oauth\"\nmodel = \"claude-opus-4-8\"\n",
+        )
+        .expect("seed config");
+
+        device_id::persist(&path, "work", "abc123").expect("persist");
+
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        let config: ConfigFile = toml::from_str(&contents).expect("re-parse");
+        let persisted = config
+            .providers
+            .get("work")
+            .and_then(|profile| profile.device_id.as_deref());
+        assert_eq!(
+            persisted,
+            Some("abc123"),
+            "device_id must be stored under the active profile"
+        );
+        // The legacy singular table must never be (re)created.
+        assert!(
+            !contents.contains("[provider]"),
+            "must not write the dead `[provider]` table: {contents}"
+        );
+        // Existing profile fields are preserved.
+        assert_eq!(
+            config.providers.get("work").map(|p| p.backend.as_str()),
+            Some("claude-oauth")
+        );
+        // Closing the loop: the reader feeds the persisted value back through `resolve`, which must
+        // return it verbatim rather than regenerate a fresh id on the next run.
+        assert_eq!(
+            device_id::resolve(Some("claude-oauth"), Some("work"), persisted),
+            "abc123",
+            "a persisted device_id must be picked up on the next run, not regenerated"
         );
     }
 
