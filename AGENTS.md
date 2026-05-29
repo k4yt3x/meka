@@ -76,6 +76,17 @@ The streaming markdown renderer (`render::StreamingRenderer`) writes to stdout b
 
 **Opt-in visibility.** When a config flag like `show_session_id_on_create` explicitly requests visible output, honour it via `println!` / `eprintln!`; don't silently demote it to `info!` and force `-v`.
 
+## Configuration surfaces
+
+meka has three configuration surfaces with a fixed precedence: **CLI flags > environment variables > `config.toml`**. Keep coverage principled rather than adding ad-hoc overrides:
+
+- **`config.toml` is the complete source of truth** — every persistent setting lives here.
+- **CLI flags** expose the per-invocation knobs a user changes for one interactive run (provider, model, base-url, permission, instructions, render-mode, streaming, thinking, sandbox-backend, continue, oneshot, skill).
+- **Environment variables** expose only the subset needed for non-interactive deployment (containers, CI, secrets, spawned agents): secrets/tokens, provider/model, config/data dirs, permission, instructions, sandbox backend, MCP timeout, render mode, and `RUST_LOG`.
+- **Session and display tuning stays config-only** (e.g. `context_messages`, `retention_days`, `auto_compact`, `newline_*`, `show_*`) — don't add env vars or flags for set-once preferences.
+
+When a setting genuinely needs an env var or flag, wire every tier it belongs in and keep the `CLI > env > file` precedence (the idiom is `cli.x.or_else(env).or(file)` in `ResolvedConfig::from_cli`).
+
 ## CLI help text
 
 Clap `///` doc-comments must render within 80 columns when shown via `-h`. Verify by running the actual binary for every changed subcommand: source-line length doesn't account for clap's indent, value-name length, or auto-appended hints like `[possible values: ...]`. Put `Examples:` and other long-form prose after a blank `///` line so they only show in `--help`, not `-h`. When that long-form prose has multiple lines or indented blocks (e.g. an `Examples:` list), add `#[command(verbatim_doc_comment)]` to the struct/variant so clap preserves the line breaks instead of re-wrapping them into one paragraph.

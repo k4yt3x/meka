@@ -424,6 +424,20 @@ impl std::fmt::Display for SandboxBackend {
     }
 }
 
+impl std::str::FromStr for SandboxBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "landlock" => Ok(SandboxBackend::Landlock),
+            "bubblewrap" => Ok(SandboxBackend::Bubblewrap),
+            other => Err(format!(
+                "unknown sandbox backend '{other}' (expected 'landlock' or 'bubblewrap')"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct SessionConfig {
     pub context_messages: Option<usize>,
@@ -1077,6 +1091,33 @@ fn resolve_permission(
     (permission, enabled)
 }
 
+/// `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend` for non-interactive / containerized
+/// runs (the `mekabox` wrapper sets it to pin Landlock and silence the auto-resolve warning when
+/// it mounts the host config read-only). Accepts `landlock` / `bubblewrap` (case-insensitive); an
+/// unrecognized value is warned about and ignored. Like the config field, this only affects the
+/// resolved backend on Linux.
+fn sandbox_backend_override() -> Option<SandboxBackend> {
+    parse_sandbox_backend_override(&std::env::var("MEKA_SANDBOX_BACKEND").ok()?)
+}
+
+/// Parse a `MEKA_SANDBOX_BACKEND` value (case-insensitive, trimmed). Empty or unrecognized values
+/// yield `None`; unrecognized ones also warn. Split from [`sandbox_backend_override`] so the
+/// parsing is unit-testable without mutating process env.
+fn parse_sandbox_backend_override(value: &str) -> Option<SandboxBackend> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Env tolerates a bad value (warn and ignore); the CLI path uses `FromStr` directly and errors.
+    match trimmed.parse() {
+        Ok(backend) => Some(backend),
+        Err(message) => {
+            tracing::warn!("ignoring MEKA_SANDBOX_BACKEND: {}", message);
+            None
+        }
+    }
+}
+
 /// Resolve the active Linux sandbox backend.
 ///
 /// When the user pinned `[shell].sandbox_backend = "..."` in `config.toml`, that choice is binding,
@@ -1323,14 +1364,19 @@ impl ResolvedConfig {
         // has disabled sandboxing globally. The placeholder probe is never consulted in that state;
         // the shell tool short-circuits on `sandbox_enabled = false`, and the warn helper early-
         // returns on `!state.enabled`.
+        // Backend precedence: `--sandbox-backend` > `MEKA_SANDBOX_BACKEND` >
+        // `[shell].sandbox_backend`. An explicit value from any tier also flips
+        // `auto_resolved` off, suppressing the "install Bubblewrap" startup warning.
+        let configured_backend = cli
+            .sandbox_backend
+            .or_else(sandbox_backend_override)
+            .or(file_shell.sandbox_backend);
         let (sandbox_backend, sandbox_auto_resolved, backend_probe) =
             if file_shell.sandbox.unwrap_or(true) {
-                resolve_sandbox_backend(file_shell.sandbox_backend)
+                resolve_sandbox_backend(configured_backend)
             } else {
                 (
-                    file_shell
-                        .sandbox_backend
-                        .unwrap_or(SandboxBackend::Landlock),
+                    configured_backend.unwrap_or(SandboxBackend::Landlock),
                     false,
                     crate::sandbox::BackendProbe::Missing {
                         reason: "sandbox disabled in config".to_string(),
@@ -1365,6 +1411,11 @@ impl ResolvedConfig {
             backend_probe,
             render_mode: cli
                 .render_mode
+                .or_else(|| {
+                    std::env::var("MEKA_RENDER_MODE")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                })
                 .or(file_display.render_mode)
                 .unwrap_or_default(),
             context_messages: file_session
@@ -2570,6 +2621,48 @@ Rule 2.
             Some("FROM ENV VAR"),
             "MEKA_INSTRUCTIONS should override [prompt].instructions in the config file",
         );
+    }
+
+    #[test]
+    fn test_parse_sandbox_backend_override() {
+        assert_eq!(
+            parse_sandbox_backend_override("landlock"),
+            Some(SandboxBackend::Landlock)
+        );
+        assert_eq!(
+            parse_sandbox_backend_override("Bubblewrap"),
+            Some(SandboxBackend::Bubblewrap)
+        );
+        assert_eq!(
+            parse_sandbox_backend_override("  LANDLOCK  "),
+            Some(SandboxBackend::Landlock),
+            "value is trimmed and case-insensitive"
+        );
+        assert_eq!(parse_sandbox_backend_override(""), None);
+        assert_eq!(
+            parse_sandbox_backend_override("nonsense"),
+            None,
+            "unrecognized values are ignored, not fatal"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_backend_from_str() {
+        assert_eq!(
+            "landlock".parse::<SandboxBackend>(),
+            Ok(SandboxBackend::Landlock)
+        );
+        assert_eq!(
+            "Bubblewrap".parse::<SandboxBackend>(),
+            Ok(SandboxBackend::Bubblewrap)
+        );
+        assert_eq!(
+            "  LANDLOCK  ".parse::<SandboxBackend>(),
+            Ok(SandboxBackend::Landlock),
+            "trimmed and case-insensitive"
+        );
+        // Unlike the env path, the CLI parse surfaces an error for a bad value.
+        assert!("bogus".parse::<SandboxBackend>().is_err());
     }
 
     #[test]

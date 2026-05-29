@@ -345,6 +345,10 @@ pub struct Cli {
     #[arg(long = "base-url")]
     pub base_url: Option<String>,
 
+    /// Linux sandbox backend: landlock or bubblewrap
+    #[arg(long = "sandbox-backend", value_parser = parse_sandbox_backend)]
+    pub sandbox_backend: Option<crate::config::SandboxBackend>,
+
     /// Disable streaming mode
     #[arg(long = "no-stream")]
     pub no_stream: bool,
@@ -387,6 +391,10 @@ fn parse_permission(s: &str) -> std::result::Result<Permission, String> {
 }
 
 fn parse_render_mode(s: &str) -> std::result::Result<crate::render::RenderMode, String> {
+    s.parse()
+}
+
+fn parse_sandbox_backend(s: &str) -> std::result::Result<crate::config::SandboxBackend, String> {
     s.parse()
 }
 

@@ -14,6 +14,8 @@ Environment variables override config file values but are overridden by CLI flag
 | `MEKA_INSTRUCTIONS` | Replace `[prompt].instructions` for this run. Equivalent to `--instructions`. Used by the `mekabox` container wrapper to tell the agent it can install packages freely. | `Be terse.` |
 | `MEKA_CONFIG_DIR` | Override the default config directory. Points at the `meka` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform: `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. | `/tmp/meka-test/meka` |
 | `MEKA_DATA_DIR` | Override the default data directory (where `meka.db` lives). Same cross-platform escape hatch: `dirs::data_dir()` ignores `$XDG_DATA_HOME` on macOS/Windows. Useful for tests, portable installs, and per-project session isolation. | `/tmp/meka-test/data/meka` |
+| `MEKA_SANDBOX_BACKEND` | Override `[shell].sandbox_backend` (Linux only). Pinning a value also suppresses the "install Bubblewrap" auto-resolve warning. Used by the `mekabox` wrapper to pin Landlock in the container without editing the read-only host config. | `landlock`, `bubblewrap` |
+| `MEKA_RENDER_MODE` | Override `[display].render_mode`. Handy for CI / non-TTY runs that want plain or no output. | `bat`, `termimad`, `raw`, `silent` |
 
 ## MCP Variables
 
@@ -35,6 +37,7 @@ Environment variables override config file values but are overridden by CLI flag
 | `CLAUDE_OAUTH_TOKEN` | OAuth access token for the `claude-oauth` provider |
 | `OPENAI_CODEX_TOKEN` | OAuth access token for the `openai-codex` provider |
 | `CODEX_CLIENT_ID` | Override the default OpenAI OAuth client ID for the `openai-codex` setup wizard (rarely needed) |
+| `CLAUDE_CLIENT_ID` | Override the default Claude OAuth client ID for the `claude-oauth` provider (rarely needed) |
 
 On first use, the OAuth token is saved to the database and loaded automatically on subsequent launches. Setting the env var again replaces the stored token.
 
@@ -43,6 +46,8 @@ On first use, the OAuth token is saved to the database and loaded automatically 
 | Variable | Description |
 |----------|-------------|
 | `OPENAI_BASE_URL` | Custom base URL for the OpenAI-compatible endpoint |
+
+`OPENAI_BASE_URL` intentionally follows the OpenAI SDK's own env-var name (rather than a generic `MEKA_BASE_URL`) so existing OpenAI-compatible setups work unchanged. Use the `--base-url` flag to override it per run.
 
 ## Logging
 

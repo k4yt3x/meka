@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `meka acp` subcommand for editors that speak the Agent Client Protocol.
 - `meka serve` subcommand exposes the agent over HTTP+JSON.
 - REPL input history persists across runs in the SQLite DB.
+- `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend`; mekabox uses it to pin Landlock.
+- `--sandbox-backend` flag, so the backend is settable via config, env, and CLI consistently.
+- `MEKA_RENDER_MODE` overrides `[display].render_mode` for CI / non-TTY runs.
 
 ### Changed
 
