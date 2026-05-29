@@ -20,7 +20,7 @@ The `openai-codex` provider talks to OpenAI's subscription endpoint using the OA
 meka setup
 # Pick "openai-codex (ChatGPT subscription login)"
 # A browser opens; sign in to ChatGPT and approve.
-# Tokens are saved to ~/.local/share/meka/sessions.db (chmod 0600).
+# Tokens are saved to ~/.local/share/meka/meka.db (chmod 0600).
 ```
 
 The wizard binds a local listener on `127.0.0.1:1455` to receive the OAuth callback, matching the redirect URI registered with OpenAI's auth server. If port 1455 is already in use (e.g. you're already running the Codex CLI), free it first.
@@ -69,7 +69,7 @@ If you have both a ChatGPT subscription and an OpenAI API key:
 Removing the saved tokens:
 
 ```bash
-sqlite3 ~/.local/share/meka/sessions.db "DELETE FROM oauth_tokens WHERE provider = 'openai-codex'"
+sqlite3 ~/.local/share/meka/meka.db "DELETE FROM oauth_tokens WHERE provider = 'openai-codex'"
 ```
 
 Then re-run `meka setup` to log in again with a fresh PKCE pair.

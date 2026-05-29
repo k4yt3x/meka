@@ -123,12 +123,12 @@ impl Drop for SessionLock {
 fn default_database_path() -> Result<PathBuf> {
     // `MEKA_DATA_DIR` is the cross-platform override, the only env var that works on every OS,
     // mirroring how `MEKA_CONFIG_DIR` overrides the config directory. The value points at the
-    // `meka` data dir itself (the parent that contains `sessions.db`). Useful for tests, portable
-    // installs, and isolating per-project session state from the global one.
+    // `meka` data dir itself (the parent that contains `meka.db`). Useful for tests, portable
+    // installs, and isolating per-project state from the global one.
     if let Ok(value) = std::env::var("MEKA_DATA_DIR")
         && !value.is_empty()
     {
-        return Ok(PathBuf::from(value).join("sessions.db"));
+        return Ok(PathBuf::from(value).join("meka.db"));
     }
 
     // `dirs::data_dir()` honors XDG_DATA_HOME on Linux, returns `~/Library/Application Support` on
@@ -137,12 +137,12 @@ fn default_database_path() -> Result<PathBuf> {
     // asking the user to set `MEKA_DATA_DIR` explicitly.
     let base = dirs::data_dir().ok_or_else(|| {
         MekaError::Config(
-            "could not determine a data directory for the session database; \
+            "could not determine a data directory for the database; \
              set MEKA_DATA_DIR to an absolute path"
                 .into(),
         )
     })?;
-    Ok(base.join("meka").join("sessions.db"))
+    Ok(base.join("meka").join("meka.db"))
 }
 
 /// Create a directory (and any missing parents) born at mode 0700 on Unix. Avoids the umask window
@@ -2268,7 +2268,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let db_path = temp_dir.path().join("data").join("sessions.db");
+        let db_path = temp_dir.path().join("data").join("meka.db");
 
         let _manager = SessionManager::open(Some(&db_path))
             .await
@@ -2510,7 +2510,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_prunes_orphan_lock_files() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let db_path = temp_dir.path().join("sessions.db");
+        let db_path = temp_dir.path().join("meka.db");
         let lock_dir = temp_dir.path().join("locks");
         std::fs::create_dir_all(&lock_dir).expect("create locks dir");
         let orphan = lock_dir.join(format!("{}.lock", Uuid::new_v4()));
@@ -3115,7 +3115,7 @@ mod tests {
         use rusqlite::Connection as RusqliteConnection;
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let db_path = temp_dir.path().join("sessions.db");
+        let db_path = temp_dir.path().join("meka.db");
         let session_id = Uuid::new_v4();
         let now = chrono::Utc::now().to_rfc3339();
 

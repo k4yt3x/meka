@@ -51,9 +51,9 @@ Sessions are stored in a SQLite database at a platform-specific location:
 
 | Platform | Path |
 |----------|------|
-| Linux | `~/.local/share/meka/sessions.db` (`$XDG_DATA_HOME/meka/sessions.db`) |
-| macOS | `~/Library/Application Support/meka/sessions.db` |
-| Windows | `%APPDATA%\meka\sessions.db` |
+| Linux | `~/.local/share/meka/meka.db` (`$XDG_DATA_HOME/meka/meka.db`) |
+| macOS | `~/Library/Application Support/meka/meka.db` |
+| Windows | `%APPDATA%\meka\meka.db` |
 
 ## Database Schema
 
@@ -205,6 +205,6 @@ meka delete --all
 You can also manage sessions directly through the SQLite database. For example, to list all sessions:
 
 ```bash
-sqlite3 ~/.local/share/meka/sessions.db \
+sqlite3 ~/.local/share/meka/meka.db \
   "SELECT id, created_at, updated_at FROM sessions ORDER BY updated_at DESC;"
 ```
