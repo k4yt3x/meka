@@ -8,8 +8,9 @@ The `openai-codex` provider talks to OpenAI's subscription endpoint using the OA
 
 | Setting | Value |
 |---------|-------|
-| Provider name | `openai-codex` |
+| Profile `type` | `openai-codex` |
 | Default base URL | `https://chatgpt.com` (request path `/backend-api/codex/responses`) |
+| Credential | OAuth bundle stored in the database (acquired via `meka provider add` / `login`) |
 | Auth method | OAuth 2.0 Authorization Code with PKCE |
 | OAuth issuer | `https://auth.openai.com` |
 | Required tier | ChatGPT Plus, Pro, Team, Business, Enterprise, or Edu |
@@ -17,19 +18,22 @@ The `openai-codex` provider talks to OpenAI's subscription endpoint using the OA
 ## Initial Setup
 
 ```bash
-meka setup
-# Pick "openai-codex (ChatGPT subscription login)"
+meka provider add chatgpt --type openai-codex --model gpt-5
 # A browser opens; sign in to ChatGPT and approve.
 # Tokens are saved to ~/.local/share/meka/meka.db (chmod 0600).
 ```
 
-The wizard binds a local listener on `127.0.0.1:1455` to receive the OAuth callback, matching the redirect URI registered with OpenAI's auth server. If port 1455 is already in use (e.g. you're already running the Codex CLI), free it first.
+`meka provider add` binds a local listener on `127.0.0.1:1455` to receive the OAuth callback, matching the redirect URI registered with OpenAI's auth server. If port 1455 is already in use (e.g. you're already running the Codex CLI), free it first.
 
 ## Config File
 
+`meka provider add` writes this for you (the token bundle stays in the database):
+
 ```toml
-[provider]
-name = "openai-codex"
+default_provider = "chatgpt"
+
+[providers.chatgpt]
+type = "openai-codex"
 model = "gpt-5"
 effort = "high"   # optional; "low" | "medium" | "high"
 ```
@@ -66,10 +70,12 @@ If you have both a ChatGPT subscription and an OpenAI API key:
 
 ## Logging Out
 
-Removing the saved tokens:
+`meka provider remove <name>` revokes the OAuth token (best-effort), deletes the stored credential
+from the database, and removes the profile from the config file:
 
 ```bash
-sqlite3 ~/.local/share/meka/meka.db "DELETE FROM oauth_tokens WHERE provider = 'openai-codex'"
+meka provider remove chatgpt
 ```
 
-Then re-run `meka setup` to log in again with a fresh PKCE pair.
+To re-authenticate the same profile without removing it (e.g. after a dead refresh token), run
+`meka provider login <name>` for a fresh PKCE pair.

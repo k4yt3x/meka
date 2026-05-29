@@ -8,66 +8,63 @@ The `claude-oauth` provider authenticates with a Claude Code subscription via OA
 
 | Setting | Value |
 |---------|-------|
-| Provider name | `claude-oauth` |
+| Profile `type` | `claude-oauth` |
 | Default base URL | `https://api.anthropic.com` |
-| OAuth token env var | `CLAUDE_OAUTH_TOKEN` |
-| OAuth client ID env var | `CLAUDE_CLIENT_ID` (optional) |
+| Credential | OAuth bundle stored in the database (acquired via `meka provider add` / `login`) |
 | Auth method | `Authorization: Bearer <oauth_token>` |
 | API version | `2023-06-01` |
 
-### Quickest Start (Setup Wizard)
+### Quickest Start
 
 ```bash
-meka setup
+meka provider add work --type claude-oauth --model claude-opus-4-6
 ```
 
-Pick **claude-oauth** when prompted. The wizard opens your browser, walks you through authorization, and saves the tokens to the local database.
-
-### Minimal Setup (Manual OAuth Token)
-
-```bash
-export MEKA_PROVIDER=claude-oauth
-export MEKA_MODEL=claude-opus-4-6
-export CLAUDE_OAUTH_TOKEN=sk-ant-oat01-...
-meka
-```
-
-On first run the OAuth token is saved to the database. Subsequent runs load it automatically; you no longer need the env var.
+`meka provider add` opens your browser, walks you through authorization, and saves the tokens to the
+local database. It also writes the `[providers.work]` profile and sets it as the default.
 
 ### Config File
 
+`meka provider add` writes this for you; you can also edit it by hand (secrets stay in the database):
+
 ```toml
-[provider]
-name = "claude-oauth"
+default_provider = "work"
+
+[providers.work]
+type = "claude-oauth"
 model = "claude-opus-4-6"
 effort = "high"          # optional; "low" | "medium" | "high"
 redact_thinking = false  # optional; redact thinking content for privacy
-# device_id, oauth_token_url, oauth_token are all optional overrides
+# device_id, oauth_token_url, client_id are all optional overrides
 ```
 
 See [Configuration → Config File](../configuration/config-file.md) for the full list of fields.
 
 ## Provider-specific knobs
 
-### `[provider].effort`
+### `effort`
 
 Sent as `output_config.effort` for effort-capable models (`opus-4-6`, `sonnet-4-6`). Accepts `"low"`, `"medium"`, or `"high"`. Defaults to `"high"`. Mirrors Claude Code's effort knob in `utils/effort.ts`. Older models (Sonnet 4.0, Opus 4.1, Haiku 4.5) ignore this field on the wire and the body field is omitted automatically.
 
-### `[provider].redact_thinking`
+### `redact_thinking`
 
 When `true`, meka adds the `redact-thinking-2026-02-12` beta header so the server returns redacted thinking blocks instead of full thinking summaries. The redacted payloads can't be replayed back to the server in multi-turn conversations, so meka stores them as opaque signatures only. Defaults to `false`.
 
-### `[provider].device_id`
+### `device_id`
 
 Stable per-machine identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device ID (`getOrCreateUserID` in `utils/config.ts`).
 
-If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine present as the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way the resolved value is persisted back to `[provider].device_id` in `config.toml`. Other providers ignore this field; no stub config file is written for them.
+If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine present as the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way the resolved value is persisted back to `[providers.<name>].device_id` in `config.toml`. Other backends ignore this field; no stub config file is written for them.
+
+### `client_id`
+
+Optional override for the OAuth client ID. Defaults to Claude Code's client ID; rarely needed.
 
 ## Authentication
 
-### Setup Wizard (recommended)
+### OAuth login
 
-`meka setup` performs an OAuth 2.0 Authorization Code flow with PKCE:
+`meka provider add` (and `meka provider login <name>` to re-authenticate) performs an OAuth 2.0 Authorization Code flow with PKCE:
 
 1. meka generates a PKCE challenge and opens your browser to Claude's authorization page.
 2. You authorize the application in your browser.
@@ -75,17 +72,17 @@ If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and 
 4. meka exchanges the code for access + refresh tokens.
 5. Tokens are stored in the local database and refreshed automatically.
 
-The OAuth client ID defaults to Claude Code's client ID but can be overridden via the `CLAUDE_CLIENT_ID` env var.
+The OAuth client ID defaults to Claude Code's client ID but can be overridden per profile via `client_id`.
 
 ### Token Lifecycle
 
-1. Provide the initial token via setup wizard, env var, or config.
-2. meka saves it to the database on first use.
+1. Acquire the initial token with `meka provider add` / `login`.
+2. The token bundle is stored in the database, keyed by the profile name.
 3. On subsequent launches the token is loaded from the database.
-4. meka refreshes the access token automatically when it's within 5 minutes of expiry; the new token is written back to the database.
-5. Setting a new env var or config value replaces the stored token.
+4. meka refreshes the access token automatically when it's within 5 minutes of expiry; the new token is written back to the database under the same profile.
+5. If the refresh token dies, run `meka provider login <name>` to re-authenticate.
 
-**Token refresh URL:** defaults to `https://api.anthropic.com/v1/oauth/token`. Configurable via `provider.oauth_token_url` in the config file.
+**Token refresh URL:** defaults to `https://api.anthropic.com/v1/oauth/token`. Configurable via `oauth_token_url` in the profile.
 
 ## Supported Models
 
@@ -125,7 +122,7 @@ Composed dynamically from the model + thinking settings, mirroring Claude Code's
 | `oauth-2025-04-20` | Always (subscription auth) |
 | `adaptive-thinking-2026-01-28` | Thinking on AND model is `opus-4-6` / `sonnet-4-6` |
 | `interleaved-thinking-2025-05-14` | Thinking on AND model is older Claude 4 (Sonnet 4.0, etc.) |
-| `redact-thinking-2026-02-12` | `[provider].redact_thinking = true` AND thinking on |
+| `redact-thinking-2026-02-12` | profile `redact_thinking = true` AND thinking on |
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
 | `effort-2025-11-24` | `opus-4-6` / `sonnet-4-6` only |
@@ -142,9 +139,9 @@ Only block 3 is marked for caching, matching the recent Claude Code wire shape (
 
 ### Other body fields
 
-- `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "", "session_id": "..."}` (`device_id` from `[provider].device_id`; `session_id` is per-process).
+- `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "", "session_id": "..."}` (`device_id` from the profile's `device_id`; `session_id` is per-process).
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
-- `output_config.effort`: present for effort-capable models, value from `[provider].effort`.
+- `output_config.effort`: present for effort-capable models, value from the profile's `effort`.
 - `temperature: 1` (only when thinking is disabled).
 - `max_tokens`: `64_000` for adaptive-thinking models, `max(thinking_budget * 2, 32_000)` for legacy thinking models, `32_000` otherwise.
 

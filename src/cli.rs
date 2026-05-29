@@ -12,8 +12,11 @@ use crate::permission::Permission;
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
-    /// Run the interactive configuration wizard
-    Setup,
+    /// Manage provider profiles
+    Provider {
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
     /// Export a session as Markdown
     Export {
         /// Session UUID to export
@@ -40,17 +43,17 @@ pub enum Command {
         #[arg(long)]
         include_children: bool,
     },
-    /// Manage MCP servers (list, add, remove, reconnect, login, logout)
+    /// Manage MCP servers
     Mcp {
         #[command(subcommand)]
         action: McpAction,
     },
-    /// Inspect built-in tool filters (allow/disable/permission overrides)
+    /// Inspect built-in tool filters
     Tools {
         #[command(subcommand)]
         action: ToolsAction,
     },
-    /// Manage user skills (list, add, remove, show)
+    /// Manage user skills
     Skill {
         #[command(subcommand)]
         action: SkillAction,
@@ -79,6 +82,56 @@ pub enum Command {
 pub enum ToolsAction {
     /// List every built-in tool with its effective permission and status.
     List,
+}
+
+// `Add` is the outlier with several flags inline; same one-shot CLI dispatch reasoning as the
+// other action enums.
+#[allow(clippy::large_enum_variant)]
+#[derive(clap::Subcommand, Debug)]
+pub enum ProviderAction {
+    /// Add a provider profile and authenticate it.
+    ///
+    /// Prompts for any of type/model not passed as flags, then acquires the
+    /// secret (OAuth login for claude-oauth / openai-codex, API-key prompt for
+    /// claude-api / openai-api) and stores it in the database. Sets the default
+    /// provider when this is the first profile.
+    Add {
+        /// Profile name (e.g. `work`, `personal`).
+        name: String,
+        /// Backend type.
+        ///
+        /// One of: openai-api, openai-codex, claude-api, claude-oauth.
+        #[arg(long = "type")]
+        r#type: Option<String>,
+        /// Model name.
+        #[arg(long)]
+        model: Option<String>,
+        /// API base URL (for OpenAI-compatible endpoints).
+        #[arg(long = "base-url")]
+        base_url: Option<String>,
+        /// Read the API key from stdin (API backends only).
+        ///
+        /// Non-interactive alternative to the key prompt.
+        #[arg(long = "api-key-stdin")]
+        api_key_stdin: bool,
+    },
+    /// List configured provider profiles.
+    List,
+    /// Set the default provider profile.
+    Use {
+        /// Profile name to make the default.
+        name: String,
+    },
+    /// Remove a provider profile and clear its stored credential.
+    Remove {
+        /// Profile name to remove.
+        name: String,
+    },
+    /// Re-authenticate an existing provider profile.
+    Login {
+        /// Profile name to re-authenticate.
+        name: String,
+    },
 }
 
 // `Add` is the outlier with several flags inline; same one-shot CLI dispatch reasoning as
@@ -333,11 +386,11 @@ pub struct Cli {
     #[arg(long = "permission", value_parser = parse_permission)]
     pub permission: Option<Permission>,
 
-    /// LLM provider: openai-api, openai-codex, claude-api, claude-oauth
+    /// Provider profile to use this run (name from [providers.<name>])
     #[arg(long = "provider")]
     pub provider: Option<String>,
 
-    /// Model name
+    /// Override the active profile's model for this run
     #[arg(short = 'm', long = "model")]
     pub model: Option<String>,
 
@@ -518,8 +571,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_setup_subcommand() {
-        let cli = Cli::parse_from(["meka", "setup"]);
-        assert!(matches!(cli.command, Some(Command::Setup)));
+    fn test_cli_provider_add_subcommand() {
+        let cli = Cli::parse_from(["meka", "provider", "add", "work", "--type", "claude-oauth"]);
+        match cli.command {
+            Some(Command::Provider {
+                action: ProviderAction::Add { name, r#type, .. },
+            }) => {
+                assert_eq!(name, "work");
+                assert_eq!(r#type.as_deref(), Some("claude-oauth"));
+            }
+            other => panic!("expected provider add, got {:?}", other),
+        }
     }
 }

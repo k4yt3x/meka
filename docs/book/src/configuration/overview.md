@@ -1,44 +1,62 @@
 # Configuration Overview
 
-The recommended way to configure meka is with a config file at `~/.config/meka/config.toml`:
+meka is configured with named **provider profiles** in a config file at
+`~/.config/meka/config.toml`, plus secrets stored in the database. The quickest way to get started
+is to let `meka provider add` write both for you:
 
-```toml
-[provider]
-name = "openai-api"
-model = "gpt-4o"
-api_key = "sk-..."
+```console
+$ meka provider add work --type claude-oauth --model claude-opus-4-6
 ```
 
-This is all you need to get started. See [Config File](./config-file.md) for the full reference.
+That command writes a `[providers.work]` profile to the config file, runs the OAuth login (or prompts
+for an API key, depending on the backend), stores the secret in the database, and makes the profile
+the default. The resulting config looks like:
+
+```toml
+default_provider = "work"
+
+[providers.work]
+type  = "claude-oauth"
+model = "claude-opus-4-6"
+```
+
+See [Config File](./config-file.md) for the full reference and the [`meka provider`](./config-file.md#meka-provider-cli) command suite.
 
 ## Required Settings
 
-meka requires three settings to function. If any are missing, it prints an error with setup instructions:
+To run a turn, meka needs an active provider profile that pins a backend `type` and `model`, and a
+stored credential for it. If no profile can be selected, or the active profile has no model or no
+credential, meka prints an error pointing at `meka provider add` / `meka provider login`.
 
-| Setting | Config Key | Env Var | CLI Flag |
-|---------|------------|---------|----------|
-| Provider | `provider.name` | `MEKA_PROVIDER` | `--provider` |
-| Model | `provider.model` | `MEKA_MODEL` | `-m`, `--model` |
-| API Key | `provider.api_key` | `OPENAI_API_KEY` or `CLAUDE_API_KEY` | -- |
+| Setting | Source | Per-run override |
+|---------|--------|------------------|
+| Active profile | `default_provider` in config, or the sole profile | `--provider <name>` |
+| Backend (`type`) | `[providers.<name>].type` | -- |
+| Model | `[providers.<name>].model` | `-m`, `--model` |
+| Credential (API key / OAuth) | Database, via `meka provider add` / `login` | -- |
 
 ## Override Layers
 
-Configuration is layered. Higher-priority layers override lower ones:
+Provider configuration is layered as follows; higher-priority layers override lower ones:
 
-1. **CLI flags**: per-invocation overrides (`--provider`, `--model`, `--base-url`, `-p`)
-2. **Environment variables**: useful for CI, containers, or temporary overrides (`MEKA_PROVIDER`, etc.)
-3. **Config file**: persistent settings in `~/.config/meka/config.toml`
-4. **Built-in defaults**: permission defaults to `read`, streaming defaults to on
+1. **CLI flags**: per-invocation overrides (`--provider`, `--model`, `--base-url`).
+2. **Config file**: persistent profiles in `~/.config/meka/config.toml`.
+3. **Built-in defaults**: permission defaults to `read`, streaming defaults to on.
 
-For example, `--model gpt-4o-mini` on the command line overrides both `MEKA_MODEL` and `provider.model` in the config file.
+For example, `--model gpt-4o-mini` on the command line overrides the active profile's `model` for
+that run. There is **no environment-variable tier** for provider configuration; an ambient
+`OPENAI_API_KEY` or `MEKA_PROVIDER` has no effect (see [Environment Variables](./environment-variables.md)).
 
-## API Key Resolution
+## Credential Resolution
 
-The API key environment variable depends on the configured provider:
+The credential for the active profile is loaded from the database, keyed by the profile name. It is
+acquired interactively:
 
-- Provider `openai-api`: reads `OPENAI_API_KEY`
-- Provider `openai-codex`: reads `OPENAI_CODEX_TOKEN`, otherwise loads the OAuth token saved by `meka setup`
-- Provider `claude-api`: reads `CLAUDE_API_KEY`
-- Provider `claude-oauth`: reads `CLAUDE_OAUTH_TOKEN`, otherwise loads the OAuth token saved by `meka setup`
+- `meka provider add <name>` runs the OAuth login (`claude-oauth`, `openai-codex`) or prompts for the
+  API key (`claude-api`, `openai-api`) when the profile is created.
+- `meka provider login <name>` re-acquires it for an existing profile (rotate an API key, recover
+  from a dead OAuth refresh token).
+- `meka provider remove <name>` deletes the stored credential and the profile.
 
-If the environment variable is not set, it falls back to `provider.api_key` (or `provider.oauth_token` for OAuth providers) in the config file.
+Because secrets are keyed per profile, two profiles using the same backend (for example, two Claude
+accounts) keep independent credentials.

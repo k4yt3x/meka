@@ -6,25 +6,30 @@ The `openai-api` provider uses the [Chat Completions API](https://platform.opena
 
 | Setting | Value |
 |---------|-------|
-| Provider name | `openai-api` |
+| Profile `type` | `openai-api` |
 | Default base URL | `https://api.openai.com/v1` |
-| API key env var | `OPENAI_API_KEY` |
+| Credential | API key (`sk-...`) stored in the database |
 | Auth method | Bearer token (`Authorization: Bearer <key>`) |
 
-### Minimal Setup
+### Quickest Start
 
 ```bash
-export MEKA_PROVIDER=openai-api
-export MEKA_MODEL=gpt-4o
-export OPENAI_API_KEY=sk-...
-meka
+meka provider add openai --type openai-api --model gpt-4o
 ```
+
+`meka provider add` prompts for your OpenAI API key, stores it in the database, and writes the
+`[providers.openai]` profile. To read the key from a pipe instead of prompting, pass
+`--api-key-stdin`.
 
 ### Config File
 
+`meka provider add` writes this for you (the key stays in the database, not here):
+
 ```toml
-[provider]
-name = "openai-api"
+default_provider = "openai"
+
+[providers.openai]
+type = "openai-api"
 model = "gpt-4o"
 ```
 
@@ -39,25 +44,28 @@ Any model available through the OpenAI Chat Completions API (or compatible endpo
 
 ## Custom Base URL
 
-To use an OpenAI-compatible endpoint, set the base URL:
+To use an OpenAI-compatible endpoint, set the profile's `base_url`. Add it when creating the profile:
 
 ```bash
-# Ollama
-meka --provider openai-api --model llama3 --base-url http://localhost:11434/v1
+# Ollama (no real key; pipe a placeholder)
+printf 'unused' | meka provider add ollama --type openai-api --model llama3 \
+    --base-url http://localhost:11434/v1 --api-key-stdin
 
 # OpenRouter
-meka --provider openai-api --model anthropic/claude-sonnet-4-20250514 --base-url https://openrouter.ai/api/v1
+meka provider add openrouter --type openai-api --model anthropic/claude-sonnet-4.6 \
+    --base-url https://openrouter.ai/api/v1
 ```
 
-Or in the config file:
+The resulting profile (the key, if any, lives in the database):
 
 ```toml
-[provider]
-name = "openai-api"
+[providers.ollama]
+type = "openai-api"
 model = "llama3"
-api_key = "unused"
 base_url = "http://localhost:11434/v1"
 ```
+
+`--base-url` is also available as a per-run flag to override the profile's value for one invocation.
 
 ## API Details
 

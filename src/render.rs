@@ -748,9 +748,9 @@ pub fn render_error(error: &dyn std::fmt::Display) {
 /// Print the "no provider configured" hint shown when the agent fails to initialize. Centralized so
 /// the wording stays in sync everywhere.
 pub fn render_provider_setup_hint() {
-    eprintln!("Configure a provider and model to use meka.");
-    eprintln!("Example: meka --provider openai-api --model gpt-4o \"hello\"");
-    eprintln!("Or set MEKA_PROVIDER, MEKA_MODEL, and OPENAI_API_KEY environment variables.");
+    eprintln!("Configure a provider to use meka.");
+    eprintln!("Example: meka provider add work --type claude-oauth --model claude-opus-4-6");
+    eprintln!("Run `meka provider list` to see configured profiles.");
 }
 
 /// Walk backwards through `messages` and return the suffix that starts at the `n`th most recent

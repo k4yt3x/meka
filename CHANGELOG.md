@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `meka acp` subcommand for editors that speak the Agent Client Protocol.
 - `meka serve` subcommand exposes the agent over HTTP+JSON.
+- `meka provider` suite (add/list/use/login/remove) to configure and switch named provider profiles.
 - REPL input history persists across runs in the SQLite DB.
 - `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend`; mekabox uses it to pin Landlock.
 - `--sandbox-backend` flag, so the backend is settable via config, env, and CLI consistently.
@@ -20,12 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Renamed the project `agsh` → `meka`: binary, `~/.config/meka` config dir, `MEKA_*` env vars.
 - Renamed the database `sessions.db` → `meka.db`; it now holds more than sessions.
+- Providers are now named `[providers.<name>]` profiles with secrets stored in the DB, not config.
 - `serde_yaml` (unmaintained) replaced with the maintained `serde_norway` fork.
 - `edit_file` now rejects an ambiguous `old_string` (multiple matches without `replace_all`).
 - Replaced `todo_write`/`todo_read` with one `todo` tool: `title`, `set` patches, `cancelled`.
 
 ### Removed
 
+- `meka setup` wizard and all provider env vars (`MEKA_PROVIDER`, `MEKA_MODEL`, API keys, tokens).
 - `[agent] max_turn_requests` cap; it was cutting off legitimate long-running workflows.
 
 ### Fixed

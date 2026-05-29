@@ -27,9 +27,6 @@ use crate::{
     session::TokenStore,
 };
 
-/// Identifier persisted in `oauth_tokens.provider` for the Codex token row.
-pub(crate) const STORAGE_KEY: &str = "openai-codex";
-
 /// Default endpoint for OpenAI Codex subscription requests. The path `/backend-api/codex/responses`
 /// is appended at request time.
 const DEFAULT_BASE_URL: &str = "https://chatgpt.com";
@@ -56,6 +53,9 @@ pub struct OpenAiCodexProvider {
     client_id: String,
     oauth_token_url: String,
     token_store: Option<Arc<TokenStore>>,
+    /// Profile name this provider's credential is stored under, so refreshed tokens are written
+    /// back to the correct `provider_credentials` row.
+    credential_key: String,
     /// `low` / `medium` / `high` for reasoning models (gpt-5, o-series). Forwarded as
     /// `reasoning.effort` in the request body. `None` skips the reasoning block entirely.
     reasoning_effort: Option<String>,
@@ -63,6 +63,7 @@ pub struct OpenAiCodexProvider {
 }
 
 impl OpenAiCodexProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         credential: AuthCredential,
         model: String,
@@ -70,6 +71,7 @@ impl OpenAiCodexProvider {
         client_id: Option<String>,
         oauth_token_url: Option<String>,
         token_store: Option<Arc<TokenStore>>,
+        credential_key: String,
         reasoning_effort: Option<String>,
     ) -> Result<Self> {
         // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets bot-clearance cookies
@@ -92,6 +94,7 @@ impl OpenAiCodexProvider {
             client_id: client_id.unwrap_or_else(|| DEFAULT_OPENAI_CODEX_CLIENT_ID.to_string()),
             oauth_token_url: oauth_token_url.unwrap_or_else(|| DEFAULT_TOKEN_URL.to_string()),
             token_store,
+            credential_key,
             reasoning_effort,
             user_agent: format!(
                 "meka/{} ({}; {})",
@@ -146,7 +149,7 @@ impl OpenAiCodexProvider {
         // re-read we'd POST a stale refresh_token and the OAuth provider would reject it with
         // `invalid_grant`.
         if let Some(store) = &self.token_store {
-            match store.load_oauth_token(STORAGE_KEY).await {
+            match store.load_provider_credential(&self.credential_key).await {
                 Ok(Some(latest)) => *credential = latest,
                 Ok(None) => {}
                 Err(error) => {
@@ -194,7 +197,9 @@ impl OpenAiCodexProvider {
         };
 
         if let Some(store) = &self.token_store
-            && let Err(error) = store.save_oauth_token(STORAGE_KEY, &new_credential).await
+            && let Err(error) = store
+                .save_provider_credential(&self.credential_key, &new_credential)
+                .await
         {
             tracing::warn!("failed to persist refreshed Codex OAuth token: {}", error);
         }
@@ -377,6 +382,7 @@ mod tests {
             None,
             None,
             None,
+            "test".to_string(),
             Some("high".to_string()),
         )
         .expect("provider")
@@ -405,6 +411,7 @@ mod tests {
             None,
             None,
             None,
+            "test".to_string(),
             None,
         )
         .expect("provider");
@@ -423,6 +430,7 @@ mod tests {
             None,
             None,
             None,
+            "test".to_string(),
             None,
         )
         .expect("provider");
@@ -452,6 +460,7 @@ mod tests {
             None,
             None,
             None,
+            "test".to_string(),
             None,
         )
         .expect("provider");
@@ -474,6 +483,7 @@ mod tests {
             None,
             None,
             None,
+            "test".to_string(),
             None,
         )
         .expect("provider");

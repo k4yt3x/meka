@@ -327,12 +327,15 @@ impl SessionManager {
                     CREATE INDEX IF NOT EXISTS idx_messages_session_id
                         ON messages(session_id);
 
-                    CREATE TABLE IF NOT EXISTS oauth_tokens (
-                        provider TEXT PRIMARY KEY,
-                        access_token TEXT NOT NULL,
-                        refresh_token TEXT,
-                        expires_at INTEGER,
-                        account_id TEXT,
+                    -- Provider credentials (API keys and OAuth bundles) are keyed by the
+                    -- user-chosen profile name and stored as a serialized AuthCredential. The
+                    -- pre-0.27 `oauth_tokens` table is dropped; users re-authenticate via
+                    -- `meka provider add`.
+                    DROP TABLE IF EXISTS oauth_tokens;
+
+                    CREATE TABLE IF NOT EXISTS provider_credentials (
+                        profile TEXT PRIMARY KEY,
+                        credentials_json TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     );
 
@@ -371,21 +374,6 @@ impl SessionManager {
                     > 0;
                 if has_locked_by {
                     connection.execute_batch("ALTER TABLE sessions DROP COLUMN locked_by")?;
-                }
-
-                // Migration: add `oauth_tokens.account_id` for openai-codex's ChatGPT-Account-ID
-                // header. Existing rows get NULL, which is fine for providers that don't use it
-                // (Claude OAuth).
-                let has_account_id: bool = connection
-                    .query_row(
-                        "SELECT COUNT(*) FROM pragma_table_info('oauth_tokens') WHERE name = 'account_id'",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                    > 0;
-                if !has_account_id {
-                    connection.execute_batch("ALTER TABLE oauth_tokens ADD COLUMN account_id TEXT")?;
                 }
 
                 connection.execute_batch(
@@ -1744,36 +1732,90 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
-    pub async fn load_oauth_token(&self, provider: &str) -> Result<Option<AuthCredential>> {
-        let provider = provider.to_string();
-        self.connection
+    /// Load the stored credential (API key or OAuth bundle) for a provider profile, keyed by the
+    /// user-chosen profile name. The credential is stored as a serialized [`AuthCredential`].
+    pub async fn load_provider_credential(&self, profile: &str) -> Result<Option<AuthCredential>> {
+        let profile = profile.to_string();
+        let json: Option<String> = self
+            .connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
-                    "SELECT access_token, refresh_token, expires_at, account_id \
-                     FROM oauth_tokens WHERE provider = ?1",
-                    rusqlite::params![provider],
-                    |row| {
-                        let access_token: String = row.get(0)?;
-                        let refresh_token: Option<String> = row.get(1)?;
-                        let expires_at: Option<i64> = row.get(2)?;
-                        let account_id: Option<String> = row.get(3)?;
-                        Ok(AuthCredential::OAuthToken {
-                            access_token,
-                            refresh_token,
-                            expires_at,
-                            account_id,
-                        })
-                    },
+                    "SELECT credentials_json FROM provider_credentials WHERE profile = ?1",
+                    rusqlite::params![profile],
+                    |row| row.get::<_, String>(0),
                 );
-
                 match result {
-                    Ok(credential) => Ok(Some(credential)),
+                    Ok(json) => Ok(Some(json)),
                     Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                     Err(error) => Err(error),
                 }
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to load OAuth token: {}", error)))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load provider credential: {}", error))
+            })?;
+
+        match json {
+            Some(json) => {
+                let credential = serde_json::from_str(&json).map_err(|error| {
+                    MekaError::Database(format!(
+                        "failed to parse stored provider credential: {}",
+                        error
+                    ))
+                })?;
+                Ok(Some(credential))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist (or replace) the credential for a provider profile, keyed by profile name.
+    pub async fn save_provider_credential(
+        &self,
+        profile: &str,
+        credential: &AuthCredential,
+    ) -> Result<()> {
+        let profile = profile.to_string();
+        let json = serde_json::to_string(credential).map_err(|error| {
+            MekaError::Database(format!(
+                "failed to serialize provider credential: {}",
+                error
+            ))
+        })?;
+        let now = chrono::Utc::now().to_rfc3339();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "INSERT INTO provider_credentials (profile, credentials_json, updated_at) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(profile) DO UPDATE SET \
+                         credentials_json = excluded.credentials_json, \
+                         updated_at = excluded.updated_at",
+                    rusqlite::params![profile, json, now],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to save provider credential: {}", error))
+            })
+    }
+
+    /// Remove the stored credential for a provider profile (used by `provider remove`).
+    pub async fn delete_provider_credential(&self, profile: &str) -> Result<()> {
+        let profile = profile.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "DELETE FROM provider_credentials WHERE profile = ?1",
+                    rusqlite::params![profile],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to delete provider credential: {}", error))
+            })
     }
 
     pub async fn load_mcp_credentials(&self, server_name: &str) -> Result<Option<String>> {
@@ -1913,55 +1955,6 @@ impl TokenStore {
             .map_err(|error| {
                 MekaError::Database(format!("failed to clear MCP auth probe cache: {}", error))
             })
-    }
-
-    pub async fn save_oauth_token(
-        &self,
-        provider: &str,
-        credential: &AuthCredential,
-    ) -> Result<()> {
-        let AuthCredential::OAuthToken {
-            access_token,
-            refresh_token,
-            expires_at,
-            account_id,
-        } = credential
-        else {
-            return Ok(());
-        };
-
-        let provider = provider.to_string();
-        let access_token = access_token.clone();
-        let refresh_token = refresh_token.clone();
-        let expires_at = *expires_at;
-        let account_id = account_id.clone();
-        let now = chrono::Utc::now().to_rfc3339();
-
-        self.connection
-            .call(move |connection| -> rusqlite::Result<_> {
-                connection.execute(
-                    "INSERT INTO oauth_tokens \
-                         (provider, access_token, refresh_token, expires_at, account_id, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                     ON CONFLICT(provider) DO UPDATE SET \
-                         access_token = excluded.access_token, \
-                         refresh_token = excluded.refresh_token, \
-                         expires_at = excluded.expires_at, \
-                         account_id = excluded.account_id, \
-                         updated_at = excluded.updated_at",
-                    rusqlite::params![
-                        provider,
-                        access_token,
-                        refresh_token,
-                        expires_at,
-                        account_id,
-                        now
-                    ],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| MekaError::Database(format!("failed to save OAuth token: {}", error)))
     }
 }
 
@@ -3653,12 +3646,12 @@ mod tests {
         };
 
         store
-            .save_oauth_token("openai-codex", &credential)
+            .save_provider_credential("openai-codex", &credential)
             .await
             .expect("save");
 
         let loaded = store
-            .load_oauth_token("openai-codex")
+            .load_provider_credential("openai-codex")
             .await
             .expect("load")
             .expect("present");
@@ -3696,11 +3689,14 @@ mod tests {
         };
 
         store
-            .save_oauth_token("claude", &credential)
+            .save_provider_credential("claude", &credential)
             .await
             .expect("save");
 
-        let loaded = store.load_oauth_token("claude").await.expect("load");
+        let loaded = store
+            .load_provider_credential("claude")
+            .await
+            .expect("load");
 
         match loaded {
             Some(AuthCredential::OAuthToken {
@@ -3739,21 +3735,21 @@ mod tests {
         };
 
         store
-            .save_oauth_token("openai-codex", &codex_credential)
+            .save_provider_credential("openai-codex", &codex_credential)
             .await
             .expect("save codex");
         store
-            .save_oauth_token("claude", &claude_credential)
+            .save_provider_credential("claude", &claude_credential)
             .await
             .expect("save claude");
 
         let codex_loaded = store
-            .load_oauth_token("openai-codex")
+            .load_provider_credential("openai-codex")
             .await
             .expect("load codex")
             .expect("present");
         let claude_loaded = store
-            .load_oauth_token("claude")
+            .load_provider_credential("claude")
             .await
             .expect("load claude")
             .expect("present");
@@ -3768,5 +3764,61 @@ mod tests {
         } else {
             panic!("expected OAuthToken");
         }
+    }
+
+    #[tokio::test]
+    async fn test_api_key_credential_round_trip() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        let credential = AuthCredential::ApiKey("sk-secret-123".to_string());
+        store
+            .save_provider_credential("personal", &credential)
+            .await
+            .expect("save");
+
+        let loaded = store
+            .load_provider_credential("personal")
+            .await
+            .expect("load")
+            .expect("present");
+
+        match loaded {
+            AuthCredential::ApiKey(key) => assert_eq!(key, "sk-secret-123"),
+            _ => panic!("expected ApiKey"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_provider_credential_removes_entry() {
+        let manager = SessionManager::open(Some(Path::new(":memory:")))
+            .await
+            .expect("memory store");
+        let store = manager.token_store();
+
+        store
+            .save_provider_credential("work", &AuthCredential::ApiKey("key".to_string()))
+            .await
+            .expect("save");
+        store
+            .delete_provider_credential("work")
+            .await
+            .expect("delete");
+
+        assert!(
+            store
+                .load_provider_credential("work")
+                .await
+                .expect("load")
+                .is_none(),
+            "credential must be gone after delete"
+        );
+        // Deleting a missing profile is a no-op, not an error.
+        store
+            .delete_provider_credential("work")
+            .await
+            .expect("delete missing is a no-op");
     }
 }

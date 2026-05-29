@@ -1,15 +1,15 @@
 # Environment Variables
 
-The [config file](./config-file.md) is the recommended way to configure meka. Environment variables are useful as overrides; for example, in CI pipelines, containers, or when you want to temporarily switch providers without editing your config.
+The [config file](./config-file.md) is the recommended way to configure meka. Environment variables are useful for operational overrides; for example, in CI pipelines, containers, or to isolate a per-project config and data directory.
 
-Environment variables override config file values but are overridden by CLI flags.
+These operational variables override config file values but are overridden by CLI flags.
+
+> **Provider configuration is not configurable via the environment.** Provider selection, model, and base URL come from the [config file](./config-file.md) (with per-run `--provider` / `--model` / `--base-url` flags); secrets come from the database via [`meka provider`](./config-file.md#meka-provider-cli). There are no provider env vars. This is deliberate: an ambient `OPENAI_API_KEY` or `MEKA_PROVIDER` left in the environment must never silently rebind which account a named profile bills.
 
 ## meka-Specific Variables
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MEKA_PROVIDER` | LLM provider name | `openai-api`, `claude-api`, `claude-oauth` |
-| `MEKA_MODEL` | Model identifier | `gpt-4o`, `claude-sonnet-4-20250514` |
 | `MEKA_PERMISSION` | Default permission mode | `none`, `read`, `write` |
 | `MEKA_INSTRUCTIONS` | Replace `[prompt].instructions` for this run. Equivalent to `--instructions`. Used by the `mekabox` container wrapper to tell the agent it can install packages freely. | `Be terse.` |
 | `MEKA_CONFIG_DIR` | Override the default config directory. Points at the `meka` directory itself (contains `config.toml` and `skills/`). The only isolation knob that works on every platform: `dirs::config_dir()` ignores `$XDG_CONFIG_HOME` on macOS/Windows. | `/tmp/meka-test/meka` |
@@ -22,32 +22,6 @@ Environment variables override config file values but are overridden by CLI flag
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MEKA_MCP_TOOL_TIMEOUT` | Per-call timeout for MCP tools, in milliseconds. Applies to every remote tool invocation; on timeout meka cancels the request and returns an error to the model. | `600000` (600s) |
-
-## Provider API Keys
-
-| Variable | Used When |
-|----------|-----------|
-| `OPENAI_API_KEY` | Provider is `openai-api` |
-| `CLAUDE_API_KEY` | Provider is `claude-api` |
-
-## OAuth Authentication
-
-| Variable | Description |
-|----------|-------------|
-| `CLAUDE_OAUTH_TOKEN` | OAuth access token for the `claude-oauth` provider |
-| `OPENAI_CODEX_TOKEN` | OAuth access token for the `openai-codex` provider |
-| `CODEX_CLIENT_ID` | Override the default OpenAI OAuth client ID for the `openai-codex` setup wizard (rarely needed) |
-| `CLAUDE_CLIENT_ID` | Override the default Claude OAuth client ID for the `claude-oauth` provider (rarely needed) |
-
-On first use, the OAuth token is saved to the database and loaded automatically on subsequent launches. Setting the env var again replaces the stored token.
-
-## Provider Base URL
-
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_BASE_URL` | Custom base URL for the OpenAI-compatible endpoint |
-
-`OPENAI_BASE_URL` intentionally follows the OpenAI SDK's own env-var name (rather than a generic `MEKA_BASE_URL`) so existing OpenAI-compatible setups work unchanged. Use the `--base-url` flag to override it per run.
 
 ## Logging
 

@@ -2,6 +2,8 @@
 //! and the [`ProviderBuilder`] that returns a concrete Claude or OpenAI-compatible implementation.
 
 mod claude;
+/// `meka provider` subcommand suite (add/list/use/remove/login) and the provider OAuth login flows.
+pub mod cli;
 /// Scripted provider used by the ACP integration test. Available in debug builds only; release
 /// builds don't pay the binary-size cost. Activated by the `MEKA_ACP_MOCK_PROVIDER` env var inside
 /// `acp::run_acp`; never reachable from production paths otherwise.
@@ -32,7 +34,7 @@ pub(crate) const DEFAULT_OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7
 pub const SUPPORTED_PROVIDERS: &[&str] =
     &["openai-api", "openai-codex", "claude-api", "claude-oauth"];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthCredential {
     ApiKey(String),
     OAuthToken {
@@ -430,6 +432,9 @@ pub struct ProviderBuilder {
     client_id: Option<String>,
     oauth_token_url: Option<String>,
     token_store: Option<Arc<TokenStore>>,
+    /// Profile name the credential is stored under; OAuth providers use it to write refreshed
+    /// tokens back to the right `provider_credentials` row. Defaults to the backend name.
+    credential_key: Option<String>,
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
     reasoning_effort: Option<String>,
@@ -453,6 +458,7 @@ impl ProviderBuilder {
             client_id: None,
             oauth_token_url: None,
             token_store: None,
+            credential_key: None,
             thinking_enabled: false,
             thinking_budget_tokens: 0,
             reasoning_effort: None,
@@ -486,6 +492,13 @@ impl ProviderBuilder {
     /// tokens are held in memory only.
     pub fn token_store(mut self, value: Option<Arc<TokenStore>>) -> Self {
         self.token_store = value;
+        self
+    }
+
+    /// Profile name the credential is stored under (OAuth refresh write-back key). Defaults to the
+    /// backend name when unset.
+    pub fn credential_key(mut self, value: Option<String>) -> Self {
+        self.credential_key = value;
         self
     }
 
@@ -577,6 +590,8 @@ impl ProviderBuilder {
                     self.client_id,
                     self.oauth_token_url,
                     self.token_store,
+                    self.credential_key
+                        .unwrap_or_else(|| self.provider_name.clone()),
                     self.thinking_enabled,
                     self.thinking_budget_tokens,
                     self.device_id,
@@ -600,6 +615,8 @@ impl ProviderBuilder {
                     self.client_id,
                     self.oauth_token_url,
                     self.token_store,
+                    self.credential_key
+                        .unwrap_or_else(|| self.provider_name.clone()),
                     self.reasoning_effort,
                 )?))
             }
@@ -615,6 +632,40 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_auth_credential_json_round_trip() {
+        // `AuthCredential` is serialized to JSON for storage in `provider_credentials`; both
+        // variants must survive a round-trip intact.
+        let api_key = AuthCredential::ApiKey("sk-test".to_string());
+        let json = serde_json::to_string(&api_key).expect("serialize ApiKey");
+        match serde_json::from_str::<AuthCredential>(&json).expect("deserialize ApiKey") {
+            AuthCredential::ApiKey(key) => assert_eq!(key, "sk-test"),
+            other => panic!("expected ApiKey, got {:?}", other),
+        }
+
+        let oauth = AuthCredential::OAuthToken {
+            access_token: "access".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(1_700_000_000_000),
+            account_id: Some("acct".to_string()),
+        };
+        let json = serde_json::to_string(&oauth).expect("serialize OAuthToken");
+        match serde_json::from_str::<AuthCredential>(&json).expect("deserialize OAuthToken") {
+            AuthCredential::OAuthToken {
+                access_token,
+                refresh_token,
+                expires_at,
+                account_id,
+            } => {
+                assert_eq!(access_token, "access");
+                assert_eq!(refresh_token.as_deref(), Some("refresh"));
+                assert_eq!(expires_at, Some(1_700_000_000_000));
+                assert_eq!(account_id.as_deref(), Some("acct"));
+            }
+            other => panic!("expected OAuthToken, got {:?}", other),
+        }
+    }
 
     /// Regression test for the "silent `{}` fallback" bug: a tool call with unparseable JSON
     /// arguments must be rejected via [`StreamEvent::ToolCallRejected`] rather than replayed with

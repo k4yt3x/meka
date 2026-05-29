@@ -135,12 +135,11 @@ pub fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
         if let Some(reason) = backend_unavailable_reason(&state.probe) {
             // We deliberately don't suggest a specific alternative backend here; the "other"
             // backend might also be unavailable on this host (kernel without Landlock, bwrap not
-            // installed, etc.), and `meka setup` is the path that probes both and resolves it
-            // correctly.
+            // installed, etc.).
             tracing::warn!(
                 "read-mode sandbox: {} (configured: {}). Read-mode shell commands will fail \
-                 until this is fixed. Run `meka setup` to reconfigure, or update \
-                 [shell].sandbox_backend in config.toml.",
+                 until this is fixed. Set [shell].sandbox_backend in config.toml (or \
+                 MEKA_SANDBOX_BACKEND) to a usable backend, or disable sandboxing.",
                 reason,
                 state.backend,
             );

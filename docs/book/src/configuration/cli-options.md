@@ -7,15 +7,20 @@ meka <COMMAND>
 
 ## Commands
 
-### `setup`
+### `provider`
 
-Run the interactive configuration wizard. Prompts for provider, authentication, model, and base URL, then writes the configuration to `~/.config/meka/config.toml`.
+Manage provider profiles (add, list, switch, login, remove). `meka provider add` writes a
+`[providers.<name>]` profile to `~/.config/meka/config.toml` and stores its secret in the database.
 
 ```bash
-meka setup
+meka provider add work --type claude-oauth --model claude-opus-4-6
+meka provider list
+meka provider use work
+meka provider login work
+meka provider remove work
 ```
 
-This wizard also runs automatically on first launch when no config file exists.
+See the [`meka provider` CLI reference](./config-file.md#meka-provider-cli) for the full flag list.
 
 ### `export`
 
@@ -86,17 +91,18 @@ Default: `read`.
 
 ### `--provider <NAME>`
 
-Set the LLM provider. Overrides `MEKA_PROVIDER` and the config file.
+Select which configured provider profile to use for this run. Takes the name of a profile from
+`[providers.<name>]`, overriding `default_provider` in the config file.
 
 ```bash
-meka --provider claude-oauth
+meka --provider work
 ```
 
-Supported values: `openai-api`, `claude-api`, `claude-oauth`.
+The value is a profile name (e.g. `work`, `personal`), not a backend type. List configured profiles with `meka provider list`.
 
 ### `-m`, `--model <MODEL>`
 
-Set the model name. Overrides `MEKA_MODEL` and the config file.
+Override the active profile's model for this run.
 
 ```bash
 meka -m gpt-4o-mini
@@ -104,7 +110,7 @@ meka -m gpt-4o-mini
 
 ### `--base-url <URL>`
 
-Set a custom API base URL. Overrides `OPENAI_BASE_URL` and the config file.
+Override the active profile's API base URL for this run.
 
 ```bash
 meka --base-url http://localhost:11434/v1

@@ -1,40 +1,55 @@
 # Providers Overview
 
-Providers are the LLM inference backends that meka uses to process your instructions. meka ships with four built-in providers:
+Providers are the LLM inference backends that meka uses to process your instructions. meka ships with four built-in backends, each selectable as a profile `type`:
 
-| Provider | Auth | API | Notes |
-|----------|------|-----|-------|
-| [`openai-api`](./openai-api.md) | `OPENAI_API_KEY` | Chat Completions | Works with OpenAI and any compatible endpoint (Ollama, vLLM, OpenRouter, …) |
-| [`openai-codex`](./openai-codex.md) | OAuth login (setup wizard) | OpenAI Responses | Uses a ChatGPT subscription; talks to `chatgpt.com/backend-api/codex` like the Codex CLI |
-| [`claude-api`](./claude-api.md) | `CLAUDE_API_KEY` | Claude Messages | Direct Claude API, billed per-token |
-| [`claude-oauth`](./claude-oauth.md) | OAuth login (setup wizard) | Claude Messages | Uses a Claude Code subscription; replicates Claude Code's request shape and attestation |
+| Backend | Auth | API | Notes |
+|---------|------|-----|-------|
+| [`openai-api`](./openai-api.md) | API key | Chat Completions | Works with OpenAI and any compatible endpoint (Ollama, vLLM, OpenRouter, …) |
+| [`openai-codex`](./openai-codex.md) | OAuth login | OpenAI Responses | Uses a ChatGPT subscription; talks to `chatgpt.com/backend-api/codex` like the Codex CLI |
+| [`claude-api`](./claude-api.md) | API key | Claude Messages | Direct Claude API, billed per-token |
+| [`claude-oauth`](./claude-oauth.md) | OAuth login | Claude Messages | Uses a Claude Code subscription; replicates Claude Code's request shape and attestation |
+
+## Configuring a Provider
+
+Providers are configured as named profiles. The easiest way is `meka provider add`, which writes the
+profile to the config file and stores the secret (API key or OAuth token) in the database:
+
+```console
+$ meka provider add work --type claude-oauth --model claude-opus-4-6
+```
+
+This produces a `[providers.work]` entry in `~/.config/meka/config.toml`:
+
+```toml
+default_provider = "work"
+
+[providers.work]
+type  = "claude-oauth"
+model = "claude-opus-4-6"
+```
 
 ## Selecting a Provider
 
-Set the provider via any configuration layer:
+meka uses the profile named by `--provider <name>` (per run), else `default_provider`, else the sole
+profile. Switch the default with `meka provider use <name>`:
 
 ```bash
-# CLI flag
-meka --provider claude-oauth
-
-# Environment variable
-export MEKA_PROVIDER=claude-api
-
-# Config file (~/.config/meka/config.toml)
-[provider]
-name = "openai-api"
+meka --provider work     # this run only
+meka provider use work   # persist as default_provider
 ```
+
+There is no environment-variable override for provider selection.
 
 ## OpenAI-Compatible APIs
 
-The `openai-api` provider works with any API that implements the OpenAI Chat Completions format. This includes:
+The `openai-api` backend works with any API that implements the OpenAI Chat Completions format. This includes:
 
 - **OpenAI** (default endpoint)
 - **Ollama** (`http://localhost:11434/v1`)
 - **OpenRouter** (`https://openrouter.ai/api/v1`)
 - **vLLM**, **LiteLLM**, and other OpenAI-compatible servers
 
-Set the `--base-url` flag or `OPENAI_BASE_URL` environment variable to point at the alternative endpoint.
+Set the profile's `base_url` (or the `--base-url` flag for one run) to point at the alternative endpoint.
 
 ## claude-api vs claude-oauth
 

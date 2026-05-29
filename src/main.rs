@@ -31,7 +31,6 @@ mod repl;
 mod sandbox;
 mod server;
 mod session;
-mod setup;
 mod skills;
 mod stats;
 mod tools;
@@ -108,9 +107,9 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         return runtime.block_on(async move {
             let session_manager = SessionManager::open(None).await?;
             match command {
-                cli::Command::Setup => {
+                cli::Command::Provider { action } => {
                     let token_store = session_manager.token_store();
-                    setup::run_setup(&token_store).await
+                    provider::cli::run(action, &token_store).await
                 }
                 cli::Command::Export { session_id, output } => {
                     export_session(&session_manager, *session_id, output.as_deref()).await
@@ -132,15 +131,6 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
             }
         });
-    }
-
-    // Auto-detect first launch: no config file and no env-based provider.
-    if !config::config_file_exists() && std::env::var("MEKA_PROVIDER").is_err() {
-        runtime.block_on(async {
-            let session_manager = SessionManager::open(None).await?;
-            let token_store = session_manager.token_store();
-            setup::run_setup(&token_store).await
-        })?;
     }
 
     // --oneshot needs something to do; reject early before any setup.
@@ -220,7 +210,7 @@ fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscrib
 }
 
 async fn async_main(
-    mut config: ResolvedConfig,
+    config: ResolvedConfig,
     acp_mode: bool,
     serve_mode: bool,
 ) -> anyhow::Result<()> {
@@ -259,38 +249,6 @@ async fn async_main(
         if deleted > 0 {
             tracing::info!("deleted {} sessions to enforce storage limit", deleted);
         }
-    }
-
-    // If no credential from env/config, try loading from database. Storage key stays "claude"
-    // across the rename to "claude-oauth" so existing users keep their tokens; "openai-codex"
-    // matches the provider name.
-    let oauth_storage_key = match config.provider_name.as_deref() {
-        Some("claude-oauth") => Some("claude"),
-        Some("openai-codex") => Some(crate::provider::openai::codex::STORAGE_KEY),
-        _ => None,
-    };
-    if config.auth_credential.is_none()
-        && let Some(storage_key) = oauth_storage_key
-    {
-        match token_store.load_oauth_token(storage_key).await {
-            Ok(Some(credential)) => {
-                tracing::info!("loaded OAuth token from database");
-                config.auth_credential = Some(credential);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!("failed to load OAuth token from database: {}", error);
-            }
-        }
-    }
-
-    // Save OAuth token from env/config to database for future use, so the refresh path has a place
-    // to land updated tokens.
-    if let Some(credential @ AuthCredential::OAuthToken { .. }) = &config.auth_credential
-        && let Some(storage_key) = oauth_storage_key
-        && let Err(error) = token_store.save_oauth_token(storage_key, credential).await
-    {
-        tracing::warn!("failed to save OAuth token to database: {}", error);
     }
 
     let mcp_context = mcp::McpClientContext::new();
@@ -403,6 +361,7 @@ pub async fn build_shared_deps(
     let provider = ProviderBuilder::new(provider_name, credential, model)
         .base_url(config.base_url.clone())
         .client_id(config.client_id.clone())
+        .credential_key(config.active_profile.clone())
         .oauth_token_url(config.oauth_token_url.clone())
         .token_store(if needs_token_store {
             Some(Arc::new(token_store))
@@ -653,6 +612,7 @@ async fn create_agent_from_config(
     let provider = ProviderBuilder::new(provider_name, credential, model)
         .base_url(config.base_url.clone())
         .client_id(config.client_id.clone())
+        .credential_key(config.active_profile.clone())
         .oauth_token_url(config.oauth_token_url.clone())
         .token_store(if needs_token_store {
             Some(Arc::new(token_store))
@@ -797,7 +757,7 @@ async fn run_oneshot(
             crate::sandbox::WarnContext::InitialReadMode,
         );
     }
-    let credential = resolve_credential(&config)?;
+    let credential = resolve_credential(&config, &token_store).await?;
     let session_stats = Arc::new(stats::SessionStats::default());
     // Oneshot has no REPL, so approval requests can't reach a human. The channel below is
     // intentionally disconnected on the receiver side: `ReplFrontend::request_permission`'s `send`
@@ -966,7 +926,7 @@ async fn run_interactive(
     });
 
     // Try to create the agent (may fail if config is incomplete)
-    let credential = match resolve_credential(&config) {
+    let credential = match resolve_credential(&config, &token_store).await {
         Ok(credential) => credential,
         Err(error) => {
             render::render_error(&error);
@@ -1726,13 +1686,20 @@ fn history_render_options(config: &ResolvedConfig) -> render::HistoryRenderOptio
     }
 }
 
-fn resolve_credential(config: &ResolvedConfig) -> anyhow::Result<AuthCredential> {
-    match &config.auth_credential {
-        Some(credential) => Ok(credential.clone()),
+async fn resolve_credential(
+    config: &ResolvedConfig,
+    token_store: &TokenStore,
+) -> anyhow::Result<AuthCredential> {
+    let Some(profile) = config.active_profile.as_deref() else {
+        anyhow::bail!("no provider configured. Run `meka provider add <name>` to set one up.");
+    };
+    match token_store.load_provider_credential(profile).await? {
+        Some(credential) => Ok(credential),
         None => Err(anyhow::anyhow!(
-            "no API key or OAuth token configured. Set OPENAI_API_KEY, CLAUDE_API_KEY, \
-             or CLAUDE_OAUTH_TOKEN env var, or provider.api_key / provider.oauth_token \
-             in config file (~/.config/meka/config.toml)"
+            "provider profile '{}' has no stored credential. Run `meka provider login {}` to \
+             authenticate.",
+            profile,
+            profile
         )),
     }
 }

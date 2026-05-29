@@ -78,14 +78,13 @@ The streaming markdown renderer (`render::StreamingRenderer`) writes to stdout b
 
 ## Configuration surfaces
 
-meka has three configuration surfaces with a fixed precedence: **CLI flags > environment variables > `config.toml`**. Keep coverage principled rather than adding ad-hoc overrides:
+meka has several configuration surfaces. Keep coverage principled rather than adding ad-hoc overrides:
 
-- **`config.toml` is the complete source of truth** — every persistent setting lives here.
-- **CLI flags** expose the per-invocation knobs a user changes for one interactive run (provider, model, base-url, permission, instructions, render-mode, streaming, thinking, sandbox-backend, continue, oneshot, skill).
-- **Environment variables** expose only the subset needed for non-interactive deployment (containers, CI, secrets, spawned agents): secrets/tokens, provider/model, config/data dirs, permission, instructions, sandbox backend, MCP timeout, render mode, and `RUST_LOG`.
+- **`config.toml` is the complete source of truth** for non-secret settings — every persistent setting lives here.
+- **Provider configuration is config-only, never env.** Providers are named profiles in `[providers.<name>]` (backend `type` + model/base_url/etc.); the active one is chosen by `--provider <name>` > `default_provider` > the sole profile. There is deliberately **no env tier** for provider selection, model, base_url, or credentials: an ambient `OPENAI_API_KEY` / `MEKA_PROVIDER` must never silently rebind which account a named profile bills. CLI `--provider`/`--model`/`--base-url` are the only per-run overrides. Profiles are managed via the `meka provider` suite (`add`/`list`/`use`/`login`/`remove`), mirroring `meka mcp`.
+- **Secrets live in the database, never in config or env.** API keys and OAuth bundles are stored in the `provider_credentials` table keyed by profile name, acquired via `meka provider add` / `login` and deleted via `remove`. Per-profile keying lets two accounts of the same backend coexist.
+- **Environment variables are operational-only**: config/data dirs (`MEKA_CONFIG_DIR`, `MEKA_DATA_DIR`), permission, instructions, sandbox backend, render mode, MCP timeout, and `RUST_LOG`. For these the precedence is **CLI flags > env > `config.toml`** (the idiom is `cli.x.or_else(env).or(file)` in `ResolvedConfig::from_cli`).
 - **Session and display tuning stays config-only** (e.g. `context_messages`, `retention_days`, `auto_compact`, `newline_*`, `show_*`) — don't add env vars or flags for set-once preferences.
-
-When a setting genuinely needs an env var or flag, wire every tier it belongs in and keep the `CLI > env > file` precedence (the idiom is `cli.x.or_else(env).or(file)` in `ResolvedConfig::from_cli`).
 
 ## CLI help text
 

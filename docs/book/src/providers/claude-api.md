@@ -6,26 +6,31 @@ The `claude-api` provider talks to the [Claude Messages API](https://docs.anthro
 
 | Setting | Value |
 |---------|-------|
-| Provider name | `claude-api` |
+| Profile `type` | `claude-api` |
 | Default base URL | `https://api.anthropic.com` |
-| API key env var | `CLAUDE_API_KEY` |
+| Credential | API key (`sk-ant-api03-...`) stored in the database |
 | Auth method | `x-api-key` header |
 | API version | `2023-06-01` |
 
-### Minimal Setup
+### Quickest Start
 
 ```bash
-export MEKA_PROVIDER=claude-api
-export MEKA_MODEL=claude-opus-4-6
-export CLAUDE_API_KEY=sk-ant-api03-...
-meka
+meka provider add anthropic --type claude-api --model claude-opus-4-6
 ```
+
+`meka provider add` prompts for your Claude API key, stores it in the database, and writes the
+`[providers.anthropic]` profile. To read the key from a pipe instead of prompting, pass
+`--api-key-stdin`.
 
 ### Config File
 
+`meka provider add` writes this for you (the key stays in the database, not here):
+
 ```toml
-[provider]
-name = "claude-api"
+default_provider = "anthropic"
+
+[providers.anthropic]
+type = "claude-api"
 model = "claude-opus-4-6"
 ```
 

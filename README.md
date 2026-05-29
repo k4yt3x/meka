@@ -31,21 +31,22 @@ cargo install --locked --git https://github.com/k4yt3x/meka.git
 
 ## Quick Start
 
-Run `meka setup` for an interactive wizard that picks a provider, runs the OAuth login if applicable, and writes the config for you.
+Add a provider profile with `meka provider add`. It runs the OAuth login (or prompts for an API key), stores the secret in the database, and writes the profile to `~/.config/meka/config.toml`:
 
-To configure manually, create `~/.config/meka/config.toml`. For example, to use OpenRouter with a Claude model:
+```bash
+meka provider add work --type claude-oauth --model claude-opus-4-6
+```
 
-```toml
-[provider]
-name = "openai-api"
-base_url = "https://openrouter.ai/api/v1"
-api_key = "sk-or-v1-..."
-model = "anthropic/claude-opus-4.6"
+The profile pins a backend `type` (`openai-api`, `openai-codex`, `claude-api`, or `claude-oauth`) plus a model. Add several profiles and switch with `meka provider use <name>` or `--provider <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url`:
+
+```bash
+meka provider add openrouter --type openai-api --model anthropic/claude-opus-4.6 \
+    --base-url https://openrouter.ai/api/v1
 ```
 
 Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, ask, write):
 
-```
+```console
 meka [r] > find all TODO comments in this project
 meka [w] > install and start nginx
 ```
@@ -112,7 +113,7 @@ Conversations are persisted in a local SQLite database and can be resumed:
 
 Prefix input with `!` to execute a command directly, bypassing the LLM:
 
-```
+```console
 meka [r] > !uname -a
 meka [r] > !docker ps
 ```

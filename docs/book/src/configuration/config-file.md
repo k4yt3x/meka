@@ -12,23 +12,53 @@ The config file is optional. If it does not exist, meka silently skips it.
 
 Set the `MEKA_CONFIG_DIR` environment variable to override the default location entirely. The value points at the `meka` directory itself (contains `config.toml` and `skills/`). Useful for tests, portable installs, and isolating a per-project config from your global one.
 
-## Format
+## Providers
+
+Providers are configured as **named profiles** under `[providers.<name>]`. Each profile pins a
+backend `type` plus its model and other non-secret knobs. You can keep several profiles side by
+side (including multiple accounts of the same backend) and switch between them by name.
+
+**Secrets are never stored in the config file.** API keys and OAuth token bundles live in meka's
+database, keyed by profile name, and are acquired through the [`meka provider`](#meka-provider-cli)
+command suite (`meka provider add` runs the API-key prompt or the OAuth login for you). The config
+file holds only the non-secret settings shown below.
 
 ```toml
-[provider]
-name = "openai-api"
-model = "gpt-4o"
-api_key = "sk-..."
-base_url = "https://api.openai.com/v1"
+default_provider = "work"
+
+[providers.work]
+type  = "claude-oauth"
+model = "claude-opus-4-6"
+
+[providers.local]
+type     = "openai-api"
+base_url = "http://localhost:11434/v1"
+model    = "llama3"
 ```
 
-All fields under `[provider]` are optional individually; you can set some in the config file and override others with environment variables or CLI flags.
+### Selecting the active profile
 
-## Fields
+For each run meka picks one profile using this precedence:
 
-### `provider.name`
+1. `--provider <name>` CLI flag.
+2. `default_provider` in the config file.
+3. The sole profile, if exactly one is configured.
 
-The LLM provider to use.
+If none of these resolve (no profiles configured, or more than one with no `default_provider` /
+`--provider`), meka errors and points you at `meka provider add` / `meka provider use`. There is no
+environment-variable tier for provider selection; the config file (plus the per-run CLI flag) is the
+source of truth.
+
+## `default_provider`
+
+Top-level field naming the profile to use when `--provider` isn't passed. Set it with
+`meka provider use <name>`; `meka provider add` sets it automatically when adding the first profile.
+
+## Profile fields
+
+### `type`
+
+The backend the profile uses (required).
 
 | Value | Description |
 |-------|-------------|
@@ -37,7 +67,7 @@ The LLM provider to use.
 | `claude-api` | Claude Messages API with `x-api-key` auth |
 | `claude-oauth` | Claude Messages API via Claude Code OAuth (fingerprinting + attestation) |
 
-### `provider.model`
+### `model`
 
 The model identifier to send to the provider. Examples:
 
@@ -45,22 +75,9 @@ The model identifier to send to the provider. Examples:
 - `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5` (Claude)
 - Any model supported by an OpenAI-compatible endpoint
 
-### `provider.api_key`
+Override per-run with `--model`.
 
-The API key for authentication. It is recommended to use environment variables (`OPENAI_API_KEY` or `CLAUDE_API_KEY`) instead of storing the key in the config file.
-
-### `provider.oauth_token`
-
-OAuth access token for the `claude-oauth` and `openai-codex` providers. Equivalent env vars: `CLAUDE_OAUTH_TOKEN` (claude-oauth) or `OPENAI_CODEX_TOKEN` (openai-codex). Run `meka setup` to obtain one interactively. The token is saved to the database on first use and loaded automatically on subsequent launches.
-
-### `provider.oauth_token_url`
-
-Custom OAuth token refresh endpoint. Defaults:
-
-- `https://api.anthropic.com/v1/oauth/token` for `claude-oauth`
-- `https://auth.openai.com/oauth/token` for `openai-codex`
-
-### `provider.base_url`
+### `base_url`
 
 Custom API base URL. Useful for:
 
@@ -70,114 +87,136 @@ Custom API base URL. Useful for:
 
 If not set, defaults to:
 
-- `https://api.openai.com/v1` for the `openai-api` provider
-- `https://chatgpt.com` for the `openai-codex` provider (request path is `/backend-api/codex/responses`)
-- `https://api.anthropic.com` for the `claude-api` and `claude-oauth` providers
+- `https://api.openai.com/v1` for the `openai-api` backend
+- `https://chatgpt.com` for the `openai-codex` backend (request path is `/backend-api/codex/responses`)
+- `https://api.anthropic.com` for the `claude-api` and `claude-oauth` backends
 
-### `provider.reasoning_effort`
+Override per-run with `--base-url`.
+
+### `oauth_token_url`
+
+Custom OAuth token refresh endpoint. Defaults:
+
+- `https://api.anthropic.com/v1/oauth/token` for `claude-oauth`
+- `https://auth.openai.com/oauth/token` for `openai-codex`
+
+### `reasoning_effort`
 
 Reasoning effort level for OpenAI o-series models. When set, the `reasoning_effort` parameter is included in API requests and `max_completion_tokens` is used instead of `max_tokens`.
 
 Accepted values: `low`, `medium`, `high`. Omitted by default.
 
 ```toml
-[provider]
+[providers.work]
+type             = "openai-api"
 reasoning_effort = "medium"
 ```
 
-### `provider.effort`
+### `effort`
 
 `claude-oauth` only. Controls the `output_config.effort` field that the `effort-2025-11-24` beta unlocks for adaptive-thinking-capable models (`opus-4-6`, `sonnet-4-6`). Higher values give the model more time to think; the field is ignored on non-effort-capable models.
 
 Accepted values: `low`, `medium`, `high`. Defaults to `high`. Unrecognised values fall back to `high` and are logged at `warn`.
 
 ```toml
-[provider]
+[providers.work]
+type   = "claude-oauth"
 effort = "medium"
 ```
 
-### `provider.redact_thinking`
+### `redact_thinking`
 
 `claude-oauth` only. When `true`, meka sends the `redact-thinking-2026-02-12` beta header so the API returns `redacted_thinking` blocks instead of full thinking summaries, useful when you don't render thinking in the UI and want the smaller response. Defaults to `false` (full thinking summaries).
 
 Caveat: `redacted_thinking` blocks carry a signed payload that must be replayed verbatim on subsequent turns; meka currently flattens them to `[redacted]` text on receipt, which means multi-turn conversations after enabling this flag may be rejected by the server. Treat as experimental.
 
 ```toml
-[provider]
+[providers.work]
+type            = "claude-oauth"
 redact_thinking = true
 ```
 
-### `provider.device_id`
+### `client_id`
+
+OAuth client ID override (advanced; `claude-oauth` / `openai-codex` only). Leave unset to use meka's built-in default client IDs.
+
+### `device_id`
 
 `claude-oauth` only. Stable per-device identifier embedded in `metadata.user_id` to mirror Claude Code's `~/.claude.json` device ID (`getOrCreateUserID` in `utils/config.ts`).
 
-If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to this same config file under `[provider].device_id`. This file write only happens for the `claude-oauth` provider; other providers don't need a device ID.
+If unset, meka first tries to adopt `userID` from `~/.claude.json` (so meka and Claude Code on the same machine look like the same device). If that file is missing or has no `userID`, meka generates a 64-character hex string. Either way, the resolved value is persisted back to the profile under `[providers.<name>].device_id`. This file write only happens for the `claude-oauth` backend; other backends don't need a device ID.
 
 You can supply your own value if you want to control attribution explicitly:
 
 ```toml
-[provider]
+[providers.work]
+type      = "claude-oauth"
 device_id = "your-stable-id-here"
+```
+
+## `meka provider` CLI
+
+Add, switch, and remove profiles without editing `config.toml` by hand. The credential prompt /
+OAuth login runs as part of `add` and `login`, and secrets are written to the database, never the
+config file.
+
+| Command | Action |
+|---|---|
+| `meka provider add <name> [--type T] [--model M] [--base-url U] [--api-key-stdin]` | Add a profile. Prompts for any of type/model interactively when not flagged (the model prompt offers a backend default: `claude-opus-4-8` for Claude, `gpt-5.5` for OpenAI), then acquires the secret (OAuth login for `claude-oauth` / `openai-codex`, API-key prompt for `claude-api` / `openai-api`). Sets `default_provider` when it's the first profile. |
+| `meka provider list` | List configured profiles with type, model, the default marker, and whether each has a stored credential. |
+| `meka provider use <name>` | Set `default_provider` to this profile. |
+| `meka provider login <name>` | Re-acquire the secret for an existing profile (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). |
+| `meka provider remove <name>` | Logout + delete: best-effort revoke the OAuth token, delete the stored credential from the database, and remove the `[providers.<name>]` entry from the config file. |
+
+`--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
+
+```console
+$ printf '%s' "$OPENAI_API_KEY" | meka provider add local --type openai-api --model gpt-4o --api-key-stdin
 ```
 
 ## Examples
 
-### OpenAI API
+### Claude OAuth (Claude Code subscription)
 
-```toml
-[provider]
-name = "openai-api"
-model = "gpt-4o"
-# API key via env: export OPENAI_API_KEY=sk-...
+```console
+$ meka provider add work --type claude-oauth --model claude-opus-4-6
+# Opens the browser for the OAuth login, then stores the token in the database.
 ```
 
 ### Claude API
 
-```toml
-[provider]
-name = "claude-api"
-model = "claude-opus-4-6"
-# API key via env: export CLAUDE_API_KEY=sk-ant-api03-...
+```console
+$ meka provider add anthropic --type claude-api --model claude-opus-4-6
+# Prompts for your CLAUDE API key (sk-ant-api03-...).
 ```
 
-### Claude OAuth
+### OpenAI API
 
-```toml
-[provider]
-name = "claude-oauth"
-model = "claude-opus-4-6"
-# Run `meka setup` to perform the OAuth login, or:
-# export CLAUDE_OAUTH_TOKEN=sk-ant-oat01-...
+```console
+$ meka provider add openai --type openai-api --model gpt-4o
+# Prompts for your OpenAI API key (sk-...).
 ```
 
 ### OpenAI Codex (ChatGPT subscription)
 
-```toml
-[provider]
-name = "openai-codex"
-model = "gpt-5"
-# Run `meka setup` to perform the OAuth login, or:
-# export OPENAI_CODEX_TOKEN=...
+```console
+$ meka provider add chatgpt --type openai-codex --model gpt-5
+# Opens the browser for the ChatGPT OAuth login.
 ```
 
-### Ollama (local)
+### Ollama (local, no key)
 
-```toml
-[provider]
-name = "openai-api"
-model = "llama3"
-api_key = "unused"
-base_url = "http://localhost:11434/v1"
+```console
+$ printf 'unused' | meka provider add ollama --type openai-api --model llama3 \
+    --base-url http://localhost:11434/v1 --api-key-stdin
 ```
 
 ### OpenRouter
 
-```toml
-[provider]
-name = "openai-api"
-model = "anthropic/claude-sonnet-4.6"
-base_url = "https://openrouter.ai/api/v1"
-# API key via env: export OPENAI_API_KEY=sk-or-...
+```console
+$ meka provider add openrouter --type openai-api --model anthropic/claude-sonnet-4.6 \
+    --base-url https://openrouter.ai/api/v1
+# Prompts for your OpenRouter key (sk-or-...).
 ```
 
 ## `[display]`
@@ -356,7 +395,7 @@ Linux-only choice between `"landlock"` and `"bubblewrap"`:
 - **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
 - **Landlock** (`"landlock"`) uses the Landlock LSM (kernel 5.13+) to block filesystem writes. Does **not** block dbus / systemd-user IPC; a sandboxed shell can still invoke state-mutating dbus methods. Kept as the lighter-weight fallback for hosts without Bubblewrap.
 
-When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. `meka setup` does not write this field; leave it unset to keep auto-detection.
+When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. `meka provider add` does not write this field; leave it unset to keep auto-detection.
 
 If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `execute_command` in read mode hard-errors with a message naming the configured backend and the specific failure reason. Read mode is not blocked for other tools; only `execute_command` requires a usable sandbox.
 

@@ -11,7 +11,6 @@ use serde::Deserialize;
 use crate::{
     cli::Cli,
     permission::{EnabledPermissions, Permission},
-    provider::AuthCredential,
     render::RenderMode,
 };
 
@@ -20,7 +19,12 @@ use crate::{
 /// `resolve_config` merges it with CLI flags and env vars to produce a [`ResolvedConfig`].
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
-    pub provider: Option<ProviderConfig>,
+    /// Name of the profile to use when no `--provider` flag is given.
+    pub default_provider: Option<String>,
+    /// Named provider profiles, parsed from `[providers.<name>]`. Each pins a backend `type` plus
+    /// non-secret settings; credentials live in the DB, not here.
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, ProviderProfile>,
     pub display: Option<DisplayConfig>,
     pub web: Option<WebConfig>,
     pub shell: Option<ShellConfig>,
@@ -447,16 +451,21 @@ pub struct SessionConfig {
     pub context_window: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct ProviderConfig {
-    pub name: Option<String>,
+/// One named provider profile from `[providers.<name>]`. Holds only non-secret settings; the
+/// credential (API key or OAuth bundle) is stored in the DB keyed by the profile name and is
+/// acquired via `meka provider add` / `login`.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ProviderProfile {
+    /// Backend kind: one of [`crate::provider::SUPPORTED_PROVIDERS`].
+    #[serde(rename = "type")]
+    pub backend: String,
     pub model: Option<String>,
-    pub api_key: Option<String>,
-    pub oauth_token: Option<String>,
-    pub oauth_token_url: Option<String>,
     pub base_url: Option<String>,
+    pub oauth_token_url: Option<String>,
     pub reasoning_effort: Option<String>,
     pub device_id: Option<String>,
+    /// OAuth client ID override (advanced; `claude-oauth` / `openai-codex`).
+    pub client_id: Option<String>,
     /// `claude-oauth` only: value emitted as `output_config.effort`. Mirrors Claude Code's effort
     /// knob. See `temp/claude-code/src/utils/effort.ts`. Accepted values: `"low" | "medium" |
     /// "high"`. Defaults to `"high"`.
@@ -473,9 +482,15 @@ pub struct ProviderConfig {
 /// `resolve_config` (Linux) and the non-Linux variant below it.
 #[derive(Debug)]
 pub struct ResolvedConfig {
+    /// Backend type of the active profile (one of [`crate::provider::SUPPORTED_PROVIDERS`]);
+    /// `None` when no profile could be selected.
     pub provider_name: Option<String>,
+    /// Name of the active profile, used as the DB key for its credential.
+    pub active_profile: Option<String>,
+    /// Set when profile selection failed (no profiles, ambiguous, or an unknown name); surfaced by
+    /// [`Self::validate`] with guidance to run `meka provider add` / `use`.
+    pub provider_error: Option<String>,
     pub model: Option<String>,
-    pub auth_credential: Option<AuthCredential>,
     pub base_url: Option<String>,
     pub client_id: Option<String>,
     pub oauth_token_url: Option<String>,
@@ -849,10 +864,6 @@ pub(crate) fn config_file_path() -> Option<PathBuf> {
     meka_config_dir().map(|dir| dir.join("config.toml"))
 }
 
-pub(crate) fn config_file_exists() -> bool {
-    config_file_path().is_some_and(|path| path.exists())
-}
-
 /// Write `content` to `path` atomically: serialise to `<path>.tmp` in the same directory,
 /// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
 /// Unix) and chmods the final file to 0600 on Unix so `auth_token` / OAuth-derived secrets aren't
@@ -926,46 +937,7 @@ pub(crate) fn write_config_atomic(path: &Path, content: &str) -> std::io::Result
     })
 }
 
-/// Write a freshly initialized `config.toml` from the setup wizard. No `[shell]` table is
-/// emitted; the sandbox backend auto-resolves at runtime (bubblewrap preferred, landlock
-/// fallback; see [`resolve_sandbox_backend`]), so a pinned value is only ever needed when the user
-/// wants to override that default by hand.
-pub(crate) fn write_config_file(
-    provider_name: &str,
-    model: &str,
-    api_key: Option<&str>,
-    base_url: Option<&str>,
-) -> std::io::Result<()> {
-    let path = config_file_path().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "could not determine config directory",
-        )
-    })?;
-
-    let mut provider_table = toml::map::Map::new();
-    provider_table.insert(
-        "name".to_string(),
-        toml::Value::String(provider_name.to_string()),
-    );
-    provider_table.insert("model".to_string(), toml::Value::String(model.to_string()));
-    if let Some(key) = api_key {
-        provider_table.insert("api_key".to_string(), toml::Value::String(key.to_string()));
-    }
-    if let Some(url) = base_url {
-        provider_table.insert("base_url".to_string(), toml::Value::String(url.to_string()));
-    }
-
-    let mut root = toml::map::Map::new();
-    root.insert("provider".to_string(), toml::Value::Table(provider_table));
-
-    let content = toml::to_string_pretty(&root)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
-
-    write_config_atomic(&path, &content)
-}
-
-fn load_config_file() -> ConfigFile {
+pub(crate) fn load_config_file() -> ConfigFile {
     let Some(path) = config_file_path() else {
         return ConfigFile::default();
     };
@@ -1229,10 +1201,64 @@ fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServer
     }
 }
 
+/// Resolve which provider profile is active given an explicit request (from `--provider` or
+/// `default_provider`) and the configured profiles. Returns `(active_profile, provider_error)`:
+/// exactly one is `Some`. A deferred error string (rather than a hard failure) keeps `from_cli`
+/// infallible; `validate()` surfaces it later with guidance.
+fn select_active_profile(
+    requested: Option<String>,
+    providers: &std::collections::BTreeMap<String, ProviderProfile>,
+) -> (Option<String>, Option<String>) {
+    match requested {
+        Some(name) if providers.contains_key(&name) => (Some(name), None),
+        Some(_) if providers.is_empty() => (
+            None,
+            Some("no provider profiles configured. Run `meka provider add <name>`.".to_string()),
+        ),
+        Some(name) => (
+            None,
+            Some(format!(
+                "no provider profile named '{}' (configured: {}). Pass `--provider` or set \
+                 `default_provider`.",
+                name,
+                providers.keys().cloned().collect::<Vec<_>>().join(", ")
+            )),
+        ),
+        None => match providers.len() {
+            0 => (
+                None,
+                Some(
+                    "no provider configured. Run `meka provider add <name>` to set one up."
+                        .to_string(),
+                ),
+            ),
+            1 => (providers.keys().next().cloned(), None),
+            _ => (
+                None,
+                Some(format!(
+                    "multiple provider profiles configured ({}); set `default_provider` or pass \
+                     `--provider <name>`.",
+                    providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                )),
+            ),
+        },
+    }
+}
+
 impl ResolvedConfig {
     pub fn from_cli(cli: &Cli) -> Self {
         let config_file = load_config_file();
-        let file_provider = config_file.provider.unwrap_or_default();
+        let providers = config_file.providers;
+        // Select the active profile: `--provider` flag, else `default_provider`, else the sole
+        // profile. Absence / ambiguity / unknown name becomes a deferred error surfaced by
+        // `validate()` so `from_cli` stays infallible.
+        let (active_profile, provider_error) = select_active_profile(
+            cli.provider
+                .clone()
+                .or_else(|| config_file.default_provider.clone()),
+            &providers,
+        );
+        let active = active_profile.as_ref().and_then(|name| providers.get(name));
         let file_display = config_file.display.unwrap_or_default();
         let file_web = config_file.web.unwrap_or_default();
         let file_shell = config_file.shell.unwrap_or_default();
@@ -1323,25 +1349,20 @@ impl ResolvedConfig {
             })
             .collect();
 
-        let provider_name = cli
-            .provider
-            .clone()
-            .or_else(|| std::env::var("MEKA_PROVIDER").ok())
-            .or_else(|| file_provider.name.clone());
+        // Provider config comes from the active profile (no env tier); the credential is loaded
+        // from the DB in main.rs by `active_profile`. CLI `--model` / `--base-url` override the
+        // profile's values for this run.
+        let provider_name = active.map(|profile| profile.backend.clone());
 
         let model = cli
             .model
             .clone()
-            .or_else(|| std::env::var("MEKA_MODEL").ok())
-            .or_else(|| file_provider.model.clone());
-
-        let auth_credential = credential::resolve(provider_name.as_deref(), &file_provider);
+            .or_else(|| active.and_then(|profile| profile.model.clone()));
 
         let base_url = cli
             .base_url
             .clone()
-            .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
-            .or_else(|| file_provider.base_url.clone());
+            .or_else(|| active.and_then(|profile| profile.base_url.clone()));
 
         let file_permissions = config_file.permissions.unwrap_or_default();
         let (permission, enabled_permissions) = resolve_permission(
@@ -1353,10 +1374,14 @@ impl ResolvedConfig {
 
         // Compute device_id before the struct literal so we can borrow `provider_name` here without
         // conflicting with the `provider_name` field move below.
-        let device_id =
-            device_id::resolve(provider_name.as_deref(), file_provider.device_id.as_deref());
-        let effort = effort::resolve(file_provider.effort.as_deref());
-        let redact_thinking = file_provider.redact_thinking.unwrap_or(false);
+        let device_id = device_id::resolve(
+            provider_name.as_deref(),
+            active.and_then(|profile| profile.device_id.as_deref()),
+        );
+        let effort = effort::resolve(active.and_then(|profile| profile.effort.as_deref()));
+        let redact_thinking = active
+            .and_then(|profile| profile.redact_thinking)
+            .unwrap_or(false);
 
         // Only probe the sandbox backend when sandboxing is actually enabled. Skipping the probe
         // for `sandbox = false` saves the smoke-test cost on every invocation of subcommands that
@@ -1386,11 +1411,12 @@ impl ResolvedConfig {
 
         Self {
             provider_name,
+            active_profile,
+            provider_error,
             model,
-            auth_credential,
             base_url,
-            client_id: std::env::var("CLAUDE_CLIENT_ID").ok(),
-            oauth_token_url: file_provider.oauth_token_url.clone(),
+            client_id: active.and_then(|profile| profile.client_id.clone()),
+            oauth_token_url: active.and_then(|profile| profile.oauth_token_url.clone()),
             permission,
             enabled_permissions,
             streaming: !cli.no_stream,
@@ -1434,7 +1460,7 @@ impl ResolvedConfig {
                     .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS)
             }),
             thinking_show_content: file_thinking.show_content.unwrap_or(false),
-            reasoning_effort: file_provider.reasoning_effort.clone(),
+            reasoning_effort: active.and_then(|profile| profile.reasoning_effort.clone()),
             device_id,
             effort,
             redact_thinking,
@@ -1460,18 +1486,22 @@ impl ResolvedConfig {
     }
 
     pub fn validate(&self) -> crate::error::Result<()> {
+        // Profile-selection failure (none / ambiguous / unknown name) is reported first with its
+        // specific guidance.
+        if let Some(error) = &self.provider_error {
+            return Err(crate::error::MekaError::Config(error.clone()));
+        }
         match self.provider_name.as_deref() {
             None => {
-                return Err(crate::error::MekaError::Config(format!(
-                    "no provider configured. Set --provider, MEKA_PROVIDER env var, or \
-                     provider.name in config file (~/.config/meka/config.toml). Supported \
-                     providers: {}",
-                    crate::provider::SUPPORTED_PROVIDERS.join(", "),
-                )));
+                return Err(crate::error::MekaError::Config(
+                    "no provider configured. Run `meka provider add <name>` to set one up."
+                        .to_string(),
+                ));
             }
             Some(name) if !crate::provider::SUPPORTED_PROVIDERS.contains(&name) => {
                 return Err(crate::error::MekaError::Config(format!(
-                    "'{}' is not a valid provider. Supported providers: {}",
+                    "profile '{}' has unknown type '{}'. Supported types: {}",
+                    self.active_profile.as_deref().unwrap_or("?"),
                     name,
                     crate::provider::SUPPORTED_PROVIDERS.join(", "),
                 )));
@@ -1479,11 +1509,11 @@ impl ResolvedConfig {
             Some(_) => {}
         }
         if self.model.is_none() {
-            return Err(crate::error::MekaError::Config(
-                "no model configured. Set --model, MEKA_MODEL env var, \
-                 or provider.model in config file (~/.config/meka/config.toml)"
-                    .to_string(),
-            ));
+            return Err(crate::error::MekaError::Config(format!(
+                "no model configured for profile '{}'. Set `model` in its [providers.<name>] \
+                 table, or pass --model.",
+                self.active_profile.as_deref().unwrap_or("?"),
+            )));
         }
         Ok(())
     }
@@ -1619,75 +1649,6 @@ mod effort {
                     DEFAULT,
                 );
                 DEFAULT.to_string()
-            }
-        }
-    }
-}
-
-/// Provider credential lookup: env var → config file, with provider-specific env-var precedence.
-/// OAuth database fallback happens in `main.rs`.
-mod credential {
-    use super::{AuthCredential, ProviderConfig};
-
-    pub(super) fn resolve(
-        provider_name: Option<&str>,
-        file_provider: &ProviderConfig,
-    ) -> Option<AuthCredential> {
-        match provider_name {
-            Some("claude-api") => {
-                if let Ok(key) = std::env::var("CLAUDE_API_KEY") {
-                    return Some(AuthCredential::ApiKey(key));
-                }
-                if let Some(key) = &file_provider.api_key {
-                    return Some(AuthCredential::ApiKey(key.clone()));
-                }
-                None
-            }
-            Some("claude-oauth") => {
-                if let Ok(token) = std::env::var("CLAUDE_OAUTH_TOKEN") {
-                    return Some(AuthCredential::OAuthToken {
-                        access_token: token,
-                        refresh_token: None,
-                        expires_at: None,
-                        account_id: None,
-                    });
-                }
-                if let Some(token) = &file_provider.oauth_token {
-                    return Some(AuthCredential::OAuthToken {
-                        access_token: token.clone(),
-                        refresh_token: None,
-                        expires_at: None,
-                        account_id: None,
-                    });
-                }
-                // Database fallback happens in main.rs
-                None
-            }
-            Some("openai-codex") => {
-                if let Ok(token) = std::env::var("OPENAI_CODEX_TOKEN") {
-                    return Some(AuthCredential::OAuthToken {
-                        access_token: token,
-                        refresh_token: None,
-                        expires_at: None,
-                        account_id: None,
-                    });
-                }
-                if let Some(token) = &file_provider.oauth_token {
-                    return Some(AuthCredential::OAuthToken {
-                        access_token: token.clone(),
-                        refresh_token: None,
-                        expires_at: None,
-                        account_id: None,
-                    });
-                }
-                // Database fallback happens in main.rs
-                None
-            }
-            _ => {
-                let key = std::env::var("OPENAI_API_KEY")
-                    .ok()
-                    .or_else(|| file_provider.api_key.clone())?;
-                Some(AuthCredential::ApiKey(key))
             }
         }
     }
@@ -1967,19 +1928,23 @@ command = "npx"
     #[test]
     fn test_config_file_deserialization() {
         let toml_str = r#"
-[provider]
-name = "openai-api"
+default_provider = "work"
+
+[providers.work]
+type = "openai-api"
 model = "gpt-4o"
-api_key = "sk-test"
 base_url = "https://api.openai.com/v1"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
-        let provider = config.provider.expect("provider should be present");
-        assert_eq!(provider.name.as_deref(), Some("openai-api"));
-        assert_eq!(provider.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(provider.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(config.default_provider.as_deref(), Some("work"));
+        let profile = config
+            .providers
+            .get("work")
+            .expect("profile should be present");
+        assert_eq!(profile.backend, "openai-api");
+        assert_eq!(profile.model.as_deref(), Some("gpt-4o"));
         assert_eq!(
-            provider.base_url.as_deref(),
+            profile.base_url.as_deref(),
             Some("https://api.openai.com/v1")
         );
     }
@@ -1987,21 +1952,85 @@ base_url = "https://api.openai.com/v1"
     #[test]
     fn test_empty_config_file() {
         let config: ConfigFile = toml::from_str("").expect("failed to parse empty toml");
-        assert!(config.provider.is_none());
+        assert!(config.providers.is_empty());
+        assert!(config.default_provider.is_none());
     }
 
     #[test]
     fn test_partial_config_file() {
         let toml_str = r#"
-[provider]
-name = "claude-oauth"
+[providers.main]
+type = "claude-oauth"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
-        let provider = config.provider.expect("provider should be present");
-        assert_eq!(provider.name.as_deref(), Some("claude-oauth"));
-        assert!(provider.model.is_none());
-        assert!(provider.api_key.is_none());
-        assert!(provider.base_url.is_none());
+        let profile = config
+            .providers
+            .get("main")
+            .expect("profile should be present");
+        assert_eq!(profile.backend, "claude-oauth");
+        assert!(profile.model.is_none());
+        assert!(profile.base_url.is_none());
+    }
+
+    fn profiles_from(
+        backends: &[(&str, &str)],
+    ) -> std::collections::BTreeMap<String, ProviderProfile> {
+        backends
+            .iter()
+            .map(|(name, backend)| {
+                (name.to_string(), ProviderProfile {
+                    backend: backend.to_string(),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_select_active_profile_explicit_request_wins() {
+        let providers = profiles_from(&[("work", "claude-oauth"), ("personal", "openai-api")]);
+        let (active, error) = select_active_profile(Some("personal".to_string()), &providers);
+        assert_eq!(active.as_deref(), Some("personal"));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn test_select_active_profile_sole_profile_when_no_request() {
+        let providers = profiles_from(&[("only", "claude-api")]);
+        let (active, error) = select_active_profile(None, &providers);
+        assert_eq!(active.as_deref(), Some("only"));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn test_select_active_profile_zero_profiles_errors() {
+        let providers = profiles_from(&[]);
+        let (active, error) = select_active_profile(None, &providers);
+        assert!(active.is_none());
+        assert!(error.expect("error expected").contains("provider add"));
+    }
+
+    #[test]
+    fn test_select_active_profile_ambiguous_without_default_errors() {
+        let providers = profiles_from(&[("work", "claude-oauth"), ("personal", "openai-api")]);
+        let (active, error) = select_active_profile(None, &providers);
+        assert!(active.is_none());
+        let error = error.expect("error expected");
+        assert!(error.contains("multiple provider profiles"));
+        // The error lists the configured names so the user knows what to pick.
+        assert!(error.contains("work") && error.contains("personal"));
+    }
+
+    #[test]
+    fn test_select_active_profile_unknown_name_errors() {
+        let providers = profiles_from(&[("work", "claude-oauth")]);
+        let (active, error) = select_active_profile(Some("missing".to_string()), &providers);
+        assert!(active.is_none());
+        assert!(
+            error
+                .expect("error expected")
+                .contains("no provider profile named 'missing'")
+        );
     }
 
     #[test]
@@ -2125,18 +2154,21 @@ name = "claude-oauth"
     }
 
     #[test]
-    fn test_provider_config_deserializes_effort_and_redact_thinking() {
+    fn test_provider_profile_deserializes_effort_and_redact_thinking() {
         let toml_str = r#"
-[provider]
-name = "claude-oauth"
+[providers.work]
+type = "claude-oauth"
 model = "claude-opus-4-6-20250514"
 effort = "medium"
 redact_thinking = true
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
-        let provider = config.provider.expect("provider should be present");
-        assert_eq!(provider.effort.as_deref(), Some("medium"));
-        assert_eq!(provider.redact_thinking, Some(true));
+        let profile = config
+            .providers
+            .get("work")
+            .expect("profile should be present");
+        assert_eq!(profile.effort.as_deref(), Some("medium"));
+        assert_eq!(profile.redact_thinking, Some(true));
     }
 
     #[test]
@@ -2840,7 +2872,7 @@ enabled = ["read", "write"]
 
     /// `sandbox_backend = "bubblewrap"` and `"landlock"` deserialize cleanly. Any other value,
     /// including the prior internal alias `"bwrap"`, must be rejected; we don't want alias creep
-    /// that would silently desync `meka setup`-generated configs from hand-edited ones.
+    /// that would silently desync generated configs from hand-edited ones.
     #[test]
     fn test_sandbox_backend_deserializes_strict_values() {
         let bubblewrap: ShellConfig =

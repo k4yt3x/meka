@@ -46,6 +46,9 @@ pub struct ClaudeOAuthProvider {
     client_id: String,
     oauth_token_url: String,
     token_store: Option<Arc<TokenStore>>,
+    /// Profile name this provider's credential is stored under, so refreshed tokens are written
+    /// back to the correct `provider_credentials` row.
+    credential_key: String,
     session_id: String,
     device_id: String,
     thinking_enabled: bool,
@@ -70,6 +73,7 @@ impl ClaudeOAuthProvider {
         client_id: Option<String>,
         oauth_token_url: Option<String>,
         token_store: Option<Arc<TokenStore>>,
+        credential_key: String,
         thinking_enabled: bool,
         thinking_budget_tokens: u64,
         device_id: String,
@@ -86,6 +90,7 @@ impl ClaudeOAuthProvider {
             oauth_token_url: oauth_token_url
                 .unwrap_or_else(|| "https://api.anthropic.com/v1/oauth/token".to_string()),
             token_store,
+            credential_key,
             session_id: Uuid::new_v4().to_string(),
             device_id,
             thinking_enabled,
@@ -187,7 +192,7 @@ impl ClaudeOAuthProvider {
         // since startup. Without this re-read we'd POST a stale refresh_token and the OAuth
         // provider would reject it with `invalid_grant`.
         if let Some(store) = &self.token_store {
-            match store.load_oauth_token("claude").await {
+            match store.load_provider_credential(&self.credential_key).await {
                 Ok(Some(latest)) => *credential = latest,
                 Ok(None) => {}
                 Err(error) => {
@@ -229,10 +234,10 @@ impl ClaudeOAuthProvider {
         let new_credential = self.refresh_oauth_token(&refresh_token).await?;
         let (header_name, header_value) = new_credential.auth_header();
 
-        // Storage key kept as "claude" to preserve existing users' refresh tokens across the
-        // provider rename to "claude-oauth".
         if let Some(store) = &self.token_store
-            && let Err(error) = store.save_oauth_token("claude", &new_credential).await
+            && let Err(error) = store
+                .save_provider_credential(&self.credential_key, &new_credential)
+                .await
         {
             tracing::warn!("failed to persist refreshed OAuth token: {}", error);
         }
@@ -538,6 +543,7 @@ mod tests {
             None,
             None,
             None,
+            "test".to_string(),
             false,
             10000,
             "a".repeat(64),
@@ -1072,6 +1078,7 @@ mod tests {
             None,
             None,
             None,
+            "test".to_string(),
             thinking,
             10000,
             "a".repeat(64),
@@ -2512,6 +2519,7 @@ mod tests {
             None,
             Some(format!("http://{}/", local)),
             None,
+            "test".to_string(),
             false,
             10000,
             "a".repeat(64),

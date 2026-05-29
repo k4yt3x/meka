@@ -1,23 +1,28 @@
 # Quick Start
 
-## 1. Run the Setup Wizard
+## 1. Add a Provider
 
-On first launch, meka automatically starts an interactive setup wizard:
+Before the first run, configure a provider profile. `meka provider add` runs the right credential
+flow (OAuth login or API-key prompt) and writes the profile to `~/.config/meka/config.toml`:
 
 ```bash
-meka
+# Claude Code subscription (OAuth)
+meka provider add work --type claude-oauth --model claude-opus-4-6
+
+# or a Claude API key
+meka provider add work --type claude-api --model claude-opus-4-6
+
+# or OpenAI
+meka provider add work --type openai-api --model gpt-4o
 ```
 
-The wizard will guide you through:
+`add` prompts for any of `--type` / `--model` you omit, acquires the secret (browser OAuth for
+`claude-oauth` / `openai-codex`, an API-key prompt otherwise), stores it in the database, and makes
+the profile the default. Add more profiles later and switch with `meka provider use <name>` or the
+per-run `--provider <name>` flag.
 
-1. **Provider selection**: Choose between `claude-oauth`, `claude-api`, or `openai-api`
-2. **Authentication**: OAuth login (`claude-oauth`) or API key entry (`claude-api`, `openai-api`)
-3. **Model selection**: Enter the model name to use
-4. **Base URL**: Optionally set a custom API endpoint
-
-The wizard writes your configuration to `~/.config/meka/config.toml`. You can re-run it at any time with `meka setup`.
-
-> You can also create the config file manually or use environment variables (`OPENAI_API_KEY`, `MEKA_PROVIDER`, etc.) and CLI flags (`--provider`, `-m`) as overrides. See [Configuration](../configuration/overview.md) for all options.
+> If you launch `meka` with no provider configured, it errors and tells you to run `meka provider add`.
+> See [Configuration](../configuration/overview.md) for all options and the full `meka provider` reference.
 
 ## 2. Start Using meka
 

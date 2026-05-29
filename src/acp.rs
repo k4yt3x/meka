@@ -1124,7 +1124,7 @@ pub async fn run_acp(
     mcp_context: Arc<mcp::McpClientContext>,
 ) -> anyhow::Result<()> {
     // Resolve provider credentials the same way the REPL path does.
-    let credential = resolve_credential_for_acp(&config)?;
+    let credential = resolve_credential_for_acp(&config, &session_manager.token_store()).await?;
 
     // Build process-wide shared deps once. Sessions hold an `Arc<SharedDeps>` and read fields by
     // reference; no work happens here that needs to be re-run per session.
@@ -2071,11 +2071,23 @@ async fn build_session_runtime(
 
 /// Mirrors `main::resolve_credential` but stays in this module to avoid widening `main`'s
 /// visibility for an ACP-only call site.
-fn resolve_credential_for_acp(config: &ResolvedConfig) -> anyhow::Result<AuthCredential> {
-    config
-        .auth_credential
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("meka acp requires a configured provider credential"))
+async fn resolve_credential_for_acp(
+    config: &ResolvedConfig,
+    token_store: &crate::session::TokenStore,
+) -> anyhow::Result<AuthCredential> {
+    let Some(profile) = config.active_profile.as_deref() else {
+        anyhow::bail!("meka acp requires a configured provider; run `meka provider add <name>`");
+    };
+    token_store
+        .load_provider_credential(profile)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider profile '{}' has no stored credential; run `meka provider login {}`",
+                profile,
+                profile
+            )
+        })
 }
 
 #[cfg(test)]

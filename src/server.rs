@@ -70,10 +70,20 @@ pub async fn run_serve(
     let max_body_bytes = serve.max_body_bytes;
     let bind_addr = serve.bind.clone();
 
-    let credential = config
-        .auth_credential
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("meka serve requires a configured provider credential"))?;
+    let credential = match config.active_profile.as_deref() {
+        Some(profile) => session_manager
+            .token_store()
+            .load_provider_credential(profile)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider profile '{}' has no stored credential; run `meka provider login {}`",
+                    profile,
+                    profile
+                )
+            })?,
+        None => anyhow::bail!("meka serve requires a configured provider; run `meka provider add`"),
+    };
 
     let shared = Arc::new(
         crate::build_shared_deps(
