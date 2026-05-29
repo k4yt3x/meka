@@ -142,6 +142,13 @@ impl OpenAiProvider {
             "stream": stream,
         });
 
+        // OpenAI omits `usage` from streamed responses unless explicitly asked; without this the
+        // final usage-only chunk never arrives and token accounting (the `/status` context gauge,
+        // auto-compact) silently reads zero for streaming turns.
+        if stream {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
+
         if let Some(effort) = &self.reasoning_effort {
             body["reasoning_effort"] = serde_json::json!(effort);
             body["max_completion_tokens"] = serde_json::json!(32_000);
@@ -363,6 +370,11 @@ impl Provider for OpenAiProvider {
         let mut tool_call_accumulators: std::collections::HashMap<i64, ToolCallAccumulator> =
             std::collections::HashMap::new();
 
+        // Set when a `finish_reason` chunk arrives. The loop keeps running afterward so the
+        // trailing usage chunk (emitted by `stream_options.include_usage`) is captured;
+        // finalisation and the single MessageEnd run once the stream ends, below the loop.
+        let mut final_stop: Option<StopReason> = None;
+
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => {
@@ -376,23 +388,6 @@ impl Provider for OpenAiProvider {
                     match event {
                         Ok(event) => {
                             if event.data == "[DONE]" {
-                                let has_tools = finalize_tool_call_accumulators(
-                                    &mut tool_call_accumulators,
-                                    &event_sender,
-                                )
-                                .await;
-                                let stop_reason = if has_tools {
-                                    StopReason::ToolUse
-                                } else {
-                                    StopReason::EndTurn
-                                };
-                                if event_sender
-                                    .send(StreamEvent::MessageEnd { stop_reason })
-                                    .await
-                                    .is_err()
-                                {
-                                    tracing::trace!("stream event receiver dropped");
-                                }
                                 break;
                             }
 
@@ -431,20 +426,12 @@ impl Provider for OpenAiProvider {
                             };
 
                             if let Some(finish_reason) = choice.get("finish_reason").and_then(|reason| reason.as_str()) {
-                                let stop_reason = parse_openai_stop_reason(finish_reason);
-                                finalize_tool_call_accumulators(
-                                    &mut tool_call_accumulators,
-                                    &event_sender,
-                                )
-                                .await;
-                                if event_sender
-                                    .send(StreamEvent::MessageEnd { stop_reason })
-                                    .await
-                                    .is_err()
-                                {
-                                    tracing::trace!("stream event receiver dropped");
-                                }
-                                break;
+                                // Record the stop reason but keep reading: with
+                                // `stream_options.include_usage` the usage arrives in a trailing
+                                // chunk AFTER this one (and before `[DONE]`). Finalisation and the
+                                // single MessageEnd happen once the stream ends, below the loop.
+                                final_stop = Some(parse_openai_stop_reason(finish_reason));
+                                continue;
                             }
 
                             let Some(delta) = choice.get("delta") else {
@@ -520,6 +507,23 @@ impl Provider for OpenAiProvider {
             }
         }
 
+        // The stream ended (`[DONE]` or the connection closed). Finalise any pending tool calls and
+        // emit the single MessageEnd, preferring the finish_reason we recorded; fall back to
+        // tool-presence when no finish_reason arrived.
+        let has_tools =
+            finalize_tool_call_accumulators(&mut tool_call_accumulators, &event_sender).await;
+        let stop_reason = final_stop.unwrap_or(if has_tools {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        });
+        if event_sender
+            .send(StreamEvent::MessageEnd { stop_reason })
+            .await
+            .is_err()
+        {
+            tracing::trace!("stream event receiver dropped");
+        }
         Ok(())
     }
 

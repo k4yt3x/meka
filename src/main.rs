@@ -33,6 +33,7 @@ mod server;
 mod session;
 mod skills;
 mod stats;
+mod tokens;
 mod tools;
 
 use std::sync::Arc;
@@ -911,10 +912,35 @@ async fn run_interactive(
     let repl_sandbox_state = crate::sandbox::SandboxState::from_config(&config);
     let repl_cwd = Arc::clone(&cwd);
     let repl_history_db_path = Some(session_manager.database_path().to_path_buf());
+
+    // Live context gauge for the prompt: a shared counter the agent writes after each turn and the
+    // prompt reads each render. Created here (before the agent) so the REPL, spawned below, can
+    // hold it; the agent adopts the same atomic via `set_context_tokens`. Seeded with an
+    // estimate when resuming so the gauge isn't blank until the first new turn measures the
+    // context exactly.
+    let context_window = config.context_window.unwrap_or_else(|| {
+        config
+            .model
+            .as_deref()
+            .map(crate::config::context_window_for_model)
+            .unwrap_or(128_000)
+    });
+    let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if !messages.is_empty() {
+        context_tokens.store(
+            tokens::estimate_messages(messages.as_slice()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let context_indicator = config
+        .show_context_in_prompt
+        .then(|| (Arc::clone(&context_tokens), context_window));
+
     let repl_handle = tokio::task::spawn_blocking(move || {
         repl::run_repl(
             repl_permission,
             show_path_in_prompt,
+            context_indicator,
             input_style,
             initial_turn_pending,
             repl_sandbox_state,
@@ -936,8 +962,19 @@ async fn run_interactive(
             return Ok(());
         }
     };
-    let session_stats = Arc::new(stats::SessionStats::default());
-    let agent = match create_agent_from_config(
+    // A resumed session continues its lifetime `/status` totals; a fresh session (or a load
+    // failure) starts empty.
+    let session_stats = match session_id {
+        Some(id) => match session_manager.load_session_stats(id).await {
+            Ok(snapshot) => Arc::new(stats::SessionStats::from_snapshot(&snapshot)),
+            Err(error) => {
+                tracing::warn!("failed to load session stats, starting fresh: {}", error);
+                Arc::new(stats::SessionStats::default())
+            }
+        },
+        None => Arc::new(stats::SessionStats::default()),
+    };
+    let mut agent = match create_agent_from_config(
         &config,
         session_manager.clone(),
         shared_permission,
@@ -960,6 +997,9 @@ async fn run_interactive(
             return Ok(());
         }
     };
+    // Point the agent's live context counter at the same atomic the REPL prompt holds, so the
+    // prompt gauge tracks what the agent writes after each turn (and the resume seed above).
+    agent.set_context_tokens(Arc::clone(&context_tokens));
 
     while let Some(event) = input_receiver.recv().await {
         match event {
@@ -1194,7 +1234,13 @@ async fn run_interactive(
                     }
                     repl::SlashCommand::Status => {
                         let snap = agent.session_stats_snapshot();
-                        render::render_session_status(&snap, messages.len());
+                        let (context_tokens, context_window) = agent.context_usage();
+                        render::render_session_status(
+                            &snap,
+                            messages.len(),
+                            context_tokens,
+                            context_window,
+                        );
                     }
                     repl::SlashCommand::History(limit) => {
                         let materialised = messages.as_slice();

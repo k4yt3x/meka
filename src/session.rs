@@ -566,6 +566,30 @@ impl SessionManager {
                     connection.execute_batch("ALTER TABLE sessions ADD COLUMN token_id TEXT")?;
                 }
 
+                // Migration: per-session cumulative stat columns (surfaced by `/status`) so the
+                // running totals survive resume instead of restarting at zero each process. Added as
+                // a set; the presence of `stat_turns` gates the whole batch.
+                let has_stat_cols: bool = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'stat_turns'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    > 0;
+                if !has_stat_cols {
+                    connection.execute_batch(
+                        "ALTER TABLE sessions ADD COLUMN stat_turns INTEGER NOT NULL DEFAULT 0;
+                         ALTER TABLE sessions ADD COLUMN stat_input_tokens INTEGER NOT NULL DEFAULT 0;
+                         ALTER TABLE sessions ADD COLUMN stat_output_tokens INTEGER NOT NULL DEFAULT 0;
+                         ALTER TABLE sessions ADD COLUMN stat_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;
+                         ALTER TABLE sessions ADD COLUMN stat_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0;
+                         ALTER TABLE sessions ADD COLUMN stat_redactions INTEGER NOT NULL DEFAULT 0;
+                         ALTER TABLE sessions ADD COLUMN stat_redacted_images INTEGER NOT NULL DEFAULT 0;
+                         ALTER TABLE sessions ADD COLUMN stat_redacted_bytes INTEGER NOT NULL DEFAULT 0;",
+                    )?;
+                }
+
                 Ok(())
             })
             .await
@@ -934,6 +958,89 @@ impl SessionManager {
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to save message: {}", error)))
+    }
+
+    /// Persist the cumulative `/status` counters onto the session row so they survive resume. The
+    /// caller treats this as best-effort (a failed write must never fail a turn).
+    pub async fn save_session_stats(
+        &self,
+        session_id: Uuid,
+        stats: &crate::stats::SessionStatsSnapshot,
+    ) -> Result<()> {
+        // SQLite has no u64; counts never realistically exceed i64::MAX, so cast on the way in/out.
+        let stats = stats.clone();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET
+                         stat_turns = ?2,
+                         stat_input_tokens = ?3,
+                         stat_output_tokens = ?4,
+                         stat_cache_creation_input_tokens = ?5,
+                         stat_cache_read_input_tokens = ?6,
+                         stat_redactions = ?7,
+                         stat_redacted_images = ?8,
+                         stat_redacted_bytes = ?9
+                     WHERE id = ?1",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        stats.turns as i64,
+                        stats.input_tokens as i64,
+                        stats.output_tokens as i64,
+                        stats.cache_creation_input_tokens as i64,
+                        stats.cache_read_input_tokens as i64,
+                        stats.redactions as i64,
+                        stats.redacted_images as i64,
+                        stats.redacted_bytes as i64,
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to save session stats: {}", error))
+            })
+    }
+
+    /// Load the persisted cumulative stats for a session, used to seed `SessionStats` on resume.
+    /// Returns all-zero when the session row doesn't exist yet (fresh session).
+    pub async fn load_session_stats(
+        &self,
+        session_id: Uuid,
+    ) -> Result<crate::stats::SessionStatsSnapshot> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let result = connection.query_row(
+                    "SELECT stat_turns, stat_input_tokens, stat_output_tokens,
+                            stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
+                            stat_redactions, stat_redacted_images, stat_redacted_bytes
+                     FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id.to_string()],
+                    |row| {
+                        Ok(crate::stats::SessionStatsSnapshot {
+                            turns: row.get::<_, i64>(0)? as u64,
+                            input_tokens: row.get::<_, i64>(1)? as u64,
+                            output_tokens: row.get::<_, i64>(2)? as u64,
+                            cache_creation_input_tokens: row.get::<_, i64>(3)? as u64,
+                            cache_read_input_tokens: row.get::<_, i64>(4)? as u64,
+                            redactions: row.get::<_, i64>(5)? as u64,
+                            redacted_images: row.get::<_, i64>(6)? as u64,
+                            redacted_bytes: row.get::<_, i64>(7)? as u64,
+                        })
+                    },
+                );
+                match result {
+                    Ok(snapshot) => Ok(snapshot),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        Ok(crate::stats::SessionStatsSnapshot::default())
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load session stats: {}", error))
+            })
     }
 
     /// Fetch raw rows for a session. Internal helper for [`Self::load_events`]; external consumers
@@ -2314,6 +2421,55 @@ mod tests {
                 .await
                 .expect("failed to check")
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_stats_persist_round_trip() {
+        let manager = test_manager().await;
+        let session_id = manager.create_session(None).await.expect("create session");
+
+        // A fresh row starts at all-zero (columns default to 0).
+        let fresh = manager
+            .load_session_stats(session_id)
+            .await
+            .expect("load fresh");
+        assert_eq!(fresh.turns, 0);
+        assert_eq!(fresh.input_tokens, 0);
+
+        let snapshot = crate::stats::SessionStatsSnapshot {
+            turns: 5,
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 200,
+            redactions: 2,
+            redacted_images: 3,
+            redacted_bytes: 4096,
+        };
+        manager
+            .save_session_stats(session_id, &snapshot)
+            .await
+            .expect("save stats");
+
+        let loaded = manager
+            .load_session_stats(session_id)
+            .await
+            .expect("load stats");
+        assert_eq!(loaded.turns, 5);
+        assert_eq!(loaded.input_tokens, 100);
+        assert_eq!(loaded.output_tokens, 50);
+        assert_eq!(loaded.cache_creation_input_tokens, 10);
+        assert_eq!(loaded.cache_read_input_tokens, 200);
+        assert_eq!(loaded.redactions, 2);
+        assert_eq!(loaded.redacted_images, 3);
+        assert_eq!(loaded.redacted_bytes, 4096);
+
+        // An unknown session id is not an error; it reads as all-zero.
+        let unknown = manager
+            .load_session_stats(uuid::Uuid::new_v4())
+            .await
+            .expect("load unknown");
+        assert_eq!(unknown.turns, 0);
     }
 
     #[tokio::test]

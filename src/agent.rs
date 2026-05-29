@@ -157,7 +157,14 @@ pub struct Agent {
     /// environment-context block, and the MCP `roots/list` handler. Process `cwd` is no longer
     /// mutated.
     cwd: SharedCwd,
-    last_input_tokens: std::sync::atomic::AtomicU64,
+    /// Total tokens of this agent's most recent provider round: the live, cache-write, and
+    /// cache-read input tiers plus output. That equals everything in context as of the last
+    /// exchange, i.e. the size the next request re-sends minus the new user prompt. Drives
+    /// auto-compact and the `/status` context gauge, and is shared (`Arc`) with the REPL prompt
+    /// for the optional live indicator. Seeded by an estimate after `/compact` and on resume
+    /// until the next real response corrects it. Per-`Agent`, so sub-agents (own counter) are
+    /// excluded from a parent's reading.
+    last_context_tokens: Arc<std::sync::atomic::AtomicU64>,
     /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by MCP tool adapters so
     /// oversized-output persistence uses `mcp_<server>_<tool>` instead of the plain tool name.
     /// Cleared between turns by `persist_oversized_results`.
@@ -168,6 +175,10 @@ pub struct Agent {
     /// Counters surfaced by `/status`. Shared with the Claude providers, which increment the
     /// redaction-related fields when oversized request bodies trigger image-block redaction.
     session_stats: Arc<crate::stats::SessionStats>,
+    /// Whether this agent persists `session_stats` onto its session row after each turn. True for
+    /// the primary agent; false for sub-agents, which share the parent's `SessionStats` Arc but
+    /// own a child session row (so only the primary writes the parent-inclusive totals).
+    persist_session_stats: bool,
 }
 
 impl Agent {
@@ -197,10 +208,11 @@ impl Agent {
             skills,
             frontend,
             cwd,
-            last_input_tokens: std::sync::atomic::AtomicU64::new(0),
+            last_context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             scratchpad_hints: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             mcp_manager: None,
             session_stats,
+            persist_session_stats: true,
         }
     }
 
@@ -278,7 +290,7 @@ impl Agent {
             .map(|guard| guard.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
         let sub_cwd: SharedCwd = Arc::new(RwLock::new(parent_path));
-        Self::new(
+        let mut agent = Self::new(
             provider,
             tool_registry,
             session_manager,
@@ -290,12 +302,38 @@ impl Agent {
             frontend,
             sub_cwd,
             session_stats,
-        )
+        );
+        // Sub-agents share the parent's `SessionStats` Arc but own a child session row; only the
+        // primary agent persists, so the parent-inclusive totals aren't stamped onto a child.
+        agent.persist_session_stats = false;
+        agent
     }
 
     /// Snapshot of the per-session counters used by `/status`. Called from the REPL on demand.
     pub fn session_stats_snapshot(&self) -> crate::stats::SessionStatsSnapshot {
         self.session_stats.snapshot()
+    }
+
+    /// Live context occupancy for `/status`: `(tokens_in_context, context_window)`.
+    ///
+    /// `tokens_in_context` is the total tokens of this agent's most recent provider round (all
+    /// input tiers + output) = what the next request re-sends minus the new prompt; `0` before
+    /// the first turn. It is per-`Agent`, so sub-agents are excluded; a sub-agent's *returned
+    /// result* counts only insofar as it became a tool result in this agent's own context.
+    /// `context_window` is the resolved window for the active model (`0` if unknown).
+    pub fn context_usage(&self) -> (u64, u64) {
+        (
+            self.last_context_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.options.context_window,
+        )
+    }
+
+    /// Point this agent's live context counter at an externally-owned atomic so the REPL prompt
+    /// (constructed before the agent) can read the same value the agent writes after each turn.
+    /// Safe to call only before the first turn; the primary REPL path uses it, sub-agents don't.
+    pub fn set_context_tokens(&mut self, handle: Arc<std::sync::atomic::AtomicU64>) {
+        self.last_context_tokens = handle;
     }
 
     /// Shared handle to the auto-refreshing skill cache. The REPL's `/skill <name>` dispatch reads
@@ -391,12 +429,12 @@ impl Agent {
         // Keep the shared session ID in sync so scratchpad tools can access it.
         *self.shared_session_id.write().await = Some(sid);
 
-        // Auto-compact if the last turn's input tokens exceeded the threshold fraction of the
+        // Auto-compact if the last turn's context occupancy exceeded the threshold fraction of the
         // context window. This runs between turns (not mid-tool-loop) so the stable base_messages
         // invariant is preserved.
         if self.options.auto_compact && self.options.context_window > 0 {
             let last_tokens = self
-                .last_input_tokens
+                .last_context_tokens
                 .load(std::sync::atomic::Ordering::Relaxed);
             let threshold = self.options.context_window * AUTO_COMPACT_THRESHOLD_PERCENT / 100;
             if last_tokens > threshold && messages.len() > 1 {
@@ -539,8 +577,19 @@ impl Agent {
                     }
                 };
 
-                self.last_input_tokens
-                    .store(usage.input_tokens, std::sync::atomic::Ordering::Relaxed);
+                // Total of all tiers including output = everything in context as of this exchange,
+                // which is what the next request re-sends (minus the new user prompt). Summing the
+                // input tiers + output (Claude reports cached tokens in separate fields) is the
+                // true occupancy and what the `/status` gauge and auto-compact
+                // threshold read.
+                self.last_context_tokens.store(
+                    usage
+                        .input_tokens
+                        .saturating_add(usage.cache_creation_input_tokens)
+                        .saturating_add(usage.cache_read_input_tokens)
+                        .saturating_add(usage.output_tokens),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 turn_usage.input_tokens =
                     turn_usage.input_tokens.saturating_add(usage.input_tokens);
                 turn_usage.output_tokens =
@@ -661,6 +710,19 @@ impl Agent {
             // inside the inner loop) so a single `/status` reading reflects whole turns, not
             // partial state.
             self.session_stats.record_turn(&turn_usage);
+            // Persist the cumulative counters onto the session row so `/status` survives resume.
+            // Best-effort: a DB hiccup must not fail the turn. Only the primary agent writes; a
+            // sub-agent shares the parent's `SessionStats` (rolling its usage into the parent's
+            // totals) but owns a child session row, so letting it write would stamp the
+            // parent-inclusive totals onto the child.
+            if self.persist_session_stats
+                && let Err(error) = self
+                    .session_manager
+                    .save_session_stats(sid, &self.session_stats.snapshot())
+                    .await
+            {
+                tracing::warn!("failed to persist session stats: {}", error);
+            }
             self.frontend
                 .emit(FrontendEvent::TokenUsage(turn_usage))
                 .await;
@@ -823,7 +885,11 @@ impl Agent {
                     stop_reason = reason;
                 }
                 StreamEvent::Usage(usage) => {
-                    token_usage = usage;
+                    // Merge rather than overwrite: Anthropic streams the input/cache tiers on
+                    // `message_start` and the output on `message_delta`, so last-event-wins would
+                    // drop the input count. The non-zero merge keeps each tier from whichever event
+                    // reported it.
+                    token_usage.merge_stream(&usage);
                 }
                 StreamEvent::Notice(notice) => {
                     // Forward provider-side advisories (image redaction, etc.) to the frontend
@@ -1213,6 +1279,14 @@ impl Agent {
         // read-tracker so `edit_file` re-reads rather than trusting a pre-compaction read (also
         // bounds its growth).
         self.tool_registry.clear_read_tracker().await;
+
+        // Seed the live context gauge with an estimate of the compacted working set so `/status`
+        // (and the prompt indicator) immediately reflect the smaller size; the next real turn
+        // overwrites it with the exact provider-reported total.
+        self.last_context_tokens.store(
+            crate::tokens::estimate_messages(messages.as_slice()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         Ok(())
     }

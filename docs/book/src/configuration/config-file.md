@@ -264,6 +264,12 @@ Whether to show the current working directory in the interactive prompt.
 
 Default: `true`
 
+### `display.show_context_in_prompt`
+
+Whether to show a live context-window gauge in the interactive prompt, e.g. `128.4k/1.0M 13%` (tokens in context / model window / percent used). The figure comes from the most recent turn's reported usage (and an estimate right after `/compact` or on resume), the same value `/status` shows on its `Context:` line. Hidden until the first turn produces a measurement.
+
+Default: `false`
+
 ### `display.newline_before_prompt`
 
 Whether to add a blank line before the prompt after each agent response.

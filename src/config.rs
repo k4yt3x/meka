@@ -224,6 +224,7 @@ pub struct DisplayConfig {
     pub show_session_id_on_create: Option<bool>,
     pub show_session_id_on_exit: Option<bool>,
     pub show_path_in_prompt: Option<bool>,
+    pub show_context_in_prompt: Option<bool>,
     pub show_token_usage: Option<bool>,
     pub render_mode: Option<RenderMode>,
     /// Style applied to the REPL input buffer so submitted prompts stand out in scrollback. Parsed
@@ -505,6 +506,7 @@ pub struct ResolvedConfig {
     pub show_session_id_on_create: bool,
     pub show_session_id_on_exit: bool,
     pub show_path_in_prompt: bool,
+    pub show_context_in_prompt: bool,
     pub show_token_usage: bool,
     pub resume_show_recent: Option<usize>,
     pub web_client: WebClientConfig,
@@ -1431,6 +1433,7 @@ impl ResolvedConfig {
             show_token_usage: file_display.show_token_usage.unwrap_or(false),
             resume_show_recent: file_display.resume_show_recent,
             show_path_in_prompt: file_display.show_path_in_prompt.unwrap_or(true),
+            show_context_in_prompt: file_display.show_context_in_prompt.unwrap_or(false),
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
             sandbox_backend,

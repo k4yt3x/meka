@@ -674,19 +674,21 @@ pub fn render_hint(message: &str) {
     eprintln!("{}", message.with(Color::DarkGrey));
 }
 
-fn format_token_count(n: u64) -> String {
+pub(crate) fn format_token_count(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
-    } else {
+    } else if n < 1_000_000 {
         format!("{:.1}k", (n as f64) / 1_000.0)
+    } else {
+        format!("{:.1}M", (n as f64) / 1_000_000.0)
     }
 }
 
 /// Print a one-line per-turn token-usage summary to stderr in dark grey, preceded by a blank line
 /// so it visually separates from the agent's response. Format: `[in 12.3k / cache hit 96% / out
 /// 1.2k]`. The "in" column is the total of all three input-token tiers (live, cache-write,
-/// cache-read); the cache-hit % is `cache_read / total_in`. Numbers below 1k show as raw counts;
-/// otherwise as `Nk` with one decimal.
+/// cache-read); the cache-hit % is `cache_read / total_in`. Numbers below 1k show as raw counts,
+/// below 1M as `Nk`, and otherwise as `NM`, each with one decimal.
 pub fn render_token_usage(usage: &crate::provider::TokenUsage) {
     let total_in = usage
         .input_tokens
@@ -712,11 +714,29 @@ pub fn render_token_usage(usage: &crate::provider::TokenUsage) {
 
 /// Multi-line cumulative session report shown by the `/status` slash command. Goes to stderr
 /// (matches the rest of REPL UI feedback).
-pub fn render_session_status(snap: &crate::stats::SessionStatsSnapshot, message_count: usize) {
+pub fn render_session_status(
+    snap: &crate::stats::SessionStatsSnapshot,
+    message_count: usize,
+    context_tokens: u64,
+    context_window: u64,
+) {
     let total_in = snap.total_input_tokens();
     let header = "Session status".with(Color::Cyan);
     eprintln!("{}", header);
     eprintln!("  Turns:           {}", snap.turns);
+    // Live context occupancy: how full the window was on the last request. Distinct from the
+    // cumulative "Input tokens" total below, which sums every turn's usage for the whole session.
+    if context_window > 0 && context_tokens > 0 {
+        let pct = ((context_tokens as f64 / context_window as f64) * 100.0).round() as u64;
+        let remaining = context_window.saturating_sub(context_tokens);
+        eprintln!(
+            "  Context:         {} / {} ({}% used, {} left)",
+            format_token_count(context_tokens),
+            format_token_count(context_window),
+            pct,
+            format_token_count(remaining),
+        );
+    }
     eprintln!(
         "  Input tokens:    {}  (cache hit: {}%)",
         format_token_count(total_in),
@@ -1126,6 +1146,19 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_token_count_tiers() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_000), "1.0k");
+        assert_eq!(format_token_count(234_000), "234.0k");
+        assert_eq!(format_token_count(999_999), "1000.0k");
+        assert_eq!(format_token_count(1_000_000), "1.0M");
+        // A 1M-token model window renders compactly rather than as "1047.6k".
+        assert_eq!(format_token_count(1_047_576), "1.0M");
+        assert_eq!(format_token_count(2_300_000), "2.3M");
+    }
 
     #[test]
     fn test_builtin_primary_param_todo() {

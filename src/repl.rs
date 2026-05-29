@@ -46,16 +46,48 @@ struct MekaPrompt {
     /// the lock per prompt render is cheap (microseconds) and bounded; `/cd` is the only
     /// writer.
     cwd: crate::agent::SharedCwd,
+    /// Live context-window gauge, present only when `display.show_context_in_prompt` is set.
+    context: Option<ContextIndicator>,
+}
+
+/// Shared handle to the live context-token counter plus the model window, for the optional prompt
+/// gauge. The counter is the agent's `last_context_tokens` (updated after each turn / on compact).
+struct ContextIndicator {
+    tokens: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    window: u64,
+}
+
+impl ContextIndicator {
+    /// Format as `used/window pct%`, or `None` before the first turn (no measurement yet) or when
+    /// the window is unknown.
+    fn render(&self) -> Option<String> {
+        let tokens = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
+        if tokens == 0 || self.window == 0 {
+            return None;
+        }
+        let pct = ((tokens as f64 / self.window as f64) * 100.0).round() as u64;
+        Some(format!(
+            "{}/{} {}%",
+            crate::render::format_token_count(tokens),
+            crate::render::format_token_count(self.window),
+            pct
+        ))
+    }
 }
 
 impl Prompt for MekaPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        if self.show_path {
+        let mut left = if self.show_path {
             let path = crate::agent::cwd_snapshot(&self.cwd);
-            Cow::Owned(format!("meka {} ", shorten_path_with_tilde(&path)))
+            format!("meka {} ", shorten_path_with_tilde(&path))
         } else {
-            Cow::Borrowed("meka ")
+            "meka ".to_string()
+        };
+        if let Some(gauge) = self.context.as_ref().and_then(ContextIndicator::render) {
+            left.push_str(&gauge);
+            left.push(' ');
         }
+        Cow::Owned(left)
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -350,6 +382,7 @@ fn print_help() {
 pub fn run_repl(
     shared_permission: SharedPermission,
     show_path_in_prompt: bool,
+    context_indicator: Option<(std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>,
     input_style: nu_ansi_term::Style,
     initial_turn_pending: bool,
     sandbox_state: crate::sandbox::SandboxState,
@@ -383,6 +416,7 @@ pub fn run_repl(
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
         cwd: cwd.clone(),
+        context: context_indicator.map(|(tokens, window)| ContextIndicator { tokens, window }),
     };
 
     // If the caller queued a synthetic first turn (e.g. `--skill` or a bare positional `[PROMPT]`

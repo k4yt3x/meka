@@ -21,6 +21,21 @@ pub struct SessionStats {
 }
 
 impl SessionStats {
+    /// Rebuild the counters from a persisted snapshot, so a resumed session continues its lifetime
+    /// totals instead of restarting at zero.
+    pub fn from_snapshot(snapshot: &SessionStatsSnapshot) -> Self {
+        Self {
+            turns: AtomicU64::new(snapshot.turns),
+            input_tokens: AtomicU64::new(snapshot.input_tokens),
+            output_tokens: AtomicU64::new(snapshot.output_tokens),
+            cache_creation_input_tokens: AtomicU64::new(snapshot.cache_creation_input_tokens),
+            cache_read_input_tokens: AtomicU64::new(snapshot.cache_read_input_tokens),
+            redactions: AtomicU64::new(snapshot.redactions),
+            redacted_images: AtomicU64::new(snapshot.redacted_images),
+            redacted_bytes: AtomicU64::new(snapshot.redacted_bytes),
+        }
+    }
+
     /// Roll a successful turn's usage into the running totals.
     pub fn record_turn(&self, usage: &TokenUsage) {
         self.turns.fetch_add(1, Relaxed);
@@ -54,7 +69,7 @@ impl SessionStats {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionStatsSnapshot {
     pub turns: u64,
     pub input_tokens: u64,
@@ -124,6 +139,40 @@ mod tests {
         assert_eq!(snap.redactions, 2);
         assert_eq!(snap.redacted_images, 3);
         assert_eq!(snap.redacted_bytes, 6_000_000);
+    }
+
+    #[test]
+    fn from_snapshot_seeds_all_fields() {
+        // Resume rebuilds the live counters from the persisted snapshot.
+        let snapshot = SessionStatsSnapshot {
+            turns: 3,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 30,
+            cache_read_input_tokens: 40,
+            redactions: 1,
+            redacted_images: 2,
+            redacted_bytes: 1024,
+        };
+        let round = SessionStats::from_snapshot(&snapshot).snapshot();
+        assert_eq!(round.turns, 3);
+        assert_eq!(round.input_tokens, 10);
+        assert_eq!(round.output_tokens, 20);
+        assert_eq!(round.cache_creation_input_tokens, 30);
+        assert_eq!(round.cache_read_input_tokens, 40);
+        assert_eq!(round.redactions, 1);
+        assert_eq!(round.redacted_images, 2);
+        assert_eq!(round.redacted_bytes, 1024);
+        // A turn recorded after seeding accumulates on top of the seeded totals.
+        let seeded = SessionStats::from_snapshot(&snapshot);
+        seeded.record_turn(&TokenUsage {
+            input_tokens: 5,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        });
+        assert_eq!(seeded.snapshot().turns, 4);
+        assert_eq!(seeded.snapshot().input_tokens, 15);
     }
 
     #[test]

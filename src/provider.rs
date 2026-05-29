@@ -308,6 +308,29 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: u64,
 }
 
+impl TokenUsage {
+    /// Fold a streamed usage update into the running per-round total, taking each field from
+    /// `update` only when it is non-zero. Providers split usage across events: Anthropic reports
+    /// the input/cache tiers on `message_start` and the final `output_tokens` on
+    /// `message_delta` (the other fields absent, i.e. parsed as 0), while OpenAI/Codex send a
+    /// single usage event. The non-zero rule keeps the `message_start` input/cache values
+    /// instead of letting a later event that omits them clobber the count back to 0.
+    pub fn merge_stream(&mut self, update: &TokenUsage) {
+        if update.input_tokens > 0 {
+            self.input_tokens = update.input_tokens;
+        }
+        if update.output_tokens > 0 {
+            self.output_tokens = update.output_tokens;
+        }
+        if update.cache_creation_input_tokens > 0 {
+            self.cache_creation_input_tokens = update.cache_creation_input_tokens;
+        }
+        if update.cache_read_input_tokens > 0 {
+            self.cache_read_input_tokens = update.cache_read_input_tokens;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StopReason {
     EndTurn,
@@ -632,6 +655,47 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_token_usage_merge_stream_keeps_input_from_start_output_from_delta() {
+        // Anthropic streaming: `message_start` carries the input/cache tiers (output a
+        // placeholder), `message_delta` carries the final output with the input/cache
+        // fields absent (parsed as 0).
+        let mut usage = TokenUsage::default();
+        usage.merge_stream(&TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 1,
+            cache_creation_input_tokens: 200,
+            cache_read_input_tokens: 5000,
+        });
+        usage.merge_stream(&TokenUsage {
+            input_tokens: 0,
+            output_tokens: 250,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        });
+        assert_eq!(
+            usage.input_tokens, 1000,
+            "input retained from message_start"
+        );
+        assert_eq!(usage.cache_creation_input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 5000);
+        assert_eq!(usage.output_tokens, 250, "output taken from message_delta");
+    }
+
+    #[test]
+    fn test_token_usage_merge_stream_single_event_is_verbatim() {
+        // OpenAI/Codex emit a single usage event; merging from default keeps it as-is.
+        let mut usage = TokenUsage::default();
+        usage.merge_stream(&TokenUsage {
+            input_tokens: 800,
+            output_tokens: 120,
+            ..Default::default()
+        });
+        assert_eq!(usage.input_tokens, 800);
+        assert_eq!(usage.output_tokens, 120);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
 
     #[test]
     fn test_auth_credential_json_round_trip() {
