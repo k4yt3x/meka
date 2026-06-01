@@ -613,19 +613,43 @@ impl Agent {
                     user_saved = true;
                 }
 
-                // Defer the assistant-message save until we know whether this
-                // iteration ends in tool_use.  On tool_use the assistant + the
-                // following tool-results message are persisted in one transaction so a
-                // mid-write failure can't leave the conversation with an unmatched
-                // tool_use head.  On any other stop reason the assistant message stands
-                // alone and is saved on its own.  The in-memory append happens
-                // immediately so the provider sees the full state on the next iteration.
-                messages.append(assistant_message.clone());
-
                 if cancellation.is_cancelled() {
+                    // Interrupted mid-stream. Persist the partial assistant text so it survives
+                    // resume instead of being discarded, but drop any `tool_use` blocks first: no
+                    // tools run on an interrupt, so a persisted `tool_use` would be orphaned (no
+                    // matching `tool_result`) and the provider would reject the next request. Only
+                    // persist when text actually streamed; a partial with no text (interrupted
+                    // before any output, or mid-thinking) has nothing worth restoring.
+                    let partial = assistant_message.without_tool_use();
+                    if partial
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text { .. }))
+                    {
+                        messages.append(partial.clone());
+                        if let Err(error) = self
+                            .session_manager
+                            .save_events_atomic(sid, vec![crate::conversation::Event::Append(
+                                partial,
+                            )])
+                            .await
+                        {
+                            tracing::error!(
+                                "failed to persist interrupted partial assistant message: {}",
+                                error
+                            );
+                        }
+                    }
                     break 'turn Err(MekaError::Interrupted);
                 }
 
+                // Defer the assistant-message save until we know whether this iteration ends in
+                // tool_use. On tool_use the assistant + the following tool-results message are
+                // persisted in one transaction so a mid-write failure can't leave the conversation
+                // with an unmatched tool_use head. On any other stop reason the assistant message
+                // stands alone and is saved on its own. The in-memory append happens immediately so
+                // the provider sees the full state on the next iteration.
+                messages.append(assistant_message.clone());
                 let assistant_event = crate::conversation::Event::Append(assistant_message.clone());
 
                 match stop_reason {

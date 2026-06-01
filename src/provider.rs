@@ -194,6 +194,21 @@ impl Message {
             .join("")
     }
 
+    /// A copy of this message with every [`ContentBlock::ToolUse`] removed. Used when persisting a
+    /// turn that was interrupted before its tools ran: keeping the `tool_use` blocks would orphan
+    /// them (no matching `tool_result`) and the provider would reject the next request.
+    pub fn without_tool_use(&self) -> Message {
+        Message {
+            role: self.role.clone(),
+            content: self
+                .content
+                .iter()
+                .filter(|block| !matches!(block, ContentBlock::ToolUse { .. }))
+                .cloned()
+                .collect(),
+        }
+    }
+
     #[cfg(test)]
     pub fn tool_uses(&self) -> Vec<&ContentBlock> {
         self.content
@@ -720,6 +735,47 @@ mod tests {
         );
         // No images yields the same shape as `Message::user`.
         assert_eq!(Message::user_with_images("hi", vec![]).content.len(), 1);
+    }
+
+    #[test]
+    fn test_without_tool_use_keeps_text_and_thinking_drops_tool_use() {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "hmm".to_string(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "let me check".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+        };
+        let stripped = message.without_tool_use();
+        assert_eq!(stripped.role, Role::Assistant);
+        assert_eq!(stripped.content.len(), 2);
+        assert!(matches!(
+            &stripped.content[0],
+            ContentBlock::Thinking { .. }
+        ));
+        assert!(
+            matches!(&stripped.content[1], ContentBlock::Text { text } if text == "let me check")
+        );
+        // A tool-use-only message strips to empty content.
+        let only_tool = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_2".to_string(),
+                name: "x".to_string(),
+                input: serde_json::json!({}),
+            }],
+        };
+        assert!(only_tool.without_tool_use().content.is_empty());
     }
 
     #[test]

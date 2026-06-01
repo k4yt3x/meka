@@ -2186,6 +2186,206 @@ model = "claude-sonnet-4-5"
     );
 }
 
+/// Regression: a turn interrupted mid-stream must persist the partial assistant text so it survives
+/// resume. Previously the partial was appended only in memory and discarded on exit, so resume
+/// showed only the user prompt. Round 1 streams a partial answer then stalls in a `sleep`; the test
+/// fires `session/cancel` once the partial has streamed. Round 2 loads the session and asserts the
+/// replay carries the partial answer (and not the post-interrupt text, which never streamed).
+#[test]
+fn acp_interrupted_turn_persists_partial_assistant_text() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_dir = temp.path().join("meka");
+    let data_dir = temp.path().join("data").join("meka");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+
+    let config_toml = r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+"#;
+    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+
+    // A partial answer streams, then the turn stalls in a 5s sleep that races cancellation. The
+    // text after the sleep must never stream once cancel fires, and so must never be persisted.
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "partial answer before interrupt" },
+            { "kind": "sleep", "ms": 5000 },
+            { "kind": "text", "text": "TEXT-AFTER-INTERRUPT-MUST-NOT-PERSIST" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let script_path = temp.path().join("script.json");
+    std::fs::write(&script_path, script.to_string()).expect("write script.json");
+
+    // Round 1: prompt, wait for the partial to stream, fire cancel, capture sessionId, exit
+    // cleanly.
+    let session_id = {
+        let mut child = meka_acp()
+            .arg("acp")
+            .env("MEKA_CONFIG_DIR", &config_dir)
+            .env("MEKA_DATA_DIR", &data_dir)
+            .env("HOME", temp.path())
+            .env("MEKA_ACP_MOCK_PROVIDER", "1")
+            .env("MEKA_ACP_MOCK_PROVIDER_SCRIPT", &script_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn meka acp");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr_pipe = child.stderr.take().expect("stderr");
+        let mut reader = BufReader::new(stdout);
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut r = BufReader::new(stderr_pipe);
+            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
+            buf
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
+        )
+        .expect("initialize");
+        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+
+        let new_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": { "cwd": config_dir.clone(), "mcpServers": [] }
+        });
+        writeln!(stdin, "{}", new_req).expect("session/new");
+        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let sid = serde_json::from_str::<serde_json::Value>(
+            new_lines
+                .iter()
+                .find(|line| line.contains("\"id\":2"))
+                .expect("session/new response"),
+        )
+        .expect("parse")["result"]["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string();
+
+        let prompt_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": sid,
+                "prompt": [{ "type": "text", "text": "interrupt me mid-turn" }]
+            }
+        });
+        writeln!(stdin, "{}", prompt_req).expect("session/prompt");
+
+        // Wait until the partial answer has streamed so the agent has it buffered, then cancel.
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        let _ = read_until(&mut reader, start_deadline, |line| {
+            line.contains("partial answer before interrupt")
+        });
+        let cancel_notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": sid }
+        });
+        writeln!(stdin, "{}", cancel_notif).expect("cancel");
+
+        // The prompt should resolve (cancelled) well before the 5s sleep would finish.
+        let response_deadline = Instant::now() + Duration::from_secs(3);
+        let lines = read_until(&mut reader, response_deadline, |line| {
+            line.contains("\"id\":3")
+        });
+        let response: serde_json::Value = serde_json::from_str(
+            lines
+                .iter()
+                .find(|line| line.contains("\"id\":3"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no PromptResponse before deadline; cancel was likely starved.\nSTDERR:\n{}",
+                        stderr_handle.join().unwrap_or_default(),
+                    )
+                }),
+        )
+        .expect("parse PromptResponse");
+        assert_eq!(
+            response["result"]["stopReason"], "cancelled",
+            "prompt must resolve as cancelled; got: {}",
+            response,
+        );
+
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        sid
+    };
+
+    // Round 2: load the persisted session; the replay must carry the partial answer.
+    let mut child = meka_acp()
+        .arg("acp")
+        .env("MEKA_CONFIG_DIR", &config_dir)
+        .env("MEKA_DATA_DIR", &data_dir)
+        .env("HOME", temp.path())
+        .env("MEKA_ACP_MOCK_PROVIDER", "1")
+        .env("MEKA_ACP_MOCK_PROVIDER_SCRIPT", &script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn meka acp #2");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr_pipe = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut r = BufReader::new(stderr_pipe);
+        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
+        buf
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
+    )
+    .expect("initialize");
+    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+
+    let load_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/load",
+        "params": {
+            "sessionId": session_id,
+            "cwd": config_dir.clone(),
+            "mcpServers": []
+        }
+    });
+    writeln!(stdin, "{}", load_req).expect("session/load");
+    let load_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":4"));
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let replay = load_lines.join("");
+    assert!(
+        replay.contains("partial answer before interrupt"),
+        "session/load replay must carry the interrupted turn's partial answer; stream:\n{}\nSTDERR:\n{}",
+        replay,
+        stderr_handle.join().unwrap_or_default(),
+    );
+    assert!(
+        !replay.contains("TEXT-AFTER-INTERRUPT-MUST-NOT-PERSIST"),
+        "post-interrupt text must not be persisted; stream:\n{}",
+        replay,
+    );
+}
+
 /// when the client advertises both `fs.readTextFile` and `fs.writeTextFile`, `edit_file` delegates
 /// both halves and does not touch the local disk. Covers the previously-untested delegated
 /// read+write composition.

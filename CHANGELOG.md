@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Gate adaptive thinking / effort on the parsed Claude model version (`>= 4.6`), not a fixed allowlist.
 - REPL log warnings now appear during a turn instead of being buffered until the next prompt.
+- Interrupting a turn now persists the partial assistant text so it survives resume instead of being lost.
 
 ## [0.27.1] - 2026-05-29
 
