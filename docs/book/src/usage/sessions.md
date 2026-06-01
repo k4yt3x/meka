@@ -44,6 +44,7 @@ Only one meka instance can be attached to a session at a time. This prevents rac
 
 - If you try to resume a session that is locked by a running meka process, you will get an error.
 - If the locking process has exited (crashed or was killed), meka detects this and allows you to take over the lock.
+- Under ACP (`meka acp`), the lock is released as soon as the editor disconnects: closing the connection (stdin EOF) or sending SIGTERM/Ctrl-C makes `meka acp` exit, so the session can be reopened immediately.
 
 ## Storage Location
 

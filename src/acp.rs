@@ -30,10 +30,15 @@
 //! [`crate::frontend::PermissionForwardingFrontend`], so their permission prompts, fs delegates,
 //! and terminal delegates all flow through the parent session's editor UI.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use agent_client_protocol::{
-    Agent as AcpAgentRole, Client, ConnectionTo, Stdio,
+    Agent as AcpAgentRole, ByteStreams, Client, ConnectionTo,
     schema::{
         AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
@@ -55,8 +60,12 @@ use agent_client_protocol::{
 };
 use async_trait::async_trait;
 use base64::Engine;
+use futures::io::AsyncRead;
 use tokio::sync::Mutex;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{
+    compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt},
+    sync::CancellationToken,
+};
 
 use crate::{
     agent::{Agent, SharedCwd, resolve_against_cwd},
@@ -1357,7 +1366,134 @@ struct SessionRuntime {
     tool_registry: crate::tools::ToolRegistry,
 }
 
-/// Run meka as an ACP agent over stdio. Returns when the client disconnects (stdin EOF).
+/// `futures::io::AsyncRead` wrapper over the ACP stdin transport that fires `eof` (a
+/// `CancellationToken`) when the underlying reader reports end-of-stream. The
+/// `agent-client-protocol` connection future does not resolve on idle stdin EOF by itself (its
+/// outgoing actor stays alive while we hold `ConnectionTo` handles), so we observe EOF here and let
+/// `acp_run_until_disconnect` use it to shut down. Without this, a `meka acp` whose client
+/// disconnected lingers forever holding its session `flock`, and reopening that session later fails
+/// with `SessionLocked`.
+struct EofSignalingRead<R> {
+    inner: R,
+    eof: CancellationToken,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for EofSignalingRead<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        // A zero-length read into a non-empty buffer is end-of-stream: the client closed stdio (or
+        // the parent died, closing the pipe). Fire the shutdown token; `cancel()` is idempotent so
+        // repeated EOF reads are harmless.
+        if matches!(result, Poll::Ready(Ok(0))) && !buf.is_empty() {
+            this.eof.cancel();
+        }
+        result
+    }
+}
+
+/// Max time to wait for in-flight turns to unwind during ACP shutdown before abandoning them. They
+/// are abandoned safely regardless (the OS releases the session `flock` when the process exits),
+/// but the grace window lets a running turn reach its interrupt path and persist its partial output
+/// first.
+const ACP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `connect_with` `main_fn`: resolve (shutting the connection down) when the ACP client disconnects
+/// (stdin EOF, signalled via `stdin_eof`) or a termination signal arrives. Before returning it
+/// cancels every in-flight turn and waits briefly so a running turn can persist its partial output.
+/// The connection's spawned turns run inside the `background` future this return races against, so
+/// the drain must happen here, before we return and that future is dropped.
+async fn acp_run_until_disconnect(
+    state: Arc<ServerState>,
+    stdin_eof: CancellationToken,
+) -> std::result::Result<(), agent_client_protocol::Error> {
+    tokio::select! {
+        _ = stdin_eof.cancelled() => {
+            tracing::info!("ACP client disconnected (stdin EOF); shutting down");
+        }
+        _ = acp_shutdown_signal() => {
+            tracing::info!("received termination signal; shutting down ACP server");
+        }
+    }
+    drain_acp_sessions(&state).await;
+    if tokio::time::timeout(ACP_DRAIN_TIMEOUT, wait_for_sessions_idle(&state))
+        .await
+        .is_err()
+    {
+        tracing::warn!("ACP shutdown drain timed out; abandoning in-flight turn(s)");
+    }
+    Ok(())
+}
+
+/// Cancel every active session's in-flight turn. Mirrors `crate::server`'s drain. Clones each token
+/// out before any `await` so no lock guard is held across an await point.
+async fn drain_acp_sessions(state: &ServerState) {
+    let tokens: Vec<CancellationToken> = {
+        let sessions = state.sessions.read().await;
+        sessions
+            .values()
+            .map(|entry| {
+                entry
+                    .cancellation
+                    .read()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            })
+            .collect()
+    };
+    for token in tokens {
+        token.cancel();
+    }
+}
+
+/// Resolve once no session is running a turn. The prompt handler holds `entry.runtime`'s lock for
+/// the whole turn, so a successful `try_lock` on every session means all turns have unwound.
+async fn wait_for_sessions_idle(state: &ServerState) {
+    loop {
+        let all_idle = {
+            let sessions = state.sessions.read().await;
+            sessions
+                .values()
+                .all(|entry| entry.runtime.try_lock().is_ok())
+        };
+        if all_idle {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait for a cross-platform termination signal: SIGTERM or Ctrl-C on unix, Ctrl-C elsewhere.
+/// Mirrors `crate::server`'s `shutdown_signal`.
+async fn acp_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::debug!("failed to install SIGTERM handler ({error}); using Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Run meka as an ACP agent over stdio. Returns (and the process then exits) when the client
+/// disconnects (stdin EOF) or a termination signal arrives.
 pub async fn run_acp(
     config: ResolvedConfig,
     session_manager: SessionManager,
@@ -1418,6 +1554,17 @@ pub async fn run_acp(
         sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         transport_dead,
         vision,
+    });
+
+    // Observe stdin EOF so the connection shuts down when the client disconnects (or the parent
+    // dies). The connection future does not resolve on idle EOF by itself, so wrap the incoming
+    // side; `acp_run_until_disconnect` (the `connect_with` closure below) waits on this token.
+    // tokio stdio + `tokio_util::compat` provide the `futures::io` byte streams the transport wants
+    // without pulling in the `blocking` crate.
+    let stdin_eof = CancellationToken::new();
+    let transport = ByteStreams::new(tokio::io::stdout().compat_write(), EofSignalingRead {
+        inner: tokio::io::stdin().compat(),
+        eof: stdin_eof.clone(),
     });
 
     let acp_result = AcpAgentRole
@@ -1685,7 +1832,10 @@ pub async fn run_acp(
             },
             agent_client_protocol::on_receive_notification!(),
         )
-        .connect_to(Stdio::new())
+        .connect_with(transport, {
+            let state = Arc::clone(&state);
+            async move |_cx: ConnectionTo<Client>| acp_run_until_disconnect(state, stdin_eof).await
+        })
         .await;
 
     acp_result.map_err(|error| anyhow::anyhow!("ACP server error: {}", error))

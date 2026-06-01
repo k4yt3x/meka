@@ -990,6 +990,196 @@ model = "claude-sonnet-4-5"
     );
 }
 
+/// Poll `child.try_wait()` until the process exits or `timeout` elapses. Returns the exit status,
+/// or `None` on timeout (the caller decides whether that's a failure and is responsible for killing
+/// the child).
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Regression: `meka acp` must exit (releasing its session `flock`) when the client disconnects
+/// (stdin EOF), instead of lingering as an orphan that pins the lock. Run 1 takes the lock via
+/// `session/new` + a prompt, then drops stdin WITHOUT `session/close` or `kill`; the process must
+/// exit on its own. Run 2 then loads the same session from a fresh process and must succeed (not
+/// `SessionLocked`), proving run 1 released the lock by exiting.
+#[test]
+fn acp_exits_and_releases_lock_on_stdin_eof() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_dir = temp.path().join("meka");
+    let data_dir = temp.path().join("data").join("meka");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+
+    let config_toml = r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+"#;
+    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "done!" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let script_path = temp.path().join("script.json");
+    std::fs::write(&script_path, script.to_string()).expect("write script.json");
+
+    // Run 1: take the session lock, then disconnect by dropping stdin (no session/close, no kill).
+    let session_id = {
+        let mut child = meka_acp()
+            .arg("acp")
+            .env("MEKA_CONFIG_DIR", &config_dir)
+            .env("MEKA_DATA_DIR", &data_dir)
+            .env("HOME", temp.path())
+            .env("MEKA_ACP_MOCK_PROVIDER", "1")
+            .env("MEKA_ACP_MOCK_PROVIDER_SCRIPT", &script_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn meka acp");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr_pipe = child.stderr.take().expect("stderr");
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut r = BufReader::new(stderr_pipe);
+            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
+            buf
+        });
+        let mut reader = BufReader::new(stdout);
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
+        )
+        .expect("initialize");
+        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+
+        let new_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": { "cwd": config_dir.clone(), "mcpServers": [] }
+        });
+        writeln!(stdin, "{}", new_req).expect("session/new");
+        let new_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":2"));
+        let sid = serde_json::from_str::<serde_json::Value>(
+            new_lines
+                .iter()
+                .find(|line| line.contains("\"id\":2"))
+                .expect("session/new response"),
+        )
+        .expect("parse")["result"]["sessionId"]
+            .as_str()
+            .expect("sessionId")
+            .to_string();
+
+        // One prompt so the session lock is definitely held.
+        let prompt_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": "hello" }] }
+        });
+        writeln!(stdin, "{}", prompt_req).expect("session/prompt");
+        let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":3"));
+
+        // Drain remaining stdout on a thread so a shutdown-time write can't block the child, then
+        // disconnect by closing stdin. Crucially: NO `child.kill()` -- the process must exit
+        // itself.
+        let stdout_handle =
+            std::thread::spawn(move || std::io::copy(&mut reader, &mut std::io::sink()));
+        drop(stdin);
+
+        let exited = wait_for_exit(&mut child, Duration::from_secs(10)).is_some();
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = stdout_handle.join();
+        assert!(
+            exited,
+            "meka acp did not exit within 10s of stdin EOF (orphaned, lock still held).\nSTDERR:\n{}",
+            stderr_handle.join().unwrap_or_default(),
+        );
+        sid
+    };
+
+    // Run 2: a fresh process must be able to lock + load the same session.
+    let mut child = meka_acp()
+        .arg("acp")
+        .env("MEKA_CONFIG_DIR", &config_dir)
+        .env("MEKA_DATA_DIR", &data_dir)
+        .env("HOME", temp.path())
+        .env("MEKA_ACP_MOCK_PROVIDER", "1")
+        .env("MEKA_ACP_MOCK_PROVIDER_SCRIPT", &script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn meka acp #2");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr_pipe = child.stderr.take().expect("stderr");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut r = BufReader::new(stderr_pipe);
+        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
+        buf
+    });
+    let mut reader = BufReader::new(stdout);
+    let deadline = Instant::now() + Duration::from_secs(15);
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":1}}}}"#,
+    )
+    .expect("initialize");
+    let _ = read_until(&mut reader, deadline, |line| line.contains("\"id\":1"));
+
+    let load_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/load",
+        "params": { "sessionId": session_id, "cwd": config_dir.clone(), "mcpServers": [] }
+    });
+    writeln!(stdin, "{}", load_req).expect("session/load");
+    let load_lines = read_until(&mut reader, deadline, |line| line.contains("\"id\":4"));
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let response_line = load_lines
+        .iter()
+        .find(|line| line.contains("\"id\":4"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no session/load response; run 1 may not have released the lock.\nSTDERR:\n{}",
+                stderr_handle.join().unwrap_or_default(),
+            )
+        });
+    let response: serde_json::Value =
+        serde_json::from_str(response_line).expect("parse session/load response");
+    assert!(
+        response.get("error").is_none(),
+        "session/load must succeed after run 1 exited; got error (lock not released?): {}",
+        response,
+    );
+}
+
 /// a `session/list` with a `cwd` filter must only return sessions whose persisted cwd matches.
 #[test]
 fn acp_session_list_filters_by_cwd() {

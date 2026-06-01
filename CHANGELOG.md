@@ -9,14 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- ACP: richer editor integration: plans, embedded resource/image input, session titles, and tool-call detail.
+- ACP: richer editor integration: plans, embedded resource/image input, titles, tool-call detail.
 - `[providers.<name>]` gains `context_window`, `vision`, and `max_output_tokens` overrides.
 
 ### Fixed
 
-- Gate adaptive thinking / effort on the parsed Claude model version (`>= 4.6`), not a fixed allowlist.
+- Gate adaptive thinking / effort on the parsed Claude model version (`>= 4.6`), not an allowlist.
 - REPL log warnings now appear during a turn instead of being buffered until the next prompt.
-- Interrupting a turn now persists the partial assistant text so it survives resume instead of being lost.
+- Interrupting a turn now persists the partial assistant text so it survives resume.
+- `meka acp` exits on client disconnect (stdin EOF) or SIGTERM/Ctrl-C, releasing its session lock.
 
 ## [0.27.1] - 2026-05-29
 
