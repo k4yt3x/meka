@@ -2197,7 +2197,10 @@ fn decode_list_cursor(token: &str) -> Result<(String, String)> {
     Ok((cursor.updated_at, cursor.id))
 }
 
-fn truncate_preview(text: &str, max_chars: usize) -> String {
+/// Derive a short, single-line preview from a stored user message: strip the agent's `<context>`
+/// preamble, take the first line, and cap it at `max_chars` (appending `…` when cut). Used both for
+/// the `session/list` preview column and the ACP live session title.
+pub(crate) fn truncate_preview(text: &str, max_chars: usize) -> String {
     let text = strip_context_tags(text);
     let first_line = text.lines().next().unwrap_or("");
     if first_line.chars().count() <= max_chars {

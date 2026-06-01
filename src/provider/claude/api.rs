@@ -28,6 +28,8 @@ pub struct ClaudeApiProvider {
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
     thinking_override: AtomicI8,
+    /// Per-request output token cap from the profile; `None` keeps the built-in default.
+    max_output_tokens: Option<u64>,
     /// Per-session counters incremented when image-redaction events fire.
     session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
@@ -39,6 +41,7 @@ impl ClaudeApiProvider {
         base_url: Option<String>,
         thinking_enabled: bool,
         thinking_budget_tokens: u64,
+        max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
     ) -> Self {
         Self {
@@ -49,6 +52,7 @@ impl ClaudeApiProvider {
             thinking_enabled,
             thinking_budget_tokens,
             thinking_override: AtomicI8::new(-1),
+            max_output_tokens,
             session_stats,
         }
     }
@@ -86,6 +90,7 @@ impl ClaudeApiProvider {
             self.is_thinking_enabled(),
             &self.model,
             self.thinking_budget_tokens,
+            self.max_output_tokens,
         );
 
         body.insert("stream".to_string(), serde_json::json!(stream));
@@ -233,6 +238,7 @@ mod tests {
             None,
             false,
             10000,
+            None,
             None,
         )
     }

@@ -873,6 +873,16 @@ pub fn render_message_history(messages: &[crate::provider::Message], opts: &Hist
                         emitted_any = true;
                     }
                 },
+                // Input images (from an ACP client) have no terminal rendering; show a marker so a
+                // replayed/exported transcript notes the attachment instead of dropping it
+                // silently.
+                ContentBlock::Image { .. } => {
+                    if spacing.before_text() {
+                        eprintln!();
+                    }
+                    eprintln!("[image]");
+                    emitted_any = true;
+                }
                 ContentBlock::Thinking { thinking, .. } => {
                     if opts.show_thinking && !thinking.trim().is_empty() {
                         if spacing.before_thinking() {

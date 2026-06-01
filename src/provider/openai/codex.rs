@@ -59,6 +59,8 @@ pub struct OpenAiCodexProvider {
     /// `low` / `medium` / `high` for reasoning models (gpt-5, o-series). Forwarded as
     /// `reasoning.effort` in the request body. `None` skips the reasoning block entirely.
     reasoning_effort: Option<String>,
+    /// Per-request output token cap from the profile; `None` leaves the Responses API default.
+    max_output_tokens: Option<u64>,
     user_agent: String,
 }
 
@@ -73,6 +75,7 @@ impl OpenAiCodexProvider {
         token_store: Option<Arc<TokenStore>>,
         credential_key: String,
         reasoning_effort: Option<String>,
+        max_output_tokens: Option<u64>,
     ) -> Result<Self> {
         // chatgpt.com is fronted by Cloudflare; enabling the cookie jar lets bot-clearance cookies
         // (e.g. `__cf_bm`) persist across requests.
@@ -96,6 +99,7 @@ impl OpenAiCodexProvider {
             token_store,
             credential_key,
             reasoning_effort,
+            max_output_tokens,
             user_agent: format!(
                 "meka/{} ({}; {})",
                 env!("CARGO_PKG_VERSION"),
@@ -332,6 +336,7 @@ impl Provider for OpenAiCodexProvider {
             messages,
             tools,
             self.reasoning_effort.as_deref(),
+            self.max_output_tokens,
             true,
         );
 
@@ -384,6 +389,7 @@ mod tests {
             None,
             "test".to_string(),
             Some("high".to_string()),
+            None,
         )
         .expect("provider")
     }
@@ -413,6 +419,7 @@ mod tests {
             None,
             "test".to_string(),
             None,
+            None,
         )
         .expect("provider");
         assert_eq!(
@@ -431,6 +438,7 @@ mod tests {
             None,
             None,
             "test".to_string(),
+            None,
             None,
         )
         .expect("provider");
@@ -462,6 +470,7 @@ mod tests {
             None,
             "test".to_string(),
             None,
+            None,
         )
         .expect("provider");
         let result = provider.ensure_valid_credential().await;
@@ -484,6 +493,7 @@ mod tests {
             None,
             None,
             "test".to_string(),
+            None,
             None,
         )
         .expect("provider");

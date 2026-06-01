@@ -31,6 +31,7 @@ pub(super) fn build_request_body(
     messages: &[Message],
     tools: &[ToolDefinition],
     reasoning_effort: Option<&str>,
+    max_output_tokens: Option<u64>,
     stream: bool,
 ) -> serde_json::Value {
     let mut input = Vec::with_capacity(messages.len());
@@ -64,6 +65,10 @@ pub(super) fn build_request_body(
         body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
     }
 
+    if let Some(max_output) = max_output_tokens {
+        body["max_output_tokens"] = serde_json::json!(max_output);
+    }
+
     body
 }
 
@@ -93,22 +98,32 @@ fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value 
                 "type": "input_text",
                 "text": text,
             }),
-            ToolResultContent::Image { source } => serde_json::json!({
-                "type": "input_image",
-                "image_url": format!("data:{};base64,{}", source.media_type, source.data),
-                "detail": "auto",
-            }),
+            ToolResultContent::Image { source } => input_image_part(source),
         })
         .collect();
     serde_json::Value::Array(parts)
 }
 
+/// Build a Responses API `input_image` content part from an image source. Shared by the tool-result
+/// and user-message encoders.
+fn input_image_part(source: &crate::provider::ImageSource) -> serde_json::Value {
+    serde_json::json!({
+        "type": "input_image",
+        "image_url": super::super::data_url(source),
+        "detail": "auto",
+    })
+}
+
 fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
     let mut text_parts: Vec<&str> = Vec::new();
+    let mut image_parts: Vec<serde_json::Value> = Vec::new();
 
     for block in &message.content {
         match block {
             ContentBlock::Text { text } => text_parts.push(text),
+            // Responses takes `input_image` content parts on the user message. No model gate;
+            // non-vision models return a clear error.
+            ContentBlock::Image { source } => image_parts.push(input_image_part(source)),
             ContentBlock::ToolResult {
                 tool_use_id,
                 content,
@@ -126,14 +141,19 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
         }
     }
 
+    let mut content_parts: Vec<serde_json::Value> = Vec::new();
     if !text_parts.is_empty() {
+        content_parts.push(serde_json::json!({
+            "type": "input_text",
+            "text": text_parts.join("\n"),
+        }));
+    }
+    content_parts.extend(image_parts);
+    if !content_parts.is_empty() {
         input.push(serde_json::json!({
             "type": "message",
             "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": text_parts.join("\n"),
-            }],
+            "content": content_parts,
         }));
     }
 }
@@ -451,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_request_body_minimal() {
-        let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, true);
+        let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["stream"], true);
         assert_eq!(body["tool_choice"], "auto");
@@ -470,6 +490,7 @@ mod tests {
             &[Message::user("hi")],
             &[],
             None,
+            None,
             true,
         );
         assert_eq!(body["instructions"], "be helpful");
@@ -477,7 +498,15 @@ mod tests {
 
     #[test]
     fn test_request_body_user_message_uses_input_text() {
-        let body = build_request_body("gpt-5", "", &[Message::user("hello")], &[], None, true);
+        let body = build_request_body(
+            "gpt-5",
+            "",
+            &[Message::user("hello")],
+            &[],
+            None,
+            None,
+            true,
+        );
         let input = body["input"].as_array().expect("input array");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
@@ -493,7 +522,7 @@ mod tests {
             Message::assistant_text("b"),
             Message::user("c"),
         ];
-        let body = build_request_body("gpt-5", "", &messages, &[], None, true);
+        let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
         let input = body["input"].as_array().expect("input array");
         assert_eq!(input.len(), 3);
         assert_eq!(input[1]["role"], "assistant");
@@ -525,7 +554,7 @@ mod tests {
             },
         ];
 
-        let body = build_request_body("gpt-5", "", &messages, &[], None, true);
+        let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
         let input = body["input"].as_array().expect("input array");
 
         // [0] user message, [1] function_call, [2] function_call_output
@@ -547,7 +576,7 @@ mod tests {
             "A demo tool",
             serde_json::json!({"type": "object", "properties": {}}),
         )];
-        let body = build_request_body("gpt-5", "", &[], &tools, None, true);
+        let body = build_request_body("gpt-5", "", &[], &tools, None, None, true);
         let tools_arr = body["tools"].as_array().expect("tools");
         assert_eq!(tools_arr[0]["type"], "function");
         // Top-level `name` / `description` / `parameters` (NOT wrapped under a `function` object
@@ -566,6 +595,7 @@ mod tests {
             &[Message::user("think hard")],
             &[],
             Some("high"),
+            None,
             true,
         );
         assert_eq!(body["reasoning"]["effort"], "high");
@@ -576,8 +606,44 @@ mod tests {
     }
 
     #[test]
+    fn test_request_body_user_image_emits_input_image() {
+        let message = Message::user_with_images("describe", vec![crate::provider::ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "QUJD".to_string(),
+        }]);
+        let body = build_request_body("gpt-5", "", &[message], &[], None, None, true);
+        let input = body["input"].as_array().expect("input array");
+        let content = input[0]["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "describe");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn test_request_body_sets_max_output_tokens_when_overridden() {
+        let body = build_request_body(
+            "gpt-5",
+            "",
+            &[Message::user("hi")],
+            &[],
+            None,
+            Some(40_000),
+            true,
+        );
+        assert_eq!(body["max_output_tokens"], 40_000);
+    }
+
+    #[test]
+    fn test_request_body_omits_max_output_tokens_when_unset() {
+        let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
     fn test_request_body_omits_reasoning_when_effort_unset() {
-        let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, true);
+        let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
         assert!(body.get("reasoning").is_none());
         assert!(body.get("include").is_none());
     }
@@ -596,7 +662,7 @@ mod tests {
                 is_error: false,
             }],
         }];
-        let body = build_request_body("gpt-5", "", &messages, &[], None, true);
+        let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
         let input = body["input"].as_array().expect("input array");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "function_call_output");
@@ -959,7 +1025,7 @@ mod tests {
                 is_error: false,
             }],
         });
-        let body = build_request_body("gpt-5", "", &messages, &[], None, true);
+        let body = build_request_body("gpt-5", "", &messages, &[], None, None, true);
         let input = body["input"].as_array().expect("input array");
         let output_item = input
             .iter()

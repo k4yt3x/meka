@@ -170,6 +170,22 @@ pub(crate) fn prepare_image_payload(
     }
 }
 
+/// Normalize raw image bytes into a base64 [`ImageSource`] (byte cap + format conversion via
+/// [`prepare_image_payload`]). Used for *input* images (e.g. an ACP client's @-mention or pasted
+/// screenshot), parallel to [`build_image_tool_output`] for tool results.
+pub(crate) fn prepare_image_source(
+    handling: ImageHandling,
+    bytes: &[u8],
+) -> Result<ImageSource, String> {
+    let (media_type, payload) = prepare_image_payload(handling, bytes)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+    Ok(ImageSource {
+        source_type: "base64".to_string(),
+        media_type: media_type.to_string(),
+        data: encoded,
+    })
+}
+
 /// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
 /// pre-computed classification. Wraps `prepare_image_payload` so error paths become a text
 /// `ToolOutput` with `is_error: true`. Shared by `fetch_url`, `read_file`, and `render_image`.
@@ -178,27 +194,19 @@ pub(crate) fn build_image_tool_output(
     handling: ImageHandling,
     bytes: &[u8],
 ) -> ToolOutput {
-    let (media_type, payload) = match prepare_image_payload(handling, bytes) {
-        Ok(pair) => pair,
+    let source = match prepare_image_source(handling, bytes) {
+        Ok(source) => source,
         Err(message) => {
             return ToolOutput::text(format!("Error: {}: {}", marker, message), true);
         }
     };
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
 
     ToolOutput {
         content: vec![
             ToolResultContent::Text {
                 text: format!("[{}]", marker),
             },
-            ToolResultContent::Image {
-                source: ImageSource {
-                    source_type: "base64".to_string(),
-                    media_type: media_type.to_string(),
-                    data: encoded,
-                },
-            },
+            ToolResultContent::Image { source },
         ],
         is_error: false,
         scratchpad_hint: None,

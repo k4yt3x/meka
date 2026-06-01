@@ -518,6 +518,45 @@ mod tests {
     }
 
     #[test]
+    fn test_message_log_sanitize_orphans_drops_truncated_multi_tool_use_tail() {
+        // Reproduces the real corruption shape: a model response truncated at `max_tokens` while
+        // emitting tools, persisted as a trailing assistant message with leading text plus several
+        // `tool_use` blocks and no following `tool_result`. Anthropic rejects this on the next turn
+        // ("tool_use ids were found without tool_result blocks"); sanitize must drop the whole
+        // message regardless of the leading text or the number of tool_use blocks.
+        let mut log = Conversation::new();
+        log.append(Message::user("read the diff and explain it"));
+        log.append(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll check the uncommitted changes.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "u1".to_string(),
+                    name: "execute_command".to_string(),
+                    input: serde_json::json!({"command": "git diff"}),
+                },
+                ContentBlock::ToolUse {
+                    id: "u2".to_string(),
+                    name: "scratchpad_read".to_string(),
+                    input: serde_json::json!({"name": "tool_1_output"}),
+                },
+            ],
+        });
+
+        let dropped = log.sanitize_orphans();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log.as_slice()[0].text_content(),
+            "read the diff and explain it"
+        );
+        // Idempotent: a second pass on the now-clean log is a no-op.
+        assert!(log.sanitize_orphans().is_empty());
+    }
+
+    #[test]
     fn test_message_log_sanitize_orphans_preserves_matched_tool_use() {
         let mut log = Conversation::new();
         log.append(Message::user("ask"));

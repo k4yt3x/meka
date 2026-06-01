@@ -60,6 +60,8 @@ pub struct ClaudeOAuthProvider {
     /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
     /// header.
     redact_thinking: bool,
+    /// Per-request output token cap from the profile; `None` keeps the built-in default.
+    max_output_tokens: Option<u64>,
     /// Per-session counters incremented when image-redaction events fire.
     session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
@@ -79,6 +81,7 @@ impl ClaudeOAuthProvider {
         device_id: String,
         effort: String,
         redact_thinking: bool,
+        max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
     ) -> Self {
         Self {
@@ -98,6 +101,7 @@ impl ClaudeOAuthProvider {
             thinking_override: AtomicI8::new(-1),
             effort,
             redact_thinking,
+            max_output_tokens,
             session_stats,
         }
     }
@@ -357,6 +361,7 @@ impl ClaudeOAuthProvider {
             self.is_thinking_enabled(),
             &self.model,
             self.thinking_budget_tokens,
+            self.max_output_tokens,
         );
 
         // Mirrors `getAPIContextManagement` (`compact/apiMicrocompact.ts:64-92`) for the
@@ -549,6 +554,7 @@ mod tests {
             "a".repeat(64),
             "high".to_string(),
             false,
+            None,
             None,
         )
     }
@@ -1084,6 +1090,7 @@ mod tests {
             "a".repeat(64),
             effort.to_string(),
             redact_thinking,
+            None,
             None,
         )
     }
@@ -2525,6 +2532,7 @@ mod tests {
             "a".repeat(64),
             "high".to_string(),
             false,
+            None,
             None,
         ));
 

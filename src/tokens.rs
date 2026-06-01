@@ -34,6 +34,7 @@ pub fn estimate_message(message: &Message) -> u64 {
     for block in &message.content {
         let block_tokens = match block {
             ContentBlock::Text { text } => estimate_text(text),
+            ContentBlock::Image { .. } => IMAGE_TOKENS,
             ContentBlock::Thinking { thinking, .. } => estimate_text(thinking),
             // Tool-call args are serialized JSON on the wire; count the name plus the compact JSON.
             ContentBlock::ToolUse { name, input, .. } => {
@@ -116,6 +117,20 @@ mod tests {
         let json_tokens = estimate_text(&serde_json::json!({"path": "a"}).to_string());
         let expected = MESSAGE_OVERHEAD_TOKENS + 2 + 1 + json_tokens;
         assert_eq!(estimate_message(&message), expected);
+    }
+
+    #[test]
+    fn estimate_message_charges_flat_for_input_images() {
+        let message = Message::user_with_images("look", vec![ImageSource {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: "x".repeat(100_000), // payload length must NOT inflate the estimate
+        }]);
+        // overhead + text("look" = 4 bytes -> 1) + flat image cost.
+        assert_eq!(
+            estimate_message(&message),
+            MESSAGE_OVERHEAD_TOKENS + 1 + IMAGE_TOKENS
+        );
     }
 
     #[test]

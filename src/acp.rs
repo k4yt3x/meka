@@ -37,21 +37,24 @@ use agent_client_protocol::{
     schema::{
         AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
-        ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff, EnvVariable,
-        Implementation, InitializeRequest, InitializeResponse, KillTerminalRequest,
-        ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-        NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
-        PromptCapabilities, PromptRequest, PromptResponse, ReadTextFileRequest,
-        ReleaseTerminalRequest, RequestPermissionOutcome, RequestPermissionRequest,
-        ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities,
-        SessionId, SessionInfo, SessionListCapabilities, SessionMode, SessionModeId,
-        SessionModeState, SessionNotification, SessionResumeCapabilities, SessionUpdate,
-        SetSessionModeRequest, SetSessionModeResponse, StopReason, TerminalOutputRequest, ToolCall,
-        ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-        ToolKind, UnstructuredCommandInput, WaitForTerminalExitRequest, WriteTextFileRequest,
+        ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
+        EmbeddedResource, EmbeddedResourceResource, EnvVariable, ImageContent, Implementation,
+        InitializeRequest, InitializeResponse, KillTerminalRequest, ListSessionsRequest,
+        ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+        NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+        PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse,
+        ReadTextFileRequest, ReleaseTerminalRequest, RequestPermissionOutcome,
+        RequestPermissionRequest, ResumeSessionRequest, ResumeSessionResponse, SessionCapabilities,
+        SessionCloseCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
+        SessionListCapabilities, SessionMode, SessionModeId, SessionModeState, SessionNotification,
+        SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
+        StopReason, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation,
+        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
+        WaitForTerminalExitRequest, WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
+use base64::Engine;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -69,6 +72,7 @@ use crate::{
     provider::{AuthCredential, ContentBlock as MekaContentBlock, Role, ToolResultContent},
     session::SessionManager,
     skills::SkillCache,
+    tools::todo::{TodoItem, TodoStatus},
 };
 
 /// Build a JSON-RPC `InvalidParams` error (`-32602`) with a free-form human-readable message in the
@@ -240,14 +244,15 @@ impl Frontend for AcpFrontend {
                 id,
                 name,
                 input,
-                // `display_summary` is REPL-facing chrome; ACP clients render their own tool-call
-                // title from `raw_input` and `locations`.
-                display_summary: _,
+                display_summary,
             } => {
                 // No separate `pending` state in the agent loop, so the in-progress emit is the
-                // first one the client sees.
+                // first one the client sees. The title carries the resolved primary argument (the
+                // command, file path, URL, ...) so editors show what's actually running instead of
+                // a bare tool name; `raw_input` still carries the full argument object.
                 let locations = tool_locations(&name, &input, &self.cwd);
-                let call = ToolCall::new(id, name.clone())
+                let title = tool_call_title(&name, display_summary.as_deref());
+                let call = ToolCall::new(id, title)
                     .kind(tool_kind_for(&name))
                     .status(ToolCallStatus::InProgress)
                     .locations(locations)
@@ -256,6 +261,7 @@ impl Frontend for AcpFrontend {
             }
             FrontendEvent::ToolCallCompleted {
                 id,
+                name,
                 is_error,
                 content,
                 metadata,
@@ -265,10 +271,15 @@ impl Frontend for AcpFrontend {
                 } else {
                     ToolCallStatus::Completed
                 };
-                let acp_content = build_completion_content(&content, metadata);
-                let fields = ToolCallUpdateFields::new()
+                let acp_content = build_completion_content(&name, &content, metadata);
+                let mut fields = ToolCallUpdateFields::new()
                     .status(status)
                     .content(acp_content);
+                // Surface the structured tool output too, so clients (e.g. Zed's tool-call detail
+                // view) can introspect the result beyond the rendered `content` blocks.
+                if let Ok(raw) = serde_json::to_value(&content) {
+                    fields = fields.raw_output(raw);
+                }
                 SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id, fields))
             }
             FrontendEvent::Notice(notice) => {
@@ -301,7 +312,14 @@ impl Frontend for AcpFrontend {
                 );
                 return;
             }
-            // REPL-specific signage (todos, token usage, lifecycle).
+            FrontendEvent::TodoListUpdated { items, .. } => {
+                // The `todo` tool's list maps onto ACP's plan panel. The REPL-only `title` has no
+                // `Plan` analogue and is dropped. Note: the agent loop suppresses emission of an
+                // emptied list (`agent.rs`), so a cleared plan is not pushed - parity with the
+                // REPL.
+                SessionUpdate::Plan(Plan::new(todo_items_to_plan(&items)))
+            }
+            // REPL-specific signage (token usage, lifecycle).
             _ => return,
         };
 
@@ -564,6 +582,121 @@ fn tool_kind_for(name: &str) -> ToolKind {
     }
 }
 
+/// Build the human-readable `title` for a tool call from the resolved primary argument
+/// (`display_summary`: the command for `execute_command`, the path for `read_file`, the URL for
+/// `fetch_url`, ...). Mirrors claude-agent-acp: editors should show what's running, not the bare
+/// tool name. `raw_input` still carries the full argument object for clients that want it.
+fn tool_call_title(name: &str, display_summary: Option<&str>) -> String {
+    let arg = display_summary.map(str::trim).filter(|s| !s.is_empty());
+    let raw = match (name, arg) {
+        ("execute_command", Some(command)) => command.to_string(),
+        ("read_file", Some(path)) => format!("Read {path}"),
+        ("edit_file", Some(path)) => format!("Edit {path}"),
+        ("write_file", Some(path)) => format!("Write {path}"),
+        ("find_files", Some(pattern)) => format!("Find {pattern}"),
+        ("search_contents", Some(pattern)) => format!("Search {pattern}"),
+        ("fetch_url", Some(url)) => format!("Fetch {url}"),
+        ("web_search", Some(query)) => format!("Web search: {query}"),
+        ("spawn_agent", Some(task)) => format!("Sub-agent: {task}"),
+        // Any other built-in or MCP (`mcp__server__tool`) tool: show its primary argument when one
+        // was resolved (via the tool's JSON Schema), else fall back to the bare tool name.
+        (other, Some(argument)) => format!("{other}: {argument}"),
+        (other, None) => other.to_string(),
+    };
+    sanitize_title(&raw)
+}
+
+/// Collapse internal whitespace (so a multi-line command becomes a one-line title) and cap the
+/// length so an editor never gets an unwieldy title. Mirrors claude-agent-acp's `sanitizeTitle`.
+fn sanitize_title(text: &str) -> String {
+    const MAX_TITLE_CHARS: usize = 256;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_TITLE_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(MAX_TITLE_CHARS - 1).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Convert meka's `todo` tool list into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. meka's
+/// `Cancelled` status has no ACP analogue, so it maps to `Completed` ("no longer active") to keep
+/// the entry count stable against the model's own todo list. meka tracks no per-item priority, so
+/// every entry is reported as `Medium`.
+fn todo_items_to_plan(items: &[TodoItem]) -> Vec<PlanEntry> {
+    items
+        .iter()
+        .map(|item| {
+            let status = match item.status {
+                TodoStatus::Pending => PlanEntryStatus::Pending,
+                TodoStatus::InProgress => PlanEntryStatus::InProgress,
+                TodoStatus::Completed | TodoStatus::Cancelled => PlanEntryStatus::Completed,
+            };
+            PlanEntry::new(item.text.clone(), PlanEntryPriority::Medium, status)
+        })
+        .collect()
+}
+
+/// Append one prompt content block to `prompt_text`, inserting a newline separator between blocks.
+fn push_prompt_block(prompt_text: &mut String, block: &str) {
+    if !prompt_text.is_empty() {
+        prompt_text.push('\n');
+    }
+    prompt_text.push_str(block);
+}
+
+/// Append a ` mime="..."` attribute to a resource/resource_link tag when one is present.
+fn push_mime_attr(tag: &mut String, mime: &Option<String>) {
+    if let Some(mime) = mime {
+        tag.push_str(&format!(" mime=\"{}\"", mime));
+    }
+}
+
+/// Render an ACP embedded resource (an @-mention's inlined contents) as a `<resource>` tag for the
+/// prompt body. Text resources inline their contents; binary (blob) resources emit a self-closing
+/// marker without the (potentially huge) payload, so the model still learns the reference exists.
+///
+/// A distinct `<resource>` tag (not `<context>`) is deliberate: the stored user message is wrapped
+/// by the agent's own `<context>...</context>` preamble, and [`crate::session::strip_context_tags`]
+/// keys on that first `</context>`. A `<resource>` tag therefore round-trips through history replay
+/// exactly like `<resource_link>` does.
+fn format_embedded_resource(embedded: &EmbeddedResource) -> String {
+    match &embedded.resource {
+        EmbeddedResourceResource::TextResourceContents(text) => {
+            let mut tag = format!("<resource uri=\"{}\"", text.uri);
+            push_mime_attr(&mut tag, &text.mime_type);
+            tag.push('>');
+            tag.push_str(&text.text);
+            tag.push_str("</resource>");
+            tag
+        }
+        EmbeddedResourceResource::BlobResourceContents(blob) => {
+            let mut tag = format!("<resource uri=\"{}\"", blob.uri);
+            push_mime_attr(&mut tag, &blob.mime_type);
+            tag.push_str(" encoding=\"base64\"/>");
+            tag
+        }
+        // `EmbeddedResourceResource` is `#[non_exhaustive]`; a future variant we can't introspect
+        // still gets a bare marker so the prompt stays well-formed.
+        _ => "<resource/>".to_string(),
+    }
+}
+
+/// Decode an ACP image content block into meka's internal [`crate::provider::ImageSource`],
+/// normalizing through the shared image pipeline: base64-decode the payload, classify the format
+/// (by the declared MIME type, falling back to the magic bytes), then enforce the size cap and
+/// convert unsupported formats to PNG. Returns a human-readable message on failure.
+fn decode_acp_image(image: &ImageContent) -> Result<crate::provider::ImageSource, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data.as_bytes())
+        .map_err(|error| format!("base64 decode failed: {}", error))?;
+    let handling = match crate::image::classify_content_type(&image.mime_type) {
+        crate::image::ImageHandling::Unsupported => crate::image::classify_bytes(&bytes),
+        handling => handling,
+    };
+    crate::image::prepare_image_source(handling, &bytes)
+}
+
 /// Compute the `locations` entries for a tool call. For tools whose primary argument is a path,
 /// resolve it against the agent's per-session cwd (ACP requires absolute paths). Anything else
 /// returns an empty list; clients fall back to the `raw_input` field.
@@ -574,14 +707,33 @@ fn tool_locations(name: &str, input: &serde_json::Value, cwd: &SharedCwd) -> Vec
         }
         _ => None,
     };
-    raw.map(|path| vec![ToolCallLocation::new(resolve_against_cwd(cwd, path))])
-        .unwrap_or_default()
+    raw.map(|path| {
+        let mut location = ToolCallLocation::new(resolve_against_cwd(cwd, path));
+        // For `read_file`, point the client at the first line being read. meka's `offset` is
+        // 0-based; ACP line numbers are 1-based.
+        if name == "read_file"
+            && let Some(offset) = input.get("offset").and_then(|value| value.as_u64())
+        {
+            location = location.line(u32::try_from(offset.saturating_add(1)).unwrap_or(u32::MAX));
+        }
+        vec![location]
+    })
+    .unwrap_or_default()
+}
+
+/// Wrap a string as a plain-text [`ToolCallContent`] block.
+fn text_content_block(text: impl Into<String>) -> ToolCallContent {
+    ToolCallContent::from(ContentBlock::Text(
+        agent_client_protocol::schema::TextContent::new(text.into()),
+    ))
 }
 
 /// Build the `content` array of a `tool_call_update` from meka's tool output. A populated `Diff`
-/// metadata wins over the raw text content so clients (Zed) get the structured diff for apply-UI;
-/// if no metadata is set, text/image content blocks pass through.
+/// metadata wins (so clients like Zed get the structured diff for apply-UI). `execute_command`
+/// output is wrapped in a `console` code block so editors render it monospaced (mirrors
+/// claude-agent-acp's no-terminal fallback). Other tools pass their text/image blocks through.
 fn build_completion_content(
+    tool_name: &str,
     content: &[ToolResultContent],
     metadata: Option<ToolOutputMetadata>,
 ) -> Vec<ToolCallContent> {
@@ -598,6 +750,17 @@ fn build_completion_content(
         return vec![ToolCallContent::Diff(diff)];
     }
 
+    if tool_name == "execute_command" {
+        // Reuse the canonical text-flattening; `execute_command` output is text-only, so the
+        // `[Image]` marker `tool_result_text_content` would emit for images never appears here.
+        let combined = MekaContentBlock::tool_result_text_content(content);
+        let trimmed = combined.trim_end();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        return vec![text_content_block(format!("```console\n{trimmed}\n```"))];
+    }
+
     content
         .iter()
         .map(|block| {
@@ -607,9 +770,7 @@ fn build_completion_content(
                 // stays valid.
                 ToolResultContent::Image { .. } => "[image]".to_string(),
             };
-            ToolCallContent::from(ContentBlock::Text(
-                agent_client_protocol::schema::TextContent::new(text),
-            ))
+            text_content_block(text)
         })
         .collect()
 }
@@ -631,7 +792,10 @@ fn replay_session_updates(
     cwd: &SharedCwd,
     messages: &Conversation,
 ) {
-    let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Map each open `tool_use_id` to its tool name so the result update can format output per tool
+    // and the orphan sweep can close stragglers.
+    let mut open_tools: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for message in messages.as_slice() {
         match message.role {
             Role::User => {
@@ -663,7 +827,11 @@ fn replay_session_updates(
                             } else {
                                 ToolCallStatus::Completed
                             };
-                            let acp_content = build_completion_content(content, None);
+                            let tool_name = open_tools
+                                .get(tool_use_id)
+                                .map(String::as_str)
+                                .unwrap_or("");
+                            let acp_content = build_completion_content(tool_name, content, None);
                             let fields = ToolCallUpdateFields::new()
                                 .status(status)
                                 .content(acp_content);
@@ -676,6 +844,19 @@ fn replay_session_updates(
                                 )),
                             );
                             open_tools.remove(tool_use_id);
+                        }
+                        // Re-emit input images so a reopened session shows the attachment.
+                        MekaContentBlock::Image { source } => {
+                            send_session_update(
+                                connection,
+                                session_id,
+                                SessionUpdate::UserMessageChunk(ContentChunk::new(
+                                    ContentBlock::Image(ImageContent::new(
+                                        source.data.clone(),
+                                        source.media_type.clone(),
+                                    )),
+                                )),
+                            );
                         }
                         _ => {}
                     }
@@ -712,7 +893,13 @@ fn replay_session_updates(
                         }
                         MekaContentBlock::ToolUse { id, name, input } => {
                             let locations = tool_locations(name, input, cwd);
-                            let call = ToolCall::new(id.clone(), name.clone())
+                            // Match the live path's rich title. No tool schema is available on
+                            // replay, so only built-in tools resolve a primary argument; MCP tools
+                            // fall back to the bare name.
+                            let display_summary =
+                                crate::render::resolve_primary_param(name, input, None);
+                            let title = tool_call_title(name, display_summary.as_deref());
+                            let call = ToolCall::new(id.clone(), title)
                                 .kind(tool_kind_for(name))
                                 .status(ToolCallStatus::InProgress)
                                 .locations(locations)
@@ -722,7 +909,7 @@ fn replay_session_updates(
                                 session_id,
                                 SessionUpdate::ToolCall(call),
                             );
-                            open_tools.insert(id.clone());
+                            open_tools.insert(id.clone(), name.clone());
                         }
                         _ => {}
                     }
@@ -733,7 +920,7 @@ fn replay_session_updates(
 
     // Tool calls without a matching result: close them as failed so the client's "tool running"
     // indicator doesn't get stuck.
-    for orphan_id in open_tools {
+    for orphan_id in open_tools.into_keys() {
         let fields = ToolCallUpdateFields::new().status(ToolCallStatus::Failed);
         send_session_update(
             connection,
@@ -753,6 +940,53 @@ fn send_session_update(
     {
         tracing::debug!("session/load replay send_notification failed: {}", error);
     }
+}
+
+/// The first user message's preview text (the basis for the session title), or `None` if the
+/// conversation carries no user text yet. The stored text still has the agent's `<context>`
+/// preamble, which [`crate::session::truncate_preview`] strips.
+fn first_user_preview(messages: &Conversation) -> Option<String> {
+    for message in messages.as_slice() {
+        if message.role != Role::User {
+            continue;
+        }
+        for block in &message.content {
+            if let MekaContentBlock::Text { text } = block {
+                let preview = crate::session::truncate_preview(text, 80);
+                if !preview.is_empty() {
+                    return Some(preview);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Emit a `session_info_update` carrying the session title exactly once. The title is the first
+/// user message preview, which never changes after the first turn, so `title_sent` guards against
+/// re-emission across the first prompt and any later load/resume of the same session.
+fn maybe_emit_session_title(
+    connection: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    title_sent: &std::sync::atomic::AtomicBool,
+    messages: &Conversation,
+) {
+    use std::sync::atomic::Ordering;
+    if title_sent.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(title) = first_user_preview(messages) else {
+        return;
+    };
+    // Claim the one-shot before sending; if a concurrent path beat us to it, skip.
+    if title_sent.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    send_session_update(
+        connection,
+        session_id,
+        SessionUpdate::SessionInfoUpdate(SessionInfoUpdate::new().title(title)),
+    );
 }
 
 /// Drive the ACP `terminal/*` four-call dance for a delegated execute:
@@ -1071,6 +1305,9 @@ struct ServerState {
     /// Shared with every per-session `AcpFrontend`; see the field on `AcpFrontend` for the
     /// stdio-level rationale.
     transport_dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Resolved per-profile vision flag (`[providers.<name>].vision`, default `true`). Gates the
+    /// advertised `image` prompt capability and whether `session/prompt` accepts image blocks.
+    vision: bool,
 }
 
 /// Per-session map entry. Most fields live outside `runtime` so the cancel / set_mode / close
@@ -1085,6 +1322,10 @@ struct SessionEntry {
     /// the runtime lock after installing the new token, so a between-turn cancel signal isn't
     /// lost. See `acp_session_cancel_between_turns_applied_to_next_prompt`.
     cancel_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the session's `session_info_update` title has been emitted. The title is the first
+    /// user message preview, stable after the first turn, so it is pushed exactly once (after that
+    /// first turn, or at load/resume when history already carries it).
+    title_sent: Arc<std::sync::atomic::AtomicBool>,
     /// Hoisted out of `SessionRuntime` so `set_mode` can flip the permission without waiting on
     /// the runtime mutex.
     permission: SharedPermission,
@@ -1125,6 +1366,11 @@ pub async fn run_acp(
 ) -> anyhow::Result<()> {
     // Resolve provider credentials the same way the REPL path does.
     let credential = resolve_credential_for_acp(&config, &session_manager.token_store()).await?;
+
+    // Capture the resolved per-profile vision flag before `config` is moved into
+    // `build_shared_deps`. It gates the advertised `image` prompt capability and image ingest
+    // below.
+    let vision = config.vision;
 
     // Build process-wide shared deps once. Sessions hold an `Arc<SharedDeps>` and read fields by
     // reference; no work happens here that needs to be re-run per session.
@@ -1171,6 +1417,7 @@ pub async fn run_acp(
         client_state: client_state.clone(),
         sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         transport_dead,
+        vision,
     });
 
     let acp_result = AcpAgentRole
@@ -1198,12 +1445,11 @@ pub async fn run_acp(
                         .list(Some(SessionListCapabilities::new()))
                         .resume(Some(SessionResumeCapabilities::new()))
                         .close(Some(SessionCloseCapabilities::new()));
-                    // meka accepts only `ContentBlock::Text` in
-                    // `session/prompt` today. Default
-                    // `PromptCapabilities` is `{image: false, audio:
-                    // false, embedded_context: false}`, declared
-                    // explicitly so the contract is visible in the
-                    // initialize response and any future SDK default
+                    // meka accepts `text`, `resource_link`, and embedded `resource` (@-mention)
+                    // blocks in `session/prompt`, so `embedded_context` is advertised true. `image`
+                    // follows the active profile's `vision` flag (default true; set false for a
+                    // text-only model). `audio` stays false. Each field is set explicitly so the
+                    // contract is visible in the initialize response and a future SDK default
                     // change can't quietly flip it.
                     //
                     // `mcp_capabilities` is intentionally omitted:
@@ -1217,7 +1463,11 @@ pub async fn run_acp(
                     let capabilities = AgentCapabilities::new()
                         .load_session(true)
                         .session_capabilities(session_caps)
-                        .prompt_capabilities(PromptCapabilities::new());
+                        .prompt_capabilities(
+                            PromptCapabilities::new()
+                                .image(vision)
+                                .embedded_context(true),
+                        );
                     // Reject the V0 sentinel explicitly. The schema uses V0 as the "couldn't parse
                     // the requested version" fallback; a clamped `min(V0, LATEST)` would silently
                     // echo it back and let the handshake proceed against a malformed input.
@@ -1318,6 +1568,7 @@ pub async fn run_acp(
                         runtime: Arc::new(Mutex::new(runtime)),
                         cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
                         cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        title_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         permission: permission.clone(),
                         frontend,
                         session_lock,
@@ -1451,41 +1702,53 @@ async fn run_prompt_turn(
     req: PromptRequest,
     responder: agent_client_protocol::Responder<PromptResponse>,
 ) -> Result<(), agent_client_protocol::Error> {
-    // Accept `text` + `resource_link` (the ACP baseline). Other content variants get rejected with
-    // `InvalidParams` below.
+    // Accept `text` + `resource_link` (the ACP baseline) + embedded `resource` and, when the
+    // profile has vision enabled, `image`. Other content variants get rejected below.
     let mut prompt_text = String::new();
+    let mut images: Vec<crate::provider::ImageSource> = Vec::new();
     for block in &req.prompt {
         match block {
             ContentBlock::Text(text) => {
-                if !prompt_text.is_empty() {
-                    prompt_text.push('\n');
-                }
-                prompt_text.push_str(&text.text);
+                push_prompt_block(&mut prompt_text, &text.text);
             }
             // `ResourceLink` is part of the ACP baseline that every agent MUST support (alongside
             // `Text`). meka doesn't fetch the resource server-side; the model sees the reference as
             // a structured tag carrying the link's name, uri, and (optional) description so it can
             // decide what to do with it.
             ContentBlock::ResourceLink(link) => {
-                if !prompt_text.is_empty() {
-                    prompt_text.push('\n');
-                }
                 let mut tag =
                     format!("<resource_link name=\"{}\" uri=\"{}\"", link.name, link.uri,);
-                if let Some(mime) = &link.mime_type {
-                    tag.push_str(&format!(" mime=\"{}\"", mime));
-                }
+                push_mime_attr(&mut tag, &link.mime_type);
                 tag.push('>');
                 if let Some(description) = &link.description {
                     tag.push_str(description);
                 }
                 tag.push_str("</resource_link>");
-                prompt_text.push_str(&tag);
+                push_prompt_block(&mut prompt_text, &tag);
             }
+            // `Resource` carries an @-mention's inlined contents (the `embedded_context`
+            // capability). meka surfaces it to the model as a `<resource>` tag rather than fetching
+            // anything server-side, mirroring `ResourceLink`.
+            ContentBlock::Resource(embedded) => {
+                push_prompt_block(&mut prompt_text, &format_embedded_resource(embedded));
+            }
+            // `Image` is accepted only when the active profile advertised the `image` capability
+            // (vision on). Normalize the payload through the shared image pipeline so the size cap
+            // and format conversion match tool-result images.
+            ContentBlock::Image(image) if state.vision => match decode_acp_image(image) {
+                Ok(source) => images.push(source),
+                Err(message) => {
+                    return responder.respond_with_error(invalid_params_error(format!(
+                        "invalid image content block: {}",
+                        message
+                    )));
+                }
+            },
             _ => {
                 return responder.respond_with_error(invalid_params_error(
-                    "meka acp accepts only `text` and `resource_link` content blocks in \
-                     `prompt`; `image`, `audio`, and `resource` are not yet supported",
+                    "meka acp accepts `text`, `resource_link`, `resource`, and (when the \
+                     profile has vision enabled) `image` content blocks in `prompt`; `audio` is \
+                     not supported",
                 ));
             }
         }
@@ -1606,7 +1869,13 @@ async fn run_prompt_turn(
     // `MekaError::Interrupted` path.
     let cancel_probe = cancellation.clone();
     let result = agent
-        .run_turn(&mut session_uuid_opt, messages, prompt_text, cancellation)
+        .run_turn(
+            &mut session_uuid_opt,
+            messages,
+            prompt_text,
+            images,
+            cancellation,
+        )
         .await;
 
     let stop_reason = match result {
@@ -1624,6 +1893,15 @@ async fn run_prompt_turn(
             }
         }
     };
+
+    // The first user message defines the session title; push it once now that the turn has run and
+    // that message is in the conversation.
+    maybe_emit_session_title(
+        &frontend.connection,
+        &frontend.session_id,
+        &entry.title_sent,
+        messages,
+    );
 
     responder.respond(PromptResponse::new(stop_reason))
 }
@@ -1748,10 +2026,15 @@ async fn handle_load_session(
 
     let permission = runtime.permission.clone();
     let frontend = Arc::clone(&runtime.frontend);
+    // History already carries the first user message, so the title is known; push it once now,
+    // sharing the flag with the entry so a later prompt won't re-emit it.
+    let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    maybe_emit_session_title(&cx, &session_id, &title_sent, &runtime.messages);
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
         cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
         cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        title_sent,
         permission: permission.clone(),
         frontend,
         session_lock,
@@ -1923,10 +2206,15 @@ async fn handle_resume_session(
 
     let permission = runtime.permission.clone();
     let frontend = Arc::clone(&runtime.frontend);
+    // History already carries the first user message, so the title is known; push it once now,
+    // sharing the flag with the entry so a later prompt won't re-emit it.
+    let title_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    maybe_emit_session_title(&cx, &session_id, &title_sent, &runtime.messages);
     let entry = SessionEntry {
         runtime: Arc::new(Mutex::new(runtime)),
         cancellation: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
         cancel_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        title_sent,
         permission: permission.clone(),
         frontend,
         session_lock,
@@ -2124,6 +2412,137 @@ mod tests {
     }
 
     #[test]
+    fn test_todo_items_to_plan_maps_status_and_priority() {
+        let items = vec![
+            TodoItem {
+                text: "first".to_string(),
+                status: TodoStatus::Pending,
+            },
+            TodoItem {
+                text: "second".to_string(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                text: "third".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoItem {
+                text: "fourth".to_string(),
+                status: TodoStatus::Cancelled,
+            },
+        ];
+        let entries = todo_items_to_plan(&items);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].content, "first");
+        assert_eq!(entries[0].status, PlanEntryStatus::Pending);
+        assert_eq!(entries[1].status, PlanEntryStatus::InProgress);
+        assert_eq!(entries[2].status, PlanEntryStatus::Completed);
+        // Cancelled has no ACP analogue; it collapses to Completed.
+        assert_eq!(entries[3].status, PlanEntryStatus::Completed);
+        // meka tracks no per-item priority, so every entry is Medium.
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.priority == PlanEntryPriority::Medium)
+        );
+    }
+
+    #[test]
+    fn test_decode_acp_image_passes_through_within_cap() {
+        // The PassThrough path validates size only, so small arbitrary bytes labelled `image/png`
+        // round-trip into an `ImageSource` without needing a real PNG.
+        let raw = vec![0u8; 128];
+        let data = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let image = ImageContent::new(data, "image/png".to_string());
+        let source = decode_acp_image(&image).expect("decode");
+        assert_eq!(source.source_type, "base64");
+        assert_eq!(source.media_type, "image/png");
+    }
+
+    #[test]
+    fn test_decode_acp_image_rejects_oversized() {
+        let raw = vec![0u8; crate::image::MAX_IMAGE_RAW_BYTES + 1];
+        let data = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let image = ImageContent::new(data, "image/png".to_string());
+        let error = decode_acp_image(&image).expect_err("should reject oversized");
+        assert!(error.contains("too large"), "got: {error}");
+    }
+
+    #[test]
+    fn test_decode_acp_image_rejects_bad_base64() {
+        let image = ImageContent::new("not%%%valid".to_string(), "image/png".to_string());
+        assert!(decode_acp_image(&image).is_err());
+    }
+
+    #[test]
+    fn test_format_embedded_resource_text_inlines_contents() {
+        let embedded = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
+            agent_client_protocol::schema::TextResourceContents::new(
+                "fn main() {}",
+                "file:///proj/src/main.rs",
+            )
+            .mime_type("text/x-rust".to_string()),
+        ));
+        let tag = format_embedded_resource(&embedded);
+        assert_eq!(
+            tag,
+            "<resource uri=\"file:///proj/src/main.rs\" mime=\"text/x-rust\">fn main() {}</resource>"
+        );
+    }
+
+    #[test]
+    fn test_format_embedded_resource_blob_emits_marker_without_payload() {
+        let embedded = EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(
+            agent_client_protocol::schema::BlobResourceContents::new(
+                "QUJD",
+                "file:///proj/logo.png",
+            )
+            .mime_type("image/png".to_string()),
+        ));
+        let tag = format_embedded_resource(&embedded);
+        // The base64 payload must NOT be inlined; only a self-closing marker.
+        assert_eq!(
+            tag,
+            "<resource uri=\"file:///proj/logo.png\" mime=\"image/png\" encoding=\"base64\"/>"
+        );
+        assert!(!tag.contains("QUJD"));
+    }
+
+    #[test]
+    fn test_embedded_resource_tag_survives_context_wrapper_strip() {
+        // A `<resource>` tag is part of the user's prompt body. Once wrapped by the agent's
+        // `<context>...</context>` preamble and stripped on replay, the tag must remain intact.
+        let embedded = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
+            agent_client_protocol::schema::TextResourceContents::new("hello", "file:///note.txt"),
+        ));
+        let prompt_body = format!("see this\n{}", format_embedded_resource(&embedded));
+        let wrapped = format!(
+            "<context>\n[Environment context]\n</context>\n\n{}",
+            prompt_body
+        );
+        assert_eq!(crate::session::strip_context_tags(&wrapped), prompt_body);
+    }
+
+    #[test]
+    fn test_first_user_preview_strips_context_and_truncates() {
+        let mut convo = Conversation::new();
+        convo.append(crate::provider::Message::user(
+            "<context>\n[Environment context]\n</context>\n\nfind all rust files",
+        ));
+        convo.append(crate::provider::Message::assistant_text("ok"));
+        assert_eq!(
+            first_user_preview(&convo).as_deref(),
+            Some("find all rust files")
+        );
+    }
+
+    #[test]
+    fn test_first_user_preview_none_when_no_user_text() {
+        let convo = Conversation::new();
+        assert!(first_user_preview(&convo).is_none());
+    }
+
+    #[test]
     fn test_tool_locations_resolves_relative_against_cwd() {
         let cwd: SharedCwd = Arc::new(std::sync::RwLock::new(PathBuf::from("/home/agent/proj")));
         let input = serde_json::json!({"path": "src/main.rs"});
@@ -2152,6 +2571,22 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_locations_read_file_line_from_offset() {
+        let cwd: SharedCwd = Arc::new(std::sync::RwLock::new(PathBuf::from("/home/agent/proj")));
+        // `read_file` offset is 0-based; ACP `line` is 1-based.
+        let input = serde_json::json!({"path": "src/main.rs", "offset": 41});
+        let locations = tool_locations("read_file", &input, &cwd);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].line, Some(42));
+        // No offset -> no line.
+        let no_offset = serde_json::json!({"path": "src/main.rs"});
+        assert_eq!(tool_locations("read_file", &no_offset, &cwd)[0].line, None);
+        // Other path tools never set a line, even with an offset present.
+        let edit = serde_json::json!({"path": "src/main.rs", "offset": 41});
+        assert_eq!(tool_locations("edit_file", &edit, &cwd)[0].line, None);
+    }
+
+    #[test]
     fn test_build_completion_content_prefers_diff_metadata() {
         let metadata = Some(ToolOutputMetadata::Diff {
             path: PathBuf::from("/tmp/foo.txt"),
@@ -2161,9 +2596,90 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "ignored".to_string(),
         }];
-        let blocks = build_completion_content(&content, metadata);
+        let blocks = build_completion_content("edit_file", &content, metadata);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ToolCallContent::Diff(_)));
+    }
+
+    #[test]
+    fn test_tool_call_title_per_tool() {
+        assert_eq!(
+            tool_call_title("execute_command", Some("git status && git diff")),
+            "git status && git diff"
+        );
+        assert_eq!(
+            tool_call_title("read_file", Some("src/main.rs")),
+            "Read src/main.rs"
+        );
+        assert_eq!(
+            tool_call_title("edit_file", Some("src/lib.rs")),
+            "Edit src/lib.rs"
+        );
+        assert_eq!(
+            tool_call_title("write_file", Some("out.txt")),
+            "Write out.txt"
+        );
+        assert_eq!(
+            tool_call_title("find_files", Some("**/*.rs")),
+            "Find **/*.rs"
+        );
+        assert_eq!(
+            tool_call_title("search_contents", Some("TODO")),
+            "Search TODO"
+        );
+        assert_eq!(
+            tool_call_title("fetch_url", Some("https://example.com")),
+            "Fetch https://example.com"
+        );
+        assert_eq!(
+            tool_call_title("web_search", Some("rust acp")),
+            "Web search: rust acp"
+        );
+        // MCP / unknown tool with a resolved primary argument.
+        assert_eq!(
+            tool_call_title("mcp__exa__web_search_exa", Some("query")),
+            "mcp__exa__web_search_exa: query"
+        );
+        // No primary argument resolved -> bare tool name.
+        assert_eq!(tool_call_title("read_file", None), "read_file");
+    }
+
+    #[test]
+    fn test_tool_call_title_sanitizes_whitespace_and_length() {
+        // A multi-line command collapses to a single line.
+        assert_eq!(
+            tool_call_title("execute_command", Some("git status\n  && git diff")),
+            "git status && git diff"
+        );
+        // Over-long titles are truncated with an ellipsis.
+        let long = "x".repeat(400);
+        let title = tool_call_title("execute_command", Some(&long));
+        assert!(title.chars().count() <= 256);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn test_build_completion_content_execute_command_wraps_console() {
+        let content = vec![ToolResultContent::Text {
+            text: "hello\nworld\n".to_string(),
+        }];
+        let blocks = build_completion_content("execute_command", &content, None);
+        assert_eq!(blocks.len(), 1);
+        let ToolCallContent::Content(chunk) = &blocks[0] else {
+            panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);
+        };
+        let ContentBlock::Text(text) = &chunk.content else {
+            panic!("expected ContentBlock::Text; got {:?}", chunk.content);
+        };
+        assert_eq!(text.text, "```console\nhello\nworld\n```");
+    }
+
+    #[test]
+    fn test_build_completion_content_execute_command_empty_output_no_block() {
+        let content = vec![ToolResultContent::Text {
+            text: "   \n".to_string(),
+        }];
+        assert!(build_completion_content("execute_command", &content, None).is_empty());
     }
 
     #[test]
@@ -2257,7 +2773,7 @@ mod tests {
         let content = vec![ToolResultContent::Text {
             text: "hello".to_string(),
         }];
-        let blocks = build_completion_content(&content, None);
+        let blocks = build_completion_content("read_file", &content, None);
         assert_eq!(blocks.len(), 1);
         assert!(matches!(blocks[0], ToolCallContent::Content(_)));
     }
@@ -2276,7 +2792,7 @@ mod tests {
                 data: "irrelevant".to_string(),
             },
         }];
-        let blocks = build_completion_content(&content, None);
+        let blocks = build_completion_content("read_file", &content, None);
         assert_eq!(blocks.len(), 1);
         let ToolCallContent::Content(chunk) = &blocks[0] else {
             panic!("expected ToolCallContent::Content; got {:?}", blocks[0]);

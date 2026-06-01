@@ -67,6 +67,11 @@ pub enum ContentBlockView {
     Text {
         text: String,
     },
+    Image {
+        // Signal an input image was present without the base64 payload, mirroring
+        // `ToolResultContentView::Image`, so history responses stay tractable.
+        media_type: String,
+    },
     Thinking {
         thinking: String,
     },
@@ -237,6 +242,9 @@ fn derive_turn_indexes(messages: &[Message]) -> Vec<String> {
 fn view_for_block(block: &ContentBlock) -> ContentBlockView {
     match block {
         ContentBlock::Text { text } => ContentBlockView::Text { text: text.clone() },
+        ContentBlock::Image { source } => ContentBlockView::Image {
+            media_type: source.media_type.clone(),
+        },
         ContentBlock::Thinking { thinking, .. } => ContentBlockView::Thinking {
             thinking: thinking.clone(),
         },

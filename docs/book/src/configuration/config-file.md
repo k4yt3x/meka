@@ -136,6 +136,38 @@ type            = "claude-oauth"
 redact_thinking = true
 ```
 
+### `context_window`
+
+Override the model's context window (total tokens it can hold), used for the `/status` gauge and auto-compaction. Takes precedence over `[session].context_window`, which in turn overrides the model-name inference. Leave unset to use the inferred default.
+
+```toml
+[providers.work]
+type           = "openai-api"
+model          = "my-128k-model"
+context_window = 131072
+```
+
+### `vision`
+
+Whether this profile's model accepts image input. Defaults to `true`. Set `false` for a text-only model so the ACP frontend stops advertising and accepting images (see [ACP](../usage/acp.md)).
+
+```toml
+[providers.local]
+type   = "openai-api"
+model  = "llama-3-8b"
+vision = false
+```
+
+### `max_output_tokens`
+
+Override the per-request output (completion) token cap. When unset, each backend keeps its built-in default (Claude 32k–64k depending on thinking; OpenAI 32k with reasoning effort; otherwise the API default). On Claude with thinking enabled, the value must exceed `[thinking].budget_tokens` (validated at startup).
+
+```toml
+[providers.work]
+type              = "claude-api"
+max_output_tokens = 16000
+```
+
 ### `client_id`
 
 OAuth client ID override (advanced; `claude-oauth` / `openai-codex` only). Leave unset to use meka's built-in default client IDs.
@@ -480,7 +512,7 @@ auto_compact = false
 
 ### `session.context_window`
 
-Override the model's context window size (in tokens). Used for auto-compact threshold calculation. If not set, meka infers the context window from the model name.
+Override the model's context window size (in tokens). Used for auto-compact threshold calculation. A per-profile `[providers.<name>].context_window` takes precedence over this; if neither is set, meka infers the context window from the model name.
 
 ```toml
 [session]

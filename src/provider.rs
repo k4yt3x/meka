@@ -14,6 +14,7 @@ pub(crate) mod openai;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+pub(crate) use claude::model_supports_adaptive_thinking;
 pub use claude::{ClaudeApiProvider, ClaudeOAuthProvider};
 pub use openai::{OpenAiCodexProvider, OpenAiProvider};
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,12 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    /// Image supplied as *input* (e.g. an ACP client's @-mention or pasted screenshot). Distinct
+    /// from a tool result's image, which travels inside [`ContentBlock::ToolResult`] as a
+    /// [`ToolResultContent::Image`].
+    Image {
+        source: ImageSource,
+    },
     Thinking {
         thinking: String,
         signature: Option<String>,
@@ -150,6 +157,22 @@ impl Message {
         Self {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// User message carrying a text block followed by zero or more input images. Used by the ACP
+    /// prompt path when the client attaches images; `images` empty yields the same shape as
+    /// [`Message::user`].
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
+        let mut content = vec![ContentBlock::Text { text: text.into() }];
+        content.extend(
+            images
+                .into_iter()
+                .map(|source| ContentBlock::Image { source }),
+        );
+        Self {
+            role: Role::User,
+            content,
         }
     }
 
@@ -464,6 +487,7 @@ pub struct ProviderBuilder {
     device_id: String,
     effort: String,
     redact_thinking: bool,
+    max_output_tokens: Option<u64>,
     session_stats: Option<Arc<crate::stats::SessionStats>>,
 }
 
@@ -488,6 +512,7 @@ impl ProviderBuilder {
             device_id: String::new(),
             effort: "high".to_string(),
             redact_thinking: false,
+            max_output_tokens: None,
             session_stats: None,
         }
     }
@@ -557,6 +582,13 @@ impl ProviderBuilder {
         self
     }
 
+    /// Per-request output (completion) token cap. When `None`, each backend keeps its built-in
+    /// default. Consumed by every backend.
+    pub fn max_output_tokens(mut self, value: Option<u64>) -> Self {
+        self.max_output_tokens = value;
+        self
+    }
+
     /// Per-session counters incremented when image-redaction events fire. Currently consumed only
     /// by `claude-oauth` and `claude-api`.
     pub fn session_stats(mut self, value: Option<Arc<crate::stats::SessionStats>>) -> Self {
@@ -576,6 +608,7 @@ impl ProviderBuilder {
                     self.model,
                     self.base_url,
                     self.reasoning_effort,
+                    self.max_output_tokens,
                 )))
             }
             "claude-api" => {
@@ -595,6 +628,7 @@ impl ProviderBuilder {
                     self.base_url,
                     self.thinking_enabled,
                     self.thinking_budget_tokens,
+                    self.max_output_tokens,
                     self.session_stats,
                 )))
             }
@@ -620,6 +654,7 @@ impl ProviderBuilder {
                     self.device_id,
                     self.effort,
                     self.redact_thinking,
+                    self.max_output_tokens,
                     self.session_stats,
                 )))
             }
@@ -641,6 +676,7 @@ impl ProviderBuilder {
                     self.credential_key
                         .unwrap_or_else(|| self.provider_name.clone()),
                     self.reasoning_effort,
+                    self.max_output_tokens,
                 )?))
             }
             other => Err(MekaError::Config(format!(
@@ -655,6 +691,36 @@ impl ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_user_with_images_appends_image_blocks_after_text() {
+        let images = vec![
+            ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            },
+            ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/jpeg".to_string(),
+                data: "BBBB".to_string(),
+            },
+        ];
+        let message = Message::user_with_images("look at these", images);
+        assert_eq!(message.role, Role::User);
+        assert_eq!(message.content.len(), 3);
+        assert!(
+            matches!(&message.content[0], ContentBlock::Text { text } if text == "look at these")
+        );
+        assert!(
+            matches!(&message.content[1], ContentBlock::Image { source } if source.media_type == "image/png")
+        );
+        assert!(
+            matches!(&message.content[2], ContentBlock::Image { source } if source.media_type == "image/jpeg")
+        );
+        // No images yields the same shape as `Message::user`.
+        assert_eq!(Message::user_with_images("hi", vec![]).content.len(), 1);
+    }
 
     #[test]
     fn test_token_usage_merge_stream_keeps_input_from_start_output_from_delta() {

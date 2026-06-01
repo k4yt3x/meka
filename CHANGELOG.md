@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- ACP: richer editor integration: plans, embedded resource/image input, session titles, and tool-call detail.
+- `[providers.<name>]` gains `context_window`, `vision`, and `max_output_tokens` overrides.
+
+### Fixed
+
+- Gate adaptive thinking / effort on the parsed Claude model version (`>= 4.6`), not a fixed allowlist.
+- REPL log warnings now appear during a turn instead of being buffered until the next prompt.
+
 ## [0.27.1] - 2026-05-29
 
 ### Fixed

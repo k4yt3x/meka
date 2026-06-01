@@ -427,7 +427,14 @@ pub fn run_repl(
     }
 
     loop {
-        match editor.read_line(&prompt) {
+        // reedline drains the relay's `ExternalPrinter` only inside `read_line()`. Flag that window
+        // so log lines route through the printer (cleanly above the live prompt) while it's active
+        // and go straight to stderr otherwise (e.g. during a turn), surfacing immediately instead
+        // of buffering until the turn ends and the next prompt is drawn.
+        RELAY.set_at_prompt(true);
+        let signal = editor.read_line(&prompt);
+        RELAY.set_at_prompt(false);
+        match signal {
             Ok(Signal::Success(buffer)) => {
                 if buffer == CYCLE_PERMISSION_SENTINEL {
                     let new_permission = shared_permission.cycle();

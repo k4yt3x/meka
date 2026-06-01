@@ -216,6 +216,9 @@ pub enum FrontendEvent {
     /// tool_call_update` with `status: completed | failed`.
     ToolCallCompleted {
         id: String,
+        /// Tool name (matches the [`Self::ToolCallStarted`] `name`). Lets a frontend format the
+        /// output per tool, e.g. wrapping `execute_command` output in a console code block.
+        name: String,
         is_error: bool,
         content: Vec<crate::provider::ToolResultContent>,
         /// Tool-specific structured side-channel. `edit_file` / `write_file` populate

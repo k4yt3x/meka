@@ -462,6 +462,16 @@ pub struct ProviderProfile {
     pub backend: String,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    /// Override the model's context window (total tokens the model can hold), used for the context
+    /// gauge and auto-compaction. When unset, falls back to `[session].context_window` and then to
+    /// the model-name inference in [`context_window_for_model`].
+    pub context_window: Option<u64>,
+    /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
+    /// the ACP frontend from advertising / accepting images for a text-only model.
+    pub vision: Option<bool>,
+    /// Override the per-request output (completion) token cap. When unset, each backend keeps its
+    /// built-in default. On Claude the value must exceed the thinking budget.
+    pub max_output_tokens: Option<u64>,
     pub oauth_token_url: Option<String>,
     pub reasoning_effort: Option<String>,
     pub device_id: Option<String>,
@@ -541,6 +551,12 @@ pub struct ResolvedConfig {
     pub redact_thinking: bool,
     pub auto_compact: bool,
     pub context_window: Option<u64>,
+    /// Whether the active profile's model accepts image input (the ACP `image` prompt capability).
+    /// Resolved from `[providers.<name>].vision`, defaulting to `true`.
+    pub vision: bool,
+    /// Per-request output (completion) token cap from `[providers.<name>].max_output_tokens`.
+    /// `None` leaves each backend's built-in default in place.
+    pub max_output_tokens: Option<u64>,
     pub mcp_servers: Vec<McpServerConfig>,
     /// Parsed [`Permission`] from `[mcp].default_permission`, carried so per-turn tool-permission
     /// resolution in `src/mcp.rs` doesn't have to re-read the config file. `None` means "no
@@ -1469,7 +1485,13 @@ impl ResolvedConfig {
             effort,
             redact_thinking,
             auto_compact: file_session.auto_compact.unwrap_or(true),
-            context_window: file_session.context_window,
+            // Precedence: profile > `[session].context_window` > model-name inference (applied at
+            // the call sites in `main.rs` via `context_window_for_model`).
+            context_window: active
+                .and_then(|profile| profile.context_window)
+                .or(file_session.context_window),
+            vision: active.and_then(|profile| profile.vision).unwrap_or(true),
+            max_output_tokens: active.and_then(|profile| profile.max_output_tokens),
             mcp_servers,
             mcp_default_permission,
             user_instructions,
@@ -1519,8 +1541,44 @@ impl ResolvedConfig {
                 self.active_profile.as_deref().unwrap_or("?"),
             )));
         }
+        validate_max_output_tokens(
+            self.provider_name.as_deref(),
+            self.model.as_deref(),
+            self.max_output_tokens,
+            self.thinking_enabled,
+            self.thinking_budget_tokens,
+        )?;
         Ok(())
     }
+}
+
+/// Reject a `max_output_tokens` override that can't produce a valid Claude request: with thinking
+/// enabled the budget is drawn from `max_tokens`, so the cap must exceed it. Surfaced as a config
+/// error with clear guidance rather than a provider 400 mid-turn. Non-Claude backends and the
+/// thinking-off case have no such constraint.
+fn validate_max_output_tokens(
+    provider_name: Option<&str>,
+    model: Option<&str>,
+    max_output_tokens: Option<u64>,
+    thinking_enabled: bool,
+    thinking_budget_tokens: u64,
+) -> crate::error::Result<()> {
+    let Some(max_output) = max_output_tokens else {
+        return Ok(());
+    };
+    let is_claude = matches!(provider_name, Some("claude-api") | Some("claude-oauth"));
+    // Adaptive-thinking models (Claude 4.6+) send `thinking: {type: adaptive}` with no explicit
+    // `budget_tokens`, so the `max_tokens > budget` invariant only applies to the budgeted
+    // (non-adaptive) path. Don't reject an adaptive config that's actually valid.
+    let adaptive = model.is_some_and(crate::provider::model_supports_adaptive_thinking);
+    if is_claude && thinking_enabled && !adaptive && max_output <= thinking_budget_tokens {
+        return Err(crate::error::MekaError::Config(format!(
+            "max_output_tokens ({}) must exceed the thinking budget ({}) for a Claude profile \
+             with thinking enabled; raise max_output_tokens or lower [thinking].budget_tokens.",
+            max_output, thinking_budget_tokens,
+        )));
+    }
+    Ok(())
 }
 
 pub fn context_window_for_model(model: &str) -> u64 {
@@ -2231,6 +2289,116 @@ redact_thinking = true
             .expect("profile should be present");
         assert_eq!(profile.effort.as_deref(), Some("medium"));
         assert_eq!(profile.redact_thinking, Some(true));
+    }
+
+    #[test]
+    fn test_provider_profile_deserializes_capability_knobs() {
+        let toml_str = r#"
+[providers.work]
+type = "openai-api"
+model = "gpt-5.5"
+context_window = 1000000
+vision = false
+max_output_tokens = 64000
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let profile = config
+            .providers
+            .get("work")
+            .expect("profile should be present");
+        assert_eq!(profile.context_window, Some(1_000_000));
+        assert_eq!(profile.vision, Some(false));
+        assert_eq!(profile.max_output_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn test_validate_max_output_tokens_rejects_below_budget_on_claude() {
+        // `claude-sonnet-4-5` uses the budgeted (non-adaptive) thinking path.
+        let result = validate_max_output_tokens(
+            Some("claude-oauth"),
+            Some("claude-sonnet-4-5"),
+            Some(5_000),
+            true,
+            10_000,
+        );
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("thinking budget"), "got: {message}");
+    }
+
+    #[test]
+    fn test_validate_max_output_tokens_allows_above_budget_on_claude() {
+        assert!(
+            validate_max_output_tokens(
+                Some("claude-oauth"),
+                Some("claude-sonnet-4-5"),
+                Some(20_000),
+                true,
+                10_000
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_max_output_tokens_allows_adaptive_below_budget() {
+        // Adaptive-thinking models send no `budget_tokens`, so a cap below the configured budget is
+        // valid and must not be rejected.
+        assert!(
+            validate_max_output_tokens(
+                Some("claude-oauth"),
+                Some("claude-opus-4-6"),
+                Some(5_000),
+                true,
+                10_000
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_max_output_tokens_ignores_non_claude_and_thinking_off() {
+        // Non-Claude backend: no budget constraint even when below.
+        assert!(
+            validate_max_output_tokens(Some("openai-api"), Some("gpt-5"), Some(100), true, 10_000)
+                .is_ok()
+        );
+        // Claude with thinking off: the budget isn't drawn from max_tokens.
+        assert!(
+            validate_max_output_tokens(
+                Some("claude-api"),
+                Some("claude-sonnet-4-5"),
+                Some(100),
+                false,
+                10_000
+            )
+            .is_ok()
+        );
+        // No override at all.
+        assert!(
+            validate_max_output_tokens(
+                Some("claude-api"),
+                Some("claude-sonnet-4-5"),
+                None,
+                true,
+                10_000
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_provider_profile_capability_knobs_default_to_none() {
+        let toml_str = r#"
+[providers.work]
+type = "openai-api"
+model = "gpt-5.5"
+"#;
+        let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let profile = config.providers.get("work").expect("profile present");
+        assert_eq!(profile.context_window, None);
+        assert_eq!(profile.vision, None);
+        assert_eq!(profile.max_output_tokens, None);
     }
 
     #[test]

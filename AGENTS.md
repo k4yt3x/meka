@@ -6,6 +6,7 @@ This file provides guidance to AI agents when working with code in this reposito
 
 - Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
 - Do not write organizational or comments that summarize the code. Comments should only be written in order to explain "why" the code is written in some way in the case there is a reason that is tricky / non-obvious.
+- Never hand-wrap comments. Write each comment (and doc comment) as one line per paragraph and let `cargo +nightly fmt` wrap it (`.rustfmt.toml` has `wrap_comments = true`). If fmt's wrap lands awkwardly, reword the prose rather than inserting a manual break.
 - Prefer implementing functionality in existing files unless it is a new logical component. Avoid creating many small files.
 - Avoid using functions that panic like `unwrap()`, instead use mechanisms like `?` to propagate errors.
 - Be careful with operations like indexing which may panic if the indexes are out of bounds.

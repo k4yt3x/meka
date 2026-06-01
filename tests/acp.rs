@@ -536,6 +536,13 @@ model = "claude-sonnet-4-5"
             "expected tool_call status in_progress: {}",
             update,
         );
+        // The title carries the resolved primary argument (the path), not the bare tool name.
+        let title = update["title"].as_str().unwrap_or("");
+        assert!(
+            title.starts_with("Read ") && title.contains("target.txt"),
+            "tool_call title should be 'Read <path>': {}",
+            update,
+        );
         true
     });
     assert!(
@@ -555,6 +562,74 @@ model = "claude-sonnet-4-5"
         response["result"]["stopReason"], "end_turn",
         "expected stopReason=end_turn; full response: {}",
         response,
+    );
+}
+
+/// The `todo` tool surfaces as a `plan` session/update with one entry per item.
+#[test]
+fn acp_todo_tool_emits_plan_update() {
+    let config_toml = r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+"#;
+    let mut harness = AcpTestHarness::builder()
+        .config(config_toml)
+        .pre_spawn(|_dir| {
+            serde_json::json!([
+                [
+                    { "kind": "text", "text": "planning...\n" },
+                    { "kind": "tool_use_start", "id": "call_todo", "name": "todo" },
+                    {
+                        "kind": "tool_use_end",
+                        "input": { "title": "Work", "items": ["First", "Second"] }
+                    },
+                    { "kind": "message_end", "stop_reason": "tool_use" }
+                ],
+                [
+                    { "kind": "text", "text": "done" },
+                    { "kind": "message_end", "stop_reason": "end_turn" }
+                ]
+            ])
+        })
+        .build();
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "make a plan");
+    let (updates, response) = harness.collect_updates(&sid, id);
+
+    let plan = updates
+        .iter()
+        .find(|value| value["params"]["update"]["sessionUpdate"] == "plan")
+        .unwrap_or_else(|| panic!("expected a plan session/update; updates: {:?}", updates));
+    let entries = plan["params"]["update"]["entries"]
+        .as_array()
+        .expect("plan entries array");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["content"], "First");
+    assert_eq!(entries[0]["status"], "pending");
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+}
+
+/// The first turn of a fresh session emits a `session_info_update` carrying the title (the first
+/// user message preview, with the agent's `<context>` preamble stripped).
+#[test]
+fn acp_first_turn_emits_session_info_update_title() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "ok" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "explain the build system");
+    let (updates, _response) = harness.collect_updates(&sid, id);
+
+    let info = updates
+        .iter()
+        .find(|value| value["params"]["update"]["sessionUpdate"] == "session_info_update")
+        .unwrap_or_else(|| panic!("expected a session_info_update; updates: {:?}", updates));
+    assert_eq!(
+        info["params"]["update"]["title"],
+        "explain the build system"
     );
 }
 
@@ -3075,11 +3150,11 @@ type = "claude-api"
 model = "claude-sonnet-4-5"
 "#;
 
-/// `session/prompt` against an unknown `sessionId` must error with `InvalidParams`. Non-text
-/// content blocks (image / audio / resource) likewise: meka advertises text-only
-/// `PromptCapabilities`, so any other block type is a client contract violation.
+/// `session/prompt` against an unknown `sessionId` must error with `InvalidParams`. An `audio`
+/// content block likewise: meka accepts `text` / `resource_link` / `resource` / `image` (when
+/// vision is on) but never `audio`, so it is a client contract violation.
 #[test]
-fn acp_session_prompt_rejects_unknown_session_and_non_text_blocks() {
+fn acp_session_prompt_rejects_unknown_session_and_audio_block() {
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
 
     let unknown = harness.request(
@@ -3091,10 +3166,37 @@ fn acp_session_prompt_rejects_unknown_session_and_non_text_blocks() {
     );
     assert_invalid_params(&unknown, "prompt with unknown sessionId");
 
-    // Now open a real session and send an image block (also a contract violation); must yield
-    // InvalidParams.
+    // Open a real session and send an audio block (an unsupported content type); must yield
+    // InvalidParams during content parsing, before any turn work.
     let sid = harness.new_session();
     let bad_block = harness.request(
+        "session/prompt",
+        serde_json::json!({
+            "sessionId": sid,
+            "prompt": [{
+                "type": "audio",
+                "data": "AAAA",
+                "mimeType": "audio/wav"
+            }]
+        }),
+    );
+    assert_invalid_params(&bad_block, "prompt with audio content block");
+}
+
+/// With `vision = false` on the active profile, meka advertises `image: false` and rejects image
+/// content blocks with `InvalidParams` (the rejection happens during parsing, before any turn).
+#[test]
+fn acp_session_prompt_rejects_image_when_vision_disabled() {
+    const NO_VISION_CONFIG: &str = r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+vision = false
+"#;
+    let mut harness = AcpTestHarness::spawn(NO_VISION_CONFIG, None);
+
+    let sid = harness.new_session();
+    let rejected = harness.request(
         "session/prompt",
         serde_json::json!({
             "sessionId": sid,
@@ -3105,7 +3207,7 @@ fn acp_session_prompt_rejects_unknown_session_and_non_text_blocks() {
             }]
         }),
     );
-    assert_invalid_params(&bad_block, "prompt with non-text content block");
+    assert_invalid_params(&rejected, "image block with vision disabled");
 }
 
 /// `session/load` rejects malformed UUIDs and refuses to re-load a session that's already open
@@ -4015,6 +4117,71 @@ fn acp_session_prompt_accepts_resource_link_baseline() {
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
         "resource_link content block must be accepted, not error: {}",
+        response,
+    );
+}
+
+/// An embedded `resource` block (an @-mention's inlined contents) is accepted and flattened into a
+/// `<resource>` tag, not rejected. meka advertises `embeddedContext: true`.
+#[test]
+fn acp_session_prompt_accepts_embedded_resource() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "ack" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.send_request(
+        "session/prompt",
+        serde_json::json!({
+            "sessionId": sid,
+            "prompt": [
+                { "type": "text", "text": "summarize:" },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///tmp/notes.txt",
+                        "text": "the meeting notes",
+                        "mimeType": "text/plain"
+                    }
+                }
+            ]
+        }),
+    );
+    let response = harness.await_response(id);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "embedded resource block must be accepted, not error: {}",
+        response,
+    );
+}
+
+/// An `image` content block is accepted when the profile has vision on (the default), and the turn
+/// runs to completion.
+#[test]
+fn acp_session_prompt_accepts_image_with_vision() {
+    let script = serde_json::json!([[
+        { "kind": "text", "text": "i see it" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    // A 1x1 transparent PNG, base64-encoded.
+    let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let id = harness.send_request(
+        "session/prompt",
+        serde_json::json!({
+            "sessionId": sid,
+            "prompt": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image", "data": png_b64, "mimeType": "image/png" }
+            ]
+        }),
+    );
+    let response = harness.await_response(id);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "image block must be accepted when vision is on: {}",
         response,
     );
 }

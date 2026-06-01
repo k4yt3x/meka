@@ -74,7 +74,9 @@ use crate::{
     error::{MekaError, Result},
     frontend::{Frontend, FrontendEvent, PermissionOutcome, PermissionRequest},
     permission::SharedPermission,
-    provider::{ContentBlock, Message, Provider, Role, StopReason, StreamEvent, ToolDefinition},
+    provider::{
+        ContentBlock, ImageSource, Message, Provider, Role, StopReason, StreamEvent, ToolDefinition,
+    },
     session::SessionManager,
     skills::SkillCache,
     tools::{ToolRegistry, todo::SharedTodoList},
@@ -405,6 +407,7 @@ impl Agent {
         session_id: &mut Option<Uuid>,
         messages: &mut Conversation,
         user_input: String,
+        images: Vec<ImageSource>,
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome> {
         // Gate on MCP readiness BEFORE touching session state / message history so a rejected turn
@@ -460,14 +463,15 @@ impl Agent {
             let block = context::build_turn_context(permission, &todos, &cwd_snapshot);
             format!("{}\n\n{}", block, user_input)
         };
-        let user_message = Message::user(&augmented_input);
-        messages.append(user_message);
+        // Build the user message once (text preamble + any input images) and reuse it for both the
+        // in-memory append and every persist path below, so attached images survive resume.
+        let user_message = Message::user_with_images(augmented_input, images);
+        messages.append(user_message.clone());
         // Persist the user message eagerly, before the first provider call.  A crash
         // during the provider roundtrip would otherwise lose it from disk.  On transient
         // DB failure the lazy save path below retries; `user_eagerly_saved` suppresses
         // double-writes on the happy path.
-        let user_event =
-            crate::conversation::Event::Append(Message::user(augmented_input.as_str()));
+        let user_event = crate::conversation::Event::Append(user_message.clone());
         let user_eagerly_saved = match self.session_manager.save_event(sid, &user_event).await {
             Ok(()) => true,
             Err(error) => {
@@ -602,8 +606,7 @@ impl Agent {
                     .saturating_add(usage.cache_read_input_tokens);
 
                 if !user_saved {
-                    let user_event =
-                        crate::conversation::Event::Append(Message::user(augmented_input.as_str()));
+                    let user_event = crate::conversation::Event::Append(user_message.clone());
                     if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
                         break 'turn Err(error);
                     }
@@ -731,8 +734,7 @@ impl Agent {
 
         match &result {
             Err(MekaError::Interrupted) if !user_saved => {
-                let user_event =
-                    crate::conversation::Event::Append(Message::user(augmented_input.as_str()));
+                let user_event = crate::conversation::Event::Append(user_message.clone());
                 if let Err(error) = self.session_manager.save_event(sid, &user_event).await {
                     tracing::error!("failed to save user message on interruption: {}", error);
                 }
@@ -989,6 +991,7 @@ impl Agent {
             self.frontend
                 .emit(FrontendEvent::ToolCallCompleted {
                     id: id.clone(),
+                    name: name.clone(),
                     is_error: output.is_error,
                     content: output.content.clone(),
                     metadata: output.frontend_metadata.clone(),

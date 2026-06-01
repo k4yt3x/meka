@@ -14,3 +14,9 @@ pub mod codex;
 
 pub use api::OpenAiProvider;
 pub use codex::OpenAiCodexProvider;
+
+/// A `data:` URL for an image, the one piece of image wire-format both sub-providers share (Chat
+/// Completions `image_url.url` and the Responses API `input_image.image_url`).
+fn data_url(source: &crate::provider::ImageSource) -> String {
+    format!("data:{};base64,{}", source.media_type, source.data)
+}

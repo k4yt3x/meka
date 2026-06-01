@@ -453,6 +453,7 @@ async fn run_blocking_turn(
             &mut session_uuid_opt,
             &mut runtime_inner.messages,
             message,
+            Vec::new(),
             cancellation,
         )
         .await;
@@ -529,6 +530,7 @@ async fn run_streaming_turn(
                 &mut session_uuid_opt,
                 &mut runtime_inner.messages,
                 message,
+                Vec::new(),
                 cancel_for_task,
             )
             .await;
@@ -1073,6 +1075,7 @@ mod tests {
             },
             FrontendEvent::ToolCallCompleted {
                 id: "tu_1".into(),
+                name: "read_file".into(),
                 is_error: false,
                 content: vec![ToolResultContent::Text {
                     text: "fn main() {}".into(),

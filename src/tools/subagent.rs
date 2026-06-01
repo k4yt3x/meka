@@ -371,6 +371,7 @@ impl Tool for SpawnAgentTool {
                 &mut session_id_opt,
                 &mut messages,
                 augmented_prompt,
+                Vec::new(),
                 cancellation,
             )
             .await?;

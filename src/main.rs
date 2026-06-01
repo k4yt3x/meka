@@ -374,6 +374,7 @@ pub async fn build_shared_deps(
         .device_id(config.device_id.clone())
         .effort(config.effort.clone())
         .redact_thinking(config.redact_thinking)
+        .max_output_tokens(config.max_output_tokens)
         .session_stats(Some(Arc::clone(&session_stats)))
         .build()?;
 
@@ -625,6 +626,7 @@ async fn create_agent_from_config(
         .device_id(config.device_id.clone())
         .effort(config.effort.clone())
         .redact_thinking(config.redact_thinking)
+        .max_output_tokens(config.max_output_tokens)
         .session_stats(Some(Arc::clone(&session_stats)))
         .build()?;
 
@@ -735,7 +737,7 @@ async fn run_turn_interruptible(
         })
     };
     let result = agent
-        .run_turn(session_id, messages, input, cancellation)
+        .run_turn(session_id, messages, input, Vec::new(), cancellation)
         .await;
     signal_handle.abort();
     // REPL / `meka -p` callers don't surface a stop reason; they only care whether the turn
@@ -1689,7 +1691,8 @@ pub(crate) fn format_session_as_markdown(
                             writeln!(output, "</details>\n").ok();
                         }
                         provider::ContentBlock::ToolResult { .. }
-                        | provider::ContentBlock::Thinking { .. } => {}
+                        | provider::ContentBlock::Thinking { .. }
+                        | provider::ContentBlock::Image { .. } => {}
                     }
                 }
             }

@@ -30,6 +30,8 @@ These are returned in `InitializeResponse.agentCapabilities`:
 - **`sessionCapabilities.list`**: the client may call `session/list` to browse the persisted session catalogue (cwd-filtered, cursor-paginated; sub-agent audit sessions are hidden).
 - **`sessionCapabilities.resume`**: the client may adopt a persisted session id without replaying history.
 - **`sessionCapabilities.close`**: the client may release the active session slot.
+- **`promptCapabilities.embeddedContext: true`**: the client may inline @-mentioned file contents as embedded `resource` blocks (see [Prompt turn](#prompt-turn)).
+- **`promptCapabilities.image`**: follows the active profile's `vision` flag (default `true`; set `vision = false` in `[providers.<name>]` for a text-only model). When `true`, the client may attach `image` blocks.
 
 `mcpCapabilities` is intentionally **not** advertised. meka is itself an MCP client, but the servers it consumes are configured via meka's own `config.toml` rather than the `mcpServers` field on `session/new`. Advertising HTTP/SSE while silently ignoring the client's array would have been misleading; the marker will return when client-supplied MCP server connections are actually implemented.
 
@@ -59,14 +61,23 @@ meka holds an in-memory map of `sessionId → SessionEntry`. Any number of sessi
 
 ## Prompt turn
 
-A `session/prompt` carries a `prompt` array of `ContentBlock`s. meka accepts `text` and `resource_link` blocks (the ACP baseline). `resource_link` blocks are flattened into a `<resource_link name="…" uri="…">description</resource_link>` tag inside the prompt text so the model can see the reference; meka does not fetch the resource server-side. `image`, `audio`, and `resource` blocks are not yet supported and produce `InvalidParams`.
+A `session/prompt` carries a `prompt` array of `ContentBlock`s. meka accepts:
+
+- **`text`**: the baseline.
+- **`resource_link`**: flattened into a `<resource_link name="…" uri="…">description</resource_link>` tag inside the prompt text so the model sees the reference; meka does not fetch the resource server-side.
+- **`resource`** (embedded @-mention contents): a text resource is inlined as a `<resource uri="…">…contents…</resource>` tag; a binary (blob) resource becomes a self-closing `<resource uri="…" encoding="base64"/>` marker (the payload is not inlined).
+- **`image`**: accepted only when the profile has vision on. The payload is normalized through meka's image pipeline (size cap, format conversion) and forwarded to the model as native vision input (Claude `image`, OpenAI chat `image_url`, Codex `input_image`).
+
+`audio` blocks (and `image` when `vision = false`) produce `InvalidParams`.
 
 While the turn runs, meka streams `session/update` notifications:
 
 - `agent_message_chunk` for each piece of assistant text.
 - `agent_thought_chunk` for thinking blocks (Claude OAuth / extended-thinking models).
-- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd), and the raw input.
-- `tool_call_update` when a tool finishes, with the final `status` (`completed` / `failed`) and a `content` array. `edit_file` and `write_file` populate diff content blocks so clients can render the apply-diff UI.
+- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd, with the start line for `read_file`), the raw input, and a human-readable `title`. The title is the tool's primary argument, so editors show what's running rather than the bare tool name: the command for `execute_command`, `Read <path>` / `Edit <path>` / `Write <path>` for file tools, `Fetch <url>`, `Web search: <query>`, etc.
+- `tool_call_update` when a tool finishes, with the final `status` (`completed` / `failed`), a `content` array, and `raw_output` (the structured tool result). `execute_command` output is wrapped in a fenced `console` code block so editors render it monospaced; `edit_file` and `write_file` populate diff content blocks so clients can render the apply-diff UI. (Large outputs offloaded to the scratchpad show the scratchpad reference rather than the full payload.)
+- `plan` whenever the agent's `todo` tool updates the task list, so clients with a plan panel (e.g. Zed) render the live to-do list. meka's `cancelled` todo status maps to `completed`.
+- `session_info_update` once per session, carrying the title (the first user message preview) so a freshly created or loaded tab gets a label without a `session/list` call.
 
 The response carries a final `stopReason`:
 
@@ -120,4 +131,5 @@ Each command carries a generic free-form input hint (`"additional context (optio
 - **Tool-call diff metadata isn't persisted.** A session reopened with `session/load` replays `tool_call_update`s as plain text rather than diffs. The on-disk content is unaffected.
 - **`read` mode + `terminal` capability**: meka runs the local sandboxed shell instead of delegating, to preserve the read-only jail. The shell appears in meka's own output rather than the client's terminal pane until you switch to `ask` or `write`.
 - **Image and regex `read_file`**: stay local. The `fs/read_text_file` request carries only text, so there's no protocol surface to delegate either case.
-- **Single content type in prompts**: meka's `session/prompt` accepts text only today. Image / audio / resource prompts will arrive as meka's `PromptCapabilities` advertise them.
+- **`audio` prompts**: not supported; `audio` content blocks produce `InvalidParams`.
+- **No client-side model gate for images**: when `vision` is on, meka forwards images to whatever model the profile names; a non-vision model returns a provider error rather than meka rejecting up front. Set `vision = false` for text-only endpoints.

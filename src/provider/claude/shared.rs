@@ -74,18 +74,34 @@ pub(super) fn resolve_thinking_enabled(override_atomic: &AtomicI8, default: bool
     )
 }
 
-/// Mirrors Claude Code's `modelSupportsAdaptiveThinking` (`utils/thinking.ts:113-144`): explicit
-/// allowlist for `opus-4-6` / `sonnet-4-6`, explicit deny for any other named opus/sonnet/haiku
-/// (covers Claude 4.0 / 4.5 and Haiku 4.5), default-true for unknown 1P model strings.
-pub(super) fn model_supports_adaptive_thinking(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("opus-4-6") || lower.contains("sonnet-4-6") {
-        return true;
-    }
-    if lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku") {
-        return false;
-    }
-    true
+/// Parse a `(major, minor)` version out of a Claude model name. The version is written as
+/// hyphen-separated digit groups, which sit after the family on the 4.x line (`claude-opus-4-8`)
+/// but before it on the 3.x line (`claude-3-5-sonnet`); in both layouts it is the first one or two
+/// *short* numeric segments. The trailing date stamp (`-20250514`) is skipped because it has more
+/// than two digits. The first short number becomes the major and the next the minor (defaulting to
+/// 0); returns `None` when no version-like segment is present.
+fn parse_model_version(model: &str) -> Option<(u32, u32)> {
+    let mut numbers = model
+        .split('-')
+        .filter(|segment| {
+            !segment.is_empty()
+                && segment.len() <= 2
+                && segment.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .filter_map(|segment| segment.parse::<u32>().ok());
+    let major = numbers.next()?;
+    let minor = numbers.next().unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Whether a Claude model supports adaptive thinking (`thinking: {type: "adaptive"}`, with no
+/// explicit `budget_tokens`) rather than the older budgeted form. Adaptive thinking shipped with
+/// Claude 4.6, so this is true for any model at version 4.6 or newer, read from the model name via
+/// [`parse_model_version`]. Models whose version can't be parsed default to adaptive, matching
+/// Claude Code's default-true for unknown 1P model strings.
+pub(crate) fn model_supports_adaptive_thinking(model: &str) -> bool {
+    const MIN_ADAPTIVE_VERSION: (u32, u32) = (4, 6);
+    parse_model_version(model).is_none_or(|version| version >= MIN_ADAPTIVE_VERSION)
 }
 
 pub(super) fn model_is_haiku(model: &str) -> bool {
@@ -94,22 +110,30 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 
 /// Insert the `max_tokens` + `thinking` fields shared by both Claude providers' request bodies.
 /// Adaptive-thinking models get a fixed 64k ceiling; others get `max(budget*2, 32k)` with an
-/// explicit budget; thinking-off uses a flat 32k.
+/// explicit budget; thinking-off uses a flat 32k. A `max_output_tokens` override (the profile knob)
+/// replaces whichever default would otherwise apply; on the budgeted path it is clamped to stay
+/// above `budget_tokens` (the API rejects `max_tokens <= thinking.budget_tokens`).
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
     thinking_enabled: bool,
     model: &str,
     budget_tokens: u64,
+    max_output_tokens: Option<u64>,
 ) {
     if thinking_enabled {
         if model_supports_adaptive_thinking(model) {
-            body.insert("max_tokens".to_string(), serde_json::json!(64_000));
+            let max_tokens = max_output_tokens.unwrap_or(64_000);
+            body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
             body.insert(
                 "thinking".to_string(),
                 serde_json::json!({ "type": "adaptive" }),
             );
         } else {
-            let max_tokens = std::cmp::max(budget_tokens * 2, 32_000);
+            let default_max = std::cmp::max(budget_tokens * 2, 32_000);
+            // Clamp above the budget so an override that's too small can't produce a 400.
+            let max_tokens = max_output_tokens
+                .unwrap_or(default_max)
+                .max(budget_tokens.saturating_add(1));
             body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
             body.insert(
                 "thinking".to_string(),
@@ -120,7 +144,8 @@ pub(super) fn insert_thinking_fields(
             );
         }
     } else {
-        body.insert("max_tokens".to_string(), serde_json::json!(32_000));
+        let max_tokens = max_output_tokens.unwrap_or(32_000);
+        body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
     }
 }
 
@@ -132,18 +157,12 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
     lower.contains("claude") && !lower.contains("claude-3-")
 }
 
-/// Mirrors Claude Code's `modelSupportsEffort` (`utils/effort.ts:23-49`):
-/// `opus-4-6` / `sonnet-4-6` allowlist, explicit deny for other named
-/// opus/sonnet/haiku, default-true for unknown model strings (meka is 1P).
+/// Whether a Claude model supports the `output_config.effort` knob (the `effort-2025-11-24` beta).
+/// Effort shipped alongside adaptive thinking in Claude 4.6, so the same `>= 4.6` version heuristic
+/// applies (see [`parse_model_version`]); unknown model strings default to true.
 pub(super) fn model_supports_effort(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("opus-4-6") || lower.contains("sonnet-4-6") {
-        return true;
-    }
-    if lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku") {
-        return false;
-    }
-    true
+    const MIN_EFFORT_VERSION: (u32, u32) = (4, 6);
+    parse_model_version(model).is_none_or(|version| version >= MIN_EFFORT_VERSION)
 }
 
 pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<serde_json::Value> {
@@ -170,6 +189,14 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
                             serde_json::json!({
                                 "type": "text",
                                 "text": text,
+                            })
+                        }
+                        // `ImageSource` serializes to `{type:"base64", media_type, data}`, which is
+                        // exactly Anthropic's image `source` object.
+                        ContentBlock::Image { source } => {
+                            serde_json::json!({
+                                "type": "image",
+                                "source": source,
                             })
                         }
                         ContentBlock::ToolUse { id, name, input } => {
@@ -688,19 +715,35 @@ pub(super) fn redact_oldest_images(
 
     'outer: for message in &mut redacted[..last] {
         for block in &mut message.content {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                for item in content.iter_mut() {
-                    if let ToolResultContent::Image { source } = item {
-                        stats.bytes_freed = stats.bytes_freed.saturating_add(source.data.len());
-                        stats.images_redacted = stats.images_redacted.saturating_add(1);
-                        *item = ToolResultContent::Text {
-                            text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
-                        };
-                        if stats.bytes_freed >= bytes_to_drop {
-                            break 'outer;
+            match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    for item in content.iter_mut() {
+                        if let ToolResultContent::Image { source } = item {
+                            stats.bytes_freed = stats.bytes_freed.saturating_add(source.data.len());
+                            stats.images_redacted = stats.images_redacted.saturating_add(1);
+                            *item = ToolResultContent::Text {
+                                text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                            };
+                            if stats.bytes_freed >= bytes_to_drop {
+                                break 'outer;
+                            }
                         }
                     }
                 }
+                // Input images (ACP @-mentions) count toward the same 32 MiB cap; collapse them to
+                // the placeholder text just like tool-result images.
+                ContentBlock::Image { source } => {
+                    let freed = source.data.len();
+                    stats.bytes_freed = stats.bytes_freed.saturating_add(freed);
+                    stats.images_redacted = stats.images_redacted.saturating_add(1);
+                    *block = ContentBlock::Text {
+                        text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                    };
+                    if stats.bytes_freed >= bytes_to_drop {
+                        break 'outer;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -725,26 +768,60 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
         ImageFormat::from_mime_type(media_type)
     }
 
-    // First pass: detect whether any image needs downscaling. Cheap: just base64-decode to peek at
-    // header bytes. If nothing's oversized, skip the clone+rewrite entirely and return
+    // True when this image decodes and exceeds the per-axis pixel cap.
+    fn oversized(source: &crate::provider::ImageSource) -> bool {
+        let Some(format) = parse_format(&source.media_type) else {
+            return false;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&source.data) else {
+            return false;
+        };
+        crate::image::read_image_dimensions(&bytes, format)
+            .map(|(w, h)| w > MAX_IMAGE_DIMENSION_PX || h > MAX_IMAGE_DIMENSION_PX)
+            .unwrap_or(false)
+    }
+
+    // Re-encode `source` to a within-cap PNG in place; no-op if it can't be decoded or already
+    // fits.
+    fn downscale_in_place(source: &mut crate::provider::ImageSource) {
+        let Some(format) = parse_format(&source.media_type) else {
+            return;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&source.data) else {
+            return;
+        };
+        let Ok((w, h)) = crate::image::read_image_dimensions(&bytes, format) else {
+            return;
+        };
+        if w <= MAX_IMAGE_DIMENSION_PX && h <= MAX_IMAGE_DIMENSION_PX {
+            return;
+        }
+        match crate::image::downscale_to_dim_cap(&bytes, format, MAX_IMAGE_DIMENSION_PX) {
+            Ok(png) => {
+                source.media_type = "image/png".to_string();
+                source.data = base64::engine::general_purpose::STANDARD.encode(&png);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed to downscale {}x{} {} image: {}",
+                    w,
+                    h,
+                    source.media_type,
+                    error,
+                );
+            }
+        }
+    }
+
+    // First pass: detect whether any image - tool-result OR input (`ContentBlock::Image`) - needs
+    // downscaling. Cheap header read; if nothing's oversized, skip the clone+rewrite and return
     // Cow::Borrowed.
     let needs_work = messages.iter().any(|message| {
         message.content.iter().any(|block| match block {
-            ContentBlock::ToolResult { content, .. } => content.iter().any(|item| match item {
-                ToolResultContent::Image { source } => {
-                    let Some(format) = parse_format(&source.media_type) else {
-                        return false;
-                    };
-                    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&source.data)
-                    else {
-                        return false;
-                    };
-                    crate::image::read_image_dimensions(&bytes, format)
-                        .map(|(w, h)| w > MAX_IMAGE_DIMENSION_PX || h > MAX_IMAGE_DIMENSION_PX)
-                        .unwrap_or(false)
-                }
-                _ => false,
-            }),
+            ContentBlock::ToolResult { content, .. } => content.iter().any(
+                |item| matches!(item, ToolResultContent::Image { source } if oversized(source)),
+            ),
+            ContentBlock::Image { source } => oversized(source),
             _ => false,
         })
     });
@@ -755,45 +832,16 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
     let mut owned: Vec<Message> = messages.to_vec();
     for message in owned.iter_mut() {
         for block in message.content.iter_mut() {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                for item in content.iter_mut() {
-                    if let ToolResultContent::Image { source } = item {
-                        let Some(format) = parse_format(&source.media_type) else {
-                            continue;
-                        };
-                        let Ok(bytes) =
-                            base64::engine::general_purpose::STANDARD.decode(&source.data)
-                        else {
-                            continue;
-                        };
-                        let Ok((w, h)) = crate::image::read_image_dimensions(&bytes, format) else {
-                            continue;
-                        };
-                        if w <= MAX_IMAGE_DIMENSION_PX && h <= MAX_IMAGE_DIMENSION_PX {
-                            continue;
-                        }
-                        match crate::image::downscale_to_dim_cap(
-                            &bytes,
-                            format,
-                            MAX_IMAGE_DIMENSION_PX,
-                        ) {
-                            Ok(png) => {
-                                source.media_type = "image/png".to_string();
-                                source.data =
-                                    base64::engine::general_purpose::STANDARD.encode(&png);
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    "failed to downscale {}x{} {} image: {}",
-                                    w,
-                                    h,
-                                    source.media_type,
-                                    error,
-                                );
-                            }
+            match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    for item in content.iter_mut() {
+                        if let ToolResultContent::Image { source } = item {
+                            downscale_in_place(source);
                         }
                     }
                 }
+                ContentBlock::Image { source } => downscale_in_place(source),
+                _ => {}
             }
         }
     }
@@ -865,6 +913,75 @@ mod tests {
     use crate::provider::ImageSource;
 
     #[test]
+    fn test_convert_messages_serializes_input_image() {
+        let message =
+            crate::provider::Message::user_with_images("look at this", vec![ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: "QUJD".to_string(),
+            }]);
+        let converted = convert_messages_to_claude_content(&[message]);
+        let blocks = converted[0]["content"].as_array().expect("content array");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn test_redact_oldest_images_redacts_input_image() {
+        let big = "x".repeat(2_000);
+        let messages = vec![
+            crate::provider::Message::user_with_images("first", vec![ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: big.clone(),
+            }]),
+            // A trailing message: the last message is never redacted.
+            crate::provider::Message::assistant_text("ok"),
+        ];
+        let (redacted, stats) = redact_oldest_images(&messages, 1_000);
+        assert_eq!(stats.images_redacted, 1);
+        assert!(stats.bytes_freed >= 2_000);
+        // The input image block became a text placeholder.
+        assert!(matches!(&redacted[0].content[1], ContentBlock::Text { .. }));
+    }
+
+    #[test]
+    fn test_insert_thinking_fields_max_output_default_thinking_off() {
+        let mut body = serde_json::Map::new();
+        insert_thinking_fields(&mut body, false, "claude-opus-4-8", 10_000, None);
+        assert_eq!(body["max_tokens"], 32_000);
+    }
+
+    #[test]
+    fn test_insert_thinking_fields_max_output_override_thinking_off() {
+        let mut body = serde_json::Map::new();
+        insert_thinking_fields(&mut body, false, "claude-opus-4-8", 10_000, Some(50_000));
+        assert_eq!(body["max_tokens"], 50_000);
+    }
+
+    #[test]
+    fn test_insert_thinking_fields_max_output_override_adaptive() {
+        // `opus-4-6` is an adaptive-thinking model; the override replaces the 64k default.
+        let mut body = serde_json::Map::new();
+        insert_thinking_fields(&mut body, true, "claude-opus-4-6", 10_000, Some(80_000));
+        assert_eq!(body["max_tokens"], 80_000);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn test_insert_thinking_fields_max_output_clamped_above_budget() {
+        // Non-adaptive thinking sends an explicit budget; an override below it is clamped so the
+        // API's `max_tokens > budget_tokens` invariant holds.
+        let mut body = serde_json::Map::new();
+        insert_thinking_fields(&mut body, true, "claude-3-5-sonnet", 20_000, Some(5_000));
+        assert_eq!(body["max_tokens"], 20_001);
+        assert_eq!(body["thinking"]["budget_tokens"], 20_000);
+    }
+
+    #[test]
     fn test_is_thinking_enabled_override_off() {
         assert!(!is_thinking_enabled(0, true));
         assert!(!is_thinking_enabled(0, false));
@@ -908,6 +1025,55 @@ mod tests {
         assert!(!model_supports_effort("claude-haiku-4-5-20251001"));
         // Unknown 1P model defaults to true.
         assert!(model_supports_effort("claude-future-experimental-7"));
+    }
+
+    #[test]
+    fn test_parse_model_version() {
+        assert_eq!(parse_model_version("claude-opus-4-8"), Some((4, 8)));
+        // Trailing date stamp is ignored (too many digits).
+        assert_eq!(
+            parse_model_version("claude-opus-4-6-20250514"),
+            Some((4, 6))
+        );
+        assert_eq!(parse_model_version("claude-sonnet-4-5"), Some((4, 5)));
+        // 3.x line carries the version before the family.
+        assert_eq!(
+            parse_model_version("claude-3-5-sonnet-20241022"),
+            Some((3, 5))
+        );
+        // A single version segment -> minor defaults to 0.
+        assert_eq!(parse_model_version("claude-3-opus-20240229"), Some((3, 0)));
+        assert_eq!(
+            parse_model_version("claude-sonnet-4-20250514"),
+            Some((4, 0))
+        );
+        // No version-like segment at all.
+        assert_eq!(parse_model_version("claude-custom"), None);
+    }
+
+    #[test]
+    fn test_model_supports_adaptive_thinking_by_version() {
+        // 4.6 is the cutoff: 4.6 and newer use adaptive thinking.
+        assert!(model_supports_adaptive_thinking("claude-opus-4-6"));
+        assert!(model_supports_adaptive_thinking("claude-sonnet-4-6"));
+        // Regression: opus 4.8 was wrongly denied by the old hardcoded allowlist.
+        assert!(model_supports_adaptive_thinking("claude-opus-4-8"));
+        assert!(model_supports_adaptive_thinking("claude-opus-5-0"));
+        assert!(model_supports_adaptive_thinking("claude-opus-4-6-20250514"));
+        // Older than 4.6 -> budgeted thinking.
+        assert!(!model_supports_adaptive_thinking("claude-sonnet-4-5"));
+        assert!(!model_supports_adaptive_thinking("claude-opus-4-1"));
+        assert!(!model_supports_adaptive_thinking(
+            "claude-haiku-4-5-20251001"
+        ));
+        assert!(!model_supports_adaptive_thinking(
+            "claude-3-5-sonnet-20241022"
+        ));
+        assert!(!model_supports_adaptive_thinking("claude-3-opus-20240229"));
+        // Unparseable version -> default to adaptive (matches Claude Code's 1P default).
+        assert!(model_supports_adaptive_thinking(
+            "claude-future-experimental"
+        ));
     }
 
     #[test]
@@ -1138,6 +1304,39 @@ mod tests {
             downscale_oversized_images(&messages),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn test_downscale_resizes_oversized_input_image() {
+        use base64::Engine;
+        use image::ImageFormat;
+        // A user message with a top-level input image (ACP @-mention / pasted screenshot) must be
+        // downscaled the same as a tool-result image, or Anthropic rejects the multi-image request.
+        let big = synthesize_png_base64(2400, 1200);
+        let messages = vec![crate::provider::Message::user_with_images("look", vec![
+            crate::provider::ImageSource {
+                source_type: "base64".to_string(),
+                media_type: "image/png".to_string(),
+                data: big,
+            },
+        ])];
+        let owned = match downscale_oversized_images(&messages) {
+            Cow::Owned(v) => v,
+            Cow::Borrowed(_) => panic!("expected owned (input-image resize triggered)"),
+        };
+        // content[0] = Text, content[1] = the downscaled input image.
+        match &owned[0].content[1] {
+            ContentBlock::Image { source } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&source.data)
+                    .expect("decode");
+                let decoded =
+                    image::load_from_memory_with_format(&bytes, ImageFormat::Png).expect("png");
+                assert!(decoded.width() <= MAX_IMAGE_DIMENSION_PX);
+                assert!(decoded.height() <= MAX_IMAGE_DIMENSION_PX);
+            }
+            other => panic!("expected downscaled input image; got {:?}", other),
+        }
     }
 
     #[test]
