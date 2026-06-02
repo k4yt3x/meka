@@ -209,6 +209,7 @@ fn encode_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
 #[derive(Default)]
 pub(super) struct SseState {
     active_tool_call: Option<ActiveToolCall>,
+    completed_tool_call: bool,
     in_reasoning: bool,
     /// Once `response.completed` (or `response.failed` / `response.incomplete`) has been
     /// processed, the driver should stop pulling new events.
@@ -307,6 +308,7 @@ pub(super) fn process_event(
                         }
                     }
                 };
+                state.completed_tool_call = true;
                 out.push(StreamEvent::ToolUseEnd { input });
             } else if item_type == "reasoning" && state.in_reasoning {
                 state.in_reasoning = false;
@@ -339,6 +341,12 @@ pub(super) fn process_event(
                     .and_then(|v| v.as_str())
                     .map(parse_response_status)
                     .unwrap_or(StopReason::EndTurn);
+                let stop_reason =
+                    if matches!(stop_reason, StopReason::EndTurn) && state.completed_tool_call {
+                        StopReason::ToolUse
+                    } else {
+                        stop_reason
+                    };
                 out.push(StreamEvent::MessageEnd { stop_reason });
             } else {
                 out.push(StreamEvent::MessageEnd {
@@ -790,7 +798,7 @@ mod tests {
             other => panic!("expected ToolUseEnd, got {:?}", other),
         }
         assert!(matches!(events[4], StreamEvent::MessageEnd {
-            stop_reason: StopReason::EndTurn
+            stop_reason: StopReason::ToolUse
         }));
     }
 
@@ -829,6 +837,13 @@ mod tests {
             })
             .expect("ToolUseEnd present");
         assert_eq!(input["k"], 1);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd {
+                    stop_reason: StopReason::ToolUse
+                }))
+        );
     }
 
     #[test]
