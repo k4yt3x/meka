@@ -2146,7 +2146,17 @@ async fn handle_load_session(
             ));
         }
     };
-    let conversation = Conversation::from_events(events);
+    let mut conversation = Conversation::from_events(events);
+    // Drop an orphaned `tool_use` (no following `tool_result`) before adopting the session; the
+    // provider rejects orphans on the next request. Mirrors the REPL resume path.
+    let dropped = conversation.sanitize_orphans();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "dropped {} orphaned assistant message(s) with unmatched tool calls while loading session {}",
+            dropped.len(),
+            session_uuid,
+        );
+    }
     let session_id: SessionId = session_id_str.clone().into();
 
     let runtime = match build_session_runtime(
@@ -2330,7 +2340,17 @@ async fn handle_resume_session(
             ));
         }
     };
-    let conversation = Conversation::from_events(events);
+    let mut conversation = Conversation::from_events(events);
+    // Drop an orphaned `tool_use` (no following `tool_result`) before adopting the session; the
+    // provider rejects orphans on the next request. Mirrors the REPL resume path.
+    let dropped = conversation.sanitize_orphans();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "dropped {} orphaned assistant message(s) with unmatched tool calls while loading session {}",
+            dropped.len(),
+            session_uuid,
+        );
+    }
     let session_id: SessionId = session_id_str.clone().into();
 
     let runtime = match build_session_runtime(

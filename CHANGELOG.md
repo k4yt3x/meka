@@ -5,10 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.27.3] - 2026-06-11
+
+### Changed
+
+- Detect adaptive thinking / effort by excluding known pre-4.6 models, not gating on `>= 4.6`.
 
 ### Fixed
 
+- Execute tool calls present in the assistant message regardless of the reported stop reason.
+- Show a stand-in message when the model refuses with empty content, instead of a blank turn.
 - OpenAI Codex tool calls now execute before the next Responses API request.
 
 ## [0.27.2] - 2026-06-01

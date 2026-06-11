@@ -94,14 +94,28 @@ fn parse_model_version(model: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Whether `model` is a known *pre-4.6* Claude model, i.e. one that predates adaptive thinking and
+/// the `output_config.effort` knob (both shipped with Claude 4.6). Rather than allowlist the models
+/// that have these features (which silently denies every newly released model, like
+/// `claude-fable-5`, until the list is updated), we denylist the ones that don't: only the families
+/// that existed before 4.6 - `opus`, `sonnet`, `haiku`, and the Claude 3.x line - can predate them,
+/// and then only when their parsed version (see [`parse_model_version`]) is below 4.6. Any other
+/// model - a new family such as `fable`, or anything without a recognised pre-4.6 family - is
+/// assumed to support these features regardless of its version number.
+fn model_predates_adaptive_thinking(model: &str) -> bool {
+    const ADAPTIVE_MIN_VERSION: (u32, u32) = (4, 6);
+    let lower = model.to_ascii_lowercase();
+    let pre_adaptive_family =
+        lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku");
+    pre_adaptive_family
+        && parse_model_version(&lower).is_some_and(|version| version < ADAPTIVE_MIN_VERSION)
+}
+
 /// Whether a Claude model supports adaptive thinking (`thinking: {type: "adaptive"}`, with no
-/// explicit `budget_tokens`) rather than the older budgeted form. Adaptive thinking shipped with
-/// Claude 4.6, so this is true for any model at version 4.6 or newer, read from the model name via
-/// [`parse_model_version`]. Models whose version can't be parsed default to adaptive, matching
-/// Claude Code's default-true for unknown 1P model strings.
+/// explicit `budget_tokens`) rather than the older budgeted form. Enabled by default; only known
+/// pre-4.6 models are excluded (see [`model_predates_adaptive_thinking`]).
 pub(crate) fn model_supports_adaptive_thinking(model: &str) -> bool {
-    const MIN_ADAPTIVE_VERSION: (u32, u32) = (4, 6);
-    parse_model_version(model).is_none_or(|version| version >= MIN_ADAPTIVE_VERSION)
+    !model_predates_adaptive_thinking(model)
 }
 
 pub(super) fn model_is_haiku(model: &str) -> bool {
@@ -158,11 +172,10 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 }
 
 /// Whether a Claude model supports the `output_config.effort` knob (the `effort-2025-11-24` beta).
-/// Effort shipped alongside adaptive thinking in Claude 4.6, so the same `>= 4.6` version heuristic
-/// applies (see [`parse_model_version`]); unknown model strings default to true.
+/// Effort shipped alongside adaptive thinking in Claude 4.6, so it follows the same rule: enabled
+/// by default, excluded only for known pre-4.6 models (see [`model_predates_adaptive_thinking`]).
 pub(super) fn model_supports_effort(model: &str) -> bool {
-    const MIN_EFFORT_VERSION: (u32, u32) = (4, 6);
-    parse_model_version(model).is_none_or(|version| version >= MIN_EFFORT_VERSION)
+    !model_predates_adaptive_thinking(model)
 }
 
 pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<serde_json::Value> {
@@ -1025,6 +1038,9 @@ mod tests {
         assert!(!model_supports_effort("claude-haiku-4-5-20251001"));
         // Unknown 1P model defaults to true.
         assert!(model_supports_effort("claude-future-experimental-7"));
+        // New families are effort-capable by default, even with a low version number.
+        assert!(model_supports_effort("claude-fable-5"));
+        assert!(model_supports_effort("claude-fable-2"));
     }
 
     #[test]
@@ -1074,6 +1090,12 @@ mod tests {
         assert!(model_supports_adaptive_thinking(
             "claude-future-experimental"
         ));
+        // New model families are adaptive by default; the denylist only excludes known pre-4.6
+        // families.
+        assert!(model_supports_adaptive_thinking("claude-fable-5"));
+        // A new family is adaptive even with a low version number (the old `>= 4.6` rule would
+        // wrongly deny this).
+        assert!(model_supports_adaptive_thinking("claude-fable-2"));
     }
 
     #[test]

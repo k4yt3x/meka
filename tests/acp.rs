@@ -4872,3 +4872,82 @@ fn acp_session_prompt_refusal_stop_reason() {
         response,
     );
 }
+
+/// An *empty* refusal: Claude streams `stop_reason: "refusal"` with no body (as fable-5 does after
+/// a search surfaces disallowed content). meka must still surface a visible stand-in message
+/// instead of a blank turn. Regression for session fad3ed41, where the turn rendered nothing and
+/// persisted an empty `[]` assistant message.
+#[test]
+fn acp_empty_refusal_surfaces_standin_message() {
+    let script = serde_json::json!([[
+        { "kind": "message_end", "stop_reason": "refusal" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "trigger an empty refusal");
+    let (updates, response) = harness.collect_updates(&sid, id);
+    assert_eq!(
+        response["result"]["stopReason"], "refusal",
+        "empty refusal must still surface as ACP `refusal`: {}",
+        response,
+    );
+    let dump = format!("{:?}", updates);
+    assert!(
+        dump.contains("declined to respond"),
+        "empty refusal must surface a stand-in agent_message_chunk; updates: {}",
+        dump,
+    );
+}
+
+/// Regression: tool calls must run off the *presence* of `tool_use` blocks, not the reported stop
+/// reason. Providers mislabel it - OpenAI Codex reports `completed` for a tool turn, and Claude
+/// occasionally reports `end_turn` with `tool_use` present. Here the mock emits a complete
+/// `read_file` call but ends the turn with `stop_reason: "end_turn"`; meka must still execute the
+/// tool (and the turn completes normally) instead of orphaning the call and breaking the next
+/// request.
+#[test]
+fn acp_tool_calls_execute_despite_non_tool_use_stop_reason() {
+    let config_toml = r#"
+[providers.mock]
+type = "claude-api"
+model = "claude-sonnet-4-5"
+"#;
+    let mut harness = AcpTestHarness::builder()
+        .config(config_toml)
+        .pre_spawn(|config_dir| {
+            let target = config_dir.join("target.txt");
+            std::fs::write(&target, "hello from mock test\n").expect("write target");
+            serde_json::json!([
+                [
+                    { "kind": "text", "text": "reading the file...\n" },
+                    { "kind": "tool_use_start", "id": "call_1", "name": "read_file" },
+                    { "kind": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
+                    // The bug condition: a complete tool call, but the stop reason is NOT "tool_use".
+                    { "kind": "message_end", "stop_reason": "end_turn" }
+                ],
+                [
+                    { "kind": "text", "text": "done!" },
+                    { "kind": "message_end", "stop_reason": "end_turn" }
+                ]
+            ])
+        })
+        .build();
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "read the target file");
+    let (updates, response) = harness.collect_updates(&sid, id);
+
+    // The tool must have executed despite the end_turn stop reason.
+    assert!(
+        updates.iter().any(|value| {
+            let update = &value["params"]["update"];
+            update["sessionUpdate"] == "tool_call_update" && update["status"] == "completed"
+        }),
+        "tool must execute even with a non-tool_use stop reason; updates: {:?}",
+        updates,
+    );
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "turn should complete normally after the tool round; full response: {}",
+        response,
+    );
+}
