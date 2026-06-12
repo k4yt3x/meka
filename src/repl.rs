@@ -10,9 +10,10 @@ use std::{
 use async_trait::async_trait;
 use crossterm::style::{Color, Stylize};
 use reedline::{
-    EditCommand, Emacs, ExternalPrinter, Highlighter, History, KeyCode, KeyModifiers, Prompt,
-    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent,
-    Signal, StyledText, default_emacs_keybindings,
+    ColumnarMenu, Completer, DefaultHinter, EditCommand, Emacs, ExternalPrinter, Highlighter,
+    History, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
+    Suggestion, default_emacs_keybindings,
 };
 
 use crate::{
@@ -22,9 +23,105 @@ use crate::{
     render::{self, OutputSpacing, RenderMode, StreamingRenderer},
 };
 
-/// Reedline highlighter that paints the entire input buffer with a single style. The final paint
-/// reedline emits on submit is what lands in scrollback, so this is what visually separates user
-/// prompts from assistant output.
+/// A top-level REPL slash command, used to drive both `print_help` and the Tab completer so the
+/// command list lives in one place. The execution-side grammar (aliases, argument splitting,
+/// `/mcp` and `/skill` subcommands) stays in `parse_slash_command`; this table only models the
+/// names that are completed and documented.
+struct CommandSpec {
+    name: &'static str,
+    /// Alternate spellings the parser also accepts. Honored by the highlighter but never offered
+    /// as separate completions.
+    aliases: &'static [&'static str],
+    help: &'static str,
+    /// Argument syntax shown after the name in help, empty for no-argument commands. A non-empty
+    /// hint is the "takes an argument" predicate that drives completion's trailing space.
+    arg_hint: &'static str,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "help",
+        aliases: &["?"],
+        help: "Show this help message",
+        arg_hint: "",
+    },
+    CommandSpec {
+        name: "exit",
+        aliases: &["quit"],
+        help: "Exit the shell",
+        arg_hint: "",
+    },
+    CommandSpec {
+        name: "clear",
+        aliases: &[],
+        help: "Clear the terminal screen",
+        arg_hint: "",
+    },
+    CommandSpec {
+        name: "session",
+        aliases: &[],
+        help: "Show the current session ID",
+        arg_hint: "",
+    },
+    CommandSpec {
+        name: "permission",
+        aliases: &[],
+        help: "Show or set the permission level",
+        arg_hint: "[none|read|ask|write]",
+    },
+    CommandSpec {
+        name: "compact",
+        aliases: &[],
+        help: "Summarize and compact the session",
+        arg_hint: "",
+    },
+    CommandSpec {
+        name: "export",
+        aliases: &[],
+        help: "Export the current session as Markdown",
+        arg_hint: "",
+    },
+    CommandSpec {
+        name: "cd",
+        aliases: &[],
+        help: "Change working directory",
+        arg_hint: "<path>",
+    },
+    CommandSpec {
+        name: "skill",
+        aliases: &[],
+        help: "List skills, or invoke one with extra context",
+        arg_hint: "[name] [extra...]",
+    },
+    CommandSpec {
+        name: "mcp",
+        aliases: &[],
+        help: "Manage MCP servers and prompts",
+        arg_hint: "<subcommand>",
+    },
+    CommandSpec {
+        name: "status",
+        aliases: &[],
+        help: "Show session stats (turns, tokens, cache, redactions)",
+        arg_hint: "",
+    },
+    CommandSpec {
+        name: "history",
+        aliases: &[],
+        help: "Reprint past conversation (bare = all, N = last N turns)",
+        arg_hint: "[N]",
+    },
+];
+
+/// Foreground applied to the leading token of a recognized slash command.
+const KNOWN_COLOR: nu_ansi_term::Color = nu_ansi_term::Color::Green;
+/// Foreground applied to the leading token when it starts with `/` but is not a known command.
+const UNKNOWN_COLOR: nu_ansi_term::Color = nu_ansi_term::Color::Red;
+
+/// Reedline highlighter for the input buffer. The leading `/command` token is recolored to signal
+/// whether it is recognized; everything else keeps the base style. The final paint reedline emits
+/// on submit is what lands in scrollback, so this is also what visually separates user prompts from
+/// assistant output.
 struct UserInputHighlighter {
     style: nu_ansi_term::Style,
 }
@@ -32,12 +129,202 @@ struct UserInputHighlighter {
 impl Highlighter for UserInputHighlighter {
     fn highlight(&self, line: &str, _cursor: usize) -> StyledText {
         let mut text = StyledText::new();
-        text.push((self.style, line.to_string()));
+        if let Some(after_slash) = line.strip_prefix('/') {
+            let word_len = after_slash
+                .find(char::is_whitespace)
+                .unwrap_or(after_slash.len());
+            let word = &after_slash[..word_len];
+            let (token, remainder) = line.split_at(word_len + 1);
+            let known = COMMANDS
+                .iter()
+                .any(|command| command.name == word || command.aliases.contains(&word));
+            let token_color = if known { KNOWN_COLOR } else { UNKNOWN_COLOR };
+            text.push((self.style.fg(token_color), token.to_string()));
+            if !remainder.is_empty() {
+                text.push((self.style, remainder.to_string()));
+            }
+        } else {
+            text.push((self.style, line.to_string()));
+        }
         text
     }
 }
 
+/// Tab completer for slash commands. The data needed to complete arguments (MCP server names,
+/// skill names) is snapshotted at construction because reedline re-invokes `complete()` on every
+/// keystroke while the menu is open, so a per-keystroke filesystem scan like `discover_skills`
+/// (which reads every `SKILL.md`) must never live in the hot path.
+struct SlashCompleter {
+    mcp_server_names: Vec<String>,
+    skill_names: Vec<String>,
+    cwd: crate::agent::SharedCwd,
+}
+
+/// `/mcp` first-argument keywords, mirroring the grammar of `parse_mcp_slash`.
+const MCP_SUBCOMMANDS: [&str; 4] = ["list", "reconnect", "login", "logout"];
+
+/// Permission levels in canonical order, sourced through the `Display` impl so the completions
+/// cannot drift from what the parser accepts.
+const PERMISSION_LEVELS: [crate::permission::Permission; 4] = [
+    crate::permission::Permission::None,
+    crate::permission::Permission::Read,
+    crate::permission::Permission::Ask,
+    crate::permission::Permission::Write,
+];
+
+impl Completer for SlashCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        let Some(after_slash) = line.strip_prefix('/') else {
+            return Vec::new();
+        };
+        let before_cursor = line.get(..pos).unwrap_or(line);
+
+        if !before_cursor.contains(char::is_whitespace) {
+            // Cursor is still in the command word: complete command names. Aliases are
+            // intentionally not prefix-matched, since offering both `/exit` and `/quit`
+            // would just be noise.
+            let typed = line.get(1..pos).unwrap_or("");
+            return COMMANDS
+                .iter()
+                .filter(|command| command.name.starts_with(typed))
+                .map(|command| Suggestion {
+                    value: format!("/{}", command.name),
+                    description: Some(command.help.to_string()),
+                    append_whitespace: !command.arg_hint.is_empty(),
+                    span: Span::new(0, pos),
+                    ..Suggestion::default()
+                })
+                .collect();
+        }
+
+        let command = after_slash.split_whitespace().next().unwrap_or("");
+        let token_start = before_cursor
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        let prefix = line.get(token_start..pos).unwrap_or("");
+        // The command word is token 0, so the first argument is token 1.
+        let argument_index = before_cursor
+            .get(..token_start)
+            .unwrap_or("")
+            .split_whitespace()
+            .count();
+
+        match command {
+            "permission" if argument_index == 1 => terminal_suggestions(
+                PERMISSION_LEVELS.iter().map(|level| level.to_string()),
+                prefix,
+                token_start,
+                pos,
+            ),
+            "skill" if argument_index == 1 => {
+                terminal_suggestions(self.skill_names.iter().cloned(), prefix, token_start, pos)
+            }
+            "mcp" if argument_index == 1 => terminal_suggestions(
+                MCP_SUBCOMMANDS.iter().map(|keyword| keyword.to_string()),
+                prefix,
+                token_start,
+                pos,
+            ),
+            "mcp" if argument_index == 2 => {
+                let subcommand = before_cursor
+                    .get(..token_start)
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("");
+                if matches!(subcommand, "reconnect" | "login" | "logout") {
+                    terminal_suggestions(
+                        self.mcp_server_names.iter().cloned(),
+                        prefix,
+                        token_start,
+                        pos,
+                    )
+                } else {
+                    Vec::new()
+                }
+            }
+            "cd" => complete_cd_path(&self.cwd, prefix, token_start, pos),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Build suggestions for a terminal (single-token) argument, prefix-filtered. A trailing space is
+/// appended so the user can move on once a value is chosen.
+fn terminal_suggestions(
+    candidates: impl IntoIterator<Item = String>,
+    prefix: &str,
+    token_start: usize,
+    pos: usize,
+) -> Vec<Suggestion> {
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.starts_with(prefix))
+        .map(|candidate| Suggestion {
+            value: candidate,
+            append_whitespace: true,
+            span: Span::new(token_start, pos),
+            ..Suggestion::default()
+        })
+        .collect()
+}
+
+/// Complete a `/cd` argument token to matching subdirectories. Only directories are offered (`/cd`
+/// rejects files), and each value ends in `/` so Tab can keep drilling into nested directories.
+fn complete_cd_path(
+    cwd: &crate::agent::SharedCwd,
+    token: &str,
+    token_start: usize,
+    pos: usize,
+) -> Vec<Suggestion> {
+    let (parent_portion, partial) = match token.rfind('/') {
+        Some(index) => (&token[..=index], &token[index + 1..]),
+        None => ("", token),
+    };
+
+    let scan_dir = if parent_portion.is_empty() {
+        crate::agent::cwd_snapshot(cwd)
+    } else {
+        let Some(expanded) = expand_cd_target(parent_portion) else {
+            return Vec::new();
+        };
+        crate::agent::resolve_against_cwd(cwd, expanded)
+    };
+
+    let entries = match std::fs::read_dir(&scan_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut suggestions = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        // Hide dotfiles unless the user has started typing a dot, mirroring shell completion.
+        if name.starts_with('.') && !partial.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(partial) {
+            continue;
+        }
+        suggestions.push(Suggestion {
+            value: format!("{parent_portion}{name}/"),
+            append_whitespace: false,
+            span: Span::new(token_start, pos),
+            ..Suggestion::default()
+        });
+    }
+    suggestions
+}
+
 const CYCLE_PERMISSION_SENTINEL: &str = "__cycle_permission__";
+const COMPLETION_MENU: &str = "completion_menu";
 
 struct MekaPrompt {
     shared_permission: SharedPermission,
@@ -132,6 +419,7 @@ fn build_reedline_editor(
     input_style: nu_ansi_term::Style,
     printer: ExternalPrinter<String>,
     history: Option<Box<dyn History>>,
+    completer: SlashCompleter,
 ) -> Reedline {
     let mut keybindings = default_emacs_keybindings();
 
@@ -153,10 +441,26 @@ fn build_reedline_editor(
         ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
     );
 
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Tab,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Menu(COMPLETION_MENU.to_string()),
+            ReedlineEvent::MenuNext,
+        ]),
+    );
+
     let emacs_mode = Emacs::new(keybindings);
     let mut editor = Reedline::create()
         .with_edit_mode(Box::new(emacs_mode))
         .with_highlighter(Box::new(UserInputHighlighter { style: input_style }))
+        .with_hinter(Box::new(DefaultHinter::default().with_style(
+            nu_ansi_term::Style::new().fg(nu_ansi_term::Color::DarkGray),
+        )))
+        .with_completer(Box::new(completer))
+        .with_menu(ReedlineMenu::EngineCompleter(Box::new(
+            ColumnarMenu::default().with_name(COMPLETION_MENU),
+        )))
         .use_bracketed_paste(true)
         .with_external_printer(printer);
     if let Some(history) = history {
@@ -350,27 +654,34 @@ fn format_enabled(enabled: EnabledPermissions) -> String {
 
 fn print_help() {
     eprintln!("Commands:");
-    eprintln!("  /help                          Show this help message");
-    eprintln!("  /exit                          Exit the shell");
-    eprintln!("  /clear                         Clear the terminal screen");
-    eprintln!("  /session                       Show the current session ID");
-    eprintln!("  /permission [none|read|ask|write]  Show or set the permission level");
-    eprintln!("  /compact                       Summarize and compact the session");
-    eprintln!("  /export                        Export the current session as Markdown");
-    eprintln!("  /cd <path>                     Change working directory");
-    eprintln!("  /skill                         List installed skills");
-    eprintln!("  /skill <name> [extra...]       Invoke a skill, optionally with extra context");
-    eprintln!("  /mcp                           List configured MCP servers");
-    eprintln!("  /mcp reconnect <server>        Reconnect smoke-test for one server");
-    eprintln!("  /mcp login <server>            Run the OAuth flow for a server");
-    eprintln!("  /mcp logout <server>           Clear stored credentials for a server");
-    eprintln!("  /mcp <server>:<prompt> [args]  Render an MCP prompt as the next turn");
-    eprintln!(
-        "  /status                        Show session stats (turns, tokens, cache, redactions)"
-    );
-    eprintln!(
-        "  /history [N]                   Reprint past conversation (bare = all, N = last N turns)"
-    );
+    for command in COMMANDS {
+        let left = if command.arg_hint.is_empty() {
+            format!("/{}", command.name)
+        } else {
+            format!("/{} {}", command.name, command.arg_hint)
+        };
+        eprintln!("  {left:<31}  {}", command.help);
+        if command.name == "mcp" {
+            // The /mcp subcommands are arguments, not top-level commands, so they are absent from
+            // COMMANDS; list them here so help still documents the full grammar.
+            eprintln!(
+                "  {:<31}  Reconnect smoke-test for one server",
+                "/mcp reconnect <server>"
+            );
+            eprintln!(
+                "  {:<31}  Run the OAuth flow for a server",
+                "/mcp login <server>"
+            );
+            eprintln!(
+                "  {:<31}  Clear stored credentials for a server",
+                "/mcp logout <server>"
+            );
+            eprintln!(
+                "  {:<31}  Render an MCP prompt as the next turn",
+                "/mcp <server>:<prompt> [args]"
+            );
+        }
+    }
     eprintln!();
     eprintln!("Shortcuts:");
     eprintln!("  !<command>    Execute a shell command directly");
@@ -389,6 +700,7 @@ pub fn run_repl(
     input_sender: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
     agent_event_receiver: std::sync::mpsc::Receiver<AgentToReplEvent>,
     cwd: crate::agent::SharedCwd,
+    mcp_server_names: Vec<String>,
     history_db_path: Option<PathBuf>,
 ) {
     // Install reedline's `ExternalPrinter` on the process-global tracing writer BEFORE the first
@@ -411,7 +723,21 @@ pub fn run_repl(
         }
     });
 
-    let mut editor = build_reedline_editor(input_style, printer, history);
+    // Snapshot skill names once. `discover_skills` reads every `SKILL.md`, so it must not run per
+    // keystroke inside the completer. A skill added mid-session will not autocomplete until
+    // restart, but `/skill` execution rediscovers live, so a stale snapshot never yields an
+    // invalid command.
+    let skill_names: Vec<String> = crate::skills::discover_skills()
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    let completer = SlashCompleter {
+        mcp_server_names,
+        skill_names,
+        cwd: cwd.clone(),
+    };
+
+    let mut editor = build_reedline_editor(input_style, printer, history, completer);
     let prompt = MekaPrompt {
         shared_permission: shared_permission.clone(),
         show_path: show_path_in_prompt,
@@ -847,25 +1173,26 @@ fn shorten_path_with_tilde(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) {
-    let raw = if target.is_empty() || target == "~" {
-        match dirs::home_dir() {
-            Some(home) => home,
-            None => {
-                eprintln!("cd: could not determine home directory");
-                return;
-            }
-        }
+/// Expand a `/cd` target's leading tilde to the home directory. Shared by `handle_cd` and the path
+/// completer so both apply identical `~` / `~/` rules. Returns `None` only when a tilde needs the
+/// home directory but it cannot be determined.
+fn expand_cd_target(target: &str) -> Option<PathBuf> {
+    if target.is_empty() || target == "~" {
+        dirs::home_dir()
     } else if let Some(rest) = target.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(home) => home.join(rest),
-            None => {
-                eprintln!("cd: could not determine home directory");
-                return;
-            }
-        }
+        dirs::home_dir().map(|home| home.join(rest))
     } else {
-        PathBuf::from(target)
+        Some(PathBuf::from(target))
+    }
+}
+
+fn handle_cd(cwd: &crate::agent::SharedCwd, target: &str) {
+    let raw = match expand_cd_target(target) {
+        Some(raw) => raw,
+        None => {
+            eprintln!("cd: could not determine home directory");
+            return;
+        }
     };
 
     // Resolve relative inputs against the current per-session cwd so `/cd subdir` lands inside the
@@ -1153,6 +1480,233 @@ mod tests {
         };
         let rendered = highlighter.highlight("hello", 0).render_simple();
         assert_eq!(rendered, "hello");
+    }
+
+    #[test]
+    fn test_user_input_highlighter_known_command_distinct_from_unknown() {
+        let highlighter = UserInputHighlighter {
+            style: crate::config::default_input_style(),
+        };
+        let known = highlighter.highlight("/compact", 8).render_simple();
+        let unknown = highlighter.highlight("/bogus", 6).render_simple();
+        assert!(
+            known.contains("/compact"),
+            "known token survives: {known:?}"
+        );
+        assert!(
+            unknown.contains("/bogus"),
+            "unknown token survives: {unknown:?}"
+        );
+        assert_ne!(
+            known, unknown,
+            "known and unknown commands must render with different styles"
+        );
+    }
+
+    #[test]
+    fn test_user_input_highlighter_non_slash_single_style() {
+        let highlighter = UserInputHighlighter {
+            style: crate::config::default_input_style(),
+        };
+        let line = "hello world";
+        let mut expected = StyledText::new();
+        expected.push((highlighter.style, line.to_string()));
+        assert_eq!(
+            highlighter.highlight(line, 0).render_simple(),
+            expected.render_simple()
+        );
+    }
+
+    fn empty_completer() -> SlashCompleter {
+        SlashCompleter {
+            mcp_server_names: Vec::new(),
+            skill_names: Vec::new(),
+            cwd: crate::agent::test_cwd(),
+        }
+    }
+
+    fn completer_at(cwd: crate::agent::SharedCwd) -> SlashCompleter {
+        SlashCompleter {
+            mcp_server_names: vec!["postgres".into(), "github".into()],
+            skill_names: vec!["search".into(), "deep-research".into()],
+            cwd,
+        }
+    }
+
+    #[test]
+    fn test_slash_completer_prefix_matches_expected() {
+        let mut completer = empty_completer();
+        let suggestions = completer.complete("/comp", 5);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value, "/compact");
+    }
+
+    #[test]
+    fn test_slash_completer_bare_slash_returns_all() {
+        let mut completer = empty_completer();
+        let suggestions = completer.complete("/", 1);
+        assert_eq!(suggestions.len(), COMMANDS.len());
+        assert!(suggestions.iter().all(|s| s.value.starts_with('/')));
+    }
+
+    #[test]
+    fn test_slash_completer_non_slash_returns_empty() {
+        let mut completer = empty_completer();
+        assert!(completer.complete("hello", 5).is_empty());
+        assert!(completer.complete("", 0).is_empty());
+    }
+
+    #[test]
+    fn test_slash_completer_no_args_for_argless_commands() {
+        let mut completer = empty_completer();
+        // Commands without an argument completer return nothing once past the command word.
+        assert!(completer.complete("/compact ", 9).is_empty());
+        assert!(completer.complete("/status foo", 11).is_empty());
+    }
+
+    #[test]
+    fn test_slash_completer_span_replaces_whole_token() {
+        let mut completer = empty_completer();
+        let suggestions = completer.complete("/comp", 5);
+        assert_eq!(suggestions[0].span.start, 0);
+        assert_eq!(suggestions[0].span.end, 5);
+    }
+
+    #[test]
+    fn test_slash_completer_append_whitespace_tracks_arguments() {
+        let mut completer = empty_completer();
+        assert!(completer.complete("/permission", 11)[0].append_whitespace);
+        assert!(completer.complete("/cd", 3)[0].append_whitespace);
+        assert!(!completer.complete("/compact", 8)[0].append_whitespace);
+        assert!(!completer.complete("/help", 5)[0].append_whitespace);
+    }
+
+    #[test]
+    fn test_slash_completer_descriptions_present() {
+        let mut completer = empty_completer();
+        assert!(
+            completer
+                .complete("/", 1)
+                .iter()
+                .all(|s| s.description.as_deref().is_some_and(|d| !d.is_empty()))
+        );
+    }
+
+    #[test]
+    fn test_slash_completer_does_not_offer_aliases() {
+        let mut completer = empty_completer();
+        // `/q` matches the `quit` alias of `exit`, but aliases are never completed.
+        assert!(completer.complete("/q", 2).is_empty());
+    }
+
+    #[test]
+    fn test_slash_completer_permission_arg_prefix() {
+        let mut completer = empty_completer();
+        let one = completer.complete("/permission w", 13);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].value, "write");
+        assert!(one[0].append_whitespace);
+        let all: Vec<String> = completer
+            .complete("/permission ", 12)
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect();
+        assert_eq!(all, ["none", "read", "ask", "write"]);
+    }
+
+    #[test]
+    fn test_slash_completer_permission_no_complete_second_arg() {
+        let mut completer = empty_completer();
+        assert!(completer.complete("/permission write extra", 23).is_empty());
+    }
+
+    #[test]
+    fn test_slash_completer_skill_arg_prefix() {
+        let mut completer = completer_at(crate::agent::test_cwd());
+        let suggestions = completer.complete("/skill sea", 10);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value, "search");
+    }
+
+    #[test]
+    fn test_slash_completer_skill_no_complete_second_arg() {
+        let mut completer = completer_at(crate::agent::test_cwd());
+        assert!(completer.complete("/skill search foo", 17).is_empty());
+    }
+
+    #[test]
+    fn test_slash_completer_mcp_arg1_keywords() {
+        let mut completer = completer_at(crate::agent::test_cwd());
+        let all: Vec<String> = completer
+            .complete("/mcp ", 5)
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect();
+        assert_eq!(all, ["list", "reconnect", "login", "logout"]);
+        let rec = completer.complete("/mcp rec", 8);
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].value, "reconnect");
+    }
+
+    #[test]
+    fn test_slash_completer_mcp_arg2_server_after_subcommand() {
+        let mut completer = completer_at(crate::agent::test_cwd());
+        let servers: Vec<String> = completer
+            .complete("/mcp reconnect ", 15)
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect();
+        assert_eq!(servers, ["postgres", "github"]);
+        assert_eq!(completer.complete("/mcp login git", 14)[0].value, "github");
+        // `list` takes no server argument, so its second token completes nothing.
+        assert!(completer.complete("/mcp list ", 10).is_empty());
+    }
+
+    #[test]
+    fn test_slash_completer_cd_lists_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonicalize");
+        std::fs::create_dir(root.join("src")).expect("mkdir src");
+        std::fs::create_dir(root.join("target")).expect("mkdir target");
+        std::fs::create_dir(root.join(".git")).expect("mkdir .git");
+        std::fs::write(root.join("README"), b"x").expect("write file");
+        std::fs::create_dir_all(root.join("src/tools")).expect("mkdir src/tools");
+        let cwd = std::sync::Arc::new(std::sync::RwLock::new(root));
+        let mut completer = completer_at(cwd);
+
+        let bare: Vec<String> = completer
+            .complete("/cd ", 4)
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect();
+        // Directories returned with a trailing slash; the file and dotdir are excluded.
+        assert!(bare.contains(&"src/".to_string()));
+        assert!(bare.contains(&"target/".to_string()));
+        assert!(!bare.iter().any(|value| value.contains("README")));
+        assert!(!bare.contains(&".git/".to_string()));
+
+        // A leading dot in the partial opts dotdirs back in.
+        let dot = completer.complete("/cd .gi", 7);
+        assert_eq!(dot.len(), 1);
+        assert_eq!(dot[0].value, ".git/");
+
+        // Relative drill-down keeps the parent portion intact.
+        let nested = completer.complete("/cd src/too", 11);
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].value, "src/tools/");
+        assert!(!nested[0].append_whitespace);
+        assert_eq!(nested[0].span.start, 4);
+        assert_eq!(nested[0].span.end, 11);
+    }
+
+    #[test]
+    fn test_slash_completer_command_word_still_completes() {
+        let mut completer = completer_at(crate::agent::test_cwd());
+        let suggestions = completer.complete("/comp", 5);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value, "/compact");
+        assert_eq!(suggestions[0].span.start, 0);
+        assert_eq!(suggestions[0].span.end, 5);
     }
 
     #[test]

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- REPL now Tab-completes slash-command names, highlights the command token, and shows history hints.
+- REPL now Tab-completes slash-command arguments (permission levels, skills, MCP servers, /cd paths).
+
 ## [0.27.3] - 2026-06-11
 
 ### Changed
@@ -20,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- ACP: richer editor integration: plans, embedded resource/image input, titles, tool-call detail.
+- ACP editor integration gained plans, embedded resource/image input, titles, and tool-call detail.
 - `[providers.<name>]` gains `context_window`, `vision`, and `max_output_tokens` overrides.
 
 ### Fixed
@@ -767,7 +774,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `spawn_agent` tool for delegating research tasks to read-only sub-agents.
 - Deferred tool loading: MCP tools listed in system prompt but schemas sent on first use.
 - `raw` parameter for `fetch_url` tool to return untreated HTML instead of markdown.
-- Scratchpad: session-scoped, name-keyed agent working memory.
+- Scratchpad provides session-scoped, name-keyed agent working memory.
 - `scratchpad_write`, `scratchpad_read`, `scratchpad_edit`, `scratchpad_list`, `scratchpad_delete` tools.
 - `scratchpad` parameter on all tools to save output directly.
 - Auto-persist for oversized tool results (>30K chars) with `{tool}_{N}` naming.
@@ -948,7 +955,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Slash commands: `/help`, `/exit`, `/clear`, `/session`, `/permission`, `/compact`.
-- Skills: user-defined Markdown knowledge files the agent can discover and read.
+- Skills are user-defined Markdown knowledge files the agent can discover and read.
 - Configurable context window limiting via `[session] context_messages`.
 - Automatic session cleanup via `[session] retention_days` and `max_storage_bytes`.
 

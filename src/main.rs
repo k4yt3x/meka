@@ -913,6 +913,11 @@ async fn run_interactive(
     let input_style = config.input_style;
     let repl_sandbox_state = crate::sandbox::SandboxState::from_config(&config);
     let repl_cwd = Arc::clone(&cwd);
+    let repl_mcp_server_names: Vec<String> = config
+        .mcp_servers
+        .iter()
+        .map(|server| server.name.clone())
+        .collect();
     let repl_history_db_path = Some(session_manager.database_path().to_path_buf());
 
     // Live context gauge for the prompt: a shared counter the agent writes after each turn and the
@@ -949,6 +954,7 @@ async fn run_interactive(
             input_sender,
             agent_event_receiver,
             repl_cwd,
+            repl_mcp_server_names,
             repl_history_db_path,
         );
     });

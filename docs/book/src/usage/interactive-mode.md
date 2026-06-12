@@ -118,6 +118,8 @@ meka supports `/` prefix commands for controlling the shell:
 | `/status` | Show session stats: live context-window usage, plus cumulative turns, tokens, cache hit ratio, redactions, message count |
 | `/history [N]` | Reprint past conversation styled like the live REPL. Bare `/history` dumps everything; `/history N` shows the last `N` turns |
 
+Press **Tab** after typing `/` to open a completion menu of command names, each shown with its description; keep typing to narrow it (`/comp` + Tab completes to `/compact`). Tab also completes arguments: permission levels for `/permission`, installed skill names for `/skill`, the subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab again after a completed directory drills into its subdirectories). The leading command token is colored as you type: an accent color when it names a known command, an error color when it does not. Previously entered inputs also surface as a dim inline hint; press **Right**, **End**, or **Ctrl+F** to accept it.
+
 ### `/history`
 
 Replays prior messages in the current session so you can scroll back through context without exiting and re-resuming. `/history` with no argument dumps every materialised message; `/history 5` shows the last 5 turns (a *turn* = the user's prompt plus everything the agent did to respond). Any non-numeric argument (`/history all`, `/history foo`) falls back to the dump-everything path.
