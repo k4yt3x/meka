@@ -1404,10 +1404,10 @@ impl ResolvedConfig {
 
         // Only probe the sandbox backend when sandboxing is actually enabled. Skipping the probe
         // for `sandbox = false` saves the smoke-test cost on every invocation of subcommands that
-        // don't touch the shell (`meka list`, `meka export`, `meka mcp list`, etc.) when the user
-        // has disabled sandboxing globally. The placeholder probe is never consulted in that state;
-        // the shell tool short-circuits on `sandbox_enabled = false`, and the warn helper early-
-        // returns on `!state.enabled`.
+        // don't touch the shell (`meka session list`, `meka session export`, `meka mcp list`, etc.)
+        // when the user has disabled sandboxing globally. The placeholder probe is never
+        // consulted in that state; the shell tool short-circuits on `sandbox_enabled =
+        // false`, and the warn helper early- returns on `!state.enabled`.
         // Backend precedence: `--sandbox-backend` > `MEKA_SANDBOX_BACKEND` >
         // `[shell].sandbox_backend`. An explicit value from any tier also flips
         // `auto_resolved` off, suppressing the "install Bubblewrap" startup warning.

@@ -1,5 +1,6 @@
-//! Clap-derived CLI definition. Owns the top-level argument struct, the subcommand enum (`setup`,
-//! `export`, `delete`, `list`), and the small parsers for permission/render-mode flag values.
+//! Clap-derived CLI definition. Owns the top-level argument struct, the subcommand enum
+//! (`provider`, `session`, `history`, `mcp`, `tools`, `skill`, `acp`, `serve`), and the small
+//! parsers for permission/render-mode flag values.
 
 use clap::Parser;
 
@@ -17,31 +18,15 @@ pub enum Command {
         #[command(subcommand)]
         action: ProviderAction,
     },
-    /// Export a session as Markdown
-    Export {
-        /// Session UUID to export
-        session_id: uuid::Uuid,
-        /// Output file (default: `session-<id>.md`; `-` = stdout)
-        #[arg(short, long)]
-        output: Option<String>,
+    /// Manage stored sessions
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
     },
-    /// Delete one or more sessions
-    Delete {
-        /// Session UUIDs to delete
-        session_ids: Vec<uuid::Uuid>,
-        /// Delete all sessions
-        #[arg(long)]
-        all: bool,
-    },
-    /// List past sessions
-    List {
-        /// Maximum number of sessions to show
-        #[arg(short = 'n', long, default_value = "20")]
-        limit: u32,
-        /// Include sub-agent sessions (children of a parent session) in the listing. Hidden by
-        /// default to keep the view focused on user-initiated conversations.
-        #[arg(long)]
-        include_children: bool,
+    /// View or clear REPL input history
+    History {
+        #[command(subcommand)]
+        action: HistoryAction,
     },
     /// Manage MCP servers
     Mcp {
@@ -58,14 +43,14 @@ pub enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
-    /// Run meka as an ACP (Agent Client Protocol) agent over stdio.
+    /// Run meka as an ACP (Agent Client Protocol) agent over stdio
     ///
     /// Speaks newline-framed JSON-RPC on stdin/stdout so ACP clients (Zed, JetBrains, Neovim, VS
     /// Code via the ACP extension, etc.) can drive meka turns directly. Diagnostic output stays on
     /// stderr; stdout is reserved for the protocol.
     #[command(verbatim_doc_comment)]
     Acp,
-    /// Run meka as a long-lived HTTP service.
+    /// Run meka as a long-lived HTTP service
     ///
     /// Exposes the agent over HTTP+JSON for programmatic clients (bots, scripts, web UIs).
     /// See the HTTP API docs for the full spec. Auth, session GC, and SSE streaming are configured
@@ -80,8 +65,50 @@ pub enum Command {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ToolsAction {
-    /// List every built-in tool with its effective permission and status.
+    /// List every built-in tool with its effective permission and status
     List,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SessionAction {
+    /// List past sessions
+    List {
+        /// Maximum number of sessions to show
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: u32,
+        /// Include sub-agent sessions (children of a parent session) in the listing. Hidden by
+        /// default to keep the view focused on user-initiated conversations.
+        #[arg(long)]
+        include_children: bool,
+    },
+    /// Export a session as Markdown
+    Export {
+        /// Session UUID to export
+        session_id: uuid::Uuid,
+        /// Output file (default: `session-<id>.md`; `-` = stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Delete one or more sessions
+    Delete {
+        /// Session UUIDs to delete
+        session_ids: Vec<uuid::Uuid>,
+        /// Delete all sessions
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum HistoryAction {
+    /// List recorded input history
+    List {
+        /// Max entries to show (0 = all)
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: u32,
+    },
+    /// Delete all recorded input history
+    Clear,
 }
 
 // `Add` is the outlier with several flags inline; same one-shot CLI dispatch reasoning as the
@@ -89,7 +116,7 @@ pub enum ToolsAction {
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Debug)]
 pub enum ProviderAction {
-    /// Add a provider profile and authenticate it.
+    /// Add a provider profile and authenticate it
     ///
     /// Prompts for any of type/model not passed as flags, then acquires the
     /// secret (OAuth login for claude-oauth / openai-codex, API-key prompt for
@@ -115,19 +142,19 @@ pub enum ProviderAction {
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
     },
-    /// List configured provider profiles.
+    /// List configured provider profiles
     List,
-    /// Set the default provider profile.
+    /// Set the default provider profile
     Use {
         /// Profile name to make the default.
         name: String,
     },
-    /// Remove a provider profile and clear its stored credential.
+    /// Remove a provider profile and clear its stored credential
     Remove {
         /// Profile name to remove.
         name: String,
     },
-    /// Re-authenticate an existing provider profile.
+    /// Re-authenticate an existing provider profile
     Login {
         /// Profile name to re-authenticate.
         name: String,
@@ -145,7 +172,7 @@ pub enum SkillAction {
     Get { name: String },
     /// Print the rendered skill body
     Show { name: String },
-    /// Scaffold a new skill at `~/.config/meka/skills/<name>/SKILL.md`.
+    /// Scaffold a new skill at `~/.config/meka/skills/<name>/SKILL.md`
     ///
     /// Examples:
     ///   meka skill add demo --description "X"
@@ -185,7 +212,7 @@ pub enum SkillAction {
     },
     /// Remove a skill's directory
     Remove { name: String },
-    /// Re-fetch skills from their `source_url` and replace them on disk.
+    /// Re-fetch skills from their `source_url` and replace them on disk
     ///
     /// Examples:
     ///   meka skill update my-skill
@@ -223,7 +250,7 @@ pub enum McpAction {
     Login { name: String },
     /// Revoke cached credentials for a server
     Logout { name: String },
-    /// Add a server to config.toml.
+    /// Add a server to config.toml
     ///
     /// Examples:
     ///   meka mcp add pg npx -y @modelcontextprotocol/server-postgres
@@ -582,5 +609,72 @@ mod tests {
             }
             other => panic!("expected provider add, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_session_list_subcommand() {
+        let cli = Cli::parse_from(["meka", "session", "list"]);
+        match cli.command {
+            Some(Command::Session {
+                action:
+                    SessionAction::List {
+                        limit,
+                        include_children,
+                    },
+            }) => {
+                assert_eq!(limit, 20);
+                assert!(!include_children);
+            }
+            other => panic!("expected session list, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_session_delete_all_subcommand() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let cli = Cli::parse_from(["meka", "session", "delete", id, "--all"]);
+        match cli.command {
+            Some(Command::Session {
+                action: SessionAction::Delete { session_ids, all },
+            }) => {
+                assert_eq!(session_ids.len(), 1);
+                assert!(all);
+            }
+            other => panic!("expected session delete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_session_export_stdout_subcommand() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let cli = Cli::parse_from(["meka", "session", "export", id, "-o", "-"]);
+        match cli.command {
+            Some(Command::Session {
+                action: SessionAction::Export { output, .. },
+            }) => assert_eq!(output.as_deref(), Some("-")),
+            other => panic!("expected session export, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_history_list_subcommand() {
+        let cli = Cli::parse_from(["meka", "history", "list", "-n", "10"]);
+        match cli.command {
+            Some(Command::History {
+                action: HistoryAction::List { limit },
+            }) => assert_eq!(limit, 10),
+            other => panic!("expected history list, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_history_clear_subcommand() {
+        let cli = Cli::parse_from(["meka", "history", "clear"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::History {
+                action: HistoryAction::Clear
+            })
+        ));
     }
 }

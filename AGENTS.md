@@ -37,7 +37,7 @@ This file provides guidance to AI agents when working with code in this reposito
 
 **Use `println!` / `eprintln!` only when the output is unavoidable:**
 
-- **Requested data**: what the user literally ran the command to get: the `meka mcp list` table, `meka mcp get` details, `meka list` session rows, `meka export` markdown on stdout, `print_help`.
+- **Requested data**: what the user literally ran the command to get: the `meka mcp list` table, `meka mcp get` details, `meka session list` session rows, `meka session export` markdown on stdout, `print_help`.
 - **Actionable content the user must copy/type/visit**: OAuth authorisation URLs, callback paste prompts, elicitation form fields, setup-wizard prompts.
 - **REPL command output**: `/permission`, `/session`, `/cd` errors, `!cmd` status, tool-use indicators, streaming assistant markdown, thinking blocks, `Unknown command` feedback.
 - **Hard errors** propagated back to the user with context (`render::render_error`, clap-side validation errors).
@@ -47,7 +47,7 @@ This file provides guidance to AI agents when working with code in this reposito
 
 When `println!` / `eprintln!` *is* the right call (the output is unavoidable per the list above), the choice of stream is not a style decision; it's a contract:
 
-- **`stdout` (`println!`, `print!`)**: only the data the user invoked the command to obtain. Examples: the agent's streamed assistant response, an `meka list` table, an `meka export -` markdown body, an `meka skill show` body, `meka mcp list` / `mcp get` / `mcp tools` rows.
+- **`stdout` (`println!`, `print!`)**: only the data the user invoked the command to obtain. Examples: the agent's streamed assistant response, an `meka session list` table, an `meka session export -` markdown body, an `meka skill show` body, `meka mcp list` / `mcp get` / `mcp tools` rows.
 - **`stderr` (`eprintln!`, `eprint!`)**: everything else: tool-call indicators, thinking blocks, todo lists, spacing newlines, status confirmations, hints, errors, interrupt notices, setup-wizard prompts, OAuth URLs, REPL UI feedback (`/permission`, `/cd`, `Unknown command`, approval prompts, `!cmd` exit-code messages).
 
 **Litmus test:** `meka ... 2>/dev/null | next-tool` should leave only the requested data on stdout. If a user can't usefully pipe the output, your `println!()` is probably an `eprintln!()`.
@@ -90,6 +90,8 @@ meka has several configuration surfaces. Keep coverage principled rather than ad
 ## CLI help text
 
 Clap `///` doc-comments must render within 80 columns when shown via `-h`. Verify by running the actual binary for every changed subcommand: source-line length doesn't account for clap's indent, value-name length, or auto-appended hints like `[possible values: ...]`. Put `Examples:` and other long-form prose after a blank `///` line so they only show in `--help`, not `-h`. When that long-form prose has multiple lines or indented blocks (e.g. an `Examples:` list), add `#[command(verbatim_doc_comment)]` to the struct/variant so clap preserves the line breaks instead of re-wrapping them into one paragraph.
+
+Command and subcommand `///` summaries (the one-line description clap shows in the command list) don't end with a period; multi-sentence descriptions and `Examples:` prose use normal punctuation.
 
 ## Build & Formatting Commands
 

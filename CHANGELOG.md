@@ -9,8 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- REPL now Tab-completes slash-command names, highlights the command token, and shows history hints.
+- REPL now Tab-completes slash-command names and highlights the command token.
 - REPL now Tab-completes slash-command arguments (permission levels, skills, MCP servers, /cd paths).
+- `meka history list` / `meka history clear` view and clear REPL input history.
+
+### Changed
+
+- Session subcommands `list`, `export`, and `delete` moved under `meka session` for consistency.
 
 ## [0.27.3] - 2026-06-11
 

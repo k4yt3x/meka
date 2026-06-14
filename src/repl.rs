@@ -10,8 +10,8 @@ use std::{
 use async_trait::async_trait;
 use crossterm::style::{Color, Stylize};
 use reedline::{
-    ColumnarMenu, Completer, DefaultHinter, EditCommand, Emacs, ExternalPrinter, Highlighter,
-    History, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
+    ColumnarMenu, Completer, EditCommand, Emacs, ExternalPrinter, Highlighter, History, KeyCode,
+    KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     PromptHistorySearchStatus, Reedline, ReedlineEvent, ReedlineMenu, Signal, Span, StyledText,
     Suggestion, default_emacs_keybindings,
 };
@@ -454,9 +454,6 @@ fn build_reedline_editor(
     let mut editor = Reedline::create()
         .with_edit_mode(Box::new(emacs_mode))
         .with_highlighter(Box::new(UserInputHighlighter { style: input_style }))
-        .with_hinter(Box::new(DefaultHinter::default().with_style(
-            nu_ansi_term::Style::new().fg(nu_ansi_term::Color::DarkGray),
-        )))
         .with_completer(Box::new(completer))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(
             ColumnarMenu::default().with_name(COMPLETION_MENU),

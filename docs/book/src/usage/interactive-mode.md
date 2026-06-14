@@ -118,7 +118,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/status` | Show session stats: live context-window usage, plus cumulative turns, tokens, cache hit ratio, redactions, message count |
 | `/history [N]` | Reprint past conversation styled like the live REPL. Bare `/history` dumps everything; `/history N` shows the last `N` turns |
 
-Press **Tab** after typing `/` to open a completion menu of command names, each shown with its description; keep typing to narrow it (`/comp` + Tab completes to `/compact`). Tab also completes arguments: permission levels for `/permission`, installed skill names for `/skill`, the subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab again after a completed directory drills into its subdirectories). The leading command token is colored as you type: an accent color when it names a known command, an error color when it does not. Previously entered inputs also surface as a dim inline hint; press **Right**, **End**, or **Ctrl+F** to accept it.
+Press **Tab** after typing `/` to open a completion menu of command names, each shown with its description; keep typing to narrow it (`/comp` + Tab completes to `/compact`). Tab also completes arguments: permission levels for `/permission`, installed skill names for `/skill`, the subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab again after a completed directory drills into its subdirectories). The leading command token is colored as you type: an accent color when it names a known command, an error color when it does not.
 
 ### `/history`
 
@@ -152,7 +152,7 @@ Session status
 
 The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with a single summary message followed by the recent tail. This is useful for long sessions that are approaching the context window limit or becoming expensive.
 
-After compacting, the session continues with the summary as context. The pre-compaction messages stay in the underlying event log on disk (the model just no longer sees them), so `meka export` and resume continue to work exactly as if the compaction had wiped them.
+After compacting, the session continues with the summary as context. The pre-compaction messages stay in the underlying event log on disk (the model just no longer sees them), so `meka session export` and resume continue to work exactly as if the compaction had wiped them.
 
 ## Shell Escape
 

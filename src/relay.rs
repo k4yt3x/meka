@@ -8,8 +8,8 @@
 //! [`Relay`] holds an optional [`reedline::ExternalPrinter`] (a crossbeam channel reedline drains
 //! every poll tick to print messages *above* the prompt without clobbering it). Tracing output goes
 //! through the printer when the REPL has registered one; otherwise it falls back to plain stderr so
-//! the non-interactive paths (`meka export`, `meka list`, etc.) and the pre-REPL startup window
-//! still see logs.
+//! the non-interactive paths (`meka session export`, `meka session list`, etc.) and the pre-REPL
+//! startup window still see logs.
 //!
 //! Crucially, reedline only drains that channel while `read_line()` is running, so the printer is
 //! used *only* while the prompt is live (tracked via [`Relay::set_at_prompt`]). Off-prompt windows,

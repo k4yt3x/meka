@@ -142,7 +142,7 @@ context_window = 200000  # optional override
 To see past sessions:
 
 ```bash
-meka list
+meka session list
 ```
 
 This shows a table with each session's ID, last update time, and a preview of the first message:
@@ -156,7 +156,7 @@ a1b2c3d4-e5f6-7890-abcd-ef1234567890  2026-03-13 09:30:00  Fix the login page CS
 By default the 20 most recent sessions are shown. Use `-n` to change:
 
 ```bash
-meka list -n 50
+meka session list -n 50
 ```
 
 ## Exporting a Session
@@ -164,7 +164,7 @@ meka list -n 50
 You can export any session as a Markdown file:
 
 ```bash
-meka export 550e8400-e29b-41d4-a716-446655440000
+meka session export 550e8400-e29b-41d4-a716-446655440000
 ```
 
 This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks.
@@ -172,13 +172,13 @@ This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current dir
 To write to a specific file:
 
 ```bash
-meka export 550e8400-e29b-41d4-a716-446655440000 -o conversation.md
+meka session export 550e8400-e29b-41d4-a716-446655440000 -o conversation.md
 ```
 
 To print to stdout (for piping):
 
 ```bash
-meka export 550e8400-e29b-41d4-a716-446655440000 -o -
+meka session export 550e8400-e29b-41d4-a716-446655440000 -o -
 ```
 
 ## Deleting Sessions
@@ -186,19 +186,36 @@ meka export 550e8400-e29b-41d4-a716-446655440000 -o -
 Delete specific sessions by UUID:
 
 ```bash
-meka delete 550e8400-e29b-41d4-a716-446655440000
+meka session delete 550e8400-e29b-41d4-a716-446655440000
 ```
 
 Delete multiple sessions at once:
 
 ```bash
-meka delete 550e8400-e29b-41d4-a716-446655440000 a1b2c3d4-e5f6-7890-abcd-ef1234567890
+meka session delete 550e8400-e29b-41d4-a716-446655440000 a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ```
 
 Delete all sessions:
 
 ```bash
-meka delete --all
+meka session delete --all
+```
+
+## Input History
+
+Separate from your saved conversations, meka keeps a rolling history of the prompts you *type* at the REPL, so **Up-arrow** recall and **Ctrl+R** reverse-search work across runs (shell-style). This is distinct from a session (a stored conversation) and from the `/history` slash command (which reprints the current conversation).
+
+List recent input-history entries (oldest first; `-n 0` shows all):
+
+```bash
+meka history list
+meka history list -n 100
+```
+
+Clear it entirely:
+
+```bash
+meka history clear
 ```
 
 ## Managing Sessions via SQLite

@@ -1149,7 +1149,7 @@ impl SessionManager {
     /// List sessions, most-recent first. When `include_children` is `false`, sub-agent sessions
     /// (rows with non-NULL `parent_session_id`) are hidden; they're persisted for audit/debug but
     /// shouldn't clutter the user's view of their own conversations. Set to `true` to surface them,
-    /// e.g. via `meka list --include-children`.
+    /// e.g. via `meka session list --include-children`.
     ///
     /// `cwd_filter`, if `Some`, restricts the result set to sessions whose persisted `cwd` matches
     /// the given path (rows with NULL `cwd` are excluded; legacy rows can't be filtered by cwd
@@ -2902,7 +2902,7 @@ mod tests {
         assert!(preview.len() <= 84); // 80 chars + "…"
     }
 
-    // End-to-end regression tests for `meka list`'s preview.
+    // End-to-end regression tests for `meka session list`'s preview.
     // These tests mock the complete pipeline that produces the
     // `Preview` column: build the turn-context block the agent
     // actually sends, prepend it to a user prompt the way
@@ -2937,8 +2937,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sessions_preview_is_user_prompt_not_context_wrapper() {
-        // The canonical regression: user types a prompt, turn runs, `meka list` must show the
-        // prompt, not `<context>`, not the permission/environment metadata.
+        // The canonical regression: user types a prompt, turn runs, `meka session list` must show
+        // the prompt, not `<context>`, not the permission/environment metadata.
         let manager = test_manager().await;
         let session_id = manager.create_session(None).await.expect("create_session");
 
@@ -3451,8 +3451,8 @@ mod tests {
         assert_eq!(after_flip.permission.as_deref(), Some("write"));
     }
 
-    // Child-session tests: parent→sub-agent linkage, cascade-on-delete, and `meka list` filter
-    // behavior.
+    // Child-session tests: parent→sub-agent linkage, cascade-on-delete, and `meka session list`
+    // filter behavior.
 
     #[tokio::test]
     async fn test_create_child_session_writes_parent_id() {

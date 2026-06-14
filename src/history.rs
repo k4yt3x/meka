@@ -43,6 +43,26 @@ impl PromptHistory {
         })
     }
 
+    /// Most-recent entries, returned oldest-first for display. `limit == 0` returns all of them.
+    pub fn recent(&self, limit: usize) -> rusqlite::Result<Vec<String>> {
+        // SQLite treats a negative LIMIT as unbounded, so `0` maps to `-1` and needs no second
+        // query or string building.
+        let bound: i64 = if limit == 0 { -1 } else { limit as i64 };
+        let mut statement = self
+            .connection
+            .prepare("SELECT command_line FROM prompt_history ORDER BY id DESC LIMIT ?1")?;
+        let mut rows: Vec<String> = statement
+            .query_map(params![bound], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    /// Delete every input-history row, returning the number removed.
+    pub fn clear_all(&self) -> rusqlite::Result<usize> {
+        self.connection.execute("DELETE FROM prompt_history", [])
+    }
+
     /// Translate a [`SearchQuery`]'s id bounds and command-line filter into a SQL `WHERE` clause
     /// and its bound parameters. `start_id`/`end_id` are exclusive and direction-dependent,
     /// matching reedline's `FileBackedHistory` semantics. Time / cwd / hostname / exit filters
@@ -333,6 +353,25 @@ mod tests {
         let mut history = history();
         save(&mut history, "line one\nline two");
         assert_eq!(last(&history).as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn test_recent_returns_oldest_first_and_honors_limit() {
+        let mut history = history();
+        save(&mut history, "a");
+        save(&mut history, "b");
+        save(&mut history, "c");
+        assert_eq!(history.recent(0).expect("recent all"), ["a", "b", "c"]);
+        assert_eq!(history.recent(2).expect("recent 2"), ["b", "c"]);
+    }
+
+    #[test]
+    fn test_clear_all_returns_count_and_empties() {
+        let mut history = history();
+        save(&mut history, "a");
+        save(&mut history, "b");
+        assert_eq!(history.clear_all().expect("clear"), 2);
+        assert_eq!(history.count_all().expect("count"), 0);
     }
 
     #[test]

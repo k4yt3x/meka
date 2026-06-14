@@ -95,9 +95,10 @@ Conversations are persisted in a local SQLite database and can be resumed:
 
 - `meka -c` continues the last session
 - `meka -c <UUID>` resumes a specific session by ID
-- `meka list` lists past sessions
-- `meka delete <UUID>` deletes sessions
-- `meka export <UUID>` exports a session as Markdown
+- `meka session list` lists past sessions
+- `meka session delete <UUID>` deletes sessions
+- `meka session export <UUID>` exports a session as Markdown
+- `meka history list` / `meka history clear` view or clear REPL input history
 - `/export` exports the current session from within the shell
 - `/compact` summarizes and compacts the session history
 

@@ -22,34 +22,28 @@ meka provider remove work
 
 See the [`meka provider` CLI reference](./config-file.md#meka-provider-cli) for the full flag list.
 
-### `export`
+### `session`
 
-Export a session as Markdown.
-
-```bash
-meka export <SESSION_ID> [-o <PATH>]
-```
-
-Use `-o -` to print to stdout. See [Sessions](../usage/sessions.md#exporting-a-session) for details.
-
-### `delete`
-
-Delete one or more sessions by UUID, or all sessions with `--all`.
+Manage stored sessions: list them, export one as Markdown, or delete them.
 
 ```bash
-meka delete <SESSION_ID>...
-meka delete --all
+meka session list [-n <LIMIT>]          # default limit: 20
+meka session export <SESSION_ID> [-o <PATH>]   # -o - prints to stdout
+meka session delete <SESSION_ID>...
+meka session delete --all
 ```
 
-### `list`
+See [Sessions](../usage/sessions.md#exporting-a-session) for details.
 
-List past sessions with ID, last update time, and a preview.
+### `history`
+
+View or clear the REPL input history that powers Up-arrow / Ctrl+R recall (distinct from saved
+sessions and from the `/history` slash command).
 
 ```bash
-meka list [-n <LIMIT>]
+meka history list [-n <LIMIT>]   # default 50; -n 0 shows all
+meka history clear
 ```
-
-Default limit: 20.
 
 ## Arguments
 

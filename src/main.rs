@@ -112,16 +112,12 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     let token_store = session_manager.token_store();
                     provider::cli::run(action, &token_store).await
                 }
-                cli::Command::Export { session_id, output } => {
-                    export_session(&session_manager, *session_id, output.as_deref()).await
+                cli::Command::Session { action } => {
+                    run_session_subcommand(&session_manager, action).await
                 }
-                cli::Command::Delete { session_ids, all } => {
-                    delete_sessions(&session_manager, session_ids, *all).await
+                cli::Command::History { action } => {
+                    run_history_subcommand(&session_manager, action).await
                 }
-                cli::Command::List {
-                    limit,
-                    include_children,
-                } => list_sessions(&session_manager, *limit, *include_children).await,
                 cli::Command::Mcp { action } => {
                     run_mcp_subcommand(&session_manager, action, cli_ref).await
                 }
@@ -1565,6 +1561,51 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
         cli::SkillAction::Remove { name } => skills::cli::run_remove(name).await?,
         cli::SkillAction::Update { name, all, yes } => {
             skills::cli::run_update(name.as_deref(), *all, *yes).await?
+        }
+    }
+    Ok(())
+}
+
+async fn run_session_subcommand(
+    session_manager: &SessionManager,
+    action: &cli::SessionAction,
+) -> anyhow::Result<()> {
+    match action {
+        cli::SessionAction::List {
+            limit,
+            include_children,
+        } => list_sessions(session_manager, *limit, *include_children).await,
+        cli::SessionAction::Export { session_id, output } => {
+            export_session(session_manager, *session_id, output.as_deref()).await
+        }
+        cli::SessionAction::Delete { session_ids, all } => {
+            delete_sessions(session_manager, session_ids, *all).await
+        }
+    }
+}
+
+async fn run_history_subcommand(
+    session_manager: &SessionManager,
+    action: &cli::HistoryAction,
+) -> anyhow::Result<()> {
+    // Capacity only gates the write/prune path, so `0` is fine for read/clear. The table is created
+    // lazily by `open`, so this is safe on a fresh database.
+    let history = crate::history::PromptHistory::open(session_manager.database_path(), 0)?;
+    match action {
+        cli::HistoryAction::List { limit } => {
+            let entries = history.recent(*limit as usize)?;
+            if entries.is_empty() {
+                println!("No input history.");
+            } else {
+                for entry in entries {
+                    println!("{}", entry);
+                }
+            }
+        }
+        cli::HistoryAction::Clear => {
+            let removed = history.clear_all()?;
+            let noun = if removed == 1 { "entry" } else { "entries" };
+            println!("Cleared {} input history {}.", removed, noun);
         }
     }
     Ok(())
