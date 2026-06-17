@@ -1323,18 +1323,16 @@ async fn export_session(
         anyhow::bail!("session not found: {}", session_id);
     }
 
-    // Export the materialized conversation view, not the raw event log:
-    // post-compaction users expect to see the summary + tail (which is what
-    // the agent saw the last time it ran), not the pre-compaction
-    // messages the boundary replaced. The events are still on disk.
+    // Export the full event log so pre-compaction turns are included. Compaction only hides older
+    // turns from the model (it appends a boundary, never deletes), so the export walks the raw log
+    // and renders every turn plus a marker at each compaction point.
     let events = session_manager.load_events(session_id).await?;
-    let conversation = conversation::Conversation::from_events(events);
     let tool_outputs: std::collections::HashMap<String, String> = session_manager
         .load_all_tool_outputs(session_id)
         .await?
         .into_iter()
         .collect();
-    let markdown = format_session_as_markdown(session_id, conversation.as_slice(), &tool_outputs);
+    let markdown = format_session_as_markdown(session_id, &events, &tool_outputs);
 
     match output {
         Some("-") => {
@@ -1681,7 +1679,7 @@ fn format_timestamp(rfc3339: &str) -> String {
 
 pub(crate) fn format_session_as_markdown(
     session_id: uuid::Uuid,
-    messages: &[provider::Message],
+    events: &[conversation::Event],
     tool_outputs: &std::collections::HashMap<String, String>,
 ) -> String {
     use std::fmt::Write;
@@ -1689,64 +1687,93 @@ pub(crate) fn format_session_as_markdown(
     let mut output = String::new();
     writeln!(output, "# Session {}\n", session_id).ok();
 
-    for message in messages {
-        match message.role {
-            provider::Role::User => {
-                // A "user" message can be either a plain user turn or a tool_results envelope.
-                // Inspect content blocks rather than role to decide.
-                let has_tool_results = message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, provider::ContentBlock::ToolResult { .. }));
-                if has_tool_results {
-                    for block in &message.content {
-                        if let provider::ContentBlock::ToolResult {
-                            content, is_error, ..
-                        } = block
-                        {
-                            let label = if *is_error {
-                                "Tool result (error)"
-                            } else {
-                                "Tool result"
-                            };
-                            writeln!(output, "<details>").ok();
-                            writeln!(output, "<summary>{}</summary>\n", label).ok();
-                            let text = provider::ContentBlock::tool_result_text_content(content);
-                            let text = resolve_large_output_tags(&text, tool_outputs);
-                            writeln!(output, "```\n{}\n```\n", text).ok();
-                            writeln!(output, "</details>\n").ok();
-                        }
-                    }
-                } else {
-                    writeln!(output, "## User\n").ok();
-                    writeln!(output, "{}\n", message.text_content()).ok();
-                }
+    // Walk the raw event log so the full conversation is exported, including turns a compaction
+    // later hid from the model. Each `CompactBoundary` becomes a marker; the turns it summarized
+    // stay above it (the kept tail is re-appended after it, so the recent turns appear on both
+    // sides of the marker, as stored).
+    for event in events {
+        match event {
+            conversation::Event::Append(message) => {
+                write_message_markdown(&mut output, message, tool_outputs);
             }
-            provider::Role::Assistant => {
-                writeln!(output, "## Assistant\n").ok();
-                for block in &message.content {
-                    match block {
-                        provider::ContentBlock::Text { text } => {
-                            writeln!(output, "{}\n", text).ok();
-                        }
-                        provider::ContentBlock::ToolUse { name, input, .. } => {
-                            let input_pretty = serde_json::to_string_pretty(input)
-                                .unwrap_or_else(|_| input.to_string());
-                            writeln!(output, "<details>").ok();
-                            writeln!(output, "<summary>Tool call: {}</summary>\n", name).ok();
-                            writeln!(output, "```json\n{}\n```\n", input_pretty).ok();
-                            writeln!(output, "</details>\n").ok();
-                        }
-                        provider::ContentBlock::ToolResult { .. }
-                        | provider::ContentBlock::Thinking { .. }
-                        | provider::ContentBlock::Image { .. } => {}
-                    }
-                }
+            conversation::Event::CompactBoundary { summary, .. } => {
+                writeln!(output, "---\n").ok();
+                writeln!(output, "<details>").ok();
+                writeln!(
+                    output,
+                    "<summary>Session compaction (summary the model saw in place of the turns above)</summary>\n"
+                )
+                .ok();
+                writeln!(output, "{}\n", summary.text_content()).ok();
+                writeln!(output, "</details>\n").ok();
             }
         }
     }
 
     output
+}
+
+fn write_message_markdown(
+    output: &mut String,
+    message: &provider::Message,
+    tool_outputs: &std::collections::HashMap<String, String>,
+) {
+    use std::fmt::Write;
+
+    match message.role {
+        provider::Role::User => {
+            // A "user" message can be either a plain user turn or a tool_results envelope.
+            // Inspect content blocks rather than role to decide.
+            let has_tool_results = message
+                .content
+                .iter()
+                .any(|block| matches!(block, provider::ContentBlock::ToolResult { .. }));
+            if has_tool_results {
+                for block in &message.content {
+                    if let provider::ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } = block
+                    {
+                        let label = if *is_error {
+                            "Tool result (error)"
+                        } else {
+                            "Tool result"
+                        };
+                        writeln!(output, "<details>").ok();
+                        writeln!(output, "<summary>{}</summary>\n", label).ok();
+                        let text = provider::ContentBlock::tool_result_text_content(content);
+                        let text = resolve_large_output_tags(&text, tool_outputs);
+                        writeln!(output, "```\n{}\n```\n", text).ok();
+                        writeln!(output, "</details>\n").ok();
+                    }
+                }
+            } else {
+                writeln!(output, "## User\n").ok();
+                writeln!(output, "{}\n", message.text_content()).ok();
+            }
+        }
+        provider::Role::Assistant => {
+            writeln!(output, "## Assistant\n").ok();
+            for block in &message.content {
+                match block {
+                    provider::ContentBlock::Text { text } => {
+                        writeln!(output, "{}\n", text).ok();
+                    }
+                    provider::ContentBlock::ToolUse { name, input, .. } => {
+                        let input_pretty = serde_json::to_string_pretty(input)
+                            .unwrap_or_else(|_| input.to_string());
+                        writeln!(output, "<details>").ok();
+                        writeln!(output, "<summary>Tool call: {}</summary>\n", name).ok();
+                        writeln!(output, "```json\n{}\n```\n", input_pretty).ok();
+                        writeln!(output, "</details>\n").ok();
+                    }
+                    provider::ContentBlock::ToolResult { .. }
+                    | provider::ContentBlock::Thinking { .. }
+                    | provider::ContentBlock::Image { .. } => {}
+                }
+            }
+        }
+    }
 }
 
 fn resolve_large_output_tags(
@@ -2087,5 +2114,60 @@ mod tests {
             "user's RUST_LOG should pass through unchanged; got: {}",
             rendered
         );
+    }
+
+    #[test]
+    fn full_export_includes_pre_compaction_turns() {
+        // A compacted session: the early turns are hidden from the model behind a CompactBoundary,
+        // but `meka session export` must still render them. Build the same event log compaction
+        // produces and assert the export contains both the summarized turns and a boundary marker.
+        let mut log = conversation::Conversation::new();
+        log.append(user_msg("first question"));
+        log.append(assistant_text("first answer"));
+        log.append(user_msg("second question"));
+        log.append(assistant_text("second answer"));
+        log.replace_for_compaction(
+            user_msg("[Conversation summary from session compaction]\n\nYou discussed things."),
+            vec![assistant_text("kept tail answer")],
+            std::collections::HashSet::new(),
+        );
+
+        let markdown = format_session_as_markdown(
+            uuid::Uuid::nil(),
+            log.events(),
+            &std::collections::HashMap::new(),
+        );
+
+        // Pre-compaction turns survive in the export even though the model no longer sees them.
+        assert!(
+            markdown.contains("first question") && markdown.contains("second answer"),
+            "full export must include pre-compaction turns:\n{markdown}"
+        );
+        // The boundary is marked, and its summary is available (collapsed).
+        assert!(
+            markdown.contains("Session compaction") && markdown.contains("You discussed things."),
+            "full export must mark the compaction boundary:\n{markdown}"
+        );
+        // The retained tail (re-appended after the boundary) is present.
+        assert!(
+            markdown.contains("kept tail answer"),
+            "full export must include the retained tail:\n{markdown}"
+        );
+    }
+
+    #[test]
+    fn export_without_compaction_renders_plain_turns() {
+        let mut log = conversation::Conversation::new();
+        log.append(user_msg("hello"));
+        log.append(assistant_text("hi there"));
+        let markdown = format_session_as_markdown(
+            uuid::Uuid::nil(),
+            log.events(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(markdown.contains("## User") && markdown.contains("hello"));
+        assert!(markdown.contains("## Assistant") && markdown.contains("hi there"));
+        // No compaction happened, so no boundary marker.
+        assert!(!markdown.contains("Session compaction"));
     }
 }

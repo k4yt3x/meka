@@ -23,6 +23,8 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`scratchpad_delete`](./scratchpad.md#scratchpad_delete) | Read | Delete a scratchpad entry |
 | [`skill`](./overview.md#skill) | Read | Load a named skill's instructions |
 | [`render_image`](./overview.md#render_image) | Read | View an image from in-memory base64 or scratchpad |
+| [`recall`](./overview.md#recall) | Read | Search the full conversation history, including compacted turns |
+| [`recall_read`](./overview.md#recall) | Read | Read conversation turns by index |
 
 ## Permission Requirements
 
@@ -32,6 +34,7 @@ Tools are grouped by the minimum permission level required:
 - `read_file`, `find_files`, `search_contents`, `fetch_url`, `web_search`
 - `execute_command` (sandboxed, filesystem write-protected)
 - `todo`, `spawn_agent`, `skill`, `render_image`
+- `recall`, `recall_read`
 - All scratchpad tools
 
 **Write permission** (only available in write mode):
@@ -125,6 +128,32 @@ Exactly one of `from_scratchpad` or `base64` must be provided. Prefer `from_scra
 The bytes must decode to a supported raster image. PNG, JPEG, GIF, WebP, and BMP pass through unchanged; TIFF, ICO, HDR, EXR, TGA, PNM, QOI, DDS, and Farbfeld are auto-converted to PNG. Size cap is ~3.75 MB on the final payload.
 
 Only call `render_image` when the current model supports vision input.
+
+## `recall` / `recall_read`
+
+Search and re-read this session's **full** conversation, including earlier turns that [compaction](../usage/interactive-mode.md#compact) summarized and removed from the model's context. Compaction never deletes turns (it appends a boundary and hides the older ones); these tools read straight from the on-disk event log, so a detail the compaction summary dropped is still recoverable.
+
+`recall` searches and returns matching lines, each tagged with a message index (`#N`) and role:
+
+```text
+recall({"query": "auth token", "regex": false, "limit": 20})
+```
+
+- `query` (required) — text to search for; a literal substring (case-insensitive) unless `regex` is set.
+- `regex` — treat `query` as a case-sensitive regular expression. Default: `false`.
+- `limit` — maximum matches to return (capped at 100). Default: 20.
+
+`recall_read` reads turns by the `#N` index that `recall` reports:
+
+```text
+recall_read({"start": 47, "count": 3})
+```
+
+- `start` (required) — 1-based message index to read from.
+- `count` — number of consecutive messages to read (max 20). Default: 1.
+- `scratchpad` — save the output to a scratchpad entry instead of returning it inline.
+
+After a compaction, the summary message reminds the agent that these tools exist. Large tool outputs appear as `<large-output>` references in both `recall` and `recall_read` results (rather than inlining the full payload); read their full content with `scratchpad_read`.
 
 ## Redirecting output to the scratchpad
 

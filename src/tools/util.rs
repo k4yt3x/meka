@@ -1,12 +1,33 @@
 //! Small shared helpers for tool-input parsing and validation.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use super::ToolOutput;
 use crate::error::{MekaError, Result};
 
 /// Default cap for regex-search-mode hits; shared by `read_file` and `scratchpad_read`.
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
+
+/// Resolve the active session id for a session-scoped tool, erroring if no session is open. Shared
+/// by the scratchpad and recall tool families.
+pub(super) async fn resolve_session_id(
+    session_id: &Arc<RwLock<Option<Uuid>>>,
+    tool_name: &str,
+) -> Result<Uuid> {
+    session_id
+        .read()
+        .await
+        .ok_or_else(|| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: "no active session".to_string(),
+        })
+}
 
 pub(super) fn require_str(
     input: &serde_json::Value,

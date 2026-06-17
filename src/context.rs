@@ -430,6 +430,18 @@ pub fn build_post_compact_context(
         parts.push(listing);
     }
 
+    // The summary above replaces the earlier turns; if a needed detail is missing from it, the full
+    // history is still searchable. `recall` is a Read-tier tool, so the nudge only applies when
+    // tools can run at all (not in `none` mode).
+    if permission != Permission::None {
+        parts.push(
+            "[Earlier turns were summarized above. If you need a detail the summary omitted, use \
+             the `recall` tool to search the full conversation history and `recall_read` to read a \
+             specific turn.]"
+                .to_string(),
+        );
+    }
+
     parts.join("\n")
 }
 

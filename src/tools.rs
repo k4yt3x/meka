@@ -7,6 +7,7 @@ mod find;
 mod grep;
 mod load_tool;
 pub(crate) mod mcp_resources;
+mod recall;
 mod render_image;
 pub(crate) mod scratchpad;
 mod shell;
@@ -570,6 +571,14 @@ impl ToolRegistry {
             session_id: shared_session_id.clone(),
             parent_session_id,
             inherited_names: inherited_scratchpad_names.clone(),
+        }));
+        self.register_builtin(Arc::new(recall::RecallTool {
+            session_manager: session_manager.clone(),
+            session_id: shared_session_id.clone(),
+        }));
+        self.register_builtin(Arc::new(recall::RecallReadTool {
+            session_manager: session_manager.clone(),
+            session_id: shared_session_id.clone(),
         }));
         self.register_builtin(Arc::new(scratchpad::ScratchpadEditTool {
             session_manager: session_manager.clone(),

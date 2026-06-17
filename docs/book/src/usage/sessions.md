@@ -167,7 +167,7 @@ You can export any session as a Markdown file:
 meka session export 550e8400-e29b-41d4-a716-446655440000
 ```
 
-This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks.
+This writes `session-550e8400-e29b-41d4-a716-446655440000.md` in the current directory with the full conversation. User and assistant messages are rendered as Markdown sections, while tool calls and results are wrapped in collapsible `<details>` blocks. The export always covers the **entire** session, including turns that were later hidden from the model by [compaction](interactive-mode.md#compact) (each compaction point is marked with its summary).
 
 To write to a specific file:
 

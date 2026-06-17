@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::{
     Tool, ToolOutput,
-    util::{MAX_SEARCH_MATCHES, search_lines},
+    util::{MAX_SEARCH_MATCHES, resolve_session_id, search_lines},
 };
 use crate::{
     error::{MekaError, Result},
@@ -39,19 +39,6 @@ pub(crate) fn format_size(bytes: usize) -> String {
     } else {
         format!("{} bytes", bytes)
     }
-}
-
-async fn resolve_session_id(
-    session_id: &Arc<RwLock<Option<Uuid>>>,
-    tool_name: &str,
-) -> Result<Uuid> {
-    session_id
-        .read()
-        .await
-        .ok_or_else(|| MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message: "no active session".to_string(),
-        })
 }
 
 /// Build a map from tool_use_id to (tool_name, input) for the ToolUse blocks in an assistant

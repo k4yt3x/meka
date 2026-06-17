@@ -12,10 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - REPL now Tab-completes slash-command names and highlights the command token.
 - REPL now Tab-completes slash-command arguments (permission levels, skills, MCP servers, /cd paths).
 - `meka history list` / `meka history clear` view and clear REPL input history.
+- `recall` / `recall_read` tools search and read the full conversation, including compacted turns.
 
 ### Changed
 
 - Session subcommands `list`, `export`, and `delete` moved under `meka session` for consistency.
+- `meka session export` now exports the full conversation, including turns hidden by compaction.
 
 ## [0.27.3] - 2026-06-11
 

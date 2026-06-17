@@ -152,7 +152,7 @@ Session status
 
 The `/compact` command asks the LLM to summarize the entire conversation, then replaces the messages the model sees with a single summary message followed by the recent tail. This is useful for long sessions that are approaching the context window limit or becoming expensive.
 
-After compacting, the session continues with the summary as context. The pre-compaction messages stay in the underlying event log on disk (the model just no longer sees them), so `meka session export` and resume continue to work exactly as if the compaction had wiped them.
+After compacting, the session continues with the summary as context. The pre-compaction messages are never deleted: they stay in the underlying event log on disk (the model just no longer sees them). `meka session export` walks that full log, so an export always contains the entire conversation including the compacted-away turns, with a marker at each compaction point.
 
 ## Shell Escape
 
