@@ -329,7 +329,14 @@ pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
         // model's text content is what the user sees as the refusal. Surface an empty refusal
         // payload; the assistant message blocks carry the human-readable explanation already.
         "refusal" => StopReason::Refusal(String::new()),
-        other => StopReason::Unknown(other.to_string()),
+        // Log unrecognized reasons (e.g. `pause_turn`) so a recurrence is diagnosable; the raw
+        // string is otherwise discarded once mapped to `Unknown`.
+        other => {
+            tracing::warn!(
+                "claude returned unrecognized stop_reason {other:?}; mapping to Unknown"
+            );
+            StopReason::Unknown(other.to_string())
+        }
     }
 }
 
@@ -1113,6 +1120,16 @@ mod tests {
         assert_eq!(
             parse_claude_stop_reason("max_tokens"),
             StopReason::MaxTokens
+        );
+        assert_eq!(
+            parse_claude_stop_reason("refusal"),
+            StopReason::Refusal(String::new())
+        );
+        // `pause_turn` is unrecognized and maps to `Unknown` carrying the raw string, so the
+        // literal reaches the warn log and the empty-turn stand-in intact.
+        assert_eq!(
+            parse_claude_stop_reason("pause_turn"),
+            StopReason::Unknown("pause_turn".to_string())
         );
         assert_eq!(
             parse_claude_stop_reason("something_else"),

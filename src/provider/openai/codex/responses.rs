@@ -384,7 +384,12 @@ fn parse_response_status(status: &str) -> StopReason {
     match status {
         "completed" => StopReason::EndTurn,
         "incomplete" => StopReason::MaxTokens,
-        other => StopReason::Unknown(other.to_string()),
+        other => {
+            tracing::warn!(
+                "openai responses returned unrecognized status {other:?}; mapping to Unknown"
+            );
+            StopReason::Unknown(other.to_string())
+        }
     }
 }
 

@@ -573,7 +573,12 @@ fn parse_openai_stop_reason(reason: &str) -> StopReason {
         "stop" => StopReason::EndTurn,
         "tool_calls" => StopReason::ToolUse,
         "length" => StopReason::MaxTokens,
-        other => StopReason::Unknown(other.to_string()),
+        other => {
+            tracing::warn!(
+                "openai returned unrecognized finish_reason {other:?}; mapping to Unknown"
+            );
+            StopReason::Unknown(other.to_string())
+        }
     }
 }
 

@@ -3824,6 +3824,43 @@ fn acp_session_prompt_emits_agent_thought_chunk_for_thinking_block() {
     assert_eq!(response["result"]["stopReason"], "end_turn");
 }
 
+/// A thinking-only round (no visible text) ending in `end_turn` must not end the turn silently. The
+/// agent nudges once for a user-visible response and re-issues, so the scripted second round's text
+/// reaches the client. Mirrors Claude Code's `query_thinking_only_response` recovery. Without the
+/// nudge the first round's `end_turn` would end the turn and the second round would never run.
+#[test]
+fn acp_session_prompt_nudges_thinking_only_turn() {
+    let script = serde_json::json!([
+        [
+            { "kind": "thinking_delta", "text": "pondering silently" },
+            { "kind": "thinking_complete", "signature": null },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "kind": "text", "text": "recovered answer" },
+            { "kind": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "go");
+    let (updates, response) = harness.collect_updates(&sid, id);
+
+    // The second round runs only if the nudge fired after the thinking-only first round.
+    let saw_recovered = updates.iter().any(|u| {
+        u["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && u["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("recovered answer"))
+    });
+    assert!(
+        saw_recovered,
+        "thinking-only turn must nudge and surface the second round's text; updates: {:?}",
+        updates,
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+}
+
 /// `MockStopReason::MaxTokens` propagates end-to-end as `stopReason: "max_tokens"` on the
 /// `PromptResponse`. The mock already had the enum variant; this test plugs the gap in integration
 /// coverage.

@@ -509,6 +509,9 @@ impl Agent {
         let turn_start_len = messages.len();
 
         let mut user_saved = user_eagerly_saved;
+        // Set once we've nudged the model for a user-visible response this turn, so the recovery
+        // fires at most once and can't loop (see `should_nudge_thinking_only`).
+        let mut thinking_only_nudged = false;
         // Accumulate token usage across every provider call within this turn so the per-turn
         // display reflects the whole turn (including tool-execution loops), not just the final
         // round-trip.
@@ -652,12 +655,53 @@ impl Agent {
                     .content
                     .iter()
                     .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+                let has_visible_text = has_visible_text(&assistant_message.content);
 
-                // A non-tool turn can come back with no content (e.g. a hard refusal). Without this
-                // it shows nothing and persists an empty content array, which is invalid on the
-                // next request and breaks resume. Surface a stand-in in the assistant's place and
-                // persist it so the message is non-empty.
-                if !has_tool_calls && assistant_message.content.is_empty() {
+                // A turn that makes no tool call and produces no visible text (a thinking-only
+                // response, or an empty one) would otherwise end silently. Mirror Claude Code's
+                // `query_thinking_only_response`: record the turn, then nudge the model once for a
+                // user-visible response and continue. The nudge is appended *after* the assistant
+                // message so the thinking-only turn isn't the trailing assistant message - Claude
+                // strips trailing thinking blocks only from the last assistant turn, so keeping it
+                // non-last preserves its thinking block on the retry request.
+                if should_nudge_thinking_only(
+                    has_tool_calls,
+                    has_visible_text,
+                    &stop_reason,
+                    thinking_only_nudged,
+                ) {
+                    messages.append(assistant_message.clone());
+                    let assistant_event =
+                        crate::conversation::Event::Append(assistant_message.clone());
+                    let nudge = Message {
+                        role: Role::User,
+                        content: vec![ContentBlock::Text {
+                            text: THINKING_ONLY_NUDGE.to_string(),
+                        }],
+                    };
+                    let nudge_event = crate::conversation::Event::Append(nudge.clone());
+                    if let Err(error) = self
+                        .session_manager
+                        .save_events_atomic(sid, vec![assistant_event, nudge_event])
+                        .await
+                    {
+                        break 'turn Err(error);
+                    }
+                    messages.append(nudge);
+                    thinking_only_nudged = true;
+                    tracing::info!(
+                        "thinking-only response (no visible text, stop_reason {:?}); nudging once",
+                        stop_reason,
+                    );
+                    continue;
+                }
+
+                // No tool call and no visible text, and the nudge above didn't fire (already used
+                // this turn, or a stop reason with its own handling such as refusal / max tokens).
+                // Surface a stand-in in the assistant's place and persist it so the message is
+                // non-empty: an empty content array is invalid on the next request and breaks
+                // resume, and a silent turn leaves the user with nothing.
+                if !has_tool_calls && !has_visible_text {
                     let notice = empty_turn_notice(&stop_reason);
                     self.frontend
                         .emit(FrontendEvent::AssistantTextDelta(notice.clone()))
@@ -1395,6 +1439,15 @@ fn has_tool_results(content: &[ContentBlock]) -> bool {
         .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
+/// Whether an assistant turn produced any user-visible text: a `Text` block with non-whitespace
+/// content. `Thinking`, `ToolUse`, `ToolResult`, and `Image` blocks are not user-visible prose, so
+/// a thinking-only turn returns `false` here.
+fn has_visible_text(content: &[ContentBlock]) -> bool {
+    content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
+}
+
 /// Human-readable stand-in for a terminal turn that produced no content (e.g. a hard refusal, or an
 /// empty `max_tokens` / `end_turn`). Used both as the persisted assistant text (so the message
 /// isn't empty) and as the line surfaced to the user.
@@ -1412,6 +1465,28 @@ fn empty_turn_notice(stop_reason: &StopReason) -> String {
         }
         _ => "[The model returned an empty response.]".to_string(),
     }
+}
+
+/// Meta message injected to coax a user-visible response out of a turn that produced only thinking
+/// (or nothing). Mirrors Claude Code's `query_thinking_only_response` nudge.
+const THINKING_ONLY_NUDGE: &str = "[Your previous response contained no visible output. Please \
+                                   continue and produce a user-visible response.]";
+
+/// Whether to nudge the model for a user-visible response after a turn that made no tool call and
+/// produced no visible text (e.g. a thinking-only turn). Mirrors Claude Code's
+/// `query_thinking_only_response`: fire at most once per turn, and only for a terminal stop reason
+/// without its own handling - `MaxTokens` and `Refusal` carry their own outcomes, so a no-text turn
+/// under those reasons falls through to [`empty_turn_notice`] instead of being retried.
+fn should_nudge_thinking_only(
+    has_tool_calls: bool,
+    has_visible_text: bool,
+    stop_reason: &StopReason,
+    already_nudged: bool,
+) -> bool {
+    !has_tool_calls
+        && !has_visible_text
+        && !already_nudged
+        && matches!(stop_reason, StopReason::EndTurn | StopReason::Unknown(_))
 }
 
 /// Preprocess message content blocks for the compaction summarizer:
@@ -1484,6 +1559,89 @@ mod tests {
         let notice = empty_turn_notice(&StopReason::Unknown("pause_turn".to_string()));
         assert!(notice.contains("pause_turn"), "got: {notice}");
         assert!(empty_turn_notice(&StopReason::EndTurn).contains("empty response"));
+    }
+
+    #[test]
+    fn test_has_visible_text() {
+        assert!(!has_visible_text(&[]));
+        assert!(!has_visible_text(&[ContentBlock::Thinking {
+            thinking: "pondering".to_string(),
+            signature: None,
+        }]));
+        // Whitespace-only text is not visible output.
+        assert!(!has_visible_text(&[ContentBlock::Text {
+            text: "   \n".to_string(),
+        }]));
+        assert!(!has_visible_text(&[ContentBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({}),
+        }]));
+        assert!(has_visible_text(&[ContentBlock::Text {
+            text: "hello".to_string(),
+        }]));
+        // A thinking block followed by real text still counts as visible.
+        assert!(has_visible_text(&[
+            ContentBlock::Thinking {
+                thinking: "pondering".to_string(),
+                signature: None,
+            },
+            ContentBlock::Text {
+                text: "answer".to_string(),
+            },
+        ]));
+    }
+
+    #[test]
+    fn test_should_nudge_thinking_only() {
+        // Thinking-only end_turn: nudge once.
+        assert!(should_nudge_thinking_only(
+            false,
+            false,
+            &StopReason::EndTurn,
+            false
+        ));
+        // Thinking-only unrecognized reason (e.g. pause_turn): nudge once.
+        assert!(should_nudge_thinking_only(
+            false,
+            false,
+            &StopReason::Unknown("pause_turn".to_string()),
+            false,
+        ));
+        // Already nudged this turn: no second nudge (prevents loops).
+        assert!(!should_nudge_thinking_only(
+            false,
+            false,
+            &StopReason::EndTurn,
+            true
+        ));
+        // Visible text present: nothing to recover.
+        assert!(!should_nudge_thinking_only(
+            false,
+            true,
+            &StopReason::EndTurn,
+            false
+        ));
+        // Tool calls present: the tool path drives continuation.
+        assert!(!should_nudge_thinking_only(
+            true,
+            false,
+            &StopReason::EndTurn,
+            false
+        ));
+        // MaxTokens and Refusal carry their own outcomes; don't retry them.
+        assert!(!should_nudge_thinking_only(
+            false,
+            false,
+            &StopReason::MaxTokens,
+            false
+        ));
+        assert!(!should_nudge_thinking_only(
+            false,
+            false,
+            &StopReason::Refusal(String::new()),
+            false,
+        ));
     }
 
     fn user_msg(text: &str) -> Message {
