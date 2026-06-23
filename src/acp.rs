@@ -900,6 +900,19 @@ fn replay_session_updates(
                                 )),
                             );
                         }
+                        MekaContentBlock::RedactedThinking { .. } => {
+                            send_session_update(
+                                connection,
+                                session_id,
+                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                    ContentBlock::Text(
+                                        agent_client_protocol::schema::TextContent::new(
+                                            "[redacted thinking]".to_string(),
+                                        ),
+                                    ),
+                                )),
+                            );
+                        }
                         MekaContentBlock::ToolUse { id, name, input } => {
                             let locations = tool_locations(name, input, cwd);
                             // Match the live path's rich title. No tool schema is available on

@@ -34,7 +34,7 @@ default_provider = "work"
 type = "claude-oauth"
 model = "claude-opus-4-6"
 effort = "high"          # optional; "low" | "medium" | "high"
-redact_thinking = false  # optional; redact thinking content for privacy
+redact_thinking = true   # optional; default on, matching Claude Code
 # device_id, oauth_token_url, client_id are all optional overrides
 ```
 
@@ -48,7 +48,7 @@ Sent as `output_config.effort` for effort-capable models (`opus-4-6`, `sonnet-4-
 
 ### `redact_thinking`
 
-When `true`, meka adds the `redact-thinking-2026-02-12` beta header so the server returns redacted thinking blocks instead of full thinking summaries. The redacted payloads can't be replayed back to the server in multi-turn conversations, so meka stores them as opaque signatures only. Defaults to `false`.
+Adds the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which sends it by default. With it on, the server withholds the readable chain of thought: `thinking` blocks come back with empty text plus a signature, and any `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn reasoning continuity is maintained. The practical effect is that live thinking output goes quiet for these models (there is no readable text to show), exactly as in Claude Code. Defaults to `true`; set `redact_thinking = false` to drop the beta and keep interleaved thinking visible.
 
 ### `device_id`
 
@@ -122,7 +122,7 @@ Composed dynamically from the model + thinking settings, mirroring Claude Code's
 | `oauth-2025-04-20` | Always (subscription auth) |
 | `adaptive-thinking-2026-01-28` | Thinking on AND model is `opus-4-6` / `sonnet-4-6` |
 | `interleaved-thinking-2025-05-14` | Thinking on AND model is older Claude 4 (Sonnet 4.0, etc.) |
-| `redact-thinking-2026-02-12` | profile `redact_thinking = true` AND thinking on |
+| `redact-thinking-2026-02-12` | Any modern Claude (4.x+); on by default, `redact_thinking = false` opts out |
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
 | `effort-2025-11-24` | `opus-4-6` / `sonnet-4-6` only |
@@ -133,9 +133,9 @@ Sent as an array of three `text` blocks:
 
 1. `x-anthropic-billing-header: cc_version=<version>.<fingerprint>; cc_entrypoint=cli; cch=<xxHash64-attestation>;` The fingerprint suffix is a 3-character hex hash derived from the first user message (`SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]`); the `cch` token is xxHash64 of the entire serialized request body, computed and patched in just before send.
 2. `You are Claude Code, Anthropic's official CLI for Claude.` (fixed identity prefix).
-3. Your own system prompt, which carries `cache_control: {type: "ephemeral", ttl: "1h"}`.
+3. Your own system prompt, which carries `cache_control: {type: "ephemeral", ttl: "1h", scope: "global"}`.
 
-Only block 3 is marked for caching, matching the recent Claude Code wire shape ("boundary mode" in `utils/api.ts:362-409`). Blocks 1 and 2 must come first so the `cch=00000` placeholder is the first occurrence in the serialized JSON, which is what `patch_request_body` looks for when computing the attestation.
+Only block 3 is marked for caching, matching the captured Claude Code CLI wire shape ("boundary mode" in `utils/api.ts:362-409`); `scope: "global"` shares the cached prefix across sessions. Tools carry no `cache_control` (the rolling last-message breakpoint caches the tools+system prefix). Blocks 1 and 2 must come first so the `cch=00000` placeholder is the first occurrence in the serialized JSON, which is what `patch_request_body` looks for when computing the attestation.
 
 ### Other body fields
 

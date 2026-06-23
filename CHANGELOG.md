@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Log a warning for unrecognized provider stop reasons (e.g. `pause_turn`) for diagnosability.
 
+### Changed
+
+- Match newest Claude Code request fidelity.
+
 ### Fixed
 
 - Recover thinking-only model turns with a one-shot nudge instead of ending the turn with no output.

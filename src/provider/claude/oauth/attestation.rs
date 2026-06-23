@@ -69,14 +69,23 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 /// derived from the first user message per Claude Code's behaviour (`services/api/claude.ts:1325`).
 /// The `cch` is replaced with the real attestation by [`patch_request_body`] after serialization.
 pub(super) fn generate_billing_header(messages: &[Message]) -> String {
+    // Claude Code appends `cc_is_subagent=true;` after the `cch` segment for sub-agent requests
+    // (`qun()` in the CLI). meka tracks this via the [`crate::provider::is_subagent`] task-local.
+    let subagent = if crate::provider::is_subagent() {
+        " cc_is_subagent=true;"
+    } else {
+        ""
+    };
     format!(
-        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;",
+        "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}",
         CC_VERSION,
         compute_fingerprint_from_messages(messages),
+        subagent,
     )
 }
 
-// xxHash64 with Claude-specific seed. See ATTESTATION.md for details.
+// xxHash64 and the `cch` attestation token. Algorithm derivation and reverse-engineering notes live
+// in `temp/cc-re/cch/`.
 
 const XXH64_PRIME1: u64 = 0x9e3779b185ebca87;
 const XXH64_PRIME2: u64 = 0xc2b2ae3d27d4eb4f;
@@ -84,8 +93,8 @@ const XXH64_PRIME3: u64 = 0x165667b19e3779f9;
 const XXH64_PRIME4: u64 = 0x85ebca77c2b2ae63;
 const XXH64_PRIME5: u64 = 0x27d4eb2f165667c5;
 
-/// Claude Code attestation seed.
-const CCH_XXH64_SEED: u64 = 0x6e52736ac806831e;
+/// xxHash64 seed for the `cch` attestation token.
+const CCH_XXH64_SEED: u64 = 0x4d659218e32a3268;
 
 fn xxh64_round(acc: u64, lane: u64) -> u64 {
     acc.wrapping_add(lane.wrapping_mul(XXH64_PRIME2))
@@ -196,8 +205,122 @@ fn xxh64(input: &[u8], seed: u64) -> u64 {
     xxh64_avalanche(h64)
 }
 
-/// Replaces the `cch=00000` placeholder with xxHash64(body) & 0xFFFFF. Anchors the search to the
-/// billing header to avoid false matches in messages.
+/// Builds the byte sequence the `cch` is hashed over: a copy of the body (carrying the `cch=00000`
+/// placeholder) with the `model` value emptied and `max_tokens`, `fallbacks`, and
+/// `fallback_credit_token` removed along with their separating comma.
+fn filtered_preimage(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+
+    while i < body.len() {
+        if let Some((next, replacement, trim_prev_comma)) = filter_edit(body, i) {
+            if trim_prev_comma && out.last() == Some(&b',') {
+                out.pop();
+            }
+            out.extend_from_slice(replacement);
+            i = next;
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+
+    out
+}
+
+/// If a field to strip/normalize starts at `i`, returns `(next_index, replacement_bytes,
+/// trim_preceding_comma)`. `trim_preceding_comma` removes a now-dangling comma left before a
+/// deleted field that had no trailing comma of its own.
+fn filter_edit(body: &[u8], i: usize) -> Option<(usize, &'static [u8], bool)> {
+    const MODEL: &[u8] = b"\"model\":\"";
+    const MODEL_EMPTY: &[u8] = b"\"model\":\"\"";
+    const MAX_TOKENS: &[u8] = b"\"max_tokens\":";
+    const FALLBACKS: &[u8] = b"\"fallbacks\":[";
+    const FALLBACK_TOKEN: &[u8] = b"\"fallback_credit_token\":\"";
+
+    if body[i..].starts_with(MODEL) {
+        let end = json_string_end(body, i + MODEL.len())?;
+        return Some((end + 1, MODEL_EMPTY, false));
+    }
+
+    if body[i..].starts_with(MAX_TOKENS) {
+        let start = i + MAX_TOKENS.len();
+        let end = digits_end(body, start);
+        return (end > start).then(|| skip_field(body, i, end));
+    }
+
+    if body[i..].starts_with(FALLBACKS) {
+        let array_start = i + FALLBACKS.len() - 1;
+        let end = json_array_end(body, array_start)?;
+        return Some(skip_field(body, i, end + 1));
+    }
+
+    if body[i..].starts_with(FALLBACK_TOKEN) {
+        let end = json_string_end(body, i + FALLBACK_TOKEN.len())?;
+        return Some(skip_field(body, i, end + 1));
+    }
+
+    None
+}
+
+/// Computes the edit that deletes the field spanning `start..end`, consuming a trailing comma if
+/// present, otherwise signalling that a preceding comma must be trimmed.
+fn skip_field(body: &[u8], start: usize, end: usize) -> (usize, &'static [u8], bool) {
+    if body.get(end) == Some(&b',') {
+        (end + 1, b"", false)
+    } else {
+        (end, b"", start > 0 && body[start - 1] == b',')
+    }
+}
+
+/// Index of the closing quote of a JSON string whose contents start at `i` (handles `\\` escapes).
+fn json_string_end(body: &[u8], mut i: usize) -> Option<usize> {
+    while i < body.len() {
+        match body[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Index of the closing bracket of a JSON array whose opening `[` is at `i`.
+fn json_array_end(body: &[u8], mut i: usize) -> Option<usize> {
+    let mut depth = 0usize;
+
+    while i < body.len() {
+        match body[i] {
+            b'"' => i = json_string_end(body, i + 1)? + 1,
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    None
+}
+
+/// Index just past a run of ASCII digits starting at `i`.
+fn digits_end(body: &[u8], mut i: usize) -> usize {
+    while body.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    i
+}
+
+/// Replaces the `cch=00000` placeholder with the attestation token. The placeholder search is
+/// anchored to the billing header to avoid false matches in messages; the hash is taken over
+/// [`filtered_preimage`] of the body.
 pub(super) fn patch_request_body(body_json: &str) -> Result<String> {
     const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
     const PLACEHOLDER: &str = "cch=00000";
@@ -215,7 +338,8 @@ pub(super) fn patch_request_body(body_json: &str) -> Result<String> {
             )
         })?;
 
-    let digest = xxh64(body_json.as_bytes(), CCH_XXH64_SEED);
+    let preimage = filtered_preimage(body_json.as_bytes());
+    let digest = xxh64(&preimage, CCH_XXH64_SEED);
     let token = format!("{:05x}", digest & 0xfffff);
 
     let mut patched = String::with_capacity(body_json.len());
@@ -235,7 +359,7 @@ fn claude_user_agent() -> String {
 /// (Bun's Node.js compat layer) with a fixed version string.
 const STAINLESS_RUNTIME: &str = "node";
 const STAINLESS_RUNTIME_VERSION: &str = "v24.3.0";
-const STAINLESS_SDK_VERSION: &str = "0.90.0";
+const STAINLESS_SDK_VERSION: &str = "0.94.0";
 
 /// Maps `std::env::consts::ARCH` to Node.js/Bun `process.arch` names.
 fn stainless_arch() -> &'static str {
@@ -282,6 +406,8 @@ pub(super) fn apply_headers(
         .header("x-stainless-runtime", STAINLESS_RUNTIME)
         .header("x-stainless-runtime-version", STAINLESS_RUNTIME_VERSION)
         .header("anthropic-version", "2023-06-01")
+        // Set by the SDK; observed on real Claude Code 2.1.185 CLI requests.
+        .header("anthropic-dangerous-direct-browser-access", "true")
         // From the SDK's `authHeaders()`.
         .header(auth_header_name, auth_header_value)
         // From Claude Code's `defaultHeaders()` (User-Agent updates in place above).
@@ -460,28 +586,32 @@ mod tests {
 
     #[test]
     fn test_xxh64_claude_seed_short_body() {
+        // No volatile fields, so the preimage equals the raw body; pins the seed.
         let body = r#"{"test":"cch=00000"}"#;
         let digest = xxh64(body.as_bytes(), CCH_XXH64_SEED);
         let token = format!("{:05x}", digest & 0xfffff);
-        assert_eq!(token, "14d28");
+        assert_eq!(token, "2f60d");
     }
 
     #[test]
-    fn test_xxh64_claude_seed_realistic_body() {
+    fn test_filtered_preimage_strips_volatile_fields() {
+        // model emptied; max_tokens, fallbacks, fallback_credit_token removed with their commas.
+        let body = br#"{"model":"claude-x","max_tokens":1024,"a":1,"fallbacks":[{"x":1}],"fallback_credit_token":"tok","b":2}"#;
+        let preimage = String::from_utf8(filtered_preimage(body)).unwrap();
+        assert_eq!(preimage, r#"{"model":"","a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn test_patch_request_body_realistic() {
         let body = concat!(
-            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header:"#,
-            r#" cc_version=2.1.86.123; cc_entrypoint=cli; cch=00000;"},{"type"#,
-            r#":"text","text":"You are Claude Code","cache_control":{"type":"e"#,
-            r#"phemeral"}}],"model":"claude-sonnet-4-20250514","messages":[{"r"#,
-            r#"ole":"user","content":[{"type":"text","text":"hello"}]}],"max_t"#,
-            r#"okens":8192,"stream":false,"metadata":{"user_id":"meka"}}"#,
+            r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: "#,
+            r#"cc_version=2.1.185.abc; cc_entrypoint=cli; cch=00000;"}],"model""#,
+            r#":"claude-opus-4-20250514","max_tokens":1024,"messages":[{"role""#,
+            r#":"user","content":"hi"}]}"#,
         );
 
-        let digest = xxh64(body.as_bytes(), CCH_XXH64_SEED);
-        let token = format!("{:05x}", digest & 0xfffff);
-
         let patched = patch_request_body(body).unwrap();
-        assert!(patched.contains(&format!("cch={}", token)));
+        assert!(patched.contains("cch=16a13;"), "got: {patched}");
         assert!(!patched.contains("cch=00000"));
     }
 

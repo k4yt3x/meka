@@ -884,19 +884,33 @@ impl Agent {
                     current_thinking.push_str(&text);
                 }
                 StreamEvent::ThinkingComplete { signature } => {
-                    if !current_thinking.is_empty() {
-                        let content = std::mem::take(&mut current_thinking);
-                        self.frontend
-                            .emit(FrontendEvent::ThinkingBlock {
-                                content: content.clone(),
-                                signature: signature.clone(),
-                            })
-                            .await;
+                    let content = std::mem::take(&mut current_thinking);
+                    // Keep the block whenever it carries replayable state: visible text and/or a
+                    // signature. Under `redact-thinking` the text is empty but the signature must
+                    // survive to continue the reasoning chain on the next turn.
+                    if !content.is_empty() || signature.is_some() {
+                        if !content.is_empty() {
+                            self.frontend
+                                .emit(FrontendEvent::ThinkingBlock {
+                                    content: content.clone(),
+                                    signature: signature.clone(),
+                                })
+                                .await;
+                        }
                         content_blocks.push(ContentBlock::Thinking {
                             thinking: content,
                             signature,
                         });
                     }
+                }
+                StreamEvent::RedactedThinking { data } => {
+                    self.frontend
+                        .emit(FrontendEvent::ThinkingBlock {
+                            content: "[redacted thinking]".to_string(),
+                            signature: None,
+                        })
+                        .await;
+                    content_blocks.push(ContentBlock::RedactedThinking { data });
                 }
                 StreamEvent::TextDelta(text) => {
                     current_text.push_str(&text);

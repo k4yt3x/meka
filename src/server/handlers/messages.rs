@@ -75,6 +75,9 @@ pub enum ContentBlockView {
     Thinking {
         thinking: String,
     },
+    /// Encrypted reasoning whose contents the API withholds; surfaced as a presence marker so
+    /// history responses note it occurred without exposing the opaque payload.
+    RedactedThinking {},
     ToolUse {
         id: String,
         name: String,
@@ -248,6 +251,7 @@ fn view_for_block(block: &ContentBlock) -> ContentBlockView {
         ContentBlock::Thinking { thinking, .. } => ContentBlockView::Thinking {
             thinking: thinking.clone(),
         },
+        ContentBlock::RedactedThinking { .. } => ContentBlockView::RedactedThinking {},
         ContentBlock::ToolUse { id, name, input } => ContentBlockView::ToolUse {
             id: id.clone(),
             name: name.clone(),

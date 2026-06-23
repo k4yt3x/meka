@@ -455,6 +455,14 @@ struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: Option<i64>,
+    /// Anthropic's OAuth token response carries the subscriber's account here; its `uuid` is what
+    /// Claude Code sends as `metadata.user_id.account_uuid` on every request.
+    account: Option<OAuthAccount>,
+}
+
+#[derive(serde::Deserialize)]
+struct OAuthAccount {
+    uuid: String,
 }
 
 async fn exchange_claude_code(
@@ -496,7 +504,7 @@ async fn exchange_claude_code(
         access_token: token.access_token,
         refresh_token: token.refresh_token,
         expires_at,
-        account_id: None,
+        account_id: token.account.map(|account| account.uuid),
     })
 }
 
@@ -779,6 +787,32 @@ mod tests {
     #[test]
     fn test_generate_state_unique() {
         assert_ne!(generate_state(), generate_state());
+    }
+
+    #[test]
+    fn test_token_response_extracts_account_uuid() {
+        let json = serde_json::json!({
+            "access_token": "at",
+            "refresh_token": "rt",
+            "expires_in": 3600,
+            "account": { "uuid": "7194a774-10cb-47f6-a031-78078f9054c9" },
+        });
+        let token: TokenResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            token.account.map(|account| account.uuid).as_deref(),
+            Some("7194a774-10cb-47f6-a031-78078f9054c9"),
+        );
+    }
+
+    #[test]
+    fn test_token_response_without_account_is_none() {
+        let json = serde_json::json!({
+            "access_token": "at",
+            "refresh_token": "rt",
+            "expires_in": 3600,
+        });
+        let token: TokenResponse = serde_json::from_value(json).unwrap();
+        assert!(token.account.is_none());
     }
 
     #[test]

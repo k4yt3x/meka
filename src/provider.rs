@@ -35,6 +35,27 @@ pub(crate) const DEFAULT_OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7
 pub const SUPPORTED_PROVIDERS: &[&str] =
     &["openai-api", "openai-codex", "claude-api", "claude-oauth"];
 
+tokio::task_local! {
+    /// True while a sub-agent's turn is running. The Claude OAuth provider is shared across the
+    /// main agent and its sub-agents via a single `Arc`, so per-request sub-agent attribution can't
+    /// live on the provider; it rides this task-local instead. Mirrors Claude Code's
+    /// `AsyncLocalStorage`-based `cc_is_subagent` attribution. Set via [`scope_subagent`] around the
+    /// sub-agent run; read via [`is_subagent`] when building the billing header.
+    static IS_SUBAGENT: bool;
+}
+
+/// Whether the current task is executing a sub-agent's turn. Returns `false` outside any
+/// [`scope_subagent`] (the main agent, tests, etc.).
+pub(crate) fn is_subagent() -> bool {
+    IS_SUBAGENT.try_with(|flag| *flag).unwrap_or(false)
+}
+
+/// Run `future` with the sub-agent attribution flag set. `tokio::task_local` scopes the value to
+/// this specific future, so parallel sub-agents (and the main agent) stay isolated.
+pub(crate) async fn scope_subagent<F: std::future::Future>(future: F) -> F::Output {
+    IS_SUBAGENT.scope(true, future).await
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuthCredential {
     ApiKey(String),
@@ -97,6 +118,13 @@ pub enum ContentBlock {
     Thinking {
         thinking: String,
         signature: Option<String>,
+    },
+    /// Encrypted reasoning the API declines to return in the clear (the `redact-thinking` beta).
+    /// `data` is opaque: it cannot be read, only replayed verbatim on later turns so the model can
+    /// continue its prior reasoning chain. Distinct from a [`ContentBlock::Thinking`] with empty
+    /// text, which carries a `signature` instead of `data`.
+    RedactedThinking {
+        data: String,
     },
     ToolUse {
         id: String,
@@ -264,6 +292,11 @@ pub enum StreamEvent {
     ThinkingDelta(String),
     ThinkingComplete {
         signature: Option<String>,
+    },
+    /// A complete `redacted_thinking` block (the `redact-thinking` beta). `data` is opaque and
+    /// arrives whole in the `content_block_start` event, so there is no delta/complete pair.
+    RedactedThinking {
+        data: String,
     },
     ToolUseStart {
         id: String,
@@ -526,7 +559,7 @@ impl ProviderBuilder {
             reasoning_effort: None,
             device_id: String::new(),
             effort: "high".to_string(),
-            redact_thinking: false,
+            redact_thinking: true,
             max_output_tokens: None,
             session_stats: None,
         }

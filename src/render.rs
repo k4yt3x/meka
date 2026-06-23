@@ -892,6 +892,15 @@ pub fn render_message_history(messages: &[crate::provider::Message], opts: &Hist
                         emitted_any = true;
                     }
                 }
+                ContentBlock::RedactedThinking { .. } => {
+                    if opts.show_thinking {
+                        if spacing.before_thinking() {
+                            eprintln!();
+                        }
+                        render_thinking_block("[redacted thinking]", true);
+                        emitted_any = true;
+                    }
+                }
                 ContentBlock::ToolUse { name, input, .. } => {
                     if spacing.before_tool_indicator() {
                         eprintln!();
@@ -1991,6 +2000,9 @@ mod tests {
                     ContentBlock::Thinking {
                         thinking: "I should call read_file.".to_string(),
                         signature: None,
+                    },
+                    ContentBlock::RedactedThinking {
+                        data: "opaque".to_string(),
                     },
                     ContentBlock::Text {
                         text: "Sure, reading now.".to_string(),

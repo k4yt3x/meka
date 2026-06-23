@@ -3824,6 +3824,44 @@ fn acp_session_prompt_emits_agent_thought_chunk_for_thinking_block() {
     assert_eq!(response["result"]["stopReason"], "end_turn");
 }
 
+/// Under `redact-thinking`, the provider streams a `thinking_complete` carrying only a signature
+/// (no `thinking_delta`). The agent must retain that block for replay continuity without surfacing
+/// a spurious empty `agent_thought_chunk`: the turn completes normally and the only visible output
+/// is the assistant text.
+#[test]
+fn acp_session_prompt_keeps_empty_thinking_with_signature_quietly() {
+    let script = serde_json::json!([[
+        { "kind": "thinking_complete", "signature": "OPAQUE_SIGNATURE_BLOB" },
+        { "kind": "text", "text": "answer" },
+        { "kind": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "go");
+    let (updates, response) = harness.collect_updates(&sid, id);
+
+    // No empty thought chunk: the redacted (text-less) thinking block stays off-screen.
+    assert!(
+        !updates
+            .iter()
+            .any(|u| u["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"),
+        "empty thinking block must not emit an agent_thought_chunk; updates: {:?}",
+        updates,
+    );
+    let saw_answer = updates.iter().any(|u| {
+        u["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && u["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("answer"))
+    });
+    assert!(
+        saw_answer,
+        "assistant text should reach the client; got: {:?}",
+        updates
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+}
+
 /// A thinking-only round (no visible text) ending in `end_turn` must not end the turn silently. The
 /// agent nudges once for a user-visible response and re-issues, so the scripted second round's text
 /// reaches the client. Mirrors Claude Code's `query_thinking_only_response` recovery. Without the

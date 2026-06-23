@@ -1769,6 +1769,7 @@ fn write_message_markdown(
                     }
                     provider::ContentBlock::ToolResult { .. }
                     | provider::ContentBlock::Thinking { .. }
+                    | provider::ContentBlock::RedactedThinking { .. }
                     | provider::ContentBlock::Image { .. } => {}
                 }
             }

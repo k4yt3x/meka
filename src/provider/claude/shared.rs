@@ -127,6 +127,9 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// explicit budget; thinking-off uses a flat 32k. A `max_output_tokens` override (the profile knob)
 /// replaces whichever default would otherwise apply; on the budgeted path it is clamped to stay
 /// above `budget_tokens` (the API rejects `max_tokens <= thinking.budget_tokens`).
+///
+/// No `display` field is set: real Claude Code 2.1.185 sends `{type:"adaptive"}` with no `display`
+/// (verified by wire capture), so the model default applies.
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
     thinking_enabled: bool,
@@ -176,6 +179,33 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 /// by default, excluded only for known pre-4.6 models (see [`model_predates_adaptive_thinking`]).
 pub(super) fn model_supports_effort(model: &str) -> bool {
     !model_predates_adaptive_thinking(model)
+}
+
+/// Whether a Claude model ships a 1M-token context window (gating the `context-1m-2025-08-07`
+/// beta). For the current Claude lineup the 1M models are exactly the adaptive-thinking-era ones
+/// (Opus 4.6/4.7/4.8, Sonnet 4.6, Fable/Mythos 5); Haiku 4.5 and 4.0-era models are 200K. Revisit
+/// if a 1M model ships that predates adaptive thinking.
+pub(super) fn model_has_1m_context(model: &str) -> bool {
+    !model_predates_adaptive_thinking(model)
+}
+
+/// Whether a Claude model accepts the `temperature` sampling parameter. Sampling params are removed
+/// (400) on Opus 4.7, Opus 4.8, and the Fable/Mythos 5 family; Opus 4.6, Sonnet 4.6, Haiku 4.5, and
+/// older models still accept them.
+pub(super) fn model_supports_temperature(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    !(lower.contains("opus-4-7")
+        || lower.contains("opus-4-8")
+        || lower.contains("fable-5")
+        || lower.contains("mythos-5"))
+}
+
+/// Whether a Claude model supports mid-conversation system messages (the
+/// `mid-conversation-system-2026-04-07` beta). Claude Code sends this only for Opus 4.8 and the
+/// newer Fable/Mythos 5 family (verified by wire capture: opus-4-8 sends it, Haiku 4.5 does not).
+pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("opus-4-8") || lower.contains("fable-5") || lower.contains("mythos-5")
 }
 
 pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<serde_json::Value> {
@@ -245,6 +275,14 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
                             }
                             obj
                         }
+                        // Replayed verbatim: the API needs the opaque `data` unchanged to continue
+                        // the redacted reasoning chain.
+                        ContentBlock::RedactedThinking { data } => {
+                            serde_json::json!({
+                                "type": "redacted_thinking",
+                                "data": data,
+                            })
+                        }
                     };
 
                     if is_last_message
@@ -297,25 +335,17 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
 }
 
 pub(super) fn convert_tools_to_claude_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
-    let tool_count = tools.len();
+    // No per-tool `cache_control`: Claude Code's captured CLI wire leaves tools unmarked, and the
+    // rolling last-message breakpoint already caches the tools+system prefix cumulatively, so the
+    // extra tool breakpoint is redundant.
     tools
         .iter()
-        .enumerate()
-        .map(|(index, tool)| {
-            let mut schema = serde_json::json!({
+        .map(|tool| {
+            serde_json::json!({
                 "name": tool.name,
                 "description": tool.description,
                 "input_schema": tool.parameters,
-            });
-            if index + 1 == tool_count
-                && let Some(obj) = schema.as_object_mut()
-            {
-                obj.insert(
-                    "cache_control".to_string(),
-                    serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
-                );
-            }
-            schema
+            })
         })
         .collect()
 }
@@ -411,14 +441,13 @@ pub(super) fn parse_non_streaming_response(
                 }
             }
             "redacted_thinking" => {
-                let signature = block
-                    .get("signature")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
-                content_blocks.push(ContentBlock::Thinking {
-                    thinking: "[redacted]".to_string(),
-                    signature,
-                });
+                if let Some(data) = block.get("data").and_then(|d| d.as_str()) {
+                    content_blocks.push(ContentBlock::RedactedThinking {
+                        data: data.to_string(),
+                    });
+                } else {
+                    tracing::warn!("redacted_thinking block missing 'data' field");
+                }
             }
             _ => {
                 tracing::warn!("unknown Claude content block type: {}", block_type);
@@ -493,20 +522,20 @@ pub(super) async fn drive_claude_sse_stream(
                                 if block_type == "thinking" {
                                     in_thinking = true;
                                 } else if block_type == "redacted_thinking" {
-                                    // Emit a stub thinking block so the UI shows something for
-                                    // redacted content.
-                                    let _ = event_sender
-                                        .send(StreamEvent::ThinkingDelta(
-                                            "[redacted]".to_string(),
-                                        ))
-                                        .await;
-                                    let signature = content_block
-                                        .get("signature")
-                                        .and_then(|s| s.as_str())
-                                        .map(|s| s.to_string());
-                                    let _ = event_sender
-                                        .send(StreamEvent::ThinkingComplete { signature })
-                                        .await;
+                                    // The opaque `data` arrives whole in the start event; forward it
+                                    // so the agent can replay it verbatim on later turns.
+                                    if let Some(data) =
+                                        content_block.get("data").and_then(|d| d.as_str())
+                                        && event_sender
+                                            .send(StreamEvent::RedactedThinking {
+                                                data: data.to_string(),
+                                            })
+                                            .await
+                                            .is_err()
+                                    {
+                                        tracing::trace!("stream event receiver dropped");
+                                        break;
+                                    }
                                 } else if block_type == "tool_use" {
                                     let id = content_block
                                         .get("id")
@@ -950,6 +979,66 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_redacted_thinking_block() {
+        let response = serde_json::json!({
+            "content": [
+                { "type": "redacted_thinking", "data": "ENCRYPTED_OPAQUE_BLOB" },
+                { "type": "text", "text": "done" },
+            ],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 1, "output_tokens": 1 },
+        });
+        let (message, ..) = parse_non_streaming_response(&response).unwrap();
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::RedactedThinking { data } if data == "ENCRYPTED_OPAQUE_BLOB"
+        ));
+    }
+
+    #[test]
+    fn test_redacted_thinking_round_trips_verbatim() {
+        let message = crate::provider::Message {
+            role: crate::provider::Role::Assistant,
+            content: vec![
+                ContentBlock::RedactedThinking {
+                    data: "ENCRYPTED_OPAQUE_BLOB".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "hi".to_string(),
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message]);
+        let block = &converted[0]["content"].as_array().unwrap()[0];
+        assert_eq!(block["type"], "redacted_thinking");
+        assert_eq!(block["data"], "ENCRYPTED_OPAQUE_BLOB");
+        // The opaque data must never be wrapped in `thinking`/`signature` fields.
+        assert!(block.get("thinking").is_none());
+        assert!(block.get("signature").is_none());
+    }
+
+    #[test]
+    fn test_empty_thinking_block_with_signature_serializes_signature() {
+        let message = crate::provider::Message {
+            role: crate::provider::Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: Some("SIG620".to_string()),
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message]);
+        let block = &converted[0]["content"].as_array().unwrap()[0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "");
+        assert_eq!(block["signature"], "SIG620");
+    }
+
+    #[test]
     fn test_redact_oldest_images_redacts_input_image() {
         let big = "x".repeat(2_000);
         let messages = vec![
@@ -973,6 +1062,8 @@ mod tests {
         let mut body = serde_json::Map::new();
         insert_thinking_fields(&mut body, false, "claude-opus-4-8", 10_000, None);
         assert_eq!(body["max_tokens"], 32_000);
+        // Thinking off: no `thinking` object is emitted.
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
@@ -989,6 +1080,8 @@ mod tests {
         insert_thinking_fields(&mut body, true, "claude-opus-4-6", 10_000, Some(80_000));
         assert_eq!(body["max_tokens"], 80_000);
         assert_eq!(body["thinking"]["type"], "adaptive");
+        // No `display` field: real Claude Code sends `{type:"adaptive"}` only.
+        assert!(body["thinking"].get("display").is_none());
     }
 
     #[test]
@@ -1111,6 +1204,49 @@ mod tests {
         assert!(model_is_haiku("claude-haiku-4-5"));
         assert!(!model_is_haiku("claude-opus-4-6-20250514"));
         assert!(!model_is_haiku("claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn test_model_has_1m_context() {
+        // 1M-context lineup (adaptive-era).
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+        ] {
+            assert!(model_has_1m_context(model), "{model}");
+        }
+        // 200K models.
+        for model in [
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-1",
+        ] {
+            assert!(!model_has_1m_context(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn test_model_supports_temperature() {
+        // Sampling-param models.
+        for model in [
+            "claude-opus-4-6-20250514",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+            "claude-sonnet-4-20250514",
+        ] {
+            assert!(model_supports_temperature(model), "{model}");
+        }
+        // Sampling-params-removed models (400 on `temperature`).
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-fable-5",
+            "claude-mythos-5",
+        ] {
+            assert!(!model_supports_temperature(model), "{model}");
+        }
     }
 
     #[test]

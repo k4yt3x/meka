@@ -366,15 +366,17 @@ impl Tool for SpawnAgentTool {
         // rendering and the omitted MCP gate are baked into the options via `new_subagent`.
         let mut messages = Conversation::new();
         let mut session_id_opt = Some(sub_session_id);
-        sub_agent
-            .run_turn(
-                &mut session_id_opt,
-                &mut messages,
-                augmented_prompt,
-                Vec::new(),
-                cancellation,
-            )
-            .await?;
+        // Mark every provider request made during this run as a sub-agent request so the Claude
+        // OAuth billing header carries `cc_is_subagent=true;` (the provider is a shared `Arc`, so
+        // the flag rides a task-local rather than provider state).
+        crate::provider::scope_subagent(sub_agent.run_turn(
+            &mut session_id_opt,
+            &mut messages,
+            augmented_prompt,
+            Vec::new(),
+            cancellation,
+        ))
+        .await?;
 
         let report = messages
             .last_assistant_text()

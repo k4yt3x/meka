@@ -126,14 +126,12 @@ effort = "medium"
 
 ### `redact_thinking`
 
-`claude-oauth` only. When `true`, meka sends the `redact-thinking-2026-02-12` beta header so the API returns `redacted_thinking` blocks instead of full thinking summaries, useful when you don't render thinking in the UI and want the smaller response. Defaults to `false` (full thinking summaries).
-
-Caveat: `redacted_thinking` blocks carry a signed payload that must be replayed verbatim on subsequent turns; meka currently flattens them to `[redacted]` text on receipt, which means multi-turn conversations after enabling this flag may be rejected by the server. Treat as experimental.
+`claude-oauth` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds; the visible effect is that live thinking output goes quiet for these models. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
 
 ```toml
 [providers.work]
 type            = "claude-oauth"
-redact_thinking = true
+redact_thinking = false
 ```
 
 ### `context_window`

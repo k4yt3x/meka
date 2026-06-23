@@ -1398,9 +1398,11 @@ impl ResolvedConfig {
             active.and_then(|profile| profile.device_id.as_deref()),
         );
         let effort = effort::resolve(active.and_then(|profile| profile.effort.as_deref()));
+        // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
+        // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
         let redact_thinking = active
             .and_then(|profile| profile.redact_thinking)
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         // Only probe the sandbox backend when sandboxing is actually enabled. Skipping the probe
         // for `sandbox = false` saves the smoke-test cost on every invocation of subcommands that

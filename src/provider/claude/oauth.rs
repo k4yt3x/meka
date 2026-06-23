@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use super::shared::{
     self, convert_messages_to_claude_content, convert_tools_to_claude_tools,
-    drive_claude_sse_stream, model_is_haiku, model_supports_adaptive_thinking,
-    model_supports_effort, model_supports_modern_features, parse_non_streaming_response,
+    drive_claude_sse_stream, model_has_1m_context, model_is_haiku, model_supports_effort,
+    model_supports_mid_conversation_system, model_supports_modern_features,
+    model_supports_temperature, parse_non_streaming_response,
 };
 use crate::{
     error::{MekaError, Result},
@@ -51,6 +52,10 @@ pub struct ClaudeOAuthProvider {
     credential_key: String,
     session_id: String,
     device_id: String,
+    /// The subscriber's account UUID, sent as `metadata.user_id.account_uuid` (matching Claude
+    /// Code). Captured from the credential at construction; empty for pre-existing logins until a
+    /// refresh persists it and the session restarts, or the user re-logs in.
+    account_uuid: String,
     thinking_enabled: bool,
     thinking_budget_tokens: u64,
     thinking_override: AtomicI8,
@@ -84,6 +89,10 @@ impl ClaudeOAuthProvider {
         max_output_tokens: Option<u64>,
         session_stats: Option<Arc<crate::stats::SessionStats>>,
     ) -> Self {
+        let account_uuid = match &credential {
+            AuthCredential::OAuthToken { account_id, .. } => account_id.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
         Self {
             client: reqwest::Client::new(),
             credential: tokio::sync::RwLock::new(credential),
@@ -96,6 +105,7 @@ impl ClaudeOAuthProvider {
             credential_key,
             session_id: Uuid::new_v4().to_string(),
             device_id,
+            account_uuid,
             thinking_enabled,
             thinking_budget_tokens,
             thinking_override: AtomicI8::new(-1),
@@ -110,44 +120,55 @@ impl ClaudeOAuthProvider {
         shared::resolve_thinking_enabled(&self.thinking_override, self.thinking_enabled)
     }
 
-    /// Mirrors Claude Code's `getAllModelBetas` (`utils/betas.ts:234-369`)
-    /// for the OAuth-on-1P case. Order matches a recent wire dump
-    /// (`claude-cli/2.1.41`) with `claude-opus-4-6` + thinking:
-    /// `claude-code-20250219, oauth-2025-04-20, adaptive-thinking-2026-01-28,
-    ///  context-management-2025-06-27, prompt-caching-scope-2026-01-05,
-    ///  effort-2025-11-24`. `redact-thinking-2026-02-12` is appended
-    ///  immediately after the thinking beta when `redact_thinking` is set,
-    ///  matching `betas.ts:270-277`.
-    fn compute_betas(&self) -> Option<String> {
+    /// Mirrors Claude Code 2.1.185's CLI `getAllModelBetas`, validated against a live wire capture
+    /// (`temp/cc-re/capture/FINDINGS.md`): first-party OAuth subscriber, opus-4-8 with tools and
+    /// thinking. `has_tools` gates `advanced-tool-use-2025-11-20` (sent only when the request
+    /// carries tools). Adaptive thinking is GA, selected via the body `thinking` param (no beta).
+    ///
+    /// `redact-thinking-2026-02-12` is sent by default (matching Claude Code) for capable models;
+    /// the `redact_thinking` knob (default on) is an opt-out. With it on, the model returns empty
+    /// `thinking` blocks carrying only a signature, plus opaque `redacted_thinking` blocks; both
+    /// are preserved and replayed verbatim (see
+    /// [`crate::provider::ContentBlock::RedactedThinking`]).
+    fn compute_betas(&self, has_tools: bool) -> Option<String> {
         let model = self.model.as_str();
-        let mut parts: Vec<&'static str> = Vec::with_capacity(7);
+        let mut parts: Vec<&'static str> = Vec::with_capacity(12);
 
         if !model_is_haiku(model) {
             parts.push("claude-code-20250219");
         }
         parts.push("oauth-2025-04-20");
 
-        if self.is_thinking_enabled() && model_supports_modern_features(model) {
-            if model_supports_adaptive_thinking(model) {
-                parts.push("adaptive-thinking-2026-01-28");
-            } else {
-                parts.push("interleaved-thinking-2025-05-14");
-            }
+        if model_has_1m_context(model) {
+            parts.push("context-1m-2025-08-07");
+        }
+
+        if model_supports_modern_features(model) {
+            parts.push("interleaved-thinking-2025-05-14");
 
             if self.redact_thinking {
                 parts.push("redact-thinking-2026-02-12");
             }
-        }
 
-        if model_supports_modern_features(model) {
+            parts.push("thinking-token-count-2026-05-13");
             parts.push("context-management-2025-06-27");
         }
 
         parts.push("prompt-caching-scope-2026-01-05");
 
+        if model_supports_mid_conversation_system(model) {
+            parts.push("mid-conversation-system-2026-04-07");
+        }
+
+        if has_tools {
+            parts.push("advanced-tool-use-2025-11-20");
+        }
+
         if model_supports_effort(model) {
             parts.push("effort-2025-11-24");
         }
+
+        parts.push("extended-cache-ttl-2025-04-11");
 
         Some(parts.join(","))
     }
@@ -224,9 +245,13 @@ impl ClaudeOAuthProvider {
             }
         }
 
-        let refresh_token = match &*credential {
-            AuthCredential::OAuthToken { refresh_token, .. } => refresh_token.clone(),
-            _ => None,
+        let (refresh_token, prior_account_id) = match &*credential {
+            AuthCredential::OAuthToken {
+                refresh_token,
+                account_id,
+                ..
+            } => (refresh_token.clone(), account_id.clone()),
+            _ => (None, None),
         };
 
         let Some(refresh_token) = refresh_token else {
@@ -235,7 +260,9 @@ impl ClaudeOAuthProvider {
             ));
         };
 
-        let new_credential = self.refresh_oauth_token(&refresh_token).await?;
+        let new_credential = self
+            .refresh_oauth_token(&refresh_token, prior_account_id)
+            .await?;
         let (header_name, header_value) = new_credential.auth_header();
 
         if let Some(store) = &self.token_store
@@ -250,7 +277,11 @@ impl ClaudeOAuthProvider {
         Ok((header_name, header_value))
     }
 
-    async fn refresh_oauth_token(&self, refresh_token: &str) -> Result<AuthCredential> {
+    async fn refresh_oauth_token(
+        &self,
+        refresh_token: &str,
+        prior_account_id: Option<String>,
+    ) -> Result<AuthCredential> {
         tracing::info!("refreshing OAuth token");
 
         let response = self
@@ -287,6 +318,12 @@ impl ClaudeOAuthProvider {
             access_token: String,
             refresh_token: Option<String>,
             expires_in: Option<u64>,
+            account: Option<RefreshAccount>,
+        }
+
+        #[derive(Deserialize)]
+        struct RefreshAccount {
+            uuid: String,
         }
 
         let data: RefreshResponse = response.json().await.map_err(|error| {
@@ -303,7 +340,11 @@ impl ClaudeOAuthProvider {
                 .refresh_token
                 .or_else(|| Some(refresh_token.to_string())),
             expires_at,
-            account_id: None,
+            // Prefer the freshly returned account, but never blank an account we already know.
+            account_id: data
+                .account
+                .map(|account| account.uuid)
+                .or(prior_account_id),
         })
     }
 
@@ -318,7 +359,7 @@ impl ClaudeOAuthProvider {
 
         let metadata_user_id = serde_json::json!({
             "device_id": self.device_id,
-            "account_uuid": "",
+            "account_uuid": self.account_uuid,
             "session_id": self.session_id,
         })
         .to_string();
@@ -333,6 +374,8 @@ impl ClaudeOAuthProvider {
             // `cache_control`. Billing header and identity prefix are unmarked; the source's
             // "boundary mode" (`utils/api.ts:362-409`) assigns `cacheScope: null` to both. ttl `1h`
             // matches Claude Code's `getCacheControl` for OAuth subscribers (`claude.ts:358-374`).
+            // `scope: "global"` mirrors the captured CLI breakpoint (the
+            // `prompt-caching-scope-2026-01-05` beta), sharing the cached prefix across sessions.
             body.insert(
                 "system".to_string(),
                 serde_json::json!([
@@ -347,7 +390,7 @@ impl ClaudeOAuthProvider {
                     {
                         "type": "text",
                         "text": system_prompt,
-                        "cache_control": { "type": "ephemeral", "ttl": "1h" }
+                        "cache_control": { "type": "ephemeral", "ttl": "1h", "scope": "global" }
                     }
                 ]),
             );
@@ -377,7 +420,10 @@ impl ClaudeOAuthProvider {
             );
         }
 
-        if !self.is_thinking_enabled() {
+        // Claude Code sends `temperature: 1` only when thinking is off AND the model accepts
+        // sampling params. Opus 4.7/4.8 and the Fable/Mythos family reject `temperature` with a
+        // 400.
+        if !self.is_thinking_enabled() && model_supports_temperature(&self.model) {
             body.insert("temperature".to_string(), serde_json::json!(1));
         }
 
@@ -428,7 +474,7 @@ impl Provider for ClaudeOAuthProvider {
         let body_size_mib = body_json.len() / 1_048_576;
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
-        let betas = self.compute_betas();
+        let betas = self.compute_betas(!tools.is_empty());
 
         let request = attestation::apply_headers(
             self.client
@@ -498,7 +544,7 @@ impl Provider for ClaudeOAuthProvider {
         let body_size_mib = body_json.len() / 1_048_576;
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
 
-        let betas = self.compute_betas();
+        let betas = self.compute_betas(!tools.is_empty());
 
         let request = attestation::apply_headers(
             self.client
@@ -588,11 +634,11 @@ mod tests {
 
         assert_eq!(system[2]["type"], "text");
         assert_eq!(system[2]["text"], "system prompt");
-        // User system prompt carries cache_control with ttl=1h (matches `getCacheControl` for OAuth
-        // subscribers).
+        // User system prompt carries cache_control with ttl=1h and scope=global (matches the
+        // captured Claude Code CLI breakpoint).
         assert_eq!(
             system[2]["cache_control"],
-            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+            serde_json::json!({"type": "ephemeral", "ttl": "1h", "scope": "global"})
         );
 
         let body_json = serde_json::to_string(&body).unwrap();
@@ -641,7 +687,8 @@ mod tests {
         assert_eq!(claude_tools[0]["name"], "read_file");
         assert_eq!(claude_tools[0]["description"], "Read a file");
         assert!(claude_tools[0].get("input_schema").is_some());
-        assert!(claude_tools[0].get("cache_control").is_some());
+        // Tools carry no cache_control (matches the captured CLI wire).
+        assert!(claude_tools[0].get("cache_control").is_none());
     }
 
     #[test]
@@ -918,7 +965,7 @@ mod tests {
         assert!(json.find("\"system\"").unwrap() < json.find("\"messages\"").unwrap());
 
         let tools_array = body["tools"].as_array().unwrap();
-        assert!(tools_array.last().unwrap().get("cache_control").is_some());
+        assert!(tools_array.last().unwrap().get("cache_control").is_none());
     }
 
     #[test]
@@ -933,6 +980,38 @@ mod tests {
         assert_eq!(parsed["account_uuid"], "");
         let session_id = parsed["session_id"].as_str().unwrap();
         assert!(Uuid::parse_str(session_id).is_ok(), "{}", session_id);
+    }
+
+    #[test]
+    fn test_account_uuid_sourced_from_oauth_credential() {
+        let provider = ClaudeOAuthProvider::new(
+            AuthCredential::OAuthToken {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                account_id: Some("7194a774-10cb-47f6-a031-78078f9054c9".to_string()),
+            },
+            "claude-opus-4-8".to_string(),
+            None,
+            None,
+            None,
+            None,
+            "test".to_string(),
+            false,
+            10000,
+            "a".repeat(64),
+            "high".to_string(),
+            false,
+            None,
+            None,
+        );
+        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+        let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
+        assert_eq!(
+            parsed["account_uuid"],
+            "7194a774-10cb-47f6-a031-78078f9054c9"
+        );
     }
 
     #[test]
@@ -1096,101 +1175,113 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_minimal_no_thinking_non_haiku() {
-        // Sonnet 4.0 (not adaptive, not effort-capable), no thinking.
-        let provider = provider_with("claude-sonnet-4-20250514", false);
-        let betas = provider.compute_betas().unwrap();
+    fn test_betas_no_adaptive_thinking_beta() {
+        // `adaptive-thinking-2026-01-28` does not exist in Claude Code; adaptive thinking is GA and
+        // selected via the body `thinking` param, never a beta header.
+        for (model, thinking) in [
+            ("claude-opus-4-6-20250514", true),
+            ("claude-opus-4-8", true),
+            ("claude-opus-4-6-20250514", false),
+        ] {
+            let betas = provider_with(model, thinking).compute_betas(true).unwrap();
+            assert!(
+                !betas.contains("adaptive-thinking"),
+                "{model} (thinking={thinking}) must not send an adaptive-thinking beta: {betas}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_betas_modern_thinking_model_full_set() {
+        // opus-4-8 with tools + thinking: matches the live Claude Code 2.1.185 CLI wire capture
+        // exactly, except `redact-thinking-2026-02-12` (CC sends it by default; meka keeps it
+        // behind the `redact_thinking` knob — see `compute_betas`).
+        let betas = provider_with("claude-opus-4-8", true)
+            .compute_betas(true)
+            .unwrap();
         let parts: Vec<&str> = betas.split(',').collect();
         assert_eq!(
             parts,
             vec![
                 "claude-code-20250219",
                 "oauth-2025-04-20",
+                "context-1m-2025-08-07",
+                "interleaved-thinking-2025-05-14",
+                "thinking-token-count-2026-05-13",
                 "context-management-2025-06-27",
                 "prompt-caching-scope-2026-01-05",
+                "mid-conversation-system-2026-04-07",
+                "advanced-tool-use-2025-11-20",
+                "effort-2025-11-24",
+                "extended-cache-ttl-2025-04-11",
             ],
-            "minimal beta set for non-adaptive non-effort sonnet without thinking"
+            "opus-4-8 CLI beta set"
         );
+    }
+
+    #[test]
+    fn test_betas_thinking_family_independent_of_toggle() {
+        // Claude Code gates interleaved-thinking / thinking-token-count on model capability, not
+        // the thinking toggle, so they appear whether thinking is on or off.
+        for thinking in [true, false] {
+            let betas = provider_with("claude-opus-4-6-20250514", thinking)
+                .compute_betas(true)
+                .unwrap();
+            assert!(betas.contains("interleaved-thinking-2025-05-14"), "{betas}");
+            assert!(betas.contains("thinking-token-count-2026-05-13"), "{betas}");
+        }
+    }
+
+    #[test]
+    fn test_betas_context_1m_only_for_1m_models() {
+        assert!(
+            provider_with("claude-opus-4-6-20250514", false)
+                .compute_betas(true)
+                .unwrap()
+                .contains("context-1m-2025-08-07")
+        );
+        // Sonnet 4.0 (200K) and Haiku 4.5 (200K) do not get the 1M beta.
+        for model in ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"] {
+            assert!(
+                !provider_with(model, false)
+                    .compute_betas(true)
+                    .unwrap()
+                    .contains("context-1m-2025-08-07"),
+                "{model} is not a 1M-context model"
+            );
+        }
+    }
+
+    #[test]
+    fn test_betas_extended_cache_ttl_always_present() {
+        // meka always sends a 1h cache TTL, so the extended-cache-ttl beta is unconditional.
+        for model in [
+            "claude-opus-4-6-20250514",
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(
+                provider_with(model, false)
+                    .compute_betas(true)
+                    .unwrap()
+                    .contains("extended-cache-ttl-2025-04-11"),
+                "{model} must send extended-cache-ttl"
+            );
+        }
     }
 
     #[test]
     fn test_betas_haiku_skips_claude_code_and_effort() {
-        let provider = provider_with("claude-haiku-4-5-20251001", false);
-        let betas = provider.compute_betas().unwrap();
-        assert!(
-            !betas.contains("claude-code-20250219"),
-            "claude-code beta must be skipped for Haiku models: {}",
-            betas
-        );
-        assert!(
-            !betas.contains("effort-2025-11-24"),
-            "effort beta must be skipped for Haiku models: {}",
-            betas
-        );
-        // Haiku 4.5 still supports modern features (context management, etc.) and OAuth +
-        // prompt-caching-scope are unconditional.
-        assert!(betas.contains("oauth-2025-04-20"), "{}", betas);
-        assert!(betas.contains("context-management-2025-06-27"), "{}", betas);
-        assert!(
-            betas.contains("prompt-caching-scope-2026-01-05"),
-            "{}",
-            betas
-        );
-    }
-
-    #[test]
-    fn test_betas_adaptive_with_thinking_matches_wire_dump() {
-        // Mirrors the user-supplied wire dump for claude-cli/2.1.41 with an adaptive-capable model
-        // and thinking enabled.
-        let provider = provider_with("claude-opus-4-6-20250514", true);
-        let betas = provider.compute_betas().unwrap();
-        assert_eq!(
-            betas,
-            "claude-code-20250219,oauth-2025-04-20,adaptive-thinking-2026-01-28,\
-             context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24",
-            "must exactly match the recent Claude Code wire dump"
-        );
-    }
-
-    #[test]
-    fn test_betas_interleaved_for_non_adaptive_with_thinking() {
-        // Sonnet 4.0 supports thinking but NOT adaptive thinking, so the older interleaved-thinking
-        // beta is sent instead of adaptive-thinking.
-        let provider = provider_with("claude-sonnet-4-20250514", true);
-        let betas = provider.compute_betas().unwrap();
-        assert!(
-            betas.contains("interleaved-thinking-2025-05-14"),
-            "non-adaptive thinking model should send interleaved-thinking beta: {}",
-            betas
-        );
-        assert!(
-            !betas.contains("adaptive-thinking-2026-01-28"),
-            "non-adaptive model must not send adaptive-thinking beta: {}",
-            betas
-        );
-        assert!(
-            !betas.contains("effort-2025-11-24"),
-            "sonnet-4 (not 4-6) is not effort-capable: {}",
-            betas
-        );
-    }
-
-    #[test]
-    fn test_betas_no_thinking_beta_when_thinking_disabled() {
-        let provider = provider_with("claude-opus-4-6-20250514", false);
-        let betas = provider.compute_betas().unwrap();
-        assert!(
-            !betas.contains("adaptive-thinking-2026-01-28"),
-            "no thinking beta when thinking is off: {}",
-            betas
-        );
-        assert!(
-            !betas.contains("interleaved-thinking-2025-05-14"),
-            "no thinking beta when thinking is off: {}",
-            betas
-        );
-        // effort beta is independent of thinking; opus-4-6 supports it.
-        assert!(betas.contains("effort-2025-11-24"), "{}", betas);
+        let betas = provider_with("claude-haiku-4-5-20251001", false)
+            .compute_betas(true)
+            .unwrap();
+        assert!(!betas.contains("claude-code-20250219"), "{betas}");
+        assert!(!betas.contains("effort-2025-11-24"), "{betas}");
+        // OAuth, prompt-caching-scope, and extended-cache-ttl are unconditional; Haiku still has
+        // modern features (interleaved-thinking, context-management).
+        assert!(betas.contains("oauth-2025-04-20"), "{betas}");
+        assert!(betas.contains("prompt-caching-scope-2026-01-05"), "{betas}");
+        assert!(betas.contains("interleaved-thinking-2025-05-14"), "{betas}");
     }
 
     #[test]
@@ -1201,7 +1292,7 @@ mod tests {
             "claude-haiku-4-5-20251001",
         ] {
             let provider = provider_with(model, false);
-            let betas = provider.compute_betas().unwrap();
+            let betas = provider.compute_betas(true).unwrap();
             assert!(betas.contains("oauth-2025-04-20"), "{} → {}", model, betas);
             assert!(
                 betas.contains("prompt-caching-scope-2026-01-05"),
@@ -1251,10 +1342,90 @@ mod tests {
     }
 
     #[test]
+    fn test_temperature_present_when_model_supports_it() {
+        // Opus 4.6 accepts sampling params; with thinking off, `temperature: 1` is sent.
+        let provider = provider_with("claude-opus-4-6-20250514", false);
+        let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        assert_eq!(body["temperature"], 1);
+    }
+
+    #[test]
+    fn test_temperature_omitted_when_model_rejects_it() {
+        // Opus 4.8 rejects `temperature` (400); meka must omit it even with thinking off.
+        let provider = provider_with("claude-opus-4-8", false);
+        let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        assert!(
+            body.get("temperature").is_none(),
+            "temperature must be omitted for sampling-param-removed models"
+        );
+    }
+
+    #[test]
+    fn test_betas_advanced_tool_use_gated_on_tools() {
+        let provider = provider_with("claude-opus-4-8", true);
+        assert!(
+            provider
+                .compute_betas(true)
+                .unwrap()
+                .contains("advanced-tool-use-2025-11-20"),
+            "advanced-tool-use must be sent when the request carries tools"
+        );
+        assert!(
+            !provider
+                .compute_betas(false)
+                .unwrap()
+                .contains("advanced-tool-use-2025-11-20"),
+            "advanced-tool-use must be omitted when there are no tools"
+        );
+    }
+
+    #[test]
+    fn test_betas_mid_conversation_system_gated_on_model() {
+        // Opus 4.8 gets it; opus-4-6 and haiku do not (capture-confirmed).
+        assert!(
+            provider_with("claude-opus-4-8", true)
+                .compute_betas(true)
+                .unwrap()
+                .contains("mid-conversation-system-2026-04-07")
+        );
+        for model in ["claude-opus-4-6-20250514", "claude-haiku-4-5-20251001"] {
+            assert!(
+                !provider_with(model, true)
+                    .compute_betas(true)
+                    .unwrap()
+                    .contains("mid-conversation-system-2026-04-07"),
+                "{model} must not send mid-conversation-system"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_billing_header_marks_subagent_under_scope() {
+        let provider = test_provider();
+        let messages = vec![Message::user("hi")];
+
+        // Outside any sub-agent scope: no subagent segment.
+        let main_body = provider.build_request_body("system prompt", &messages, &[], false);
+        let main_billing = main_body["system"][0]["text"].as_str().unwrap();
+        assert!(!main_billing.contains("cc_is_subagent"), "{main_billing}");
+
+        // Inside `scope_subagent`: the billing header carries `cc_is_subagent=true;` after `cch`.
+        let sub_billing = crate::provider::scope_subagent(async {
+            let body = provider.build_request_body("system prompt", &messages, &[], false);
+            body["system"][0]["text"].as_str().unwrap().to_string()
+        })
+        .await;
+        assert!(
+            sub_billing.contains("cch=00000; cc_is_subagent=true;"),
+            "{sub_billing}"
+        );
+    }
+
+    #[test]
     fn test_betas_redact_thinking_added_when_enabled() {
         // Adaptive-thinking-capable model + thinking on + redact_thinking on.
         let provider = provider_full("claude-opus-4-6-20250514", true, "high", true);
-        let betas = provider.compute_betas().unwrap();
+        let betas = provider.compute_betas(true).unwrap();
         assert!(
             betas.contains("redact-thinking-2026-02-12"),
             "redact-thinking beta must be present when redact_thinking=true: {}",
@@ -1265,7 +1436,7 @@ mod tests {
     #[test]
     fn test_betas_redact_thinking_omitted_when_disabled() {
         let provider = provider_full("claude-opus-4-6-20250514", true, "high", false);
-        let betas = provider.compute_betas().unwrap();
+        let betas = provider.compute_betas(true).unwrap();
         assert!(
             !betas.contains("redact-thinking-2026-02-12"),
             "redact-thinking beta must be omitted when redact_thinking=false: {}",
@@ -1274,16 +1445,14 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_redact_thinking_omitted_when_thinking_disabled() {
-        // The beta only makes sense when thinking is also enabled; Claude Code's
-        // `getAllModelBetas` gates it on `modelSupportsISP(model)` (which we collapse into
-        // `model_supports_modern_features`) AND we additionally gate on the thinking toggle since
-        // there's no thinking stream to redact when thinking is off.
+    fn test_betas_redact_thinking_independent_of_toggle() {
+        // Claude Code gates redact-thinking on model capability, not the thinking toggle, so meka
+        // sends it whenever the `redact_thinking` knob is on (here with thinking off).
         let provider = provider_full("claude-opus-4-6-20250514", false, "high", true);
-        let betas = provider.compute_betas().unwrap();
+        let betas = provider.compute_betas(true).unwrap();
         assert!(
-            !betas.contains("redact-thinking-2026-02-12"),
-            "redact-thinking beta must be omitted when thinking is off: {}",
+            betas.contains("redact-thinking-2026-02-12"),
+            "redact-thinking is toggle-independent (gated on the knob + capability): {}",
             betas
         );
     }
@@ -1318,18 +1487,18 @@ mod tests {
 
         let expected = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
 
-        // System: only the user prompt block (system[2]) has cache_control.
+        // System: only the user prompt block (system[2]) has cache_control; it adds scope=global.
         let system = body["system"].as_array().unwrap();
         assert!(system[0].get("cache_control").is_none());
         assert!(system[1].get("cache_control").is_none());
-        assert_eq!(system[2]["cache_control"], expected);
-
-        // Tools: last tool carries cache_control with ttl=1h.
-        let tools_arr = body["tools"].as_array().unwrap();
         assert_eq!(
-            tools_arr.last().unwrap().get("cache_control").unwrap(),
-            &expected,
+            system[2]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h", "scope": "global"})
         );
+
+        // Tools: no cache_control (the rolling message breakpoint caches the prefix).
+        let tools_arr = body["tools"].as_array().unwrap();
+        assert!(tools_arr.last().unwrap().get("cache_control").is_none());
 
         // Messages: last block of the last message carries cache_control with ttl=1h.
         let messages_arr = body["messages"].as_array().unwrap();
@@ -2383,7 +2552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_cache_control_on_last_tool() {
+    fn test_claude_tools_carry_no_cache_control() {
         let provider = test_provider();
 
         let tools = vec![
@@ -2401,8 +2570,10 @@ mod tests {
         let body = provider.build_request_body("system", &[Message::user("hi")], &tools, false);
         let claude_tools = body["tools"].as_array().unwrap();
 
+        // No tool carries cache_control: the rolling last-message breakpoint caches the
+        // tools+system prefix, matching the captured Claude Code CLI wire.
         assert!(claude_tools[0].get("cache_control").is_none());
-        assert!(claude_tools[1].get("cache_control").is_some());
+        assert!(claude_tools[1].get("cache_control").is_none());
     }
 
     #[test]

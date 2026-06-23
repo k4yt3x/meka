@@ -36,6 +36,10 @@ pub fn estimate_message(message: &Message) -> u64 {
             ContentBlock::Text { text } => estimate_text(text),
             ContentBlock::Image { .. } => IMAGE_TOKENS,
             ContentBlock::Thinking { thinking, .. } => estimate_text(thinking),
+            // Opaque encrypted reasoning; its on-wire token cost isn't derivable from `data`
+            // length, so leave it out of the local estimate (the provider's usage
+            // reading is authoritative).
+            ContentBlock::RedactedThinking { .. } => 0,
             // Tool-call args are serialized JSON on the wire; count the name plus the compact JSON.
             ContentBlock::ToolUse { name, input, .. } => {
                 estimate_text(name).saturating_add(estimate_text(&input.to_string()))

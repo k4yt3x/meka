@@ -60,6 +60,9 @@ fn searchable_text(message: &Message) -> String {
             ContentBlock::Thinking { thinking, .. } => {
                 segments.push(format!("[thinking] {thinking}"))
             }
+            ContentBlock::RedactedThinking { .. } => {
+                segments.push("[redacted thinking]".to_string())
+            }
             ContentBlock::ToolUse { name, input, .. } => {
                 segments.push(format!("[tool call: {name}] {input}"));
             }
@@ -90,6 +93,9 @@ fn render_message_full(message: &Message) -> String {
             ContentBlock::Text { text } => segments.push(text.clone()),
             ContentBlock::Thinking { thinking, .. } => {
                 segments.push(format!("[thinking]\n{thinking}"))
+            }
+            ContentBlock::RedactedThinking { .. } => {
+                segments.push("[redacted thinking]".to_string())
             }
             ContentBlock::ToolUse { name, input, .. } => {
                 let pretty =
