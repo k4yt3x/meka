@@ -12,10 +12,11 @@
 //!   [`crate::frontend::ToolOutputMetadata::Diff`]), and ends with `end_turn` / `cancelled` stop
 //!   reasons. `session/request_permission` handles `ask`-mode tool approvals; per-session sticky
 //!   always/never sets short-circuit subsequent requests.
-//! - **Skills + modes**: installed skills surface as `available_commands_update` palette entries;
-//!   the agent resolves `/<skill-name> [extra]` prompts to the rendered skill body before the turn.
-//!   `Permission` levels map 1:1 to ACP `SessionMode` ids, advertised on every session-creation
-//!   response and mutated live via `session/set_mode`.
+//! - **Commands + modes**: built-in local commands (`/status`, `/mcp`) and installed skills surface
+//!   as `available_commands_update` palette entries. Local commands render text and end the turn
+//!   with no model call; skills resolve `/<skill-name> [extra]` prompts to the rendered skill body
+//!   before the turn. `Permission` levels map 1:1 to ACP `SessionMode` ids, advertised on every
+//!   session-creation response and mutated live via `session/set_mode`.
 //! - **Delegation**: `read_file` / `write_file` / `edit_file` / `execute_command` route through the
 //!   client's `fs/read_text_file`, `fs/write_text_file`, and `terminal/*` when the matching
 //!   capability is offered, falling back to local syscalls otherwise. `read` permission mode
@@ -1242,9 +1243,104 @@ fn build_mode_state(permission: &SharedPermission) -> SessionModeState {
     SessionModeState::new(mode_id_for(permission.get()), modes)
 }
 
-/// Emit a `session/update: available_commands_update` listing every installed skill as an
-/// [`AvailableCommand`]. Editor clients render these as slash commands in their prompt input;
-/// picking one inserts `/<name> ` and lets the user type extra context after.
+/// Slash commands meka handles entirely agent-side: they render text and end the turn with no model
+/// call, unlike skills (which resolve to prompt text and run the model). `(name, description)`.
+const LOCAL_COMMANDS: &[(&str, &str)] = &[
+    (
+        "status",
+        "Show session status: model, context usage, tokens, mode",
+    ),
+    (
+        "mcp",
+        "List configured MCP servers and their connection status",
+    ),
+];
+
+/// If `prompt_text` is a [`LOCAL_COMMANDS`] invocation, render its output; otherwise `None` so the
+/// prompt falls through to skill resolution / the model. Text after the command name is ignored
+/// (these commands take no arguments).
+async fn try_local_command(
+    prompt_text: &str,
+    runtime: &SessionRuntime,
+    shared: &crate::SharedDeps,
+) -> Option<String> {
+    let (name, _extra) = split_acp_slash(prompt_text)?;
+    match name.as_str() {
+        "status" => Some(build_status_text(runtime, shared)),
+        "mcp" => Some(build_mcp_list_text(shared).await),
+        _ => None,
+    }
+}
+
+/// Plain-text `/status` output, mirroring the REPL's `render_session_status` plus the model and
+/// mode an ACP client may not otherwise surface.
+fn build_status_text(runtime: &SessionRuntime, shared: &crate::SharedDeps) -> String {
+    use std::fmt::Write as _;
+    let snap = runtime.agent.session_stats_snapshot();
+    let (used, window) = runtime.agent.context_usage();
+    let mut out = String::from("meka session status\n");
+    if let Some(model) = shared.config.model.as_deref() {
+        let _ = writeln!(out, "  Model:    {model}");
+    }
+    let _ = writeln!(
+        out,
+        "  Mode:     {}",
+        mode_display_name(runtime.permission.get())
+    );
+    if window > 0 && used > 0 {
+        let pct = ((used as f64 / window as f64) * 100.0).round() as u64;
+        let left = window.saturating_sub(used);
+        let _ = writeln!(
+            out,
+            "  Context:  {} / {} ({pct}% used, {} left)",
+            crate::render::format_token_count(used),
+            crate::render::format_token_count(window),
+            crate::render::format_token_count(left),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  Tokens:   in {} (cache hit {}%) / out {}",
+        crate::render::format_token_count(snap.total_input_tokens()),
+        snap.cache_hit_pct(),
+        crate::render::format_token_count(snap.output_tokens),
+    );
+    let _ = writeln!(out, "  Turns:    {}", snap.turns);
+    let _ = write!(out, "  Messages: {}", runtime.messages.len());
+    out
+}
+
+/// Plain-text `/mcp` output: each configured MCP server and its live connection state.
+async fn build_mcp_list_text(shared: &crate::SharedDeps) -> String {
+    use std::fmt::Write as _;
+    let Some(manager) = shared.mcp_manager.as_ref() else {
+        return "No MCP servers configured.".to_string();
+    };
+    let names = manager.server_names();
+    if names.is_empty() {
+        return "No MCP servers configured.".to_string();
+    }
+    let mut out = String::from("MCP servers\n");
+    for name in names {
+        let status = match manager.server_entry(&name) {
+            Some(entry) => match entry.state().await {
+                crate::mcp::ServerState::Failed { error, .. } => {
+                    format!("failed: {}", error.lines().next().unwrap_or("").trim())
+                }
+                other => other.label().to_string(),
+            },
+            None => "unknown".to_string(),
+        };
+        let _ = writeln!(out, "  {name}: {status}");
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// Emit a `session/update: available_commands_update` listing meka's built-in local commands
+/// ([`LOCAL_COMMANDS`]) followed by every installed skill, each as an [`AvailableCommand`]. Editor
+/// clients render these as slash commands in their prompt input; picking one inserts `/<name> `.
+/// Skills whose name collides with a built-in command are dropped so the palette has no duplicates.
 ///
 /// `SkillCache::current` is mtime-cached, so calling this at the top of every prompt is cheap (one
 /// `read_dir`, no parsing on the warm path).
@@ -1254,16 +1350,22 @@ async fn emit_available_commands(
     skills: &Arc<SkillCache>,
 ) {
     let snapshot = skills.current().await;
-    let commands: Vec<AvailableCommand> = snapshot
+    let mut commands: Vec<AvailableCommand> = LOCAL_COMMANDS
         .iter()
-        .map(|skill| {
-            AvailableCommand::new(skill.name.clone(), skill.description.clone()).input(
-                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
-                    "additional context (optional)",
-                )),
-            )
-        })
+        .map(|(name, description)| AvailableCommand::new(*name, *description))
         .collect();
+    commands.extend(
+        snapshot
+            .iter()
+            .filter(|skill| !LOCAL_COMMANDS.iter().any(|(name, _)| *name == skill.name))
+            .map(|skill| {
+                AvailableCommand::new(skill.name.clone(), skill.description.clone()).input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                        "additional context (optional)",
+                    )),
+                )
+            }),
+    );
     send_session_update(
         connection,
         session_id,
@@ -2015,6 +2117,24 @@ async fn run_prompt_turn(
         &state.shared.skills,
     )
     .await;
+
+    // Local slash commands (`/status`, `/mcp`) render text and end the turn with no model call.
+    // Checked before skill resolution so they aren't misread as unknown skills.
+    if let Some(output) = try_local_command(&prompt_text, &runtime, &state.shared).await {
+        // `agent_message_chunk` is rendered as Markdown, where a bare newline is a soft break (it
+        // collapses to a space) and small indents are stripped. Wrap the preformatted table in a
+        // fenced code block so the column alignment and line breaks survive, matching how
+        // `execute_command` output is rendered.
+        let body = format!("```\n{output}\n```");
+        send_session_update(
+            &frontend.connection,
+            &frontend.session_id,
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                agent_client_protocol::schema::v1::TextContent::new(body),
+            ))),
+        );
+        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+    }
 
     let original_prompt_text = prompt_text.clone();
     let prompt_text = match slash_to_prompt_text(

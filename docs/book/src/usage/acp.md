@@ -111,12 +111,16 @@ When the active mode is `ask`, write-gated tools trigger a `session/request_perm
 
 Sticky decisions live in meka's process memory; they reset on session close.
 
-## Skills as slash commands
+## Slash commands
 
-Every installed skill (see [Skills](./skills.md)) is advertised through `session/update: available_commands_update` after `session/new` / `session/load` / `session/resume`, and refreshed at the top of every `session/prompt` so a skill installed mid-session shows up without a reconnect.
+Two kinds of slash command are advertised through `session/update: available_commands_update` (after `session/new` / `session/load` / `session/resume`, and refreshed at the top of every `session/prompt` so a skill installed mid-session shows up without a reconnect):
 
-Each command carries a generic free-form input hint (`"additional context (optional)"`). When the user picks one from the palette, the client typically inserts `/<skill-name> ` and lets the user type extra context. meka parses the prompt as follows:
+- **Built-in local commands** — `/status` (model, context usage, tokens, mode) and `/mcp` (configured MCP servers and their connection status). They render text back as an `agent_message_chunk` and end the turn immediately, with no model call.
+- **Skills** (see [Skills](./skills.md)) — each installed skill is a top-level command carrying a free-form input hint (`"additional context (optional)"`).
 
+When the user picks one from the palette, the client typically inserts `/<name> ` and lets the user type extra context. meka parses the prompt as follows:
+
+- A built-in local command (`/status`, `/mcp`): handled agent-side, output streamed back, turn ends with no model call. Checked first, so a skill can't shadow a built-in (a skill named `status`/`mcp` is dropped from the palette).
 - Plain text (no leading slash): passes through to the model unchanged.
 - `/<skill-name>` matching an installed skill: loads the skill body via the same path as the REPL's `/skill` command (substituting `${MEKA_SKILL_DIR}` and `${MEKA_SESSION_ID}`) and prepends any extra context the user typed.
 - Slash with a syntactically valid but unknown skill name (`/nonexistent`): JSON-RPC error.

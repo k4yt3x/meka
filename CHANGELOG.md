@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Report context usage to ACP clients via the standard `usage_update` notification (e.g. Zed gauge).
+- Report context usage to ACP clients via the standard `usage_update` notification.
+- Expose `/status` and `/mcp` as ACP slash commands alongside skills.
 
 ## [0.29.0] - 2026-06-23
 
