@@ -7,7 +7,7 @@ description = "A general-purpose AI agent harness"
 repository = "https://github.com/k4yt3x/meka"
 
 [dependencies]
-agent-client-protocol = "0.12.1"
+agent-client-protocol = "0.15.1"
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"

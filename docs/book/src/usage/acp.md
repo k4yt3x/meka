@@ -78,6 +78,7 @@ While the turn runs, meka streams `session/update` notifications:
 - `tool_call_update` when a tool finishes, with the final `status` (`completed` / `failed`), a `content` array, and `raw_output` (the structured tool result). `execute_command` output is wrapped in a fenced `console` code block so editors render it monospaced; `edit_file` and `write_file` populate diff content blocks so clients can render the apply-diff UI. (Large outputs offloaded to the scratchpad show the scratchpad reference rather than the full payload.)
 - `plan` whenever the agent's `todo` tool updates the task list, so clients with a plan panel (e.g. Zed) render the live to-do list. meka's `cancelled` todo status maps to `completed`.
 - `session_info_update` once per session, carrying the title (the first user message preview) so a freshly created or loaded tab gets a label without a `session/list` call.
+- `usage_update` after each turn, carrying `used` (tokens currently in context: all input tiers plus output) and `size` (the model's context window), so clients with a context gauge (e.g. Zed) show how full the window is. Emitted only once both values are known.
 
 The response carries a final `stopReason`:
 

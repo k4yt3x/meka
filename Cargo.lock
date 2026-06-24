@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.12.1"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4361ba6627e51de955b10f3c77fb9eb959c85191a236c1c2c84e32f4ff240faf"
+checksum = "eb5232c1162bcff4eafe378cc88a1ccaee2d49cedd9fe3d2517c5742bb748ced"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -20,24 +20,21 @@ dependencies = [
  "blocking",
  "futures",
  "futures-concurrency",
- "jsonrpcmsg",
- "rmcp",
  "rustc-hash",
  "schemars 1.2.1",
  "serde",
  "serde_json",
  "shell-words",
- "tokio",
- "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "0.11.1"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cabdc9d845d08ec7ed2d0c9de1ae4a1b198301407d55855261572761be90ec9f"
+checksum = "7cb3131da850c922c348b36a9b96684d69779c3a776e83a948ba0b10e77766bb"
 dependencies = [
  "quote",
  "syn",
@@ -45,9 +42,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b957d8391ac3933e2a940446171c508d2b8ffc386d8fa7d0b9c936a2575b463e"
+checksum = "b4e7eb6f1e554741f621ae4abb046d4fbb3cb88541bc599693ae7f9aa30b72eb"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -2147,16 +2144,6 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "jsonrpcmsg"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d833a15225c779251e13929203518c2ff26e2fe0f322d584b213f4f4dad37bd"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]

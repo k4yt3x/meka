@@ -39,7 +39,7 @@ use std::{
 
 use agent_client_protocol::{
     Agent as AcpAgentRole, ByteStreams, Client, ConnectionTo,
-    schema::{
+    schema::v1::{
         AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
         CancelNotification, ClientCapabilities, CloseSessionRequest, CloseSessionResponse,
         ContentBlock, ContentChunk, CreateTerminalRequest, CurrentModeUpdate, Diff,
@@ -55,7 +55,7 @@ use agent_client_protocol::{
         SessionResumeCapabilities, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse,
         StopReason, TerminalOutputRequest, ToolCall, ToolCallContent, ToolCallLocation,
         ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-        WaitForTerminalExitRequest, WriteTextFileRequest,
+        UsageUpdate, WaitForTerminalExitRequest, WriteTextFileRequest,
     },
 };
 use async_trait::async_trait;
@@ -176,6 +176,13 @@ pub struct AcpFrontend {
     /// in `client_disconnected()` and OR them) so a single session's drop doesn't take the
     /// process down with it. Grep for `transport_dead` to find the migration points.
     transport_dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Live context-occupancy counter shared with this session's agent (it writes the value after
+    /// each round via [`Agent::set_context_tokens`]); read on every `TokenUsage` event to emit an
+    /// ACP `usage_update` so editors show "tokens used / context window". `context_window` holds
+    /// the resolved window for the `size` field, set once the agent is built (`0` until then,
+    /// which suppresses the update).
+    context_tokens: Arc<std::sync::atomic::AtomicU64>,
+    context_window: std::sync::atomic::AtomicU64,
 }
 
 impl AcpFrontend {
@@ -185,6 +192,7 @@ impl AcpFrontend {
         cwd: SharedCwd,
         client_state: SharedClientState,
         transport_dead: Arc<std::sync::atomic::AtomicBool>,
+        context_tokens: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             connection,
@@ -194,7 +202,16 @@ impl AcpFrontend {
             never_allowed: std::sync::Mutex::new(std::collections::HashSet::new()),
             client_state,
             transport_dead,
+            context_tokens,
+            context_window: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Record the resolved context-window size for this session's model, used as the `size` of the
+    /// ACP `usage_update`. Called once the agent is built (its window resolution is authoritative).
+    fn set_context_window(&self, window: u64) {
+        self.context_window
+            .store(window, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Mark the stdio transport as dead. Called from `emit` and the `session/load` replay loop
@@ -241,12 +258,12 @@ impl Frontend for AcpFrontend {
         let update = match event {
             FrontendEvent::AssistantTextDelta(text) => {
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(text),
+                    agent_client_protocol::schema::v1::TextContent::new(text),
                 )))
             }
             FrontendEvent::ThinkingBlock { content, .. } => {
                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(content),
+                    agent_client_protocol::schema::v1::TextContent::new(content),
                 )))
             }
             FrontendEvent::ToolCallStarted {
@@ -298,7 +315,7 @@ impl Frontend for AcpFrontend {
                 // today; when ACP grows a typed notice variant, branch on it here.
                 let text = format!("[meka] {}", notice.text);
                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                    agent_client_protocol::schema::TextContent::new(text),
+                    agent_client_protocol::schema::v1::TextContent::new(text),
                 )))
             }
             FrontendEvent::McpProgress(update) => {
@@ -328,7 +345,24 @@ impl Frontend for AcpFrontend {
                 // REPL.
                 SessionUpdate::Plan(Plan::new(todo_items_to_plan(&items)))
             }
-            // REPL-specific signage (token usage, lifecycle).
+            FrontendEvent::TokenUsage(_) => {
+                // Mirror the REPL's context gauge as an ACP `usage_update` so editors (e.g. Zed)
+                // show "tokens used / context window". `used` is read from the shared atomic the
+                // agent updates each round (current occupancy: all input tiers + output) rather
+                // than the event's per-turn total, which over-counts multi-round tool turns;
+                // `size` is the resolved window. Suppress until both are known.
+                let used = self
+                    .context_tokens
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let size = self
+                    .context_window
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if used == 0 || size == 0 {
+                    return;
+                }
+                SessionUpdate::UsageUpdate(UsageUpdate::new(used, size))
+            }
+            // REPL-specific signage (lifecycle, diffs).
             _ => return,
         };
 
@@ -733,7 +767,7 @@ fn tool_locations(name: &str, input: &serde_json::Value, cwd: &SharedCwd) -> Vec
 /// Wrap a string as a plain-text [`ToolCallContent`] block.
 fn text_content_block(text: impl Into<String>) -> ToolCallContent {
     ToolCallContent::from(ContentBlock::Text(
-        agent_client_protocol::schema::TextContent::new(text.into()),
+        agent_client_protocol::schema::v1::TextContent::new(text.into()),
     ))
 }
 
@@ -818,7 +852,7 @@ fn replay_session_updates(
                                     session_id,
                                     SessionUpdate::UserMessageChunk(ContentChunk::new(
                                         ContentBlock::Text(
-                                            agent_client_protocol::schema::TextContent::new(
+                                            agent_client_protocol::schema::v1::TextContent::new(
                                                 stripped.to_string(),
                                             ),
                                         ),
@@ -880,7 +914,7 @@ fn replay_session_updates(
                                 session_id,
                                 SessionUpdate::AgentMessageChunk(ContentChunk::new(
                                     ContentBlock::Text(
-                                        agent_client_protocol::schema::TextContent::new(
+                                        agent_client_protocol::schema::v1::TextContent::new(
                                             text.clone(),
                                         ),
                                     ),
@@ -893,7 +927,7 @@ fn replay_session_updates(
                                 session_id,
                                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(
                                     ContentBlock::Text(
-                                        agent_client_protocol::schema::TextContent::new(
+                                        agent_client_protocol::schema::v1::TextContent::new(
                                             thinking.clone(),
                                         ),
                                     ),
@@ -906,7 +940,7 @@ fn replay_session_updates(
                                 session_id,
                                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(
                                     ContentBlock::Text(
-                                        agent_client_protocol::schema::TextContent::new(
+                                        agent_client_protocol::schema::v1::TextContent::new(
                                             "[redacted thinking]".to_string(),
                                         ),
                                     ),
@@ -2516,17 +2550,25 @@ async fn build_session_runtime(
     let permission =
         SharedPermission::new(shared.config.permission, shared.config.enabled_permissions);
 
+    // Shared with the agent (adopted via `set_context_tokens` below) so the frontend can read the
+    // current context occupancy when emitting `usage_update`.
+    let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let acp_frontend = Arc::new(AcpFrontend::new(
         connection,
         session_id,
         Arc::clone(&cwd),
         client_state.clone(),
         Arc::clone(transport_dead),
+        Arc::clone(&context_tokens),
     ));
     let frontend: Arc<dyn Frontend> = acp_frontend.clone();
 
-    let (agent, tool_registry) =
+    let (mut agent, tool_registry) =
         crate::build_session_agent(shared, permission.clone(), frontend, Arc::clone(&cwd)).await?;
+    // Point the agent's context counter at the shared atomic and capture its resolved window, so
+    // the frontend's `usage_update` reports the same occupancy/size the REPL gauge would.
+    agent.set_context_tokens(Arc::clone(&context_tokens));
+    acp_frontend.set_context_window(agent.context_usage().1);
 
     Ok(SessionRuntime {
         session_id_str,
@@ -2660,7 +2702,7 @@ mod tests {
     #[test]
     fn test_format_embedded_resource_text_inlines_contents() {
         let embedded = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
-            agent_client_protocol::schema::TextResourceContents::new(
+            agent_client_protocol::schema::v1::TextResourceContents::new(
                 "fn main() {}",
                 "file:///proj/src/main.rs",
             )
@@ -2676,7 +2718,7 @@ mod tests {
     #[test]
     fn test_format_embedded_resource_blob_emits_marker_without_payload() {
         let embedded = EmbeddedResource::new(EmbeddedResourceResource::BlobResourceContents(
-            agent_client_protocol::schema::BlobResourceContents::new(
+            agent_client_protocol::schema::v1::BlobResourceContents::new(
                 "QUJD",
                 "file:///proj/logo.png",
             )
@@ -2696,7 +2738,10 @@ mod tests {
         // A `<resource>` tag is part of the user's prompt body. Once wrapped by the agent's
         // `<context>...</context>` preamble and stripped on replay, the tag must remain intact.
         let embedded = EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
-            agent_client_protocol::schema::TextResourceContents::new("hello", "file:///note.txt"),
+            agent_client_protocol::schema::v1::TextResourceContents::new(
+                "hello",
+                "file:///note.txt",
+            ),
         ));
         let prompt_body = format!("see this\n{}", format_embedded_resource(&embedded));
         let wrapped = format!(
@@ -2867,7 +2912,7 @@ mod tests {
 
     #[test]
     fn test_translate_permission_outcome_maps_each_option() {
-        use agent_client_protocol::schema::SelectedPermissionOutcome;
+        use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
 
         // Capture sticky pushes via a `Cell` so each call site borrows it fresh; this sidesteps the
         // closure-vs-direct-read borrow conflict that comes from sharing one `&mut Vec`.
@@ -2942,7 +2987,7 @@ mod tests {
 
     #[test]
     fn test_translate_permission_outcome_unknown_option_denies() {
-        use agent_client_protocol::schema::SelectedPermissionOutcome;
+        use agent_client_protocol::schema::v1::SelectedPermissionOutcome;
         let result = translate_permission_outcome(
             RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new("future_option")),
             "read_file",
@@ -3150,9 +3195,11 @@ mod tests {
         assert!(shared.client_info().is_none());
 
         let updated_caps = ClientCapabilities::new()
-            .fs(agent_client_protocol::schema::FileSystemCapabilities::new()
-                .read_text_file(true)
-                .write_text_file(true))
+            .fs(
+                agent_client_protocol::schema::v1::FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true),
+            )
             .terminal(true);
         let updated_info = Implementation::new("test-editor", "9.9.9");
         shared.record_initialize(updated_caps, Some(updated_info));
