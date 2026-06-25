@@ -59,7 +59,6 @@ async fn open_write_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
         // FILE_FLAG_OPEN_REPARSE_POINT opens the link itself rather than following it, so a
         // symlinked path yields a handle we can inspect. Truncation is deferred to `set_len`
         // *after* the symlink check so a rejected target is never destroyed.
