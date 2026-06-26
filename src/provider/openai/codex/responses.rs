@@ -406,10 +406,7 @@ pub(super) async fn drive_responses_sse_stream(
             tracing::warn!("failed to read Codex error response body: {}", error);
             String::new()
         });
-        return Err(MekaError::Provider(format!(
-            "Codex API returned status {}: {}",
-            status, response_text
-        )));
+        return Err(crate::error::provider_http_error(status, &response_text));
     }
 
     let mut event_stream = response.bytes_stream().eventsource();

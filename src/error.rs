@@ -17,6 +17,13 @@ pub enum MekaError {
     #[error("provider error: {0}")]
     Provider(String),
 
+    /// The provider rejected the request because the prompt exceeded the model's context window
+    /// (e.g. HTTP 400 "prompt is too long" / 413 / `context_length_exceeded`). Distinct from
+    /// [`Self::Provider`] so the agent loop can catch it by type and compact-and-retry once instead
+    /// of matching error strings at the call site.
+    #[error("context window exceeded: {0}")]
+    ContextOverflow(String),
+
     #[error("tool execution error: {tool_name}: {message}")]
     ToolExecution { tool_name: String, message: String },
 
@@ -65,6 +72,27 @@ pub enum MekaError {
 
 pub type Result<T> = std::result::Result<T, MekaError>;
 
+/// Classify a provider HTTP failure response: map context-window overflows to
+/// [`MekaError::ContextOverflow`] (so the agent loop can compact-and-retry once) and everything
+/// else to [`MekaError::Provider`]. Anthropic returns HTTP 400 `invalid_request_error` with "prompt
+/// is too long"; OpenAI returns 400 `context_length_exceeded` (or 413). Matched on the body because
+/// a bare 400 is shared with many unrelated errors.
+pub(crate) fn provider_http_error(status: reqwest::StatusCode, body: &str) -> MekaError {
+    let lower = body.to_ascii_lowercase();
+    let overflow = status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        || lower.contains("prompt is too long")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("context length exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("exceeds the maximum context");
+    let message = format!("API returned status {status}: {body}");
+    if overflow {
+        MekaError::ContextOverflow(message)
+    } else {
+        MekaError::Provider(message)
+    }
+}
+
 /// Format a [`reqwest::Error`] together with its full source chain.
 ///
 /// reqwest's outer Display string ("error sending request for url …") usually hides the actual
@@ -83,4 +111,55 @@ pub(crate) fn format_reqwest_error(error: &reqwest::Error) -> String {
         source = cause.source();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_http_error_maps_overflow() {
+        // Anthropic: 400 invalid_request_error / "prompt is too long".
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+            ),
+            MekaError::ContextOverflow(_)
+        ));
+        // OpenAI: context_length_exceeded.
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"context_length_exceeded"}}"#,
+            ),
+            MekaError::ContextOverflow(_)
+        ));
+        // 413 Payload Too Large is an overflow regardless of body.
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                "Request Entity Too Large"
+            ),
+            MekaError::ContextOverflow(_)
+        ));
+    }
+
+    #[test]
+    fn test_provider_http_error_maps_other_as_provider() {
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::UNAUTHORIZED,
+                r#"{"error":{"type":"authentication_error"}}"#,
+            ),
+            MekaError::Provider(_)
+        ));
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded"
+            ),
+            MekaError::Provider(_)
+        ));
+    }
 }

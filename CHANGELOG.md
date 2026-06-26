@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Compaction keeps a token-budgeted recent tail and uses a richer, security-aware summary prompt.
+- Compact proactively when the next request would overflow the context window, not only reactively.
+
+### Fixed
+
+- Recover from a provider context-window overflow by compacting once and retrying instead of failing.
+
 ## [0.29.1] - 2026-06-25
 
 ### Added

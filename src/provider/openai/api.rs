@@ -352,10 +352,7 @@ impl Provider for OpenAiProvider {
             .map_err(|error| MekaError::Provider(format!("failed to read response: {}", error)))?;
 
         if !status.is_success() {
-            return Err(MekaError::Provider(format!(
-                "API returned status {}: {}",
-                status, response_text
-            )));
+            return Err(crate::error::provider_http_error(status, &response_text));
         }
 
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
@@ -395,10 +392,7 @@ impl Provider for OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             let response_text = response.text().await.unwrap_or_default();
-            return Err(MekaError::Provider(format!(
-                "API returned status {}: {}",
-                status, response_text
-            )));
+            return Err(crate::error::provider_http_error(status, &response_text));
         }
 
         let mut event_stream = response.bytes_stream().eventsource();

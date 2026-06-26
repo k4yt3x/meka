@@ -121,15 +121,15 @@ The full history remains in SQLite for resumption. Only the API payload is trunc
 
 ### Compacting a Session
 
-If a session becomes too long, you can use the `/compact` command to have the LLM summarize the conversation and replace older messages with a structured summary. Recent messages are preserved verbatim. The summary includes key files, decisions, errors, and user preferences.
+If a session becomes too long, you can use the `/compact` command to have the LLM summarize the conversation and replace older messages with a structured summary. A token-budgeted tail of the most recent messages is preserved verbatim (snapped to a clean user-turn boundary so tool calls aren't split). The structured summary captures the primary task and current state, key files and decisions, errors and fixes, every distinct user request, the next step (quoted verbatim to avoid drift), and any security-relevant constraints the user stated (preserved verbatim so they keep applying after compaction).
 
-Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented after compaction. Tools that the model loaded via `load_tool` before compaction stay loaded after; the deferred-tool active set is snapshotted into the compaction boundary, so resumed sessions don't re-issue `load_tool` for tools they already used.
+Compaction preserves scratchpad entries and the todo list, and re-injects environment context so the agent isn't disoriented after compaction. The summary message ends with a directive to resume the work directly rather than narrate the summary. Tools that the model loaded via `load_tool` before compaction stay loaded after; the deferred-tool active set is snapshotted into the compaction boundary, so resumed sessions don't re-issue `load_tool` for tools they already used. If a detail was dropped, the model can `recall` / `recall_read` the full pre-compaction history, which stays on disk.
 
 Internally, compaction does not delete pre-compaction rows from the database. It appends a `compact_boundary` row to the `messages` table; the materialized view is reconstructed from the event log, so the persisted log itself stays append-only.
 
 ### Auto-Compact
 
-When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation when the input token count exceeds 80% of the context window. This runs between turns, not during tool loops.
+When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation when the input token count exceeds 80% of the context window. This runs between turns, not during tool loops. The check is both reactive (the previous turn's reported usage) and proactive (an estimate of the next request, so a turn whose own input jumps over the window is compacted before it is sent). As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
 
 ```toml
 [session]

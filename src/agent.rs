@@ -86,6 +86,11 @@ use crate::{
 /// context window.
 const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
+/// How many times a single turn may emergency-compact-and-retry after the provider reports a
+/// context-window overflow before giving up. One pass shrinks the request dramatically; if it still
+/// overflows, looping won't help.
+const MAX_OVERFLOW_RETRIES: u32 = 1;
+
 /// Per-turn configuration knobs for [`Agent`]. Constructed once by `main` from the
 /// [`crate::config::ResolvedConfig`] and held immutably for the agent's lifetime; mid-session
 /// permission cycling and tool loading are handled by shared state (see [`SharedPermission`] and
@@ -500,13 +505,41 @@ impl Agent {
             )),
         };
 
+        // Proactive pre-send compaction. The reactive check at the top of the turn reads the
+        // *previous* round's reported usage, so a turn whose own input jumps over the window (a
+        // huge paste, a large tool result carried in) would be sent uncompacted and
+        // hard-fail. Project this request locally (conversation + system prompt) and
+        // compact before sending if it would cross the threshold. `estimate_messages`
+        // under-reads (no tool schemas), so this is a floor that complements, not replaces,
+        // the reactive check and the overflow recovery below.
+        if self.options.auto_compact && self.options.context_window > 0 && messages.len() > 1 {
+            let projected = crate::tokens::estimate_messages(messages.as_slice())
+                .saturating_add(crate::tokens::estimate_text(&system_prompt));
+            let threshold = self.options.context_window * AUTO_COMPACT_THRESHOLD_PERCENT / 100;
+            if projected > threshold {
+                tracing::info!(
+                    "proactive compaction: projected {} input tokens exceeds {}% of {} window",
+                    projected,
+                    AUTO_COMPACT_THRESHOLD_PERCENT,
+                    self.options.context_window
+                );
+                if let Err(error) = self.compact_session(session_id, messages).await {
+                    tracing::warn!("proactive compaction failed: {}", error);
+                }
+            }
+        }
+
         // Wrapped in `Arc` once so the no-tool-progress branch below can share it with a cheap
-        // `Arc::clone` instead of a deep `Vec` clone on every loop iteration.
-        let base_messages: Arc<[Message]> = Arc::from(truncate_messages_for_context(
+        // `Arc::clone` instead of a deep `Vec` clone on every loop iteration. `mut` so an overflow
+        // recovery (compact-and-retry, below) can rebuild it from the compacted conversation.
+        let mut base_messages: Arc<[Message]> = Arc::from(truncate_messages_for_context(
             messages.as_slice(),
             self.options.context_messages,
         ));
-        let turn_start_len = messages.len();
+        let mut turn_start_len = messages.len();
+        // Bounds the emergency compact-and-retry on a `ContextOverflow` so a request that stays too
+        // large after one compaction fails cleanly instead of looping.
+        let mut overflow_retries = 0u32;
 
         let mut user_saved = user_eagerly_saved;
         // Set once we've nudged the model for a user-visible response this turn, so the recovery
@@ -555,33 +588,62 @@ impl Agent {
                 // blocking provider call surfaces notices in its return tuple (no event channel);
                 // we forward them to the frontend here so the user sees the same advisories the
                 // streaming path emits inline via `StreamEvent::Notice`.
-                let (mut assistant_message, stop_reason, usage) = if self.options.streaming {
-                    match self
-                        .run_streaming(
+                let call_result: Result<(Message, StopReason, crate::provider::TokenUsage)> =
+                    if self.options.streaming {
+                        self.run_streaming(
                             Arc::clone(&system_prompt),
                             api_messages,
                             tools,
                             cancellation.clone(),
                         )
                         .await
-                    {
-                        Ok(value) => value,
-                        Err(error) => break 'turn Err(error),
-                    }
-                } else {
-                    match self
-                        .provider
-                        .complete(&system_prompt, &api_messages, &tools)
-                        .await
-                    {
-                        Ok((message, stop_reason, usage, notices)) => {
-                            for notice in notices {
-                                self.frontend.emit(FrontendEvent::Notice(notice)).await;
+                    } else {
+                        match self
+                            .provider
+                            .complete(&system_prompt, &api_messages, &tools)
+                            .await
+                        {
+                            Ok((message, stop_reason, usage, notices)) => {
+                                for notice in notices {
+                                    self.frontend.emit(FrontendEvent::Notice(notice)).await;
+                                }
+                                Ok((message, stop_reason, usage))
                             }
-                            (message, stop_reason, usage)
+                            Err(error) => Err(error),
                         }
-                        Err(error) => break 'turn Err(error),
+                    };
+
+                let (mut assistant_message, stop_reason, usage) = match call_result {
+                    Ok(value) => value,
+                    // Context overflow despite the proactive check (the local estimate under-counts
+                    // tool schemas). Compact once and retry rather than fail the turn; the
+                    // compacted conversation already holds this turn's tool
+                    // results, so the retry rebuilds `base_messages` from it
+                    // and re-sends.
+                    Err(MekaError::ContextOverflow(message))
+                        if self.options.auto_compact
+                            && self.options.context_window > 0
+                            && messages.len() > 1
+                            && overflow_retries < MAX_OVERFLOW_RETRIES =>
+                    {
+                        overflow_retries += 1;
+                        tracing::warn!(
+                            "provider reported context overflow; compacting and retrying ({})",
+                            message
+                        );
+                        if let Err(compact_error) = self.compact_session(session_id, messages).await
+                        {
+                            tracing::warn!("emergency compaction failed: {}", compact_error);
+                            break 'turn Err(MekaError::ContextOverflow(message));
+                        }
+                        base_messages = Arc::from(truncate_messages_for_context(
+                            messages.as_slice(),
+                            self.options.context_messages,
+                        ));
+                        turn_start_len = messages.len();
+                        continue;
                     }
+                    Err(error) => break 'turn Err(error),
                 };
 
                 // Total of all tiers including output = everything in context as of this exchange,
@@ -1272,32 +1334,20 @@ impl Agent {
              3. **Key files**: Files read, created, or modified (list paths).\n\
              4. **Key decisions**: Important choices made and their rationale.\n\
              5. **Errors and fixes**: Problems encountered and how they were resolved.\n\
-             6. **User preferences**: Feedback or corrections about how to work.";
+             6. **User preferences and constraints**: Feedback or corrections about how to \
+             work. Preserve any security-relevant instructions verbatim (sensitive files or \
+             data to avoid, operations that must not be performed, secret-handling rules) so \
+             they keep applying after compaction.\n\
+             7. **All user requests**: Every distinct request the user made, in order, so none \
+             of their intent is lost.\n\
+             8. **Next step**: The immediate next action. If a task was mid-flight, quote the \
+             user's most recent request verbatim so the work does not drift.";
 
-        // Split into messages to summarize vs. recent messages to keep verbatim. Walk backward from
-        // the target split point to find a safe cut that doesn't orphan tool_use blocks from their
-        // tool_result responses.
-        let view = messages.as_slice();
-        let (to_summarize, to_keep) = if view.len() > 6 {
-            let mut split = view.len() - 2;
-            loop {
-                if split == 0 {
-                    break;
-                }
-                let message = &view[split];
-                if message.role == Role::User && !has_tool_results(&message.content) {
-                    break;
-                }
-                split -= 1;
-            }
-            if split >= 4 {
-                (view[..split].to_vec(), view[split..].to_vec())
-            } else {
-                (view.to_vec(), Vec::new())
-            }
-        } else {
-            (view.to_vec(), Vec::new())
-        };
+        // Split into a head to summarize and a recent tail to keep verbatim. The tail is the
+        // largest recent suffix that fits a token budget (~10% of the window, capped), snapped back
+        // to a clean user boundary so tool_use/tool_result pairs are never orphaned.
+        let keep_budget = (self.options.context_window / 10).clamp(4_000, 16_000);
+        let (to_summarize, to_keep) = compute_compaction_split(messages.as_slice(), keep_budget);
 
         // Clone and preprocess messages for the summarizer: strip images and truncate large text
         // blocks to avoid overwhelming the summary call.
@@ -1335,18 +1385,18 @@ impl Agent {
         // Build post-compact context: environment, todos, scratchpad inventory.
         let post_context = self.build_post_compact_context(sid).await;
 
-        let context_message = if post_context.is_empty() {
-            format!(
-                "[Conversation summary from session compaction]\n\n{}",
-                summary_text,
-            )
-        } else {
-            format!(
-                "[Conversation summary from session compaction]\n\n{}\n\n\
-                 [Post-compaction context]\n\n{}",
-                summary_text, post_context,
-            )
-        };
+        let mut context_message =
+            format!("[Conversation summary from session compaction]\n\n{summary_text}");
+        if !post_context.is_empty() {
+            context_message.push_str(&format!("\n\n[Post-compaction context]\n\n{post_context}"));
+        }
+        // Behavioural directive (always last, most salient): pick the work back up rather than
+        // narrate the summary. Without it, the turn after an auto-compaction tends to open with
+        // "Based on the summary, I'll continue..." preambles that waste output and add nothing.
+        context_message.push_str(
+            "\n\n[Continue the work directly from the summary above. Do not acknowledge or recap \
+             this summary; resume as if the conversation had not been interrupted.]",
+        );
 
         // Snapshot the deferred-tool active set BEFORE compaction so the `CompactBoundary` event
         // carries it forward; otherwise tools the model loaded pre-compaction would silently drop
@@ -1451,6 +1501,48 @@ fn has_tool_results(content: &[ContentBlock]) -> bool {
     content
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+}
+
+/// Split a conversation for compaction into `(to_summarize, to_keep)`. The kept tail is the largest
+/// recent suffix whose estimated tokens stay within `keep_budget`, then snapped backward to a clean
+/// `User`-without-`tool_results` boundary so a tool_use/tool_result pair is never orphaned and the
+/// kept window starts on a valid user turn. If that leaves fewer than `MIN_SUMMARIZE` messages to
+/// summarize, the whole conversation is summarized and no tail is kept (a smaller head saves too
+/// little to be worth a boundary).
+fn compute_compaction_split(view: &[Message], keep_budget: u64) -> (Vec<Message>, Vec<Message>) {
+    const MIN_SUMMARIZE: usize = 4;
+    if view.len() <= MIN_SUMMARIZE {
+        return (view.to_vec(), Vec::new());
+    }
+
+    // Grow the tail from the end while it fits the budget; always keep at least the last message.
+    let mut split = view.len();
+    let mut tail_tokens = 0u64;
+    while split > 0 {
+        let candidate =
+            tail_tokens.saturating_add(crate::tokens::estimate_message(&view[split - 1]));
+        if candidate > keep_budget && split < view.len() {
+            break;
+        }
+        tail_tokens = candidate;
+        split -= 1;
+    }
+
+    // Snap back to a clean user boundary. This only grows the tail, so it never orphans a
+    // tool_result and guarantees the kept window starts on a User turn.
+    while split > 0 {
+        let message = &view[split];
+        if message.role == Role::User && !has_tool_results(&message.content) {
+            break;
+        }
+        split -= 1;
+    }
+
+    if split >= MIN_SUMMARIZE {
+        (view[..split].to_vec(), view[split..].to_vec())
+    } else {
+        (view.to_vec(), Vec::new())
+    }
 }
 
 /// Whether an assistant turn produced any user-visible text: a `Text` block with non-whitespace
@@ -1798,6 +1890,52 @@ mod tests {
         let result = truncate_messages_for_context(&messages, Some(4));
         assert_eq!(result[0].role, Role::User);
         assert!(!has_tool_results(&result[0].content));
+    }
+
+    #[test]
+    fn test_compaction_split_small_summarizes_all() {
+        let messages = vec![user_msg("a"), assistant_msg("b"), user_msg("c")];
+        let (head, tail) = compute_compaction_split(&messages, 10_000);
+        assert_eq!(head.len(), 3);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn test_compaction_split_keeps_recent_tail_within_budget() {
+        let mut messages = Vec::new();
+        for i in 0..6 {
+            messages.push(user_msg(&format!("user {i}")));
+            messages.push(assistant_msg(&format!("assistant {i}")));
+        }
+        let (head, tail) = compute_compaction_split(&messages, 30);
+        // The split partitions the whole conversation.
+        assert_eq!(head.len() + tail.len(), messages.len());
+        // A small budget keeps only a recent slice, leaving a real head to summarize.
+        assert!(head.len() >= 4);
+        assert!(!tail.is_empty() && tail.len() < messages.len());
+        // The kept window starts on a clean user boundary.
+        assert_eq!(tail[0].role, Role::User);
+        assert!(!has_tool_results(&tail[0].content));
+    }
+
+    #[test]
+    fn test_compaction_split_does_not_orphan_tool_results() {
+        let messages = vec![
+            user_msg("first"),
+            assistant_msg("r1"),
+            user_msg("second"),
+            assistant_msg("r2"),
+            user_msg("third"),
+            assistant_tool_use(),
+            tool_result_msg(),
+            assistant_msg("final"),
+        ];
+        // A budget that naively cuts inside the assistant(tool_use)->user(tool_result) chain must
+        // snap back to the user boundary before it.
+        let (head, tail) = compute_compaction_split(&messages, 20);
+        assert_eq!(head.len() + tail.len(), messages.len());
+        assert_eq!(tail[0].role, Role::User);
+        assert!(!has_tool_results(&tail[0].content));
     }
 
     // Cache prefix stability tests. These tests simulate the agent's message-assembly logic (stable

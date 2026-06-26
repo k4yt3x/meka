@@ -500,10 +500,7 @@ impl Provider for ClaudeOAuthProvider {
             .map_err(|error| MekaError::Provider(format!("failed to read response: {}", error)))?;
 
         if !status.is_success() {
-            return Err(MekaError::Provider(format!(
-                "API returned status {}: {}",
-                status, response_text
-            )));
+            return Err(crate::error::provider_http_error(status, &response_text));
         }
 
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
