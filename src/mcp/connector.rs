@@ -337,6 +337,29 @@ async fn build_mcp_adapters(
 
 /// Connect to an MCP server, dispatching to the auth or no-auth path. This function is only called
 /// from top-level startup code (e.g. `connect_all`) where a `Send` future isn't required: the
+/// Drain a stdio MCP child's stderr line by line into meka's tracing stream. Many MCP servers log
+/// diagnostics to stderr; with rmcp's default inherited stderr those lines land directly on meka's
+/// terminal and corrupt the REPL. Emitting at `debug!` keeps them off the terminal at default
+/// verbosity while still surfacing under `-v` / `RUST_LOG`, tagged with the server name. The task
+/// is detached: it ends on its own when the child exits and stderr reaches EOF.
+fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => tracing::debug!(server = %server_name, "{}", line),
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!(server = %server_name, "stderr read error: {}", error);
+                    break;
+                }
+            }
+        }
+    });
+}
+
 /// OAuth path pulls in an rmcp auth future that is `!Send`. Connect to an MCP server. The returned
 /// future is `!Send` when the server config uses OAuth (rmcp 1.5's auth module holds a `!Sync`
 /// closure across an await). Callers that need a `Send` future (e.g. `Tool::execute` during
@@ -373,12 +396,21 @@ pub(super) async fn connect_server(
                 command.envs(env);
             }
 
-            let transport = rmcp::transport::TokioChildProcess::new(command).map_err(|error| {
-                MekaError::McpConnection {
+            // rmcp's `TokioChildProcess::new` leaves the child's stderr inherited, so an MCP server
+            // that logs to stderr (many `tracing`/`log`-based servers do) writes straight onto
+            // meka's terminal and corrupts the REPL display. Pipe it and drain it into our own
+            // tracing stream instead: quiet by default, visible under `-v` / `RUST_LOG`, and
+            // attributed to the server rather than mixed into the live prompt.
+            let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(command)
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| MekaError::McpConnection {
                     server_name: server_name.to_string(),
                     message: format!("failed to spawn process: {}", error),
-                }
-            })?;
+                })?;
+            if let Some(stderr) = stderr {
+                forward_child_stderr(server_name.to_string(), stderr);
+            }
 
             handler
                 .serve(transport)
