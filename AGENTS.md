@@ -108,9 +108,13 @@ CI's `lint` job denies warnings on both clippy and rustdoc, so the bare commands
 ## Changelog
 
 - Update `CHANGELOG.md` after every meaningful change (new features, bug fixes, breaking changes, deprecations, removals)
-- Follow the [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) format
+- Follow the [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/) format
 - Add entries under the `[Unreleased]` section
 - Keep each changelog entry to around 100 characters
+- Use only the six types (Added, Changed, Deprecated, Removed, Fixed, Security) and group entries by type
+- `Fixed` means the behavior was wrong and is now correct; `Changed` means it worked as intended and now works differently
+- Mark a breaking change with an inline `**Breaking:**` prefix inside its type, not in a separate section
+- Lead a `Security` entry with its CVE id when one exists
 
 ## Documentation
 
