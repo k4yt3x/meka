@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use html2md::rewrite_html;
+use html2md::rewrite_html_custom_with_url;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -163,6 +163,40 @@ static DDG_CAPTCHA: LazyLock<scraper::Selector> = LazyLock::new(|| {
         .expect("static CSS selector")
 });
 
+/// Matches the open/close tags of `<nav>` and `<footer>` elements (with any attributes). The name
+/// is anchored by the trailing `(\s|>|/)` group so sibling elements like `<navbar>` or a custom
+/// `<nav-menu>` are left untouched.
+#[allow(clippy::expect_used)]
+static BOILERPLATE_CONTAINER_TAG: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)<(/?)(?:nav|footer)(\s[^>]*)?>").expect("static regex")
+});
+
+/// Rewrite `<nav>` / `<footer>` container tags to `<div>` before HTML-to-markdown conversion.
+///
+/// `fast_html2md` unconditionally drops the entire subtree of `head, nav, footer, script, noscript,
+/// style` as boilerplate (it calls lol_html's `el.remove()`, which deletes the element and all its
+/// content). That is reasonable for `script` / `style`, but modern sites (Next.js and friends) put
+/// primary navigation and useful footer links inside `<nav>` / `<footer>`, so those links (text and
+/// href alike) silently vanish from the converted markdown. Renaming just the open/close tags to a
+/// neutral `<div>` keeps the content while leaving `script` / `style` / `head` stripping intact.
+fn keep_boilerplate_container_content(html: &str) -> std::borrow::Cow<'_, str> {
+    BOILERPLATE_CONTAINER_TAG.replace_all(html, "<${1}div${2}>")
+}
+
+/// Convert fetched HTML to Markdown exactly the way `fetch_url` does. Two steps: rewrite `<nav>` /
+/// `<footer>` containers so their links survive [`keep_boilerplate_container_content`], then run
+/// `fast_html2md` with the document's URL as the base so root-relative links (`/docs`) resolve to
+/// absolute URLs (`https://host/docs`) the model can follow directly. A `None` base leaves relative
+/// links relative (the converter only rewrites hrefs that start with `/`).
+fn html_to_markdown(html: &str, base_url: &Option<url::Url>) -> String {
+    rewrite_html_custom_with_url(
+        &keep_boilerplate_container_content(html),
+        &None,
+        false,
+        base_url,
+    )
+}
+
 /// Cap on a single result's snippet text (after `**bold**` markers are added). 10 results × 300
 /// chars = ~3 KB of snippets, a sane default for the model; longer content is available via
 /// `fetch_url` on the result URL.
@@ -315,6 +349,11 @@ impl Tool for FetchUrlTool {
             });
         }
 
+        // Capture the document's final (post-redirect) URL to resolve relative links against. Taken
+        // before `bytes_stream` consumes the response; re-parsed through our own `url` crate so the
+        // type matches `html_to_markdown` regardless of reqwest's `url` re-export.
+        let document_url: Option<url::Url> = url::Url::parse(response.url().as_str()).ok();
+
         let mut body_bytes: Vec<u8> = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -340,7 +379,7 @@ impl Tool for FetchUrlTool {
         let body = if raw {
             html
         } else {
-            rewrite_html(&html, false)
+            html_to_markdown(&html, &document_url)
         };
 
         // When the caller redirects to the scratchpad we produce full content regardless of
@@ -661,6 +700,9 @@ fn parse_duckduckgo_results(html: &str) -> DdgOutcome {
 
 #[cfg(test)]
 mod tests {
+    // The raw, un-pre-processed converter, used below to demonstrate the boilerplate-drop that
+    // `html_to_markdown` works around. Production code goes through `html_to_markdown`.
+    use html2md::rewrite_html;
     use regex::Regex;
 
     use super::*;
@@ -943,6 +985,116 @@ mod tests {
             resolve_result_href("https://example.com/page"),
             "https://example.com/page"
         );
+    }
+
+    #[test]
+    fn test_nav_links_survive_markdown_conversion() {
+        // Regression: fast_html2md drops the whole subtree of <nav>/<footer>, taking link text and
+        // href with it. The pre-pass rewrites those containers to <div> so the links survive.
+        let html = r#"<nav class="x"><a href="/docs">Docs</a></nav>"#;
+        assert_eq!(rewrite_html(html, false), "");
+        let fixed = rewrite_html(&keep_boilerplate_container_content(html), false);
+        assert!(fixed.contains("[Docs](/docs)"), "got: {fixed:?}");
+
+        let footer = r#"<footer><a href="/terms">Terms</a></footer>"#;
+        let fixed_footer = rewrite_html(&keep_boilerplate_container_content(footer), false);
+        assert!(
+            fixed_footer.contains("[Terms](/terms)"),
+            "got: {fixed_footer:?}"
+        );
+    }
+
+    #[test]
+    fn test_keep_boilerplate_container_content_is_bounded() {
+        // <navbar> / custom <nav-menu> share a prefix with <nav> but must not be rewritten.
+        assert_eq!(
+            keep_boilerplate_container_content("<navbar>x</navbar>"),
+            "<navbar>x</navbar>"
+        );
+        assert_eq!(
+            keep_boilerplate_container_content("<nav-menu>x</nav-menu>"),
+            "<nav-menu>x</nav-menu>"
+        );
+        // Real nav/footer tags (with and without attributes) become div, preserving attributes.
+        assert_eq!(
+            keep_boilerplate_container_content(r#"<nav class="top"><a>x</a></nav>"#),
+            r#"<div class="top"><a>x</a></div>"#
+        );
+        // <script> is still stripped by the converter even though we don't touch it here.
+        let md = rewrite_html(
+            &keep_boilerplate_container_content("<div>keep<script>var x=1;</script></div>"),
+            false,
+        );
+        assert_eq!(md.trim(), "keep");
+    }
+
+    #[test]
+    fn test_html_to_markdown_resolves_relative_links() {
+        let html = r#"<a href="/docs">Docs</a>"#;
+        // With a base URL, root-relative hrefs become absolute and followable.
+        let base = url::Url::parse("https://example.test/").expect("base url");
+        let absolute = html_to_markdown(html, &Some(base));
+        assert!(
+            absolute.contains("[Docs](https://example.test/docs)"),
+            "got: {absolute:?}"
+        );
+        // Without a base URL, the href is preserved verbatim (still better than being dropped).
+        let relative = html_to_markdown(html, &None);
+        assert!(relative.contains("[Docs](/docs)"), "got: {relative:?}");
+    }
+
+    #[test]
+    fn test_html_to_markdown_synthetic_page_end_to_end() {
+        // Synthetic page (not a real site) exercising the full fetch_url conversion: a nav and a
+        // footer holding the only links, plus a script that must be stripped. Mirrors the layout of
+        // modern SPA sites where primary navigation lives in <nav>/<footer>.
+        let html = r#"
+            <!doctype html><html>
+            <head><title>Widget Co</title><style>.a{color:red}</style></head>
+            <body>
+              <nav class="topbar">
+                <a href="/">Home</a><a href="/products">Products</a><a href="/docs">Docs</a>
+                <a href="https://app.widget.test">Launch</a>
+              </nav>
+              <main>
+                <h1>Widget Co</h1>
+                <p>Durable widgets. See our <a href="/pricing">pricing</a>.</p>
+                <script>trackVisitor("secret-token");</script>
+              </main>
+              <footer>
+                <a href="/legal/terms">Terms</a><a href="https://status.widget.test">Status</a>
+              </footer>
+            </body></html>
+        "#;
+        let base = url::Url::parse("https://widget.test/").expect("base url");
+        let md = html_to_markdown(html, &Some(base));
+
+        // Nav links survive the boilerplate strip and are resolved to absolute URLs.
+        assert!(md.contains("[Home](https://widget.test/)"), "got: {md}");
+        assert!(
+            md.contains("[Products](https://widget.test/products)"),
+            "got: {md}"
+        );
+        assert!(md.contains("[Docs](https://widget.test/docs)"), "got: {md}");
+        // Footer links survive too.
+        assert!(
+            md.contains("[Terms](https://widget.test/legal/terms)"),
+            "got: {md}"
+        );
+        // Body link resolved; absolute links pass through unchanged.
+        assert!(
+            md.contains("[pricing](https://widget.test/pricing)"),
+            "got: {md}"
+        );
+        assert!(md.contains("[Launch](https://app.widget.test"), "got: {md}");
+        assert!(
+            md.contains("[Status](https://status.widget.test"),
+            "got: {md}"
+        );
+        // Body text is kept; the script (and its payload) is dropped.
+        assert!(md.contains("Widget Co"), "got: {md}");
+        assert!(!md.contains("trackVisitor"), "script not stripped: {md}");
+        assert!(!md.contains("secret-token"), "script not stripped: {md}");
     }
 
     #[test]

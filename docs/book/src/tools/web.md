@@ -20,7 +20,8 @@ Fetch a web page and return its content as markdown text.
 ### Behavior
 
 - Fetches the page via HTTP GET.
-- Converts HTML to Markdown using `fast_html2md` (unless `raw` is true).
+- Converts HTML to Markdown using `fast_html2md` (unless `raw` is true). `<nav>` and `<footer>` containers are preserved (rewritten to `<div>` before conversion) so their links survive; `fast_html2md` would otherwise drop those subtrees as boilerplate. `<script>` / `<style>` / `<head>` are still stripped.
+- Resolves root-relative links against the page's final (post-redirect) URL, so a `/docs` href renders as the absolute `https://host/docs` the model can follow directly.
 - Truncates the output to `max_length` characters (default: 30,000).
 - HTTP timeout: 30 seconds.
 - Returns the HTTP status code as an error if the request fails (e.g., 404, 500).
