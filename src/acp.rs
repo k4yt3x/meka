@@ -1254,6 +1254,10 @@ const LOCAL_COMMANDS: &[(&str, &str)] = &[
         "mcp",
         "List configured MCP servers and their connection status",
     ),
+    (
+        "usage",
+        "Show account rate-limit usage (subscription providers)",
+    ),
 ];
 
 /// If `prompt_text` is a [`LOCAL_COMMANDS`] invocation, render its output; otherwise `None` so the
@@ -1268,7 +1272,17 @@ async fn try_local_command(
     match name.as_str() {
         "status" => Some(build_status_text(runtime, shared)),
         "mcp" => Some(build_mcp_list_text(shared).await),
+        "usage" => Some(build_usage_text(runtime).await),
         _ => None,
+    }
+}
+
+/// Plain-text `/usage` output for ACP clients, reusing the shared `render::format_account_usage`.
+async fn build_usage_text(runtime: &SessionRuntime) -> String {
+    match runtime.agent.fetch_usage().await {
+        Ok(Some(usage)) => crate::render::format_account_usage(&usage),
+        Ok(None) => "Account usage isn't available for this provider.".to_string(),
+        Err(error) => format!("Error fetching usage: {error}"),
     }
 }
 

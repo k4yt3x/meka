@@ -23,6 +23,7 @@
 - [Permissions](./usage/permissions.md)
 - [Sessions](./usage/sessions.md)
 - [Skills](./usage/skills.md)
+- [Account Info](./usage/account.md)
 
 # Providers
 

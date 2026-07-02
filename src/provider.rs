@@ -81,6 +81,90 @@ impl AuthCredential {
     }
 }
 
+/// Normalized account rate-limit usage, as returned by a subscription provider's usage endpoint
+/// (Claude OAuth's `/api/oauth/usage`, Codex's `/wham/usage`). Provider-agnostic so one renderer
+/// serves every backend; providers map their native shapes into [`UsageWindow`]s.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountUsage {
+    /// Rolling rate-limit windows (e.g. the 5-hour session window and the weekly window), in the
+    /// order the provider reported them.
+    pub windows: Vec<UsageWindow>,
+    /// Pay-as-you-go / extra-usage (overage credit) state, when the provider reports it.
+    pub extra_usage: Option<ExtraUsage>,
+    /// Optional one-line addendum (e.g. the plan name) shown beneath the windows. `None` when the
+    /// provider offered nothing extra.
+    pub note: Option<String>,
+}
+
+/// Pay-as-you-go / extra-usage (overage credits) state. Normalized from Anthropic's `extra_usage` +
+/// `spend` blocks and Codex's `credits` + `spend_control` blocks; every numeric field is optional
+/// because the two providers report different subsets.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExtraUsage {
+    /// Whether extra usage / pay-as-you-go is enabled on the account.
+    pub enabled: bool,
+    /// Percent of the extra-usage / spend limit consumed (`0.0..=100.0`), if reported.
+    pub utilization: Option<f64>,
+    /// Amount spent this period, in `currency`, if reported.
+    pub used: Option<f64>,
+    /// Remaining credit balance, in `currency`, if reported.
+    pub balance: Option<f64>,
+    /// Currency code (e.g. `"USD"`); `None` when the provider didn't say.
+    pub currency: Option<String>,
+}
+
+/// A single rolling usage window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageWindow {
+    /// Human label, e.g. `"5-hour (session)"` or `"Weekly"`.
+    pub label: String,
+    /// Percentage of the window consumed, `0.0..=100.0`.
+    pub used_percent: f64,
+    /// When the window resets, as a Unix timestamp in seconds. `None` if the provider didn't say.
+    pub resets_at: Option<i64>,
+}
+
+/// Normalized account identity, from a subscription provider's profile endpoint (Claude OAuth's
+/// `/api/oauth/profile` + `/api/oauth/claude_cli/roles`, Codex's `plan_type`). Every field is
+/// optional so each backend fills what it can. Serialized as the `identity` block of `meka account
+/// whoami --format json`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountIdentity {
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    /// Plan label, e.g. `"claude_max"`, `"pro"`, `"plus"`.
+    pub plan: Option<String>,
+    /// Rate-limit tier, e.g. `"default_claude_max_20x"`.
+    pub tier: Option<String>,
+    pub subscription_status: Option<String>,
+    pub organization: Option<String>,
+    /// Organization role, e.g. `"admin"`.
+    pub role: Option<String>,
+}
+
+/// Normalized historical usage, from a provider's stats endpoint (Codex's `/wham/profiles/me`,
+/// Claude's `/api/organization/claude_code_first_token_date`). Fields are optional because the
+/// providers report very different amounts: Codex is rich (lifetime/daily/streaks), Claude offers
+/// only a first-used date.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageHistory {
+    pub lifetime_tokens: Option<i64>,
+    pub peak_daily_tokens: Option<i64>,
+    pub current_streak_days: Option<i64>,
+    pub longest_streak_days: Option<i64>,
+    /// When the account first used the tool (RFC 3339 or `YYYY-MM-DD`), if known.
+    pub first_used: Option<String>,
+    /// Per-day token counts, in the order the provider returned them.
+    pub daily: Vec<DailyUsage>,
+}
+
+/// One day's token count in [`UsageHistory::daily`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DailyUsage {
+    pub date: String,
+    pub tokens: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -450,6 +534,26 @@ pub trait Provider: Send + Sync {
     /// `None` restores the default. Default impl is a silent no-op. Providers that don't support
     /// thinking should leave it that way; providers that do must override.
     fn set_thinking_override(&self, _enabled: Option<bool>) {}
+
+    /// Fetch the account's current rate-limit usage (session / weekly windows and reset times).
+    /// Returns `Ok(None)` for providers that have no per-account usage endpoint (API-key backends,
+    /// Ollama, the local CLI); OAuth subscription providers override this. Errors propagate so the
+    /// caller can surface a refresh/auth failure rather than silently showing nothing.
+    async fn fetch_usage(&self) -> Result<Option<AccountUsage>> {
+        Ok(None)
+    }
+
+    /// Fetch the account's identity (display name, plan/tier, organization, role). Same `Ok(None)`
+    /// contract as [`Self::fetch_usage`]: only OAuth subscription providers override it.
+    async fn fetch_identity(&self) -> Result<Option<AccountIdentity>> {
+        Ok(None)
+    }
+
+    /// Fetch the account's historical usage (lifetime tokens, streaks, per-day counts, first-used
+    /// date). Same `Ok(None)` contract as [`Self::fetch_usage`].
+    async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
+        Ok(None)
+    }
 }
 
 struct ToolCallAccumulator {

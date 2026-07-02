@@ -1,6 +1,6 @@
 //! Clap-derived CLI definition. Owns the top-level argument struct, the subcommand enum
-//! (`provider`, `session`, `history`, `mcp`, `tools`, `skill`, `acp`, `serve`), and the small
-//! parsers for permission/render-mode flag values.
+//! (`provider`, `session`, `history`, `mcp`, `tools`, `skill`, `account`, `acp`, `serve`), and the
+//! small parsers for permission/render-mode/output-format flag values.
 
 use clap::Parser;
 
@@ -42,6 +42,11 @@ pub enum Command {
     Skill {
         #[command(subcommand)]
         action: SkillAction,
+    },
+    /// Show OAuth account info (usage, identity) for scripting
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
     },
     /// Run meka as an ACP (Agent Client Protocol) agent over stdio
     ///
@@ -231,6 +236,56 @@ pub enum SkillAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// Read-only account introspection, for scripting (e.g. an i3blocks status bar). Both subcommands
+/// take an optional profile (defaults to the active provider) and a `--format`.
+#[derive(clap::Subcommand, Debug)]
+pub enum AccountAction {
+    /// Show account rate-limit usage (session / weekly windows)
+    Usage {
+        /// Provider profile (defaults to the active provider)
+        profile: Option<String>,
+        /// Output format
+        #[arg(long, value_parser = parse_output_format, default_value = "plain")]
+        format: OutputFormat,
+    },
+    /// Show account identity (plan, tier, org, role) and local auth status
+    Whoami {
+        /// Provider profile (defaults to the active provider)
+        profile: Option<String>,
+        /// Output format
+        #[arg(long, value_parser = parse_output_format, default_value = "plain")]
+        format: OutputFormat,
+    },
+    /// Show historical usage (lifetime tokens, streaks, per-day counts)
+    Stats {
+        /// Provider profile (defaults to the active provider)
+        profile: Option<String>,
+        /// Output format
+        #[arg(long, value_parser = parse_output_format, default_value = "plain")]
+        format: OutputFormat,
+    },
+}
+
+/// Output format for `meka account` subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable text.
+    Plain,
+    /// JSON (stable shape, for scripts).
+    Json,
+}
+
+fn parse_output_format(s: &str) -> std::result::Result<OutputFormat, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "plain" | "text" => Ok(OutputFormat::Plain),
+        "json" => Ok(OutputFormat::Json),
+        other => Err(format!(
+            "unknown format '{}' (expected plain or json)",
+            other
+        )),
+    }
 }
 
 // Same reasoning as `Command` above: `Add` is the outlier and the enum lives on `main`'s stack for

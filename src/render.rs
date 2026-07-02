@@ -760,6 +760,139 @@ pub fn render_session_status(
     eprintln!("  Messages:        {}", message_count);
 }
 
+/// Plain-text (no ANSI) rendering of account rate-limit usage, shared by the REPL/ACP `/usage`
+/// command and the `meka account usage` CLI. Kept ANSI-free so the CLI can pipe it into scripts
+/// unchanged; the trailing newline lets callers `print!`/`eprint!` it directly.
+pub fn format_account_usage(usage: &crate::provider::AccountUsage) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("Account usage\n");
+    if usage.windows.is_empty() {
+        out.push_str("  (no usage windows reported)\n");
+    }
+    for window in &usage.windows {
+        let percent = window.used_percent.clamp(0.0, 100.0);
+        let reset = window
+            .resets_at
+            .map(format_reset_time)
+            .map(|when| format!("  (resets {when})"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  {:<18} {} {:>3}% used{}",
+            window.label,
+            usage_bar(percent),
+            percent.round() as u64,
+            reset,
+        );
+    }
+    if let Some(extra) = &usage.extra_usage
+        && let Some(line) = format_extra_usage(extra)
+    {
+        let _ = writeln!(out, "  Extra usage: {line}");
+    }
+    if let Some(note) = &usage.note {
+        let _ = writeln!(out, "  {note}");
+    }
+    out
+}
+
+/// One-line summary of extra-usage / credits state, or `None` when there's nothing worth showing
+/// (disabled with no balance and nothing spent).
+fn format_extra_usage(extra: &crate::provider::ExtraUsage) -> Option<String> {
+    let has_data =
+        extra.enabled || extra.used.is_some_and(|used| used > 0.0) || extra.balance.is_some();
+    if !has_data {
+        return None;
+    }
+    let mut parts = vec![if extra.enabled { "enabled" } else { "disabled" }.to_string()];
+    if let Some(utilization) = extra.utilization {
+        parts.push(format!("{}% used", utilization.round() as i64));
+    }
+    if let Some(used) = extra.used {
+        parts.push(format!(
+            "{} spent",
+            format_money(used, extra.currency.as_deref())
+        ));
+    }
+    if let Some(balance) = extra.balance {
+        parts.push(format!(
+            "{} balance",
+            format_money(balance, extra.currency.as_deref())
+        ));
+    }
+    Some(parts.join(" · "))
+}
+
+/// Format a monetary amount: `$3.00` for USD/unknown, `3.00 EUR` otherwise.
+fn format_money(amount: f64, currency: Option<&str>) -> String {
+    match currency {
+        Some("USD") | None => format!("${amount:.2}"),
+        Some(other) => format!("{amount:.2} {other}"),
+    }
+}
+
+/// REPL `/usage` rendering: the shared plain text to stderr (REPL UI feedback). The "not available"
+/// case is handled by the caller via `render_hint`.
+pub fn render_account_usage(usage: &crate::provider::AccountUsage) {
+    eprint!("{}", format_account_usage(usage));
+}
+
+/// A fixed-width `[####------]` gauge for a 0-100 percentage.
+fn usage_bar(percent: f64) -> String {
+    const CELLS: usize = 10;
+    let filled = ((percent / 100.0) * CELLS as f64).round() as usize;
+    let filled = filled.min(CELLS);
+    let mut bar = String::with_capacity(CELLS + 2);
+    bar.push('[');
+    for cell in 0..CELLS {
+        bar.push(if cell < filled { '#' } else { '-' });
+    }
+    bar.push(']');
+    bar
+}
+
+/// Format a non-negative duration in seconds compactly, e.g. `2d 3h`, `4h 12m`, `45m`, `30s`. Used
+/// by `meka account whoami` for the token time-to-expiry.
+pub(crate) fn format_duration_short(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let minutes = seconds / 60;
+    if minutes >= 24 * 60 {
+        format!("{}d {}h", minutes / (24 * 60), (minutes % (24 * 60)) / 60)
+    } else if minutes >= 60 {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    } else if minutes >= 1 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Format a reset instant (Unix seconds) as "relative, local clock", e.g. "in 4h 12m, 2026-07-02
+/// 02:10". Falls back to a plain clock when the timestamp is in the past or unparseable. Shared
+/// with the ACP `/usage` text builder.
+pub(crate) fn format_reset_time(epoch_seconds: i64) -> String {
+    let Some(when) = chrono::DateTime::from_timestamp(epoch_seconds, 0) else {
+        return "unknown".to_string();
+    };
+    let clock = when.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M");
+    let minutes = when.signed_duration_since(chrono::Utc::now()).num_minutes();
+    if minutes <= 0 {
+        return format!("now, {clock}");
+    }
+    let relative = if minutes >= 24 * 60 {
+        format!(
+            "in {}d {}h",
+            minutes / (24 * 60),
+            (minutes % (24 * 60)) / 60
+        )
+    } else if minutes >= 60 {
+        format!("in {}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("in {minutes}m")
+    };
+    format!("{relative}, {clock}")
+}
+
 /// Print a single-line CLI error to stderr in the project's standard format.
 pub fn render_error(error: &dyn std::fmt::Display) {
     eprintln!("{} {}", "Error:".with(Color::Red), error);
@@ -1165,6 +1298,55 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_duration_short() {
+        assert_eq!(format_duration_short(30), "30s");
+        assert_eq!(format_duration_short(90), "1m");
+        assert_eq!(format_duration_short(3600 + 12 * 60), "1h 12m");
+        assert_eq!(format_duration_short(2 * 86400 + 3 * 3600), "2d 3h");
+        assert_eq!(format_duration_short(-5), "0s");
+    }
+
+    #[test]
+    fn test_format_account_usage_is_ansi_free() {
+        let usage = crate::provider::AccountUsage {
+            windows: vec![crate::provider::UsageWindow {
+                label: "5-hour (session)".into(),
+                used_percent: 23.0,
+                resets_at: None,
+            }],
+            extra_usage: None,
+            note: None,
+        };
+        let out = format_account_usage(&usage);
+        assert!(
+            !out.contains('\u{1b}'),
+            "must be ANSI-free for piping: {out:?}"
+        );
+        // Disabled/empty extra usage adds no line.
+        assert!(!out.contains("Extra usage"), "got: {out:?}");
+    }
+
+    #[test]
+    fn test_format_account_usage_shows_enabled_extra_usage() {
+        let usage = crate::provider::AccountUsage {
+            windows: vec![],
+            extra_usage: Some(crate::provider::ExtraUsage {
+                enabled: true,
+                utilization: Some(70.0),
+                used: Some(3.5),
+                balance: Some(5.0),
+                currency: None,
+            }),
+            note: None,
+        };
+        let out = format_account_usage(&usage);
+        assert!(
+            out.contains("Extra usage: enabled · 70% used · $3.50 spent · $5.00 balance"),
+            "got: {out:?}"
+        );
+    }
 
     #[test]
     fn test_format_token_count_tiers() {

@@ -21,8 +21,9 @@ use self::{
 use crate::{
     error::{MekaError, Result},
     provider::{
-        AuthCredential, DEFAULT_OPENAI_CODEX_CLIENT_ID, Message, Provider, StopReason, StreamEvent,
-        TokenUsage, ToolDefinition,
+        AccountIdentity, AccountUsage, AuthCredential, DEFAULT_OPENAI_CODEX_CLIENT_ID, DailyUsage,
+        ExtraUsage, Message, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        UsageHistory, UsageWindow,
     },
     session::TokenStore,
 };
@@ -120,6 +121,60 @@ impl OpenAiCodexProvider {
         } else {
             format!("{}/backend-api/codex/responses", trimmed)
         }
+    }
+
+    /// URL of the ChatGPT-backend usage endpoint (`/wham/usage`), which lives under `/backend-api`
+    /// alongside the responses endpoint.
+    fn usage_url(&self) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        if trimmed.contains("/backend-api") {
+            format!("{}/wham/usage", trimmed)
+        } else {
+            format!("{}/backend-api/wham/usage", trimmed)
+        }
+    }
+
+    /// URL of the ChatGPT-backend token-usage-profile endpoint (`/wham/profiles/me`).
+    fn profiles_url(&self) -> String {
+        let trimmed = self.base_url.trim_end_matches('/');
+        if trimmed.contains("/backend-api") {
+            format!("{}/wham/profiles/me", trimmed)
+        } else {
+            format!("{}/backend-api/wham/profiles/me", trimmed)
+        }
+    }
+
+    /// GET `/wham/usage` and parse it. Shared by `fetch_usage` (rate-limit windows) and
+    /// `fetch_identity` (the `plan_type` field), which both read this one payload.
+    async fn fetch_wham_usage(&self) -> Result<CodexUsageResponse> {
+        let (bearer, account_id) = self.ensure_valid_credential().await?;
+        // Not `apply_headers`: that sets `Accept: text/event-stream` for the SSE responses call,
+        // but the usage endpoint returns plain JSON.
+        let mut request = self
+            .client
+            .get(self.usage_url())
+            .header("Authorization", format!("Bearer {}", bearer))
+            .header("originator", ORIGINATOR)
+            .header("User-Agent", &self.user_agent)
+            .header("Accept", "application/json");
+        if let Some(account_id) = account_id.as_deref() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            MekaError::Provider(format!(
+                "Codex usage request failed: {}",
+                crate::error::format_reqwest_error(&error)
+            ))
+        })?;
+        let status = response.status();
+        let response_text = response.text().await.map_err(|error| {
+            MekaError::Provider(format!("failed to read Codex usage response: {}", error))
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(status, &response_text));
+        }
+        serde_json::from_str(&response_text)
+            .map_err(|error| MekaError::Provider(format!("invalid Codex usage JSON: {}", error)))
     }
 
     /// Returns `(bearer_token, account_id)`, refreshing the access token first if it's within 5
@@ -363,6 +418,247 @@ impl Provider for OpenAiCodexProvider {
     fn name(&self) -> &str {
         "openai-codex"
     }
+
+    async fn fetch_usage(&self) -> Result<Option<AccountUsage>> {
+        Ok(Some(self.fetch_wham_usage().await?.into_account_usage()))
+    }
+
+    async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
+        let (bearer, account_id) = self.ensure_valid_credential().await?;
+        let mut request = self
+            .client
+            .get(self.profiles_url())
+            .header("Authorization", format!("Bearer {}", bearer))
+            .header("originator", ORIGINATOR)
+            .header("User-Agent", &self.user_agent)
+            .header("Accept", "application/json");
+        if let Some(account_id) = account_id.as_deref() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let response = request.send().await.map_err(|error| {
+            MekaError::Provider(format!(
+                "Codex profile request failed: {}",
+                crate::error::format_reqwest_error(&error)
+            ))
+        })?;
+        let status = response.status();
+        let text = response.text().await.map_err(|error| {
+            MekaError::Provider(format!("failed to read Codex profile response: {}", error))
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(status, &text));
+        }
+        let parsed: CodexProfileResponse = serde_json::from_str(&text).map_err(|error| {
+            MekaError::Provider(format!("invalid Codex profile JSON: {}", error))
+        })?;
+        Ok(Some(parsed.into_history()))
+    }
+
+    async fn fetch_identity(&self) -> Result<Option<AccountIdentity>> {
+        // The plan is the one identity field the usage payload carries; name/org/role need
+        // `accounts/check` (a documented follow-up), so leave them `None` for now.
+        let plan = self.fetch_wham_usage().await?.plan_type;
+        Ok(Some(AccountIdentity {
+            display_name: None,
+            email: None,
+            plan,
+            tier: None,
+            subscription_status: None,
+            organization: None,
+            role: None,
+        }))
+    }
+}
+
+/// Subset of the ChatGPT backend `GET /wham/usage` body that we render. Mirrors the fields the
+/// Codex CLI reads (`RateLimitStatusPayload`), tolerant of absent/null buckets.
+#[derive(Deserialize)]
+struct CodexUsageResponse {
+    #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<CodexRateLimit>,
+    #[serde(default)]
+    credits: Option<CodexCredits>,
+    #[serde(default)]
+    spend_control: Option<CodexSpendControl>,
+}
+
+#[derive(Deserialize)]
+struct CodexRateLimit {
+    #[serde(default)]
+    primary_window: Option<CodexWindow>,
+    #[serde(default)]
+    secondary_window: Option<CodexWindow>,
+}
+
+#[derive(Deserialize)]
+struct CodexWindow {
+    used_percent: f64,
+    #[serde(default)]
+    limit_window_seconds: Option<i64>,
+    #[serde(default)]
+    reset_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CodexCredits {
+    #[serde(default)]
+    has_credits: Option<bool>,
+    /// Dollar string, e.g. `"9.99"` or `"$9.99"`.
+    #[serde(default)]
+    balance: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexSpendControl {
+    #[serde(default)]
+    individual_limit: Option<CodexIndividualLimit>,
+}
+
+#[derive(Deserialize)]
+struct CodexIndividualLimit {
+    /// Dollar string of the amount spent against the cap.
+    #[serde(default)]
+    used: Option<String>,
+    #[serde(default)]
+    used_percent: Option<f64>,
+}
+
+impl CodexUsageResponse {
+    fn into_account_usage(self) -> AccountUsage {
+        let mut windows = Vec::new();
+        if let Some(rate_limit) = self.rate_limit {
+            push_codex_window(&mut windows, rate_limit.primary_window, "Primary");
+            push_codex_window(&mut windows, rate_limit.secondary_window, "Secondary");
+        }
+        let note = self
+            .plan_type
+            .filter(|plan| !plan.is_empty())
+            .map(|plan| format!("plan: {plan}"));
+        AccountUsage {
+            windows,
+            extra_usage: codex_extra_usage(self.credits, self.spend_control),
+            note,
+        }
+    }
+}
+
+/// Parse a dollar string like `"$9.99"` / `"9.99"` / `"1,234.50"` into an `f64`.
+fn parse_dollars(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .trim_start_matches('$')
+        .replace(',', "")
+        .parse::<f64>()
+        .ok()
+}
+
+/// Normalize Codex's `credits` + `spend_control` blocks into [`ExtraUsage`].
+fn codex_extra_usage(
+    credits: Option<CodexCredits>,
+    spend_control: Option<CodexSpendControl>,
+) -> Option<ExtraUsage> {
+    if credits.is_none() && spend_control.is_none() {
+        return None;
+    }
+    let (enabled, balance) = match credits {
+        Some(credits) => (
+            credits.has_credits.unwrap_or(false),
+            credits.balance.as_deref().and_then(parse_dollars),
+        ),
+        None => (false, None),
+    };
+    let (used, utilization) = match spend_control.and_then(|control| control.individual_limit) {
+        Some(limit) => (
+            limit.used.as_deref().and_then(parse_dollars),
+            limit.used_percent,
+        ),
+        None => (None, None),
+    };
+    Some(ExtraUsage {
+        enabled,
+        utilization,
+        used,
+        balance,
+        currency: None,
+    })
+}
+
+fn push_codex_window(windows: &mut Vec<UsageWindow>, window: Option<CodexWindow>, fallback: &str) {
+    if let Some(window) = window {
+        windows.push(UsageWindow {
+            label: codex_window_label(window.limit_window_seconds, fallback),
+            used_percent: window.used_percent,
+            resets_at: window.reset_at,
+        });
+    }
+}
+
+/// Subset of Codex's `GET /wham/profiles/me` body (`TokenUsageProfile`).
+#[derive(Deserialize)]
+struct CodexProfileResponse {
+    #[serde(default)]
+    stats: Option<CodexProfileStats>,
+}
+
+#[derive(Deserialize)]
+struct CodexProfileStats {
+    #[serde(default)]
+    lifetime_tokens: Option<i64>,
+    #[serde(default)]
+    peak_daily_tokens: Option<i64>,
+    #[serde(default)]
+    current_streak_days: Option<i64>,
+    #[serde(default)]
+    longest_streak_days: Option<i64>,
+    #[serde(default)]
+    daily_usage_buckets: Vec<CodexDailyBucket>,
+}
+
+#[derive(Deserialize)]
+struct CodexDailyBucket {
+    start_date: String,
+    tokens: i64,
+}
+
+impl CodexProfileResponse {
+    fn into_history(self) -> UsageHistory {
+        let stats = self.stats;
+        UsageHistory {
+            lifetime_tokens: stats.as_ref().and_then(|s| s.lifetime_tokens),
+            peak_daily_tokens: stats.as_ref().and_then(|s| s.peak_daily_tokens),
+            current_streak_days: stats.as_ref().and_then(|s| s.current_streak_days),
+            longest_streak_days: stats.as_ref().and_then(|s| s.longest_streak_days),
+            first_used: None,
+            daily: stats
+                .map(|s| {
+                    s.daily_usage_buckets
+                        .into_iter()
+                        .map(|bucket| DailyUsage {
+                            date: bucket.start_date,
+                            tokens: bucket.tokens,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Human label for a window from its duration (seconds). Common durations get friendly names; the
+/// rest fall back to the primary/secondary position label.
+fn codex_window_label(limit_window_seconds: Option<i64>, fallback: &str) -> String {
+    let Some(minutes) = limit_window_seconds.map(|seconds| seconds / 60) else {
+        return fallback.to_string();
+    };
+    match minutes {
+        300 => "5-hour".to_string(),
+        m if m == 7 * 24 * 60 => "Weekly".to_string(),
+        m if m % (24 * 60) == 0 => format!("{}-day", m / (24 * 60)),
+        m if m % 60 == 0 => format!("{}-hour", m / 60),
+        m => format!("{m}-min"),
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +693,94 @@ mod tests {
     #[test]
     fn test_provider_name() {
         assert_eq!(test_provider().name(), "openai-codex");
+    }
+
+    #[test]
+    fn test_usage_url_default_appends_backend_api_wham() {
+        assert_eq!(
+            test_provider().usage_url(),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+    }
+
+    #[test]
+    fn test_codex_usage_maps_windows_and_note() {
+        // Shaped like the ChatGPT-backend `/wham/usage` body (RateLimitStatusPayload).
+        let body = r#"{
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {"used_percent": 42, "limit_window_seconds": 18000, "reset_at": 123},
+                "secondary_window": {"used_percent": 84, "limit_window_seconds": 604800, "reset_at": 456}
+            },
+            "credits": {"has_credits": true, "unlimited": false, "balance": "9.99"}
+        }"#;
+        let usage = serde_json::from_str::<CodexUsageResponse>(body)
+            .expect("parse")
+            .into_account_usage();
+        assert_eq!(usage.windows.len(), 2);
+        // 18000s = 300min -> 5-hour; 604800s = 10080min -> Weekly.
+        assert_eq!(usage.windows[0].label, "5-hour");
+        assert_eq!(usage.windows[0].used_percent, 42.0);
+        assert_eq!(usage.windows[0].resets_at, Some(123));
+        assert_eq!(usage.windows[1].label, "Weekly");
+        // Plan stays in the note; credits move to extra_usage.
+        assert_eq!(usage.note.as_deref(), Some("plan: plus"));
+        let extra = usage.extra_usage.expect("extra_usage");
+        assert!(extra.enabled);
+        assert_eq!(extra.balance, Some(9.99));
+    }
+
+    #[test]
+    fn test_codex_extra_usage_parses_spend_control() {
+        let body = r#"{
+            "plan_type": "pro",
+            "credits": {"has_credits": true, "unlimited": false, "balance": "$5.00"},
+            "spend_control": {"individual_limit": {"used": "$3.50", "used_percent": 70}}
+        }"#;
+        let extra = serde_json::from_str::<CodexUsageResponse>(body)
+            .unwrap()
+            .into_account_usage()
+            .extra_usage
+            .expect("extra_usage");
+        assert!(extra.enabled);
+        assert_eq!(extra.balance, Some(5.0));
+        assert_eq!(extra.used, Some(3.5));
+        assert_eq!(extra.utilization, Some(70.0));
+    }
+
+    #[test]
+    fn test_codex_profile_maps_history() {
+        let body = r#"{
+            "stats": {
+                "lifetime_tokens": 1200000,
+                "peak_daily_tokens": 45000,
+                "current_streak_days": 3,
+                "longest_streak_days": 12,
+                "daily_usage_buckets": [
+                    {"start_date": "2026-06-30", "tokens": 8100},
+                    {"start_date": "2026-07-01", "tokens": 12300}
+                ]
+            }
+        }"#;
+        let history = serde_json::from_str::<CodexProfileResponse>(body)
+            .unwrap()
+            .into_history();
+        assert_eq!(history.lifetime_tokens, Some(1_200_000));
+        assert_eq!(history.current_streak_days, Some(3));
+        assert_eq!(history.daily.len(), 2);
+        assert_eq!(history.daily[1].date, "2026-07-01");
+        assert_eq!(history.daily[1].tokens, 12300);
+    }
+
+    #[test]
+    fn test_codex_usage_empty_rate_limit_is_no_windows() {
+        let usage = serde_json::from_str::<CodexUsageResponse>(r#"{"plan_type": "pro"}"#)
+            .unwrap()
+            .into_account_usage();
+        assert!(usage.windows.is_empty());
+        assert_eq!(usage.note.as_deref(), Some("plan: pro"));
     }
 
     #[test]

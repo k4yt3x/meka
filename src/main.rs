@@ -123,6 +123,9 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 }
                 cli::Command::Tools { action } => run_tools_subcommand(action, cli_ref).await,
                 cli::Command::Skill { action } => run_skill_subcommand(action).await,
+                cli::Command::Account { action } => {
+                    run_account_subcommand(&session_manager, action).await
+                }
                 cli::Command::Acp | cli::Command::Serve { .. } => {
                     unreachable!("Acp / Serve route through async_main above");
                 }
@@ -1246,6 +1249,13 @@ async fn run_interactive(
                             context_window,
                         );
                     }
+                    repl::SlashCommand::Usage => match agent.fetch_usage().await {
+                        Ok(Some(usage)) => render::render_account_usage(&usage),
+                        Ok(None) => {
+                            render::render_hint("Account usage isn't available for this provider.")
+                        }
+                        Err(error) => render::render_error(&error),
+                    },
                     repl::SlashCommand::History(limit) => {
                         let materialised = messages.as_slice();
                         let slice = match limit {
@@ -1562,6 +1572,253 @@ async fn run_skill_subcommand(action: &cli::SkillAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Local (no-network) auth status for a stored credential: is the token valid, and when does it
+/// expire. Serialized as the `auth` block of `meka account whoami --format json`.
+#[derive(serde::Serialize)]
+struct AuthStatus {
+    valid: bool,
+    /// Token expiry as Unix seconds (`None` for API keys / no expiry).
+    expires_at: Option<i64>,
+    /// Seconds until expiry (negative if already expired).
+    expires_in_seconds: Option<i64>,
+}
+
+impl AuthStatus {
+    fn from_credential(credential: &AuthCredential) -> Self {
+        match credential {
+            AuthCredential::OAuthToken { expires_at, .. } => {
+                // `expires_at` is stored as epoch milliseconds.
+                let expires_at = expires_at.map(|millis| millis / 1000);
+                let expires_in_seconds =
+                    expires_at.map(|secs| secs - chrono::Utc::now().timestamp());
+                AuthStatus {
+                    valid: expires_in_seconds.is_none_or(|remaining| remaining > 0),
+                    expires_at,
+                    expires_in_seconds,
+                }
+            }
+            AuthCredential::ApiKey(_) => AuthStatus {
+                valid: true,
+                expires_at: None,
+                expires_in_seconds: None,
+            },
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct UsageOutput<'a> {
+    provider: &'a str,
+    #[serde(flatten)]
+    usage: &'a crate::provider::AccountUsage,
+}
+
+#[derive(serde::Serialize)]
+struct WhoamiOutput<'a> {
+    provider: &'a str,
+    backend: &'a str,
+    auth: AuthStatus,
+    identity: Option<crate::provider::AccountIdentity>,
+}
+
+/// `meka account { usage, whoami }`: resolve a profile, build just that provider (no agent/MCP/
+/// session), fetch the requested info, and print it (plain to stdout, or JSON). Requested data goes
+/// to stdout; the "not available" / error notes go to stderr, so `… 2>/dev/null | jq` stays clean.
+async fn run_account_subcommand(
+    session_manager: &SessionManager,
+    action: &cli::AccountAction,
+) -> anyhow::Result<()> {
+    let (profile_arg, format) = match action {
+        cli::AccountAction::Usage { profile, format } => (profile.clone(), *format),
+        cli::AccountAction::Whoami { profile, format } => (profile.clone(), *format),
+        cli::AccountAction::Stats { profile, format } => (profile.clone(), *format),
+    };
+
+    let token_store = session_manager.token_store();
+    let config_file = config::load_config_file();
+    let requested = profile_arg.or_else(|| config_file.default_provider.clone());
+    let (name, error) = config::select_active_profile(requested, &config_file.providers);
+    let name = name.ok_or_else(|| {
+        anyhow::anyhow!(error.unwrap_or_else(|| "no provider configured".to_string()))
+    })?;
+    let profile = config_file
+        .providers
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("provider profile '{}' not found", name))?;
+    let credential = token_store
+        .load_provider_credential(&name)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no stored credential for profile '{}'. Run `meka provider login {}`.",
+                name,
+                name
+            )
+        })?;
+
+    let provider = ProviderBuilder::new(
+        profile.backend.clone(),
+        credential.clone(),
+        profile.model.clone().unwrap_or_default(),
+    )
+    .base_url(profile.base_url.clone())
+    .client_id(profile.client_id.clone())
+    .oauth_token_url(profile.oauth_token_url.clone())
+    .credential_key(Some(name.clone()))
+    .token_store(Some(std::sync::Arc::new(session_manager.token_store())))
+    .build()?;
+
+    match action {
+        cli::AccountAction::Usage { .. } => match provider.fetch_usage().await? {
+            Some(usage) => match format {
+                cli::OutputFormat::Plain => {
+                    print!("{}", render::format_account_usage(&usage));
+                }
+                cli::OutputFormat::Json => {
+                    let out = UsageOutput {
+                        provider: &name,
+                        usage: &usage,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+            },
+            None => {
+                eprintln!("Account usage isn't available for provider '{}'.", name);
+                std::process::exit(1);
+            }
+        },
+        cli::AccountAction::Whoami { .. } => {
+            // The identity call may refresh + rotate the token; re-read afterwards so the auth
+            // block reflects the current expiry. A failed identity fetch (e.g. re-login needed)
+            // still prints the local auth status so scripts can detect it.
+            let identity = provider.fetch_identity().await;
+            let fresh = session_manager
+                .token_store()
+                .load_provider_credential(&name)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(credential);
+            let auth = AuthStatus::from_credential(&fresh);
+            let identity = match identity {
+                Ok(identity) => identity,
+                Err(error) => {
+                    eprintln!("warning: could not fetch identity: {}", error);
+                    None
+                }
+            };
+            let out = WhoamiOutput {
+                provider: &name,
+                backend: &profile.backend,
+                auth,
+                identity,
+            };
+            match format {
+                cli::OutputFormat::Plain => print!("{}", format_whoami_plain(&out)),
+                cli::OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&out)?),
+            }
+            if !out.auth.valid {
+                std::process::exit(1);
+            }
+        }
+        cli::AccountAction::Stats { .. } => match provider.fetch_history().await? {
+            Some(history) => {
+                let out = StatsOutput {
+                    provider: &name,
+                    history: &history,
+                };
+                match format {
+                    cli::OutputFormat::Plain => print!("{}", format_stats_plain(&out)),
+                    cli::OutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&out)?)
+                    }
+                }
+            }
+            None => {
+                eprintln!("Account history isn't available for provider '{}'.", name);
+                std::process::exit(1);
+            }
+        },
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct StatsOutput<'a> {
+    provider: &'a str,
+    #[serde(flatten)]
+    history: &'a crate::provider::UsageHistory,
+}
+
+/// Plain-text (ANSI-free) rendering of `meka account stats`.
+fn format_stats_plain(out: &StatsOutput<'_>) -> String {
+    use std::fmt::Write as _;
+    let history = out.history;
+    let mut text = format!("Account history: {}\n", out.provider);
+    let row_tokens = |text: &mut String, label: &str, value: Option<i64>| {
+        if let Some(value) = value {
+            let _ = writeln!(
+                text,
+                "  {label:<18} {}",
+                render::format_token_count(value.max(0) as u64)
+            );
+        }
+    };
+    let row_days = |text: &mut String, label: &str, value: Option<i64>| {
+        if let Some(value) = value {
+            let _ = writeln!(text, "  {label:<18} {value} days");
+        }
+    };
+    if let Some(first) = &history.first_used {
+        // Trim an RFC 3339 timestamp to just the date for the human view.
+        let date = first.split('T').next().unwrap_or(first);
+        let _ = writeln!(text, "  {:<18} {date}", "First used:");
+    }
+    row_tokens(&mut text, "Lifetime tokens:", history.lifetime_tokens);
+    row_tokens(&mut text, "Peak daily:", history.peak_daily_tokens);
+    row_days(&mut text, "Current streak:", history.current_streak_days);
+    row_days(&mut text, "Longest streak:", history.longest_streak_days);
+    if !history.daily.is_empty() {
+        let _ = writeln!(text, "  Recent:");
+        for day in history.daily.iter().rev().take(7) {
+            let _ = writeln!(
+                text,
+                "    {}  {}",
+                day.date,
+                render::format_token_count(day.tokens.max(0) as u64)
+            );
+        }
+    }
+    text
+}
+
+/// Plain-text (ANSI-free) rendering of `meka account whoami`.
+fn format_whoami_plain(out: &WhoamiOutput<'_>) -> String {
+    use std::fmt::Write as _;
+    let mut text = format!("Account: {} ({})\n", out.provider, out.backend);
+    let auth = match (out.auth.valid, out.auth.expires_in_seconds) {
+        (true, Some(secs)) => format!("valid ({})", render::format_duration_short(secs.max(0))),
+        (true, None) => "valid".to_string(),
+        (false, _) => "EXPIRED — run `meka provider login`".to_string(),
+    };
+    let _ = writeln!(text, "  Auth:          {auth}");
+    if let Some(identity) = &out.identity {
+        let row = |text: &mut String, label: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                let _ = writeln!(text, "  {label:<14} {value}");
+            }
+        };
+        row(&mut text, "Name:", &identity.display_name);
+        row(&mut text, "Email:", &identity.email);
+        row(&mut text, "Plan:", &identity.plan);
+        row(&mut text, "Tier:", &identity.tier);
+        row(&mut text, "Subscription:", &identity.subscription_status);
+        row(&mut text, "Organization:", &identity.organization);
+        row(&mut text, "Role:", &identity.role);
+    }
+    text
 }
 
 async fn run_session_subcommand(
@@ -1967,6 +2224,34 @@ async fn load_session_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_auth_status_from_credential() {
+        let future = AuthCredential::OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            // 1 hour out, in epoch millis.
+            expires_at: Some((chrono::Utc::now().timestamp() + 3600) * 1000),
+            account_id: None,
+        };
+        let status = AuthStatus::from_credential(&future);
+        assert!(status.valid);
+        assert!(status.expires_in_seconds.unwrap() > 3000);
+
+        let expired = AuthCredential::OAuthToken {
+            access_token: "t".into(),
+            refresh_token: None,
+            expires_at: Some((chrono::Utc::now().timestamp() - 60) * 1000),
+            account_id: None,
+        };
+        assert!(!AuthStatus::from_credential(&expired).valid);
+
+        // API keys never expire.
+        let api = AuthCredential::ApiKey("k".into());
+        let status = AuthStatus::from_credential(&api);
+        assert!(status.valid);
+        assert_eq!(status.expires_at, None);
+    }
 
     fn user_msg(text: &str) -> provider::Message {
         provider::Message::user(text)

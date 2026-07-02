@@ -23,8 +23,9 @@ use super::shared::{
 use crate::{
     error::{MekaError, Result},
     provider::{
-        AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, Message, Notice, Provider, StopReason,
-        StreamEvent, TokenUsage, ToolDefinition,
+        AccountIdentity, AccountUsage, AuthCredential, DEFAULT_CLAUDE_CLIENT_ID, ExtraUsage,
+        Message, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        UsageHistory, UsageWindow,
     },
     session::TokenStore,
 };
@@ -576,6 +577,314 @@ impl Provider for ClaudeOAuthProvider {
         };
         self.thinking_override.store(value, Ordering::Relaxed);
     }
+
+    async fn fetch_usage(&self) -> Result<Option<AccountUsage>> {
+        let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
+        // Reuse the full Claude Code header set; the `oauth-2025-04-20` beta is what unlocks the
+        // usage endpoint for OAuth tokens.
+        let request = attestation::apply_headers(
+            self.client
+                .get(format!("{}/api/oauth/usage", self.base_url)),
+            auth_header_name,
+            &auth_header_value,
+            &self.session_id,
+            Some("oauth-2025-04-20"),
+        );
+        let response = request.send().await.map_err(|error| {
+            MekaError::Provider(format!(
+                "usage request failed: {}",
+                crate::error::format_reqwest_error(&error),
+            ))
+        })?;
+        let status = response.status();
+        let response_text = response.text().await.map_err(|error| {
+            MekaError::Provider(format!("failed to read usage response: {}", error))
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(status, &response_text));
+        }
+        let parsed: OAuthUsageResponse = serde_json::from_str(&response_text)
+            .map_err(|error| MekaError::Provider(format!("invalid usage JSON: {}", error)))?;
+        Ok(Some(parsed.into_account_usage()))
+    }
+
+    async fn fetch_identity(&self) -> Result<Option<AccountIdentity>> {
+        let (auth_name, auth_value) = self.ensure_valid_credential().await?;
+
+        // Required: the profile (identity + plan/tier/org).
+        let profile_text = {
+            let request = attestation::apply_headers(
+                self.client
+                    .get(format!("{}/api/oauth/profile", self.base_url)),
+                auth_name,
+                &auth_value,
+                &self.session_id,
+                Some("oauth-2025-04-20"),
+            );
+            let response = request.send().await.map_err(|error| {
+                MekaError::Provider(format!(
+                    "profile request failed: {}",
+                    crate::error::format_reqwest_error(&error),
+                ))
+            })?;
+            let status = response.status();
+            let text = response.text().await.map_err(|error| {
+                MekaError::Provider(format!("failed to read profile response: {}", error))
+            })?;
+            if !status.is_success() {
+                return Err(crate::error::provider_http_error(status, &text));
+            }
+            text
+        };
+        let profile: OAuthProfileResponse = serde_json::from_str(&profile_text)
+            .map_err(|error| MekaError::Provider(format!("invalid profile JSON: {}", error)))?;
+
+        // Best-effort: the org/workspace role. A failure here (missing scope, network) must not
+        // sink the whole command, so any error degrades `role` to `None`.
+        let role = {
+            let request = attestation::apply_headers(
+                self.client
+                    .get(format!("{}/api/oauth/claude_cli/roles", self.base_url)),
+                auth_name,
+                &auth_value,
+                &self.session_id,
+                Some("oauth-2025-04-20"),
+            );
+            match request.send().await {
+                Ok(response) if response.status().is_success() => response
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<OAuthRolesResponse>(&text).ok())
+                    .and_then(|roles| roles.organization_role),
+                _ => None,
+            }
+        };
+
+        Ok(Some(profile.into_identity(role)))
+    }
+
+    async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
+        // Anthropic exposes only a first-used date, not the rich Codex-style stats.
+        let (auth_name, auth_value) = self.ensure_valid_credential().await?;
+        let request = attestation::apply_headers(
+            self.client.get(format!(
+                "{}/api/organization/claude_code_first_token_date",
+                self.base_url
+            )),
+            auth_name,
+            &auth_value,
+            &self.session_id,
+            Some("oauth-2025-04-20"),
+        );
+        let response = request.send().await.map_err(|error| {
+            MekaError::Provider(format!(
+                "history request failed: {}",
+                crate::error::format_reqwest_error(&error),
+            ))
+        })?;
+        let status = response.status();
+        let text = response.text().await.map_err(|error| {
+            MekaError::Provider(format!("failed to read history response: {}", error))
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(status, &text));
+        }
+        #[derive(Deserialize)]
+        struct FirstTokenDate {
+            first_token_date: Option<String>,
+        }
+        let parsed: FirstTokenDate = serde_json::from_str(&text)
+            .map_err(|error| MekaError::Provider(format!("invalid history JSON: {}", error)))?;
+        Ok(Some(UsageHistory {
+            lifetime_tokens: None,
+            peak_daily_tokens: None,
+            current_streak_days: None,
+            longest_streak_days: None,
+            first_used: parsed.first_token_date,
+            daily: Vec::new(),
+        }))
+    }
+}
+
+/// Subset of Anthropic's `GET /api/oauth/usage` body that we render. The live response carries many
+/// more (feature-flagged, mostly-null) buckets plus a newer `limits[]` array; we deserialize only
+/// the stable flat windows and ignore the rest.
+#[derive(Deserialize)]
+struct OAuthUsageResponse {
+    five_hour: Option<OAuthRateLimit>,
+    seven_day: Option<OAuthRateLimit>,
+    seven_day_opus: Option<OAuthRateLimit>,
+    seven_day_sonnet: Option<OAuthRateLimit>,
+    extra_usage: Option<OAuthExtraUsage>,
+    spend: Option<OAuthSpend>,
+}
+
+#[derive(Deserialize)]
+struct OAuthRateLimit {
+    /// Percentage of the window consumed, `0.0..=100.0`.
+    utilization: Option<f64>,
+    /// RFC 3339 timestamp of the next reset.
+    resets_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OAuthExtraUsage {
+    is_enabled: Option<bool>,
+    utilization: Option<f64>,
+    currency: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OAuthSpend {
+    enabled: Option<bool>,
+    used: Option<OAuthSpendUsed>,
+    /// Remaining balance in the account currency, if the provider reports one.
+    balance: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct OAuthSpendUsed {
+    amount_minor: Option<i64>,
+    currency: Option<String>,
+    /// Decimal places: `amount_minor / 10^exponent` is the major-unit amount.
+    exponent: Option<i32>,
+}
+
+impl OAuthUsageResponse {
+    fn into_account_usage(self) -> AccountUsage {
+        let mut windows = Vec::new();
+        push_oauth_window(&mut windows, "5-hour (session)", self.five_hour);
+        push_oauth_window(&mut windows, "Weekly", self.seven_day);
+        push_oauth_window(&mut windows, "Weekly (Opus)", self.seven_day_opus);
+        push_oauth_window(&mut windows, "Weekly (Sonnet)", self.seven_day_sonnet);
+        AccountUsage {
+            windows,
+            extra_usage: oauth_extra_usage(self.extra_usage, self.spend),
+            note: None,
+        }
+    }
+}
+
+/// Normalize Anthropic's `extra_usage` + `spend` blocks into [`ExtraUsage`]. Present whenever
+/// either block is; `used` is derived from `spend.used.amount_minor / 10^exponent`.
+fn oauth_extra_usage(
+    extra_usage: Option<OAuthExtraUsage>,
+    spend: Option<OAuthSpend>,
+) -> Option<ExtraUsage> {
+    if extra_usage.is_none() && spend.is_none() {
+        return None;
+    }
+    let extra_usage = extra_usage.unwrap_or(OAuthExtraUsage {
+        is_enabled: None,
+        utilization: None,
+        currency: None,
+    });
+    let (spend_enabled, used, spend_currency, balance) = match spend {
+        Some(spend) => {
+            let (used, currency) = match spend.used {
+                Some(used) => {
+                    let exponent = used.exponent.unwrap_or(2).max(0);
+                    let amount = used
+                        .amount_minor
+                        .map(|minor| minor as f64 / 10f64.powi(exponent));
+                    (amount, used.currency)
+                }
+                None => (None, None),
+            };
+            (
+                spend.enabled.unwrap_or(false),
+                used,
+                currency,
+                spend.balance,
+            )
+        }
+        None => (false, None, None, None),
+    };
+    Some(ExtraUsage {
+        enabled: extra_usage.is_enabled.unwrap_or(false) || spend_enabled,
+        utilization: extra_usage.utilization,
+        used,
+        balance,
+        currency: spend_currency.or(extra_usage.currency),
+    })
+}
+
+/// Append a window iff the bucket is present and carries a utilization figure. `resets_at` is
+/// parsed from RFC 3339 into Unix seconds; an unparseable value degrades to `None`, not an error.
+fn push_oauth_window(windows: &mut Vec<UsageWindow>, label: &str, limit: Option<OAuthRateLimit>) {
+    if let Some(limit) = limit
+        && let Some(used_percent) = limit.utilization
+    {
+        let resets_at = limit
+            .resets_at
+            .as_deref()
+            .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+            .map(|dt| dt.timestamp());
+        windows.push(UsageWindow {
+            label: label.to_string(),
+            used_percent,
+            resets_at,
+        });
+    }
+}
+
+/// Subset of `GET /api/oauth/profile` we render. Verified live against a `claude_max` account.
+#[derive(Deserialize)]
+struct OAuthProfileResponse {
+    account: Option<OAuthProfileAccount>,
+    organization: Option<OAuthProfileOrg>,
+}
+
+#[derive(Deserialize)]
+struct OAuthProfileAccount {
+    display_name: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OAuthProfileOrg {
+    name: Option<String>,
+    /// e.g. `claude_max` / `claude_pro` / `claude_enterprise`.
+    organization_type: Option<String>,
+    /// e.g. `default_claude_max_20x`.
+    rate_limit_tier: Option<String>,
+    subscription_status: Option<String>,
+}
+
+/// Subset of `GET /api/oauth/claude_cli/roles`.
+#[derive(Deserialize)]
+struct OAuthRolesResponse {
+    organization_role: Option<String>,
+}
+
+impl OAuthProfileResponse {
+    fn into_identity(self, role: Option<String>) -> AccountIdentity {
+        let (display_name, email) = self
+            .account
+            .map(|account| (account.display_name, account.email))
+            .unwrap_or((None, None));
+        let (organization, plan, tier, subscription_status) = self
+            .organization
+            .map(|org| {
+                (
+                    org.name,
+                    org.organization_type,
+                    org.rate_limit_tier,
+                    org.subscription_status,
+                )
+            })
+            .unwrap_or((None, None, None, None));
+        AccountIdentity {
+            display_name,
+            email,
+            plan,
+            tier,
+            subscription_status,
+            organization,
+            role,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -977,6 +1286,83 @@ mod tests {
         assert_eq!(parsed["account_uuid"], "");
         let session_id = parsed["session_id"].as_str().unwrap();
         assert!(Uuid::parse_str(session_id).is_ok(), "{}", session_id);
+    }
+
+    #[test]
+    fn test_oauth_profile_maps_identity() {
+        // Trimmed from the live-verified `GET /api/oauth/profile` body.
+        let body = r#"{
+            "account": {"display_name": "Alice", "email": "a@example.com", "has_claude_max": true},
+            "organization": {"name": "Acme", "organization_type": "claude_max",
+                             "rate_limit_tier": "default_claude_max_20x",
+                             "subscription_status": "active"}
+        }"#;
+        let identity = serde_json::from_str::<OAuthProfileResponse>(body)
+            .expect("parse")
+            .into_identity(Some("admin".to_string()));
+        assert_eq!(identity.display_name.as_deref(), Some("Alice"));
+        assert_eq!(identity.email.as_deref(), Some("a@example.com"));
+        assert_eq!(identity.plan.as_deref(), Some("claude_max"));
+        assert_eq!(identity.tier.as_deref(), Some("default_claude_max_20x"));
+        assert_eq!(identity.subscription_status.as_deref(), Some("active"));
+        assert_eq!(identity.organization.as_deref(), Some("Acme"));
+        assert_eq!(identity.role.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn test_oauth_profile_tolerates_missing_fields() {
+        let identity = serde_json::from_str::<OAuthProfileResponse>(r#"{"account": {}}"#)
+            .unwrap()
+            .into_identity(None);
+        assert_eq!(identity.display_name, None);
+        assert_eq!(identity.plan, None);
+        assert_eq!(identity.role, None);
+    }
+
+    #[test]
+    fn test_oauth_usage_maps_windows() {
+        // Trimmed from a real `GET /api/oauth/usage` body: flat windows plus null/extra buckets we
+        // must tolerate.
+        let body = r#"{
+            "five_hour": {"utilization": 8.0, "resets_at": "2026-07-02T02:10:00.621901+00:00"},
+            "seven_day": {"utilization": 2.0, "resets_at": "2026-07-02T13:00:00.621920+00:00"},
+            "seven_day_opus": null,
+            "seven_day_sonnet": null,
+            "extra_usage": {"is_enabled": false},
+            "limits": [{"kind": "session", "percent": 8}]
+        }"#;
+        let parsed: OAuthUsageResponse = serde_json::from_str(body).expect("parse usage");
+        let usage = parsed.into_account_usage();
+        assert_eq!(usage.windows.len(), 2);
+        assert_eq!(usage.windows[0].label, "5-hour (session)");
+        assert_eq!(usage.windows[0].used_percent, 8.0);
+        assert_eq!(usage.windows[1].label, "Weekly");
+        assert_eq!(usage.windows[1].used_percent, 2.0);
+        // RFC 3339 with fractional seconds + offset parses to Unix seconds.
+        assert_eq!(
+            usage.windows[0].resets_at,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-07-02T02:10:00.621901+00:00")
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+    }
+
+    #[test]
+    fn test_oauth_usage_includes_opus_when_present() {
+        let body = r#"{
+            "five_hour": {"utilization": 10.0, "resets_at": null},
+            "seven_day": {"utilization": 5.0, "resets_at": null},
+            "seven_day_opus": {"utilization": 42.0, "resets_at": null}
+        }"#;
+        let usage = serde_json::from_str::<OAuthUsageResponse>(body)
+            .unwrap()
+            .into_account_usage();
+        assert_eq!(usage.windows.len(), 3);
+        assert_eq!(usage.windows[2].label, "Weekly (Opus)");
+        assert_eq!(usage.windows[2].used_percent, 42.0);
+        assert_eq!(usage.windows[0].resets_at, None);
     }
 
     #[test]

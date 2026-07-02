@@ -336,6 +336,12 @@ impl Agent {
         )
     }
 
+    /// Fetch the account's rate-limit usage from the active provider, for the `/usage` command.
+    /// `Ok(None)` when the provider has no per-account usage endpoint.
+    pub async fn fetch_usage(&self) -> Result<Option<crate::provider::AccountUsage>> {
+        self.provider.fetch_usage().await
+    }
+
     /// Point this agent's live context counter at an externally-owned atomic so the REPL prompt
     /// (constructed before the agent) can read the same value the agent writes after each turn.
     /// Safe to call only before the first turn; the primary REPL path uses it, sub-agents don't.

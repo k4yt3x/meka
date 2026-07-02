@@ -116,6 +116,7 @@ meka supports `/` prefix commands for controlling the shell:
 | `/mcp logout <server>` | Revoke cached credentials for a server |
 | `/mcp <server>:<prompt> [args...]` | Render a server-defined prompt and send it to the agent |
 | `/status` | Show session stats: live context-window usage, plus cumulative turns, tokens, cache hit ratio, redactions, message count |
+| `/usage` | Show the account's rate-limit usage (subscription providers): session/weekly windows, percent used, reset times |
 | `/history [N]` | Reprint past conversation styled like the live REPL. Bare `/history` dumps everything; `/history N` shows the last `N` turns |
 
 Press **Tab** after typing `/` to open a completion menu of command names, each shown with its description; keep typing to narrow it (`/comp` + Tab completes to `/compact`). Tab also completes arguments: permission levels for `/permission`, installed skill names for `/skill`, the subcommands and configured servers for `/mcp`, and directory paths for `/cd` (Tab again after a completed directory drills into its subdirectories). The leading command token is colored as you type: an accent color when it names a known command, an error color when it does not.
@@ -147,6 +148,18 @@ Session status
 `Input tokens` (and the other cumulative counters) is the total billed across every turn of the whole session. These totals are persisted, so resuming a session with `meka -c` continues them rather than restarting at zero.
 
 `Redactions` reports any times the Claude provider had to drop oldest tool-result image blocks because the request body would have exceeded Anthropic's 32 MiB ceiling. A non-zero count indicates the cache prefix was invalidated for the redacted messages. See [`display.show_token_usage`](../configuration/config-file.md#displayshow_token_usage) for a per-turn variant of the same data.
+
+### `/usage`
+
+Fetch the account's current rate-limit usage from the active provider and print each rolling window with its percentage used and reset time:
+
+```
+Account usage
+  5-hour (session)   [#---------]   8% used  (resets in 4h 12m, 2026-07-02 02:10)
+  Weekly             [----------]   2% used  (resets in 22h 50m, 2026-07-02 13:00)
+```
+
+This is distinct from `/status`, which reports this session's own token counters. `/usage` queries the provider for your whole-account subscription limits. It works only for OAuth subscription providers that expose a usage endpoint (`claude-oauth`'s 5-hour and weekly windows; `openai-codex`'s primary/secondary windows plus plan and credit balance). For API-key backends, OpenAI-compatible endpoints, and Ollama, it prints a short "not available for this provider" note instead. The same command is available under ACP.
 
 ### `/compact`
 

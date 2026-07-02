@@ -1223,7 +1223,7 @@ fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServer
 /// `default_provider`) and the configured profiles. Returns `(active_profile, provider_error)`:
 /// exactly one is `Some`. A deferred error string (rather than a hard failure) keeps `from_cli`
 /// infallible; `validate()` surfaces it later with guidance.
-fn select_active_profile(
+pub(crate) fn select_active_profile(
     requested: Option<String>,
     providers: &std::collections::BTreeMap<String, ProviderProfile>,
 ) -> (Option<String>, Option<String>) {

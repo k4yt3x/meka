@@ -106,6 +106,12 @@ const COMMANDS: &[CommandSpec] = &[
         arg_hint: "",
     },
     CommandSpec {
+        name: "usage",
+        aliases: &[],
+        help: "Show account rate-limit usage (subscription providers)",
+        arg_hint: "",
+    },
+    CommandSpec {
         name: "history",
         aliases: &[],
         help: "Reprint past conversation (bare = all, N = last N turns)",
@@ -509,6 +515,8 @@ pub enum SlashCommand {
     /// `/status`: print cumulative session stats (turns, tokens, cache hit ratio, image
     /// redactions).
     Status,
+    /// `/usage`: fetch and print the account's rate-limit usage from the active provider.
+    Usage,
     /// `/history [N]`: reprint past conversation in REPL style. Bare `/history` dumps every
     /// materialised message; `/history N` shows the last `N` turns (turn = user prompt + the agent
     /// work it triggered). Any non-numeric argument (e.g. `all`) falls back to the dump-everything
@@ -565,6 +573,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "mcp" => parse_mcp_slash(argument.as_deref().unwrap_or("")),
         "skill" => Some(parse_skill_slash(argument.as_deref().unwrap_or(""))),
         "status" => Some(SlashCommand::Status),
+        "usage" => Some(SlashCommand::Usage),
         "history" => Some(SlashCommand::History(
             argument
                 .as_deref()
@@ -853,6 +862,7 @@ pub fn run_repl(
                             | SlashCommand::SkillList
                             | SlashCommand::SkillInvoke { .. }
                             | SlashCommand::Status
+                            | SlashCommand::Usage
                             | SlashCommand::History(_)),
                         ) => {
                             if input_sender.send(ReplEvent::Command(command)).is_err() {
@@ -2088,6 +2098,7 @@ mod tests {
             Some(SlashCommand::SkillList) => "SkillList",
             Some(SlashCommand::SkillInvoke { .. }) => "SkillInvoke",
             Some(SlashCommand::Status) => "Status",
+            Some(SlashCommand::Usage) => "Usage",
             Some(SlashCommand::History(_)) => "History",
         }
     }
