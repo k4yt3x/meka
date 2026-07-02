@@ -1801,7 +1801,7 @@ fn format_whoami_plain(out: &WhoamiOutput<'_>) -> String {
     let auth = match (out.auth.valid, out.auth.expires_in_seconds) {
         (true, Some(secs)) => format!("valid ({})", render::format_duration_short(secs.max(0))),
         (true, None) => "valid".to_string(),
-        (false, _) => "EXPIRED — run `meka provider login`".to_string(),
+        (false, _) => "EXPIRED: run `meka provider login`".to_string(),
     };
     let _ = writeln!(text, "  Auth:          {auth}");
     if let Some(identity) = &out.identity {

@@ -504,7 +504,8 @@ struct CodexRateLimit {
 
 #[derive(Deserialize)]
 struct CodexWindow {
-    used_percent: f64,
+    #[serde(default)]
+    used_percent: Option<f64>,
     #[serde(default)]
     limit_window_seconds: Option<i64>,
     #[serde(default)]
@@ -572,7 +573,7 @@ fn codex_extra_usage(
     if credits.is_none() && spend_control.is_none() {
         return None;
     }
-    let (enabled, balance) = match credits {
+    let (has_credits, balance) = match credits {
         Some(credits) => (
             credits.has_credits.unwrap_or(false),
             credits.balance.as_deref().and_then(parse_dollars),
@@ -587,7 +588,9 @@ fn codex_extra_usage(
         None => (None, None),
     };
     Some(ExtraUsage {
-        enabled,
+        // Extra usage is active if the account holds credits or has recorded spend against a cap;
+        // keying only on `has_credits` would mislabel spend-only accounts as "disabled".
+        enabled: has_credits || used.is_some(),
         utilization,
         used,
         balance,
@@ -596,10 +599,12 @@ fn codex_extra_usage(
 }
 
 fn push_codex_window(windows: &mut Vec<UsageWindow>, window: Option<CodexWindow>, fallback: &str) {
-    if let Some(window) = window {
+    if let Some(window) = window
+        && let Some(used_percent) = window.used_percent
+    {
         windows.push(UsageWindow {
             label: codex_window_label(window.limit_window_seconds, fallback),
-            used_percent: window.used_percent,
+            used_percent,
             resets_at: window.reset_at,
         });
     }
@@ -663,7 +668,6 @@ fn codex_window_label(limit_window_seconds: Option<i64>, fallback: &str) -> Stri
         return fallback.to_string();
     };
     match minutes {
-        300 => "5-hour".to_string(),
         m if m == 7 * 24 * 60 => "Weekly".to_string(),
         m if m % (24 * 60) == 0 => format!("{}-day", m / (24 * 60)),
         m if m % 60 == 0 => format!("{}-hour", m / 60),
@@ -758,6 +762,40 @@ mod tests {
         assert_eq!(extra.balance, Some(5.0));
         assert_eq!(extra.used, Some(3.5));
         assert_eq!(extra.utilization, Some(70.0));
+    }
+
+    #[test]
+    fn test_codex_extra_usage_spend_only_is_enabled() {
+        // No purchased credits, but recorded spend against a cap: must render as enabled, not
+        // "disabled · $X spent".
+        let body = r#"{
+            "spend_control": {"individual_limit": {"used": "$3.50", "used_percent": 70}}
+        }"#;
+        let extra = serde_json::from_str::<CodexUsageResponse>(body)
+            .unwrap()
+            .into_account_usage()
+            .extra_usage
+            .expect("extra_usage");
+        assert!(extra.enabled);
+        assert_eq!(extra.used, Some(3.5));
+    }
+
+    #[test]
+    fn test_codex_window_missing_used_percent_is_skipped_not_fatal() {
+        // A partial window object (no `used_percent`) degrades to being dropped rather than failing
+        // the whole payload; the complete sibling window still parses.
+        let body = r#"{
+            "rate_limit": {
+                "primary_window": {"limit_window_seconds": 18000, "reset_at": 123},
+                "secondary_window": {"used_percent": 84, "limit_window_seconds": 604800}
+            }
+        }"#;
+        let usage = serde_json::from_str::<CodexUsageResponse>(body)
+            .expect("partial window must not fail the parse")
+            .into_account_usage();
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].label, "Weekly");
+        assert_eq!(usage.windows[0].used_percent, 84.0);
     }
 
     #[test]

@@ -737,7 +737,6 @@ struct OAuthUsageResponse {
     seven_day_opus: Option<OAuthRateLimit>,
     seven_day_sonnet: Option<OAuthRateLimit>,
     extra_usage: Option<OAuthExtraUsage>,
-    spend: Option<OAuthSpend>,
 }
 
 #[derive(Deserialize)]
@@ -748,27 +747,16 @@ struct OAuthRateLimit {
     resets_at: Option<String>,
 }
 
+/// The `extra_usage` block from `GET /api/oauth/usage`. The credit figures are carried inline here
+/// (not in a separate top-level object): `used_credits` and `monthly_limit` are both in cents (the
+/// API's minor unit), so divide by 100 for dollars. Credits are billed in USD, so no currency is
+/// reported.
 #[derive(Deserialize)]
 struct OAuthExtraUsage {
     is_enabled: Option<bool>,
     utilization: Option<f64>,
-    currency: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OAuthSpend {
-    enabled: Option<bool>,
-    used: Option<OAuthSpendUsed>,
-    /// Remaining balance in the account currency, if the provider reports one.
-    balance: Option<f64>,
-}
-
-#[derive(Deserialize)]
-struct OAuthSpendUsed {
-    amount_minor: Option<i64>,
-    currency: Option<String>,
-    /// Decimal places: `amount_minor / 10^exponent` is the major-unit amount.
-    exponent: Option<i32>,
+    used_credits: Option<i64>,
+    monthly_limit: Option<i64>,
 }
 
 impl OAuthUsageResponse {
@@ -780,53 +768,26 @@ impl OAuthUsageResponse {
         push_oauth_window(&mut windows, "Weekly (Sonnet)", self.seven_day_sonnet);
         AccountUsage {
             windows,
-            extra_usage: oauth_extra_usage(self.extra_usage, self.spend),
+            extra_usage: oauth_extra_usage(self.extra_usage),
             note: None,
         }
     }
 }
 
-/// Normalize Anthropic's `extra_usage` + `spend` blocks into [`ExtraUsage`]. Present whenever
-/// either block is; `used` is derived from `spend.used.amount_minor / 10^exponent`.
-fn oauth_extra_usage(
-    extra_usage: Option<OAuthExtraUsage>,
-    spend: Option<OAuthSpend>,
-) -> Option<ExtraUsage> {
-    if extra_usage.is_none() && spend.is_none() {
-        return None;
-    }
-    let extra_usage = extra_usage.unwrap_or(OAuthExtraUsage {
-        is_enabled: None,
-        utilization: None,
-        currency: None,
-    });
-    let (spend_enabled, used, spend_currency, balance) = match spend {
-        Some(spend) => {
-            let (used, currency) = match spend.used {
-                Some(used) => {
-                    let exponent = used.exponent.unwrap_or(2).max(0);
-                    let amount = used
-                        .amount_minor
-                        .map(|minor| minor as f64 / 10f64.powi(exponent));
-                    (amount, used.currency)
-                }
-                None => (None, None),
-            };
-            (
-                spend.enabled.unwrap_or(false),
-                used,
-                currency,
-                spend.balance,
-            )
-        }
-        None => (false, None, None, None),
-    };
+/// Normalize Anthropic's `extra_usage` block into [`ExtraUsage`]. `used` is `used_credits` in
+/// dollars; `balance` is the remaining allowance (`monthly_limit - used_credits`) in dollars.
+fn oauth_extra_usage(extra_usage: Option<OAuthExtraUsage>) -> Option<ExtraUsage> {
+    let extra_usage = extra_usage?;
+    let used = extra_usage.used_credits.map(|cents| cents as f64 / 100.0);
+    let balance = extra_usage
+        .monthly_limit
+        .map(|limit| (limit - extra_usage.used_credits.unwrap_or(0)) as f64 / 100.0);
     Some(ExtraUsage {
-        enabled: extra_usage.is_enabled.unwrap_or(false) || spend_enabled,
+        enabled: extra_usage.is_enabled.unwrap_or(false),
         utilization: extra_usage.utilization,
         used,
         balance,
-        currency: spend_currency.or(extra_usage.currency),
+        currency: None,
     })
 }
 
@@ -1367,6 +1328,26 @@ mod tests {
                     .timestamp()
             )
         );
+    }
+
+    #[test]
+    fn test_oauth_extra_usage_maps_credits() {
+        // Credit dollars are carried inline in `extra_usage`, in cents: used_credits=350 -> $3.50
+        // spent, monthly_limit=1000 -> $10.00 cap, so balance = (1000 - 350)/100 = $6.50.
+        let body = r#"{
+            "five_hour": {"utilization": 8.0, "resets_at": null},
+            "extra_usage": {"is_enabled": true, "utilization": 35.0, "used_credits": 350, "monthly_limit": 1000}
+        }"#;
+        let extra = serde_json::from_str::<OAuthUsageResponse>(body)
+            .expect("parse usage")
+            .into_account_usage()
+            .extra_usage
+            .expect("extra_usage");
+        assert!(extra.enabled);
+        assert_eq!(extra.utilization, Some(35.0));
+        assert_eq!(extra.used, Some(3.5));
+        assert_eq!(extra.balance, Some(6.5));
+        assert_eq!(extra.currency, None);
     }
 
     #[test]

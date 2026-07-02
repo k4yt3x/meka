@@ -2132,8 +2132,8 @@ async fn run_prompt_turn(
     )
     .await;
 
-    // Local slash commands (`/status`, `/mcp`) render text and end the turn with no model call.
-    // Checked before skill resolution so they aren't misread as unknown skills.
+    // Local slash commands (`/status`, `/mcp`, `/usage`) render text and end the turn with no model
+    // call. Checked before skill resolution so they aren't misread as unknown skills.
     if let Some(output) = try_local_command(&prompt_text, &runtime, &state.shared).await {
         // `agent_message_chunk` is rendered as Markdown, where a bare newline is a soft break (it
         // collapses to a space) and small indents are stripped. Wrap the preformatted table in a
