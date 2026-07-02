@@ -66,6 +66,15 @@ pub enum MockEvent {
     Fail {
         message: String,
     },
+    /// Synthetic *transient* provider failure. The stream returns
+    /// `Err(MekaError::RetryableProvider { .. })` immediately, exercising `Agent::run_streaming`'s
+    /// retry-with-backoff path. Each retry consumes one more round from the script, so a
+    /// `[FailRetryable, ..success events..]` script simulates "first attempt overloaded, retry
+    /// succeeds" — the same shape a real transient 429/529 followed by success takes.
+    FailRetryable {
+        message: String,
+        retry_after_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +159,15 @@ impl Provider for MockProvider {
                 MockEvent::Fail { message } => {
                     return Err(crate::error::MekaError::Provider(message));
                 }
+                MockEvent::FailRetryable {
+                    message,
+                    retry_after_secs,
+                } => {
+                    return Err(crate::error::MekaError::RetryableProvider {
+                        message,
+                        retry_after: retry_after_secs.map(std::time::Duration::from_secs),
+                    });
+                }
                 MockEvent::Sleep { ms } => {
                     // Race the sleep against cancellation so a mid-turn `session/cancel` doesn't
                     // have to wait for the full delay to elapse.
@@ -174,7 +192,9 @@ impl Provider for MockProvider {
                         MockEvent::MessageEnd { stop_reason } => StreamEvent::MessageEnd {
                             stop_reason: stop_reason.into(),
                         },
-                        MockEvent::Sleep { .. } | MockEvent::Fail { .. } => {
+                        MockEvent::Sleep { .. }
+                        | MockEvent::Fail { .. }
+                        | MockEvent::FailRetryable { .. } => {
                             unreachable!("handled above")
                         }
                     };
@@ -293,6 +313,35 @@ mod tests {
         );
         // No events were sent before the failure.
         assert!(rx.recv().await.is_none(), "Fail must not emit events");
+    }
+
+    /// `FailRetryable` returns `Err(MekaError::RetryableProvider { .. })` carrying the configured
+    /// `retry_after`, without emitting any events — mirrors `Fail`'s shape but with the typed
+    /// variant `Agent::run_streaming`'s retry loop pattern-matches on.
+    #[tokio::test]
+    async fn test_mock_provider_fail_retryable_event_returns_typed_error() {
+        let provider = MockProvider::from_rounds(vec![vec![MockEvent::FailRetryable {
+            message: "overloaded".into(),
+            retry_after_secs: Some(3),
+        }]]);
+        let (tx, mut rx) = mpsc::channel(8);
+        let result = provider
+            .stream("", &[], &[], tx, CancellationToken::new())
+            .await;
+        match result.expect_err("FailRetryable must propagate as Err") {
+            crate::error::MekaError::RetryableProvider {
+                message,
+                retry_after,
+            } => {
+                assert_eq!(message, "overloaded");
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(3)));
+            }
+            other => panic!("expected RetryableProvider, got {other:?}"),
+        }
+        assert!(
+            rx.recv().await.is_none(),
+            "FailRetryable must not emit events"
+        );
     }
 
     /// `ThinkingDelta` + `ThinkingComplete` map straight through to the same-named `StreamEvent`

@@ -222,6 +222,15 @@ struct ActiveToolCall {
 /// Pure SSE-event handler. Inspects the named event + parsed JSON payload, updates `state`, and
 /// returns the meka-level [`StreamEvent`]s to forward to the agent. Returns `Err` when the server
 /// reports a fatal stream error; the driver propagates this back to the caller.
+/// Whether a `response.failed` event's error `code`/`type` indicates a transient, retryable
+/// condition. Conservative on purpose (matches the Claude driver's equivalent): only the codes
+/// OpenAI documents as transient server-side conditions are retryable; anything else (including
+/// unrecognized codes) is treated as permanent so a real problem surfaces immediately instead of
+/// being masked by retries.
+fn is_retryable_codex_error_code(code: &str) -> bool {
+    matches!(code, "server_error" | "rate_limit_exceeded" | "overloaded")
+}
+
 pub(super) fn process_event(
     event_name: &str,
     data: &serde_json::Value,
@@ -349,19 +358,35 @@ pub(super) fn process_event(
 
         "response.failed" => {
             state.finished = true;
-            let message = data
+            let error_object = data
                 .get("response")
-                .and_then(|response| response.get("error"))
+                .and_then(|response| response.get("error"));
+            let message = error_object
                 .and_then(|error| error.get("message"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("response.failed event")
                 .to_string();
-            out.push(StreamEvent::Error(message.clone()));
-            return Err(MekaError::Provider(message));
+            // OpenAI's error objects carry `code` (occasionally `type`); either indicates a
+            // transient server-side condition worth retrying. Sending `StreamEvent::Error` is
+            // handled by the caller (`drive_responses_sse_stream`), which has channel access.
+            let error_code = error_object
+                .and_then(|error| error.get("code").or_else(|| error.get("type")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            return Err(if is_retryable_codex_error_code(error_code) {
+                MekaError::RetryableProvider {
+                    message,
+                    retry_after: None,
+                }
+            } else {
+                MekaError::Provider(message)
+            });
         }
 
         "response.incomplete" => {
             state.finished = true;
+            // `incomplete_details.reason` (e.g. "max_output_tokens", "content_filter") is a
+            // deterministic outcome, not a transient failure — never retryable.
             let reason = data
                 .get("response")
                 .and_then(|response| response.get("incomplete_details"))
@@ -369,7 +394,6 @@ pub(super) fn process_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             let message = format!("response.incomplete: {}", reason);
-            out.push(StreamEvent::Error(message.clone()));
             return Err(MekaError::Provider(message));
         }
 
@@ -402,11 +426,16 @@ pub(super) async fn drive_responses_sse_stream(
 ) -> Result<()> {
     let status = response.status();
     if !status.is_success() {
+        let retry_after = crate::error::parse_retry_after(response.headers());
         let response_text = response.text().await.unwrap_or_else(|error| {
             tracing::warn!("failed to read Codex error response body: {}", error);
             String::new()
         });
-        return Err(crate::error::provider_http_error(status, &response_text));
+        return Err(crate::error::provider_http_error(
+            status,
+            &response_text,
+            retry_after,
+        ));
     }
 
     let mut event_stream = response.bytes_stream().eventsource();
@@ -445,6 +474,17 @@ pub(super) async fn drive_responses_sse_stream(
                 let events = match outcomes {
                     Ok(events) => events,
                     Err(error) => {
+                        // `process_event` doesn't have channel access, so forward the error here
+                        // (mirrors the Claude driver's pattern) rather than relying on the caller
+                        // to notice — best-effort: a dropped receiver just means no one's
+                        // listening anymore, not a reason to fail differently.
+                        if event_sender
+                            .send(StreamEvent::Error(error.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            tracing::trace!("stream event receiver dropped");
+                        }
                         return Err(error);
                     }
                 };
@@ -874,6 +914,43 @@ mod tests {
         assert!(
             matches!(result, Err(MekaError::Provider(ref message)) if message.contains("too many tokens"))
         );
+    }
+
+    #[test]
+    fn test_process_event_failed_with_server_error_code_is_retryable() {
+        let mut state = SseState::default();
+        let result = process_event(
+            "response.failed",
+            &serde_json::json!({
+                "response": {"error": {"code": "server_error", "message": "internal error"}}
+            }),
+            &mut state,
+        );
+        assert!(matches!(result, Err(MekaError::RetryableProvider { .. })));
+    }
+
+    #[test]
+    fn test_process_event_failed_without_code_stays_permanent() {
+        // No `code`/`type` field at all — default is not-retryable, matching today's behavior.
+        let mut state = SseState::default();
+        let result = process_event(
+            "response.failed",
+            &serde_json::json!({
+                "response": {"error": {"message": "bad request"}}
+            }),
+            &mut state,
+        );
+        assert!(matches!(result, Err(MekaError::Provider(_))));
+    }
+
+    #[test]
+    fn test_is_retryable_codex_error_code() {
+        for retryable in ["server_error", "rate_limit_exceeded", "overloaded"] {
+            assert!(is_retryable_codex_error_code(retryable));
+        }
+        for permanent in ["invalid_request_error", "unknown", ""] {
+            assert!(!is_retryable_codex_error_code(permanent));
+        }
     }
 
     #[test]

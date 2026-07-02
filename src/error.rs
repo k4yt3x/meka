@@ -1,6 +1,8 @@
 //! Crate-wide [`MekaError`] enum and [`Result`] alias. All non-binary code paths return `Result<T,
 //! MekaError>`; the `main` binary wraps these in `anyhow::Result` for top-level reporting.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -23,6 +25,17 @@ pub enum MekaError {
     /// of matching error strings at the call site.
     #[error("context window exceeded: {0}")]
     ContextOverflow(String),
+
+    /// A transient provider failure (HTTP 429, any 5xx including Anthropic's 529 "overloaded", or a
+    /// mid-stream `overloaded_error`/`rate_limit_error`/`api_error` SSE event) that is safe to
+    /// retry with backoff. Distinct from [`Self::Provider`] so the agent loop can retry by type
+    /// instead of matching error strings. Carries the provider's `Retry-After` hint when
+    /// present.
+    #[error("provider temporarily unavailable: {message}")]
+    RetryableProvider {
+        message: String,
+        retry_after: Option<Duration>,
+    },
 
     #[error("tool execution error: {tool_name}: {message}")]
     ToolExecution { tool_name: String, message: String },
@@ -73,11 +86,18 @@ pub enum MekaError {
 pub type Result<T> = std::result::Result<T, MekaError>;
 
 /// Classify a provider HTTP failure response: map context-window overflows to
-/// [`MekaError::ContextOverflow`] (so the agent loop can compact-and-retry once) and everything
-/// else to [`MekaError::Provider`]. Anthropic returns HTTP 400 `invalid_request_error` with "prompt
-/// is too long"; OpenAI returns 400 `context_length_exceeded` (or 413). Matched on the body because
-/// a bare 400 is shared with many unrelated errors.
-pub(crate) fn provider_http_error(status: reqwest::StatusCode, body: &str) -> MekaError {
+/// [`MekaError::ContextOverflow`] (so the agent loop can compact-and-retry once), transient
+/// failures (429, any 5xx including Anthropic's 529 "overloaded") to
+/// [`MekaError::RetryableProvider`] (so the agent loop can retry with backoff), and everything else
+/// to [`MekaError::Provider`]. Anthropic returns HTTP 400 `invalid_request_error` with "prompt is
+/// too long"; OpenAI returns 400 `context_length_exceeded` (or 413). The overflow check is matched
+/// on the body (a bare 400 is shared with many unrelated errors) and takes priority over the status
+/// code so it can't be shadowed by an unrelated retryable status.
+pub(crate) fn provider_http_error(
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after: Option<Duration>,
+) -> MekaError {
     let lower = body.to_ascii_lowercase();
     let overflow = status == reqwest::StatusCode::PAYLOAD_TOO_LARGE
         || lower.contains("prompt is too long")
@@ -88,9 +108,26 @@ pub(crate) fn provider_http_error(status: reqwest::StatusCode, body: &str) -> Me
     let message = format!("API returned status {status}: {body}");
     if overflow {
         MekaError::ContextOverflow(message)
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        MekaError::RetryableProvider {
+            message,
+            retry_after,
+        }
     } else {
         MekaError::Provider(message)
     }
+}
+
+/// Parse the `Retry-After` response header as a whole number of seconds. Only the delta-seconds
+/// form is handled (what every provider we talk to actually sends); the less common HTTP-date form
+/// is ignored (returns `None`, falling back to computed backoff) rather than pulling in a date
+/// parser for a form we've never observed in practice.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 /// Format a [`reqwest::Error`] together with its full source chain.
@@ -124,6 +161,7 @@ mod tests {
             provider_http_error(
                 reqwest::StatusCode::BAD_REQUEST,
                 r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+                None,
             ),
             MekaError::ContextOverflow(_)
         ));
@@ -132,6 +170,7 @@ mod tests {
             provider_http_error(
                 reqwest::StatusCode::BAD_REQUEST,
                 r#"{"error":{"code":"context_length_exceeded"}}"#,
+                None,
             ),
             MekaError::ContextOverflow(_)
         ));
@@ -139,7 +178,8 @@ mod tests {
         assert!(matches!(
             provider_http_error(
                 reqwest::StatusCode::PAYLOAD_TOO_LARGE,
-                "Request Entity Too Large"
+                "Request Entity Too Large",
+                None,
             ),
             MekaError::ContextOverflow(_)
         ));
@@ -151,15 +191,104 @@ mod tests {
             provider_http_error(
                 reqwest::StatusCode::UNAUTHORIZED,
                 r#"{"error":{"type":"authentication_error"}}"#,
+                None,
             ),
+            MekaError::Provider(_)
+        ));
+        // 404 / 422 are permanent client errors, not retryable.
+        assert!(matches!(
+            provider_http_error(reqwest::StatusCode::NOT_FOUND, "not found", None),
             MekaError::Provider(_)
         ));
         assert!(matches!(
-            provider_http_error(
-                reqwest::StatusCode::TOO_MANY_REQUESTS,
-                "rate limit exceeded"
-            ),
+            provider_http_error(reqwest::StatusCode::UNPROCESSABLE_ENTITY, "invalid", None),
             MekaError::Provider(_)
         ));
+    }
+
+    #[test]
+    fn test_provider_http_error_maps_retryable() {
+        // 429 rate limit.
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded",
+                None,
+            ),
+            MekaError::RetryableProvider { .. }
+        ));
+        // 5xx server errors, including Anthropic's non-standard 529 "overloaded".
+        for status in [500u16, 502, 503, 504, 529] {
+            let status = reqwest::StatusCode::from_u16(status).expect("valid status");
+            assert!(
+                matches!(
+                    provider_http_error(status, "Overloaded", None),
+                    MekaError::RetryableProvider { .. }
+                ),
+                "status {status} should be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_provider_http_error_retryable_carries_retry_after() {
+        let delay = Duration::from_secs(7);
+        match provider_http_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "rate limited",
+            Some(delay),
+        ) {
+            MekaError::RetryableProvider { retry_after, .. } => {
+                assert_eq!(retry_after, Some(delay));
+            }
+            other => panic!("expected RetryableProvider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_provider_http_error_overflow_takes_priority_over_retryable_status() {
+        // A 500 whose body happens to mention the context window should still classify as
+        // overflow, not retryable — the body check is checked first regardless of status.
+        assert!(matches!(
+            provider_http_error(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "context_length_exceeded",
+                None,
+            ),
+            MekaError::ContextOverflow(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_retry_after_present_integer_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_parse_retry_after_absent() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn test_parse_retry_after_ignores_http_date_form() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn test_parse_retry_after_ignores_malformed_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            "not-a-number".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
     }
 }

@@ -346,13 +346,18 @@ impl Provider for OpenAiProvider {
             })?;
 
         let status = response.status();
+        let retry_after = crate::error::parse_retry_after(response.headers());
         let response_text = response
             .text()
             .await
             .map_err(|error| MekaError::Provider(format!("failed to read response: {}", error)))?;
 
         if !status.is_success() {
-            return Err(crate::error::provider_http_error(status, &response_text));
+            return Err(crate::error::provider_http_error(
+                status,
+                &response_text,
+                retry_after,
+            ));
         }
 
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
@@ -391,8 +396,13 @@ impl Provider for OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = crate::error::parse_retry_after(response.headers());
             let response_text = response.text().await.unwrap_or_default();
-            return Err(crate::error::provider_http_error(status, &response_text));
+            return Err(crate::error::provider_http_error(
+                status,
+                &response_text,
+                retry_after,
+            ));
         }
 
         let mut event_stream = response.bytes_stream().eventsource();

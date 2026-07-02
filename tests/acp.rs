@@ -4013,6 +4013,155 @@ fn acp_session_prompt_surfaces_provider_error_as_jsonrpc_error() {
     );
 }
 
+/// A transient failure (`FailRetryable`) on the first attempt must be retried automatically:
+/// `Agent::run_streaming` re-invokes `provider.stream()`, consuming the mock's next scripted round,
+/// and the turn completes successfully with exactly the second round's content — no duplication,
+/// no error surfaced to the client.
+#[test]
+fn acp_session_prompt_retries_transient_provider_error_then_succeeds() {
+    let script = serde_json::json!([
+        [{ "kind": "fail_retryable", "message": "overloaded", "retry_after_secs": null }],
+        [
+            { "kind": "text", "text": "recovered" },
+            { "kind": "message_end", "stop_reason": "end_turn" },
+        ],
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "go");
+    let (updates, response) = harness.collect_updates(&sid, id);
+
+    assert!(
+        response.get("error").is_none(),
+        "the retry must be invisible to the client; got error: {}",
+        response,
+    );
+
+    let text_chunks: Vec<&str> = updates
+        .iter()
+        .filter(|u| u["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert_eq!(
+        text_chunks,
+        vec!["recovered"],
+        "exactly one clean copy of the recovered round's text, no duplication from the failed \
+         first attempt; updates: {:?}",
+        updates,
+    );
+}
+
+/// `FailRetryable` repeated past `MAX_PROVIDER_RETRIES` must exhaust the retry budget and surface
+/// the failure to the client as a normal JSON-RPC error, exactly like a non-retryable failure does.
+#[test]
+fn acp_session_prompt_exhausts_retries_then_surfaces_error() {
+    // MAX_PROVIDER_RETRIES (3) retries + the initial attempt = 4 total attempts, all failing.
+    let script = serde_json::json!([
+        [{ "kind": "fail_retryable", "message": "overloaded 1", "retry_after_secs": null }],
+        [{ "kind": "fail_retryable", "message": "overloaded 2", "retry_after_secs": null }],
+        [{ "kind": "fail_retryable", "message": "overloaded 3", "retry_after_secs": null }],
+        [{ "kind": "fail_retryable", "message": "overloaded 4", "retry_after_secs": null }],
+    ]);
+    // The default backoff (1s + 2s + 4s = 7s of sleeping) plus process overhead is comfortably
+    // under 15s, but give this one extra headroom since it's the slowest test in the suite by
+    // design.
+    let mut harness = AcpTestHarness::builder()
+        .config(ACP_INVALID_PARAMS_CONFIG)
+        .script(script)
+        .deadline(std::time::Duration::from_secs(25))
+        .build();
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "go");
+    let response = harness.await_response(id);
+
+    assert!(
+        response.get("error").is_some(),
+        "exhausted retries must surface as a JSON-RPC error; got: {}",
+        response,
+    );
+    let data = response["error"]["data"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error.data must carry the detail string: {}", response));
+    // The last attempt's message is what propagates.
+    assert!(
+        data.contains("overloaded 4"),
+        "error.data should carry the final attempt's message; got: {}",
+        data,
+    );
+}
+
+/// A non-retryable failure (`Fail`, mapping to a plain `MekaError::Provider`) must still fail
+/// immediately with no backoff delay — a regression guard against over-broadening the new retry
+/// classification to errors that were never meant to retry.
+#[test]
+fn acp_session_prompt_plain_fail_is_not_retried() {
+    let script = serde_json::json!([[{ "kind": "fail", "message": "permanent failure" }]]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "go");
+    let started = std::time::Instant::now();
+    let response = harness.await_response(id);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a non-retryable failure must not incur any backoff delay; took {:?}",
+        started.elapsed(),
+    );
+    assert!(
+        response.get("error").is_some(),
+        "plain Fail must still surface as a JSON-RPC error; got: {}",
+        response,
+    );
+    let data = response["error"]["data"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error.data must carry the detail string: {}", response));
+    assert!(
+        data.contains("permanent failure"),
+        "error.data should propagate the underlying provider error text; got: {}",
+        data,
+    );
+}
+
+/// Once the frontend has already shown text this attempt, a subsequent transient error in the
+/// SAME round must NOT trigger a retry — retrying after the user has seen partial output would
+/// duplicate/corrupt what's on screen. The mock's per-round-is-one-`stream()`-call model means a
+/// `FailRetryable` after a `Text` event in the same round exercises exactly this: the driver sends
+/// the text (setting `content_started`), then fails, and `run_streaming` must propagate the error
+/// immediately instead of consuming a second round.
+#[test]
+fn acp_session_prompt_does_not_retry_once_content_shown() {
+    let script = serde_json::json!([
+        [
+            { "kind": "text", "text": "partial" },
+            { "kind": "fail_retryable", "message": "overloaded mid-stream", "retry_after_secs": null },
+        ],
+        [
+            { "kind": "text", "text": "should never be reached" },
+            { "kind": "message_end", "stop_reason": "end_turn" },
+        ],
+    ]);
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
+    let sid = harness.new_session();
+    let id = harness.prompt(&sid, "go");
+    let (updates, response) = harness.collect_updates(&sid, id);
+
+    assert!(
+        response.get("error").is_some(),
+        "a transient error after content was shown must surface immediately, not retry; got: {}",
+        response,
+    );
+    let text_chunks: Vec<&str> = updates
+        .iter()
+        .filter(|u| u["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|u| u["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert_eq!(
+        text_chunks,
+        vec!["partial"],
+        "only the pre-failure text must appear; the second round must never be consumed: {:?}",
+        updates,
+    );
+}
+
 /// `session/request_permission` failure marks the connection as disconnected so the agent loop
 /// bails out promptly. A spec-conformant client always answers `Selected` / `Cancelled`, so any
 /// `Err` from `block_task` (channel closed or peer JSON-RPC error) signals a broken/malformed

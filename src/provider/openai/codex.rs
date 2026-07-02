@@ -167,11 +167,16 @@ impl OpenAiCodexProvider {
             ))
         })?;
         let status = response.status();
+        let retry_after = crate::error::parse_retry_after(response.headers());
         let response_text = response.text().await.map_err(|error| {
             MekaError::Provider(format!("failed to read Codex usage response: {}", error))
         })?;
         if !status.is_success() {
-            return Err(crate::error::provider_http_error(status, &response_text));
+            return Err(crate::error::provider_http_error(
+                status,
+                &response_text,
+                retry_after,
+            ));
         }
         serde_json::from_str(&response_text)
             .map_err(|error| MekaError::Provider(format!("invalid Codex usage JSON: {}", error)))
@@ -442,11 +447,16 @@ impl Provider for OpenAiCodexProvider {
             ))
         })?;
         let status = response.status();
+        let retry_after = crate::error::parse_retry_after(response.headers());
         let text = response.text().await.map_err(|error| {
             MekaError::Provider(format!("failed to read Codex profile response: {}", error))
         })?;
         if !status.is_success() {
-            return Err(crate::error::provider_http_error(status, &text));
+            return Err(crate::error::provider_http_error(
+                status,
+                &text,
+                retry_after,
+            ));
         }
         let parsed: CodexProfileResponse = serde_json::from_str(&text).map_err(|error| {
             MekaError::Provider(format!("invalid Codex profile JSON: {}", error))

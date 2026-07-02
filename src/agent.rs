@@ -604,18 +604,43 @@ impl Agent {
                         )
                         .await
                     } else {
-                        match self
-                            .provider
-                            .complete(&system_prompt, &api_messages, &tools)
-                            .await
-                        {
-                            Ok((message, stop_reason, usage, notices)) => {
-                                for notice in notices {
-                                    self.frontend.emit(FrontendEvent::Notice(notice)).await;
+                        // Non-streaming is fully atomic (nothing is visible until this returns
+                        // `Ok`), so `content_started` is always `false` here — every retryable
+                        // failure is retried up to the cap regardless of prior attempts.
+                        let mut retries = 0u32;
+                        loop {
+                            match self
+                                .provider
+                                .complete(&system_prompt, &api_messages, &tools)
+                                .await
+                            {
+                                Ok((message, stop_reason, usage, notices)) => {
+                                    for notice in notices {
+                                        self.frontend.emit(FrontendEvent::Notice(notice)).await;
+                                    }
+                                    break Ok((message, stop_reason, usage));
                                 }
-                                Ok((message, stop_reason, usage))
+                                Err(error) => {
+                                    match should_retry_provider_error(&error, false, retries) {
+                                        Some(delay) => {
+                                            retries += 1;
+                                            tracing::warn!(
+                                                "provider request failed transiently (attempt \
+                                                 {}/{}), retrying in {:?}: {}",
+                                                retries,
+                                                crate::provider::retry::MAX_PROVIDER_RETRIES,
+                                                delay,
+                                                error
+                                            );
+                                            tokio::select! {
+                                                _ = tokio::time::sleep(delay) => {}
+                                                _ = cancellation.cancelled() => break Err(MekaError::Interrupted),
+                                            }
+                                        }
+                                        None => break Err(error),
+                                    }
+                                }
                             }
-                            Err(error) => Err(error),
                         }
                     };
 
@@ -910,12 +935,69 @@ impl Agent {
         result
     }
 
+    /// Streaming provider call with bounded retry-with-backoff on transient failures
+    /// ([`MekaError::RetryableProvider`]) — 429/5xx (including Anthropic's 529 "overloaded") and,
+    /// for Claude, a mid-stream `event: error` of a retryable type. Each attempt runs
+    /// [`Self::run_streaming_attempt`] fresh (new channel, new spawned task, all accumulator state
+    /// reinitialized); retries only fire when that attempt reports `content_started == false`, i.e.
+    /// nothing has been forwarded to the frontend yet this attempt — retrying after the user has
+    /// already seen partial output would duplicate or corrupt what's on screen. Nothing is
+    /// persisted to the session DB until the whole turn's result is resolved (see `run_turn`),
+    /// so a discarded attempt never leaves a partial write behind.
     async fn run_streaming(
         &self,
         system_prompt: Arc<str>,
         messages: Arc<[Message]>,
         tools: Arc<[ToolDefinition]>,
         cancellation: CancellationToken,
+    ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
+        let mut retries = 0u32;
+        loop {
+            let mut content_started = false;
+            match self
+                .run_streaming_attempt(
+                    Arc::clone(&system_prompt),
+                    Arc::clone(&messages),
+                    Arc::clone(&tools),
+                    cancellation.clone(),
+                    &mut content_started,
+                )
+                .await
+            {
+                Ok(value) => return Ok(value),
+                Err(error) => match should_retry_provider_error(&error, content_started, retries) {
+                    Some(delay) => {
+                        retries += 1;
+                        tracing::warn!(
+                            "provider stream failed transiently (attempt {}/{}), retrying in \
+                             {:?}: {}",
+                            retries,
+                            crate::provider::retry::MAX_PROVIDER_RETRIES,
+                            delay,
+                            error
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+                        }
+                    }
+                    None => return Err(error),
+                },
+            }
+        }
+    }
+
+    /// A single streaming attempt: spawns `provider.stream(...)`, drains its `StreamEvent`s into a
+    /// `Message`. `content_started` is set the instant anything user-visible is forwarded to the
+    /// frontend — see [`Self::run_streaming`], which reads it back to decide whether a failure is
+    /// safe to retry.
+    async fn run_streaming_attempt(
+        &self,
+        system_prompt: Arc<str>,
+        messages: Arc<[Message]>,
+        tools: Arc<[ToolDefinition]>,
+        cancellation: CancellationToken,
+        content_started: &mut bool,
     ) -> Result<(Message, StopReason, crate::provider::TokenUsage)> {
         // Bounded so a provider streaming faster than the renderer consumes can't grow memory
         // without limit. 1024 is far above any realistic in-flight backlog, so backpressure
@@ -958,6 +1040,7 @@ impl Agent {
                     // survive to continue the reasoning chain on the next turn.
                     if !content.is_empty() || signature.is_some() {
                         if !content.is_empty() {
+                            *content_started = true;
                             self.frontend
                                 .emit(FrontendEvent::ThinkingBlock {
                                     content: content.clone(),
@@ -972,6 +1055,7 @@ impl Agent {
                     }
                 }
                 StreamEvent::RedactedThinking { data } => {
+                    *content_started = true;
                     self.frontend
                         .emit(FrontendEvent::ThinkingBlock {
                             content: "[redacted thinking]".to_string(),
@@ -981,6 +1065,7 @@ impl Agent {
                     content_blocks.push(ContentBlock::RedactedThinking { data });
                 }
                 StreamEvent::TextDelta(text) => {
+                    *content_started = true;
                     current_text.push_str(&text);
                     self.frontend
                         .emit(FrontendEvent::AssistantTextDelta(text))
@@ -1000,6 +1085,7 @@ impl Agent {
                     current_tool_input_json.push_str(&delta);
                 }
                 StreamEvent::ToolUseEnd { input } => {
+                    *content_started = true;
                     let schema = self
                         .tool_registry
                         .get(&current_tool_name)
@@ -1031,6 +1117,7 @@ impl Agent {
                     // round-trip, but `resolve_and_execute_tool` sees the marker and surfaces an
                     // error back to the model rather than running the tool on a silently-empty
                     // argument object.
+                    *content_started = true;
                     let marker_input = serde_json::json!({
                         crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
                     });
@@ -1073,13 +1160,19 @@ impl Agent {
                     // Forward provider-side advisories (image redaction, etc.) to the frontend
                     // alongside the stream. Emitted inline so the user sees them in order with the
                     // assistant text that follows.
+                    *content_started = true;
                     self.frontend.emit(FrontendEvent::Notice(notice)).await;
                 }
                 StreamEvent::Error(error) => {
-                    // Treat as terminal: if the worker emits Error then closes the channel with
-                    // Ok(()), a log-and-continue would silently truncate the turn to EndTurn.
+                    // Log only; deliberately don't return here. Every producer of this event sends
+                    // it immediately before its own typed `Err` return (see
+                    // `drive_claude_sse_stream`/`drive_responses_sse_stream`), so the task finishes
+                    // right after this, the channel closes, and this loop ends naturally. The
+                    // `stream_handle.await` join below then surfaces the ORIGINAL typed error
+                    // (e.g. `RetryableProvider` vs. plain `Provider`) — returning a generic
+                    // `MekaError::Provider(error)` here would discard that classification before
+                    // `run_streaming`'s retry logic ever saw it.
                     tracing::error!("stream error: {}", error);
-                    return Err(crate::error::MekaError::Provider(error));
                 }
             }
         }
@@ -1509,6 +1602,30 @@ fn has_tool_results(content: &[ContentBlock]) -> bool {
         .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
+/// Whether a failed provider call should be retried, and if so, after how long. Pure and
+/// sleep-free so it's unit-testable in isolation from the async retry loops in `run_streaming` and
+/// `run_turn`'s non-streaming branch, which both call this with their current `retries` count
+/// (0-indexed, incremented by the caller only when this returns `Some`). `content_started` must
+/// always be `false` for the non-streaming path — nothing is ever partially visible there, so every
+/// retryable failure is retryable regardless of prior attempts within the same call.
+fn should_retry_provider_error(
+    error: &MekaError,
+    content_started: bool,
+    retries: u32,
+) -> Option<std::time::Duration> {
+    match error {
+        MekaError::RetryableProvider { retry_after, .. }
+            if !content_started && retries < crate::provider::retry::MAX_PROVIDER_RETRIES =>
+        {
+            Some(crate::provider::retry::backoff_delay(
+                retries + 1,
+                *retry_after,
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Split a conversation for compaction into `(to_summarize, to_keep)`. The kept tail is the largest
 /// recent suffix whose estimated tokens stay within `keep_budget`, then snapped backward to a clean
 /// `User`-without-`tool_results` boundary so a tool_use/tool_result pair is never orphaned and the
@@ -1656,6 +1773,78 @@ fn strip_images_and_truncate(content: &mut [ContentBlock]) {
 mod tests {
     use super::*;
     use crate::provider::ToolResultContent;
+
+    fn retryable_error() -> MekaError {
+        MekaError::RetryableProvider {
+            message: "overloaded".to_string(),
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn test_should_retry_provider_error_retries_when_no_content_and_under_cap() {
+        let delay = should_retry_provider_error(&retryable_error(), false, 0);
+        assert!(delay.is_some());
+    }
+
+    #[test]
+    fn test_should_retry_provider_error_stops_once_content_started() {
+        // The core safety property: once the user has seen any output this attempt, a retryable
+        // error must not trigger a retry (would duplicate/corrupt what's already shown).
+        assert_eq!(
+            should_retry_provider_error(&retryable_error(), true, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn test_should_retry_provider_error_stops_at_retry_cap() {
+        assert_eq!(
+            should_retry_provider_error(
+                &retryable_error(),
+                false,
+                crate::provider::retry::MAX_PROVIDER_RETRIES
+            ),
+            None
+        );
+        // One below the cap still retries.
+        assert!(
+            should_retry_provider_error(
+                &retryable_error(),
+                false,
+                crate::provider::retry::MAX_PROVIDER_RETRIES - 1
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn test_should_retry_provider_error_ignores_non_retryable_errors() {
+        assert_eq!(
+            should_retry_provider_error(&MekaError::Provider("bad request".to_string()), false, 0),
+            None
+        );
+        assert_eq!(
+            should_retry_provider_error(
+                &MekaError::ContextOverflow("too long".to_string()),
+                false,
+                0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_should_retry_provider_error_uses_retry_after_hint() {
+        let error = MekaError::RetryableProvider {
+            message: "rate limited".to_string(),
+            retry_after: Some(std::time::Duration::from_secs(5)),
+        };
+        assert_eq!(
+            should_retry_provider_error(&error, false, 0),
+            Some(std::time::Duration::from_secs(5))
+        );
+    }
 
     #[test]
     fn test_empty_turn_notice_includes_unknown_stop_reason() {

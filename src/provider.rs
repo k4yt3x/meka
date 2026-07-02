@@ -10,6 +10,8 @@ pub mod cli;
 #[cfg(debug_assertions)]
 pub(crate) mod mock;
 pub(crate) mod openai;
+/// Backoff policy for retrying [`crate::error::MekaError::RetryableProvider`] failures.
+pub(crate) mod retry;
 
 use std::sync::Arc;
 

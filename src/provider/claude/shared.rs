@@ -465,6 +465,19 @@ pub(super) fn parse_non_streaming_response(
     ))
 }
 
+/// Whether a mid-stream Anthropic `event: error`'s `error.type` indicates a transient condition
+/// safe to retry. `overloaded_error` (529 capacity), `rate_limit_error`, and `api_error` are
+/// documented as retryable; everything else (invalid_request_error, authentication_error,
+/// permission_error, not_found_error, and any unrecognized type) defaults to *not* retryable —
+/// conservative on purpose, since retrying a permanent failure would just burn the retry budget
+/// before surfacing the real problem.
+fn is_retryable_claude_error_type(error_type: &str) -> bool {
+    matches!(
+        error_type,
+        "overloaded_error" | "rate_limit_error" | "api_error"
+    )
+}
+
 pub(super) async fn drive_claude_sse_stream(
     response: reqwest::Response,
     event_sender: mpsc::Sender<StreamEvent>,
@@ -472,11 +485,16 @@ pub(super) async fn drive_claude_sse_stream(
 ) -> Result<()> {
     let status = response.status();
     if !status.is_success() {
+        let retry_after = crate::error::parse_retry_after(response.headers());
         let response_text = response.text().await.unwrap_or_else(|error| {
             tracing::warn!("failed to read Claude error response body: {}", error);
             String::new()
         });
-        return Err(crate::error::provider_http_error(status, &response_text));
+        return Err(crate::error::provider_http_error(
+            status,
+            &response_text,
+            retry_after,
+        ));
     }
 
     let mut event_stream = response.bytes_stream().eventsource();
@@ -706,6 +724,42 @@ pub(super) async fn drive_claude_sse_stream(
                                 }
                             }
                             "ping" => {}
+                            // Anthropic can send this *after* the 200 response has already started
+                            // streaming (typically right after `message_start`, before any visible
+                            // content) — e.g. `overloaded_error` during a capacity spike. Previously
+                            // fell into the `other` catch-all below and was silently dropped,
+                            // making an overloaded turn look like it succeeded with truncated/empty
+                            // content. Forward it on the channel for visibility, then return the
+                            // classified error directly so the caller can decide whether to retry.
+                            "error" => {
+                                let error_type = data
+                                    .get("error")
+                                    .and_then(|error| error.get("type"))
+                                    .and_then(|kind| kind.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                let message = data
+                                    .get("error")
+                                    .and_then(|error| error.get("message"))
+                                    .and_then(|message| message.as_str())
+                                    .unwrap_or("stream error event")
+                                    .to_string();
+                                if event_sender
+                                    .send(StreamEvent::Error(message.clone()))
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::trace!("stream event receiver dropped");
+                                }
+                                return Err(if is_retryable_claude_error_type(&error_type) {
+                                    MekaError::RetryableProvider {
+                                        message,
+                                        retry_after: None,
+                                    }
+                                } else {
+                                    MekaError::Provider(message)
+                                });
+                            }
                             other => {
                                 tracing::debug!("unknown Claude SSE event: {}", other);
                             }
@@ -957,6 +1011,29 @@ where
 mod tests {
     use super::*;
     use crate::provider::ImageSource;
+
+    #[test]
+    fn test_is_retryable_claude_error_type() {
+        for retryable in ["overloaded_error", "rate_limit_error", "api_error"] {
+            assert!(
+                is_retryable_claude_error_type(retryable),
+                "{retryable} should be retryable"
+            );
+        }
+        for permanent in [
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "not_found_error",
+            "unknown",
+            "",
+        ] {
+            assert!(
+                !is_retryable_claude_error_type(permanent),
+                "{permanent} should not be retryable"
+            );
+        }
+    }
 
     #[test]
     fn test_convert_messages_serializes_input_image() {

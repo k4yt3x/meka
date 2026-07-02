@@ -9,8 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `/usage` command (REPL and ACP) shows account rate-limit windows for `claude-oauth` and `openai-codex`.
+- `/usage` command shows account rate-limit windows for `claude-oauth` and `openai-codex`.
 - `meka account usage` / `whoami` / `stats` CLI with `--format plain|json` for scripting.
+- Retry transient provider errors (429/5xx incl. 529) with bounded backoff, honoring `Retry-After`.
+
+### Fixed
+
+- Handle Claude's mid-stream `event: error` instead of silently dropping it.
 
 ## [0.29.4] - 2026-06-30
 
