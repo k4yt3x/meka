@@ -2,17 +2,224 @@
 
 Most upgrades are a binary swap: replace the old executable with the new one and carry on. This page covers the ones that are not.
 
+## Copying a store
+
+The store under `MEKA_DATA_DIR` runs in WAL mode, so the most recent writes, including a schema
+migration, can sit in `meka.db-wal` beside `meka.db` until SQLite checkpoints them. A copy that
+takes `meka.db` alone can therefore carry a schema version its tables have not caught up with.
+meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
+and `-shm` companions with the file, or run `PRAGMA wal_checkpoint(TRUNCATE)` on the source first.
+
+## 0.45 to 0.46
+
+The store migrates itself, as every release since 0.43 has. **`config.toml` does not**, and this
+release changes its shape: a `[providers.<name>]` profile is now an `[accounts.<name>]` table plus
+a `[profiles.<name>]` table, `default_provider` is `default_profile`, and the `ask` permission
+level is gone. A config in the old shape is refused at startup, naming the first key meka does not
+know, rather than read with a guess at what it meant. The conversion is a one-shot script,
+`migrate-0.45-to-0.46.py`, attached as an asset to the 0.46 release and kept under `scripts/` in the
+repository.
+
+Beyond the config shape, this release renames several tool parameters, changes a handful of HTTP
+fields and status codes, and makes ACP answer `InvalidParams` where it answered `InternalError`.
+Everything a client, a skill or a script could depend on is listed below under "What else changed"
+and "Tool parameters", each with its remedy. Run the script, launch once, and work down those two
+lists for anything you automated.
+
+### Order
+
+1. **Run the script against your config, first as a dry run, then with `--apply`.** It needs
+   Python 3.11 and the `tomlkit` package (`pip install tomlkit`), which is what lets it keep every
+   comment and the order of everything it does not touch.
+
+   ```bash
+   python3 migrate-0.45-to-0.46.py            # prints a diff; writes nothing
+   python3 migrate-0.45-to-0.46.py --apply    # rewrites config.toml in place
+   ```
+
+   It finds meka's config the way meka does, honoring `MEKA_CONFIG_DIR`; `--config PATH` points
+   it at a copy instead. `--self-test` checks the script against its own fixture and exits.
+2. **Install 0.46 and launch it once.** The store migrates on that open, behind an automatic copy
+   beside it named for the schema version it came from (`meka.db.v9.bak` for a store 0.45 left),
+   in nine ledger steps. The first creates the REPL's `prompt_history` table where a store lacks
+   one, a no-op otherwise. The other eight: `sessions.provider` becomes `sessions.profile`, and
+   `provider_credentials` becomes `account_credentials`, keyed by account, both renames of what
+   was always there; an `approvals` column is added, every `ask` session becomes `none` with it
+   on, and a root session that never recorded a level (one an ACP client created) adopts
+   `[permissions].default`; each stored turn's inline `<context>` preamble becomes its own
+   `turn_context` block; every image's bytes move out of its message row into `blobs`, leaving
+   a reference; every column and index takes one naming rule, with the JSON in two of them
+   following suit; a `repair` row's own thinking blocks take that rule's tag too, which the
+   step before it passed over; and a root session still without a level after all that takes
+   `[permissions].default`, which reaches a store that 0.46.0 migrated while its config could not
+   be read. Four of these walk every message row, so a store with years of
+   image-heavy sessions takes a moment on that first launch and grows a copy of the same size
+   beside it. A store restored from a `.dump` replays the whole ledger, and if no default profile
+   can be resolved when it does, the frozen 0.44 step warns with its old `--provider` advice; read
+   it as `--profile`.
+
+Run the script before you launch 0.46, not after. A `meka` launched against an unconverted config
+warns that it cannot read the file and then refuses whatever needed it; only the commands that
+edit it through `toml_edit` (`meka account remove`, `meka profile remove`, `meka mcp remove`) and
+the ones that read the store alone still run. The store migrates on that launch only if no step
+needs the file. A root session that never recorded a level needs `[permissions].default` from it,
+and a migration that cannot read the file refuses and rolls back rather than stamping nothing, so
+the store keeps its 0.45 shape until the launch after the script has run. 0.46.0 did the opposite,
+stamping no such row and never returning to it; a store it migrated that way gets the level on the
+first launch of this release that can read the file.
+
+### What the script converts
+
+| Before | After |
+|---|---|
+| `default_provider = "work"` | `default_profile = "work"` |
+| `[providers.work]` with `type`, `base_url`, `client_id`, `oauth_token_url`, `device_id` | `[accounts.work]` with `backend` in place of `type`, and the other four unchanged |
+| `[providers.work]` with `model`, `context_window`, `max_output_tokens`, `effort`, `vision`, `thinking`, `thinking_budget`, `max_request_bytes`, `redact_thinking` | `[profiles.work]` with `account = "work"` and the nine keys unchanged |
+| `[permissions].enabled` containing `"ask"` | `"none"` in its place |
+| `[permissions].default = "ask"` | `default = "none"` and `approvals = true` |
+| `[web].request_timeout_seconds = 30`, `connect_timeout_seconds`, `read_timeout_seconds` | `request_timeout = "30s"`, `connect_timeout`, `read_timeout`, by value; a `0`, which meant the default, is removed |
+| `[mcp].grace_seconds = 3`, `connect_timeout_seconds = 30` | `grace = "3s"`, `connect_timeout = "30s"`, by value; a `0` becomes `"0s"`, which `grace` accepts and `connect_timeout` refuses at startup |
+| `[mcp].strict` | `default_required`, same meaning |
+| `[session].retention_days = 30` | `retention = "30d"`, by value |
+| `[thinking].budget_tokens` | `budget`, same value |
+
+Every profile becomes one account and one profile of the same name, so nothing you named changes
+its name and every session still resolves. Two old profiles on one login stay two accounts with two
+copies of the credential; merge them by hand if you like, by pointing both profiles' `account` at
+one and running `meka account remove` on the other once nothing names it. A key the script does not
+know is carried into the profile table and reported, where meka will refuse it by name; a duration
+key whose value is not a whole number is left under its old name and reported, with the same result.
+
+### What else changed
+
+- **The `meka provider` suite is gone.** `meka account add`/`login`/`list`/`remove` manage
+  accounts and their credentials; `meka profile add`/`set`/`use`/`list`/`remove` manage profiles.
+  `meka account usage`/`whoami`/`stats` are where they were, and take `--profile <name>` instead of
+  a positional name. `account add` takes `--backend` where `provider add` took `--type`.
+- **The prompt is a flag.** `meka "text"` is `meka -p "text"`, and `-p -` reads the prompt from
+  stdin. There is no positional prompt, so `meka unknowncommand` is an error rather than a session.
+- **`--provider` is `--profile`**, long form only: `-p` is the prompt.
+- **`--format json` on a `--oneshot` run** prints one object for the turn; see [One-shot
+  mode](../usage/one-shot-mode.md#json-output).
+- **HTTP API**: the `provider` field on `POST /v1/sessions`, `PATCH /v1/sessions/{id}` and every
+  session response is `profile`, and `GET /v1/providers` is `GET /v1/profiles`, whose rows carry
+  `account` and `backend` in place of `type`. A session export archive's `provider` field is
+  `profile`, and its `format_version` is 2, so an archive written by 0.45 is refused by version;
+  re-export it from a migrated store.
+- **ACP**: the `configOptions` entry `provider` is `profile`.
+- **REPL**: `/provider` is `/profile`, and `/status` shows the profile with its account.
+- **One spelling per value.** `--permission` and `MEKA_PERMISSION` take a level's full name (`n`,
+  `r`, `w`, `u` are gone), and `--render-mode`, `MEKA_RENDER_MODE` and `[display].render_mode` take
+  `termimad`, `syntect` or `raw` (`rich` is gone). The flags and the config key refuse anything
+  else; the two variables warn and fall through to the next source, as they always have. The
+  undocumented `text` spelling of `--format plain` is gone too.
+- **A `[permissions].default` or `enabled` entry naming a level meka does not have is refused at
+  startup**, with the line, the way an unknown key is, instead of being dropped with a warning. The
+  script rewrites `ask`; anything else you spelled yourself.
+- **The `ask` permission level is gone**, replaced by the `approvals` switch beside the level: a
+  call above the level is refused, or put to you when the switch is on. `/approvals on|off` in the
+  REPL, `approvals` on `POST /v1/sessions` and `PATCH /v1/sessions/{id}`, and the ACP config option
+  of the same name set it; `[permissions].approvals` is what a new session starts with. The store
+  migration turns an `ask` session into `none` with approvals on, which asks about every call as
+  `ask` did. An approved call now runs *at the session's level*, so an approved write at `read`
+  lands only under the workspace roots where `ask` wrote anywhere; raise the level if an approved
+  call needs the reach. See [Permissions](../usage/permissions.md#approvals).
+- **A user message is two blocks.** What meka injects ahead of the words for a turn (permission
+  and environment context, todos, catalog changes, background outcomes, the resume notice) is its
+  own `turn_context` content block, first, and the words are a `text` block. `GET
+  /v1/sessions/{id}/messages` returns the block typed, so a client reading `content[0].text` as the
+  prompt now reads the context; take the `text` blocks. A migration splits every stored turn once.
+- **Image bytes live in a `blobs` table.** The migration moves every inline image out of its
+  message row and leaves a reference by content hash, so a screenshot read twice is stored once. A
+  session export carries a `blobs` list with the bytes its sessions reference, and an archive that
+  references a blob neither it nor the store holds is refused. Over HTTP an image block reports
+  `media_type` and `hash`, and `GET /v1/sessions/{id}/blobs/{hash}` serves the bytes.
+- **A scheduled job runs at its session's recorded level and nothing else.** The polling process's
+  own `--permission` no longer stands in for a session row that records no level; every surface
+  records one at creation, and the migration stamps the configured default on any older root row
+  that never got one. A sub-agent's row now records its level too.
+- **Every config duration is a humantime string.** `[web].request_timeout`, `connect_timeout` and
+  `read_timeout`, `[mcp].grace` and `connect_timeout`, `[session].retention` (`"30d"`); the script
+  converts the `_seconds` and `_days` keys by value, and `"0s"` is refused where zero is
+  meaningless. `[mcp].strict` is `default_required` and `[thinking].budget_tokens` is `budget`,
+  both converted.
+  `MEKA_MCP_STDIO_CONCURRENCY` and `MEKA_MCP_HTTP_CONCURRENCY` are gone: set
+  `[mcp].stdio_concurrency` and `http_concurrency` (3 and 20 by default, zero refused).
+  `MEKA_MCP_TOOL_TIMEOUT` takes a duration such as `10m`, not milliseconds; a bare number is
+  ignored with a warning and the default of ten minutes applies.
+- **One exact spelling per value, everywhere.** `--permission`, `--render-mode`,
+  `--sandbox-backend`, `--format` and `mcp add --transport` refuse case variants (`Read`, `JSON`),
+  `session export` and `GET /v1/sessions/{id}/export` drop the `md` alias of `markdown`, `mcp add
+  --auth` takes `oauth`, `client_credentials` or `client_credentials_jwt` as the `[auth]` block
+  spells them (the hyphenated forms are gone), and `[mcp].default_permission`, a server's
+  `permission` and `tool_permissions`, and `[tools].tool_permissions` refuse a level meka does not
+  have at startup, naming the line, where they warned and ignored it.
+- **HTTP API**: an unloaded session whose row records no level omits `permission` (it sent `""`);
+  every optional field is omitted rather than `null`, `display_summary` included; `GET
+  /v1/health/ready` reports `profile_configured` (was `provider_configured`); the
+  `permission_required` event carries `input` and stays answerable for 30 minutes (was 60 seconds);
+  a body that fails to parse says which field on every endpoint; `POST
+  /v1/sessions/{id}/responses/{request_id}` at a sub-agent's id answers 422 `session-not-drivable`;
+  a fork of a session another meka process holds answers 409 `session-locked`; a session's `title`
+  is the first user words with whitespace collapsed, cut at 80 characters, and `meka session show`
+  labels it `title` (was `opening`). Four status codes move: a `[web]` or `base_url`
+  misconfiguration is a sanitized 500 (was a 422 naming the operator's path), and a session lock
+  meka cannot open is 500 (was 409 `session-locked`); meka's own request-ceiling refusal is 422
+  with the new `type` `request-too-large` (was 502 `provider`); `GET` and `PATCH
+  /v1/sessions/{id}` answer 404 or 500 for a row they cannot read (was 200 with `profile: ""`);
+  and `POST /v1/sessions/{id}/schedule` with scheduling disabled is 404 (was 422).
+- **ACP**: a locked session, a sub-agent's id, a profile the config no longer has and every other
+  refusal the caller can act on answer `InvalidParams` (was `InternalError`);
+  `session/set_config_option` refuses a profile switch while a turn is in flight instead of writing
+  the row and deferring; `session/new`, `load`, `resume` and `fork` refuse a `cwd` that is not an
+  existing directory and record it canonically; tool-call and permission titles read `<DisplayName>
+  <argument>` (`ReadFile src/x`) and permission requests carry `rawInput` with a JSON content block.
+- **Terminal output**: every timestamp is local time with its UTC offset (`2026-09-07 14:03
+  +02:00`), sizes print as MiB, KiB or B, and every listing command takes `--format json`, printing
+  the HTTP API's record shapes. The approval prompt is headed `[approval]` and takes `always` and
+  `never`.
+- **Skills you wrote** that name a renamed tool parameter (next table) or the old `[ask]` prompt
+  must be edited by hand; meka does not rewrite skill files.
+
+### Tool parameters
+
+Six built-in tool parameters are renamed so that one name means one thing across the catalog:
+`is_regex` for a boolean, `glob` for a glob, `limit` for a result cap, `id` for an identifier.
+
+| Tool | Before | After |
+|---|---|---|
+| `conversation_search` | `regex` (boolean) | `is_regex` |
+| `conversation_read` | `count` | `limit` |
+| `find_files` | `pattern` | `glob` |
+| `fetch_url` | `max_length` | `limit` |
+| `agent_followup` | `agent` | `id` |
+| `agent_delete` | `agent` | `id` |
+
+A call spelling the old name is missing its required parameter (`glob`, `id`) or, where the
+parameter was optional, has it ignored in favor of the default. `search_contents` gains a `limit`
+(1 to 100, default 100) beside its unchanged `pattern`.
+
+meka does not rewrite what names these. A skill under the skills directory
+(`~/.config/meka/skills/<name>/SKILL.md`) that spells out a `find_files` or `agent_followup` call
+must be edited by hand, and a scheduled job whose gate calls one of these tools with the old
+argument must be recreated. Past calls in a session's history keep the old names, which is
+harmless: the model reads the current schema on its next turn.
+
+The sections below predate 0.46 and use its old names: `--provider` is `--profile`, `meka provider
+…` is `meka account …` and `meka profile …`, the positional prompt is `-p`, and the `ask` level is
+`none` with approvals on.
+
 ## 0.43 to 0.44
 
 A binary swap, and the store migrates itself as promised below, **unless you authenticate an MCP
 server with `auth_token` or `client_secret`**, which are no longer config keys. Read the next
-section first if you do; meka will refuse to start otherwise. Then the behaviour changes below,
+section first if you do; meka will refuse to start otherwise. Then the behavior changes below,
 worth reading before you resume an existing session or run a scripted `meka`, several of which apply
 only if you run `meka serve` or `meka acp`.
 
 **MCP secrets moved out of `config.toml`.** `auth_token` on a server, and `client_secret` in a
 `[mcp.servers.auth]` block, are gone. Both were secrets sitting in a plaintext file people commit
-and sync; they now live in meka's database beside the OAuth tokens, which is where provider
+and sync; they now live in the store beside the OAuth tokens, which is where the login
 credentials have always been.
 
 meka cannot move them for you. The store migrates itself because it has a ledger recording what it
@@ -39,7 +246,7 @@ unknown field `auth_token`, expected one of `name`, `transport`, …
 
 Two messages because two things are stuck: the file will not parse, and the migration that has to
 name a profile for your existing sessions cannot ask it which one. Fixing the file fixes both, and
-nothing has been written in the meantime -- "The store is unchanged" is literal, and the copy taken
+nothing has been written in the meantime: "The store is unchanged" is literal, and the copy taken
 before the attempt is still beside your store. (On an installation with no sessions to carry
 forward, only the parse error appears.)
 
@@ -69,60 +276,60 @@ expansion, because they configure a process or a request and merely *may* contai
 
 **`isolated` scheduled jobs are gone; every job fires in the session that created it.** The mode ran
 a job's turn in a fresh session rather than the conversation that made it, to avoid replaying that
-conversation's history. Only `meka serve` ever honoured it: the REPL and ACP already ran such a job
+conversation's history. Only `meka serve` ever honored it: the REPL and ACP already ran such a job
 in the open conversation, with a warning, so for two of the three hosts nothing changes at all.
 
 Existing jobs are not deleted and do not need touching. The store drops the column and the job keeps
 its schedule and its prompt, firing into the session it belongs to from then on.
 
 What it cost is why it went. The fire inherited the creating session's authority (its permission
-level, its working directory, its provider profile, its MCP servers) and dropped the conversation,
+level, its working directory, its profile, its MCP servers) and dropped the conversation,
 which is where anything you told the agent that never reached a memory or an instructions file
 lives. Its result landed in a session nothing linked to, and the turn could not even cancel its own
 job, because `schedule_cancel` resolves against the session it is running in.
 
-`meka acp` and `meka serve` clients: `POST /v1/sessions/{id}/schedule` now rejects `isolated` with a
+`meka acp` and `meka serve` clients: `POST /v1/sessions/{id}/schedule` now refuses `isolated` with a
 422 naming the field, rather than accepting and ignoring it. `GET /v1/schedule` and the
 `schedule.fired` webhook no longer carry it either.
 
 If you were relying on the mode, an external timer does the same job with the level and profile
-stated outright instead of inherited:
+stated outright instead of inherited (0.44 syntax):
 
 ```bash
-meka --oneshot --permission read --provider work "summarise today's alerts"
+meka --oneshot --permission read --provider work "summarize today's alerts"
 ```
 
 Often a gate is the better answer: it means a frequent job takes no turn at all on the ticks where
 nothing happened, which saves more than skipping the history did.
 
 **A session another one spawned is driven only by its parent.** `POST /v1/sessions/{id}/turn`
-answers 422 for a sub-agent's id, `meka -r <worker-id>` refuses by name, and a scheduled fire aimed
+answers 422 for a sub-agent's id, `meka -r <sub-agent-id>` refuses by name, and a scheduled fire aimed
 at one does the same. Both agent builders now check, rather than the scheduling door alone.
 
-What this closes is that a worker's restrictions live in its spawn record, which those builders
+What this closes is that a sub-agent's restrictions live in its spawn record, which those builders
 never read: the `[subagents]` denials it was created under, its memory and instruction grants, and
 the permission ceiling its spawn call set. Driving one from a host therefore ran a conversation that
 was *deliberately given narrow tools* with the full built-in set at the host's level. `agent_followup`
 was and remains the door that reconstructs those terms, so nothing meka does for you changes.
 
-Reading a worker is untouched: `meka session export`, `GET /v1/sessions/{id}/messages` and
+Reading a sub-agent is untouched: `meka session export`, `GET /v1/sessions/{id}/messages` and
 `meka session list --include-children` all still serve it.
 
 **Forking one does not promote it**, and that is the other half of the change. A fork of a sub-agent
 now carries `parent_session_id` and the spawn terms, so the copy is a sibling under the same parent
 rather than a new root; without that, `POST /v1/sessions/{id}/fork` was a one-call way around the
-refusal above, handing back a live session over a worker's whole conversation with none of the terms
+refusal above, handing back a live session over a sub-agent's whole conversation with none of the terms
 it was spawned under. The two doors that have to hand back a *live* session therefore refuse a
 sub-agent's id up front: `POST /v1/sessions/{id}/fork` answers 422, and ACP's `session/fork` answers
 `InvalidParams`. `meka session fork` still makes the copy: it takes no runtime, and the copy is
-readable like any other worker. Forking an ordinary session is unchanged. If you want a worker's conversation as a top-level session of your own, copy
+readable like any other sub-agent. Forking an ordinary session is unchanged. If you want a sub-agent's conversation as a root session of your own, copy
 the text out rather than expecting a command to promote it.
 
 **`meka session list --long` is gone**, along with the columns it showed. If a script parses that
 output, it needs updating; the default columns are unchanged.
 
 **`/cd` with no argument returns to the directory meka was launched from**, not `$HOME`. `/cd ~`
-still goes home. The old behaviour made a bare `/cd` a surprising way to leave the project you were
+still goes home. The old behavior made a bare `/cd` a surprising way to leave the project you were
 working in.
 
 **`render_mode = "silent"` is gone**, as are `--render-mode silent` and `MEKA_RENDER_MODE=silent`.
@@ -130,7 +337,7 @@ Delete the setting: `termimad` is the default.
 
 A config still carrying it fails to parse, naming the value and the line, and `--render-mode silent`
 is refused by clap. `MEKA_RENDER_MODE=silent` is the quiet one: an unreadable value there has always
-been dropped in favour of the next source, so it falls through to your config file or the default
+been dropped in favor of the next source, so it falls through to your config file or the default
 rather than saying anything.
 
 It never did what it says. It suppressed the model's answer and nothing else, so a run under it
@@ -153,13 +360,13 @@ Leave `supports_reasoning_stream` off if you would rather have the retry.
 
 **`meka session delete` refuses ids given alongside `--all`.** It used to take both and quietly do
 the wider thing, so `meka session delete "$ID" --all` with `$ID` unset deleted every session and
-then reported the empty id as a failure -- a complete wipe reported as an error. Naming sessions and
+then reported the empty id as a failure: a complete wipe reported as an error. Naming sessions and
 asking for all of them are two different requests; say one or the other. `--older-than-days` has
 conflicted with both for the same reason since 0.44.
 
 **Every command taking a session, job or task id now accepts a unique prefix of one**, which is what
 the listings print. Full ids still work, so nothing that already worked stops. An ambiguous prefix
-is refused with the candidates named, and an empty one matches nothing rather than the only row --
+is refused with the candidates named, and an empty one matches nothing rather than the only row:
 `meka schedule cancel "$JOB"` with `$JOB` unset used to cancel whatever job was alone.
 
 **`meka mcp logout <name>` clears every credential that server holds**, not only its OAuth tokens.
@@ -169,27 +376,27 @@ secret, you will now need to store that again with `meka mcp login`.
 **A scheduled job is refused on a sub-agent session.** `POST /v1/sessions/{id}/schedule` answers 422
 if the session was spawned by another. Sub-agents never had the `schedule_*` tools, so no job meka
 created can be affected; what this closes is a client planting one directly, which would have woken
-the worker without the tool restrictions or memory grants it was spawned under.
+the sub-agent without the tool restrictions or memory grants it was spawned under.
 
 **ACP `session/load` and `session/resume` refuse a sub-agent's id.** Both used to take the session's
 lock, rewrite its `cwd`, retire its background work and replace its roots before failing with
 `Internal error`; both now decline with `InvalidParams` before touching anything, naming the parent
-to use `agent_followup` from. An editor that stored a worker's id from `session/list` gets a clear
+to use `agent_followup` from. An editor that stored a sub-agent's id from `session/list` gets a clear
 refusal instead of a mutated row and an opaque failure. Over HTTP the same holds for every write-side
-endpoint: `POST /v1/sessions/{id}/turn` and its neighbours refuse before taking the worker's lock or
+endpoint: `POST /v1/sessions/{id}/turn` and its neighbours refuse before taking the sub-agent's lock or
 marking its background tasks interrupted.
 
 **A session that carries spawn terms is refused even when its parent is not in the store.** That
-shape has one source, and it is a pair of documented commands: `meka session export <worker>
+shape has one source, and it is a pair of documented commands: `meka session export <sub-agent>
 --format json` followed by `meka session import`. The archive's `parent_id` points outside it, so the
 import re-roots the row while copying the spawn terms faithfully. The result reads as a sub-agent's
 conversation to every door, so `meka -r` on it, and `POST /turn`, `/fork`, `/schedule` and `PATCH`
 against it over HTTP, all refuse. `meka -c` skips it and `meka session list` shows it only under
 `--include-children`, both so nothing offers you a session it will then decline. **If you were using
-export-then-import to promote a worker into a standalone session, that no longer works**; there is
-no supported replacement, because the tools and permission ceiling a worker ran under live in the
+export-then-import to promote a sub-agent into a standalone session, that no longer works**; there is
+no supported replacement, because the tools and permission ceiling a sub-agent ran under live in the
 terms its parent set and nothing outside that parent can reconstruct them. The conversation itself
-stays fully readable, and importing a *whole tree* -- the root and its workers together -- is
+stays fully readable, and importing a *whole tree* (the root and its sub-agents together) is
 unaffected, since each child keeps its parent.
 
 **This upgrade deletes the pre-migration copy 0.43 left, and keeps one from now on.** Before it
@@ -222,7 +429,7 @@ every other surface already read the row, and these two were the ones that did n
 `--permission` on the resume to move it. A level that is no longer in `[permissions].enabled` is not
 granted: the session drops to the configured default with a warning.
 
-**A session now runs on the provider profile it was created with.** Every existing session is
+**A session now runs on the profile it was created with.** Every existing session is
 recorded as running on your current default profile, which is what they were in fact running on, so
 nothing moves. From here `meka -p openai` then `meka -c` stays on `openai`. If nothing could be
 resolved when the migration ran (no profile configured yet), sessions are left without one and say
@@ -237,10 +444,10 @@ always handed the same text to its client, so withholding it on HTTP left the te
 while making the one surface quieter. What it cost was the upstream's error type, which is the one
 part of a failed turn a client can act on.
 
-**Know who can read it before you leave it on.** An upstream refusal can name your provider account,
-your organisation, and your rate-limit posture. Submitting a turn takes `sessions:w`, but the
+**Know who can read it before you leave it on.** An upstream refusal can name your account with the provider,
+your organization, and your rate-limit posture. Submitting a turn takes `sessions:w`, but the
 failure is also carried by the terminal `turn.failed` event, and re-attaching to a stream takes only
-`sessions:r` -- so a read-only token sees it too. If you issue read-only tokens to people who may
+`sessions:r`, so a read-only token sees it too. If you issue read-only tokens to people who may
 observe a session but are not entitled to the account behind it, set `[serve]
 relay_provider_errors = false`. Nothing else changes: `detail` carries the same sentence either way,
 and with the key off the member is simply absent.
@@ -267,13 +474,13 @@ Nothing is needed from you: an appended step recreates the table and carries the
 into it, because a store already stamped past the missed step is only reachable by appending.
 Released 0.43 stores were never affected; they sit at the baseline and migrate straight through.
 
-**`--model`, `--base-url`, `--thinking` and `--thinking-budget` are gone.** A provider profile is an
+**`--model`, `--base-url`, `--thinking` and `--thinking-budget` are gone.** A profile is an
 indivisible bundle: the backend, the endpoint, the credential keyed to it, the model, and every
 model-tied setting. A session selects one by name and records that name. A flag that moved one field
 of the bundle left the rest behind, so `--model` against a profile stating `context_window = 1000000`
 ran a 200K model while gauging its context against a 1M window, and never auto-compacted.
 
-Change a setting on the profile:
+Change a setting on the profile (0.44 syntax):
 
 ```bash
 meka provider set work model claude-opus-5
@@ -282,7 +489,7 @@ meka provider set work effort --unset
 
 Or make a second profile and select it with `--provider`, which is now the only provider flag on a
 run. `meka provider add` has a flag for every profile field except `device_id`, which meka resolves
-and persists itself, so one command creates a whole profile:
+and persists itself, so one command creates a whole profile (0.44 syntax):
 
 ```bash
 printf '%s' "$ANTHROPIC_API_KEY" | meka provider add fast \
@@ -323,7 +530,7 @@ Before it writes anything, meka copies the store to `meka.db.v1.bak` beside it. 
 
 The whole thing is one transaction, so an interruption leaves the store exactly as it was rather than half-converted. Running two hosts at once is fine: the first takes the schema lock and the second waits, then finds nothing to do.
 
-**Coming from 0.41 or older**, run `migrate-0.41-to-0.42.py` once first, as described below. 0.43 recognises a 0.41-shaped store and refuses it by name rather than converting it into something still unreadable, and it changes nothing when it does.
+**Coming from 0.41 or older**, run `migrate-0.41-to-0.42.py` once first, as described below. 0.43 recognizes a 0.41-shaped store and refuses it by name rather than converting it into something still unreadable, and it changes nothing when it does.
 
 ### A gate that cannot be read
 
@@ -340,7 +547,7 @@ This one stays a script, and 0.43's own store migration does not replace it: 0.4
 ### Order
 
 1. **Run 0.41 once, before you replace it.** It brings a store from an older release fully up to date; 0.42 carries no migration code and cannot.
-2. **Install 0.42 and launch it once.** This is what creates the tables the script writes into, so it is not an arbitrary step you can move: run the script against a database that predates 0.42 and it stops with an explanation rather than guessing.
+2. **Install 0.42 and launch it once.** This is what creates the tables the script writes into, so it is not an arbitrary step you can move: run the script against a store that predates 0.42 and it stops with an explanation rather than guessing.
 3. **Run the script**, first as a dry run, then with `--apply`.
 
 ```bash
@@ -354,14 +561,14 @@ The dry run is the only place to read that. Its per-class counts and its warning
 
 Between steps 2 and 3 the store is live but incomplete: memories are absent from the agent's index, and any session affected by conversion E below is already broken. Step 3 is part of the upgrade rather than cleanup to get to later.
 
-The script finds meka's own directories by default, honouring `MEKA_CONFIG_DIR` and `MEKA_DATA_DIR`; `--root`, `--skills-root` and `--database` point it at a copy instead. `--self-test` checks the script against its own fixtures and exits, touching nothing of yours.
+The script finds meka's own directories by default, honoring `MEKA_CONFIG_DIR` and `MEKA_DATA_DIR`; `--root`, `--skills-root` and `--database` point it at a copy instead. `--self-test` checks the script against its own fixtures and exits, touching nothing of yours.
 
 ### What it converts
 
 | Conversion | What it changes | If you skip it |
 |---|---|---|
-| **A.** Memories | The Markdown files under `<config>/memory/` become rows in the database's `memories` table, which is where 0.42 reads memories from. The files are read, never written or deleted. | The memories are simply not there. The files are untouched on disk, so nothing is lost and the import still works whenever you get to it. |
-| **B.** Thinking blocks | A stored block's bare `signature` becomes an `opaque` object naming which provider it belongs to: `signed` for a Claude signature, `sealed` for OpenAI's encrypted reasoning. 0.41 wrote both to the same field and recorded nothing about which was which, so the script tells them apart by the shape of the blob and **reports the counts before it writes**. A blob it does not recognise is left exactly as it is. | The block loses its opaque half, so that reasoning stops being replayed to the provider. The session still loads and still runs; it just resumes without the chain of thought behind those turns. |
+| **A.** Memories | The Markdown files under `<config>/memory/` become rows in the store's `memories` table, which is where 0.42 reads memories from. The files are read, never written or deleted. | The memories are simply not there. The files are untouched on disk, so nothing is lost and the import still works whenever you get to it. |
+| **B.** Thinking blocks | A stored block's bare `signature` becomes an `opaque` object naming which provider it belongs to: `signed` for a Claude signature, `sealed` for OpenAI's encrypted reasoning. 0.41 wrote both to the same field and recorded nothing about which was which, so the script tells them apart by the shape of the blob and **reports the counts before it writes**. A blob it does not recognize is left exactly as it is. | The block loses its opaque half, so that reasoning stops being replayed to the provider. The session still loads and still runs; it just resumes without the chain of thought behind those turns. |
 | **C.** A skill's `version:` / `author:` | Both move from the top level of a `SKILL.md`'s frontmatter under `metadata:`, keeping their names, which is where the Agent Skills spec puts them. | Nothing. meka reads a top-level `version:` and `author:` permanently, because Claude Code's plugin skills declare `version:` there. This conversion is cosmetic. |
 | **D.** A skill's `priority:` | Moves under `metadata:` **and is renamed** to `meka-priority:`. | The skill silently drops to the default rank of 5. A rank is read from `metadata.meka-priority` and nowhere else, so the `[Skills]` index comes out in a different order and its cap drops different skills. Nothing warns. |
 | **E.** A stored `tool_result` | Content held as a bare JSON string becomes a list of typed blocks, `[{"type": "text", "text": ...}]`. | The affected session breaks. The row will not deserialize, so it is dropped as the session loads, which orphans the `tool_use` it answered, and the provider then refuses the next turn. |

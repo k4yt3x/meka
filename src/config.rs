@@ -2,16 +2,28 @@
 //! variables on top, and produces a [`ResolvedConfig`] that the rest of the binary consumes.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    cli::Cli,
+    fs::*,
+    paths::{config_file_path, expand_user_path, meka_config_dir},
     permission::{EnabledPermissions, Permission},
-    render::{RenderMode, ToolParams},
+};
+
+/// Accounts and profiles: the `backend` vocabulary, an account and a profile as written and a
+/// profile as resolved through its account, and which profile a run selects.
+mod profile;
+
+#[cfg(test)]
+pub(crate) use profile::PROFILE_KEY_ORDER;
+pub(crate) use profile::{
+    AccountConfig, Backend, ProfileConfig, ProfileRequest, ProfileSettings, account_for,
+    default_profile_on_disk, require_profile, resolve_device_id, resolve_profile, select_profile,
+    sort_account_keys, sort_profile_keys, validate_max_output_tokens,
 };
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
@@ -19,27 +31,31 @@ use crate::{
 /// `resolve_config` merges it with CLI flags and env vars to produce a [`ResolvedConfig`].
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ConfigFile {
-    /// Name of the profile to use when no `--provider` flag is given.
-    pub default_provider: Option<String>,
-    /// Named provider profiles, parsed from `[providers.<name>]`. Each pins a backend `type` plus
-    /// non-secret settings; credentials live in the DB, not here.
+pub(crate) struct ConfigFile {
+    /// Name of the profile to use when no `--profile` flag is given.
+    pub(crate) default_profile: Option<String>,
+    /// Named accounts, parsed from `[accounts.<name>]`. Each pins a `backend` plus the endpoint
+    /// and OAuth settings a login needs; credentials live in the DB keyed by the account name.
     #[serde(default)]
-    pub providers: std::collections::BTreeMap<String, ProviderProfile>,
-    pub display: Option<DisplayConfig>,
-    pub web: Option<WebConfig>,
-    pub shell: Option<ShellConfig>,
-    pub session: Option<SessionConfig>,
-    pub thinking: Option<ThinkingConfig>,
-    pub mcp: Option<McpConfig>,
-    pub tools: Option<ToolsConfig>,
-    pub skills: Option<SkillsConfig>,
-    pub memory: Option<MemoryConfig>,
-    pub permissions: Option<PermissionsConfig>,
-    pub schedule: Option<ScheduleConfig>,
-    pub background: Option<BackgroundConfig>,
-    pub subagents: Option<SubagentsConfig>,
-    pub serve: Option<ServeConfig>,
+    pub(crate) accounts: std::collections::BTreeMap<String, AccountConfig>,
+    /// Named profiles, parsed from `[profiles.<name>]`. Each names an account plus the model and
+    /// every model-tied setting.
+    #[serde(default)]
+    pub(crate) profiles: std::collections::BTreeMap<String, ProfileConfig>,
+    pub(crate) display: Option<DisplayConfig>,
+    pub(crate) web: Option<WebConfig>,
+    pub(crate) shell: Option<ShellConfig>,
+    pub(crate) session: Option<SessionConfig>,
+    pub(crate) thinking: Option<ThinkingConfig>,
+    pub(crate) mcp: Option<McpConfig>,
+    pub(crate) tools: Option<ToolsConfig>,
+    pub(crate) skills: Option<SkillsConfig>,
+    pub(crate) memory: Option<MemoryConfig>,
+    pub(crate) permissions: Option<PermissionsConfig>,
+    pub(crate) schedule: Option<ScheduleConfig>,
+    pub(crate) background: Option<BackgroundConfig>,
+    pub(crate) subagents: Option<SubagentsConfig>,
+    pub(crate) serve: Option<ServeConfig>,
 }
 
 /// `[skills]` table: the user-authored skill store ([`crate::skills`]).
@@ -49,28 +65,28 @@ pub struct ConfigFile {
 /// rendering, for an installation that never uses skills.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct SkillsConfig {
-    pub enabled: Option<bool>,
+pub(crate) struct SkillsConfig {
+    pub(crate) enabled: Option<bool>,
     /// Whether the agent may author skills, adding `skill_write` and `skill_delete` to its
     /// registry. Default `false`.
     ///
     /// Off by default because for the ordinary terminal session the human authors and curates
     /// skills, and an agent rewriting that store is not something the user asked for. It earns its
-    /// keep in the opposite deployment: a long-running dispatcher that spawns workers, where a
+    /// keep in the opposite deployment: a long-running dispatcher that spawns sub-agents, where a
     /// skill is the only artifact that both outlives the session and can be handed to a sub-agent
-    /// as its task, so writing one is how the agent gets a refined worker brief to the next worker
-    /// without routing it through its own context window.
+    /// as its task, so writing one is how the agent gets a refined sub-agent brief to the next
+    /// sub-agent without routing it through its own context window.
     ///
     /// Never granted to a sub-agent whatever this says; see the registration site in
     /// [`crate::tools`].
-    pub agent_managed: Option<bool>,
+    pub(crate) agent_managed: Option<bool>,
     /// Additional directories to scan for skills, **read-only**. Default empty.
     ///
     /// meka writes only to its own `skills/` directory under the config dir; these roots are never
     /// created and never written to, so listing one that does not exist costs nothing and leaves
-    /// no trace. That is what makes it safe to point at a shared location like
-    /// `~/.agents/skills`, which other Agent Skills clients populate: meka reads what is
-    /// already there rather than putting anything in `$HOME` itself.
+    /// no trace. That is what makes it safe to point at a shared location like `~/.agents/skills`,
+    /// which other Agent Skills clients populate: meka reads what is already there rather than
+    /// putting anything in `$HOME` itself.
     ///
     /// Empty by default, and deliberately not defaulted to the cross-client convention: whether a
     /// directory outside meka's own namespace should be read is the user's call, not meka's.
@@ -78,7 +94,7 @@ pub struct SkillsConfig {
     /// A leading `~` is expanded (see [`expand_user_path`]). A relative path is resolved against
     /// the process working directory, which is why nothing here is scanned implicitly: meka does
     /// not auto-trust the cwd, so a project's skills are read only when a path names them.
-    pub extra_paths: Option<Vec<String>>,
+    pub(crate) extra_paths: Option<Vec<String>>,
 }
 
 /// `[schedule]` table: agent-created wakeups ([`crate::schedule`]).
@@ -89,24 +105,24 @@ pub struct SkillsConfig {
 /// so existing jobs stay on disk without firing.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ScheduleConfig {
-    pub enabled: Option<bool>,
+pub(crate) struct ScheduleConfig {
+    pub(crate) enabled: Option<bool>,
     /// How often the scheduler looks for due jobs. Accepts humantime strings like `"10s"`, `"1m"`.
     /// Default `"10s"`. This is the real resolution floor: a job with a shorter interval fires
     /// once per tick, not once per interval.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub poll_interval: Option<std::time::Duration>,
+    pub(crate) poll_interval: Option<std::time::Duration>,
     /// How late a *one-shot* job may be and still fire after downtime. Accepts humantime strings
     /// like `"24h"`. Default `"24h"`.
     ///
     /// Recurring jobs need no equivalent: their occurrences are one period apart, so the most
     /// recent missed one is always less than a period old, and the scheduler coalesces the rest.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub missed_grace: Option<std::time::Duration>,
+    pub(crate) missed_grace: Option<std::time::Duration>,
     /// Wall-clock budget for a gate probe. Accepts humantime strings like `"30s"`. Default
     /// `"30s"`. A gate that overruns is a failure, not a silent skip.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub gate_timeout: Option<std::time::Duration>,
+    pub(crate) gate_timeout: Option<std::time::Duration>,
     /// How long a host's claim on an occurrence is good for. Default `"1h"`.
     ///
     /// The window in which a crashed host's job is nobody's, so it is the delay before another
@@ -117,57 +133,33 @@ pub struct ScheduleConfig {
     /// realistic turn and still short enough that a machine which rebooted overnight has caught
     /// up by morning.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub claim_lease: Option<std::time::Duration>,
+    pub(crate) claim_lease: Option<std::time::Duration>,
     /// Ceiling on jobs per session, refused at `schedule_create`. Default 50.
-    pub max_jobs: Option<usize>,
+    pub(crate) max_jobs: Option<usize>,
     /// How many of one session's jobs may spend a turn in a single sweep. Default 5. Jobs past it
     /// keep their occurrence and fire on the next sweep.
-    pub max_consecutive_fires: Option<usize>,
+    pub(crate) max_consecutive_fires: Option<usize>,
 }
 
 /// [`ScheduleConfig`] with every default filled in.
 #[derive(Debug, Clone)]
-pub struct ResolvedScheduleConfig {
-    /// Where a gate's tool probe is dispatched, or `None` in a process that cannot dispatch one.
-    ///
-    /// Carried here rather than threaded separately because this struct already reaches every
-    /// scheduler site and both gate doors, and already holds two other things that are not
-    /// configuration (`host_permission`, `enabled_permissions`) for the same reason. `None` makes
-    /// a tool gate decline, which is the same answer a disconnected server gets.
-    pub gate_tools: Option<std::sync::Arc<dyn crate::schedule::GateTools>>,
-    pub enabled: bool,
-    /// The permission level of the process running the scheduler.
-    ///
-    /// The **fallback** for a session row that carries no per-session level: the REPL and ACP
-    /// paths derive theirs from process config, so for those the host's level is the session's
-    /// level.
-    ///
-    /// Not a ceiling. `meka serve --permission read` does not stop a job whose own row carries a
-    /// higher level, because every session `serve` creates records its own; the host's level only
-    /// answers for a row that has none.
-    ///
-    /// Deliberately *not* a ceiling. `--permission` on `meka serve` is a starting default, and
-    /// every session `serve` itself creates persists a level of its own, so restarting at `read`
-    /// does not disarm a gate an `unrestricted` session authored. What does bound it is
-    /// `enabled_permissions` below, which the operator can only narrow in `config.toml` and which
-    /// no session can exceed.
-    pub host_permission: crate::permission::Permission,
-    /// The modes this installation permits at all.
+pub(crate) struct ResolvedScheduleConfig {
+    pub(crate) enabled: bool,
+    /// The levels this installation permits at all.
     ///
     /// The fire-time gate check reads a session's recorded level straight out of the row, and a
-    /// row outlives the configuration that produced it. Without this, narrowing
-    /// `[permissions].enabled` and restarting left an `unrestricted` row firing its gate
-    /// forever while the live session re-attached at `read` -- verified end to end, and the
-    /// exact fail-open the live re-check was added to prevent, reached from the one of five
-    /// readers that did not apply the filter.
-    pub enabled_permissions: crate::permission::EnabledPermissions,
-    pub poll_interval: std::time::Duration,
-    pub missed_grace: std::time::Duration,
-    pub gate_timeout: std::time::Duration,
+    /// row outlives the configuration that produced it. Without this filter, narrowing
+    /// `[permissions].enabled` and restarting would leave an `unrestricted` row firing its gate
+    /// forever while the live session re-attaches at `read`: the exact fail-open the live re-check
+    /// exists to prevent, reached from the one reader that did not apply it.
+    pub(crate) enabled_permissions: crate::permission::EnabledPermissions,
+    pub(crate) poll_interval: std::time::Duration,
+    pub(crate) missed_grace: std::time::Duration,
+    pub(crate) gate_timeout: std::time::Duration,
     /// See [`ScheduleConfig::claim_lease`].
-    pub claim_lease: std::time::Duration,
-    pub max_jobs: usize,
-    pub max_consecutive_fires: usize,
+    pub(crate) claim_lease: std::time::Duration,
+    pub(crate) max_jobs: usize,
+    pub(crate) max_consecutive_fires: usize,
 }
 
 impl ResolvedScheduleConfig {
@@ -193,16 +185,10 @@ impl ResolvedScheduleConfig {
 
     fn resolve(
         raw: Option<ScheduleConfig>,
-        host_permission: crate::permission::Permission,
         enabled_permissions: crate::permission::EnabledPermissions,
     ) -> Self {
         let raw = raw.unwrap_or_default();
         Self {
-            // Attached by whichever host built the process's tool stack; `resolve` runs before that
-            // exists. A config that never receives one declines tool gates, which is correct for a
-            // process that genuinely cannot dispatch them.
-            gate_tools: None,
-            host_permission,
             enabled_permissions,
             enabled: raw.enabled.unwrap_or(true),
             poll_interval: raw.poll_interval.unwrap_or(Self::DEFAULT_POLL_INTERVAL),
@@ -218,16 +204,10 @@ impl ResolvedScheduleConfig {
 }
 
 impl Default for ResolvedScheduleConfig {
-    /// `None` for the host level, which is the most restrictive: a default-constructed config is a
-    /// test fixture or a caller that never said, and neither should be able to run a gate.
     fn default() -> Self {
         // `DEFAULT` for the enabled set rather than something narrower: it can only ever *narrow*
-        // what a row already recorded, and `from_modes` guarantees a non-empty set anyway.
-        Self::resolve(
-            None,
-            crate::permission::Permission::None,
-            crate::permission::EnabledPermissions::DEFAULT,
-        )
+        // what a row already recorded, and `from_levels` guarantees a non-empty set anyway.
+        Self::resolve(None, crate::permission::EnabledPermissions::DEFAULT)
     }
 }
 
@@ -243,17 +223,17 @@ impl Default for ResolvedScheduleConfig {
 /// reachable from any tool call, so an agent will reach for it unprompted.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct BackgroundConfig {
-    pub enabled: Option<bool>,
+pub(crate) struct BackgroundConfig {
+    pub(crate) enabled: Option<bool>,
     /// Ceiling on tasks running at once per session, refused at dispatch. Default 10.
-    pub max_tasks: Option<usize>,
+    pub(crate) max_tasks: Option<usize>,
 }
 
 /// [`BackgroundConfig`] with every default filled in.
 #[derive(Debug, Clone)]
-pub struct ResolvedBackgroundConfig {
-    pub enabled: bool,
-    pub max_tasks: usize,
+pub(crate) struct ResolvedBackgroundConfig {
+    pub(crate) enabled: bool,
+    pub(crate) max_tasks: usize,
 }
 
 impl ResolvedBackgroundConfig {
@@ -283,329 +263,34 @@ impl Default for ResolvedBackgroundConfig {
 /// schemas out of every request, which is the point for someone running lean coding sessions.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct MemoryConfig {
-    pub enabled: Option<bool>,
+pub(crate) struct MemoryConfig {
+    pub(crate) enabled: Option<bool>,
 }
 
-/// `[serve]` table: HTTP server config for `meka serve`. All fields optional with sensible
-/// defaults, but at least one `[[serve.tokens]]` entry is required; the server refuses to
-/// start without one.
+/// `[permissions]` table: choose which levels are reachable at runtime and which level the
+/// session starts in. See `docs/book/src/usage/permissions.md`.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ServeConfig {
-    /// Listen address. Default `127.0.0.1:8080`: bind to loopback so a fresh deploy isn't
-    /// accidentally world-reachable. Operators front with a reverse proxy (nginx, caddy) for
-    /// TLS termination and put a public address there.
-    pub bind: Option<String>,
-    /// Idle-timeout for session eviction. Sessions with no turn activity for this long are
-    /// dropped from the in-memory map by the GC scanner. Accepts humantime strings like
-    /// `"24h"`, `"30m"`, `"86400s"`. Default `"24h"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub idle_timeout: Option<std::time::Duration>,
-    /// How often the GC scanner sweeps the session map. Accepts humantime strings like
-    /// `"5m"`, `"300s"`. Default `"5m"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub gc_scan_interval: Option<std::time::Duration>,
-    /// When true, GC also deletes the SQLite row for idle sessions; default false (keep the
-    /// row so a future request with the same session ID can re-attach, mirroring ACP's
-    /// `session/load`).
-    pub delete_on_idle: Option<bool>,
-    /// On SIGTERM / SIGINT, wait at most this long for in-flight turns to finish before
-    /// forcibly aborting. Accepts humantime strings like `"30s"`, `"1m"`. Default `"30s"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub shutdown_drain_timeout: Option<std::time::Duration>,
-    /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
-    /// (default). Returns 429 with `concurrency-limit` when exceeded.
-    pub max_concurrent_turns: Option<usize>,
-    /// Request body size limit (bytes). Default 10 MiB.
-    pub max_body_bytes: Option<usize>,
-    /// Whether a 502 carries the failing provider call's error text, as a `provider_response`
-    /// extension member. Default `true`. `detail` is meka's own sentence and is identical either
-    /// way.
-    ///
-    /// On, because the upstream's error type is the actionable part of a failed turn and "consult
-    /// the server log" is no answer to anyone running against a meka they do not operate. `meka
-    /// acp` has always handed the same text to its client, so withholding it on HTTP left the text
-    /// just as public while making the one surface quieter.
-    ///
-    /// **What it can expose.** Usually the upstream's response body, which can name the
-    /// *operator's* provider account and its rate-limit posture. Not always, though: the
-    /// member carries the failing call's error message, and for some failures that is meka's
-    /// own sentence about the call rather than anything the provider sent.
-    ///
-    /// **Who can read it.** `sessions:r`, not just `sessions:w`. Submitting a turn takes the write
-    /// scope, but the failure also rides the terminal `turn.failed` event, and `GET
-    /// /v1/sessions/{id}/stream` replays that to any reader.
-    ///
-    /// Turn it off where read-only tokens go to people who may watch a session but are not
-    /// entitled to the account behind it. `/errors/mcp-unavailable` is not covered either way:
-    /// it reports server names only, and that reason is meka's own subprocess text.
-    pub relay_provider_errors: Option<bool>,
-    /// Whether to serve the Swagger UI and the OpenAPI document at `/v1/docs` and
-    /// `/v1/openapi.json`. Default `false`.
-    ///
-    /// Off by default because they are unauthenticated -- as are the two health probes, which
-    /// publish nothing -- and what they publish is the shape of every endpoint the deployment
-    /// exposes. That is useful while
-    /// building a client and pure reconnaissance value once the deployment is real. Turn it on
-    /// deliberately, on a deployment where anyone who can reach the port is entitled to the map.
-    pub docs: Option<bool>,
-    /// How many SSE events per turn to retain so a client reconnecting with `Last-Event-ID` can
-    /// replay what it missed. Default 256, matching the live broadcast channel's capacity.
-    ///
-    /// Raising it buys a longer reconnect window at the cost of holding more per-session memory
-    /// during a turn; `0` switches replay off, so a reconnect gets only what happens from then on.
-    pub stream_replay_events: Option<usize>,
-    /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
-    /// reconnect. Accepts humantime strings like `"30s"`. Default `"30s"`.
-    ///
-    /// `"0s"` cancels the turn the moment the stream drops. That spends fewer provider tokens on
-    /// abandoned work, and makes re-attach useful only for turns that already finished.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub stream_reattach_grace: Option<std::time::Duration>,
-    /// Bearer tokens configured for this deployment. An empty list is refused at startup:
-    /// `meka serve` exits rather than binding a port nothing can authenticate against.
-    pub tokens: Option<Vec<ServeTokenConfig>>,
-    /// Outbound webhook endpoints. Empty (the default) means meka never makes an outbound request.
-    pub webhooks: Option<Vec<WebhookConfig>>,
-}
-
-/// One entry in `[[serve.webhooks]]`.
-#[derive(Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct WebhookConfig {
-    /// Where to POST. `http://` is accepted for loopback development but logged as a warning:
-    /// deliveries are signed, not encrypted, so anything on the path can read them.
-    pub url: String,
-    /// Shared secret for the `X-Meka-Signature` HMAC. Supports `${ENV_VAR}` substitution.
-    /// Mutually exclusive with `secret_file`.
-    pub secret: Option<String>,
-    /// Path to a file whose contents (trimmed) are the secret. chmod 0600 recommended.
-    pub secret_file: Option<std::path::PathBuf>,
-    /// Which events to deliver. Required and non-empty: an endpoint subscribed to nothing is
-    /// almost certainly a mistake, and silently never firing is the worst way to find out.
-    pub events: Vec<String>,
-    /// Per-attempt request timeout. Accepts humantime strings like `"10s"`. Default `"10s"`.
-    #[serde(default, deserialize_with = "deserialize_optional_duration")]
-    pub timeout: Option<std::time::Duration>,
-    /// Retries after the first attempt, with exponential backoff. Default 3.
-    pub max_retries: Option<u32>,
-}
-
-// Manual `Debug` so a secret cannot reach a log through the *raw* struct either. Nothing prints
-// this today, but the derived one would have been the single unredacted path in the webhook chain,
-// and that is exactly the kind of thing a later `dbg!` finds.
-impl std::fmt::Debug for WebhookConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebhookConfig")
-            .field("url", &self.url)
-            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
-            .field("secret_file", &self.secret_file)
-            .field("events", &self.events)
-            .field("timeout", &self.timeout)
-            .field("max_retries", &self.max_retries)
-            .finish()
-    }
-}
-
-/// Scheme + host of a webhook URL, for log lines that run at the default verbosity.
-///
-/// The path is dropped because it frequently *is* the secret (Slack, Discord, and every other
-/// "unguessable URL" webhook). Enough to tell two endpoints apart; not enough to call one.
-///
-/// Parsed rather than split on `"://"` and `'/'`. Splitting only ever removed the *path*, and a
-/// URL has three other places to keep a secret: a query (`?token=…`, which survived intact because
-/// a URL with no path has no `/` to split on), a fragment, and userinfo (`user:pass@host`, which
-/// was returned verbatim as part of the host). Every one of those reached a `warn!` that runs at
-/// default verbosity, on the line whose own comment calls it the one that gets pasted into an issue
-/// tracker. Reconstructing from the parsed components keeps only what is named here, so a component
-/// nobody thought of cannot ride along.
-pub(crate) fn webhook_host(url: &str) -> String {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return "<malformed>".to_string();
-    };
-    let Some(host) = parsed.host_str() else {
-        return "<malformed>".to_string();
-    };
-    match parsed.port() {
-        Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
-        None => format!("{}://{}", parsed.scheme(), host),
-    }
-}
-
-/// Upper bound on `[[serve.webhooks]] max_retries`. See where it is applied for the reasoning.
-const MAX_WEBHOOK_RETRIES: u32 = 10;
-
-/// Validated webhook endpoint, with `${ENV}` substitution applied and `secret_file` loaded.
-#[derive(Clone)]
-pub struct ResolvedWebhook {
-    pub url: String,
-    pub secret: Option<String>,
-    pub events: Vec<String>,
-    pub timeout: std::time::Duration,
-    pub max_retries: u32,
-}
-
-// Manual `Debug` so a configured secret never reaches a log line, matching `ResolvedServeToken`.
-impl std::fmt::Debug for ResolvedWebhook {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedWebhook")
-            .field("url", &self.url)
-            .field(
-                "secret",
-                &self
-                    .secret
-                    .as_ref()
-                    .map(|secret| format_args!("[REDACTED len={}]", secret.len()).to_string()),
-            )
-            .field("events", &self.events)
-            .field("timeout", &self.timeout)
-            .field("max_retries", &self.max_retries)
-            .finish()
-    }
-}
-
-impl ResolvedWebhook {
-    fn resolve(raw: WebhookConfig) -> Result<Self, String> {
-        if raw.url.trim().is_empty() {
-            return Err("[serve.webhooks] entry has an empty `url`".into());
-        }
-        let (url, _) = substitute_env(&raw.url)?;
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return Err(format!(
-                "[serve.webhooks] url '{}' must start with https:// or http://",
-                url
-            ));
-        }
-        let secret = match (raw.secret, raw.secret_file) {
-            (Some(_), Some(_)) => {
-                return Err(
-                    "[serve.webhooks] entry has both `secret` and `secret_file`; pick one".into(),
-                );
-            }
-            (Some(inline), None) => {
-                let (resolved, _) = substitute_env(&inline)?;
-                Some(resolved)
-            }
-            (None, Some(path)) => {
-                let resolved = std::fs::read_to_string(&path)
-                    .map(|contents| contents.trim().to_string())
-                    .map_err(|error| {
-                        format!("failed to read `secret_file` {}: {}", path.display(), error)
-                    })?;
-                warn_if_world_readable(&path);
-                Some(resolved)
-            }
-            (None, None) => None,
-        };
-        if raw.events.is_empty() {
-            return Err(format!(
-                "[serve.webhooks] entry for '{}' subscribes to no events; set `events` to one \
-                 or more of: {}",
-                url,
-                crate::server::webhook::WebhookEvent::ALL.join(", ")
-            ));
-        }
-        for event in &raw.events {
-            if !crate::server::webhook::WebhookEvent::ALL.contains(&event.as_str()) {
-                // Rejected rather than warned, unlike an unknown token scope: a scope that grants
-                // nothing still leaves the token working for whatever else it holds, whereas an
-                // endpoint whose only subscription is a typo is silently never called at all.
-                return Err(format!(
-                    "[serve.webhooks] unknown event '{}'; expected one of: {}",
-                    event,
-                    crate::server::webhook::WebhookEvent::ALL.join(", ")
-                ));
-            }
-        }
-        if secret.as_deref().is_some_and(str::is_empty) {
-            // An empty key still produces a well-formed HMAC, so the receiver would see a valid
-            // `X-Meka-Signature` computed over nothing and the "unsigned deliveries" warning would
-            // not fire. Rejected rather than treated as absent: reaching here means the operator
-            // meant to sign, and an env var that resolved to empty is the likeliest cause.
-            return Err(format!(
-                "[serve.webhooks] entry for '{}' has an empty `secret`; omit the field to send \
-                 unsigned deliveries, or supply a non-empty key",
-                url
-            ));
-        }
-        if raw.timeout == Some(std::time::Duration::ZERO) {
-            // reqwest treats a zero timeout as "already elapsed", so every delivery fails its
-            // whole retry schedule and the only symptom is a warn per event with no hint why.
-            return Err(format!(
-                "[serve.webhooks] entry for '{}' has `timeout = \"0s\"`, which fails every \
-                 delivery before it is sent. Omit the field for the default (10s).",
-                url
-            ));
-        }
-        Ok(Self {
-            url,
-            secret,
-            events: raw.events,
-            timeout: raw.timeout.unwrap_or(std::time::Duration::from_secs(10)),
-            // Clamped rather than trusted: each retry holds a task and sleeps, so a config typo of
-            // `max_retries = 100000` would keep one alive for days against an endpoint that is
-            // plainly not coming back. Ten attempts spans about two minutes of backoff.
-            max_retries: raw.max_retries.unwrap_or(3).min(MAX_WEBHOOK_RETRIES),
-        })
-    }
-}
-
-/// One entry in `[serve.tokens]`. Tokens identify callers; scopes gate what they can do. See
-/// the Auth section of the HTTP API docs for the full scope catalogue.
-#[derive(Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct ServeTokenConfig {
-    /// Inline token value. Supports `${ENV_VAR}` substitution at config-load time. Mutually
-    /// exclusive with `token_file`.
-    pub token: Option<String>,
-    /// Path to a file whose contents (trimmed) are the token. chmod 0600 recommended.
-    pub token_file: Option<std::path::PathBuf>,
-    /// Free-form description, surfaced in startup logs. Operators use it to remember which
-    /// caller a token belongs to (e.g. "telegram bridge", "ci debug").
-    pub description: Option<String>,
-    /// Scopes granted to this token. See the HTTP API docs for the catalogue.
-    pub scopes: Vec<String>,
-}
-
-// Manual `Debug` for the same reason as [`WebhookConfig`]'s, and more urgently: `ServeConfig` and
-// `ResolvedConfig` both derive `Debug` and `ResolvedConfig` owns the whole `[serve]` table, so the
-// derived impl made every bearer token reachable from a single `{:?}` on the config. Redacting only
-// `ResolvedServeToken` left that path open, because the raw form survives resolution.
-impl std::fmt::Debug for ServeTokenConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServeTokenConfig")
-            .field(
-                "token",
-                &self
-                    .token
-                    .as_ref()
-                    .map(|token| format_args!("[REDACTED len={}]", token.len()).to_string()),
-            )
-            .field("token_file", &self.token_file)
-            .field("description", &self.description)
-            .field("scopes", &self.scopes)
-            .finish()
-    }
-}
-
-/// `[permissions]` table: choose which modes are reachable at runtime and which mode the session
-/// starts in. See `docs/book/src/usage/permissions.md`.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct PermissionsConfig {
-    pub default: Option<String>,
-    pub enabled: Option<Vec<String>>,
+pub(crate) struct PermissionsConfig {
+    /// Typed rather than read as strings, so a level meka does not have is refused where the file
+    /// is parsed, with its line, the way an unknown key is.
+    pub(crate) default: Option<Permission>,
+    pub(crate) enabled: Option<Vec<Permission>>,
+    /// Whether a tool call needing more than the session's level is submitted to the user for
+    /// approval rather than refused. Off unless set; a session records its own afterwards.
+    pub(crate) approvals: Option<bool>,
 }
 
 /// Built-in tool filters, mirroring the per-server knobs on [`McpServerConfig`]. Applied at
 /// registration time by [`crate::tools::ToolRegistry`].
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ToolsConfig {
-    pub allowed_tools: Option<Vec<String>>,
-    pub disabled_tools: Option<Vec<String>>,
-    pub tool_permissions: Option<HashMap<String, String>>,
+pub(crate) struct ToolsConfig {
+    pub(crate) allowed_tools: Option<Vec<String>>,
+    pub(crate) disabled_tools: Option<Vec<String>>,
+    /// Typed, like `[permissions]`, so a level meka does not have is refused where the file is
+    /// parsed, with its line, rather than dropped with a warning.
+    pub(crate) tool_permissions: Option<HashMap<String, Permission>>,
 }
 
 /// `[subagents]` table: capabilities a sub-agent may never hold.
@@ -614,59 +299,59 @@ pub struct ToolsConfig {
 /// *capability* is something config can genuinely withhold, because a tool the registry never
 /// registered cannot be reached however the parent phrases the task. *Context* -- the memory store,
 /// the instructions file -- cannot be withheld the same way, because a parent holding it can copy
-/// it into the worker's prompt; a config key promising otherwise would read as a boundary while
+/// it into the sub-agent's prompt; a config key promising otherwise would read as a boundary while
 /// being none. Context is therefore granted per call by `agent_spawn`, defaulting to nothing, and
 /// has no key here.
 ///
 /// The forgetting failure these lists exist for is real: MCP servers are inherited by default, so a
-/// parent that never considers the question hands a worker every tool it has -- including one that
-/// messages the user. `agent_spawn`'s `deny_servers` / `deny_tools` union with these, so a parent
-/// can restrict further; there is deliberately no call-site allow-list, which would let a parent
-/// widen what config denied.
+/// parent that never considers the question hands a sub-agent every tool it has -- including one
+/// that messages the user. `agent_spawn`'s `deny_servers` / `deny_tools` union with these, so a
+/// parent can restrict further; there is deliberately no call-site allow-list, which would let a
+/// parent widen what config denied.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct SubagentsConfig {
+pub(crate) struct SubagentsConfig {
     /// Whole MCP servers a sub-agent cannot see. The coarse lever and the one that matters: naming
     /// a server removes its tools, its resources, and its prompts.
-    pub disabled_servers: Option<Vec<String>>,
+    pub(crate) disabled_servers: Option<Vec<String>>,
     /// Individual tools a sub-agent cannot see, by registry name, so built-ins and namespaced MCP
     /// tools (`mcp__<server>__<tool>`) share one namespace.
-    pub disabled_tools: Option<Vec<String>>,
+    pub(crate) disabled_tools: Option<Vec<String>>,
 }
 
 /// How much of the memory store an agent may reach.
 ///
-/// Not a config key: the primary agent always holds [`MemoryAccess::Write`], and a sub-agent holds
-/// whatever its `agent_spawn` call granted, defaulting to [`MemoryAccess::None`]. Ordered
-/// `None < Read < Write` so `min` reads as "the more restrictive of two", which is how a grant is
-/// clamped against what the granting agent itself holds.
+/// Not a config key: the root agent always holds [`MemoryAccess::Write`], and a sub-agent holds
+/// whatever its `agent_spawn` call granted, defaulting to [`MemoryAccess::None`]. Ordered `None <
+/// Read < Write` so `min` reads as "the more restrictive of two", which is how a grant is clamped
+/// against what the granting agent itself holds.
 ///
-/// `Write` is deliberately unreachable from `agent_spawn` (see [`Self::parse_grant`]). A worker
+/// `Write` is deliberately unreachable from `agent_spawn` (see [`Self::parse_grant`]). A sub-agent
 /// that inferred something from one narrow task should not be able to write it into the store every
 /// future turn then reasons from; the parent, which has the whole conversation, is better placed to
-/// decide what is worth remembering, and can record it after reading the worker's report.
+/// decide what is worth remembering, and can record it after reading the sub-agent's report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MemoryAccess {
+pub(crate) enum MemoryAccess {
     /// No memory tools at all.
     None,
     /// `memory_read` and `memory_search`; no `memory_write` or `memory_delete`.
     Read,
-    /// All four memory tools. The primary agent only.
+    /// All four memory tools. The root agent only.
     Write,
 }
 
 impl MemoryAccess {
     /// `None`, as a `#[serde(default)]` target for a persisted spec that lost the field: an absent
-    /// grant must cost the worker its memory tools rather than hand it the store.
-    pub fn none() -> Self {
+    /// grant must cost the sub-agent its memory tools rather than hand it the store.
+    pub(crate) fn none() -> Self {
         Self::None
     }
 
     /// Parse a `agent_spawn` grant. `"write"` is refused with its reason rather than clamped, so a
     /// parent asking for it learns that no sub-agent can have it instead of silently getting
     /// `read`.
-    pub fn parse_grant(text: &str) -> std::result::Result<Self, String> {
+    pub(crate) fn parse_grant(text: &str) -> std::result::Result<Self, String> {
         match text.trim().to_ascii_lowercase().as_str() {
             "none" => Ok(Self::None),
             "read" => Ok(Self::Read),
@@ -676,8 +361,7 @@ impl MemoryAccess {
                     .to_string(),
             ),
             other => Err(format!(
-                "memory = \"{}\" is not a valid access level. Use \"none\" or \"read\".",
-                other
+                "memory = \"{other}\" is not a valid access level. Use \"none\" or \"read\"."
             )),
         }
     }
@@ -686,28 +370,27 @@ impl MemoryAccess {
 /// Whether an agent was handed the installation's instructions file.
 ///
 /// Like [`MemoryAccess`], granted per `agent_spawn` call rather than configured, and defaulting to
-/// [`InstructionAccess::None`]. Instructions describe the top-level agent -- its persona, how to
-/// address the user, what to volunteer -- so a worker inherits none of it unless the parent decides
-/// this particular task needs the project's rules.
+/// [`InstructionAccess::None`]. Instructions describe the root agent (its persona, how to address
+/// the user, what to volunteer), so a sub-agent inherits none of it unless the parent decides this
+/// particular task needs the project's rules.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum InstructionAccess {
-    /// A clean slate: the worker's system prompt carries no user instructions.
+pub(crate) enum InstructionAccess {
+    /// A clean slate: the sub-agent's system prompt carries no user instructions.
     #[default]
     None,
-    /// The worker receives the instructions verbatim, as the parent has them.
+    /// The sub-agent receives the instructions verbatim, as the parent has them.
     Inherit,
 }
 
 impl InstructionAccess {
     /// Parse a `agent_spawn` grant.
-    pub fn parse_grant(text: &str) -> std::result::Result<Self, String> {
+    pub(crate) fn parse_grant(text: &str) -> std::result::Result<Self, String> {
         match text.trim().to_ascii_lowercase().as_str() {
             "none" => Ok(Self::None),
             "inherit" => Ok(Self::Inherit),
             other => Err(format!(
-                "instructions = \"{}\" is not a valid value. Use \"none\" or \"inherit\".",
-                other
+                "instructions = \"{other}\" is not a valid value. Use \"none\" or \"inherit\"."
             )),
         }
     }
@@ -715,9 +398,9 @@ impl InstructionAccess {
 
 /// [`SubagentsConfig`] with defaults filled in.
 #[derive(Debug, Clone, Default)]
-pub struct ResolvedSubagentsConfig {
-    pub disabled_servers: Vec<String>,
-    pub disabled_tools: Vec<String>,
+pub(crate) struct ResolvedSubagentsConfig {
+    pub(crate) disabled_servers: Vec<String>,
+    pub(crate) disabled_tools: Vec<String>,
 }
 
 impl ResolvedSubagentsConfig {
@@ -732,254 +415,96 @@ impl ResolvedSubagentsConfig {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ThinkingConfig {
-    /// Budget for [`crate::provider::ThinkingMode::Budgeted`]; ignored under the other modes.
+pub(crate) struct ThinkingConfig {
+    /// Budget for [`crate::config::ThinkingMode::Budgeted`]; ignored under the other modes.
     ///
-    /// The installation-wide fallback, which `[providers.<name>].thinking_budget` takes precedence
-    /// over. Kept rather than retired when the budget became a profile field, because it shipped
-    /// in 0.43 and `deny_unknown_fields` would turn a leftover into a parse error on a config
-    /// that never did anything wrong.
-    pub budget_tokens: Option<u64>,
-    pub show_content: Option<bool>,
+    /// The installation-wide fallback, which `[profiles.<name>].thinking_budget` takes precedence
+    /// over: one number for every profile that does not state its own.
+    pub(crate) budget: Option<u64>,
+    pub(crate) show_content: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct McpConfig {
-    /// Fallback permission for MCP tools when nothing more specific applies (no `tool_permissions`
-    /// override, no server-level `permission`, no `readOnlyHint` from the server). If this is also
-    /// unset the hardcoded fallback is `Unrestricted`, i.e. strict.
-    pub default_permission: Option<String>,
-    pub servers: Option<Vec<McpServerConfig>>,
-    /// Default for each server's [`McpServerConfig::required`]. When true, every enabled server
-    /// gates the turn; when false (the default) only servers that opt in with `required = true`
-    /// do. A gated turn is rejected outright rather than sent to the model.
-    ///
-    /// Defaults to false because whether a missing server should stop the turn is a property of
-    /// that server, not of the installation: one that is essential on a workstation may be
-    /// irrelevant inside a container that lacks its binary.
-    pub strict: Option<bool>,
-    /// Per-turn cap on how long to wait for still-`Pending` MCP servers to settle before the
-    /// readiness gate decides. Default: 3.
-    pub grace_seconds: Option<u64>,
-    /// Per-server wrap around connect + `initialize` + `list_tools`. A hung stdio spawn or slow
-    /// HTTPS handshake can't stall the whole fleet past this bound. Default: 30.
-    pub connect_timeout_seconds: Option<u64>,
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct McpServerConfig {
-    pub name: String,
-    pub transport: McpTransport,
-    pub command: Option<String>,
-    pub args: Option<Vec<String>>,
-    pub env: Option<std::collections::HashMap<String, String>>,
-    pub url: Option<String>,
-    pub headers: Option<std::collections::HashMap<String, String>>,
-    /// Optional path to an executable that, when run, prints dynamic HTTP headers to stdout in
-    /// `Name: Value\n` form. Merged over [`Self::headers`] (dynamic wins). Useful for SSO flows
-    /// where bearer tokens rotate. The script is spawned with `MEKA_MCP_SERVER_NAME` and
-    /// `MEKA_MCP_SERVER_URL` in its environment so one helper can drive multiple servers. Non-zero
-    /// exit fails the connect.
-    pub headers_helper: Option<String>,
-    pub auth: Option<McpAuthConfig>,
-    pub permission: Option<String>,
-    /// Optional allow-list of raw tool names (the server-advertised form, not the
-    /// `mcp__<server>__<tool>` namespaced form). When set and non-empty, only these tools from
-    /// this server are registered.
-    pub allowed_tools: Option<Vec<String>>,
-    /// Optional block-list of raw tool names. Applied after [`Self::allowed_tools`]. Tools listed
-    /// here are never registered.
-    pub disabled_tools: Option<Vec<String>>,
-    /// Raw tool names (server-advertised, not the `mcp__<server>__<tool>` namespaced form) that
-    /// should ship eager-loaded instead of deferred. Saves a `load_tool` round-trip and keeps the
-    /// schema in the cacheable tools-array prefix. Names that don't match an advertised tool
-    /// surface as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
-    pub eager_load_tools: Option<Vec<String>>,
-    /// Optional per-tool permission overrides keyed by raw tool name. Beats the server-level
-    /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
-    /// permission at registration time.
-    pub tool_permissions: Option<std::collections::HashMap<String, String>>,
-    /// Whether this server's `readOnlyHint` annotation may classify a tool as `read`. Defaults to
-    /// true, so a server that says a tool only reads is believed.
-    ///
-    /// The hint is asserted by the server, not verified by meka, and MCP tools execute in the
-    /// server's own process with no sandbox. A server that advertises `readOnlyHint: true` for a
-    /// tool that in fact writes therefore gets to write while meka sits at `read`. That is the
-    /// reason this knob exists: setting it to `false` makes the hint advisory for display only, so
-    /// the tool falls through to the strict `Unrestricted` fallback, and nothing from this server
-    /// is reachable at `read` without an explicit [`Self::tool_permissions`] or
-    /// [`Self::permission`] entry.
-    ///
-    /// A refused hint deliberately skips `[mcp].default_permission` on the way. That is a global
-    /// convenience and this is a per-server audit decision, so the per-server one wins, the same
-    /// direction the two overrides above already run. Falling through to it meant that with
-    /// `default_permission = "read"` the knob changed nothing at all: the tool landed back on
-    /// `Read` and dispatched unapproved at `--permission read`, which is precisely the outcome
-    /// setting it to `false` was meant to prevent.
-    ///
-    /// Defaulting to true keeps existing configurations working and keeps read mode useful with
-    /// well-behaved servers; the trade is that read mode's filesystem guarantee covers meka's
-    /// built-in tools plus whichever MCP servers the user has chosen to trust.
-    pub trust_read_only_hint: Option<bool>,
-    /// When true, this server is skipped at startup: no process is spawned, no HTTP connect
-    /// attempt is made. Lets users mute a flaky or in-development server without removing the
-    /// entry.
-    #[serde(default)]
-    pub disabled: bool,
-    /// Whether a turn may proceed while this server is unavailable. `None` inherits
-    /// [`McpConfig::strict`] (false by default), so a server is optional unless it says otherwise.
-    ///
-    /// The other half of the availability pair with [`Self::disabled`]: `disabled` says "don't
-    /// even try", `required` says "if trying failed, stop the turn". Resolved once in
-    /// [`ResolvedConfig::from_cli`], so every later consumer reads a plain `bool`.
-    pub required: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum McpTransport {
-    Stdio,
-    Http,
-}
-
-/// How an HTTP MCP server authenticates. The secret itself is never here: it lives in
-/// `mcp_credentials`, keyed by server name, exactly as a provider profile's key lives in
-/// `provider_credentials`. This block says *which* flow to run and with what public
-/// parameters.
-///
-/// `deny_unknown_fields` so a key this does not model is refused rather than silently
-/// dropped, which is the same strictness [`McpServerConfig`] already has. A secret quietly
-/// ignored is worse than one refused: the connect fails later, somewhere else, for a reason
-/// that names nothing.
-#[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum McpAuthConfig {
-    ClientCredentials {
-        client_id: String,
-        scopes: Option<Vec<String>>,
-        resource: Option<String>,
-    },
-    ClientCredentialsJwt {
-        client_id: String,
-        signing_key_path: String,
-        signing_algorithm: Option<String>,
-        scopes: Option<Vec<String>>,
-        resource: Option<String>,
-    },
-    #[serde(rename = "oauth")]
-    OAuth {
-        client_id: Option<String>,
-        scopes: Option<Vec<String>>,
-        redirect_port: Option<u16>,
-    },
-}
-
-/// Redacts the value of every header and environment entry.
-///
-/// `headers` and `env` are the two places a user is most likely to put a bearer token, and a
-/// `{:?}` on this struct (in a connect error, a `tracing::debug!`, a panic message) printed them.
-/// Names are kept: knowing that `Authorization` was set is the diagnostic; knowing its value is the
-/// leak.
-fn redact_map(
-    map: &Option<std::collections::HashMap<String, String>>,
-) -> Option<std::collections::BTreeMap<&str, String>> {
-    map.as_ref().map(|entries| {
-        entries
-            .iter()
-            .map(|(name, value)| (name.as_str(), format!("[REDACTED len={}]", value.len())))
-            .collect()
-    })
-}
-
-impl std::fmt::Debug for McpServerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("McpServerConfig")
-            .field("name", &self.name)
-            .field("transport", &self.transport)
-            .field("command", &self.command)
-            .field("args", &self.args)
-            .field("env", &redact_map(&self.env))
-            .field("url", &self.url)
-            .field("headers", &redact_map(&self.headers))
-            .field("headers_helper", &self.headers_helper)
-            .field("auth", &self.auth)
-            .field("permission", &self.permission)
-            .field("allowed_tools", &self.allowed_tools)
-            .field("disabled_tools", &self.disabled_tools)
-            .field("eager_load_tools", &self.eager_load_tools)
-            .field("tool_permissions", &self.tool_permissions)
-            .field("trust_read_only_hint", &self.trust_read_only_hint)
-            .field("disabled", &self.disabled)
-            .field("required", &self.required)
-            .finish()
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct DisplayConfig {
-    pub newline_before_prompt: Option<bool>,
-    pub newline_after_prompt: Option<bool>,
-    pub show_session_id_on_create: Option<bool>,
-    pub show_session_id_on_exit: Option<bool>,
-    pub show_path_in_prompt: Option<bool>,
-    pub show_context_in_prompt: Option<bool>,
-    pub show_token_usage: Option<bool>,
-    pub render_mode: Option<RenderMode>,
+pub(crate) struct DisplayConfig {
+    pub(crate) newline_before_prompt: Option<bool>,
+    pub(crate) newline_after_prompt: Option<bool>,
+    pub(crate) show_session_id_on_create: Option<bool>,
+    pub(crate) show_session_id_on_exit: Option<bool>,
+    pub(crate) show_path_in_prompt: Option<bool>,
+    pub(crate) show_context_in_prompt: Option<bool>,
+    pub(crate) show_token_usage: Option<bool>,
+    pub(crate) render_mode: Option<RenderMode>,
     /// How much of a tool call's input the `[tool X]` indicator shows: `off`, `summary` (default),
     /// or `full`.
-    pub tool_params: Option<ToolParams>,
+    pub(crate) tool_params: Option<ToolParams>,
     /// Widest line meka composes from model output, in terminal columns. Unset follows the
-    /// terminal, which is what keeps a line from ever wrapping; a set value is honoured exactly,
+    /// terminal, which is what keeps a line from ever wrapping; a set value is honored exactly,
     /// so one wider than the terminal will wrap. Covers meka's own output only: assistant
     /// markdown reflows to the real terminal through `render_mode` either way.
-    pub max_width: Option<usize>,
+    pub(crate) max_width: Option<usize>,
     /// Style applied to the REPL input buffer so submitted prompts stand out in scrollback. Parsed
-    /// by [`parse_input_style`]. Accepts `bold`, `dim`, `none`, or a colour name (`cyan`,
+    /// by [`parse_input_style`]. Accepts `bold`, `dim`, `none`, or a color name (`cyan`,
     /// `yellow`, …).
-    pub input_style: Option<String>,
+    pub(crate) input_style: Option<String>,
     /// When set to `Some(N)` with `N > 0`, resuming a session reprints the last `N` turns (user
     /// prompts plus the agent's response, styled like the live REPL). Unset reprints only the last
     /// assistant message.
-    pub resume_show_recent: Option<usize>,
+    pub(crate) resume_show_recent: Option<usize>,
+    /// Whether answers stream as they arrive. `false` is what `--no-stream` asks for one run; a
+    /// preference belongs in the file, like every other display setting.
+    pub(crate) stream: Option<bool>,
+}
+
+/// Whether answers stream: the flag turns it off for one run, the file is the standing preference,
+/// and either saying no wins.
+pub(crate) fn streaming_enabled(no_stream_flag: bool, configured: Option<bool>) -> bool {
+    !no_stream_flag && configured.unwrap_or(true)
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct WebConfig {
-    pub user_agent: Option<String>,
-    pub request_timeout_seconds: Option<u64>,
-    pub connect_timeout_seconds: Option<u64>,
-    pub read_timeout_seconds: Option<u64>,
+pub(crate) struct WebConfig {
+    pub(crate) user_agent: Option<String>,
+    /// Total request budget: connect, TLS and read. Default `"30s"`; `"0s"` is refused at
+    /// startup.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) request_timeout: Option<std::time::Duration>,
+    /// Separate cap on the TCP and TLS handshake. Unset means no separate cap; `"0s"` is refused
+    /// at startup.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) connect_timeout: Option<std::time::Duration>,
+    /// Per-chunk idle timeout, for a body that stalls mid-stream. Unset means none; `"0s"` is
+    /// refused at startup.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) read_timeout: Option<std::time::Duration>,
     /// Max number of redirects reqwest will follow. `0` disables redirects entirely. Default:
     /// `10`.
-    pub max_redirects: Option<u64>,
+    pub(crate) max_redirects: Option<u64>,
     /// Proxy URL. Accepts `http://…`, `https://…`, `socks5://…`, `socks5h://…`. The literal string
     /// `"none"` explicitly disables env-var auto-detection (overriding `HTTP_PROXY` etc.). Unset
-    /// honours the env vars.
-    pub proxy: Option<String>,
+    /// honors the env vars.
+    pub(crate) proxy: Option<String>,
     /// Path to a PEM file containing one or more root CAs to trust on top of the system trust
     /// store. Used for corporate MITM proxies or self-signed internal services.
-    pub ca_cert_file: Option<String>,
+    pub(crate) ca_cert_file: Option<String>,
     /// Reject plain `http://` URLs: only `https://` allowed.
-    pub https_only: Option<bool>,
+    pub(crate) https_only: Option<bool>,
     /// Minimum TLS version: `"1.0"`, `"1.1"`, `"1.2"`, or `"1.3"`. Anything else logs a warn and
     /// falls back to reqwest's default.
-    pub min_tls_version: Option<String>,
+    pub(crate) min_tls_version: Option<String>,
     /// DANGER: disable TLS certificate validation entirely. Allows MITM; only use against trusted
     /// local dev servers.
-    pub danger_accept_invalid_certs: Option<bool>,
+    pub(crate) danger_accept_invalid_certs: Option<bool>,
     /// DANGER: accept certificates whose hostname doesn't match. Allows MITM; only use against
     /// trusted local dev servers.
-    pub danger_accept_invalid_hostnames: Option<bool>,
+    pub(crate) danger_accept_invalid_hostnames: Option<bool>,
 }
 
-/// Minimum TLS version accepted by the web-tools client. Normalised from `[web].min_tls_version` so
+/// Minimum TLS version accepted by the web-tools client. Normalized from `[web].min_tls_version` so
 /// the rest of the crate doesn't pass free-form strings around.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MinTlsVersion {
+pub(crate) enum MinTlsVersion {
     V1_0,
     V1_1,
     V1_2,
@@ -989,7 +514,7 @@ pub enum MinTlsVersion {
 impl MinTlsVersion {
     /// Parse the config-file string form. Returns `None` on unknown input; callers are expected to
     /// log and fall through to the reqwest backend default.
-    pub fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim() {
             "1.0" => Some(Self::V1_0),
             "1.1" => Some(Self::V1_1),
@@ -1003,26 +528,26 @@ impl MinTlsVersion {
 /// Fully-resolved web-tools HTTP client configuration. Carried on [`ResolvedConfig`] and consumed
 /// by `crate::tools::web::build_web_client` at registry-build time.
 #[derive(Debug, Clone)]
-pub struct WebClientConfig {
-    pub user_agent: String,
-    pub request_timeout: std::time::Duration,
-    pub connect_timeout: Option<std::time::Duration>,
-    pub read_timeout: Option<std::time::Duration>,
+pub(crate) struct WebClientConfig {
+    pub(crate) user_agent: String,
+    pub(crate) request_timeout: std::time::Duration,
+    pub(crate) connect_timeout: Option<std::time::Duration>,
+    pub(crate) read_timeout: Option<std::time::Duration>,
     /// `0` means "no redirects" (`Policy::none`); any other value becomes `Policy::limited(n)`.
-    pub max_redirects: usize,
-    pub proxy: Option<String>,
-    pub ca_cert_file: Option<std::path::PathBuf>,
-    pub https_only: bool,
-    pub min_tls_version: Option<MinTlsVersion>,
-    pub danger_accept_invalid_certs: bool,
-    pub danger_accept_invalid_hostnames: bool,
+    pub(crate) max_redirects: usize,
+    pub(crate) proxy: Option<String>,
+    pub(crate) ca_cert_file: Option<std::path::PathBuf>,
+    pub(crate) https_only: bool,
+    pub(crate) min_tls_version: Option<MinTlsVersion>,
+    pub(crate) danger_accept_invalid_certs: bool,
+    pub(crate) danger_accept_invalid_hostnames: bool,
 }
 
 impl Default for WebClientConfig {
     fn default() -> Self {
         Self {
             user_agent: DEFAULT_WEB_USER_AGENT.to_string(),
-            request_timeout: std::time::Duration::from_secs(30),
+            request_timeout: DEFAULT_WEB_REQUEST_TIMEOUT,
             connect_timeout: None,
             read_timeout: None,
             max_redirects: 10,
@@ -1039,7 +564,7 @@ impl Default for WebClientConfig {
 impl WebClientConfig {
     /// Build a resolved config from the TOML section. Invalid `min_tls_version` strings log a warn
     /// and fall through to reqwest's default rather than aborting startup.
-    pub fn from_file(file: &WebConfig) -> Self {
+    pub(crate) fn from_file(file: &WebConfig) -> Self {
         let user_agent = file
             .user_agent
             .clone()
@@ -1052,9 +577,8 @@ impl WebClientConfig {
                     Some(v) => Some(v),
                     None => {
                         tracing::warn!(
-                            "ignoring unknown [web].min_tls_version '{}' \
-                         (expected '1.0', '1.1', '1.2', or '1.3')",
-                            raw
+                            "ignoring unknown [web].min_tls_version '{raw}' (expected '1.0', \
+                             '1.1', '1.2', or '1.3')"
                         );
                         None
                     }
@@ -1062,25 +586,22 @@ impl WebClientConfig {
 
         Self {
             user_agent,
-            request_timeout: file
-                .request_timeout_seconds
-                .filter(|n| *n > 0)
-                .map(std::time::Duration::from_secs)
-                .unwrap_or_else(|| std::time::Duration::from_secs(30)),
-            connect_timeout: file
-                .connect_timeout_seconds
-                .filter(|n| *n > 0)
-                .map(std::time::Duration::from_secs),
-            read_timeout: file
-                .read_timeout_seconds
-                .filter(|n| *n > 0)
-                .map(std::time::Duration::from_secs),
+            // A zero is carried through rather than filtered: `ResolvedConfig::validate` refuses
+            // it, and filtering here is what let a `0` silently mean "the default".
+            request_timeout: file.request_timeout.unwrap_or(DEFAULT_WEB_REQUEST_TIMEOUT),
+            connect_timeout: file.connect_timeout,
+            read_timeout: file.read_timeout,
             max_redirects: file
                 .max_redirects
                 .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
                 .unwrap_or(10),
             proxy: file.proxy.clone(),
-            ca_cert_file: file.ca_cert_file.clone().map(std::path::PathBuf::from),
+            // Through the same `~` expansion as every other path setting; a `~/certs/x.pem` was
+            // read verbatim and failed at the web client build with "No such file". A form the
+            // expansion does not take (`~user/...`) is kept as written.
+            ca_cert_file: file.ca_cert_file.as_deref().map(|path| {
+                expand_user_path(path).unwrap_or_else(|| std::path::PathBuf::from(path))
+            }),
             https_only: file.https_only.unwrap_or(false),
             min_tls_version,
             danger_accept_invalid_certs: file.danger_accept_invalid_certs.unwrap_or(false),
@@ -1091,7 +612,19 @@ impl WebClientConfig {
 
 /// Default UA for the web tools when `[web].user_agent` is unset. Kept in sync with what real
 /// Chrome emits so anti-bot filters don't single out meka by default.
-pub const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+pub(crate) const DEFAULT_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+/// `[web].request_timeout` when unset.
+pub(crate) const DEFAULT_WEB_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+/// `[mcp].grace` when unset.
+pub(crate) const DEFAULT_MCP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// `[mcp].connect_timeout` when unset. `crate::mcp::DEFAULT_MCP_REQUEST_TIMEOUT` matches it.
+pub(crate) const DEFAULT_MCP_CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+/// `[mcp].stdio_concurrency` when unset: each is a process launch.
+pub(crate) const DEFAULT_MCP_STDIO_CONCURRENCY: usize = 3;
+/// `[mcp].http_concurrency` when unset: a connect is a request, not a process.
+pub(crate) const DEFAULT_MCP_HTTP_CONCURRENCY: usize = 20;
 
 /// Max conversation messages kept in the per-turn API window by default.
 const DEFAULT_CONTEXT_MESSAGES: usize = 200;
@@ -1109,9 +642,9 @@ const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 /// disproportionate.
 const MIN_CONFIGURED_WIDTH: usize = 40;
 
-/// Widest `[display].max_width` worth honouring.
+/// Widest `[display].max_width` worth honoring.
 ///
-/// Not a taste judgement about long lines. Fitting text to a column budget re-measures a growing
+/// Not a taste judgment about long lines. Fitting text to a column budget re-measures a growing
 /// prefix, so the work to compose one line grows with the square of the width: a stray `max_width =
 /// 100000` turns each elided line into billions of width computations and hangs the renderer. No
 /// terminal is this wide, so nothing legitimate is refused.
@@ -1120,19 +653,15 @@ const MAX_CONFIGURED_WIDTH: usize = 1000;
 fn clamp_max_width(configured: usize) -> usize {
     if configured < MIN_CONFIGURED_WIDTH {
         tracing::warn!(
-            "[display].max_width = {} is below the {}-column minimum; using {}",
-            configured,
-            MIN_CONFIGURED_WIDTH,
-            MIN_CONFIGURED_WIDTH
+            "[display].max_width = {configured} is below the {MIN_CONFIGURED_WIDTH}-column \
+             minimum; using {MIN_CONFIGURED_WIDTH}"
         );
         return MIN_CONFIGURED_WIDTH;
     }
     if configured > MAX_CONFIGURED_WIDTH {
         tracing::warn!(
-            "[display].max_width = {} is above the {}-column maximum; using {}",
-            configured,
-            MAX_CONFIGURED_WIDTH,
-            MAX_CONFIGURED_WIDTH
+            "[display].max_width = {configured} is above the {MAX_CONFIGURED_WIDTH}-column \
+             maximum; using {MAX_CONFIGURED_WIDTH}"
         );
         return MAX_CONFIGURED_WIDTH;
     }
@@ -1141,320 +670,267 @@ fn clamp_max_width(configured: usize) -> usize {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ShellConfig {
-    pub sandbox: Option<bool>,
+pub(crate) struct ShellConfig {
+    pub(crate) sandbox: Option<bool>,
     /// Linux-only choice between `"landlock"` and `"bubblewrap"`. When omitted, the resolver
     /// auto-picks bubblewrap if available and falls back to landlock with a one-shot warning (see
     /// `src/sandbox.rs` and `Warn 2` in `warn_if_sandbox_issues`).
-    pub sandbox_backend: Option<SandboxBackend>,
+    pub(crate) sandbox_backend: Option<SandboxBackend>,
 }
 
-/// Linux sandbox backend. Silently ignored on macOS and Windows
-/// (sandbox-exec and Low-integrity respectively are the only options
-/// on those platforms). The absence of a default impl is intentional:
-/// an unset value is meaningful and triggers auto-resolution in
-/// [`ResolvedConfig::from_cli`].
+/// Linux sandbox backend. Silently ignored on macOS and Windows (sandbox-exec and Low-integrity
+/// respectively are the only options on those platforms). The absence of a default impl is
+/// intentional: an unset value is meaningful and triggers auto-resolution in
+/// [`ResolvedConfig::resolve`].
+///
+/// The wire spelling is [`Self::name`], which the file, the flag and the variable take; `Display`
+/// prints the brand-cased [`Self::display_name`] for prose, so a message reads "Landlock" while the
+/// config key still says `landlock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SandboxBackend {
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum SandboxBackend {
     Landlock,
     Bubblewrap,
 }
 
 impl SandboxBackend {
+    /// Every backend, in the order the names sort.
+    pub(crate) const ALL: [SandboxBackend; 2] = [Self::Bubblewrap, Self::Landlock];
+
+    /// The one spelling `[shell].sandbox_backend`, `--sandbox-backend` and `MEKA_SANDBOX_BACKEND`
+    /// take.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Landlock => "landlock",
+            Self::Bubblewrap => "bubblewrap",
+        }
+    }
+
     /// Brand-cased name for user-facing prose (logs, errors). Also the `Display` impl's output.
-    pub fn display_name(self) -> &'static str {
+    pub(crate) const fn display_name(self) -> &'static str {
         match self {
             Self::Landlock => "Landlock",
             Self::Bubblewrap => "Bubblewrap",
         }
     }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|backend| backend.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl std::fmt::Display for SandboxBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.display_name())
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.display_name())
     }
 }
 
 impl std::str::FromStr for SandboxBackend {
     type Err = String;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "landlock" => Ok(SandboxBackend::Landlock),
-            "bubblewrap" => Ok(SandboxBackend::Bubblewrap),
-            other => Err(format!(
-                "unknown sandbox backend '{other}' (expected 'landlock' or 'bubblewrap')"
-            )),
-        }
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|backend| backend.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a sandbox backend. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for SandboxBackend {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<SandboxBackend> for String {
+    fn from(backend: SandboxBackend) -> Self {
+        backend.name().to_string()
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct SessionConfig {
-    pub context_messages: Option<usize>,
+pub(crate) struct SessionConfig {
+    pub(crate) context_messages: Option<usize>,
     /// Delete sessions whose `updated_at` is older than this, at agent startup. Unset means keep
     /// everything: conversation history is not reproducible, so meka never discards it unasked.
-    pub retention_days: Option<u64>,
-    pub auto_compact: Option<bool>,
+    /// `"0s"` is refused at startup, since it would delete every session on each launch.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) retention: Option<std::time::Duration>,
+    pub(crate) auto_compact: Option<bool>,
     /// Run a checkpoint turn before each compaction, letting the agent save what must survive and
     /// write the summary itself. Default `true`. Costs one extra model call per compaction; off
     /// falls back to the standalone summarizer, which has no tools and none of the agent's
     /// identity.
-    pub compact_checkpoint: Option<bool>,
-    pub context_window: Option<u64>,
-    pub subagent_max_depth: Option<usize>,
+    pub(crate) compact_checkpoint: Option<bool>,
+    pub(crate) context_window: Option<u64>,
+    pub(crate) subagent_max_depth: Option<usize>,
 }
 
-/// One named provider profile from `[providers.<name>]`. Holds only non-secret settings; the
-/// credential (API key or OAuth bundle) is stored in the DB keyed by the profile name and is
-/// acquired via `meka provider add` / `login`.
-///
-/// **Field order is canonical and load-bearing**, and every surface that lists these keys repeats
-/// it: [`ProfileSettings`], `resolve_profile`, `ProfileTuning`, `upsert_profile_document`,
-/// `SETTABLE_PROFILE_KEYS`, the `provider add` flags, and the `config.toml` reference. It ran the
-/// other way for a while - six lists, no two agreeing, one of them documented as matching another
-/// it never had.
-///
-/// Two blocks, in this order, because they answer to different owners. First the **provider**:
-/// where a request goes and who meka is when it arrives (`type`, `base_url`, and the OAuth
-/// settings a login needs). Then the **profile**: what meka asks that endpoint for, and how
-/// (`model` and every model-tied knob). Within each block, widest reach first, ending with the
-/// narrowest - so `type` leads, `device_id` closes the first block as the one key meka writes
-/// rather than the user, and `redact_thinking` closes the second as the only `claude-subscription`
-/// setting.
-///
-/// The division is the one "Whose fact is it" draws, which is why a new field has an obvious home:
-/// would two models on one account state it differently? Then it belongs in the second block.
-/// Would two accounts on one endpoint? The first.
-#[derive(Debug, Deserialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderProfile {
-    /// Backend kind: one of [`crate::provider::SUPPORTED_PROVIDERS`].
-    #[serde(rename = "type")]
-    pub backend: String,
-    pub base_url: Option<String>,
-    pub oauth_token_url: Option<String>,
-    /// OAuth client ID override (advanced; `claude-subscription` / `chatgpt-subscription`).
-    pub client_id: Option<String>,
-    pub device_id: Option<String>,
-    pub model: Option<String>,
-    /// The model's context window (total tokens it can hold), used for the context gauge and
-    /// auto-compaction. Falls back to `[session].context_window`, then to
-    /// [`crate::provider::DEFAULT_CONTEXT_WINDOW`]. meka never infers this from the model name or
-    /// asks the provider for it, so this is where a model smaller than the default gets stated.
-    pub context_window: Option<u64>,
-    /// Override the per-request output (completion) token cap. When unset, each backend keeps its
-    /// built-in default. On Claude the value must exceed the thinking budget.
-    pub max_output_tokens: Option<u64>,
-    /// The reasoning-effort knob for every backend: Claude's `output_config.effort` and OpenAI's
-    /// `reasoning.effort`. Passed through verbatim (trimmed and lowercased); when unset the field
-    /// is omitted entirely, which is how meka asks for the provider's own default. meka picks no
-    /// tier of its own - see [`crate::provider::resolve_effort_level`].
-    pub effort: Option<String>,
-    /// Whether this profile's model accepts image input. Defaults to `true`; set `false` to stop
-    /// the ACP frontend from advertising / accepting images for a text-only model.
-    pub vision: Option<bool>,
-    /// Claude-only: how this profile encodes extended thinking - `adaptive`, `budgeted`, or `off`.
-    /// Defaults to `adaptive`. The right value depends on the model *and* on what the endpoint
-    /// implements, which meka can't infer, so it is stated rather than guessed; a profile that
-    /// later changes `model` is the user's to keep correct.
-    pub thinking: Option<crate::provider::ThinkingMode>,
-    /// How many tokens `thinking = "budgeted"` asks the model to spend reasoning. Falls back to
-    /// `[thinking].budget_tokens`, then to [`DEFAULT_THINKING_BUDGET_TOKENS`]. Ignored by the
-    /// other two modes, which send no budget at all.
-    ///
-    /// Per profile because it is a parameter of `thinking`, and `thinking` is per profile. It was
-    /// one value for the whole process until 0.44, which meant [`validate_max_output_tokens`] took
-    /// four arguments stated per profile and a fifth that was not: a profile could be refused over
-    /// a number it did not state, and the refusal told the user to lower a global that every
-    /// other profile was also budgeting against.
-    pub thinking_budget: Option<u64>,
-    /// `claude-subscription` only: when true, meka sends the `redact-thinking-2026-02-12` beta
-    /// header so the server returns `redacted_thinking` blocks instead of full thinking
-    /// summaries (saves bandwidth, but the redacted payloads can't be replayed back to the
-    /// server in multi-turn conversations). Defaults to true.
-    pub redact_thinking: Option<bool>,
-}
+impl Backend {
+    /// Every backend, in the order the names sort, which is the order a user is shown them.
+    pub(crate) const ALL: [Backend; 5] = [
+        Self::AnthropicMessages,
+        Self::ChatGptSubscription,
+        Self::ClaudeSubscription,
+        Self::OpenAiChatCompletions,
+        Self::OpenAiResponses,
+    ];
 
-/// [`ProviderProfile`]'s field order, as the key names a `config.toml` profile table carries.
-///
-/// The list exists because the order is now *enforced* rather than merely produced: every writer
-/// runs [`sort_profile_keys`] before saving, so a profile meka has touched is in this order however
-/// it got there - written whole by `provider add`, edited one key at a time by `provider set`, or
-/// hand-arranged and then appended to by `device_id`'s writer.
-pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
-    "type",
-    "base_url",
-    "oauth_token_url",
-    "client_id",
-    "device_id",
-    "model",
-    "context_window",
-    "max_output_tokens",
-    "effort",
-    "vision",
-    "thinking",
-    "thinking_budget",
-    "redact_thinking",
-];
+    /// The name a profile's `type` gives this backend.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::ChatGptSubscription => "chatgpt-subscription",
+            Self::ClaudeSubscription => "claude-subscription",
+            Self::OpenAiChatCompletions => "openai-chat-completions",
+            Self::OpenAiResponses => "openai-responses",
+        }
+    }
 
-/// Put one profile table's keys into [`PROFILE_KEY_ORDER`].
-///
-/// Comments ride along, because `toml_edit` hangs them off the key they belong to: whole-line
-/// comments and blank lines above a key live in its `leaf_decor`, and a trailing `# note` lives in
-/// the value's decor. Moving the entry moves both, which is what makes sorting safe on a file a
-/// user has annotated.
-///
-/// A key the current build does not model sorts last, alphabetically among its peers, rather than
-/// wherever the sort happened to leave it. `deny_unknown_fields` means such a key cannot survive a
-/// load, so this only decides what an unreachable case looks like - but "unreachable" and
-/// "arbitrary" are different, and the second one produces a diff that changes between runs.
-///
-/// Takes a [`toml_edit::Item`] rather than a `TableLike`, which is the shape every caller has,
-/// because only the concrete types carry a comparator-taking sort and their comparators differ
-/// (`Table` compares `Item`s, `InlineTable` compares `Value`s). Both are reachable: a profile is
-/// ordinarily its own table, but `providers` written as one inline table is a shape meka has had to
-/// handle before.
-pub(crate) fn sort_profile_keys(profile: &mut toml_edit::Item) {
-    fn rank(key: &str) -> (usize, &str) {
-        let position = PROFILE_KEY_ORDER
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
             .iter()
-            .position(|known| *known == key)
-            .unwrap_or(PROFILE_KEY_ORDER.len());
-        (position, key)
+            .map(|backend| backend.name())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
-    if let Some(table) = profile.as_table_mut() {
-        table.sort_values_by(|left, _, right, _| rank(left.get()).cmp(&rank(right.get())));
-    } else if let Some(inline) = profile.as_inline_table_mut() {
-        inline.sort_values_by(|left, _, right, _| rank(left.get()).cmp(&rank(right.get())));
+
+    /// Whether this backend's requests carry a `thinking` field at all, i.e. whether it speaks
+    /// Anthropic's Messages API. `/status` and `meka profile add` both key off this, so they agree
+    /// about which profiles the [`ThinkingMode`] setting is even meaningful for.
+    ///
+    /// A `name().starts_with("claude")` test holds only while every Anthropic backend is *named*
+    /// for Claude: the protocol name `anthropic-messages` silently falls out of it, and nothing
+    /// about the failure is visible except a missing line.
+    pub(crate) const fn takes_thinking(self) -> bool {
+        matches!(self, Self::AnthropicMessages | Self::ClaudeSubscription)
     }
-}
 
-/// One profile resolved into everything needed to build a provider for it.
-///
-/// This exists because a provider is no longer a property of the process. A session names the
-/// profile it runs with, so any given turn may need one that is not the configured default:
-/// resolution has to be callable per profile name rather than once at startup.
-///
-/// `context_window` and `vision` ride along despite not reaching
-/// [`crate::provider::ProviderBuilder`]: both are stated per profile, so a session that switches
-/// profile has to re-derive them or it keeps gauging its context against the window of a model it
-/// is no longer talking to.
-#[derive(Debug, Clone)]
-pub struct ProfileSettings {
-    /// Backend kind: one of [`crate::provider::SUPPORTED_PROVIDERS`].
-    pub backend: String,
-    pub base_url: Option<String>,
-    pub oauth_token_url: Option<String>,
-    pub client_id: Option<String>,
-    pub device_id: String,
-    pub model: Option<String>,
-    pub context_window: Option<u64>,
-    pub max_output_tokens: Option<u64>,
-    pub effort: Option<String>,
-    pub vision: bool,
-    pub thinking: crate::provider::ThinkingMode,
-    /// Resolved with the default already applied, unlike [`Self::context_window`]. No caller needs
-    /// to tell "unset" from "16000": the budget is only ever sent as a number, whereas an absent
-    /// window is what [`crate::provider::binding_context_window`] reports rather than dividing by
-    /// a figure meka has no reason to believe.
-    pub thinking_budget: u64,
-    pub redact_thinking: bool,
-}
+    /// Whether this backend actually sends the profile key `key`.
+    ///
+    /// [`Self::takes_thinking`] answers for the request *field*, which is the right question for
+    /// `thinking` and `thinking_budget` and the wrong one for `redact_thinking`. That key gates the
+    /// `redact-thinking-…` beta header, which only `claude-subscription` sends: the string does not
+    /// appear in the Messages API backend at all. So `profile set apikey redact_thinking false`
+    /// reported success and did nothing, which is exactly what `refuse_an_inert_key` exists to
+    /// stop one field over.
+    ///
+    /// Every other key is read by every backend that has it, so the fallback is `true` rather than
+    /// an enumeration that would need editing whenever a field is added; `max_request_bytes` is
+    /// among those, with a default on the Anthropic backends and none on the others. The two CLI
+    /// write doors and the load-time check all ask this one function.
+    pub(crate) fn reads_profile_key(self, key: &str) -> bool {
+        match key {
+            "redact_thinking" => matches!(self, Self::ClaudeSubscription),
+            "thinking" | "thinking_budget" => self.takes_thinking(),
+            _ => true,
+        }
+    }
 
-/// The active profile's name, read straight off disk without resolving anything else.
-///
-/// Exists for the one caller that opens the store *before* config is resolved: the `meka provider`
-/// subcommands deliberately skip [`ResolvedConfig::from_cli`] to avoid its sandbox probe, and
-/// opening the store is what carries an older one forward. Without this, which command a user
-/// happened to run first would decide what their existing sessions record as their provider.
-///
-/// *Selection* errors are dropped rather than reported: the caller is on its way to a command that
-/// works fine with no provider configured, and neither of the two things this feeds needs the
-/// reason. The migration context takes an absent name as "nothing resolved" and leaves those rows
-/// alone; `session::cli::plan_import` refuses the import rather than writing a session that cannot
-/// run. A config that could not be **read** is a different answer and is raised, via
-/// [`load_config_file_or_err`], for the reason that function already gives: "empty" and "your
-/// profiles are gone" are indistinguishable to a caller with no `validate()` behind it.
-///
-/// The ledger is the sharpest instance of that. It stamps whatever this returns onto every session
-/// that predates meka recording a provider, once and irreversibly, so swallowing a parse error here
-/// converted one typo in `config.toml` into every session permanently recorded against no profile,
-/// with `default_provider` naming a perfectly good one three lines above the typo. Nothing said so:
-/// the store was stamped at head, the step never ran again, and the command exited 0.
-pub fn default_profile_on_disk(requested: Option<&str>) -> crate::error::Result<Option<String>> {
-    let config_file = load_config_file_or_err()?;
-    let (source, requested) = match requested {
-        Some(name) => (ProfileRequest::Flag, Some(name.to_string())),
-        None => (
-            ProfileRequest::DefaultProvider,
-            config_file.default_provider.clone(),
-        ),
-    };
-    let (active, _error) = select_active_profile(requested, source, &config_file.providers);
-    Ok(active)
-}
-
-/// Resolve one named profile, applying the process-level fallbacks for the two settings that have
-/// them. Nothing overrides a field inside a profile, so there is nothing else to apply.
-///
-/// `session_context_window` is `[session].context_window` and `default_thinking_budget` is
-/// `[thinking].budget_tokens`; a profile's own value takes precedence over either. The two are
-/// spelled differently on the way out because they are consumed differently: the call sites in
-/// `main.rs` apply [`crate::provider::DEFAULT_CONTEXT_WINDOW`] when the window is still unset,
-/// while the budget is defaulted here because every consumer needs a number.
-pub fn resolve_profile(
-    profile: &ProviderProfile,
-    session_context_window: Option<u64>,
-    default_thinking_budget: Option<u64>,
-    // Received rather than resolved here, because resolving it is not a pure function: for a
-    // `claude-subscription` profile that states none, [`resolve_device_id`] mints one and rewrites
-    // the user's `config.toml` under the config lock. This runs per request now (every
-    // `resolved_binding`, every `binding_context_window`, every `/status`), and the profiles the
-    // registry holds are a snapshot, so a resolver called from in here never saw the value it had
-    // just persisted: it minted a new identifier, and wrote the config again, every single time.
-    device_id: String,
-) -> ProfileSettings {
-    ProfileSettings {
-        backend: profile.backend.clone(),
-        base_url: profile.base_url.clone(),
-        oauth_token_url: profile.oauth_token_url.clone(),
-        client_id: profile.client_id.clone(),
-        device_id,
-        model: profile.model.clone(),
-        context_window: profile.context_window.or(session_context_window),
-        max_output_tokens: profile.max_output_tokens,
-        // Pure passthrough for every backend: whatever the profile sets goes to the provider
-        // verbatim (the provider trims and lowercases it). Unset means the field is omitted and
-        // the provider applies its own default. An invalid value is the user's to own.
-        effort: profile.effort.clone(),
-        vision: profile.vision.unwrap_or(true),
-        thinking: profile.thinking.unwrap_or_default(),
-        thinking_budget: profile
-            .thinking_budget
-            .or(default_thinking_budget)
-            .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
-        // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
-        // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
-        redact_thinking: profile.redact_thinking.unwrap_or(true),
+    /// Whether this backend actually reads the account key `key`: `client_id` and `oauth_token_url`
+    /// are read only by the two OAuth backends. The sibling of [`Self::reads_profile_key`], asked
+    /// by `account add` and the load-time check.
+    pub(crate) fn reads_account_key(self, key: &str) -> bool {
+        match key {
+            "client_id" | "oauth_token_url" => {
+                matches!(self, Self::ClaudeSubscription | Self::ChatGptSubscription)
+            }
+            _ => true,
+        }
     }
 }
 
-/// The `claude-subscription` device identifier for one profile, seeding and persisting one when the
-/// profile states none.
+/// Say so for every profile or account key its backend never reads.
 ///
-/// Empty for every other backend. Deliberately separate from [`resolve_profile`], which callers
-/// reach on every request: this one writes `config.toml`, so it belongs where a caller can arrange
-/// to ask exactly once. [`crate::provider::ProviderRegistry`] memoises it per profile.
-pub(crate) fn resolve_device_id(
-    backend: &str,
-    profile_name: &str,
-    configured: Option<&str>,
-) -> String {
-    device_id::resolve(Some(backend), Some(profile_name), configured)
+/// The CLI write doors refuse or drop such a key, but a hand-written `config.toml` is another door
+/// with no check at all, and AGENTS.md's profile rule is that no field may state a mismatch
+/// silently: a profile on an `openai-responses` account with `thinking = "off"` read as reasoning
+/// turned off while the backend ignored the key. Asked once at load, not in `resolve_profile`,
+/// which runs per request. An unrecognized `backend`, and a profile whose account is missing, are
+/// reported elsewhere and skipped here.
+fn warn_about_inert_profile_keys(
+    accounts: &std::collections::BTreeMap<String, AccountConfig>,
+    profiles: &std::collections::BTreeMap<String, ProfileConfig>,
+) {
+    for (name, account) in accounts {
+        let Ok(backend) = account.backend.parse::<Backend>() else {
+            continue;
+        };
+        let set = [
+            ("client_id", account.client_id.is_some()),
+            ("oauth_token_url", account.oauth_token_url.is_some()),
+        ];
+        for (key, is_set) in set {
+            if is_set && !backend.reads_account_key(key) {
+                tracing::warn!(
+                    "account '{name}' sets `{key}`, which a '{backend}' account never reads; the \
+                     setting has no effect"
+                );
+            }
+        }
+    }
+    for (name, profile) in profiles {
+        let Ok(backend) = accounts
+            .get(&profile.account)
+            .and_then(|account| account.backend.parse::<Backend>().ok())
+            .ok_or(())
+        else {
+            continue;
+        };
+        let set = [
+            ("thinking", profile.thinking.is_some()),
+            ("thinking_budget", profile.thinking_budget.is_some()),
+            ("redact_thinking", profile.redact_thinking.is_some()),
+        ];
+        for (key, is_set) in set {
+            if is_set && !backend.reads_profile_key(key) {
+                tracing::warn!(
+                    "profile '{name}' sets `{key}`, which its '{backend}' account never sends; \
+                     the setting has no effect"
+                );
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Backend {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|backend| backend.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a valid backend. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
 }
 
 /// Which session a run should pick up, resolved from the mutually exclusive `--continue` and
@@ -1467,7 +943,7 @@ pub(crate) fn resolve_device_id(
 /// Splitting the two intents into a boolean and a value-taking flag puts both in line with every
 /// other root flag and removes the ambiguity at the parser rather than guessing at it afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionResume {
+pub(crate) enum SessionResume {
     /// `--continue`: the most recently updated session.
     Last,
     /// `--resume <SESSION>`: a specific UUID, or a leading prefix of one.
@@ -1477,117 +953,213 @@ pub enum SessionResume {
 impl SessionResume {
     /// `None` when neither flag was given. Clap enforces that they are mutually exclusive, so the
     /// order of these checks is not load-bearing.
-    fn from_cli(cli: &crate::cli::Cli) -> Option<Self> {
-        if let Some(id) = &cli.resume {
-            return Some(Self::Id(id.clone()));
+    pub(crate) fn from_flags(resume: Option<String>, continue_last: bool) -> Option<Self> {
+        if let Some(id) = resume {
+            return Some(Self::Id(id));
         }
-        cli.continue_last.then_some(Self::Last)
+        continue_last.then_some(Self::Last)
     }
 }
 
-/// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env vars. This is what the
-/// rest of the binary reads; `ConfigFile` is for deserialization only. Resolution lives in
-/// `resolve_config` (Linux) and the non-Linux variant below it.
-#[derive(Debug)]
-pub struct ResolvedConfig {
-    /// Backend type of the active profile (one of [`crate::provider::SUPPORTED_PROVIDERS`]);
-    /// `None` when no profile could be selected.
-    pub provider_name: Option<String>,
-    /// Name of the active profile, used as the DB key for its credential.
-    ///
-    /// The process default only. A session records the profile it runs with and resolves that one
-    /// out of [`Self::providers`] instead, which is why the map below is retained rather than
-    /// dropped once this name is picked.
-    pub active_profile: Option<String>,
-    /// The profile `default_provider` picks, ignoring `--provider`.
-    ///
-    /// Only the migration ledger wants this. It stamps a profile onto sessions that predate meka
-    /// recording one, which is a guess it makes once and cannot revisit, so the answer must not
-    /// depend on a flag the first invocation after an upgrade happened to carry: `meka --provider
-    /// side "..."` would otherwise move a whole history onto `side` because of one run. Everything
-    /// else wants [`Self::active_profile`], where the flag is the point.
-    pub configured_default_profile: Option<String>,
+/// Output format for a command's stdout: `meka account usage`, `whoami`, `stats`, and a
+/// `--oneshot` run. The one output-format vocabulary meka has; every command that offers a choice
+/// takes `--format`, and `cli` parses the flag into this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OutputFormat {
+    /// Human-readable text.
+    #[default]
+    Plain,
+    /// JSON (stable shape, for scripts).
+    Json,
+}
+
+impl OutputFormat {
+    /// Every format, in the order the names sort.
+    pub(crate) const ALL: [OutputFormat; 2] = [Self::Json, Self::Plain];
+
+    /// The one spelling `--format` takes.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Json => "json",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|format| format.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for OutputFormat {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not an output format. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+/// What the command line contributes to resolution: every root flag that overrides or requests
+/// something. Built by `cli` from the clap struct, so `config` never has to know what a flag is
+/// called.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct CliOverrides {
+    pub(crate) profile: Option<String>,
+    /// `--format` on the run, read by a `--oneshot` turn.
+    pub(crate) output_format: OutputFormat,
+    pub(crate) eager_load_tools: Vec<String>,
+    pub(crate) instructions: Option<String>,
+    pub(crate) permission: Option<Permission>,
+    pub(crate) sandbox_backend: Option<SandboxBackend>,
+    pub(crate) writable_roots: Vec<std::path::PathBuf>,
+    pub(crate) no_stream: bool,
+    pub(crate) render_mode: Option<RenderMode>,
+    pub(crate) resume: Option<String>,
+    pub(crate) continue_last: bool,
+    pub(crate) prompt: Option<String>,
+    pub(crate) oneshot: bool,
+}
+
+/// What one invocation asked for: the prompt, the session to resume, and the overrides the command
+/// line carried. Everything else on [`ResolvedConfig`] is a setting.
+#[derive(Debug, Default)]
+pub(crate) struct RunRequest {
+    pub(crate) prompt: Option<String>,
+    pub(crate) oneshot: bool,
+    /// What a `--oneshot` run writes to stdout: the answer as text, or one JSON object describing
+    /// the turn. `plain` unless `--format json` was passed.
+    pub(crate) output_format: OutputFormat,
+    pub(crate) session_resume: Option<SessionResume>,
     /// The permission level the user asked for on this run with `--permission` or
-    /// `MEKA_PERMISSION`, when the request was honoured.
+    /// `MEKA_PERMISSION`, when the request was honored.
     ///
-    /// Distinct from [`Self::permission`], which is the resolved level and is set whether or not
-    /// anyone asked for it. Resuming needs the two apart: a session runs at the level it recorded,
-    /// and only an explicit request overrides that.
-    pub requested_permission: Option<Permission>,
-    /// The profile the user named on the command line with `--provider`, if any.
+    /// Distinct from [`ResolvedConfig::permission`], which is the resolved level and is set
+    /// whether or not anyone asked for it. Resuming needs the two apart: a session runs at the
+    /// level it recorded, and only an explicit request overrides that.
+    pub(crate) requested_permission: Option<Permission>,
+    /// The profile the user named on the command line with `--profile`, if any.
     ///
-    /// Distinct from [`Self::active_profile`], which is the *resolved* default and is set whether
-    /// or not anyone asked for it. Resuming needs to tell the two apart: a session runs on the
-    /// profile it recorded, and only an explicit request rewrites that.
-    pub requested_profile: Option<String>,
-    /// Every configured profile, by name.
-    ///
-    /// Kept so a provider can be built for a profile that is not the process default. Selection
-    /// picks one name at startup, but a session names its own, and resolving that one needs the
-    /// profile still to be here.
-    pub providers: std::collections::BTreeMap<String, ProviderProfile>,
-    /// Set when profile selection failed (no profiles, ambiguous, or an unknown name); surfaced by
-    /// [`Self::validate`] with guidance to run `meka provider add` / `use`.
-    pub provider_error: Option<String>,
-    /// `config.toml` failed to read or parse. Raised by [`Self::validate`] before anything else,
-    /// since every other field is a default that silently ignores what the user wrote.
-    pub config_error: Option<String>,
-    /// The instructions the user explicitly named could not be loaded, or the two environment
-    /// variables that carry them contradict each other. Deferred like the two above so `from_cli`
-    /// stays infallible, and raised rather than shrugged off because running without guidance the
-    /// user believes they supplied is worse than not starting.
-    pub instructions_error: Option<String>,
-    pub model: Option<String>,
-    pub permission: Permission,
-    pub enabled_permissions: EnabledPermissions,
-    pub streaming: bool,
-    pub session_resume: Option<SessionResume>,
-    pub prompt: Option<String>,
-    pub oneshot: bool,
-    pub newline_before_prompt: bool,
-    pub newline_after_prompt: bool,
-    pub show_session_id_on_create: bool,
-    pub show_session_id_on_exit: bool,
-    pub show_path_in_prompt: bool,
-    pub show_context_in_prompt: bool,
-    pub show_token_usage: bool,
-    pub resume_show_recent: Option<usize>,
-    pub web_client: WebClientConfig,
-    pub sandbox: bool,
+    /// Distinct from [`ResolvedConfig::default_profile`], which is the *resolved* default and is
+    /// set whether or not anyone asked for it. Resuming needs to tell the two apart: a session
+    /// runs on the profile it recorded, and only an explicit request rewrites that.
+    pub(crate) requested_profile: Option<String>,
     /// Extra workspace roots from `--writable-root`, joined with the cwd (and, under ACP, the
     /// client's folders) to form the write boundary at `workspace` permission.
     ///
     /// CLI-only by design. Which folders a run may write is a per-run scope like the working
     /// directory, not a preference worth persisting, so there is deliberately no `config.toml`
     /// key and no env tier for it.
-    pub writable_roots: Vec<std::path::PathBuf>,
-    /// Resolved Linux sandbox backend. Auto-picked at startup when `[shell].sandbox_backend` was
-    /// not set: prefers bubblewrap, falls back to landlock. Silently `Landlock` on macOS / Windows
-    /// (those platforms have their own backend and ignore the field).
-    pub sandbox_backend: SandboxBackend,
-    /// True when [`Self::sandbox_backend`] was auto-resolved (i.e. the user did not pin a value in
-    /// `[shell].sandbox_backend`). Used to gate the "stronger sandbox available; install bwrap"
-    /// startup warn. We don't want to nag users who explicitly chose landlock.
-    pub sandbox_auto_resolved: bool,
-    /// Cached probe of the resolved backend. Consulted by `warn_if_sandbox_issues` and by the lazy
-    /// hard-error path in `src/tools/shell.rs` when read-mode `execute_command` is invoked.
-    pub backend_probe: crate::sandbox::BackendProbe,
-    pub render_mode: RenderMode,
-    pub tool_params: ToolParams,
+    pub(crate) writable_roots: Vec<std::path::PathBuf>,
+    /// CLI-flag override for `[serve].bind` (`meka serve --bind ...`). Wins over the config file
+    /// when set.
+    pub(crate) serve_bind_override: Option<String>,
+    /// `--instructions` verbatim; the host resolves it against the persistent tiers at startup
+    /// through [`crate::instructions::resolve`].
+    pub(crate) instructions: Option<String>,
+}
+
+/// One configured profile as a listing shows it: its name, the account it bills, that account's
+/// `backend` as written, and the model when the profile names one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileSummary {
+    pub(crate) name: String,
+    pub(crate) account: String,
+    pub(crate) backend: String,
+    pub(crate) model: Option<String>,
+}
+
+/// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env vars. This is what the
+/// rest of the binary reads; `ConfigFile` is for deserialization only. Resolution lives in
+/// `resolve_config` (Linux) and the non-Linux variant below it.
+#[derive(Debug)]
+pub(crate) struct ResolvedConfig {
+    /// Backend of the selected profile's account; `None` when no profile could be selected or its
+    /// account's backend is not one meka knows, in which case [`Self::provider_error`] says so.
+    pub(crate) backend: Option<Backend>,
+    /// Name of the selected profile.
+    ///
+    /// The process default only. A session records the profile it runs with and resolves that one
+    /// out of [`Self::profiles`] instead, which is why the maps below are retained rather than
+    /// dropped once this name is picked.
+    pub(crate) default_profile: Option<String>,
+    /// The profile `default_profile` picks, ignoring `--profile`.
+    ///
+    /// Only the migration ledger wants this. It stamps a profile onto sessions that predate meka
+    /// recording one, which is a guess it makes once and cannot revisit, so the answer must not
+    /// depend on a flag the first invocation after an upgrade happened to carry: `meka --profile
+    /// side -p "..."` would otherwise move a whole history onto `side` because of one run.
+    /// Everything else wants [`Self::default_profile`], where the flag is the point.
+    pub(crate) configured_default_profile: Option<String>,
+    /// Every configured account, by name. A profile's credential is stored under its account.
+    pub(crate) accounts: std::collections::BTreeMap<String, AccountConfig>,
+    /// Every configured profile, by name.
+    ///
+    /// Kept so a provider can be built for a profile that is not the process default. Selection
+    /// picks one name at startup, but a session names its own, and resolving that one needs the
+    /// profile still to be here.
+    pub(crate) profiles: std::collections::BTreeMap<String, ProfileConfig>,
+    /// Set when profile selection failed (no profiles, ambiguous, an unknown name, or a profile
+    /// whose account is missing); surfaced by [`Self::validate`] with guidance.
+    pub(crate) provider_error: Option<String>,
+    /// `config.toml` failed to read or parse. Raised by [`Self::validate`] before anything else,
+    /// since every other field is a default that silently ignores what the user wrote.
+    pub(crate) config_error: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) permission: Permission,
+    pub(crate) enabled_permissions: EnabledPermissions,
+    /// What a new session's approvals switch starts as. A resumed session brings its own.
+    pub(crate) approvals: bool,
+    pub(crate) streaming: bool,
+    pub(crate) newline_before_prompt: bool,
+    pub(crate) newline_after_prompt: bool,
+    pub(crate) show_session_id_on_create: bool,
+    pub(crate) show_session_id_on_exit: bool,
+    pub(crate) show_path_in_prompt: bool,
+    pub(crate) show_context_in_prompt: bool,
+    pub(crate) show_token_usage: bool,
+    pub(crate) resume_show_recent: Option<usize>,
+    pub(crate) web_client: WebClientConfig,
+    pub(crate) sandbox: bool,
+    /// `[shell].sandbox_backend` (or its flag and variable), before any auto-pick. Linux-only;
+    /// the host resolves and probes it at startup ([`crate::sandbox::resolve_backend`]) because
+    /// the pick depends on what the machine has.
+    pub(crate) sandbox_backend: Option<SandboxBackend>,
+    pub(crate) render_mode: RenderMode,
+    pub(crate) tool_params: ToolParams,
     /// Resolved `[display].max_width`. `None` - the default - follows the terminal.
-    pub max_width: Option<usize>,
-    pub context_messages: Option<usize>,
-    /// Resolved `[session].retention_days`. `None` - the default - disables startup cleanup.
-    pub retention_days: Option<u64>,
-    pub thinking: crate::provider::ThinkingMode,
-    /// The active profile's resolved thinking budget, the sibling of [`Self::thinking`] and
+    pub(crate) max_width: Option<usize>,
+    pub(crate) context_messages: Option<usize>,
+    /// Resolved `[session].retention`. `None`, the default, disables startup cleanup.
+    pub(crate) retention: Option<std::time::Duration>,
+    pub(crate) thinking: crate::config::ThinkingMode,
+    /// The selected profile's resolved thinking budget, the sibling of [`Self::thinking`] and
     /// [`Self::max_output_tokens`]. Answers "what would a brand-new session get", which is exactly
     /// what [`ResolvedConfig::validate_default_profile`] needs to check the pair against each
     /// other. Not the seed: that is [`Self::default_thinking_budget`].
-    pub thinking_budget: u64,
-    pub thinking_show_content: bool,
-    pub auto_compact: bool,
-    pub compact_checkpoint: bool,
+    pub(crate) thinking_budget: u64,
+    pub(crate) thinking_show_content: bool,
+    pub(crate) auto_compact: bool,
+    pub(crate) compact_checkpoint: bool,
     /// `[session].context_window` verbatim, *before* any profile is applied to it.
     ///
     /// Unresolved on purpose, and the one flat field here that must stay that way. It is the seed
@@ -1596,313 +1168,81 @@ pub struct ResolvedConfig {
     /// window for every other profile that states none: a session on a small local model would
     /// gauge itself against the big cloud default and never compact, and the reverse pairing would
     /// compact every turn. Resolving it here and again per profile is the same mistake twice.
-    pub session_context_window: Option<u64>,
-    /// `[thinking].budget_tokens` verbatim, unresolved for the reason
-    /// [`Self::session_context_window`] gives at length: it is the seed every profile falls back
-    /// to, so a value already resolved through the *active* profile would become that
-    /// profile's budget for every profile stating none.
-    pub default_thinking_budget: Option<u64>,
+    pub(crate) session_context_window: Option<u64>,
+    /// `[thinking].budget` verbatim, unresolved for the reason [`Self::session_context_window`]
+    /// gives at length: it is the seed every profile falls back to, so a value already resolved
+    /// through the *active* profile would become that profile's budget for every profile stating
+    /// none.
+    pub(crate) default_thinking_budget: Option<u64>,
     /// Maximum sub-agent recursion depth. `1` lets the root agent spawn but denies its sub-agents
     /// the same; `0` disables `agent_spawn` entirely. Seeds the root `AgentSpawnTool`'s depth
     /// budget in `main.rs`.
-    pub subagent_max_depth: usize,
-    /// Whether the active profile's model accepts image input (the ACP `image` prompt capability).
-    /// Resolved from `[providers.<name>].vision`, defaulting to `true`.
-    pub vision: bool,
-    /// Per-request output (completion) token cap from `[providers.<name>].max_output_tokens`.
+    pub(crate) subagent_max_depth: usize,
+    /// Whether the selected profile's model accepts image input (the ACP `image` prompt
+    /// capability). Resolved from `[profiles.<name>].vision`, defaulting to `true`.
+    pub(crate) vision: bool,
+    /// Per-request output (completion) token cap from `[profiles.<name>].max_output_tokens`.
     /// `None` leaves each backend's built-in default in place.
-    pub max_output_tokens: Option<u64>,
-    pub mcp_servers: Vec<McpServerConfig>,
+    pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) mcp_servers: Vec<McpServerConfig>,
     /// Parsed [`Permission`] from `[mcp].default_permission`, carried so per-turn tool-permission
     /// resolution in `src/mcp.rs` doesn't have to re-read the config file. `None` means "no
     /// `[mcp]` default configured"; resolution falls through to the hardcoded `Unrestricted`.
-    pub mcp_default_permission: Option<Permission>,
-    pub user_instructions: Option<String>,
-    /// Where [`Self::user_instructions`] came from, rendered (`--instructions`,
-    /// `MEKA_INSTRUCTIONS`, or the contributing file paths). Kept alongside the text so an
-    /// operator asking "why is it behaving like that" over the API gets the provenance, not just
-    /// the prose.
-    pub user_instructions_source: Option<String>,
-    /// Non-secret projection of the configured `[providers.<name>]` profiles: `(name, backend,
-    /// model)`.
+    pub(crate) mcp_default_permission: Option<Permission>,
+    /// Non-secret projection of the configured profiles, for `GET /v1/profiles`.
     ///
-    /// A projection rather than the profiles themselves, so a field added to [`ProviderProfile`]
-    /// later cannot start appearing on `GET /v1/providers` by accident. Credentials were never in
-    /// here to begin with; they live in the database keyed by profile name.
-    pub provider_profiles: Vec<(String, String, Option<String>)>,
+    /// A projection rather than the profiles themselves, so a field added to [`ProfileConfig`]
+    /// later cannot start appearing on the API by accident. Credentials were never in here to
+    /// begin with; they live in the database keyed by account name.
+    pub(crate) profile_summaries: Vec<ProfileSummary>,
     /// Whether the `skill_read` / `skill_search` tools are registered and the `[Skills]` index
     /// rendered. Defaults to `true`; see [`SkillsConfig`].
-    pub skills_enabled: bool,
+    pub(crate) skills_enabled: bool,
     /// Whether `skill_write` / `skill_delete` are additionally registered. Defaults to `false`;
     /// see [`SkillsConfig::agent_managed`].
-    pub skills_agent_managed: bool,
-    /// Read-only skill roots scanned in addition to meka's own; see
-    /// [`SkillsConfig::extra_paths`]. Already tilde-expanded, and empty unless configured.
+    pub(crate) skills_agent_managed: bool,
+    /// Read-only skill roots scanned in addition to meka's own; see [`SkillsConfig::extra_paths`].
+    /// Already tilde-expanded, and empty unless configured.
     ///
     /// Read through [`Self::skill_roots`] rather than directly, so the "native first, then these"
     /// order has one owner.
-    pub skills_extra_paths: Vec<std::path::PathBuf>,
+    pub(crate) skills_extra_paths: Vec<std::path::PathBuf>,
     /// Whether the `memory_*` tools are registered and the `[Memory]` index rendered. Defaults to
     /// `true`; see [`MemoryConfig`].
-    pub memory_enabled: bool,
+    pub(crate) memory_enabled: bool,
     /// `[schedule]` with defaults filled. Resolved here rather than at the call site because both
     /// the REPL and `meka serve` start a scheduler and would otherwise each re-derive it.
-    pub schedule: ResolvedScheduleConfig,
+    pub(crate) schedule: ResolvedScheduleConfig,
     /// `[background]` with defaults filled. Off unless the installation asks for it; see
     /// [`BackgroundConfig`].
-    pub background: ResolvedBackgroundConfig,
-    /// `[subagents]` with defaults filled. Governs what a spawned worker does *not* inherit; see
-    /// [`SubagentsConfig`].
-    pub subagents: ResolvedSubagentsConfig,
-    pub builtin_allowed_tools: Option<Vec<String>>,
-    pub builtin_disabled_tools: Vec<String>,
-    pub builtin_tool_permissions: HashMap<String, Permission>,
-    pub input_style: nu_ansi_term::Style,
+    pub(crate) background: ResolvedBackgroundConfig,
+    /// `[subagents]` with defaults filled. Governs what a spawned sub-agent does *not* inherit;
+    /// see [`SubagentsConfig`].
+    pub(crate) subagents: ResolvedSubagentsConfig,
+    pub(crate) builtin_allowed_tools: Option<Vec<String>>,
+    pub(crate) builtin_disabled_tools: Vec<String>,
+    pub(crate) builtin_tool_permissions: HashMap<String, Permission>,
+    pub(crate) input_style: nu_ansi_term::Style,
     /// First-turn await cap for still-connecting MCP servers.
-    pub mcp_grace: std::time::Duration,
+    pub(crate) mcp_grace: std::time::Duration,
     /// Per-server connect+initialize timeout.
-    pub mcp_connect_timeout: std::time::Duration,
-    /// Raw `[serve]` section. Resolved (defaults filled, env vars substituted, token files
-    /// read) at `meka serve` startup by [`ResolvedServeConfig::resolve`], not here, so
-    /// `from_cli` can stay infallible.
-    pub serve: Option<ServeConfig>,
-    /// CLI-flag override for `[serve].bind` (`meka serve --bind ...`). Wins over the config
-    /// file when set.
-    pub serve_bind_override: Option<String>,
-}
-
-/// Validated, defaults-filled view of [`ServeConfig`]. Constructed at config-load time by
-/// [`ResolvedServeConfig::resolve`].
-// Individual fields mirror [`ServeConfig`]; see its per-field documentation.
-#[derive(Debug, Clone)]
-pub struct ResolvedServeConfig {
-    pub bind: String,
-    pub idle_timeout: std::time::Duration,
-    pub gc_scan_interval: std::time::Duration,
-    pub delete_on_idle: bool,
-    pub shutdown_drain_timeout: std::time::Duration,
-    pub max_concurrent_turns: Option<usize>,
-    pub max_body_bytes: usize,
-    /// Whether a 502 carries the provider's own response as a `provider_response` member. On
-    /// unless turned off.
-    pub relay_provider_errors: bool,
-    /// Whether `/v1/docs` and `/v1/openapi.json` are served. Off unless asked for.
-    pub docs: bool,
-    /// How many SSE events per turn to retain for `Last-Event-ID` replay.
-    pub stream_replay_events: usize,
-    /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
-    /// reconnect. Zero cancels the turn the moment the stream drops.
-    pub stream_reattach_grace: std::time::Duration,
-    pub tokens: Vec<ResolvedServeToken>,
-    pub webhooks: Vec<ResolvedWebhook>,
-}
-
-/// Validated token entry. The `token` field carries the final secret value with `${ENV}`
-/// substitution applied and `token_file` contents loaded; call sites compare against this
-/// directly via constant-time equality.
-#[derive(Clone)]
-pub struct ResolvedServeToken {
-    pub token: String,
-    pub description: Option<String>,
-    pub scopes: Vec<String>,
-    /// Where the token value originated, used at startup to nudge operators away from inline
-    /// plaintext. See [`TokenSource`]. Not security-sensitive itself.
-    pub source: TokenSource,
-}
-
-impl std::fmt::Debug for ResolvedServeToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedServeToken")
-            .field(
-                "token",
-                &format_args!("[REDACTED len={}]", self.token.len()),
-            )
-            .field("description", &self.description)
-            .field("scopes", &self.scopes)
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
-/// Provenance of a configured token. Determines whether `meka serve` emits a `warn!` at startup
-/// (inline plaintext) or file-backed.
-#[derive(Debug, Clone)]
-pub enum TokenSource {
-    /// Literal value in `token = "..."` with no `${ENV}` markers, discouraged outside
-    /// development.
-    Inline,
-    /// `token = "${ENV_VAR}"` substituted at config-load time.
-    EnvVar,
-    /// `token_file = "/path/to/token"` read at config-load time.
-    File,
-}
-
-impl ResolvedServeConfig {
-    /// Resolve a [`ServeConfig`] (or its absence) into a [`ResolvedServeConfig`] with all
-    /// defaults filled and tokens read from disk / env. Errors are returned for caller
-    /// configuration problems (both `token` and `token_file` set, env var unset, file missing).
-    pub fn resolve(raw: Option<ServeConfig>) -> Result<Self, String> {
-        let raw = raw.unwrap_or_default();
-        // Reject zero-value `max_*` knobs at config time:
-        //   - `max_concurrent_turns = 0` would 429 every turn
-        //   - `max_body_bytes = 0` would 413 every request
-        // Operators wanting "unbounded" omit the field instead.
-        if let Some(0) = raw.max_concurrent_turns {
-            return Err(
-                "[serve] `max_concurrent_turns = 0` would block every turn. Omit the field \
-                 to disable the cap, or set a positive integer."
-                    .into(),
-            );
-        }
-        if let Some(0) = raw.max_body_bytes {
-            return Err(
-                "[serve] `max_body_bytes = 0` would reject every request body. Omit the \
-                 field to use the default (10 MiB), or set a positive integer."
-                    .into(),
-            );
-        }
-        if raw.gc_scan_interval == Some(std::time::Duration::ZERO) {
-            // `tokio::time::interval(ZERO)` panics, and the GC handle is only ever aborted, never
-            // joined, so the panic is swallowed: eviction silently never runs and every session
-            // lock is held until the process exits. `[schedule].poll_interval` guards the same
-            // shape for the same reason.
-            return Err(
-                "[serve] `gc_scan_interval = \"0s\"` would stop the session GC from ever running. \
-                 Omit the field for the default (5m), or set a positive duration."
-                    .into(),
-            );
-        }
-        let tokens = raw
-            .tokens
-            .unwrap_or_default()
-            .into_iter()
-            .map(ResolvedServeToken::resolve)
-            .collect::<Result<Vec<_>, _>>()?;
-        let webhooks = raw
-            .webhooks
-            .unwrap_or_default()
-            .into_iter()
-            .map(ResolvedWebhook::resolve)
-            .collect::<Result<Vec<_>, _>>()?;
-        for webhook in &webhooks {
-            if webhook.secret.is_none() {
-                tracing::warn!(
-                    // Host only. `warn` is the default level, so this line lands in logs an
-                    // operator may well paste elsewhere, and for a Slack- or Discord-style
-                    // endpoint the URL path *is* the credential. The full URL is at `info`.
-                    endpoint = %webhook_host(&webhook.url),
-                    "webhook has no `secret`; deliveries are unsigned and a receiver cannot \
-                     tell them apart from anything else that can reach it",
-                );
-            }
-            if webhook.url.starts_with("http://") {
-                tracing::warn!(
-                    endpoint = %webhook_host(&webhook.url),
-                    "webhook uses plaintext http; deliveries are signed but not encrypted",
-                );
-            }
-        }
-        Ok(Self {
-            bind: raw.bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
-            idle_timeout: raw
-                .idle_timeout
-                .unwrap_or(std::time::Duration::from_secs(24 * 60 * 60)),
-            gc_scan_interval: raw
-                .gc_scan_interval
-                .unwrap_or(std::time::Duration::from_secs(5 * 60)),
-            delete_on_idle: raw.delete_on_idle.unwrap_or(false),
-            shutdown_drain_timeout: raw
-                .shutdown_drain_timeout
-                .unwrap_or(std::time::Duration::from_secs(30)),
-            max_concurrent_turns: raw.max_concurrent_turns,
-            max_body_bytes: raw.max_body_bytes.unwrap_or(10 * 1024 * 1024),
-            relay_provider_errors: raw.relay_provider_errors.unwrap_or(true),
-            docs: raw.docs.unwrap_or(false),
-            // Matches the broadcast channel's capacity: retaining more than the live channel can
-            // buffer would let a client replay events a *connected* consumer would have been
-            // dropped for missing.
-            stream_replay_events: raw.stream_replay_events.unwrap_or(256),
-            stream_reattach_grace: raw
-                .stream_reattach_grace
-                .unwrap_or(std::time::Duration::from_secs(30)),
-            tokens,
-            webhooks,
-        })
-    }
-}
-
-impl ResolvedServeToken {
-    fn resolve(raw: ServeTokenConfig) -> Result<Self, String> {
-        let (token, source) = match (raw.token, raw.token_file) {
-            (Some(_), Some(_)) => {
-                return Err(
-                    "[serve.tokens] entry has both `token` and `token_file`; pick one".into(),
-                );
-            }
-            (Some(inline), None) => {
-                let (resolved, substituted) = substitute_env(&inline)?;
-                let source = if substituted {
-                    TokenSource::EnvVar
-                } else {
-                    TokenSource::Inline
-                };
-                (resolved, source)
-            }
-            (None, Some(path)) => {
-                let resolved = std::fs::read_to_string(&path)
-                    .map(|s| s.trim().to_string())
-                    .map_err(|error| {
-                        format!("failed to read `token_file` {}: {}", path.display(), error)
-                    })?;
-                warn_if_world_readable(&path);
-                (resolved, TokenSource::File)
-            }
-            (None, None) => {
-                return Err("[serve.tokens] entry must set either `token` or `token_file`".into());
-            }
-        };
-        if token.is_empty() {
-            return Err("[serve.tokens] resolved token is empty".into());
-        }
-        crate::server::scope::warn_unknown(&raw.scopes, raw.description.as_deref());
-        Ok(Self {
-            token,
-            description: raw.description,
-            scopes: raw.scopes,
-            source,
-        })
-    }
-}
-
-/// Log a warning if `path` is readable by group or others on Unix. No-op on non-Unix.
-/// Matches the advisory guidance ("chmod 0600 recommended") without
-/// refusing to start; the file has already been read successfully, so we just nudge.
-fn warn_if_world_readable(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mode = metadata.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                tracing::warn!(
-                    "[serve.tokens] token_file '{}' has permissions {:04o}; recommend chmod 0600 \
-                     to prevent other users from reading the bearer token",
-                    path.display(),
-                    mode,
-                );
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
+    pub(crate) mcp_connect_timeout: std::time::Duration,
+    /// How many stdio servers the startup connector spawns at once.
+    pub(crate) mcp_stdio_concurrency: usize,
+    /// How many HTTP servers the startup connector connects at once.
+    pub(crate) mcp_http_concurrency: usize,
+    /// Raw `[serve]` section. Resolved (defaults filled, env vars substituted, token files read)
+    /// at `meka serve` startup by [`crate::host::http::config::ResolvedServeConfig::resolve`], not
+    /// here, so [`ResolvedConfig::resolve`] can stay infallible.
+    pub(crate) serve: Option<ServeConfig>,
+    /// What this invocation asked for, as distinct from how meka is configured.
+    pub(crate) request: RunRequest,
 }
 
 /// Deserialize an optional humantime duration string (e.g. `"24h"`, `"5m"`, `"30s"`).
-/// `serde(deserialize_with)` on `Option<Duration>` requires this wrapper because
-/// `humantime_serde` only provides a `deserialize` for `Duration`, not `Option<Duration>`.
-fn deserialize_optional_duration<'de, D>(
+/// `serde(deserialize_with)` on `Option<Duration>` requires this wrapper because `humantime_serde`
+/// only provides a `deserialize` for `Duration`, not `Option<Duration>`.
+pub(crate) fn deserialize_optional_duration<'de, D>(
     deserializer: D,
 ) -> Result<Option<std::time::Duration>, D::Error>
 where
@@ -1921,10 +1261,10 @@ where
 /// for a literal `$`. Unknown variables return an error rather than expanding to empty; silent
 /// expansion to empty would produce a runtime auth-bypass-shaped configuration.
 ///
-/// Returns the substituted string plus a boolean indicating whether at least one `${VAR}`
-/// expansion happened; callers use this to classify token provenance (`TokenSource::EnvVar`
-/// vs `TokenSource::Inline`) for the startup warning.
-fn substitute_env(input: &str) -> Result<(String, bool), String> {
+/// Returns the substituted string plus a boolean indicating whether at least one `${VAR}` expansion
+/// happened; callers use this to classify token provenance (`TokenSource::EnvVar` vs
+/// `TokenSource::Inline`) for the startup warning.
+pub(crate) fn substitute_env(input: &str) -> Result<(String, bool), String> {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut substituted = false;
@@ -1953,7 +1293,7 @@ fn substitute_env(input: &str) -> Result<(String, bool), String> {
                     return Err("unclosed `${` in a substituted config value".into());
                 }
                 let value = std::env::var(&name)
-                    .map_err(|_| format!("env var `{}` referenced in config is unset", name))?;
+                    .map_err(|_| format!("env var `{name}` referenced in config is unset"))?;
                 out.push_str(&value);
                 substituted = true;
             }
@@ -1964,9 +1304,9 @@ fn substitute_env(input: &str) -> Result<(String, bool), String> {
 }
 
 /// Default input style: bold, white-ish foreground, slate-blue background. Uses truecolor RGB (not
-/// palette indices or named colours) so the visual is consistent across terminals that remap the
-/// standard 16 colours to match their theme.
-pub fn default_input_style() -> nu_ansi_term::Style {
+/// palette indices or named colors) so the visual is consistent across terminals that remap the
+/// standard 16 colors to match their theme.
+pub(crate) fn default_input_style() -> nu_ansi_term::Style {
     use nu_ansi_term::{Color, Style};
     Style::new()
         .bold()
@@ -1975,9 +1315,9 @@ pub fn default_input_style() -> nu_ansi_term::Style {
 }
 
 /// Parse a `[display].input_style` value. `"default"` (or unset) yields [`default_input_style`];
-/// `"none"` yields no styling; simple keywords pick a single colour or attribute. Unknown keywords
+/// `"none"` yields no styling; simple keywords pick a single color or attribute. Unknown keywords
 /// warn and fall back to the default so a typo doesn't lose the session to a panic.
-pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
+pub(crate) fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
     use nu_ansi_term::{Color, Style};
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "default" => default_input_style(),
@@ -1997,46 +1337,18 @@ pub fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
         "white" => Style::new().fg(Color::White),
         other => {
             tracing::warn!(
-                "ignoring unknown [display].input_style '{}' (expected \
-                 default, none, reverse, bold, dim, italic, underline, or a color name)",
-                other
+                "ignoring unknown [display].input_style '{other}' (expected default, none, \
+                 reverse, bold, dim, italic, underline, or a color name)"
             );
             default_input_style()
         }
     }
 }
 
-/// Expand a leading `~` or `~/` in a user-supplied path to the home directory.
-///
-/// Returns `None` only when a tilde needs the home directory but it cannot be determined, which the
-/// caller reports rather than silently treating `~` as a relative directory of that name.
-///
-/// Shared by the REPL's `/cd` (and its path completer) and by `[skills] extra_paths`, so a tilde
-/// means the same thing wherever a user types a path. Deliberately does *not* expand `~user`: that
-/// needs a password-database lookup, and no config surface here has ever accepted the form.
-pub fn expand_user_path(target: &str) -> Option<PathBuf> {
-    if target.is_empty() || target == "~" {
-        dirs::home_dir()
-    } else if let Some(rest) = target
-        .strip_prefix('~')
-        .and_then(|rest| rest.strip_prefix(std::path::is_separator))
-    {
-        // `is_separator`, not a literal `"~/"`. On Windows both `/` and `\` separate, and `~\` is
-        // the spelling a user reaches for there because that is what PowerShell's own tilde
-        // expansion produces. Matching only `~/` left `~\projects` unexpanded, so it became a
-        // literal relative directory of that name and `/cd` reported the tilde back at the user as
-        // though it were a folder. `[skills] extra_paths` took the same spelling and resolved to a
-        // root that never existed.
-        dirs::home_dir().map(|home| home.join(rest))
-    } else {
-        Some(PathBuf::from(target))
-    }
-}
-
 /// Resolve `[skills] extra_paths` into the read-only roots discovery will scan.
 ///
-/// A *function* rather than a chain inside `from_cli`, because each of the four things it drops has
-/// its own reason and each needs saying out loud:
+/// A *function* rather than a chain inside [`ResolvedConfig::resolve`], because each of the four
+/// things it drops has its own reason and each needs saying out loud:
 ///
 /// - An empty entry, because [`expand_user_path`] maps `""` to the home directory. That is right
 ///   for `/cd` (type `cd` and you go home) and catastrophic here: `$HOME` would become a skills
@@ -2060,257 +1372,27 @@ fn resolve_skills_extra_paths(raw: &[String], native: Option<&Path>) -> Vec<Path
         }
         let Some(path) = expand_user_path(entry) else {
             tracing::warn!(
-                "[skills] extra_paths entry '{}' needs a home directory that could not be \
-                 determined; skipping it",
-                entry
+                "[skills] extra_paths entry '{entry}' needs a home directory, and none could be \
+                 determined; skipping it"
             );
             continue;
         };
         if Some(path.as_path()) == native {
             tracing::warn!(
-                "[skills] extra_paths entry '{}' is meka's own skills directory, which is always \
-                 scanned first; ignoring it",
-                entry
+                "[skills] extra_paths entry '{entry}' is meka's own skills directory, which is \
+                 always scanned first; ignoring it"
             );
             continue;
         }
         if resolved.contains(&path) {
             tracing::warn!(
-                "[skills] extra_paths lists '{}' more than once; ignoring the repeat",
-                entry
+                "[skills] extra_paths lists '{entry}' more than once; ignoring the repeat"
             );
             continue;
         }
         resolved.push(path);
     }
     resolved
-}
-
-/// Returns the meka config directory (the directory that contains `config.toml` and `skills/`).
-/// Honours the `MEKA_CONFIG_DIR` env var, used by tests for per-run isolation and by power users
-/// who want a non-standard location, before falling back to the platform-native
-/// `dirs::config_dir().join("meka")`. The env-var route is the only reliable way to isolate state
-/// on macOS and Windows, where `dirs::config_dir()` doesn't honour `XDG_CONFIG_HOME`.
-pub fn meka_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("MEKA_CONFIG_DIR") {
-        let path = PathBuf::from(dir);
-        // An empty value reads as unset rather than as the current directory. `MEKA_CONFIG_DIR=`
-        // in a shell profile, or an exported-but-unset variable in a systemd unit, made meka load
-        // `./config.toml` from whatever directory it happened to start in -- and then spawn that
-        // file's MCP servers. A relative value has the same shape of problem: which config you get
-        // depends on your cwd. `MEKA_DATA_DIR` refuses both for the same reasons, and more
-        // sharply: `meka.db` holds every provider credential.
-        if path.as_os_str().is_empty() {
-            // `warn!`, not `debug!`: an override the user set and meka did not honour is exactly
-            // the recoverable-fallback case, and the environment-variable documentation says a
-            // warning is what happens.
-            tracing::warn!("MEKA_CONFIG_DIR is empty; using the platform config directory");
-        } else if !path.is_absolute() {
-            tracing::warn!(
-                "MEKA_CONFIG_DIR '{}' is not an absolute path; ignoring it and using the platform \
-                 config directory",
-                path.display()
-            );
-        } else {
-            return Some(path);
-        }
-    }
-    dirs::config_dir().map(|directory| directory.join("meka"))
-}
-
-pub(crate) fn config_file_path() -> Option<PathBuf> {
-    meka_config_dir().map(|dir| dir.join("config.toml"))
-}
-
-/// Resolve the user's standing instructions across the tiers that can carry them, most specific
-/// first: `--instructions`, then `MEKA_INSTRUCTIONS`, then `MEKA_INSTRUCTIONS_FILE`, then the
-/// conventional path under the config directory.
-///
-/// Inline and file are two *transports* for one setting rather than two ways of saying the same
-/// thing, which is why both survive. Which is natural follows from the channel: a filesystem
-/// channel (the config directory) points at content, while a string channel (argv, environment)
-/// carries it. Demanding a file from the latter can be impossible, not merely inconvenient: the
-/// `mekabox` wrapper mounts the host config directory read-only and then overrides the instructions
-/// for the container, which it can do with one `-e` and could not do at all if a path were the only
-/// accepted form.
-///
-/// Setting both environment variables is refused rather than silently resolved. There is no reading
-/// under which someone meant both, so picking one would just hide the mistake until the agent
-/// behaved unexpectedly.
-/// [`resolve_instructions`] over the persistent tiers only, for `meka instructions show`. A
-/// per-run `--instructions` isn't part of what a standalone query is asking about.
-pub(crate) fn resolve_instructions_for_display()
--> crate::error::Result<Option<crate::instructions::Instructions>> {
-    resolve_instructions(None)
-}
-
-fn resolve_instructions(
-    flag: Option<&str>,
-) -> crate::error::Result<Option<crate::instructions::Instructions>> {
-    if let Some(text) = flag {
-        let text = text.trim();
-        return Ok(
-            (!text.is_empty()).then(|| crate::instructions::Instructions {
-                text: text.to_string(),
-                source: crate::instructions::InstructionsSource::Flag,
-            }),
-        );
-    }
-
-    let inline = std::env::var("MEKA_INSTRUCTIONS").ok();
-    let from_file = std::env::var("MEKA_INSTRUCTIONS_FILE").ok();
-    if inline.is_some() && from_file.is_some() {
-        return Err(crate::error::MekaError::Config(
-            "MEKA_INSTRUCTIONS and MEKA_INSTRUCTIONS_FILE are both set; keep one. The first \
-             carries the text itself, the second a path to it."
-                .to_string(),
-        ));
-    }
-
-    if let Some(text) = inline {
-        let text = text.trim();
-        return Ok(
-            (!text.is_empty()).then(|| crate::instructions::Instructions {
-                text: text.to_string(),
-                source: crate::instructions::InstructionsSource::Env,
-            }),
-        );
-    }
-    if let Some(path) = from_file {
-        return crate::instructions::read_explicit(Path::new(&path)).map(Some);
-    }
-    Ok(crate::instructions::discover())
-}
-
-/// Resolve `path` through a final-component symlink, leaving anything else untouched.
-///
-/// Returns `path` unchanged when it is not a link, when the link cannot be read, or when the target
-/// is itself a link that leads nowhere useful: every failure mode falls back to writing where the
-/// caller asked, which is the previous behaviour. A relative link target is joined onto the link's
-/// own directory, as the OS resolves it.
-///
-/// Chains are followed to a small depth so a link-to-a-link still lands on the real file, with the
-/// bound there to stop a cycle (`a -> b -> a`) spinning.
-fn resolve_symlink_target(path: &Path) -> std::path::PathBuf {
-    const MAX_LINK_DEPTH: usize = 8;
-
-    let mut current = path.to_path_buf();
-    for _ in 0..MAX_LINK_DEPTH {
-        let is_link = std::fs::symlink_metadata(&current)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false);
-        if !is_link {
-            return current;
-        }
-        let Ok(target) = std::fs::read_link(&current) else {
-            return current;
-        };
-        current = if target.is_absolute() {
-            target
-        } else {
-            match current.parent() {
-                Some(parent) => parent.join(target),
-                None => return current,
-            }
-        };
-    }
-    tracing::warn!(
-        "'{}' is a symlink chain deeper than {} links; writing to the link itself",
-        path.display(),
-        MAX_LINK_DEPTH
-    );
-    path.to_path_buf()
-}
-
-/// `(device, inode)` on Unix, `(volume serial, file index)` on Windows: what makes "the thing I
-/// locked" and "the thing at this path" the same question.
-type FileIdentity = (u64, u64);
-
-/// Read the identity of an already-open file, from the descriptor rather than the path.
-///
-/// A platform that is neither Unix nor Windows gets a compile error here rather than a lock nothing
-/// revalidates.
-#[cfg(unix)]
-fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata()?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(windows)]
-fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
-    use std::os::windows::io::AsRawHandle;
-
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    // SAFETY: `BY_HANDLE_FILE_INFORMATION` is plain data with no niche, so an all-zero value is a
-    // valid one to hand out for filling.
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle is borrowed from a live `File` for the duration of the call, and the
-    // pointer is to a stack local of exactly the type the call expects.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((
-        u64::from(information.dwVolumeSerialNumber),
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
-    ))
-}
-
-/// How many times [`lock_path`] will re-take a lock whose resource was replaced underneath it.
-///
-/// A retake costs one extra wait, and each one needs the resource to have been replaced while this
-/// process was blocked on the previous inode. Bounded so a caller cannot wait forever on something
-/// replacing the resource in a loop.
-const MAX_LOCK_RETAKES: usize = 32;
-
-/// An exclusive `flock` keyed to the inode currently at a path, so a lock can be taken on the
-/// resource itself rather than on a file beside it.
-///
-/// Holding the open file is holding the lock: closing the descriptor releases it, on drop or when
-/// the kernel reaps the process.
-pub(crate) struct PathLock {
-    _file: std::fs::File,
-}
-
-/// Take [`PathLock`] on `path`, opened by `open`, and prove afterwards that it is still the live
-/// resource.
-///
-/// A waiter blocks on the inode it opened, and that inode can be removed and something else
-/// recreated under the same name before it wakes. Re-reading the identity is what stops it holding
-/// an unlinked inode nobody else can reach while the next arrival locks the replacement, each blind
-/// to the other.
-///
-/// The window this closes is the wait, not the whole critical section: a replacement landing after
-/// the check leaves the holder on the old inode with no way to notice, exactly as it would have
-/// left a lock file that the same `rm -rf` deleted. Nothing here defends against that.
-///
-/// Each iteration blocks in the kernel rather than polling, and only repeats when the check fails.
-pub(crate) fn lock_path(
-    path: &Path,
-    open: fn(&Path) -> std::io::Result<std::fs::File>,
-) -> std::io::Result<PathLock> {
-    for _ in 0..MAX_LOCK_RETAKES {
-        let file = open(path)?;
-        let held = file_identity(&file)?;
-        file.lock()?;
-
-        let live = open(path).and_then(|current| file_identity(&current));
-        match live {
-            Ok(live) if live == held => return Ok(PathLock { _file: file }),
-            _ => drop(file),
-        }
-    }
-    // Not `WouldBlock`, which promises the caller that nothing was attempted and a retry may work.
-    // This call did block, repeatedly, and gave up.
-    Err(std::io::Error::other(format!(
-        "gave up locking '{}' after {} retakes; something is replacing it continuously",
-        path.display(),
-        MAX_LOCK_RETAKES
-    )))
 }
 
 /// Exclusive cross-process lock over `config.toml`, held for a whole read-modify-write.
@@ -2346,7 +1428,7 @@ thread_local! {
     /// only holds because no `ConfigFileLock` is ever held across an `.await` on a task that can
     /// migrate. Every acquisition today runs inside `runtime.block_on` on the main thread, which
     /// never moves. If one were ever held across an await inside a `tokio::spawn`, the task could
-    /// resume on a different worker and both halves of this would break at once: a nested
+    /// resume on a different sub-agent and both halves of this would break at once: a nested
     /// acquisition there would see depth 0 and block on an `flock` this process already holds, and
     /// the guard would decrement the wrong thread's counter, leaving the original stuck above zero
     /// so every later acquisition on it silently took no lock at all.
@@ -2359,33 +1441,6 @@ impl Drop for ConfigFileLock {
     }
 }
 
-/// Open whichever inode carries the config lock.
-///
-/// The directory, not `config.toml`. Editors publish the file by `rename`, so a lock on the file
-/// stops excluding anyone the moment its holder writes: the holder is left on an unlinked inode
-/// while an arrival locks the replacement and enters a section the holder has not left.
-/// [`crate::mcp::cli`]'s `purge_server` would notice, revoking a credential over the network after
-/// its write. A directory's inode survives every write beneath it, and locking one adds no file to
-/// a tree people keep under version control.
-#[cfg(unix)]
-fn open_config_lock_target(directory: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(directory)
-}
-
-/// A file, because Windows locks are mandatory rather than advisory and `File::lock` takes the
-/// whole byte range, so a lock on `config.toml` makes it unreadable to the read-modify-write
-/// holding it -- `ERROR_LOCK_VIOLATION` from `read_to_string` on the owning thread. `LockFileEx`
-/// also rejects a directory handle with `ERROR_INVALID_PARAMETER`, leaving nowhere else to put it.
-#[cfg(windows)]
-fn open_config_lock_target(directory: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(directory.join(".config.toml.lock"))
-}
-
 /// Take [`ConfigFileLock`]. Blocks until the holder releases it, which is right for a CLI edit:
 /// the alternative is failing a `meka mcp add` because a background `device_id` write happened to
 /// be in flight.
@@ -2396,7 +1451,7 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
     }
 
     let directory = meka_config_dir()
-        .ok_or_else(|| std::io::Error::other("could not determine the config directory"))?;
+        .ok_or_else(|| std::io::Error::other("failed to determine the config directory"))?;
     // 0700 straight from `mkdir(2)`, as [`write_file_atomic`] does. A pre-existing directory is
     // left alone here and tightened by that function on the write this lock is being taken for,
     // which is also the only place that knows whether a symlink took the write out of meka's tree.
@@ -2416,189 +1471,26 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
     Ok(ConfigFileLock::Held { _lock: lock })
 }
 
-/// Write `content` to `path` atomically: serialise to a `<name>.<pid>.<seq>.tmp` beside it,
-/// `sync_all` the fd, then `rename` over the target. Also creates the parent directory (0700 on
-/// Unix, unless a symlink redirected the write out of meka's own tree) and holds the final file to
-/// at most 0600 on Unix. meka's own secrets live in the database, but an MCP server's `headers` and
-/// `env` are the user's to fill and may hold one verbatim, so the file is kept off-limits to group
-/// and other regardless of the user's umask or of what mode the target already had.
-///
-/// Not config-specific despite living here: the same durability and permission guarantees are what
-/// the skill store under the config dir wants, so `meka skill` bodies go through it too.
-///
-/// A symlinked target is followed (see [`resolve_symlink_target`]), so writing through a
-/// dotfile-manager link updates the tracked file instead of replacing the link.
-pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    // Follow a symlink to its target before choosing where to write.
-    //
-    // `rename(2)` replaces the directory entry, so renaming over a symlink destroys the link itself
-    // rather than updating what it points at. Dotfile managers (stow, chezmoi, yadm) leave
-    // `~/.config/meka/config.toml` as a link into a tracked repo, and one `meka mcp add` turned it
-    // into a plain file: the tracked copy went stale, every later edit diverged from it, and the
-    // next `stow --restow` silently reverted the lot. Resolving first keeps the write on the file
-    // the user actually manages, and the atomicity below is unaffected because the temp file is
-    // then created beside the *target*.
-    //
-    // Only the link itself is resolved, not the whole path: `canonicalize` would also resolve
-    // symlinked parent directories, which changes where the temp file lands for no benefit here.
-    let resolved = resolve_symlink_target(path);
-    // Whether the write is still landing inside meka's own tree. The 0700 tightening below is a
-    // statement about a directory meka owns, and following a link takes the write somewhere it does
-    // not: a dotfile manager's `~/dotfiles/config.toml` meant one `meka mcp disable` re-moded the
-    // whole repository directory to 0700 and every unrelated file in it stayed put but newly
-    // hidden -- a permission fact meka never established and cannot restore. Observed.
-    // Consulted only by the Unix mode-tightening branch below; there is no mode to tighten
-    // elsewhere, so computing it on those targets is dead work the compiler rightly flags.
-    #[cfg(unix)]
-    let redirected = resolved.as_path() != path;
-    let path = resolved.as_path();
-
-    if let Some(parent) = path.parent() {
-        // Create newly-missing parents already at 0700 to avoid the umask window left by
-        // `create_dir_all` followed by `set_permissions`. `DirBuilderExt::mode` passes the mode
-        // straight to `mkdir(2)`.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
-                .create(parent)?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(parent)?;
-
-        #[cfg(unix)]
-        if !redirected {
-            use std::os::unix::fs::PermissionsExt;
-            // Pre-existing dirs may have a different mode (e.g. user pre-created `~/.config` at
-            // 0755). Best-effort tighten to 0700; failure here gets a warning rather than aborting
-            // the write.
-            if let Ok(metadata) = std::fs::metadata(parent) {
-                let mut perms = metadata.permissions();
-                if perms.mode() & 0o777 != 0o700 {
-                    perms.set_mode(0o700);
-                    if let Err(error) = std::fs::set_permissions(parent, perms) {
-                        tracing::warn!(
-                            "failed to tighten '{}' to 0700: {}",
-                            parent.display(),
-                            error
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
-    })?;
-    // Unique per writer, and created exclusively. A fixed `<file>.tmp` is shared by every writer of
-    // the same path: both `open(O_TRUNC)` the same inode, both write from offset zero, and whoever
-    // renames last publishes a byte-level splice of two documents as a success. Reproduced -- 4 MiB
-    // of one body with 64 KiB of another laid over its front, renamed into place, `Ok(())` returned
-    // to both. The pid separates processes and the counter separates threads within one;
-    // `create_new` is what makes the pair a guarantee rather than a strong hope.
-    //
-    // `write_file_bytes` in `crate::tools::file` already carried the pid half of this for the same
-    // reason. This is the primitive every *store* writes through, and it had neither half.
-    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let (tmp_path, mut file) = loop {
-        let mut tmp_name = file_name.to_os_string();
-        tmp_name.push(format!(
-            ".{}.{}.tmp",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let candidate = path.with_file_name(tmp_name);
-        match options.open(&candidate) {
-            Ok(file) => break (candidate, file),
-            // Only a name collision is worth retrying; anything else is the real error.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    };
-    // Every failure arm removes the temp file. A unique name means a leftover is never reused, so
-    // without this each interrupted write leaves one behind for ever.
-    let write = (|| -> std::io::Result<()> {
-        file.write_all(content.as_bytes())?;
-        file.sync_all()
-    })();
-    drop(file);
-    if let Err(error) = write {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-
-    // An existing file keeps whatever mode it had, *narrowed* to at most 0600.
-    //
-    // Two failures meet here and only this rule avoids both. Handing the target the temp's fresh
-    // 0600 unconditionally re-moded a file meka did not create, which is wrong for a `config.toml`
-    // a dotfile manager owns. But simply carrying the old mode across is worse: it left a
-    // hand-written `headers = { Authorization = "Bearer sk-..." }` sitting in a world-readable file
-    // after any ordinary `meka mcp` edit, because the write follows the symlink out of meka's 0700
-    // directory and the group and other bits came along. Narrowing keeps a deliberately *tighter*
-    // mode like 0400 and refuses to publish a looser one.
-    //
-    // Said out loud when it bites, because it is a change to something the user set.
-    #[cfg(unix)]
-    if let Ok(existing) = std::fs::metadata(path) {
-        use std::os::unix::fs::PermissionsExt;
-        let existing_mode = existing.permissions().mode() & 0o777;
-        let narrowed = existing_mode & 0o600;
-        if narrowed != existing_mode {
-            tracing::warn!(
-                "tightening '{}' from {:o} to {:o}: meka writes credentials through this path and \
-                 will not leave them group- or world-readable",
-                path.display(),
-                existing_mode,
-                narrowed
-            );
-        }
-        if let Err(error) =
-            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(narrowed))
-        {
-            tracing::warn!(
-                "failed to set the mode of '{}' on the replacement: {}",
-                path.display(),
-                error
-            );
-        }
-    }
-
-    std::fs::rename(&tmp_path, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp_path);
-    })
-}
-
 /// Load `config.toml`, returning the parsed file and any error that stopped it from parsing.
 ///
 /// Warning and falling back to `ConfigFile::default()` is the worst of the options: one mistyped
 /// key silently reconfigures the whole agent, running it with no provider profiles, no MCP servers
 /// and default permissions, off a single line the user can easily scroll past. The error is carried
 /// instead and raised by [`ResolvedConfig::validate`], alongside the profile-selection failures, so
-/// `from_cli` can stay infallible.
+/// [`ResolvedConfig::resolve`] can stay infallible.
 ///
 /// The line between failing and continuing is whether a command *consults* the parsed config. One
-/// that does can only answer from empty defaults, which reads as fact: `meka provider list`
-/// printing "No provider profiles configured." over a file full of them. Those callers use
+/// that does can only answer from empty defaults, which reads as fact: `meka profile list`
+/// printing "No profiles configured." over a file full of them. Those callers use
 /// [`load_config_file_or_err`] / [`ResolvedConfig::require_readable_config`].
 ///
 /// Commands that instead edit the raw document through `toml_edit` are unaffected by an unknown key
 /// and are how a broken config gets fixed from the CLI, so they run anyway: `meka mcp add` /
 /// `remove` / `enable` / `disable` note the failure via
-/// [`ResolvedConfig::warn_if_config_unreadable`], and `meka provider remove` never loads the parsed
-/// config at all. Each re-reads the file itself, and each must fail on a *read* error rather than
-/// substitute an empty document, or the write-back truncates what it couldn't read.
+/// [`ResolvedConfig::warn_if_config_unreadable`], and `meka account remove` and `meka profile
+/// remove` never load the parsed config at all. Each re-reads the file itself, and each must fail
+/// on a *read* error rather than substitute an empty document, or the write-back truncates what it
+/// couldn't read.
 pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
     let Some(path) = config_file_path() else {
         return (ConfigFile::default(), None);
@@ -2621,14 +1513,14 @@ pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
 }
 
 /// [`load_config_file`] for callers that read profiles but have no `validate()` to route the error
-/// through: the `meka provider` and `meka account` subcommands.
+/// through: the `meka account` and `meka profile` subcommands.
 ///
 /// Fails rather than falling back to an empty `ConfigFile`, because for these callers "empty" is
-/// indistinguishable from "your profiles are gone". `meka provider add <existing>` is the sharp
+/// indistinguishable from "your profiles are gone". `meka profile add <existing>` is the sharp
 /// edge: its duplicate guard is the parsed map, so an empty one lets the add through to
 /// `upsert_profile_document`, which replaces the profile's table wholesale and drops every field
-/// the flags didn't set. An unparseable config must not route the user into that ("no provider
-/// profile named 'work'. Run `meka provider add work` to create it.").
+/// the flags didn't set. An unparseable config must not route the user into that ("no profile
+/// named 'work'. Run `meka profile add work` to create it.").
 pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
     let (config_file, error) = load_config_file();
     match error {
@@ -2637,77 +1529,61 @@ pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
     }
 }
 
-/// Resolve the runtime permission level and the set of enabled modes from the layered config
-/// sources. CLI > env > config file > built-in defaults. Invalid entries warn and are dropped;
-/// out-of-set overrides (e.g. `--permission ask` when `ask` is disabled) warn and clamp to the
-/// configured default rather than refusing to start, mirroring the `[tools.tool_permissions]`
-/// warn-and-skip pattern.
+/// Resolve the runtime permission level and the set of enabled levels from the layered config
+/// sources. CLI > env > config file > built-in defaults. A level meka does not have never reaches
+/// here, because [`PermissionsConfig`] is typed and serde refuses it at parse; out-of-set overrides
+/// (e.g. `--permission unrestricted` when it is disabled) warn and clamp to the configured default
+/// rather than refusing to start, mirroring the `[tools.tool_permissions]` warn-and-skip pattern.
 ///
 /// The third element is the level the user asked for on this run and got, or `None` when the level
 /// came from the config file or the built-in default. Resuming needs the distinction: a session
-/// runs at the level it recorded, and only an explicit request overrides that.
+/// runs at the level it recorded, and only an explicit request overrides that. The level
+/// `config.toml` alone gives a new session, for what is written into rows and archives: the store's
+/// ledger and an import. Unlike [`ResolvedConfig::resolve`] it reads no CLI flag and no environment
+/// variable, because those belong to one run and the row outlives it.
+pub(crate) fn default_permission_on_disk() -> crate::error::Result<Permission> {
+    let config_file = load_config_file_or_err()?;
+    let permissions = config_file.permissions.unwrap_or_default();
+    // No CLI or environment tier: what this answers is written into rows and archives that every
+    // later process reads, so only the file's own statement may decide it.
+    let (permission, _enabled, _requested) = resolve_permission(
+        None,
+        None,
+        permissions.default,
+        permissions.enabled.as_deref(),
+    );
+    Ok(permission)
+}
+
 fn resolve_permission(
     cli_permission: Option<Permission>,
     env_permission: Option<&str>,
-    file_default: Option<&str>,
-    file_enabled: Option<&[String]>,
+    file_default: Option<Permission>,
+    file_enabled: Option<&[Permission]>,
 ) -> (Permission, EnabledPermissions, Option<Permission>) {
     let enabled = match file_enabled {
-        Some(list) => {
-            let parsed: Vec<Permission> = list
-                .iter()
-                .filter_map(|raw| match raw.parse::<Permission>() {
-                    Ok(mode) => Some(mode),
-                    // The parser's own message, not a list restated here, so the two cannot drift.
-                    Err(error) => {
-                        tracing::warn!(
-                            "ignoring invalid [permissions].enabled entry '{}': {}",
-                            raw,
-                            error
-                        );
-                        None
-                    }
-                })
-                .collect();
-            match EnabledPermissions::from_modes(parsed) {
-                Some(set) => set,
-                None => {
-                    // `{read}`, not `DEFAULT`. The user wrote a list; every entry being
-                    // unrecognised means their intent could not be honoured, and `DEFAULT` answers
-                    // that by handing back *four* modes including `unrestricted`. A pre-split
-                    // config pinning `enabled = ["write"]` -- exactly one mode, deliberately --
-                    // came back with the whole ladder reachable by Shift+Tab. Falling back to the
-                    // narrowest useful set keeps a failed parse from widening authority.
-                    tracing::warn!(
-                        "no usable mode in [permissions].enabled; falling back to `read` alone"
-                    );
-                    EnabledPermissions::from_modes([Permission::Read])
-                        .unwrap_or(EnabledPermissions::DEFAULT)
-                }
+        Some(list) => match EnabledPermissions::from_levels(list.iter().copied()) {
+            Some(set) => set,
+            None => {
+                // `{read}`, not `DEFAULT`. The user wrote a list, and an empty one asks for
+                // nothing; `DEFAULT` would answer that by handing back *four* levels including
+                // `unrestricted`. Falling back to the narrowest useful set keeps an empty list
+                // from widening authority.
+                tracing::warn!(
+                    "[permissions].enabled names no level; falling back to `read` alone"
+                );
+                EnabledPermissions::from_levels([Permission::Read])
+                    .unwrap_or(EnabledPermissions::DEFAULT)
             }
-        }
+        },
         None => EnabledPermissions::DEFAULT,
     };
 
-    let configured_default = file_default.and_then(|raw| match raw.parse::<Permission>() {
-        Ok(mode) => Some(mode),
-        Err(error) => {
+    let resolved_default = match file_default {
+        Some(level) if enabled.is_enabled(level) => level,
+        Some(level) => {
             tracing::warn!(
-                "ignoring invalid [permissions].default '{}': {}",
-                raw,
-                error
-            );
-            None
-        }
-    });
-
-    let resolved_default = match configured_default {
-        Some(mode) if enabled.is_enabled(mode) => mode,
-        Some(mode) => {
-            tracing::warn!(
-                "[permissions].default = '{}' is not in [permissions].enabled; \
-                 falling back",
-                mode
+                "[permissions].default = '{level}' is not in [permissions].enabled; falling back"
             );
             if enabled.is_enabled(Permission::Read) {
                 Permission::Read
@@ -2725,23 +1601,22 @@ fn resolve_permission(
     };
 
     let env_override = env_permission.and_then(|raw| match raw.parse::<Permission>() {
-        Ok(mode) => Some(mode),
+        Ok(level) => Some(level),
         Err(error) => {
-            tracing::warn!("ignoring invalid MEKA_PERMISSION='{}': {}", raw, error);
+            tracing::warn!("ignoring invalid MEKA_PERMISSION='{raw}': {error}");
             None
         }
     });
 
     let raw_choice = cli_permission.or(env_override);
-    // A request that had to be clamped is not a request that was honoured, so it does not
-    // suppress a resumed session's recorded level either.
+    // A request that had to be clamped is not a request that was honored, so it does not suppress a
+    // resumed session's recorded level either.
     let requested = match raw_choice {
-        Some(mode) if enabled.is_enabled(mode) => Some(mode),
-        Some(mode) => {
+        Some(level) if enabled.is_enabled(level) => Some(level),
+        Some(level) => {
             tracing::warn!(
-                "requested start mode '{}' is not in [permissions].enabled; using '{}'",
-                mode,
-                resolved_default
+                "requested start level '{level}' is not in [permissions].enabled; using \
+                 '{resolved_default}'"
             );
             None
         }
@@ -2753,16 +1628,16 @@ fn resolve_permission(
 
 /// `MEKA_SANDBOX_BACKEND` overrides `[shell].sandbox_backend` for non-interactive / containerized
 /// runs (the `mekabox` wrapper sets it to pin Landlock and silence the auto-resolve warning when
-/// it mounts the host config read-only). Accepts `landlock` / `bubblewrap` (case-insensitive); an
-/// unrecognized value is warned about and ignored. Like the config field, this only affects the
-/// resolved backend on Linux.
+/// it mounts the host config read-only). Takes the one spelling the file takes; an unrecognized
+/// value is warned about and ignored. Like the config field, this only affects the resolved
+/// backend on Linux.
 fn sandbox_backend_override() -> Option<SandboxBackend> {
     parse_sandbox_backend_override(&std::env::var("MEKA_SANDBOX_BACKEND").ok()?)
 }
 
-/// Parse a `MEKA_SANDBOX_BACKEND` value (case-insensitive, trimmed). Empty or unrecognized values
-/// yield `None`; unrecognized ones also warn. Split from [`sandbox_backend_override`] so the
-/// parsing is unit-testable without mutating process env.
+/// Parse a `MEKA_SANDBOX_BACKEND` value (trimmed). Empty or unrecognized values yield `None`;
+/// unrecognized ones also warn. Split from [`sandbox_backend_override`] so the parsing is
+/// unit-testable without mutating process env.
 fn parse_sandbox_backend_override(value: &str) -> Option<SandboxBackend> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2772,74 +1647,32 @@ fn parse_sandbox_backend_override(value: &str) -> Option<SandboxBackend> {
     match trimmed.parse() {
         Ok(backend) => Some(backend),
         Err(message) => {
-            tracing::warn!("ignoring MEKA_SANDBOX_BACKEND: {}", message);
+            tracing::warn!("ignoring MEKA_SANDBOX_BACKEND: {message}");
             None
         }
     }
 }
 
-/// Resolve the active Linux sandbox backend.
-///
-/// When the user pinned `[shell].sandbox_backend = "..."` in `config.toml`, that choice is binding,
-/// no silent fallback at runtime; an unavailable explicit backend surfaces at use time via the
-/// `BackendProbe::Missing` / `UserNamespaceDenied` variants.
-///
-/// When the value is unset (`None`), meka probes bubblewrap and picks it if available, falling back
-/// to landlock otherwise. The `auto_resolved` flag is propagated so the startup warn helper can
-/// nudge the user once toward installing bwrap (without nagging users who explicitly pinned
-/// landlock).
-#[cfg(target_os = "linux")]
-fn resolve_sandbox_backend(
-    configured: Option<SandboxBackend>,
-) -> (SandboxBackend, bool, crate::sandbox::BackendProbe) {
-    use crate::sandbox::{BackendProbe, probe_backend};
-
-    // Probe Bubblewrap only when its result is load-bearing for the resolution: either the user
-    // pinned it explicitly, or no value was configured (so we need the probe to decide whether to
-    // auto-pick it). When the user pinned Landlock, the Bubblewrap smoke test would be pure waste
-    // (~500 ms on every meka start).
-    let (backend, auto_resolved, cached_bubblewrap_probe) = match configured {
-        Some(explicit) => (explicit, false, None),
-        None => {
-            let probe = probe_backend(SandboxBackend::Bubblewrap);
-            let picked = match &probe {
-                BackendProbe::Ok(_) => SandboxBackend::Bubblewrap,
-                _ => SandboxBackend::Landlock,
-            };
-            (picked, true, Some(probe))
-        }
-    };
-    // The Landlock arm discards `cached_bubblewrap_probe` because the auto-resolve path that
-    // populated it landed on Bubblewrap (it only falls through to Landlock when Bubblewrap probes
-    // unavailable, and that probe isn't useful for the chosen backend's status).
-    let backend_probe = match (backend, cached_bubblewrap_probe) {
-        (SandboxBackend::Bubblewrap, Some(probe)) => probe,
-        (SandboxBackend::Bubblewrap, None) => probe_backend(SandboxBackend::Bubblewrap),
-        (SandboxBackend::Landlock, _) => probe_backend(SandboxBackend::Landlock),
-    };
-    (backend, auto_resolved, backend_probe)
+/// `MEKA_RENDER_MODE` overrides `[display].render_mode`, with the same tolerance as
+/// [`sandbox_backend_override`]: a value meka does not have is warned about and ignored.
+fn render_mode_override() -> Option<RenderMode> {
+    parse_render_mode_override(&std::env::var("MEKA_RENDER_MODE").ok()?)
 }
 
-/// Non-Linux platforms have a single platform-native sandbox (`sandbox-exec` on macOS,
-/// Low-integrity on Windows, nothing elsewhere). `[shell].sandbox_backend` is documented as
-/// Linux-only and is ignored here: the resolved capability comes from [`crate::sandbox::detect`]
-/// and is surfaced through the same `BackendProbe::Ok` envelope so the downstream wiring in
-/// `src/main.rs` doesn't need a platform branch.
-#[cfg(not(target_os = "linux"))]
-fn resolve_sandbox_backend(
-    _configured: Option<SandboxBackend>,
-) -> (SandboxBackend, bool, crate::sandbox::BackendProbe) {
-    use crate::sandbox::{BackendProbe, SandboxCapability};
-
-    let probe = match crate::sandbox::detect() {
-        SandboxCapability::Unavailable => BackendProbe::Missing {
-            reason: "no platform sandbox backend available".to_string(),
-        },
-        capability => BackendProbe::Ok(capability),
-    };
-    // `SandboxBackend::Landlock` is a stand-in here; the field exists for Linux config parity but
-    // is never consulted on this platform.
-    (SandboxBackend::Landlock, false, probe)
+/// Parse a `MEKA_RENDER_MODE` value (trimmed). Empty or unrecognized values yield `None`;
+/// unrecognized ones also warn, so a retired spelling does not silently fall to the default.
+fn parse_render_mode_override(value: &str) -> Option<RenderMode> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse() {
+        Ok(mode) => Some(mode),
+        Err(message) => {
+            tracing::warn!("ignoring MEKA_RENDER_MODE: {message}");
+            None
+        }
+    }
 }
 
 /// Merge `--eager-load-tool SERVER:TOOL` CLI values into the matching server's
@@ -2855,23 +1688,19 @@ fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServer
                 let tool = tool.trim();
                 if server.is_empty() || tool.is_empty() {
                     tracing::warn!(
-                        "ignoring --eager-load-tool '{}' (expected SERVER:TOOL with both \
-                         parts non-empty)",
-                        raw
+                        "ignoring --eager-load-tool '{raw}' (expected SERVER:TOOL with both \
+                         parts non-empty)"
                     );
                     continue;
                 }
                 (server, tool)
             }
             None => {
-                tracing::warn!(
-                    "ignoring --eager-load-tool '{}' (expected SERVER:TOOL format)",
-                    raw
-                );
+                tracing::warn!("ignoring --eager-load-tool '{raw}' (expected SERVER:TOOL format)");
                 continue;
             }
         };
-        match servers.iter_mut().find(|s| s.name == server_name) {
+        match servers.iter_mut().find(|server| server.name == server_name) {
             Some(server) => {
                 let list = server.eager_load_tools.get_or_insert_with(Vec::new);
                 if !list.iter().any(|existing| existing == tool_name) {
@@ -2879,106 +1708,43 @@ fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServer
                 }
             }
             None => {
-                tracing::warn!(
-                    "--eager-load-tool '{}': no MCP server named '{}' is configured",
-                    raw,
-                    server_name
+                let refusal = crate::text::unknown_name(
+                    "MCP server",
+                    server_name,
+                    servers.iter().map(|server| server.name.as_str()),
                 );
+                tracing::warn!("--eager-load-tool '{raw}': {refusal}");
             }
         }
     }
 }
 
-/// Which tier asked for the profile [`select_active_profile`] could not find.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProfileRequest {
-    /// `--provider <name>` on this run.
-    Flag,
-    /// `default_provider` in `config.toml`, which is also what `meka provider use` writes.
-    DefaultProvider,
-}
-
-/// Resolve which provider profile is active given an explicit request (from `--provider` or
-/// `default_provider`) and the configured profiles. Returns `(active_profile, provider_error)`:
-/// exactly one is `Some`. A deferred error string (rather than a hard failure) keeps `from_cli`
-/// infallible; `validate()` surfaces it later with guidance.
-pub(crate) fn select_active_profile(
-    requested: Option<String>,
-    // Where `requested` came from, because the remedy differs. Telling someone who just typed
-    // `--provider typo` to "pass `--provider`" is advice they have already taken; telling someone
-    // whose `default_provider` names a deleted profile to run `meka provider list` is not enough.
-    source: ProfileRequest,
-    providers: &std::collections::BTreeMap<String, ProviderProfile>,
-) -> (Option<String>, Option<String>) {
-    match requested {
-        Some(name) if providers.contains_key(&name) => (Some(name), None),
-        Some(_) if providers.is_empty() => (
-            None,
-            Some("no provider profiles configured. Run `meka provider add <name>`.".to_string()),
-        ),
-        Some(name) => (
-            None,
-            Some(format!(
-                "no provider profile named '{}' (configured: {}). {}",
-                name,
-                providers.keys().cloned().collect::<Vec<_>>().join(", "),
-                match source {
-                    ProfileRequest::Flag => "Pass a configured name to `--provider`.",
-                    ProfileRequest::DefaultProvider =>
-                        "Fix `default_provider` in config.toml, or run `meka provider use <name>`.",
-                }
-            )),
-        ),
-        None => match providers.len() {
-            0 => (
-                None,
-                Some(
-                    "no provider configured. Run `meka provider add <name>` to set one up."
-                        .to_string(),
-                ),
-            ),
-            1 => (providers.keys().next().cloned(), None),
-            // Names `meka provider use`, which is what actually writes `default_provider`.
-            // Saying only "set `default_provider`" sends the reader to hand-edit a file for
-            // something a command does, and this state is most often reached by
-            // `meka provider remove` dropping a pointer to the profile it deleted.
-            _ => (
-                None,
-                Some(format!(
-                    "multiple provider profiles configured ({}); run `meka provider use <name>` \
-                     to pick a default, or pass `--provider <name>`.",
-                    providers.keys().cloned().collect::<Vec<_>>().join(", ")
-                )),
-            ),
-        },
-    }
-}
-
 impl ResolvedConfig {
-    pub fn from_cli(cli: &Cli) -> Self {
+    pub(crate) fn resolve(overrides: CliOverrides) -> Self {
         let (config_file, config_error) = load_config_file();
-        let providers = config_file.providers;
-        // Select the active profile: `--provider` flag, else `default_provider`, else the sole
+        let accounts = config_file.accounts;
+        let profiles = config_file.profiles;
+        // Select the selected profile: `--profile` flag, else `default_profile`, else the sole
         // profile. Absence / ambiguity / unknown name becomes a deferred error surfaced by
-        // `validate()` so `from_cli` stays infallible.
-        let (profile_request, requested_active) = match cli.provider.clone() {
+        // `validate()` so `resolve` stays infallible.
+        let (profile_request, requested_active) = match overrides.profile.clone() {
             Some(name) => (ProfileRequest::Flag, Some(name)),
             None => (
-                ProfileRequest::DefaultProvider,
-                config_file.default_provider.clone(),
+                ProfileRequest::DefaultProfile,
+                config_file.default_profile.clone(),
             ),
         };
-        let (active_profile, provider_error) =
-            select_active_profile(requested_active, profile_request, &providers);
+        let (default_profile, mut provider_error) =
+            select_profile(requested_active, profile_request, &profiles);
         // Resolved a second time without the flag, for the ledger. Its error is discarded: a
         // default nothing can pick is already reported by the resolution above, and the migration's
         // own fallbacks handle having no answer.
-        let (configured_default_profile, _) = select_active_profile(
-            config_file.default_provider.clone(),
-            ProfileRequest::DefaultProvider,
-            &providers,
+        let (configured_default_profile, _) = select_profile(
+            config_file.default_profile.clone(),
+            ProfileRequest::DefaultProfile,
+            &profiles,
         );
-        let active = active_profile.as_ref().and_then(|name| providers.get(name));
+        let active = default_profile.as_ref().and_then(|name| profiles.get(name));
         let file_display = config_file.display.unwrap_or_default();
         let file_web = config_file.web.unwrap_or_default();
         let file_shell = config_file.shell.unwrap_or_default();
@@ -2990,7 +1756,7 @@ impl ResolvedConfig {
         let skills_agent_managed = file_skills.agent_managed.unwrap_or(false);
         let skills_extra_paths = resolve_skills_extra_paths(
             file_skills.extra_paths.as_deref().unwrap_or_default(),
-            crate::skills::skills_dir().as_deref(),
+            crate::paths::skills_dir().as_deref(),
         );
         // The two keys read as independent but are not: `enabled = false` registers no skill tools
         // at all, so the authoring pair never appears however this is set. Saying so beats leaving
@@ -3008,67 +1774,40 @@ impl ResolvedConfig {
             .unwrap_or(true);
         let background = ResolvedBackgroundConfig::resolve(config_file.background);
         let subagents = ResolvedSubagentsConfig::resolve(config_file.subagents);
-        // Destructure the [mcp] table into its two independent fields so we don't have to re-open
-        // the config file later for resolution.
-        let (
-            mcp_default_permission_str,
-            mut mcp_servers,
-            mcp_strict,
-            mcp_grace,
-            mcp_connect_timeout,
-        ) = match config_file.mcp {
-            Some(mcp) => (
-                mcp.default_permission,
-                mcp.servers.unwrap_or_default(),
-                mcp.strict.unwrap_or(false),
-                std::time::Duration::from_secs(mcp.grace_seconds.unwrap_or(3)),
-                std::time::Duration::from_secs(mcp.connect_timeout_seconds.unwrap_or(30)),
-            ),
-            None => (
-                None,
-                Vec::new(),
-                false,
-                std::time::Duration::from_secs(3),
-                std::time::Duration::from_secs(30),
-            ),
-        };
-        apply_cli_eager_load_overrides(&cli.eager_load_tool, &mut mcp_servers);
+        let file_mcp = config_file.mcp.unwrap_or_default();
+        let mut mcp_servers = file_mcp.servers.unwrap_or_default();
+        let mcp_default_required = file_mcp.default_required.unwrap_or(false);
+        let mcp_grace = file_mcp.grace.unwrap_or(DEFAULT_MCP_GRACE);
+        let mcp_connect_timeout = file_mcp
+            .connect_timeout
+            .unwrap_or(DEFAULT_MCP_CONNECT_TIMEOUT);
+        let mcp_stdio_concurrency = file_mcp
+            .stdio_concurrency
+            .unwrap_or(DEFAULT_MCP_STDIO_CONCURRENCY);
+        let mcp_http_concurrency = file_mcp
+            .http_concurrency
+            .unwrap_or(DEFAULT_MCP_HTTP_CONCURRENCY);
+        let mcp_default_permission = file_mcp.default_permission;
+        apply_cli_eager_load_overrides(&overrides.eager_load_tools, &mut mcp_servers);
         // Settle `required` here so no later consumer has to remember that `None` means "inherit
-        // strict". Everything downstream reads a plain `Some(bool)`, and `strict` deliberately
-        // isn't carried on `ResolvedConfig`: a second copy of the same answer is one a future
-        // reader could gate on, believing it still decides turns on its own. It doesn't.
+        // `default_required`". Everything downstream reads a plain `Some(bool)`, and the default
+        // deliberately isn't carried on `ResolvedConfig`: a second copy of the same answer is one
+        // a future reader could gate on, believing it still decides turns on its own. It doesn't.
         for server in &mut mcp_servers {
-            server.required = Some(server.required.unwrap_or(mcp_strict));
+            server.required = Some(server.required.unwrap_or(mcp_default_required));
         }
-        let mcp_default_permission = match mcp_default_permission_str.as_deref() {
-            Some(raw) => match raw.parse::<Permission>() {
-                Ok(permission) => Some(permission),
-                Err(error) => {
-                    tracing::warn!(
-                        "ignoring invalid [mcp].default_permission '{}': {}",
-                        raw,
-                        error
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
 
-        let (instructions, instructions_error) =
-            match resolve_instructions(cli.instructions.as_deref()) {
-                Ok(found) => (found, None),
-                Err(error) => (None, Some(error.to_string())),
-            };
-        if let Some(found) = &instructions {
-            crate::instructions::warn_if_large(found);
-            tracing::info!("instructions loaded from {}", found.source);
-        }
-        let user_instructions_source = instructions.as_ref().map(|found| found.source.to_string());
-        let user_instructions = instructions.map(|found| found.text);
-        let provider_profiles: Vec<(String, String, Option<String>)> = providers
+        let profile_summaries: Vec<ProfileSummary> = profiles
             .iter()
-            .map(|(name, profile)| (name.clone(), profile.backend.clone(), profile.model.clone()))
+            .map(|(name, profile)| ProfileSummary {
+                name: name.clone(),
+                account: profile.account.clone(),
+                backend: accounts
+                    .get(&profile.account)
+                    .map(|account| account.backend.clone())
+                    .unwrap_or_default(),
+                model: profile.model.clone(),
+            })
             .collect();
 
         let builtin_allowed_tools = file_tools
@@ -3088,126 +1827,107 @@ impl ResolvedConfig {
             .into_iter()
             .filter_map(|(name, level)| {
                 let name = name.trim().to_string();
-                if name.is_empty() {
-                    return None;
-                }
-                match level.parse::<Permission>() {
-                    Ok(permission) => Some((name, permission)),
-                    Err(error) => {
-                        tracing::warn!(
-                            "ignoring invalid [tools.tool_permissions] entry '{}' = '{}': {}",
-                            name,
-                            level,
-                            error
-                        );
-                        None
-                    }
-                }
+                (!name.is_empty()).then_some((name, level))
             })
             .collect();
 
-        // Provider config comes from the active profile (no env tier); the credential is loaded
-        // from the DB in main.rs by `active_profile`. Nothing on the command line rewrites a field
-        // inside the profile: `--provider` selects which one, and `meka provider set` is how a
+        // Provider config comes from the selected profile (no env tier); the credential is loaded
+        // from the DB in main.rs by `default_profile`. Nothing on the command line rewrites a field
+        // inside the profile: `--profile` selects which one, and `meka profile set` is how a
         // field changes.
         //
         // Resolved through the same [`resolve_profile`] any other profile goes through, so the
         // process default is not a second, subtly different derivation of the same twelve fields.
         // The flat fields below are this profile's; a session naming a different one resolves it
-        // again by name.
-        // The profile's `device_id` verbatim, never a freshly seeded one. Seeding writes
-        // `config.toml`, and the flat fields below are read only to answer "what would a brand-new
-        // session get"; the provider a session actually runs on is built by
+        // again by name. The profile's `device_id` verbatim, never a freshly seeded one. Seeding
+        // writes `config.toml`, and the flat fields below are read only to answer "what would a
+        // brand-new session get"; the provider a session actually runs on is built by
         // [`crate::provider::ProviderRegistry`], which is where the seed belongs and where it
         // happens once.
-        let default_thinking_budget = file_thinking.budget_tokens;
-        let active_settings = active.map(|profile| {
+        let default_thinking_budget = file_thinking.budget;
+        let active_settings = match active.map(|profile| {
+            let account = account_for(
+                default_profile.as_deref().unwrap_or("?"),
+                profile,
+                &accounts,
+            )?;
             resolve_profile(
                 profile,
+                account,
                 file_session.context_window,
                 default_thinking_budget,
-                profile.device_id.clone().unwrap_or_default(),
+                account.device_id.clone().unwrap_or_default(),
             )
-        });
-        let provider_name = active_settings
-            .as_ref()
-            .map(|settings| settings.backend.clone());
+        }) {
+            Some(Ok(settings)) => Some(settings),
+            // Reported where a selection failure is, and only when a run needs a provider: a
+            // subcommand that never builds one must not fail over a typo in an unrelated field.
+            Some(Err(error)) => {
+                provider_error.get_or_insert(error);
+                None
+            }
+            None => None,
+        };
+        let backend = active_settings.as_ref().map(|settings| settings.backend);
         let model = active_settings
             .as_ref()
             .and_then(|settings| settings.model.clone());
 
         let file_permissions = config_file.permissions.unwrap_or_default();
         let (permission, enabled_permissions, requested_permission) = resolve_permission(
-            cli.permission,
+            overrides.permission,
             std::env::var("MEKA_PERMISSION").ok().as_deref(),
-            file_permissions.default.as_deref(),
+            file_permissions.default,
             file_permissions.enabled.as_deref(),
         );
 
-        // After `resolve_permission`, because a gate needs the level this process actually starts
-        // at: a `meka serve --permission read` must not run a gate a write-mode session authored.
-        let schedule =
-            ResolvedScheduleConfig::resolve(config_file.schedule, permission, enabled_permissions);
+        // After `resolve_permission`, because the fire-time gate check filters a row's recorded
+        // level by the enabled set, which is the one thing an operator can narrow that a row
+        // cannot exceed.
+        let schedule = ResolvedScheduleConfig::resolve(config_file.schedule, enabled_permissions);
 
         // Only probe the sandbox backend when sandboxing is actually enabled. Skipping the probe
         // for `sandbox = false` saves the smoke-test cost on every invocation of subcommands that
         // don't touch the shell (`meka session list`, `meka session export`, `meka mcp list`, etc.)
-        // when the user has disabled sandboxing globally. The placeholder probe is never
-        // consulted in that state; the shell tool short-circuits on `sandbox_enabled =
-        // false`, and the warn helper early- returns on `!state.enabled`.
-        // Backend precedence: `--sandbox-backend` > `MEKA_SANDBOX_BACKEND` >
-        // `[shell].sandbox_backend`. An explicit value from any tier also flips
-        // `auto_resolved` off, suppressing the "install Bubblewrap" startup warning.
-        let configured_backend = cli
+        // when the user has disabled sandboxing globally. The placeholder probe is never consulted
+        // in that state; the shell tool short-circuits on `sandbox_enabled = false`, and the warn
+        // helper early- returns on `!state.enabled`. Backend precedence: `--sandbox-backend` >
+        // `MEKA_SANDBOX_BACKEND` > `[shell].sandbox_backend`. An explicit value from any tier also
+        // flips `auto_resolved` off, suppressing the "install Bubblewrap" startup warning.
+        let configured_backend = overrides
             .sandbox_backend
             .or_else(sandbox_backend_override)
             .or(file_shell.sandbox_backend);
-        let (sandbox_backend, sandbox_auto_resolved, backend_probe) =
-            if file_shell.sandbox.unwrap_or(true) {
-                resolve_sandbox_backend(configured_backend)
-            } else {
-                (
-                    configured_backend.unwrap_or(SandboxBackend::Landlock),
-                    false,
-                    crate::sandbox::BackendProbe::Missing {
-                        reason: "sandbox disabled in config".to_string(),
-                    },
-                )
-            };
+        let sandbox_backend = configured_backend;
 
         // A root that does not resolve contributes nothing to the write boundary, because
         // `writable_roots` drops what it cannot canonicalise. Silently, until a write is refused
         // with a boundary the user believed included this path. The path is kept regardless of the
         // warning: a build directory that does not exist yet is a legitimate root, and the boundary
         // is recomputed on every write rather than frozen here.
-        for root in &cli.writable_root {
+        for root in &overrides.writable_roots {
             if let Err(error) = std::fs::canonicalize(root) {
                 tracing::warn!(
-                    "--writable-root {} does not resolve ({}); it grants nothing until it exists",
-                    root.display(),
-                    error
+                    "--writable-root {root} does not resolve ({error}); it grants nothing until \
+                     it exists",
+                    root = root.display()
                 );
             }
         }
 
         Self {
-            writable_roots: cli.writable_root.clone(),
-            provider_name,
-            active_profile,
+            backend,
+            default_profile,
             configured_default_profile,
-            requested_permission,
-            requested_profile: cli.provider.clone(),
-            providers,
+            accounts,
+            profiles,
             provider_error,
             config_error,
-            instructions_error,
             model,
             permission,
             enabled_permissions,
-            streaming: !cli.no_stream,
-            session_resume: SessionResume::from_cli(cli),
-            prompt: cli.prompt.clone(),
-            oneshot: cli.oneshot,
+            approvals: file_permissions.approvals.unwrap_or(false),
+            streaming: streaming_enabled(overrides.no_stream, file_display.stream),
             newline_before_prompt: file_display.newline_before_prompt.unwrap_or(true),
             newline_after_prompt: file_display.newline_after_prompt.unwrap_or(true),
             show_session_id_on_create: file_display.show_session_id_on_create.unwrap_or(false),
@@ -3219,15 +1939,9 @@ impl ResolvedConfig {
             web_client: WebClientConfig::from_file(&file_web),
             sandbox: file_shell.sandbox.unwrap_or(true),
             sandbox_backend,
-            sandbox_auto_resolved,
-            backend_probe,
-            render_mode: cli
+            render_mode: overrides
                 .render_mode
-                .or_else(|| {
-                    std::env::var("MEKA_RENDER_MODE")
-                        .ok()
-                        .and_then(|value| value.parse().ok())
-                })
+                .or_else(render_mode_override)
                 .or(file_display.render_mode)
                 .unwrap_or_default(),
             tool_params: file_display.tool_params.unwrap_or_default(),
@@ -3235,7 +1949,7 @@ impl ResolvedConfig {
             context_messages: file_session
                 .context_messages
                 .or(Some(DEFAULT_CONTEXT_MESSAGES)),
-            retention_days: file_session.retention_days,
+            retention: file_session.retention,
             thinking: active_settings
                 .as_ref()
                 .map(|settings| settings.thinking)
@@ -3266,9 +1980,7 @@ impl ResolvedConfig {
                 .and_then(|settings| settings.max_output_tokens),
             mcp_servers,
             mcp_default_permission,
-            user_instructions,
-            user_instructions_source,
-            provider_profiles,
+            profile_summaries,
             skills_enabled,
             skills_agent_managed,
             skills_extra_paths,
@@ -3286,8 +1998,23 @@ impl ResolvedConfig {
                 .unwrap_or_else(default_input_style),
             mcp_grace,
             mcp_connect_timeout,
+            mcp_stdio_concurrency,
+            mcp_http_concurrency,
             serve: config_file.serve,
-            serve_bind_override: None,
+            request: RunRequest {
+                writable_roots: overrides.writable_roots,
+                requested_permission,
+                requested_profile: overrides.profile,
+                session_resume: SessionResume::from_flags(
+                    overrides.resume,
+                    overrides.continue_last,
+                ),
+                prompt: overrides.prompt,
+                oneshot: overrides.oneshot,
+                output_format: overrides.output_format,
+                serve_bind_override: None,
+                instructions: overrides.instructions,
+            },
         }
     }
 
@@ -3297,7 +2024,7 @@ impl ResolvedConfig {
     /// `meka mcp list` over a config full of servers would otherwise print "(no MCP servers
     /// configured)", and `meka mcp get <name>` would say the server doesn't exist. Both are
     /// indistinguishable from the truthful answer, which is what makes them worth failing on.
-    pub fn require_readable_config(&self) -> crate::error::Result<()> {
+    pub(crate) fn require_readable_config(&self) -> crate::error::Result<()> {
         match &self.config_error {
             Some(error) => Err(crate::error::MekaError::Config(error.clone())),
             None => Ok(()),
@@ -3309,41 +2036,73 @@ impl ResolvedConfig {
     /// A method rather than the four `skill_roots(&config.skills_extra_paths)` spellings it
     /// replaces: the derivation is "meka's own first, then the configured extras", and a caller
     /// that assembled it itself was a caller that could get the order wrong.
-    pub fn skill_roots(&self) -> Vec<PathBuf> {
-        crate::skills::skill_roots(&self.skills_extra_paths)
+    pub(crate) fn skill_roots(&self) -> Vec<PathBuf> {
+        crate::paths::skill_roots(&self.skills_extra_paths)
     }
 
     /// Note an unreadable `config.toml` without failing, for the commands that edit the raw
     /// document through `toml_edit` and so work fine on one meka can't parse. They are how the file
     /// gets repaired from the CLI, so they must run; the warning is there because their view of the
     /// config is empty and any message they print about it would otherwise mislead.
-    pub fn warn_if_config_unreadable(&self) {
+    pub(crate) fn warn_if_config_unreadable(&self) {
         if let Some(error) = &self.config_error {
-            tracing::warn!("ignoring config file: {}", error);
+            tracing::warn!("ignoring config file: {error}");
         }
     }
 
-    pub fn validate(&self) -> crate::error::Result<()> {
+    pub(crate) fn validate(&self) -> crate::error::Result<()> {
         // Profile-selection failure (none / ambiguous / unknown name) is reported first with its
-        // specific guidance.
-        // Ahead of the provider check: with an unparsed config there are no profiles at all, and
-        // "no provider configured" would send the user chasing the wrong problem.
+        // specific guidance. Ahead of the provider check: with an unparsed config there are no
+        // profiles at all, and "no provider configured" would send the user chasing the wrong
+        // problem.
         if let Some(error) = &self.config_error {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
         self.validate_default_profile()?;
-        if let Some(error) = &self.instructions_error {
-            return Err(crate::error::MekaError::Config(error.clone()));
-        }
-        // `retention_days = 0` means "delete anything not updated in the last zero days", i.e.
+        warn_about_inert_profile_keys(&self.accounts, &self.profiles);
+        // `retention = "0s"` means "delete anything not updated in the last zero seconds", i.e.
         // every session, on every startup. Nobody means that, and the cost of guessing wrong is
         // unrecoverable, so refuse rather than run it once and find out.
-        if self.retention_days == Some(0) {
+        if self.retention.is_some_and(|retention| retention.is_zero()) {
             return Err(crate::error::MekaError::Config(
-                "[session].retention_days = 0 would delete every session on each startup. \
+                "[session].retention = \"0s\" would delete every session on each startup. \
                  Remove the key to keep sessions forever, or use `meka session delete --all`."
                     .to_string(),
             ));
+        }
+        // A zero timeout fails every request before it is sent. The integer keys these replaced
+        // read `0` as "the default", so a file converted by hand may still say it and has to be
+        // told, rather than handed a client that cannot fetch anything.
+        for (key, timeout) in [
+            ("request_timeout", Some(self.web_client.request_timeout)),
+            ("connect_timeout", self.web_client.connect_timeout),
+            ("read_timeout", self.web_client.read_timeout),
+        ] {
+            if timeout.is_some_and(|timeout| timeout.is_zero()) {
+                return Err(crate::error::MekaError::Config(format!(
+                    "[web].{key} = \"0s\" would time out every request before it is sent. Remove \
+                     the key for the default, or set a timeout like \"30s\"."
+                )));
+            }
+        }
+        if self.mcp_connect_timeout.is_zero() {
+            return Err(crate::error::MekaError::Config(
+                "[mcp].connect_timeout = \"0s\" would time out every server before it connects. \
+                 Remove the key for the default of \"30s\", or set a timeout like \"1m\"."
+                    .to_string(),
+            ));
+        }
+        // The connector buffers this many connects at once; zero would wait forever for the first.
+        for (key, limit) in [
+            ("stdio_concurrency", self.mcp_stdio_concurrency),
+            ("http_concurrency", self.mcp_http_concurrency),
+        ] {
+            if limit == 0 {
+                return Err(crate::error::MekaError::Config(format!(
+                    "[mcp].{key} = 0 would connect no server at all. Remove the key for the \
+                     default, or set how many servers may connect at once."
+                )));
+            }
         }
         // `context_messages = 0` reads as "send no history", which is not a thing the provider APIs
         // accept: a request needs at least the current user message. Indexing one past the end of
@@ -3352,8 +2111,7 @@ impl ResolvedConfig {
         if self.context_messages == Some(0) {
             return Err(crate::error::MekaError::Config(format!(
                 "[session].context_messages = 0 would send no conversation at all. Remove the \
-                     key for the default of {}, or set it to the number of messages to keep.",
-                DEFAULT_CONTEXT_MESSAGES
+                     key for the default of {DEFAULT_CONTEXT_MESSAGES}, or set it to the number of messages to keep."
             )));
         }
         // `tokio::time::interval` panics on a zero period, so this would be a config value taking
@@ -3390,10 +2148,10 @@ impl ResolvedConfig {
         }
         // A lease has to outlast the work it covers, and the probe is the part meka can check. One
         // that expires while a host is still working lets a second host take the same occurrence,
-        // which the session lock catches at the cost of a deferral and a re-run gate probe.
-        // Checked against `gate_timeout` rather than against a fixed floor because that is
-        // the only bound on the work meka knows -- the turn after it is unbounded, which is why the
-        // documentation asks for headroom on top rather than this settling the question.
+        // which the session lock catches at the cost of a deferral and a re-run gate probe. Checked
+        // against `gate_timeout` rather than against a fixed floor because that is the only bound
+        // on the work meka knows -- the turn after it is unbounded, which is why the documentation
+        // asks for headroom on top rather than this settling the question.
         if self.schedule.claim_lease <= self.schedule.gate_timeout {
             return Err(crate::error::MekaError::Config(format!(
                 "[schedule].claim_lease ({}) must outlast [schedule].gate_timeout ({}), or a \
@@ -3410,55 +2168,44 @@ impl ResolvedConfig {
     /// picked at all, that its backend is one meka speaks, and that it names a model.
     ///
     /// Skipped entirely for a resume, because a resumed session answers all three from its own row
-    /// and never reads [`Self::active_profile`]. Each is re-asked against the profile that actually
-    /// applies, with a message naming it: `look_up_profile` for the first,
+    /// and never reads [`Self::default_profile`]. Each is re-asked against the profile that
+    /// actually applies, with a message naming it: `require_profile` for the first,
     /// [`crate::provider::ProviderBuilder::build`]'s fallthrough for the second,
-    /// [`crate::provider::ProviderRegistry::build`] for the third.
+    /// [`crate::provider::ProviderRegistry::resolve`] for the third.
     ///
-    /// Firing these unconditionally did two bad things. A session whose profile was still
-    /// configured could not be resumed at all, though its row held the answer and
-    /// `meka session list` printed it. And a session whose profile *had* been deleted was refused
-    /// with whichever of these tripped first rather than with the specific "this session runs on
-    /// provider profile 'work', which is not configured" -- a generic message masking a precise
-    /// one, and only when two or more profiles happened to remain.
+    /// Firing these unconditionally would do two bad things. A session whose profile is still
+    /// configured could not be resumed at all, though its row holds the answer and `meka session
+    /// list` prints it. And a session whose profile *has* been deleted would be refused with
+    /// whichever of these tripped first rather than with the specific "no profile named 'work'": a
+    /// generic message masking a precise one, and only when two or more profiles happen to remain.
     ///
     /// Deferred, not dropped: a resume that finds no session, or a row with no recorded profile,
-    /// still needs a default, and `resolve_session_provider` carries
-    /// [`Self::provider_error`] into that path so the same guidance appears there.
+    /// still needs a default, and `resolve_session_profile` carries [`Self::provider_error`] into
+    /// that path so the same guidance appears there.
     fn validate_default_profile(&self) -> crate::error::Result<()> {
-        if self.session_resume.is_some() {
+        if self.request.session_resume.is_some() {
             return Ok(());
         }
         if let Some(error) = &self.provider_error {
             return Err(crate::error::MekaError::Config(error.clone()));
         }
-        match self.provider_name.as_deref() {
-            None => {
-                return Err(crate::error::MekaError::Config(
-                    "no provider configured. Run `meka provider add <name>` to set one up."
-                        .to_string(),
-                ));
-            }
-            Some(name) if !crate::provider::SUPPORTED_PROVIDERS.contains(&name) => {
-                return Err(crate::error::MekaError::Config(format!(
-                    "profile '{}' has unknown type '{}'. Supported types: {}",
-                    self.active_profile.as_deref().unwrap_or("?"),
-                    name,
-                    crate::provider::SUPPORTED_PROVIDERS.join(", "),
-                )));
-            }
-            Some(_) => {}
+        if self.backend.is_none() {
+            return Err(crate::error::MekaError::Config(
+                "no profile configured. Run `meka account add <name>`, then `meka profile add \
+                 <name>`, to set one up."
+                    .to_string(),
+            ));
         }
         if self.model.is_none() {
             return Err(crate::error::MekaError::Config(format!(
-                "no model configured for profile '{0}'. Run `meka provider set {0} model \
-                 <model>`, or set `model` under [providers.{0}] in config.toml.",
-                self.active_profile.as_deref().unwrap_or("?"),
+                "no model configured for profile '{0}'. Run `meka profile set {0} model <model>`, \
+                 or set `model` under [profiles.{0}] in config.toml.",
+                self.default_profile.as_deref().unwrap_or("?"),
             )));
         }
         validate_max_output_tokens(
-            self.active_profile.as_deref().unwrap_or("?"),
-            self.provider_name.as_deref(),
+            self.default_profile.as_deref().unwrap_or("?"),
+            self.backend,
             self.max_output_tokens,
             self.thinking,
             self.thinking_budget,
@@ -3467,183 +2214,695 @@ impl ResolvedConfig {
     }
 }
 
-/// Reject a `max_output_tokens` override that can't produce a valid Claude request: under
-/// [`crate::provider::ThinkingMode::Budgeted`] the budget is drawn from `max_tokens`, so the cap
-/// must exceed it. Surfaced as a config error with clear guidance rather than a provider 400
-/// mid-turn. The other two modes send no `budget_tokens` and have no such constraint, and neither
-/// do the OpenAI backends.
-///
-/// Asked once per *profile*, never once per process: the values it reads are stated per profile, so
-/// a run that resumes a session onto one profile must not be refused over another's settings, and
-/// that session's own pairing must still be checked. [`ResolvedConfig::validate_default_profile`]
-/// asks it of the process default; [`crate::provider::ProviderRegistry::build`] asks it of
-/// whichever profile a session actually names.
-///
-/// That claim was only four-fifths true until 0.44, when `thinking_budget` was one value for the
-/// whole process. A profile could be refused over a number stated nowhere in it, and the refusal
-/// named a global whose every other reader would move with it. Both arguments now come from the
-/// same [`ProfileSettings`].
-pub(crate) fn validate_max_output_tokens(
-    profile: &str,
-    provider_name: Option<&str>,
-    max_output_tokens: Option<u64>,
-    thinking: crate::provider::ThinkingMode,
-    thinking_budget: u64,
-) -> crate::error::Result<()> {
-    let Some(max_output) = max_output_tokens else {
-        return Ok(());
-    };
-    // The same predicate `/status` and `meka provider add` use, rather than a third copy of the
-    // backend list: the invariant belongs to the Messages protocol, so every backend that speaks it
-    // is in scope and a future one is in scope automatically. Missing a backend here is invisible
-    // until a real request is rejected mid-turn, which is what this check exists to pre-empt.
-    let speaks_messages = provider_name.is_some_and(crate::provider::backend_takes_thinking);
-    let budgeted = matches!(thinking, crate::provider::ThinkingMode::Budgeted);
-    if speaks_messages && budgeted && max_output <= thinking_budget {
-        // The remedy names this profile's own keys, never the `[thinking].budget_tokens` the budget
-        // may have been inherited from. Both fix the refusal; only one of them leaves every other
-        // profile budgeting against what it did before.
-        return Err(crate::error::MekaError::Config(format!(
-            "profile '{}': max_output_tokens ({}) must exceed the thinking budget ({}) for an \
-             Anthropic Messages profile with thinking = \"budgeted\"; under [providers.{}], raise \
-             max_output_tokens or set a lower thinking_budget.",
-            profile, max_output, thinking_budget, profile,
-        )));
-    }
-    Ok(())
-}
-
-/// Stable per-device identity for `claude-subscription` (embedded in `metadata.user_id`). Other
-/// providers get an empty string; we don't write a stub config file just to hold an unused value.
-mod device_id {
-    use std::path::Path;
-
-    use super::{config_file_path, write_file_atomic};
-
-    /// Lookup order: configured → Claude Code's `~/.claude.json` userID → freshly generated. The
-    /// claude.json fallback lets meka and Claude Code on the same machine share a device identity.
-    /// A freshly seeded value is persisted into the active profile's `[providers.<name>].device_id`
-    /// so it stays stable across runs.
-    pub(super) fn resolve(
-        backend: Option<&str>,
-        profile_name: Option<&str>,
-        configured: Option<&str>,
-    ) -> String {
-        if backend != Some("claude-subscription") {
-            return String::new();
-        }
-
-        // A configured value (the active profile's `device_id`, already deserialized for us) wins;
-        // no need to re-read the file for it.
-        if let Some(id) = configured
-            && !id.is_empty()
-        {
-            return id.to_string();
-        }
-
-        let (id, source) = match read_claude_code_user_id() {
-            Some(id) => (id, "~/.claude.json"),
-            None => (generate(), "random"),
-        };
-        tracing::info!("seeded claude-subscription device_id from {}", source);
-
-        // Persist into the active profile's table. Skip quietly when we can't locate the config
-        // path or the profile name; the id is still returned and used for this run, just
-        // not saved.
-        if let (Some(profile), Some(path)) = (profile_name, config_file_path())
-            && let Err(error) = persist(&path, profile, &id)
-        {
-            tracing::warn!("failed to persist device_id: {}", error);
-        }
-        id
-    }
-
-    fn generate() -> String {
-        use rand::RngExt;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
-    }
-
-    fn read_claude_code_user_id() -> Option<String> {
-        read_user_id_from(&dirs::home_dir()?.join(".claude.json"))
-    }
-
-    pub(super) fn read_user_id_from(path: &Path) -> Option<String> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) => {
-                tracing::debug!("could not read user-id file {}: {}", path.display(), error);
-                return None;
-            }
-        };
-        let document: serde_json::Value = match serde_json::from_str(&contents) {
-            Ok(document) => document,
-            Err(error) => {
-                tracing::debug!("could not parse user-id file {}: {}", path.display(), error);
-                return None;
-            }
-        };
-        let id = document.get("userID")?.as_str()?.trim();
-        if id.is_empty() {
-            return None;
-        }
-        Some(id.to_string())
-    }
-
-    pub(super) fn persist(path: &Path, profile: &str, id: &str) -> std::io::Result<()> {
-        // This is the writer that made the race ordinary rather than theoretical: it runs the first
-        // time `ProviderRegistry::device_id_for` resolves a `claude-subscription` profile that
-        // states no device id, so a plain `meka` launch competes with whatever `meka mcp add` is
-        // doing in the next terminal.
-        let _lock = super::lock_config_file()?;
-        let contents = std::fs::read_to_string(path).unwrap_or_default();
-        let mut doc: toml_edit::DocumentMut = contents
-            .parse()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-
-        // The active profile's table already exists (it's how the profile was selected); update its
-        // `device_id` in place. Bail quietly rather than synthesize a malformed inline table if the
-        // structure isn't what we expect.
-        let Some(item) = doc
-            .get_mut("providers")
-            .and_then(|providers| providers.get_mut(profile))
-        else {
-            return Ok(());
-        };
-        let Some(table) = item.as_table_like_mut() else {
-            return Ok(());
-        };
-        table.insert("device_id", toml_edit::value(id));
-        // `insert` appends, so without this the one key meka writes for itself would trail whatever
-        // the table already held. Sorting is cheap and leaves the file in the order the reference
-        // documents, which is the same thing every other writer now guarantees.
-        super::sort_profile_keys(item);
-
-        write_file_atomic(path, &doc.to_string())
-    }
-}
-
-/// The one lock serialising every test in this crate that mutates `MEKA_CONFIG_DIR` or
+/// The one lock serializing every test in this crate that mutates `MEKA_CONFIG_DIR` or
 /// `MEKA_DATA_DIR`.
 ///
-/// The var is process-global and unit tests share a process, so a per-module lock only serialises a
-/// module against itself. Two of them are worse than none: while `src/skills/cli.rs` held its own
-/// lock, a config test's `remove_var` could land mid-test and send `skills::cli::run_add` at the
-/// developer's real `~/.config/meka`. A `tokio::sync::Mutex` because the skills tests are async and
-/// hold the guard across `.await`; the synchronous tests here take it with `blocking_lock`.
+/// The var is process-global and unit tests share a process, so a per-module lock only serializes a
+/// module against itself. Two of them are worse than none: with `cli/skills.rs` holding its own
+/// lock, a config test's `remove_var` could land mid-test and send `crate::cli::skills::run_add` at
+/// the developer's real `~/.config/meka`. A `tokio::sync::Mutex` because the skills tests are async
+/// and hold the guard across `.await`; the synchronous tests here take it with `blocking_lock`.
 #[cfg(test)]
 pub(crate) static CONFIG_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Built-in tool policy from `[tools]` in `config.toml`. Mirrors the three knobs
+/// [`crate::config::McpServerConfig`] exposes for MCP tools.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BuiltinToolFilter {
+    pub(crate) allowed: Option<HashSet<String>>,
+    pub(crate) disabled: HashSet<String>,
+    pub(crate) permission_overrides: HashMap<String, Permission>,
+}
+impl BuiltinToolFilter {
+    pub(crate) fn from_config(
+        allowed: Option<Vec<String>>,
+        disabled: Vec<String>,
+        permission_overrides: HashMap<String, Permission>,
+    ) -> Self {
+        // Empty allow-list → None so `admits` treats it as "no restriction".
+        let allowed = allowed.and_then(|list| {
+            if list.is_empty() {
+                None
+            } else {
+                Some(list.into_iter().collect())
+            }
+        });
+        Self {
+            allowed,
+            disabled: disabled.into_iter().collect(),
+            permission_overrides,
+        }
+    }
+
+    pub(crate) fn admits(&self, name: &str) -> bool {
+        if self.denies(name) {
+            return false;
+        }
+        match &self.allowed {
+            Some(list) => list.contains(name),
+            None => true,
+        }
+    }
+
+    /// The block-list half alone, for tools that `allowed_tools` was never able to reach.
+    ///
+    /// `allowed_tools` is exhaustive: naming five tools removes everything else. Anyone who wrote
+    /// one before the MCP meta-tools were filterable wrote it against a world where those seven
+    /// registered unconditionally, so applying the allow-list to them now would delete
+    /// `mcp_resource_read` and friends from working installations on upgrade, with nothing in the
+    /// config to explain it. `disabled_tools` has no such problem: naming a tool there has always
+    /// meant "remove this one", so honoring it is what the user already asked for.
+    pub(crate) fn denies(&self, name: &str) -> bool {
+        self.disabled.contains(name)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum RenderMode {
+    /// syntect-based highlighter. Named after the `syntect` crate that does the in-process
+    /// highlighting. Shows the markdown source as the model wrote it, reflowing nothing, so a wide
+    /// table runs past the terminal edge.
+    Syntect,
+    /// Rendered CommonMark, reflowed to the terminal (default).
+    ///
+    /// The default because meka's own output is table-heavy: `task_list`, `scratchpad_list`, and
+    /// anything the model formats as a table all wrap inside their box here and run off the right
+    /// edge under `syntect`. Reading rendered prose is also the common case; wanting to see the
+    /// markers is the exception, and `syntect` is one config line away.
+    ///
+    /// One spelling, `termimad`, on the flag, in the environment and in `config.toml` alike.
+    #[default]
+    Termimad,
+    Raw,
+}
+impl RenderMode {
+    /// Every mode, in the order the names sort.
+    pub(crate) const ALL: [RenderMode; 3] = [Self::Raw, Self::Syntect, Self::Termimad];
+
+    /// The one spelling `[display].render_mode`, `--render-mode` and `MEKA_RENDER_MODE` take.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Syntect => "syntect",
+            Self::Termimad => "termimad",
+            Self::Raw => "raw",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|mode| mode.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+impl std::fmt::Display for RenderMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+impl TryFrom<String> for RenderMode {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+impl From<RenderMode> for String {
+    fn from(mode: RenderMode) -> Self {
+        mode.name().to_string()
+    }
+}
+/// How much of a tool call's input the tool indicator shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ToolParams {
+    /// Name only: `[tool Shell]`. The only setting under which a model-supplied string never
+    /// reaches the terminal at all.
+    Off,
+    /// Name plus the one argument [`crate::tools::resolve_primary_param`] picks out, on one line
+    /// (default).
+    #[default]
+    Summary,
+    /// Every argument, as an indented block under the name. See `render_tool_params` in `render`.
+    Full,
+}
+impl std::fmt::Display for ToolParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolParams::Off => write!(formatter, "off"),
+            ToolParams::Summary => write!(formatter, "summary"),
+            ToolParams::Full => write!(formatter, "full"),
+        }
+    }
+}
+impl std::str::FromStr for RenderMode {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|mode| mode.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a render mode. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+/// Whether a Claude request asks for extended thinking, and which wire encoding it uses.
+///
+/// One knob rather than two. Stated rather than inferred from the model name: `anthropic-messages`
+/// reaches any Anthropic-compatible endpoint, so meka cannot tell which encoding the far side
+/// implements. The profile states it, and is the user's to keep correct if they later change
+/// `model`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum ThinkingMode {
+    /// The model sets its own budget. Claude 4.6 and newer.
+    ///
+    /// Sends the adaptive thinking block, and is the default because it is what the current models
+    /// want. The wire shapes each mode produces live in
+    /// `anthropic::shared::insert_thinking_fields`.
+    #[default]
+    Adaptive,
+    /// A fixed budget, from the profile's `thinking_budget` or `[thinking].budget`. Required by
+    /// pre-4.6 Claude.
+    ///
+    /// The older encoding, and the one most third-party Anthropic-compatible servers implement.
+    Budgeted,
+    /// No thinking requested.
+    Off,
+}
+impl ThinkingMode {
+    /// Every mode, in the order the names sort.
+    pub(crate) const ALL: [ThinkingMode; 3] = [Self::Adaptive, Self::Budgeted, Self::Off];
+
+    /// The one spelling of each mode: what the profile key, `profile add --thinking` and the
+    /// `/status` block all use. One copy, because a per-surface match is several hand-written
+    /// mappings that have to agree with each other, with nothing checking them against each other.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Budgeted => "budgeted",
+            Self::Off => "off",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|mode| mode.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Whether the request asks for thinking in any encoding. The betas and the `temperature` gate
+    /// key off this rather than off a specific encoding.
+    pub(crate) fn is_on(self) -> bool {
+        !matches!(self, ThinkingMode::Off)
+    }
+}
+impl std::fmt::Display for ThinkingMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+impl std::str::FromStr for ThinkingMode {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|mode| mode.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a thinking mode. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+impl TryFrom<String> for ThinkingMode {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+impl From<ThinkingMode> for String {
+    fn from(mode: ThinkingMode) -> Self {
+        mode.name().to_string()
+    }
+}
+
+/// `headers` and `env` are the two places a user is most likely to put a bearer token, and a
+/// `{:?}` on this struct (in a connect error, a `tracing::debug!`, a panic message) printed them.
+/// Names are kept: knowing that `Authorization` was set is the diagnostic; knowing its value is the
+/// leak.
+fn redact_map(
+    map: &Option<std::collections::HashMap<String, String>>,
+) -> Option<std::collections::BTreeMap<&str, String>> {
+    map.as_ref().map(|entries| {
+        entries
+            .iter()
+            .map(|(name, value)| (name.as_str(), format!("[REDACTED len={}]", value.len())))
+            .collect()
+    })
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpConfig {
+    /// Fallback permission for MCP tools when nothing more specific applies (no `tool_permissions`
+    /// override, no server-level `permission`, no `readOnlyHint` from the server). If this is also
+    /// unset the hardcoded fallback is `Unrestricted`, i.e. strict. Typed, like `[permissions]`,
+    /// so a level meka does not have is refused where the file is parsed.
+    pub(crate) default_permission: Option<Permission>,
+    pub(crate) servers: Option<Vec<McpServerConfig>>,
+    /// Default for each server's [`McpServerConfig::required`]. When true, every enabled server
+    /// gates the turn; when false (the default) only servers that opt in with `required = true`
+    /// do. A gated turn is refused outright rather than sent to the model.
+    ///
+    /// Defaults to false because whether a missing server should stop the turn is a property of
+    /// that server, not of the installation: one that is essential on a workstation may be
+    /// irrelevant inside a container that lacks its binary.
+    pub(crate) default_required: Option<bool>,
+    /// Per-turn cap on how long to wait for still-`Pending` MCP servers to settle before the
+    /// readiness gate decides. Default `"3s"`; `"0s"` skips the wait.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) grace: Option<std::time::Duration>,
+    /// Per-server wrap around connect + `initialize` + `list_tools`. A hung stdio spawn or slow
+    /// HTTPS handshake can't stall the whole fleet past this bound. Default `"30s"`; `"0s"` is
+    /// refused at startup.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) connect_timeout: Option<std::time::Duration>,
+    /// How many stdio servers the startup connector spawns at once. Default 3; `0` is refused at
+    /// startup.
+    pub(crate) stdio_concurrency: Option<usize>,
+    /// How many HTTP servers the startup connector connects at once. Default 20; `0` is refused
+    /// at startup.
+    pub(crate) http_concurrency: Option<usize>,
+}
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct McpServerConfig {
+    pub(crate) name: String,
+    pub(crate) transport: McpTransport,
+    pub(crate) command: Option<String>,
+    pub(crate) args: Option<Vec<String>>,
+    pub(crate) env: Option<std::collections::HashMap<String, String>>,
+    pub(crate) url: Option<String>,
+    pub(crate) headers: Option<std::collections::HashMap<String, String>>,
+    /// Optional path to an executable that, when run, prints dynamic HTTP headers to stdout in
+    /// `Name: Value\n` form. Merged over [`Self::headers`] (dynamic wins). Useful for SSO flows
+    /// where bearer tokens rotate. The script is spawned with `MEKA_MCP_SERVER_NAME` and
+    /// `MEKA_MCP_SERVER_URL` in its environment so one helper can drive multiple servers. Non-zero
+    /// exit fails the connect.
+    pub(crate) headers_helper: Option<String>,
+    pub(crate) auth: Option<McpAuthConfig>,
+    /// Server-wide permission override. Typed, like `[permissions]`, so a level meka does not have
+    /// is refused where the file is parsed rather than when the server connects.
+    pub(crate) permission: Option<Permission>,
+    /// Optional allow-list of raw tool names (the server-advertised form, not the
+    /// `mcp__<server>__<tool>` namespaced form). When set and non-empty, only these tools from
+    /// this server are registered.
+    pub(crate) allowed_tools: Option<Vec<String>>,
+    /// Optional block-list of raw tool names. Applied after [`Self::allowed_tools`]. Tools listed
+    /// here are never registered.
+    pub(crate) disabled_tools: Option<Vec<String>>,
+    /// Raw tool names (server-advertised, not the `mcp__<server>__<tool>` namespaced form) that
+    /// should ship eager-loaded instead of deferred. Saves a `load_tool` round-trip and keeps the
+    /// schema in the cacheable tools-array prefix. Names that don't match an advertised tool
+    /// surface as a `warn!` via [`crate::mcp::warn_on_stale_tool_config`].
+    pub(crate) eager_load_tools: Option<Vec<String>>,
+    /// Optional per-tool permission overrides keyed by raw tool name. Beats the server-level
+    /// `permission` and the server's `readOnlyHint` annotation when resolving a tool's required
+    /// permission at registration time. Typed for the same reason [`Self::permission`] is.
+    pub(crate) tool_permissions: Option<std::collections::HashMap<String, Permission>>,
+    /// Whether this server's `readOnlyHint` annotation may classify a tool as `read`. Defaults to
+    /// true, so a server that says a tool only reads is believed.
+    ///
+    /// The hint is asserted by the server, not verified by meka, and MCP tools execute in the
+    /// server's own process with no sandbox. A server that advertises `readOnlyHint: true` for a
+    /// tool that in fact writes therefore gets to write while meka sits at `read`. That is the
+    /// reason this knob exists: setting it to `false` makes the hint advisory for display only, so
+    /// the tool falls through to the strict `Unrestricted` fallback, and nothing from this server
+    /// is reachable at `read` without an explicit [`Self::tool_permissions`] or
+    /// [`Self::permission`] entry.
+    ///
+    /// A refused hint deliberately skips `[mcp].default_permission` on the way. That is a global
+    /// convenience and this is a per-server audit decision, so the per-server one wins, the same
+    /// direction the two overrides above already run. Falling through to it meant that with
+    /// `default_permission = "read"` the knob changed nothing at all: the tool landed back on
+    /// `Read` and dispatched unapproved at `--permission read`, which is precisely the outcome
+    /// setting it to `false` was meant to prevent.
+    ///
+    /// Defaulting to true keeps existing configurations working and keeps the `read` level useful
+    /// with well-behaved servers; the trade is that the `read` level's filesystem guarantee covers
+    /// meka's built-in tools plus whichever MCP servers the user has chosen to trust.
+    pub(crate) trust_read_only_hint: Option<bool>,
+    /// When true, this server is skipped at startup: no process is spawned, no HTTP connect
+    /// attempt is made. Lets users mute a flaky or in-development server without removing the
+    /// entry. Unset means false.
+    pub(crate) disabled: Option<bool>,
+    /// Whether a turn may proceed while this server is unavailable. `None` inherits
+    /// [`McpConfig::default_required`] (false by default), so a server is optional unless it says
+    /// otherwise.
+    ///
+    /// The other half of the availability pair with [`Self::disabled`]: `disabled` says "don't
+    /// even try", `required` says "if trying failed, stop the turn". Resolved once in
+    /// [`crate::config::ResolvedConfig::resolve`], so every later consumer reads a plain `bool`.
+    pub(crate) required: Option<bool>,
+}
+
+#[cfg(test)]
+impl McpServerConfig {
+    /// A bare HTTP server entry with nothing configured but its name.
+    pub(crate) fn for_test(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            transport: McpTransport::Http,
+            command: None,
+            args: None,
+            env: None,
+            url: Some("https://example".to_string()),
+            headers: None,
+            headers_helper: None,
+            auth: None,
+            permission: None,
+            allowed_tools: None,
+            disabled_tools: None,
+            eager_load_tools: None,
+            tool_permissions: None,
+            trust_read_only_hint: None,
+            disabled: None,
+            required: None,
+        }
+    }
+}
+/// How an MCP server is reached. One spelling, [`Self::name`], on `transport` in the file and on
+/// `meka mcp add --transport`.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum McpTransport {
+    Stdio,
+    Http,
+}
+impl McpTransport {
+    /// Every transport, in the order the names sort.
+    pub(crate) const ALL: [McpTransport; 2] = [Self::Http, Self::Stdio];
+
+    /// The one spelling `transport` takes.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|transport| transport.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+impl std::fmt::Display for McpTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+impl std::str::FromStr for McpTransport {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|transport| transport.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a transport. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+impl TryFrom<String> for McpTransport {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+impl From<McpTransport> for String {
+    fn from(transport: McpTransport) -> Self {
+        transport.name().to_string()
+    }
+}
+/// How an HTTP MCP server authenticates. The secret itself is never here: it lives in
+/// `mcp_credentials`, keyed by server name, exactly as an account's key lives in
+/// `account_credentials`. This block says *which* flow to run and with what public parameters.
+///
+/// `deny_unknown_fields` so a key this does not model is refused rather than silently dropped,
+/// which is the same strictness [`McpServerConfig`] already has. A secret quietly ignored is worse
+/// than one refused: the connect fails later, somewhere else, for a reason that names nothing.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum McpAuthConfig {
+    ClientCredentials {
+        client_id: String,
+        scopes: Option<Vec<String>>,
+        resource: Option<String>,
+    },
+    ClientCredentialsJwt {
+        client_id: String,
+        signing_key_path: String,
+        signing_algorithm: Option<String>,
+        scopes: Option<Vec<String>>,
+        resource: Option<String>,
+    },
+    #[serde(rename = "oauth")]
+    OAuth {
+        client_id: Option<String>,
+        scopes: Option<Vec<String>>,
+        redirect_port: Option<u16>,
+    },
+}
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("transport", &self.transport)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &redact_map(&self.env))
+            .field("url", &self.url)
+            .field("headers", &redact_map(&self.headers))
+            .field("headers_helper", &self.headers_helper)
+            .field("auth", &self.auth)
+            .field("permission", &self.permission)
+            .field("allowed_tools", &self.allowed_tools)
+            .field("disabled_tools", &self.disabled_tools)
+            .field("eager_load_tools", &self.eager_load_tools)
+            .field("tool_permissions", &self.tool_permissions)
+            .field("trust_read_only_hint", &self.trust_read_only_hint)
+            .field("disabled", &self.disabled)
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
+/// `[serve]` table: HTTP server config for `meka serve`. All fields optional with sensible
+/// defaults, but at least one `[[serve.tokens]]` entry is required; the server refuses to start
+/// without one.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServeConfig {
+    /// Listen address. Default `127.0.0.1:8080`: bind to loopback so a fresh deploy isn't
+    /// accidentally world-reachable. Operators front with a reverse proxy (nginx, caddy) for
+    /// TLS termination and put a public address there.
+    pub(crate) bind: Option<String>,
+    /// Idle-timeout for session eviction. Sessions with no turn activity for this long are dropped
+    /// from the in-memory map by the GC scanner. Accepts humantime strings like `"24h"`, `"30m"`,
+    /// `"86400s"`. Default `"24h"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) idle_timeout: Option<std::time::Duration>,
+    /// How often the GC scanner sweeps the session map. Accepts humantime strings like `"5m"`,
+    /// `"300s"`. Default `"5m"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) gc_scan_interval: Option<std::time::Duration>,
+    /// When true, GC also deletes the SQLite row for idle sessions; default false (keep the row so
+    /// a future request with the same session ID can re-attach, mirroring ACP's `session/load`).
+    pub(crate) delete_on_idle: Option<bool>,
+    /// On SIGTERM / SIGINT, wait at most this long for in-flight turns to finish before forcibly
+    /// aborting. Accepts humantime strings like `"30s"`, `"1m"`. Default `"30s"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) shutdown_drain_timeout: Option<std::time::Duration>,
+    /// Process-wide cap on concurrent in-flight turns across all sessions. None = unbounded
+    /// (default). Returns 429 with `concurrency-limit` when exceeded.
+    pub(crate) max_concurrent_turns: Option<usize>,
+    /// Request body size limit (bytes). Default 10 MiB.
+    pub(crate) max_body_bytes: Option<usize>,
+    /// Whether a 502 carries the failing provider call's error text, as a `provider_response`
+    /// extension member. Default `true`. `detail` is meka's own sentence and is identical either
+    /// way.
+    ///
+    /// On, because the upstream's error type is the actionable part of a failed turn and "consult
+    /// the server log" is no answer to anyone running against a meka they do not operate. `meka
+    /// acp` honors this key too: the same policy decides what a failed turn's `error.data`
+    /// carries.
+    ///
+    /// **What it can expose.** Usually the upstream's response body, which can name the
+    /// *operator's* provider account and its rate-limit posture. Not always, though: the member
+    /// carries the failing call's error message, and for some failures that is meka's own sentence
+    /// about the call rather than anything the provider sent.
+    ///
+    /// **Who can read it.** `sessions:r`, not just `sessions:w`. Submitting a turn takes the write
+    /// scope, but the failure also rides the terminal `turn.failed` event, and `GET
+    /// /v1/sessions/{id}/stream` replays that to any reader.
+    ///
+    /// Turn it off where read-only tokens go to people who may watch a session but are not
+    /// entitled to the account behind it. `/errors/mcp-unavailable` is not covered either way: it
+    /// reports server names only, and that reason is meka's own subprocess text.
+    pub(crate) relay_provider_errors: Option<bool>,
+    /// Whether to serve the Swagger UI and the OpenAPI document at `/v1/docs` and
+    /// `/v1/openapi.json`. Default `false`.
+    ///
+    /// Off by default because they are unauthenticated -- as are the two health probes, which
+    /// publish nothing -- and what they publish is the shape of every endpoint the deployment
+    /// exposes. That is useful while building a client and pure reconnaissance value once the
+    /// deployment is real. Turn it on deliberately, on a deployment where anyone who can reach the
+    /// port is entitled to the map.
+    pub(crate) docs: Option<bool>,
+    /// How many SSE events per turn to retain so a client reconnecting with `Last-Event-ID` can
+    /// replay what it missed. Default 256, matching the live broadcast channel's capacity.
+    ///
+    /// Raising it buys a longer reconnect window at the cost of holding more per-session memory
+    /// during a turn; `0` switches replay off, so a reconnect gets only what happens from then on.
+    pub(crate) stream_replay_events: Option<usize>,
+    /// How long a streaming turn keeps running after its SSE consumer disconnects, waiting for a
+    /// reconnect. Accepts humantime strings like `"30s"`. Default `"30s"`.
+    ///
+    /// `"0s"` cancels the turn the moment the stream drops. That spends fewer provider tokens on
+    /// abandoned work, and makes re-attach useful only for turns that already finished.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) stream_reattach_grace: Option<std::time::Duration>,
+    /// Bearer tokens configured for this deployment. An empty list is refused at startup: `meka
+    /// serve` exits rather than binding a port nothing can authenticate against.
+    pub(crate) tokens: Option<Vec<ServeTokenConfig>>,
+    /// Outbound webhook endpoints. Empty (the default) means meka never makes an outbound request.
+    pub(crate) webhooks: Option<Vec<WebhookConfig>>,
+}
+/// One entry in `[[serve.webhooks]]`.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WebhookConfig {
+    /// Where to POST. `http://` is accepted for loopback development but logged as a warning:
+    /// deliveries are signed, not encrypted, so anything on the path can read them.
+    pub(crate) url: String,
+    /// Shared secret for the `X-Meka-Signature` HMAC. Supports `${ENV_VAR}` substitution.
+    /// Mutually exclusive with `secret_file`.
+    pub(crate) secret: Option<String>,
+    /// Path to a file whose contents (trimmed) are the secret. chmod 0600 recommended.
+    pub(crate) secret_file: Option<std::path::PathBuf>,
+    /// Which events to deliver. Required and non-empty: an endpoint subscribed to nothing is
+    /// almost certainly a mistake, and silently never firing is the worst way to find out.
+    pub(crate) events: Vec<String>,
+    /// Per-attempt request timeout. Accepts humantime strings like `"10s"`. Default `"10s"`.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub(crate) timeout: Option<std::time::Duration>,
+    /// Retries after the first attempt, with exponential backoff. Default 3.
+    pub(crate) max_retries: Option<u32>,
+}
+// Manual `Debug` so a secret cannot reach a log through the *raw* struct either. Nothing prints
+// this today, but the derived one would have been the single unredacted path in the webhook chain,
+// and that is exactly the kind of thing a later `dbg!` finds.
+impl std::fmt::Debug for WebhookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookConfig")
+            .field("url", &self.url)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("secret_file", &self.secret_file)
+            .field("events", &self.events)
+            .field("timeout", &self.timeout)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
+}
+/// One entry in `[serve.tokens]`. Tokens identify callers; scopes gate what they can do. See the
+/// Auth section of the HTTP API docs for the full scope catalog.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServeTokenConfig {
+    /// Inline token value. Supports `${ENV_VAR}` substitution at config-load time. Mutually
+    /// exclusive with `token_file`.
+    pub(crate) token: Option<String>,
+    /// Path to a file whose contents (trimmed) are the token. chmod 0600 recommended.
+    pub(crate) token_file: Option<std::path::PathBuf>,
+    /// Free-form description, surfaced in startup logs. Operators use it to remember which caller
+    /// a token belongs to (e.g. "telegram bridge", "ci debug").
+    pub(crate) description: Option<String>,
+    /// Scopes granted to this token. See the HTTP API docs for the catalog.
+    pub(crate) scopes: Vec<String>,
+}
+// Manual `Debug` for the same reason as [`WebhookConfig`]'s, and more urgently: `ServeConfig` and
+// `ResolvedConfig` both derive `Debug` and `ResolvedConfig` owns the whole `[serve]` table, so the
+// derived impl made every bearer token reachable from a single `{:?}` on the config. Redacting only
+// `ResolvedServeToken` left that path open, because the raw form survives resolution.
+impl std::fmt::Debug for ServeTokenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeTokenConfig")
+            .field(
+                "token",
+                &self
+                    .token
+                    .as_ref()
+                    .map(|token| format_args!("[REDACTED len={}]", token.len()).to_string()),
+            )
+            .field("token_file", &self.token_file)
+            .field("description", &self.description)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{instructions::resolve as resolve_instructions, sandbox::resolve_sandbox_backend};
 
     /// A tilde is expanded whichever separator follows it.
     ///
     /// `~\projects` is what a Windows user types, because it is what PowerShell's own expansion
     /// produces. Matching a literal `"~/"` left it alone, so `/cd` reported the tilde back as a
     /// missing directory and `[skills] extra_paths` resolved to a root that never existed.
+    /// `[web].ca_cert_file` is a path setting like the others, so `~` reaches the home directory
+    /// instead of the web client failing on a file literally named `~/...`.
+    #[test]
+    fn the_ca_cert_path_goes_through_tilde_expansion() {
+        let home = crate::paths::expand_user_path("~").expect("a home directory");
+        let file = WebConfig {
+            ca_cert_file: Some("~/certs/corp.pem".to_string()),
+            ..WebConfig::default()
+        };
+        assert_eq!(
+            WebClientConfig::from_file(&file).ca_cert_file,
+            Some(home.join("certs").join("corp.pem"))
+        );
+    }
+
     #[test]
     fn expand_user_path_accepts_either_separator_after_the_tilde() {
         let home = dirs::home_dir().expect("a home directory");
@@ -3662,52 +2921,6 @@ mod tests {
         );
     }
 
-    /// The webhook redactor keeps the scheme, host and port, and nothing else.
-    ///
-    /// Every case below is one a splitting implementation let through, and each reached a `warn!`
-    /// at default verbosity. The query one is the sharpest: a webhook URL with no path has no `/`
-    /// to split on, so `?token=…` was reproduced in full by the function whose entire job is to
-    /// remove the secret.
-    #[test]
-    fn webhook_host_keeps_only_the_origin() {
-        for (url, expected) in [
-            (
-                "https://hooks.example.com/services/T00/B00/XXXX",
-                "https://hooks.example.com",
-            ),
-            // No path, so nothing for a `'/'` split to cut.
-            (
-                "https://hooks.example.com?token=SECRET",
-                "https://hooks.example.com",
-            ),
-            (
-                "https://hooks.example.com/path?token=SECRET",
-                "https://hooks.example.com",
-            ),
-            (
-                "https://hooks.example.com#SECRET",
-                "https://hooks.example.com",
-            ),
-            // Userinfo rode along as part of what the old split called the host.
-            (
-                "https://user:pass@hooks.example.com/x",
-                "https://hooks.example.com",
-            ),
-            // A port distinguishes two endpoints and is not a secret, so it is kept.
-            ("http://127.0.0.1:8080/hook", "http://127.0.0.1:8080"),
-            ("not a url", "<malformed>"),
-        ] {
-            let rendered = webhook_host(url);
-            assert_eq!(rendered, expected, "redacting {url}");
-            for secret in ["SECRET", "pass", "T00", "XXXX"] {
-                assert!(
-                    !rendered.contains(secret),
-                    "{rendered} still carries `{secret}` from {url}"
-                );
-            }
-        }
-    }
-
     /// `extra_paths` resolution drops what discovery cannot use, and says so each time.
     ///
     /// A repeat, or meka's own root listed again, makes discovery walk the directory twice and then
@@ -3716,12 +2929,12 @@ mod tests {
     /// expand to `$HOME` and make the whole home directory a skills root.
     #[test]
     fn extra_paths_drops_repeats_the_native_root_and_empty_entries() {
-        let native = PathBuf::from("/cfg/skills");
+        let native = PathBuf::from("/config/skills");
         let resolved = resolve_skills_extra_paths(
             &[
                 "/a/skills".to_string(),
                 "/a/skills".to_string(),
-                "/cfg/skills".to_string(),
+                "/config/skills".to_string(),
                 "  ".to_string(),
                 "/b/skills".to_string(),
             ],
@@ -3738,90 +2951,6 @@ mod tests {
             resolve_skills_extra_paths(&["/a".to_string(), "/a".to_string()], None),
             vec![PathBuf::from("/a")]
         );
-    }
-
-    /// The redacting `Debug` impls exist to keep a secret out of a log, and until this test there
-    /// was nothing asserting any of them: each could have been deleted and the suite would have
-    /// stayed green while `{:?}` started printing secrets again.
-    ///
-    /// `McpAuthConfig` is no longer among them and needs none: its secret lives in
-    /// `mcp_credentials`, so every field it still carries is public configuration.
-    #[test]
-    fn a_secret_never_reaches_a_debug_rendering() {
-        let mut server = fixture_server("s");
-        server.headers = Some(std::collections::HashMap::from([(
-            "Authorization".to_string(),
-            "Bearer HEADERSECRET".to_string(),
-        )]));
-        server.env = Some(std::collections::HashMap::from([(
-            "API_KEY".to_string(),
-            "ENVSECRET".to_string(),
-        )]));
-        server.auth = Some(McpAuthConfig::ClientCredentials {
-            client_id: "public-client-id".to_string(),
-            scopes: None,
-            resource: None,
-        });
-
-        let rendered = format!("{:?}", server);
-        for secret in ["HEADERSECRET", "ENVSECRET"] {
-            assert!(
-                !rendered.contains(secret),
-                "'{secret}' leaked into {rendered}"
-            );
-        }
-        // The names around the secrets are the diagnostic, and must survive.
-        assert!(rendered.contains("Authorization"), "{rendered}");
-        assert!(rendered.contains("API_KEY"), "{rendered}");
-        assert!(rendered.contains("public-client-id"), "{rendered}");
-        assert!(rendered.contains("REDACTED"), "{rendered}");
-
-        let serve_token = ResolvedServeToken {
-            token: "SERVETOKEN".to_string(),
-            description: None,
-            scopes: Default::default(),
-            source: TokenSource::Inline,
-        };
-        let rendered = format!("{:?}", serve_token);
-        assert!(!rendered.contains("SERVETOKEN"), "{rendered}");
-
-        // The *raw* config form too, and by the route that actually reaches a log: `ResolvedConfig`
-        // derives `Debug` and owns the whole `[serve]` table, so redacting only the resolved token
-        // left every configured bearer token one `{:?}` away. Asserting on the raw struct alone
-        // would not have caught that; this walks the containment chain.
-        let raw_token = ServeTokenConfig {
-            token: Some("RAWSERVETOKEN".to_string()),
-            token_file: None,
-            description: Some("ci".to_string()),
-            scopes: vec!["sessions:r".to_string()],
-        };
-        let rendered = format!("{:?}", raw_token);
-        assert!(!rendered.contains("RAWSERVETOKEN"), "{rendered}");
-        assert!(
-            rendered.contains("ci"),
-            "the label must survive: {rendered}"
-        );
-
-        let serve = ServeConfig {
-            tokens: Some(vec![raw_token]),
-            ..Default::default()
-        };
-        let rendered = format!("{:?}", serve);
-        assert!(
-            !rendered.contains("RAWSERVETOKEN"),
-            "a token must not reach a log through the enclosing [serve] table: {rendered}"
-        );
-
-        let webhook = WebhookConfig {
-            url: "https://example/hook".to_string(),
-            secret: Some("WEBHOOKSECRET".to_string()),
-            secret_file: None,
-            events: Vec::new(),
-            timeout: None,
-            max_retries: None,
-        };
-        let rendered = format!("{:?}", webhook);
-        assert!(!rendered.contains("WEBHOOKSECRET"), "{rendered}");
     }
 
     fn fixture_server(name: &str) -> McpServerConfig {
@@ -3841,13 +2970,13 @@ mod tests {
             eager_load_tools: None,
             tool_permissions: None,
             trust_read_only_hint: None,
-            disabled: false,
+            disabled: None,
             required: None,
         }
     }
 
     #[test]
-    fn test_eager_load_override_appends_to_matching_server() {
+    fn eager_load_override_appends_to_matching_server() {
         let mut servers = vec![fixture_server("notion"), fixture_server("github")];
         let raw = vec![
             "notion:search".to_string(),
@@ -3866,7 +2995,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_load_override_appends_to_existing_list() {
+    fn eager_load_override_appends_to_existing_list() {
         let mut servers = vec![fixture_server("notion")];
         servers[0].eager_load_tools = Some(vec!["search".to_string()]);
         apply_cli_eager_load_overrides(&["notion:fetch".to_string()], &mut servers);
@@ -3877,7 +3006,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_load_override_dedupes_existing_entry() {
+    fn eager_load_override_dedupes_existing_entry() {
         let mut servers = vec![fixture_server("notion")];
         servers[0].eager_load_tools = Some(vec!["search".to_string()]);
         apply_cli_eager_load_overrides(&["notion:search".to_string()], &mut servers);
@@ -3889,7 +3018,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_load_override_skips_unknown_server() {
+    fn eager_load_override_skips_unknown_server() {
         let mut servers = vec![fixture_server("notion")];
         apply_cli_eager_load_overrides(&["nope:search".to_string()], &mut servers);
         // The matching `notion` entry must remain untouched; the unknown `nope` entry simply
@@ -3898,7 +3027,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_load_override_skips_malformed_values() {
+    fn eager_load_override_skips_malformed_values() {
         let mut servers = vec![fixture_server("notion")];
         let raw = vec![
             "no-colon".to_string(),
@@ -3914,13 +3043,13 @@ mod tests {
     /// startup error rather than a silently ignored line. Worth pinning both the key and the three
     /// values, since the config file is the only way to reach this setting.
     #[test]
-    fn test_display_tool_params_parses_each_value() {
+    fn display_tool_params_parses_each_value() {
         for (written, expected) in [
             ("off", ToolParams::Off),
             ("summary", ToolParams::Summary),
             ("full", ToolParams::Full),
         ] {
-            let toml_str = format!("[display]\ntool_params = \"{}\"\n", written);
+            let toml_str = format!("[display]\ntool_params = \"{written}\"\n");
             let config: ConfigFile = toml::from_str(&toml_str).expect("parse toml");
             let display = config.display.expect("display present");
             assert_eq!(display.tool_params, Some(expected));
@@ -3929,7 +3058,7 @@ mod tests {
 
     /// Omitting it leaves today's one-line indicator, so an existing config keeps its output.
     #[test]
-    fn test_display_tool_params_defaults_to_summary() {
+    fn display_tool_params_defaults_to_summary() {
         assert_eq!(ToolParams::default(), ToolParams::Summary);
     }
 
@@ -3938,9 +3067,9 @@ mod tests {
     /// passes. This is the one that fails if the resolution line is dropped.
     ///
     /// Unset means "follow the terminal", so the resolved value stays `None` rather than becoming a
-    /// number that would then be honoured exactly and pin output to a guess.
+    /// number that would then be honored exactly and pin output to a guess.
     #[test]
-    fn test_display_max_width_reaches_the_resolved_config() {
+    fn display_max_width_reaches_the_resolved_config() {
         assert_eq!(
             resolve_with_config("[display]\nmax_width = 120\n").max_width,
             Some(120)
@@ -3953,17 +3082,14 @@ mod tests {
     /// quadratically and the renderer stalls. Clamped rather than rejected at both ends: a width
     /// stated badly is a preference, not a broken config.
     #[test]
-    fn test_display_max_width_is_clamped_to_what_can_be_rendered() {
+    fn display_max_width_is_clamped_to_what_can_be_rendered() {
         assert_eq!(
             resolve_with_config("[display]\nmax_width = 5\n").max_width,
             Some(MIN_CONFIGURED_WIDTH)
         );
         assert_eq!(
-            resolve_with_config(&format!(
-                "[display]\nmax_width = {}\n",
-                MIN_CONFIGURED_WIDTH
-            ))
-            .max_width,
+            resolve_with_config(&format!("[display]\nmax_width = {MIN_CONFIGURED_WIDTH}\n"))
+                .max_width,
             Some(MIN_CONFIGURED_WIDTH)
         );
         assert_eq!(
@@ -3979,7 +3105,7 @@ mod tests {
     /// The same resolution check for `tool_params`, whose default is a value rather than an
     /// absence: unset must land on `summary`, not on whatever `ToolParams` derives.
     #[test]
-    fn test_display_tool_params_reaches_the_resolved_config() {
+    fn display_tool_params_reaches_the_resolved_config() {
         assert_eq!(
             resolve_with_config("[display]\ntool_params = \"full\"\n").tool_params,
             ToolParams::Full
@@ -3991,7 +3117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_load_override_trims_whitespace() {
+    fn eager_load_override_trims_whitespace() {
         let mut servers = vec![fixture_server("notion")];
         apply_cli_eager_load_overrides(&["  notion : search  ".to_string()], &mut servers);
         assert_eq!(
@@ -4001,13 +3127,13 @@ mod tests {
     }
 
     #[test]
-    fn test_web_config_all_fields_parse() {
+    fn web_config_all_fields_parse() {
         let toml_str = r#"
 [web]
 user_agent = "meka-test"
-request_timeout_seconds = 60
-connect_timeout_seconds = 5
-read_timeout_seconds = 10
+request_timeout = "60s"
+connect_timeout = "5s"
+read_timeout = "10s"
 max_redirects = 3
 proxy = "socks5h://127.0.0.1:1080"
 ca_cert_file = "/etc/ssl/corp.pem"
@@ -4019,9 +3145,12 @@ danger_accept_invalid_hostnames = true
         let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
         let web = config.web.expect("web present");
         assert_eq!(web.user_agent.as_deref(), Some("meka-test"));
-        assert_eq!(web.request_timeout_seconds, Some(60));
-        assert_eq!(web.connect_timeout_seconds, Some(5));
-        assert_eq!(web.read_timeout_seconds, Some(10));
+        assert_eq!(
+            web.request_timeout,
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(web.connect_timeout, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(web.read_timeout, Some(std::time::Duration::from_secs(10)));
         assert_eq!(web.max_redirects, Some(3));
         assert_eq!(web.proxy.as_deref(), Some("socks5h://127.0.0.1:1080"));
         assert_eq!(web.ca_cert_file.as_deref(), Some("/etc/ssl/corp.pem"));
@@ -4032,30 +3161,30 @@ danger_accept_invalid_hostnames = true
     }
 
     #[test]
-    fn test_web_client_config_defaults_from_empty_file() {
+    fn web_client_config_defaults_from_empty_file() {
         // Empty [web] → sensible defaults; no user-surprising failures.
         let file = WebConfig::default();
-        let cfg = WebClientConfig::from_file(&file);
-        assert_eq!(cfg.user_agent, DEFAULT_WEB_USER_AGENT);
-        assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(30));
-        assert!(cfg.connect_timeout.is_none());
-        assert!(cfg.read_timeout.is_none());
-        assert_eq!(cfg.max_redirects, 10);
-        assert!(cfg.proxy.is_none());
-        assert!(cfg.ca_cert_file.is_none());
-        assert!(!cfg.https_only);
-        assert!(cfg.min_tls_version.is_none());
-        assert!(!cfg.danger_accept_invalid_certs);
-        assert!(!cfg.danger_accept_invalid_hostnames);
+        let config = WebClientConfig::from_file(&file);
+        assert_eq!(config.user_agent, DEFAULT_WEB_USER_AGENT);
+        assert_eq!(config.request_timeout, std::time::Duration::from_secs(30));
+        assert!(config.connect_timeout.is_none());
+        assert!(config.read_timeout.is_none());
+        assert_eq!(config.max_redirects, 10);
+        assert!(config.proxy.is_none());
+        assert!(config.ca_cert_file.is_none());
+        assert!(!config.https_only);
+        assert!(config.min_tls_version.is_none());
+        assert!(!config.danger_accept_invalid_certs);
+        assert!(!config.danger_accept_invalid_hostnames);
     }
 
     #[test]
-    fn test_web_client_config_resolves_full_file() {
+    fn web_client_config_resolves_full_file() {
         let file = WebConfig {
             user_agent: Some("ua".to_string()),
-            request_timeout_seconds: Some(60),
-            connect_timeout_seconds: Some(5),
-            read_timeout_seconds: Some(10),
+            request_timeout: Some(std::time::Duration::from_secs(60)),
+            connect_timeout: Some(std::time::Duration::from_secs(5)),
+            read_timeout: Some(std::time::Duration::from_secs(10)),
             max_redirects: Some(0),
             proxy: Some("http://proxy.local:8080".to_string()),
             ca_cert_file: Some("/tmp/ca.pem".to_string()),
@@ -4064,25 +3193,31 @@ danger_accept_invalid_hostnames = true
             danger_accept_invalid_certs: Some(true),
             danger_accept_invalid_hostnames: Some(true),
         };
-        let cfg = WebClientConfig::from_file(&file);
-        assert_eq!(cfg.user_agent, "ua");
-        assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(60));
-        assert_eq!(cfg.connect_timeout, Some(std::time::Duration::from_secs(5)));
-        assert_eq!(cfg.read_timeout, Some(std::time::Duration::from_secs(10)));
-        assert_eq!(cfg.max_redirects, 0);
-        assert_eq!(cfg.proxy.as_deref(), Some("http://proxy.local:8080"));
+        let config = WebClientConfig::from_file(&file);
+        assert_eq!(config.user_agent, "ua");
+        assert_eq!(config.request_timeout, std::time::Duration::from_secs(60));
         assert_eq!(
-            cfg.ca_cert_file.as_deref(),
+            config.connect_timeout,
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            config.read_timeout,
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(config.max_redirects, 0);
+        assert_eq!(config.proxy.as_deref(), Some("http://proxy.local:8080"));
+        assert_eq!(
+            config.ca_cert_file.as_deref(),
             Some(std::path::Path::new("/tmp/ca.pem"))
         );
-        assert!(cfg.https_only);
-        assert_eq!(cfg.min_tls_version, Some(MinTlsVersion::V1_3));
-        assert!(cfg.danger_accept_invalid_certs);
-        assert!(cfg.danger_accept_invalid_hostnames);
+        assert!(config.https_only);
+        assert_eq!(config.min_tls_version, Some(MinTlsVersion::V1_3));
+        assert!(config.danger_accept_invalid_certs);
+        assert!(config.danger_accept_invalid_hostnames);
     }
 
     #[test]
-    fn test_min_tls_version_parse_accepts_all_valid() {
+    fn min_tls_version_parse_accepts_all_valid() {
         assert_eq!(MinTlsVersion::parse("1.0"), Some(MinTlsVersion::V1_0));
         assert_eq!(MinTlsVersion::parse("1.1"), Some(MinTlsVersion::V1_1));
         assert_eq!(MinTlsVersion::parse("1.2"), Some(MinTlsVersion::V1_2));
@@ -4092,58 +3227,212 @@ danger_accept_invalid_hostnames = true
     }
 
     #[test]
-    fn test_min_tls_version_parse_rejects_invalid() {
+    fn min_tls_version_parse_rejects_invalid() {
         assert!(MinTlsVersion::parse("1.5").is_none());
         assert!(MinTlsVersion::parse("tls1.3").is_none());
         assert!(MinTlsVersion::parse("").is_none());
     }
 
     #[test]
-    fn test_web_client_config_rejects_bad_min_tls_falls_back() {
+    fn web_client_config_rejects_bad_min_tls_falls_back() {
         // Invalid min_tls_version string logs a warn but doesn't abort; we fall through to
         // reqwest's default rather than failing startup on a typo.
         let file = WebConfig {
             min_tls_version: Some("1.5".to_string()),
             ..WebConfig::default()
         };
-        let cfg = WebClientConfig::from_file(&file);
-        assert!(cfg.min_tls_version.is_none());
+        let config = WebClientConfig::from_file(&file);
+        assert!(config.min_tls_version.is_none());
+    }
+
+    /// A zero timeout fails every request before it is sent. The integer keys read `0` as "the
+    /// default", which is a guess a file that says zero never asked for; each of the three is
+    /// refused by name instead.
+    #[test]
+    fn a_zero_web_timeout_is_refused_at_startup() {
+        for key in ["request_timeout", "connect_timeout", "read_timeout"] {
+            let resolved = resolve_with_config(&format!(
+                r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+
+[web]
+{key} = "0s"
+"#
+            ));
+            let error = resolved
+                .validate()
+                .expect_err("a zero timeout must not be accepted");
+            assert!(
+                error.to_string().contains(&format!("[web].{key}")),
+                "{error}"
+            );
+        }
+        let resolved = resolve_with_config(
+            r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+
+[web]
+request_timeout = "45s"
+"#,
+        );
+        resolved.validate().expect("a positive timeout is fine");
+        assert_eq!(
+            resolved.web_client.request_timeout,
+            std::time::Duration::from_secs(45)
+        );
     }
 
     #[test]
-    fn test_web_client_config_zero_timeout_uses_default() {
-        // `0` in the config is treated as "fall through to default" so users can't accidentally set
-        // request_timeout = 0 and disable timeouts entirely.
-        let file = WebConfig {
-            request_timeout_seconds: Some(0),
-            connect_timeout_seconds: Some(0),
-            read_timeout_seconds: Some(0),
-            ..WebConfig::default()
-        };
-        let cfg = WebClientConfig::from_file(&file);
-        assert_eq!(cfg.request_timeout, std::time::Duration::from_secs(30));
-        assert!(cfg.connect_timeout.is_none());
-        assert!(cfg.read_timeout.is_none());
-    }
-
-    #[test]
-    fn test_mcp_runtime_fields_parse() {
+    fn mcp_runtime_fields_parse() {
         let toml_str = r#"
 [mcp]
 default_permission = "read"
-strict = false
-grace_seconds = 5
-connect_timeout_seconds = 60
+default_required = false
+grace = "5s"
+connect_timeout = "1m"
+stdio_concurrency = 2
+http_concurrency = 40
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
         let mcp = config.mcp.expect("mcp present");
-        assert_eq!(mcp.strict, Some(false));
-        assert_eq!(mcp.grace_seconds, Some(5));
-        assert_eq!(mcp.connect_timeout_seconds, Some(60));
+        assert_eq!(mcp.default_permission, Some(Permission::Read));
+        assert_eq!(mcp.default_required, Some(false));
+        assert_eq!(mcp.grace, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(
+            mcp.connect_timeout,
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(mcp.stdio_concurrency, Some(2));
+        assert_eq!(mcp.http_concurrency, Some(40));
+    }
+
+    /// The two limits reach the connector from the file, with their documented defaults, and a
+    /// zero is refused: `buffer_unordered(0)` would wait forever for the first server.
+    #[test]
+    fn mcp_concurrency_comes_from_the_file_and_zero_is_refused() {
+        let provider = r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+"#;
+        let resolved = resolve_with_config(provider);
+        assert_eq!(resolved.mcp_stdio_concurrency, 3);
+        assert_eq!(resolved.mcp_http_concurrency, 20);
+        let resolved = resolve_with_config(&format!(
+            "{provider}\n[mcp]\nstdio_concurrency = 1\nhttp_concurrency = 5\n"
+        ));
+        resolved.validate().expect("positive limits are fine");
+        let runtime = crate::mcp::McpRuntimeConfig::from_config(&resolved);
+        assert_eq!(runtime.stdio_concurrency, 1);
+        assert_eq!(runtime.http_concurrency, 5);
+        for key in ["stdio_concurrency", "http_concurrency"] {
+            let resolved = resolve_with_config(&format!("{provider}\n[mcp]\n{key} = 0\n"));
+            let error = resolved.validate().expect_err("zero must be refused");
+            assert!(
+                error.to_string().contains(&format!("[mcp].{key}")),
+                "{error}"
+            );
+        }
+    }
+
+    /// A zero connect timeout fails every server before it connects; unlike `grace`, where zero
+    /// means "do not wait", there is no reading of it anyone wants.
+    #[test]
+    fn a_zero_mcp_connect_timeout_is_refused_and_a_zero_grace_is_not() {
+        let provider = r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+"#;
+        let resolved =
+            resolve_with_config(&format!("{provider}\n[mcp]\nconnect_timeout = \"0s\"\n"));
+        let error = resolved.validate().expect_err("zero must be refused");
+        assert!(
+            error.to_string().contains("[mcp].connect_timeout"),
+            "{error}"
+        );
+        let resolved = resolve_with_config(&format!("{provider}\n[mcp]\ngrace = \"0s\"\n"));
+        resolved.validate().expect("a zero grace skips the wait");
+        assert!(resolved.mcp_grace.is_zero());
+    }
+
+    /// `[mcp].default_permission`, a server's `permission` and its `tool_permissions` are refused
+    /// where the file is parsed, with the line, the way `[permissions]` is. Dropping a level meka
+    /// does not have with a warning, or failing the one server's connection later, tells the user
+    /// nothing about where to look.
+    #[test]
+    fn an_mcp_permission_level_meka_does_not_have_is_refused_at_parse() {
+        for body in [
+            "[mcp]\ndefault_permission = \"write\"\n",
+            "[[mcp.servers]]\nname = \"s\"\ntransport = \"http\"\nurl = \"http://x\"\npermission = \"write\"\n",
+            "[[mcp.servers]]\nname = \"s\"\ntransport = \"http\"\nurl = \"http://x\"\n[mcp.servers.tool_permissions]\nsearch = \"write\"\n",
+        ] {
+            let error = toml::from_str::<ConfigFile>(body)
+                .expect_err("write is not a level")
+                .to_string();
+            assert!(
+                error.contains("write") && error.contains("unrestricted"),
+                "names the value and the levels meka has: {error}"
+            );
+        }
+    }
+
+    /// Every key `migrate-0.45-to-0.46.py` renames is refused by its old name, so a file the script
+    /// did not see fails at the line rather than being read with the setting silently dropped.
+    #[test]
+    fn a_renamed_config_key_is_refused_by_its_old_name() {
+        for (old_key, body) in [
+            (
+                "request_timeout_seconds",
+                "[web]\nrequest_timeout_seconds = 30\n",
+            ),
+            (
+                "connect_timeout_seconds",
+                "[web]\nconnect_timeout_seconds = 5\n",
+            ),
+            ("read_timeout_seconds", "[web]\nread_timeout_seconds = 5\n"),
+            ("grace_seconds", "[mcp]\ngrace_seconds = 3\n"),
+            (
+                "connect_timeout_seconds",
+                "[mcp]\nconnect_timeout_seconds = 30\n",
+            ),
+            ("strict", "[mcp]\nstrict = true\n"),
+            ("retention_days", "[session]\nretention_days = 30\n"),
+            ("budget_tokens", "[thinking]\nbudget_tokens = 1000\n"),
+        ] {
+            let error = toml::from_str::<ConfigFile>(body)
+                .expect_err("the old key must not parse")
+                .to_string();
+            assert!(error.contains(old_key), "{old_key}: {error}");
+        }
     }
 
     #[test]
-    fn test_mcp_server_disabled_parses() {
+    fn mcp_server_disabled_parses() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "flaky"
@@ -4154,11 +3443,11 @@ disabled = true
         let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
         let servers = config.mcp.unwrap().servers.unwrap();
         assert_eq!(servers.len(), 1);
-        assert!(servers[0].disabled);
+        assert_eq!(servers[0].disabled, Some(true));
     }
 
     #[test]
-    fn test_mcp_server_disabled_defaults_false() {
+    fn mcp_server_disabled_defaults_false() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "normal"
@@ -4167,540 +3456,80 @@ command = "npx"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
         let servers = config.mcp.unwrap().servers.unwrap();
-        assert!(!servers[0].disabled);
+        assert_eq!(servers[0].disabled, None);
     }
 
     #[test]
-    fn test_config_file_deserialization() {
+    fn config_file_deserialization() {
         let toml_str = r#"
-default_provider = "work"
+default_profile = "work"
 
-[providers.work]
-type = "openai-chat-completions"
-model = "gpt-4o"
+[accounts.work]
+backend = "openai-chat-completions"
 base_url = "https://api.openai.com/v1"
+
+[profiles.work]
+account = "work"
+model = "gpt-4o"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
-        assert_eq!(config.default_provider.as_deref(), Some("work"));
-        let profile = config
-            .providers
+        assert_eq!(config.default_profile.as_deref(), Some("work"));
+        let account = config
+            .accounts
             .get("work")
-            .expect("profile should be present");
-        assert_eq!(profile.backend, "openai-chat-completions");
-        assert_eq!(profile.model.as_deref(), Some("gpt-4o"));
+            .expect("account should be present");
+        assert_eq!(account.backend, "openai-chat-completions");
         assert_eq!(
-            profile.base_url.as_deref(),
+            account.base_url.as_deref(),
             Some("https://api.openai.com/v1")
         );
+        let profile = config
+            .profiles
+            .get("work")
+            .expect("profile should be present");
+        assert_eq!(profile.account, "work");
+        assert_eq!(profile.model.as_deref(), Some("gpt-4o"));
     }
 
     #[test]
-    fn test_empty_config_file() {
+    fn empty_config_file() {
         let config: ConfigFile = toml::from_str("").expect("failed to parse empty toml");
-        assert!(config.providers.is_empty());
-        assert!(config.default_provider.is_none());
+        assert!(config.accounts.is_empty());
+        assert!(config.profiles.is_empty());
+        assert!(config.default_profile.is_none());
     }
 
     #[test]
-    fn test_partial_config_file() {
+    fn partial_config_file() {
         let toml_str = r#"
-[providers.main]
-type = "claude-subscription"
+[accounts.main]
+backend = "claude-subscription"
+
+[profiles.main]
+account = "main"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
+        let account = config
+            .accounts
+            .get("main")
+            .expect("account should be present");
+        assert_eq!(account.backend, "claude-subscription");
+        assert!(account.base_url.is_none());
         let profile = config
-            .providers
+            .profiles
             .get("main")
             .expect("profile should be present");
-        assert_eq!(profile.backend, "claude-subscription");
         assert!(profile.model.is_none());
-        assert!(profile.base_url.is_none());
-    }
-
-    fn profiles_from(
-        backends: &[(&str, &str)],
-    ) -> std::collections::BTreeMap<String, ProviderProfile> {
-        backends
-            .iter()
-            .map(|(name, backend)| {
-                (name.to_string(), ProviderProfile {
-                    backend: backend.to_string(),
-                    ..Default::default()
-                })
-            })
-            .collect()
-    }
-
-    /// An override beats the profile, and an absent one leaves the profile's value alone.
-    ///
-    /// The two fields that default *on*, and the one that falls back to `[session]`.
-    ///
-    /// A profile saying nothing must resolve the way a profile-less run did, or switching a session
-    /// onto a bare profile would silently turn images or redacted thinking off.
-    #[test]
-    fn an_unstated_profile_resolves_to_the_documented_defaults() {
-        let bare = ProviderProfile {
-            backend: "openai-chat-completions".to_string(),
-            ..Default::default()
-        };
-        let settings = resolve_profile(&bare, Some(200_000), None, String::new());
-
-        assert!(settings.vision, "vision defaults on");
-        assert!(settings.redact_thinking, "redact_thinking defaults on");
-        assert_eq!(
-            settings.context_window,
-            Some(200_000),
-            "falls back to `[session].context_window`"
-        );
-        assert_eq!(settings.effort, None, "no effort means the provider's own");
-    }
-
-    /// A profile's own window beats `[session].context_window`, which is the whole reason a
-    /// per-profile value exists: one small model among several must not drag the rest down.
-    #[test]
-    fn a_profiles_context_window_beats_the_session_default() {
-        let profile = ProviderProfile {
-            backend: "anthropic-messages".to_string(),
-            context_window: Some(32_000),
-            ..Default::default()
-        };
-        let settings = resolve_profile(&profile, Some(1_000_000), None, String::new());
-        assert_eq!(settings.context_window, Some(32_000));
-    }
-
-    /// The budget resolves like the window: profile first, then the installation-wide fallback,
-    /// then the built-in default.
-    ///
-    /// The middle rung is the one worth pinning. Dropping it silently sends every profile the
-    /// built-in 16000 and ignores a `[thinking].budget_tokens` that shipped in 0.43 and is still
-    /// the only budget most configs state, which no request would refuse and no other test would
-    /// notice.
-    #[test]
-    fn a_profiles_thinking_budget_beats_the_installation_fallback() {
-        let budgeted = |thinking_budget| ProviderProfile {
-            backend: "anthropic-messages".to_string(),
-            thinking_budget,
-            ..Default::default()
-        };
-        let resolve = |profile: &ProviderProfile, fallback| {
-            resolve_profile(profile, None, fallback, String::new()).thinking_budget
-        };
-
-        assert_eq!(
-            resolve(&budgeted(Some(8_000)), Some(64_000)),
-            8_000,
-            "the profile's own budget wins over `[thinking].budget_tokens`"
-        );
-        assert_eq!(
-            resolve(&budgeted(None), Some(64_000)),
-            64_000,
-            "a profile stating none falls back to `[thinking].budget_tokens`"
-        );
-        assert_eq!(
-            resolve(&budgeted(None), None),
-            DEFAULT_THINKING_BUDGET_TOKENS,
-            "with neither stated, the documented default"
-        );
-    }
-
-    /// Two profiles resolve two budgets from one registry.
-    ///
-    /// The whole point of the move: while the budget was one value for the process, this could not
-    /// be expressed, and [`validate_max_output_tokens`] judged both profiles against whichever
-    /// number the process happened to hold.
-    #[test]
-    fn two_profiles_can_hold_different_thinking_budgets() {
-        let big = ProviderProfile {
-            backend: "anthropic-messages".to_string(),
-            thinking_budget: Some(60_000),
-            ..Default::default()
-        };
-        let small = ProviderProfile {
-            backend: "anthropic-messages".to_string(),
-            thinking_budget: Some(2_048),
-            ..Default::default()
-        };
-        let resolve = |profile: &ProviderProfile| {
-            resolve_profile(profile, None, Some(16_000), String::new()).thinking_budget
-        };
-        assert_eq!(resolve(&big), 60_000);
-        assert_eq!(resolve(&small), 2_048);
-    }
-
-    /// A profile is judged against its own budget, not the installation's.
-    ///
-    /// `max_output_tokens = 8000` is fine beside a 2048 budget and impossible beside a 64000 one.
-    /// Before the budget was a profile field the second profile's number decided the first
-    /// profile's fate, which is the defect this pins shut.
-    #[test]
-    fn max_output_tokens_is_checked_against_the_profiles_own_budget() {
-        let check = |thinking_budget| {
-            validate_max_output_tokens(
-                "work",
-                Some("anthropic-messages"),
-                Some(8_000),
-                crate::provider::ThinkingMode::Budgeted,
-                thinking_budget,
-            )
-        };
-        assert!(
-            check(2_048).is_ok(),
-            "8000 output over a 2048 budget is fine"
-        );
-        let error = check(64_000).expect_err("8000 output cannot carry a 64000 budget");
-        let message = error.to_string();
-        assert!(
-            message.contains("[providers.work]"),
-            "the remedy names the profile's own table, not a global: {message}"
-        );
-        assert!(
-            !message.contains("[thinking].budget_tokens"),
-            "fixing one profile must not be described as editing every profile's fallback: \
-             {message}"
-        );
     }
 
     #[test]
-    fn test_select_active_profile_explicit_request_wins() {
-        let providers = profiles_from(&[
-            ("work", "claude-subscription"),
-            ("personal", "openai-chat-completions"),
-        ]);
-        let (active, error) = select_active_profile(
-            Some("personal".to_string()),
-            ProfileRequest::Flag,
-            &providers,
-        );
-        assert_eq!(active.as_deref(), Some("personal"));
-        assert!(error.is_none());
-    }
-
-    #[test]
-    fn test_select_active_profile_sole_profile_when_no_request() {
-        let providers = profiles_from(&[("only", "anthropic-messages")]);
-        let (active, error) =
-            select_active_profile(None, ProfileRequest::DefaultProvider, &providers);
-        assert_eq!(active.as_deref(), Some("only"));
-        assert!(error.is_none());
-    }
-
-    #[test]
-    fn test_select_active_profile_zero_profiles_errors() {
-        let providers = profiles_from(&[]);
-        let (active, error) =
-            select_active_profile(None, ProfileRequest::DefaultProvider, &providers);
-        assert!(active.is_none());
-        assert!(error.expect("error expected").contains("provider add"));
-    }
-
-    #[test]
-    fn test_select_active_profile_ambiguous_without_default_errors() {
-        let providers = profiles_from(&[
-            ("work", "claude-subscription"),
-            ("personal", "openai-chat-completions"),
-        ]);
-        let (active, error) =
-            select_active_profile(None, ProfileRequest::DefaultProvider, &providers);
-        assert!(active.is_none());
-        let error = error.expect("error expected");
-        assert!(error.contains("multiple provider profiles"));
-        // The error lists the configured names so the user knows what to pick.
-        assert!(error.contains("work") && error.contains("personal"));
-    }
-
-    #[test]
-    fn test_select_active_profile_unknown_name_errors() {
-        let providers = profiles_from(&[("work", "claude-subscription")]);
-        let (active, error) = select_active_profile(
-            Some("missing".to_string()),
-            ProfileRequest::Flag,
-            &providers,
-        );
-        assert!(active.is_none());
-        assert!(
-            error
-                .expect("error expected")
-                .contains("no provider profile named 'missing'")
-        );
-    }
-
-    #[test]
-    fn a_device_id_is_empty_for_every_backend_but_claude_subscription() {
-        // Should not generate / persist anything when the provider doesn't need a device_id. Empty
-        // string flows through but is ignored by non-claude-subscription providers.
-        assert_eq!(
-            device_id::resolve(Some("openai-chat-completions"), Some("work"), None),
-            ""
-        );
-        assert_eq!(
-            device_id::resolve(Some("anthropic-messages"), Some("work"), None),
-            ""
-        );
-        assert_eq!(device_id::resolve(None, None, None), "");
-        // Even an explicit configured value is suppressed when the provider isn't
-        // claude-subscription; the field is provider-scoped.
-        assert_eq!(
-            device_id::resolve(
-                Some("openai-chat-completions"),
-                Some("work"),
-                Some("explicit")
-            ),
-            ""
-        );
-    }
-
-    #[test]
-    fn test_resolve_device_id_uses_configured_value_for_claude_oauth() {
-        // A configured value returns before the persist branch, so this never touches the FS.
-        let id = "deadbeef".repeat(8);
-        assert_eq!(
-            device_id::resolve(Some("claude-subscription"), Some("work"), Some(&id)),
-            id,
-            "configured value must be used verbatim for claude-subscription"
-        );
-    }
-
-    /// Every key in [`PROFILE_KEY_ORDER`] is one [`ProviderProfile`] actually models, in order.
-    ///
-    /// `deny_unknown_fields` does the proving: a list naming a key the struct has since renamed or
-    /// dropped stops this fixture parsing. Without that, the sorter would quietly treat the real
-    /// key as unmodelled and file it last - a drift that surfaces as a diff nobody asked for rather
-    /// than as an error, which is the hardest kind to trace back.
-    ///
-    /// The fixture is also the order, written out, so the list has one readable statement of itself
-    /// that a person can check against the reference without running anything.
-    #[test]
-    fn every_canonical_key_is_one_the_profile_models() {
-        let fixture = concat!(
-            "[providers.work]\n",
-            "type = \"claude-subscription\"\n",
-            "base_url = \"https://api.anthropic.com\"\n",
-            "oauth_token_url = \"https://example.invalid/token\"\n",
-            "client_id = \"a-client\"\n",
-            "device_id = \"a-device\"\n",
-            "model = \"claude-opus-5\"\n",
-            "context_window = 200000\n",
-            "max_output_tokens = 64000\n",
-            "effort = \"high\"\n",
-            "vision = true\n",
-            "thinking = \"budgeted\"\n",
-            "thinking_budget = 32000\n",
-            "redact_thinking = true\n",
-        );
-
-        let parsed: ConfigFile =
-            toml::from_str(fixture).expect("every canonical key must be one the profile models");
-        assert!(parsed.providers.contains_key("work"));
-
-        let document: toml_edit::DocumentMut = fixture.parse().expect("parse");
-        let keys: Vec<&str> = document["providers"]["work"]
-            .as_table()
-            .expect("the profile table")
-            .iter()
-            .map(|(key, _)| key)
-            .collect();
-        assert_eq!(
-            keys, PROFILE_KEY_ORDER,
-            "the fixture must cover the canonical list exactly, in order"
-        );
-    }
-
-    /// A scrambled profile comes back in [`PROFILE_KEY_ORDER`], with its annotations intact.
-    ///
-    /// The comments are the point, not decoration. Sorting moves whole entries, and `toml_edit`
-    /// hangs a whole-line comment off the *following* key's `leaf_decor` and a trailing one off the
-    /// value - so if either were held somewhere else, sorting would silently re-attach a user's
-    /// explanation to a different setting. That is a worse failure than the disorder it fixes,
-    /// because the file still parses and still reads as if it meant something.
-    #[test]
-    fn sorting_a_profile_orders_its_keys_and_carries_the_comments_with_them() {
-        let mut document: toml_edit::DocumentMut = concat!(
-            "[providers.work]\n",
-            "redact_thinking = false\n",
-            "\n",
-            "# the window this model really has\n",
-            "context_window = 200000\n",
-            "model = \"claude-opus-5\" # pinned deliberately\n",
-            "type = \"claude-subscription\"\n",
-        )
-        .parse()
-        .expect("parse");
-
-        let profile = document
-            .get_mut("providers")
-            .and_then(|providers| providers.get_mut("work"))
-            .expect("the profile table");
-        sort_profile_keys(profile);
-
-        let rendered = document.to_string();
-        let keys: Vec<&str> = rendered
-            .lines()
-            .filter_map(|line| line.split_once(" = "))
-            .map(|(key, _)| key.trim())
-            .collect();
-        assert_eq!(
-            keys,
-            ["type", "model", "context_window", "redact_thinking"],
-            "keys should follow PROFILE_KEY_ORDER: {rendered}"
-        );
-        assert!(
-            rendered.contains("# the window this model really has\ncontext_window = 200000"),
-            "the comment should still sit above the key it explains: {rendered}"
-        );
-        assert!(
-            rendered.contains("model = \"claude-opus-5\" # pinned deliberately"),
-            "a trailing comment should still sit beside its value: {rendered}"
-        );
-    }
-
-    /// A key this build does not model sorts last rather than wherever the sort left it.
-    ///
-    /// `deny_unknown_fields` means it cannot survive a load, so this pins what an unreachable case
-    /// looks like. Worth pinning anyway: the alternative is a write whose output depends on the
-    /// sort's internals, which is the kind of thing that produces a diff on a file nobody edited.
-    #[test]
-    fn an_unmodelled_profile_key_sorts_last() {
-        let mut document: toml_edit::DocumentMut =
-            "[providers.work]\nzzz_future = 1\nmodel = \"m\"\naaa_future = 2\ntype = \"t\"\n"
-                .parse()
-                .expect("parse");
-        let profile = document
-            .get_mut("providers")
-            .and_then(|providers| providers.get_mut("work"))
-            .expect("the profile table");
-        sort_profile_keys(profile);
-
-        let rendered = document.to_string();
-        let keys: Vec<&str> = rendered
-            .lines()
-            .filter_map(|line| line.split_once(" = "))
-            .map(|(key, _)| key.trim())
-            .collect();
-        assert_eq!(
-            keys,
-            ["type", "model", "aaa_future", "zzz_future"],
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    fn test_persist_device_id_writes_into_profile_table() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "default_provider = \"work\"\n\n[providers.work]\ntype = \"claude-subscription\"\nmodel = \"claude-opus-4-8\"\n",
-        )
-        .expect("seed config");
-
-        device_id::persist(&path, "work", "abc123").expect("persist");
-
-        let contents = std::fs::read_to_string(&path).expect("read back");
-        let config: ConfigFile = toml::from_str(&contents).expect("re-parse");
-        let persisted = config
-            .providers
-            .get("work")
-            .and_then(|profile| profile.device_id.as_deref());
-        assert_eq!(
-            persisted,
-            Some("abc123"),
-            "device_id must be stored under the active profile"
-        );
-        // Existing profile fields are preserved.
-        assert_eq!(
-            config.providers.get("work").map(|p| p.backend.as_str()),
-            Some("claude-subscription")
-        );
-        // Closing the loop: the reader feeds the persisted value back through `resolve`, which must
-        // return it verbatim rather than regenerate a fresh id on the next run.
-        assert_eq!(
-            device_id::resolve(Some("claude-subscription"), Some("work"), persisted),
-            "abc123",
-            "a persisted device_id must be picked up on the next run, not regenerated"
-        );
-    }
-
-    #[test]
-    fn test_read_user_id_from_valid_claude_json() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("claude.json");
-        std::fs::write(
-            &path,
-            r#"{"userID": "af5986c7cb3b5e8d00eaf3da3b81730c6f523b1e68e1720c7128a96167534be3", "other": "stuff"}"#,
-        )
-        .expect("write");
-        assert_eq!(
-            device_id::read_user_id_from(&path).as_deref(),
-            Some("af5986c7cb3b5e8d00eaf3da3b81730c6f523b1e68e1720c7128a96167534be3")
-        );
-    }
-
-    #[test]
-    fn test_read_user_id_from_missing_file_returns_none() {
-        let path = std::path::Path::new("/nonexistent/path/claude.json");
-        assert!(device_id::read_user_id_from(path).is_none());
-    }
-
-    #[test]
-    fn test_read_user_id_from_malformed_json_returns_none() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("claude.json");
-        std::fs::write(&path, "{not valid json").expect("write");
-        assert!(device_id::read_user_id_from(&path).is_none());
-    }
-
-    #[test]
-    fn test_read_user_id_from_missing_field_returns_none() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("claude.json");
-        std::fs::write(&path, r#"{"foo": "bar"}"#).expect("write");
-        assert!(device_id::read_user_id_from(&path).is_none());
-    }
-
-    #[test]
-    fn test_read_user_id_from_empty_string_returns_none() {
-        // An empty `userID` in claude.json shouldn't override meka's own random-generation
-        // fallback; treat it as "not configured".
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("claude.json");
-        std::fs::write(&path, r#"{"userID": ""}"#).expect("write");
-        assert!(device_id::read_user_id_from(&path).is_none());
-    }
-
-    #[test]
-    fn test_read_user_id_from_whitespace_only_returns_none() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("claude.json");
-        std::fs::write(&path, r#"{"userID": "   "}"#).expect("write");
-        assert!(device_id::read_user_id_from(&path).is_none());
-    }
-
-    #[test]
-    fn test_read_user_id_from_non_string_returns_none() {
-        // A non-string `userID` (number, object, …) shouldn't crash; just decline to use the
-        // value.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("claude.json");
-        std::fs::write(&path, r#"{"userID": 12345}"#).expect("write");
-        assert!(device_id::read_user_id_from(&path).is_none());
-    }
-
-    #[test]
-    fn test_read_user_id_from_trims_surrounding_whitespace() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("claude.json");
-        std::fs::write(&path, r#"{"userID": "  abcdef123  "}"#).expect("write");
-        assert_eq!(
-            device_id::read_user_id_from(&path).as_deref(),
-            Some("abcdef123")
-        );
-    }
-
-    #[test]
-    fn test_provider_profile_deserializes_effort_and_redact_thinking() {
+    fn provider_profile_deserializes_effort_and_redact_thinking() {
         let toml_str = r#"
-[providers.work]
-type = "claude-subscription"
+[accounts.work]
+backend = "claude-subscription"
+
+[profiles.work]
+account = "work"
 model = "claude-opus-4-6-20250514"
 effort = "medium"
 thinking = "budgeted"
@@ -4708,13 +3537,13 @@ redact_thinking = true
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let profile = config
-            .providers
+            .profiles
             .get("work")
             .expect("profile should be present");
         assert_eq!(profile.effort.as_deref(), Some("medium"));
         assert_eq!(
             profile.thinking,
-            Some(crate::provider::ThinkingMode::Budgeted)
+            Some(crate::config::ThinkingMode::Budgeted)
         );
         assert_eq!(profile.redact_thinking, Some(true));
     }
@@ -4722,21 +3551,23 @@ redact_thinking = true
     #[test]
     fn the_thinking_block_parses_its_keys() {
         let config: ConfigFile =
-            toml::from_str("[thinking]\nbudget_tokens = 10000\nshow_content = true\n")
-                .expect("parse");
+            toml::from_str("[thinking]\nbudget = 10000\nshow_content = true\n").expect("parse");
         let thinking = config.thinking.expect("[thinking] present");
-        assert_eq!(thinking.budget_tokens, Some(10_000));
+        assert_eq!(thinking.budget, Some(10_000));
         assert_eq!(thinking.show_content, Some(true));
     }
 
     #[test]
-    fn test_unknown_config_keys_are_rejected() {
-        // `deny_unknown_fields`: an unrecognised key errors at load instead of silently doing
+    fn unknown_config_keys_are_rejected() {
+        // `deny_unknown_fields`: an unrecognized key errors at load instead of silently doing
         // nothing. An unknown key inside a provider profile (here `reasoning_effort`, which meka
         // does not accept because the provider owns that default).
         let stale_profile = r#"
-[providers.work]
-type = "chatgpt-subscription"
+[accounts.work]
+backend = "chatgpt-subscription"
+
+[profiles.work]
+account = "work"
 model = "gpt-5.6-sol"
 reasoning_effort = "high"
 "#;
@@ -4756,10 +3587,13 @@ reasoning_effort = "high"
     }
 
     #[test]
-    fn test_provider_profile_deserializes_capability_knobs() {
+    fn provider_profile_deserializes_capability_knobs() {
         let toml_str = r#"
-[providers.work]
-type = "openai-chat-completions"
+[accounts.work]
+backend = "openai-chat-completions"
+
+[profiles.work]
+account = "work"
 model = "gpt-5.5"
 context_window = 1000000
 vision = false
@@ -4767,7 +3601,7 @@ max_output_tokens = 64000
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let profile = config
-            .providers
+            .profiles
             .get("work")
             .expect("profile should be present");
         assert_eq!(profile.context_window, Some(1_000_000));
@@ -4776,103 +3610,31 @@ max_output_tokens = 64000
     }
 
     #[test]
-    fn the_budget_invariant_is_checked_only_under_budgeted_thinking() {
-        use crate::provider::ThinkingMode;
-
-        // Budgeted draws the thinking budget out of `max_tokens`, so a cap at or below it can only
-        // produce a 400. Catch it at config load, where the message can say what to change.
-        //
-        // Both Anthropic Messages backends, because the invariant belongs to the protocol rather
-        // than to the account: dropping either from the gate is invisible until a real request is
-        // rejected mid-turn, which is exactly what this check exists to pre-empt.
-        for backend in ["claude-subscription", "anthropic-messages"] {
-            let result = validate_max_output_tokens(
-                "work",
-                Some(backend),
-                Some(5_000),
-                ThinkingMode::Budgeted,
-                10_000,
-            );
-            assert!(result.is_err(), "{backend}");
-            assert!(
-                result.unwrap_err().to_string().contains("thinking budget"),
-                "{backend}: the error must name the budget it conflicts with"
-            );
-        }
-        assert!(
-            validate_max_output_tokens(
-                "work",
-                Some("claude-subscription"),
-                Some(20_000),
-                ThinkingMode::Budgeted,
-                10_000
-            )
-            .is_ok()
-        );
-
-        // The other two modes send no `budget_tokens` at all, so the same cap is fine. Reading the
-        // mode rather than guessing it from the model name is the point: a budget-free request is
-        // no longer inferred, it is stated.
-        for mode in [ThinkingMode::Adaptive, ThinkingMode::Off] {
-            assert!(
-                validate_max_output_tokens(
-                    "work",
-                    Some("claude-subscription"),
-                    Some(5_000),
-                    mode,
-                    10_000
-                )
-                .is_ok(),
-                "{mode:?}"
-            );
-        }
-        // Non-Claude backends have no such constraint either, whatever the mode.
-        assert!(
-            validate_max_output_tokens(
-                "work",
-                Some("openai-chat-completions"),
-                Some(100),
-                ThinkingMode::Budgeted,
-                10_000
-            )
-            .is_ok()
-        );
-        // No override at all.
-        assert!(
-            validate_max_output_tokens(
-                "work",
-                Some("anthropic-messages"),
-                None,
-                ThinkingMode::Budgeted,
-                10_000
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_provider_profile_capability_knobs_default_to_none() {
+    fn provider_profile_capability_knobs_default_to_none() {
         let toml_str = r#"
-[providers.work]
-type = "openai-chat-completions"
+[accounts.work]
+backend = "openai-chat-completions"
+
+[profiles.work]
+account = "work"
 model = "gpt-5.5"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
-        let profile = config.providers.get("work").expect("profile present");
+        let profile = config.profiles.get("work").expect("profile present");
         assert_eq!(profile.context_window, None);
         assert_eq!(profile.vision, None);
         assert_eq!(profile.max_output_tokens, None);
     }
 
     /// Deserialization only: `required` reaches the per-server config, and an omitted one stays
-    /// `None` so resolution can seed it from `strict`. What that resolution then produces is
-    /// covered by `test_strict_seeds_required_and_per_server_wins`.
+    /// `None` so resolution can seed it from `default_required`. What that resolution then
+    /// produces is covered by `default_required_seeds_required_and_per_server_wins`.
     #[test]
-    fn test_mcp_required_deserialization() {
+    fn mcp_required_deserialization() {
         let config: ConfigFile = toml::from_str(
             r#"
 [mcp]
-strict = true
+default_required = true
 
 [[mcp.servers]]
 name = "ida"
@@ -4888,14 +3650,17 @@ url = "http://127.0.0.1:9100/mcp"
         )
         .expect("parse");
         let mcp = config.mcp.expect("mcp table");
-        assert_eq!(mcp.strict, Some(true));
+        assert_eq!(mcp.default_required, Some(true));
         let servers = mcp.servers.expect("servers");
         assert_eq!(servers[0].required, Some(false), "explicit opt-out");
-        assert_eq!(servers[1].required, None, "inherits strict at resolve time");
+        assert_eq!(
+            servers[1].required, None,
+            "inherits default_required at resolve time"
+        );
     }
 
     #[test]
-    fn test_memory_and_skills_config_deserialization() {
+    fn memory_and_skills_config_deserialization() {
         let config: ConfigFile = toml::from_str(
             r#"
 [memory]
@@ -4917,7 +3682,7 @@ enabled = true
     }
 
     #[test]
-    fn test_schedule_config_deserialization() {
+    fn schedule_config_deserialization() {
         let config: ConfigFile = toml::from_str(
             r#"
 [schedule]
@@ -4932,7 +3697,6 @@ max_consecutive_fires = 3
         .expect("failed to parse toml");
         let schedule = ResolvedScheduleConfig::resolve(
             config.schedule,
-            crate::permission::Permission::Unrestricted,
             crate::permission::EnabledPermissions::DEFAULT,
         );
         assert!(schedule.enabled);
@@ -4944,12 +3708,11 @@ max_consecutive_fires = 3
     }
 
     #[test]
-    fn test_schedule_config_defaults_are_filled_when_absent() {
+    fn schedule_config_defaults_are_filled_when_absent() {
         let config: ConfigFile = toml::from_str("").expect("empty config parses");
         assert!(config.schedule.is_none());
         let schedule = ResolvedScheduleConfig::resolve(
             config.schedule,
-            crate::permission::Permission::Unrestricted,
             crate::permission::EnabledPermissions::DEFAULT,
         );
         assert!(schedule.enabled, "scheduling is on unless turned off");
@@ -4957,12 +3720,12 @@ max_consecutive_fires = 3
         assert!(!schedule.gate_timeout.is_zero());
         assert!(schedule.max_jobs > 0);
         // Pinned to the value rather than to non-zero: both doc pages state 5, and drifting either
-        // way is silent -- large disables the interleaving, 1 serialises every session.
+        // way is silent -- large disables the interleaving, 1 serializes every session.
         assert_eq!(schedule.max_consecutive_fires, 5);
     }
 
     #[test]
-    fn test_background_config_deserialization() {
+    fn background_config_deserialization() {
         let config: ConfigFile = toml::from_str(
             "[background]
 enabled = true
@@ -4976,7 +3739,7 @@ max_tasks = 3
     }
 
     #[test]
-    fn test_subagents_config_deserialization() {
+    fn subagents_config_deserialization() {
         let config: ConfigFile = toml::from_str(
             r#"[subagents]
 disabled_servers = ["mekabridge"]
@@ -4992,10 +3755,10 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
         ]);
     }
 
-    /// Absent `[subagents]` denies nothing. What a worker *receives* is not configured at all: it
-    /// is granted per `agent_spawn` call and defaults to nothing.
+    /// Absent `[subagents]` denies nothing. What a sub-agent *receives* is not configured at all:
+    /// it is granted per `agent_spawn` call and defaults to nothing.
     #[test]
-    fn test_subagents_defaults_deny_nothing() {
+    fn subagents_defaults_deny_nothing() {
         let config: ConfigFile = toml::from_str("").expect("empty config parses");
         assert!(config.subagents.is_none());
         let subagents = ResolvedSubagentsConfig::resolve(config.subagents);
@@ -5007,16 +3770,16 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
     /// memory store is context a parent can copy into a prompt regardless. Setting one must be an
     /// error rather than silently ignored.
     #[test]
-    fn test_subagents_has_no_memory_key() {
+    fn subagents_has_no_memory_key() {
         let error = toml::from_str::<ConfigFile>("[subagents]\nmemory = \"none\"\n")
-            .expect_err("an unrecognised key must not be silently ignored");
+            .expect_err("an unrecognized key must not be silently ignored");
         assert!(error.to_string().contains("memory"), "{error}");
     }
 
-    /// Sub-agents can be granted read access but never write: a worker recording what it inferred
-    /// from one narrow task puts it in front of every future turn.
+    /// Sub-agents can be granted read access but never write: a sub-agent recording what it
+    /// inferred from one narrow task puts it in front of every future turn.
     #[test]
-    fn test_memory_grant_parsing_refuses_write() {
+    fn memory_grant_parsing_refuses_write() {
         assert_eq!(MemoryAccess::parse_grant("none"), Ok(MemoryAccess::None));
         assert_eq!(MemoryAccess::parse_grant("  READ "), Ok(MemoryAccess::Read));
         let error = MemoryAccess::parse_grant("write").expect_err("write is not grantable");
@@ -5026,7 +3789,7 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
     }
 
     #[test]
-    fn test_instruction_grant_parsing() {
+    fn instruction_grant_parsing() {
         assert_eq!(
             InstructionAccess::parse_grant("inherit"),
             Ok(InstructionAccess::Inherit)
@@ -5042,7 +3805,7 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
     /// `min` is "the more restrictive of two", which is what clamps a grant against what the
     /// granting agent itself holds.
     #[test]
-    fn test_memory_access_orders_restrictive_first() {
+    fn memory_access_orders_restrictive_first() {
         assert!(MemoryAccess::None < MemoryAccess::Read);
         assert!(MemoryAccess::Read < MemoryAccess::Write);
         assert_eq!(
@@ -5058,7 +3821,7 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
     /// The one capability block that is off unless asked for. See [`BackgroundConfig`] for why it
     /// departs from `[schedule]` / `[skills]` / `[memory]`.
     #[test]
-    fn test_background_is_off_by_default() {
+    fn background_is_off_by_default() {
         let config: ConfigFile = toml::from_str("").expect("empty config parses");
         assert!(config.background.is_none());
         let background = ResolvedBackgroundConfig::resolve(config.background);
@@ -5070,7 +3833,7 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
     }
 
     #[test]
-    fn test_background_config_rejects_unknown_keys() {
+    fn background_config_rejects_unknown_keys() {
         assert!(
             toml::from_str::<ConfigFile>(
                 "[background]
@@ -5082,7 +3845,7 @@ detach = true
     }
 
     #[test]
-    fn test_schedule_config_rejects_unknown_keys() {
+    fn schedule_config_rejects_unknown_keys() {
         assert!(
             toml::from_str::<ConfigFile>(
                 "[schedule]
@@ -5093,10 +3856,11 @@ on_exit = \"make build\"
         );
     }
 
-    /// Absent tables must stay absent rather than deserialising to something opinionated; the
-    /// default-on decision lives in `from_cli`'s `unwrap_or(true)`, not in the parsed shape.
+    /// Absent tables must stay absent rather than deserializing to something opinionated; the
+    /// default-on decision lives in `ResolvedConfig::resolve`'s `unwrap_or(true)`, not in the
+    /// parsed shape.
     #[test]
-    fn test_memory_and_skills_absent_by_default() {
+    fn memory_and_skills_absent_by_default() {
         let config: ConfigFile = toml::from_str("").expect("empty config parses");
         assert!(config.memory.is_none());
         assert!(config.skills.is_none());
@@ -5107,7 +3871,7 @@ on_exit = \"make build\"
     /// Both tables are `deny_unknown_fields`, so a typo is a startup error rather than a setting
     /// that silently does nothing.
     #[test]
-    fn test_memory_and_skills_reject_unknown_keys() {
+    fn memory_and_skills_reject_unknown_keys() {
         assert!(
             toml::from_str::<ConfigFile>(
                 "[memory]
@@ -5127,30 +3891,32 @@ path = \"/tmp\"
     }
 
     #[test]
-    fn test_session_config_deserialization() {
+    fn session_config_deserialization() {
         let toml_str = r#"
 [session]
 context_messages = 100
-retention_days = 90
+retention = "90d"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let session = config.session.expect("session should be present");
         assert_eq!(session.context_messages, Some(100));
-        assert_eq!(session.retention_days, Some(90));
+        assert_eq!(
+            session.retention,
+            Some(std::time::Duration::from_secs(90 * 86_400))
+        );
     }
 
-    /// Builds a `ResolvedConfig` from a real config file, so the resolution steps in `from_cli`
-    /// are exercised rather than re-implemented in the test.
+    /// Builds a `ResolvedConfig` from a real config file, so the resolution steps in
+    /// `ResolvedConfig::resolve` are exercised rather than re-implemented in the test.
     fn resolve_with_config(body: &str) -> ResolvedConfig {
         use clap::Parser;
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config.toml"), body).expect("write config");
-        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serialises every test
-        // that touches it, and the guard is held across the whole set → resolve → clear
-        // cycle.
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serializes every test
+        // that touches it, and the guard is held across the whole set → resolve → clear cycle.
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
-        let resolved = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
+        let resolved = ResolvedConfig::resolve(crate::cli::Cli::parse_from(["meka"]).overrides());
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
         resolved
     }
@@ -5159,7 +3925,7 @@ retention_days = 90
     /// never reaches `ResolvedConfig` leaves the tools correctly gated on a flag that is always
     /// false, and every test on either side still passes.
     #[test]
-    fn test_skills_agent_managed_resolves_from_the_config_file() {
+    fn skills_agent_managed_resolves_from_the_config_file() {
         let resolved = resolve_with_config("");
         assert!(resolved.skills_enabled, "skills default on");
         assert!(
@@ -5180,14 +3946,15 @@ agent_managed = true
         );
     }
 
-    /// `strict` is only a default for `required`; every consumer downstream reads the per-server
-    /// flag, so if this resolution stopped happening `strict = true` would silently stop gating.
+    /// `default_required` is only a default for `required`; every consumer downstream reads the
+    /// per-server flag, so if this resolution stopped happening `default_required = true` would
+    /// silently stop gating.
     #[test]
-    fn test_strict_seeds_required_and_per_server_wins() {
+    fn default_required_seeds_required_and_per_server_wins() {
         let resolved = resolve_with_config(
             r#"
 [mcp]
-strict = true
+default_required = true
 
 [[mcp.servers]]
 name = "gates"
@@ -5209,13 +3976,13 @@ required = false
                 .unwrap_or_else(|| panic!("{n} present"))
                 .required
         };
-        assert_eq!(by_name("gates"), Some(true), "inherits strict");
+        assert_eq!(by_name("gates"), Some(true), "inherits default_required");
         assert_eq!(by_name("optout"), Some(false), "explicit opt-out wins");
     }
 
     /// The default is off: an unavailable server degrades the session instead of stopping it.
     #[test]
-    fn test_servers_are_optional_without_strict() {
+    fn servers_are_optional_without_default_required() {
         let resolved = resolve_with_config(
             r#"
 [[mcp.servers]]
@@ -5225,7 +3992,7 @@ command = "ida-mcp"
 "#,
         );
         assert_eq!(resolved.mcp_servers[0].required, Some(false));
-        assert!(resolved.retention_days.is_none(), "no cleanup by default");
+        assert!(resolved.retention.is_none(), "no cleanup by default");
     }
 
     /// Zero is "delete everything, every startup". Refuse rather than discover it after the fact.
@@ -5233,13 +4000,16 @@ command = "ida-mcp"
     /// assembly path indexes on the assumption that the window is non-empty. Rejecting it at load
     /// is what keeps that from becoming a panic mid-turn; nothing asserted the rejection.
     #[test]
-    fn test_context_messages_zero_is_rejected() {
+    fn context_messages_zero_is_rejected() {
         let resolved = resolve_with_config(
             r#"
-default_provider = "p"
+default_profile = "p"
 
-[providers.p]
-type = "openai-chat-completions"
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
 model = "m"
 
 [session]
@@ -5258,42 +4028,48 @@ context_messages = 0
     }
 
     #[test]
-    fn test_retention_days_zero_is_rejected() {
+    fn a_zero_retention_is_refused() {
         // Needs a usable provider: `validate` reports a missing one first, and rightly so - it
         // blocks the run outright, where retention only bites at the next startup sweep.
         let resolved = resolve_with_config(
             r#"
-default_provider = "p"
+default_profile = "p"
 
-[providers.p]
-type = "openai-chat-completions"
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
 model = "m"
 
 [session]
-retention_days = 0
+retention = "0s"
 "#,
         );
         assert_eq!(
-            resolved.retention_days,
-            Some(0),
+            resolved.retention,
+            Some(std::time::Duration::ZERO),
             "fixture must actually set it"
         );
         let error = resolved
             .validate()
-            .expect_err("retention_days = 0 must not be accepted");
-        assert!(error.to_string().contains("retention_days"), "{error}");
+            .expect_err("retention = \"0s\" must not be accepted");
+        assert!(error.to_string().contains("[session].retention"), "{error}");
     }
 
     /// `tokio::time::interval` panics on a zero period, so without this check a config value takes
     /// the whole process down at scheduler startup rather than merely behaving oddly.
     #[test]
-    fn test_schedule_poll_interval_zero_is_rejected() {
+    fn schedule_poll_interval_zero_is_rejected() {
         let resolved = resolve_with_config(
             r#"
-default_provider = "p"
+default_profile = "p"
 
-[providers.p]
-type = "openai-chat-completions"
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
 model = "m"
 
 [schedule]
@@ -5311,7 +4087,7 @@ poll_interval = "0s"
     }
 
     #[test]
-    fn test_schedule_gate_timeout_and_max_jobs_zero_are_rejected() {
+    fn schedule_gate_timeout_and_max_jobs_zero_are_rejected() {
         for (key, value, needle) in [
             ("gate_timeout", "\"0s\"", "gate_timeout"),
             ("max_jobs", "0", "max_jobs"),
@@ -5319,10 +4095,13 @@ poll_interval = "0s"
         ] {
             let resolved = resolve_with_config(&format!(
                 r#"
-default_provider = "p"
+default_profile = "p"
 
-[providers.p]
-type = "openai-chat-completions"
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
 model = "m"
 
 [schedule]
@@ -5343,14 +4122,17 @@ model = "m"
     /// occurrence to a second host. The session lock stops that becoming a second turn, but only
     /// after the occurrence has been round-tripped and the probe re-run.
     #[test]
-    fn test_schedule_claim_lease_must_outlast_the_gate_budget() {
+    fn schedule_claim_lease_must_outlast_the_gate_budget() {
         for (lease, accepted) in [("\"0s\"", false), ("\"10s\"", false), ("\"90s\"", true)] {
             let resolved = resolve_with_config(&format!(
                 r#"
-default_provider = "p"
+default_profile = "p"
 
-[providers.p]
-type = "openai-chat-completions"
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
 model = "m"
 
 [schedule]
@@ -5380,15 +4162,15 @@ claim_lease = {lease}
     /// meant one mistyped key silently ran the agent with no provider profiles, no MCP servers and
     /// default permissions, off one warn line among the rest of startup.
     #[test]
-    fn test_unparseable_config_is_reported_not_ignored() {
+    fn unparseable_config_is_reported_not_ignored() {
         // `load_config_file` carries the parse failure; `validate` is what turns it into an exit.
         let (file, error) = {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::write(dir.path().join("config.toml"), "[session]\nnot_a_key = 1\n")
                 .expect("write config");
-            // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serialises every
-            // test that touches it, and the guard is held across the whole set → read →
-            // clear cycle.
+            // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serializes every
+            // test that touches it, and the guard is held across the whole set → read → clear
+            // cycle.
             let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
             unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
             let loaded = load_config_file();
@@ -5407,7 +4189,7 @@ claim_lease = {lease}
     /// Without this, deleting the `config_error` arm leaves the whole suite green while meka goes
     /// back to silently running the agent on defaults.
     #[test]
-    fn test_validate_rejects_an_unparseable_config() {
+    fn validate_rejects_an_unparseable_config() {
         let resolved = resolve_with_config("[session]\nnot_a_key = 1\n");
         let error = resolved
             .validate()
@@ -5422,14 +4204,14 @@ claim_lease = {lease}
     /// rejected outright rather than parsed and ignored, which would leave a config that asks for
     /// a size cap looking like it got one.
     #[test]
-    fn test_size_based_cleanup_is_not_configurable() {
+    fn size_based_cleanup_is_not_configurable() {
         let error = toml::from_str::<ConfigFile>("[session]\nmax_storage_bytes = 52428800\n")
             .expect_err("the key must not parse");
         assert!(error.to_string().contains("max_storage_bytes"), "{error}");
     }
 
     #[test]
-    fn test_session_config_partial() {
+    fn session_config_partial() {
         let toml_str = r#"
 [session]
 context_messages = 50
@@ -5437,11 +4219,11 @@ context_messages = 50
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let session = config.session.expect("session should be present");
         assert_eq!(session.context_messages, Some(50));
-        assert!(session.retention_days.is_none());
+        assert!(session.retention.is_none());
     }
 
     #[test]
-    fn test_session_defaults_applied() {
+    fn session_defaults_applied() {
         let file_session = SessionConfig::default();
         let context_messages = file_session.context_messages.or(Some(200));
         let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
@@ -5449,11 +4231,11 @@ context_messages = 50
         assert_eq!(context_messages, Some(200));
         assert_eq!(subagent_max_depth, 3);
         // Retention has no default: unset means keep every session forever.
-        assert!(file_session.retention_days.is_none());
+        assert!(file_session.retention.is_none());
     }
 
     #[test]
-    fn test_mcp_config_deserialization() {
+    fn mcp_config_deserialization() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "postgres"
@@ -5483,25 +4265,25 @@ permission = "workspace"
                     .as_slice()
             )
         );
-        assert_eq!(servers[0].permission.as_deref(), Some("read"));
+        assert_eq!(servers[0].permission, Some(Permission::Read));
         assert_eq!(servers[1].name, "web-api");
         assert_eq!(servers[1].transport, McpTransport::Http);
         assert_eq!(servers[1].url.as_deref(), Some("http://localhost:8080/mcp"));
-        assert_eq!(servers[1].permission.as_deref(), Some("workspace"));
+        assert_eq!(servers[1].permission, Some(Permission::Workspace));
     }
 
     #[test]
-    fn test_mcp_config_empty() {
+    fn mcp_config_empty() {
         let config: ConfigFile = toml::from_str("").expect("failed to parse empty toml");
         assert!(config.mcp.is_none());
     }
 
     #[test]
-    fn test_session_config_overrides_defaults() {
+    fn session_config_overrides_defaults() {
         let toml_str = r#"
 [session]
 context_messages = 50
-retention_days = 30
+retention = "30d"
 subagent_max_depth = 5
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
@@ -5510,12 +4292,15 @@ subagent_max_depth = 5
         let subagent_max_depth = file_session.subagent_max_depth.unwrap_or(3);
 
         assert_eq!(context_messages, Some(50));
-        assert_eq!(file_session.retention_days, Some(30));
+        assert_eq!(
+            file_session.retention,
+            Some(std::time::Duration::from_secs(30 * 86_400))
+        );
         assert_eq!(subagent_max_depth, 5);
     }
 
     #[test]
-    fn test_mcp_auth_client_credentials() {
+    fn mcp_auth_client_credentials() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "api"
@@ -5545,12 +4330,12 @@ resource = "https://api.example.com"
                 );
                 assert_eq!(resource.as_deref(), Some("https://api.example.com"));
             }
-            other => panic!("expected ClientCredentials, got {:?}", other),
+            other => panic!("expected ClientCredentials, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_mcp_auth_client_credentials_jwt() {
+    fn mcp_auth_client_credentials_jwt() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "api"
@@ -5581,12 +4366,12 @@ scopes = ["admin"]
                 assert_eq!(scopes.as_deref(), Some(["admin".to_string()].as_slice()));
                 assert!(resource.is_none());
             }
-            other => panic!("expected ClientCredentialsJwt, got {:?}", other),
+            other => panic!("expected ClientCredentialsJwt, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_mcp_auth_oauth() {
+    fn mcp_auth_oauth() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "github"
@@ -5615,12 +4400,12 @@ redirect_port = 9000
                 );
                 assert_eq!(*redirect_port, Some(9000));
             }
-            other => panic!("expected OAuth, got {:?}", other),
+            other => panic!("expected OAuth, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_mcp_auth_oauth_minimal() {
+    fn mcp_auth_oauth_minimal() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "api"
@@ -5643,12 +4428,12 @@ type = "oauth"
                 assert!(scopes.is_none());
                 assert!(redirect_port.is_none());
             }
-            other => panic!("expected OAuth, got {:?}", other),
+            other => panic!("expected OAuth, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_mcp_no_auth() {
+    fn mcp_no_auth() {
         let toml_str = r#"
 [[mcp.servers]]
 name = "simple"
@@ -5704,7 +4489,7 @@ client_secret = "my-secret"
     }
 
     #[test]
-    fn test_parse_input_style_known_values() {
+    fn parse_input_style_known_values() {
         use nu_ansi_term::{Color, Style};
         assert_eq!(parse_input_style("bold"), Style::new().bold());
         assert_eq!(parse_input_style("BOLD"), Style::new().bold());
@@ -5714,13 +4499,13 @@ client_secret = "my-secret"
     }
 
     #[test]
-    fn test_parse_input_style_none_is_plain() {
+    fn parse_input_style_none_is_plain() {
         use nu_ansi_term::Style;
         assert_eq!(parse_input_style("none"), Style::default());
     }
 
     #[test]
-    fn test_parse_input_style_default_and_empty_yield_preset() {
+    fn parse_input_style_default_and_empty_yield_preset() {
         let preset = default_input_style();
         assert_eq!(parse_input_style(""), preset);
         assert_eq!(parse_input_style("default"), preset);
@@ -5730,27 +4515,27 @@ client_secret = "my-secret"
     }
 
     #[test]
-    fn test_parse_input_style_reverse() {
+    fn parse_input_style_reverse() {
         assert!(parse_input_style("reverse").is_reverse);
     }
 
     #[test]
-    fn test_parse_input_style_unknown_falls_back_to_default() {
+    fn parse_input_style_unknown_falls_back_to_default() {
         // Invalid keywords warn but must not panic; fall back to the same preset used when the key
         // is unset.
         assert_eq!(parse_input_style("superbold"), default_input_style());
     }
 
     #[test]
-    fn test_tools_config_deserialization() {
+    fn tools_config_deserialization() {
         let toml_str = r#"
 [tools]
 allowed_tools = ["read_file", "find_files"]
 disabled_tools = ["search_web"]
 
 [tools.tool_permissions]
-execute_command = "write"
-read_file = "ask"
+execute_command = "workspace"
+read_file = "unrestricted"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let tools = config.tools.expect("tools should be present");
@@ -5762,52 +4547,46 @@ read_file = "ask"
             tools.disabled_tools.as_deref(),
             Some(["search_web".to_string()].as_slice())
         );
-        let perms = tools.tool_permissions.expect("tool_permissions set");
+        let permissions = tools.tool_permissions.expect("tool_permissions set");
         assert_eq!(
-            perms.get("execute_command").map(String::as_str),
-            Some("write")
+            permissions.get("execute_command").copied(),
+            Some(Permission::Workspace)
         );
-        assert_eq!(perms.get("read_file").map(String::as_str), Some("ask"));
+        assert_eq!(
+            permissions.get("read_file").copied(),
+            Some(Permission::Unrestricted)
+        );
     }
 
     #[test]
-    fn test_tools_config_missing_is_none() {
+    fn tools_config_missing_is_none() {
         let config: ConfigFile = toml::from_str("").expect("failed to parse empty toml");
         assert!(config.tools.is_none());
     }
 
+    /// A level meka does not have is refused where the file is parsed, naming the value and the
+    /// levels it has, rather than dropped with a warning that leaves the tool at its built-in
+    /// level.
     #[test]
-    fn test_tools_config_invalid_permission_drops_entry() {
-        // Drive the post-parse filter directly; ResolvedConfig::from_cli runs this loop. Checks
-        // that a bad level string is filtered out without panicking and that valid entries still
-        // land.
-        let raw: HashMap<String, String> = [
-            ("read_file".to_string(), "unrestricted".to_string()),
-            ("write_file".to_string(), "superuser".to_string()),
-            ("find_files".to_string(), "read".to_string()),
-        ]
-        .into_iter()
-        .collect();
-        let parsed: HashMap<String, Permission> = raw
-            .into_iter()
-            .filter_map(|(name, level)| level.parse::<Permission>().ok().map(|p| (name, p)))
-            .collect();
-        assert_eq!(
-            parsed.get("read_file").copied(),
-            Some(Permission::Unrestricted)
-        );
-        assert_eq!(parsed.get("find_files").copied(), Some(Permission::Read));
+    fn a_tool_permission_level_meka_does_not_have_is_refused_at_parse() {
+        let error =
+            toml::from_str::<ConfigFile>("[tools.tool_permissions]\nwrite_file = \"superuser\"\n")
+                .expect_err("superuser is not a level")
+                .to_string();
         assert!(
-            !parsed.contains_key("write_file"),
-            "invalid level 'superuser' must be dropped"
+            error.contains("superuser") && error.contains("unrestricted"),
+            "{error}"
         );
     }
 
     #[test]
-    fn test_session_resume_from_cli() {
+    fn the_resume_selector_follows_the_continue_and_resume_flags() {
         use clap::Parser as _;
 
-        let parse = |args: &[&str]| SessionResume::from_cli(&crate::cli::Cli::parse_from(args));
+        let parse = |args: &[&str]| {
+            let overrides = crate::cli::Cli::parse_from(args).overrides();
+            SessionResume::from_flags(overrides.resume, overrides.continue_last)
+        };
 
         assert_eq!(parse(&["meka"]), None);
         assert_eq!(parse(&["meka", "-c"]), Some(SessionResume::Last));
@@ -5815,14 +4594,14 @@ read_file = "ask"
             parse(&["meka", "-r", "550e8400"]),
             Some(SessionResume::Id("550e8400".to_string())),
         );
-        // A prompt alongside either flag is a prompt, not a session; that ambiguity is exactly what
-        // splitting the old optional-value `-c` removed.
+        // A prompt alongside either flag is a prompt, not a session; that ambiguity is why `-c`
+        // takes no value.
         assert_eq!(
-            parse(&["meka", "-c", "fix the bug"]),
+            parse(&["meka", "-c", "-p", "fix the bug"]),
             Some(SessionResume::Last)
         );
         assert_eq!(
-            parse(&["meka", "-r", "550e8400", "fix the bug"]),
+            parse(&["meka", "-r", "550e8400", "-p", "fix the bug"]),
             Some(SessionResume::Id("550e8400".to_string())),
         );
     }
@@ -5830,13 +4609,13 @@ read_file = "ask"
     /// The conventional path is the tier with no configuration at all, so a regression here is
     /// invisible: instructions simply stop applying and nothing says so.
     #[test]
-    fn test_instructions_resolve_from_the_conventional_file() {
+    fn instructions_resolve_from_the_conventional_file() {
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("instructions.md"), "  from the file  \n")
             .expect("write instructions.md");
 
-        // SAFETY: `CONFIG_DIR_ENV_LOCK` serialises this with every other env-var test.
+        // SAFETY: `CONFIG_DIR_ENV_LOCK` serializes this with every other env-var test.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
         let resolved = resolve_instructions(None);
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
@@ -5852,7 +4631,7 @@ read_file = "ask"
     /// Splitting a grown `instructions.md` into a directory should be a rename, so the directory
     /// has to win rather than the two silently concatenating or the file shadowing it.
     #[test]
-    fn test_instructions_directory_wins_over_the_single_file() {
+    fn instructions_directory_wins_over_the_single_file() {
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("instructions.md"), "single file").expect("write file");
@@ -5875,7 +4654,7 @@ read_file = "ask"
     /// instructions can only arrive as a string. If the env tier ever stopped beating the
     /// conventional file, that wrapper would silently run with the host's instructions instead.
     #[test]
-    fn test_inline_env_beats_the_conventional_file() {
+    fn inline_env_beats_the_conventional_file() {
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("instructions.md"), "FROM THE FILE").expect("write");
@@ -5897,7 +4676,7 @@ read_file = "ask"
     }
 
     #[test]
-    fn test_instructions_file_env_reads_the_named_path() {
+    fn instructions_file_env_reads_the_named_path() {
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("elsewhere.md");
@@ -5917,7 +4696,7 @@ read_file = "ask"
     /// No reading of "both set" means both, so resolving one silently would hide the mistake until
     /// the agent behaved unexpectedly.
     #[test]
-    fn test_both_instruction_env_vars_is_an_error() {
+    fn both_instruction_env_vars_is_an_error() {
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         // SAFETY: guarded above.
         unsafe {
@@ -5936,7 +4715,7 @@ read_file = "ask"
     }
 
     #[test]
-    fn test_flag_beats_every_env_tier_and_trims() {
+    fn flag_beats_every_env_tier_and_trims() {
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
         // SAFETY: guarded above.
         unsafe { std::env::set_var("MEKA_INSTRUCTIONS", "from the env") };
@@ -5951,107 +4730,26 @@ read_file = "ask"
         );
     }
 
-    /// The active profile's window must not become every other profile's fallback.
-    ///
-    /// `session_context_window` is the seed `ProviderRegistry` hands `resolve_profile` for *each*
-    /// profile, so folding the active profile into it here applies that profile twice: a profile
-    /// stating no window inherited the default profile's, which is the exact defect per-profile
-    /// windows exist to prevent. Live-reproducible before the fix as `GET
-    /// /v1/sessions/{id}/context` reporting the default profile's number for a session on another
-    /// profile.
-    ///
-    /// Touches process env, so it serializes against any other env-var test in this file via
-    /// [`CONFIG_DIR_ENV_LOCK`].
-    #[test]
-    fn the_session_window_seed_is_not_the_active_profiles_window() {
-        let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
-        use clap::Parser;
-
-        let resolve_with = |config: &str| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            std::fs::write(dir.path().join("config.toml"), config).expect("write config.toml");
-            // SAFETY: `CONFIG_DIR_ENV_LOCK` serializes this with any other env-var test.
-            unsafe {
-                std::env::set_var("MEKA_CONFIG_DIR", dir.path());
-            }
-            let resolved = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
-            // SAFETY: same as above; the guard is held for the full set→read→clear cycle.
-            unsafe {
-                std::env::remove_var("MEKA_CONFIG_DIR");
-            }
-            resolved
-        };
-
-        let profile_only = resolve_with(
-            r#"
-default_provider = "big"
-
-[providers.big]
-type = "anthropic-messages"
-model = "big-model"
-context_window = 999000
-
-[providers.small]
-type = "anthropic-messages"
-model = "small-model"
-"#,
-        );
-        assert_eq!(
-            profile_only.session_context_window, None,
-            "a profile's own window is not a `[session]` default for the other profiles"
-        );
-        assert_eq!(
-            profile_only
-                .providers
-                .get("small")
-                .map(|profile| resolve_profile(
-                    profile,
-                    profile_only.session_context_window,
-                    profile_only.default_thinking_budget,
-                    String::new(),
-                ))
-                .and_then(|settings| settings.context_window),
-            None,
-            "a profile stating no window resolves to none, so the documented default applies"
-        );
-
-        let with_session_block = resolve_with(
-            r#"
-default_provider = "big"
-
-[session]
-context_window = 200000
-
-[providers.big]
-type = "anthropic-messages"
-model = "big-model"
-context_window = 999000
-"#,
-        );
-        assert_eq!(
-            with_session_block.session_context_window,
-            Some(200_000),
-            "`[session].context_window` is still carried through for profiles that state none"
-        );
-    }
-
     /// Touches process env, so it serializes against any other env-var test in this file via
     /// [`CONFIG_DIR_ENV_LOCK`].
     #[test]
     fn a_profiles_thinking_mode_reaches_the_resolved_config() {
-        // The resolution step, not the parse: `ProviderProfile.thinking` deserializing is separate
-        // from `from_cli` actually consulting it, and dropping the profile arm here is invisible to
-        // every wire-level test - those construct providers directly.
+        // The resolution step, not the parse: `ProfileConfig.thinking` deserializing is separate
+        // from `ResolvedConfig::resolve` actually consulting it, and dropping the profile arm here
+        // is invisible to every wire-level test: those construct providers directly.
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
 
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("config.toml"),
             r#"
-default_provider = "local"
+default_profile = "local"
 
-[providers.local]
-type = "anthropic-messages"
+[accounts.local]
+backend = "anthropic-messages"
+
+[profiles.local]
+account = "local"
 model = "some-local-model"
 thinking = "budgeted"
 "#,
@@ -6063,7 +4761,8 @@ thinking = "budgeted"
             std::env::set_var("MEKA_CONFIG_DIR", dir.path());
         }
         use clap::Parser;
-        let from_profile = ResolvedConfig::from_cli(&crate::cli::Cli::parse_from(["meka"]));
+        let from_profile =
+            ResolvedConfig::resolve(crate::cli::Cli::parse_from(["meka"]).overrides());
         // SAFETY: same as above; the guard is held for the full set→read→clear cycle.
         unsafe {
             std::env::remove_var("MEKA_CONFIG_DIR");
@@ -6071,21 +4770,18 @@ thinking = "budgeted"
 
         assert_eq!(
             from_profile.thinking,
-            crate::provider::ThinkingMode::Budgeted,
+            crate::config::ThinkingMode::Budgeted,
             "the profile's thinking mode is the only thing that decides this now"
         );
     }
 
-    /// End-to-end check that `MEKA_INSTRUCTIONS` reaches `user_instructions` when
-    /// `--instructions` is not on the CLI. Drives the actual `from_cli` path rather than
-    /// `resolve_instructions` directly, to catch a regression where the resolved value never makes
-    /// it onto `ResolvedConfig`.
+    /// `MEKA_INSTRUCTIONS` beats the conventional file when `--instructions` is not given.
     ///
     /// Touches process env, so it serializes against any other env-var test in this file via
     /// [`CONFIG_DIR_ENV_LOCK`].
     #[test]
-    fn test_env_var_overrides_config_file_instructions() {
-        // The module-level lock, not a private one: a function-local static only serialises the
+    fn env_var_overrides_config_file_instructions() {
+        // The module-level lock, not a private one: a function-local static only serializes the
         // test against itself, which let concurrent tests clobber each other's MEKA_CONFIG_DIR.
         let _guard = CONFIG_DIR_ENV_LOCK.blocking_lock();
 
@@ -6099,9 +4795,7 @@ thinking = "budgeted"
             std::env::set_var("MEKA_INSTRUCTIONS", "FROM ENV VAR");
         }
 
-        use clap::Parser;
-        let cli = crate::cli::Cli::parse_from(["meka"]);
-        let resolved = ResolvedConfig::from_cli(&cli);
+        let resolved = resolve_instructions(None).expect("instructions resolve");
 
         // SAFETY: same as above, the `CONFIG_DIR_ENV_LOCK` guard is held for the full
         // set→read→clear cycle.
@@ -6111,26 +4805,27 @@ thinking = "budgeted"
         }
 
         assert_eq!(
-            resolved.user_instructions.as_deref(),
+            resolved.as_ref().map(|found| found.text.as_str()),
             Some("FROM ENV VAR"),
             "MEKA_INSTRUCTIONS should override the conventional instructions file",
         );
     }
 
     #[test]
-    fn test_parse_sandbox_backend_override() {
+    fn the_sandbox_backend_variable_takes_one_spelling_and_ignores_the_rest() {
         assert_eq!(
             parse_sandbox_backend_override("landlock"),
             Some(SandboxBackend::Landlock)
         );
         assert_eq!(
-            parse_sandbox_backend_override("Bubblewrap"),
-            Some(SandboxBackend::Bubblewrap)
+            parse_sandbox_backend_override("  landlock  "),
+            Some(SandboxBackend::Landlock),
+            "value is trimmed"
         );
         assert_eq!(
-            parse_sandbox_backend_override("  LANDLOCK  "),
-            Some(SandboxBackend::Landlock),
-            "value is trimmed and case-insensitive"
+            parse_sandbox_backend_override("Bubblewrap"),
+            None,
+            "one spelling per backend: a case variant is ignored, not folded"
         );
         assert_eq!(parse_sandbox_backend_override(""), None);
         assert_eq!(
@@ -6141,55 +4836,80 @@ thinking = "budgeted"
     }
 
     #[test]
-    fn test_sandbox_backend_from_str() {
+    fn sandbox_backend_from_str() {
         assert_eq!(
             "landlock".parse::<SandboxBackend>(),
             Ok(SandboxBackend::Landlock)
         );
         assert_eq!(
-            "Bubblewrap".parse::<SandboxBackend>(),
+            "bubblewrap".parse::<SandboxBackend>(),
             Ok(SandboxBackend::Bubblewrap)
         );
-        assert_eq!(
-            "  LANDLOCK  ".parse::<SandboxBackend>(),
-            Ok(SandboxBackend::Landlock),
-            "trimmed and case-insensitive"
+        assert!(
+            "Bubblewrap".parse::<SandboxBackend>().is_err(),
+            "one spelling per backend"
         );
         // Unlike the env path, the CLI parse surfaces an error for a bad value.
         assert!("bogus".parse::<SandboxBackend>().is_err());
     }
 
+    /// Every value enum with a wire spelling follows `Backend`: `name()` round-trips through
+    /// `FromStr` and `Display`, and a case variant is refused rather than folded, so the flag, the
+    /// variable and the file cannot each accept a different form of the same value.
     #[test]
-    fn test_write_file_atomic_writes_content_and_no_tmp_left() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("sub").join("config.toml");
-        write_file_atomic(&path, "[x]\nk = 1\n").expect("atomic write");
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read back"),
-            "[x]\nk = 1\n"
+    fn every_value_enum_has_one_spelling_and_refuses_the_rest() {
+        fn check<T>(all: &[T], name: fn(T) -> &'static str)
+        where
+            T: Copy + PartialEq + std::fmt::Debug + std::fmt::Display + std::str::FromStr,
+            T::Err: std::fmt::Debug,
+        {
+            for value in all.iter().copied() {
+                assert_eq!(name(value).parse::<T>().ok(), Some(value));
+                assert_eq!(value.to_string(), name(value));
+                assert!(
+                    name(value).to_uppercase().parse::<T>().is_err(),
+                    "{} must be the only spelling of {value:?}",
+                    name(value)
+                );
+            }
+            assert!("nonsense".parse::<T>().is_err());
+        }
+        check(&RenderMode::ALL, RenderMode::name);
+        check(&ThinkingMode::ALL, ThinkingMode::name);
+        check(&McpTransport::ALL, McpTransport::name);
+        check(&OutputFormat::ALL, OutputFormat::name);
+        check(
+            &crate::cli::SessionExportFormat::ALL,
+            crate::cli::SessionExportFormat::name,
         );
-        // The temporary file must not be left behind after a successful write.
-        let tmp = dir.path().join("sub").join("config.toml.tmp");
-        assert!(!tmp.exists(), "temp file should not remain: {:?}", tmp);
-    }
-
-    #[test]
-    fn test_write_file_atomic_overwrites_existing() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "old contents that are LONGER than the new ones").expect("seed file");
-        write_file_atomic(&path, "new\n").expect("atomic overwrite");
-        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "new\n");
+        check(
+            &crate::store::background::TaskStatus::ALL,
+            crate::store::background::TaskStatus::name,
+        );
+        // The sandbox backend displays its brand case for prose; the wire spelling still
+        // round-trips and nothing else is taken.
+        for backend in SandboxBackend::ALL {
+            assert_eq!(backend.name().parse::<SandboxBackend>(), Ok(backend));
+            assert!(backend.display_name().parse::<SandboxBackend>().is_err());
+            assert_eq!(backend.to_string(), backend.display_name());
+        }
+        // A retired spelling of a render mode is refused everywhere, including the variable.
+        assert!("rich".parse::<RenderMode>().is_err());
+        assert_eq!(parse_render_mode_override("rich"), None);
+        assert_eq!(parse_render_mode_override(" raw "), Some(RenderMode::Raw));
+        assert_eq!(parse_render_mode_override(""), None);
+        assert!(toml::from_str::<DisplayConfig>("render_mode = \"Raw\"").is_err());
+        assert!(toml::from_str::<McpServerConfig>("name = \"s\"\ntransport = \"HTTP\"").is_err());
     }
 
     /// `write_file_atomic` makes each *write* atomic, which does nothing for a lost update: two
     /// editors that each read, mutate and write back will silently discard whichever finished
     /// first. The lock is what makes the read and the write one critical section.
     #[tokio::test]
-    async fn the_config_lock_serialises_a_read_modify_write() {
+    async fn the_config_lock_serializes_a_read_modify_write() {
         let _env = CONFIG_DIR_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serialises every test that
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serializes every test that
         // touches it and is held across the whole set → use → clear cycle.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
 
@@ -6238,7 +4958,7 @@ thinking = "budgeted"
     async fn the_config_lock_can_be_taken_again_by_the_thread_already_holding_it() {
         let _env = CONFIG_DIR_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serialises every test that
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serializes every test that
         // touches it and is held across the whole set -> use -> clear cycle.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
 
@@ -6268,7 +4988,7 @@ thinking = "budgeted"
     async fn taking_the_config_lock_adds_nothing_to_the_config_directory() {
         let _env = CONFIG_DIR_ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serialises every test that
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; the guard above serializes every test that
         // touches it and is held across the whole set -> use -> clear cycle.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
 
@@ -6318,441 +5038,152 @@ thinking = "budgeted"
         );
     }
 
-    /// A waiter must end up on whatever the path names when it wakes, not on what it queued on.
-    ///
-    /// Replacing the target while a waiter is blocked on it leaves that waiter holding an unlinked
-    /// inode, free for the next arrival to lock the live one and enter alongside it. The identity
-    /// re-check in [`lock_path`] is what closes that window.
-    ///
-    /// Pinned from the outside: while the woken waiter holds the lock, a third acquisition must
-    /// block. It does not if the waiter is holding the dead inode. The waiter also has to have
-    /// *waited*, or it reached `open` after the rename and never took the retake path at all.
-    #[test]
-    fn a_waiter_ends_up_holding_whatever_replaced_what_it_waited_for() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
-
-        fn open(path: &Path) -> std::io::Result<std::fs::File> {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(path)
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("target");
-        std::fs::write(&path, b"first").expect("seed");
-
-        let first = lock_path(&path, open).expect("first");
-
-        // Queues on the inode that is about to be replaced.
-        let waiter_holds = Arc::new(AtomicBool::new(false));
-        let waiter_may_release = Arc::new(AtomicBool::new(false));
-        let waiter = std::thread::spawn({
-            let (path, holds, may_release) = (
-                path.clone(),
-                waiter_holds.clone(),
-                waiter_may_release.clone(),
-            );
-            move || {
-                let queued_at = std::time::Instant::now();
-                let held = lock_path(&path, open).expect("waiter");
-                let waited = queued_at.elapsed();
-                holds.store(true, Ordering::SeqCst);
-                while !may_release.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                drop(held);
-                waited
-            }
-        });
-
-        // Let it block, then publish a new inode over the one it is waiting on and release.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let replacement = dir.path().join("replacement");
-        std::fs::write(&replacement, b"second").expect("replacement");
-        std::fs::rename(&replacement, &path).expect("publish a new inode");
-        drop(first);
-
-        while !waiter_holds.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        // The waiter now holds what it believes is the lock. Prove it is the live one.
-        let contender = std::thread::spawn({
-            let path = path.clone();
-            move || drop(lock_path(&path, open).expect("contender"))
-        });
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        let contender_got_in = contender.is_finished();
-
-        waiter_may_release.store(true, Ordering::SeqCst);
-        let waited = waiter.join().expect("waiter");
-        contender.join().expect("contender");
-
-        // Without this the test can pass for the wrong reason: a waiter slow enough to reach `open`
-        // after the rename locks the live inode first time and never exercises the retake at all.
-        assert!(
-            waited >= std::time::Duration::from_millis(100),
-            "the waiter took {waited:?}, so it never queued on the inode that was replaced"
-        );
-        assert!(
-            !contender_got_in,
-            "a third acquisition took the lock while the waiter held it, so the waiter is holding \
-             an inode that is no longer at the path"
-        );
-    }
-
-    /// Concurrent writers of one path must not splice their contents together.
-    ///
-    /// A fixed `<file>.tmp` is shared by every writer: both `open(O_TRUNC)` the same inode, both
-    /// write from offset zero, and whoever renames last publishes a mixture of the two as a
-    /// success. Reproduced before the fix at 4 MiB against 64 KiB; the sizes here are the same
-    /// shape, small enough to stay quick.
-    #[test]
-    fn write_file_atomic_never_publishes_two_writers_spliced_together() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("contended.txt");
-        let long = "A".repeat(512 * 1024);
-        let short = "B".repeat(4 * 1024);
-
-        for _ in 0..40 {
-            std::thread::scope(|scope| {
-                for content in [&long, &short] {
-                    let path = &path;
-                    scope.spawn(move || {
-                        write_file_atomic(path, content).expect("write");
-                    });
-                }
-            });
-            let published = std::fs::read_to_string(&path).expect("read back");
-            assert!(
-                published == long || published == short,
-                "published a splice: {} bytes, {} A and {} B",
-                published.len(),
-                published.matches('A').count(),
-                published.matches('B').count(),
-            );
-        }
-        // And no temp files are left behind by a run that succeeded.
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
-    }
-
-    /// An existing file's mode is preserved, but never left looser than 0600.
-    ///
-    /// Two failures meet here. Handing the target the temp's fresh 0600 unconditionally re-modes a
-    /// file meka did not create. Carrying the old mode across verbatim is worse: it left a
-    /// hand-written `Authorization` header in a world-readable `config.toml` after any ordinary
-    /// `meka mcp` edit, because the write follows a dotfile manager's symlink out of meka's 0700
-    /// directory and the group and other bits came with it. Narrowing keeps a deliberately tighter
-    /// mode and refuses a looser one.
-    #[cfg(unix)]
-    #[test]
-    fn write_file_atomic_never_leaves_a_rewritten_file_looser_than_0600() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        for (seeded, expected) in [
-            (0o644, 0o600),
-            (0o400, 0o400),
-            (0o600, 0o600),
-            (0o660, 0o600),
-        ] {
-            let path = dir.path().join(format!("f{seeded:o}.toml"));
-            std::fs::write(&path, "old\n").expect("seed");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(seeded))
-                .expect("chmod");
-
-            write_file_atomic(&path, "new\n").expect("rewrite");
-
-            assert_eq!(
-                std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
-                expected,
-                "seeded {seeded:o}"
-            );
-            assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
-        }
-
-        // A file meka creates still gets the restrictive mode.
-        let fresh = dir.path().join("fresh.toml");
-        write_file_atomic(&fresh, "new\n").expect("create");
-        assert_eq!(
-            std::fs::metadata(&fresh)
-                .expect("stat")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-
-    /// Following a link out of meka's tree must not re-mode the directory it lands in.
-    ///
-    /// One `meka mcp disable` against a `config.toml` symlinked into `~/dotfiles` set that whole
-    /// directory to 0700, hiding every unrelated file in it. Observed.
-    #[cfg(unix)]
-    #[test]
-    fn write_file_atomic_does_not_tighten_a_directory_it_was_redirected_into() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dotfiles = dir.path().join("dotfiles");
-        std::fs::create_dir_all(&dotfiles).expect("dotfiles");
-        std::fs::set_permissions(&dotfiles, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let target = dotfiles.join("config.toml");
-        std::fs::write(&target, "old\n").expect("seed");
-        let link = dir.path().join("config.toml");
-        std::os::unix::fs::symlink(&target, &link).expect("symlink");
-
-        write_file_atomic(&link, "new\n").expect("write through the link");
-
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("read"),
-            "new\n",
-            "the write must still land on the target"
-        );
-        assert_eq!(
-            std::fs::metadata(&dotfiles)
-                .expect("stat")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755,
-            "a directory meka was redirected into is not one it owns"
-        );
-    }
-
-    // Unix-only: the body calls `std::os::unix::fs::symlink`, so without this the file does not
-    // compile on Windows at all -- taking out the `lint` and `test` jobs that CI now runs on the
-    // three-OS matrix, which is exactly the platform-only break that matrix was added to catch and
-    // which cannot be reproduced from a Linux workstation.
-    #[cfg(unix)]
-    #[test]
-    fn write_file_atomic_writes_through_a_symlink_instead_of_replacing_it() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("tracked.toml");
-        let link = dir.path().join("config.toml");
-        std::fs::write(&target, "old\n").expect("seed target");
-        std::os::unix::fs::symlink(&target, &link).expect("symlink");
-
-        write_file_atomic(&link, "new\n").expect("atomic write through link");
-
-        assert!(
-            std::fs::symlink_metadata(&link)
-                .expect("stat link")
-                .file_type()
-                .is_symlink(),
-            "the link itself must survive the write"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("read target"),
-            "new\n",
-            "the tracked file is what should have changed"
-        );
-    }
-
-    /// A chain still resolves to the real file, and a cycle must not spin.
-    #[cfg(unix)]
-    #[test]
-    fn write_file_atomic_follows_a_symlink_chain_and_survives_a_cycle() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("real.toml");
-        let middle = dir.path().join("middle.toml");
-        let entry = dir.path().join("entry.toml");
-        std::fs::write(&target, "old\n").expect("seed");
-        std::os::unix::fs::symlink(&target, &middle).expect("link 1");
-        std::os::unix::fs::symlink(&middle, &entry).expect("link 2");
-
-        write_file_atomic(&entry, "new\n").expect("write through chain");
-        assert_eq!(std::fs::read_to_string(&target).expect("read"), "new\n");
-
-        // `a -> b -> a`: resolution gives up and the call still returns rather than hanging.
-        let loop_a = dir.path().join("a.toml");
-        let loop_b = dir.path().join("b.toml");
-        std::os::unix::fs::symlink(&loop_b, &loop_a).expect("cycle a");
-        std::os::unix::fs::symlink(&loop_a, &loop_b).expect("cycle b");
-        let _ = write_file_atomic(&loop_a, "whatever\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_write_file_atomic_sets_unix_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let parent = dir.path().join("meka");
-        let path = parent.join("config.toml");
-        write_file_atomic(&path, "x = 1\n").expect("atomic write");
-
-        let file_mode = std::fs::metadata(&path)
-            .expect("stat file")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            file_mode, 0o600,
-            "config file should be 0600, got {:o}",
-            file_mode
-        );
-
-        let dir_mode = std::fs::metadata(&parent)
-            .expect("stat dir")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            dir_mode, 0o700,
-            "config dir should be 0700, got {:o}",
-            dir_mode
-        );
-    }
-
-    fn enabled_set(modes: &[Permission]) -> EnabledPermissions {
-        EnabledPermissions::from_modes(modes.iter().copied()).unwrap()
-    }
-
-    fn enabled_strings(modes: &[&str]) -> Vec<String> {
-        modes.iter().map(|s| s.to_string()).collect()
+    fn enabled_set(levels: &[Permission]) -> EnabledPermissions {
+        EnabledPermissions::from_levels(levels.iter().copied()).unwrap()
     }
 
     #[test]
-    fn test_resolve_permission_no_config() {
-        let (perm, enabled, _requested) = resolve_permission(None, None, None, None);
-        assert_eq!(perm, Permission::Read);
+    fn resolve_permission_no_config() {
+        let (permission, enabled, _requested) = resolve_permission(None, None, None, None);
+        assert_eq!(permission, Permission::Read);
         assert_eq!(enabled, EnabledPermissions::DEFAULT);
     }
 
     #[test]
-    fn test_resolve_permission_explicit_enabled_all() {
-        let list = enabled_strings(&["none", "read", "workspace", "ask", "unrestricted"]);
-        let (_perm, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
-        assert!(enabled.is_enabled(Permission::Ask));
-        assert_eq!(enabled.iter().count(), 5);
+    fn resolve_permission_explicit_enabled_all() {
+        let list = [
+            Permission::None,
+            Permission::Read,
+            Permission::Workspace,
+            Permission::Unrestricted,
+        ];
+        let (_permission, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
+        assert!(enabled.is_enabled(Permission::Workspace));
+        assert_eq!(enabled.iter().count(), 4);
     }
 
+    /// A level meka does not have is refused where the file is parsed, with its line, the way an
+    /// unknown key is: `ask` above all, which the migration script rewrites, rather than dropped
+    /// with a warning and replaced by `read`.
     #[test]
-    fn test_resolve_permission_invalid_entry_warns_and_drops() {
-        let list = enabled_strings(&["read", "lol", "unrestricted"]);
-        let (perm, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
-        assert_eq!(
-            enabled,
-            enabled_set(&[Permission::Read, Permission::Unrestricted])
+    fn a_permission_level_meka_does_not_have_is_refused_at_parse() {
+        let error = toml::from_str::<ConfigFile>("[permissions]\ndefault = \"ask\"\n")
+            .expect_err("ask is not a level")
+            .to_string();
+        assert!(
+            error.contains("ask") && error.contains("unrestricted"),
+            "names the value and the levels meka has: {error}"
         );
-        assert_eq!(perm, Permission::Read);
+        let error = toml::from_str::<ConfigFile>("[permissions]\nenabled = [\"read\", \"lol\"]\n")
+            .expect_err("lol is not a level")
+            .to_string();
+        assert!(error.contains("lol"), "{error}");
     }
 
-    /// A list that yields nothing must not resolve to a set *wider* than the one written.
+    /// An empty list must not resolve to a set *wider* than the one written.
     ///
-    /// `EnabledPermissions::DEFAULT` was the old answer for both of these, and it holds four modes
-    /// including `unrestricted`. So `enabled = []`, which asks for nothing, and `enabled =
-    /// ["write"]`, which asks for exactly one now-retired mode, each came back with the full ladder
-    /// reachable by Shift+Tab. The fallback has to move down the ladder, never up.
+    /// `EnabledPermissions::DEFAULT` holds four levels including `unrestricted`, so falling back to
+    /// it would answer `enabled = []`, which asks for nothing, with the full ladder reachable by
+    /// Shift+Tab. The fallback has to move down the ladder, never up.
     #[test]
-    fn an_enabled_list_that_yields_nothing_falls_back_to_read_alone() {
-        for list in [enabled_strings(&[]), enabled_strings(&["write"])] {
-            let (perm, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
-            assert_eq!(enabled, enabled_set(&[Permission::Read]), "for {list:?}");
-            assert!(
-                !enabled.is_enabled(Permission::Unrestricted),
-                "a failed parse must not enable a mode the user did not write: {list:?}"
-            );
-            assert_eq!(perm, Permission::Read);
-        }
+    fn an_empty_enabled_list_falls_back_to_read_alone() {
+        let list: [Permission; 0] = [];
+        let (permission, enabled, _requested) = resolve_permission(None, None, None, Some(&list));
+        assert_eq!(enabled, enabled_set(&[Permission::Read]));
+        assert!(
+            !enabled.is_enabled(Permission::Unrestricted),
+            "an empty list must not enable a level the user did not write"
+        );
+        assert_eq!(permission, Permission::Read);
     }
 
     #[test]
-    fn test_resolve_permission_default_not_in_enabled_clamps() {
-        let list = enabled_strings(&["read", "write"]);
-        let (perm, _enabled, _requested) = resolve_permission(None, None, Some("ask"), Some(&list));
-        // `ask` is filtered out → fall back to Read because it's enabled.
-        assert_eq!(perm, Permission::Read);
+    fn resolve_permission_default_not_in_enabled_clamps() {
+        let list = [Permission::Read];
+        let (permission, _enabled, _requested) =
+            resolve_permission(None, None, Some(Permission::Unrestricted), Some(&list));
+        // `unrestricted` is not enabled → fall back to Read because it is.
+        assert_eq!(permission, Permission::Read);
     }
 
     #[test]
-    fn test_resolve_permission_default_not_in_enabled_no_read_falls_to_lowest() {
-        let list = enabled_strings(&["ask", "write"]);
-        let (perm, _enabled, _requested) =
-            resolve_permission(None, None, Some("none"), Some(&list));
-        // none isn't enabled, Read isn't either → lowest enabled is Ask.
-        assert_eq!(perm, Permission::Ask);
+    fn resolve_permission_default_not_in_enabled_no_read_falls_to_lowest() {
+        let list = [Permission::Workspace, Permission::Unrestricted];
+        let (permission, _enabled, _requested) =
+            resolve_permission(None, None, Some(Permission::None), Some(&list));
+        // none isn't enabled, Read isn't either → lowest enabled is Workspace.
+        assert_eq!(permission, Permission::Workspace);
     }
 
     #[test]
-    fn test_resolve_permission_invalid_default_falls_back() {
-        let (perm, _enabled, _requested) = resolve_permission(None, None, Some("weird"), None);
-        assert_eq!(perm, Permission::Read);
+    fn resolve_permission_explicit_default_used() {
+        let (permission, _enabled, _requested) =
+            resolve_permission(None, None, Some(Permission::Unrestricted), None);
+        assert_eq!(permission, Permission::Unrestricted);
     }
 
     #[test]
-    fn test_resolve_permission_explicit_default_used() {
-        let (perm, _enabled, _requested) =
-            resolve_permission(None, None, Some("unrestricted"), None);
-        assert_eq!(perm, Permission::Unrestricted);
-    }
-
-    #[test]
-    fn test_resolve_permission_cli_override_disabled_clamps_to_default() {
-        // `ask` not enabled → CLI request for ask warns and clamps to the configured default
+    fn resolve_permission_cli_override_disabled_clamps_to_default() {
+        // `unrestricted` not enabled → the CLI request warns and clamps to the configured default
         // (Read).
-        let (perm, _enabled, _requested) =
-            resolve_permission(Some(Permission::Ask), None, None, None);
-        assert_eq!(perm, Permission::Read);
+        let list = [Permission::Read];
+        let (permission, _enabled, _requested) =
+            resolve_permission(Some(Permission::Unrestricted), None, None, Some(&list));
+        assert_eq!(permission, Permission::Read);
     }
 
     #[test]
-    fn test_resolve_permission_cli_override_enabled_wins() {
-        let list = enabled_strings(&["none", "read", "workspace", "ask", "unrestricted"]);
-        let (perm, _enabled, _requested) =
-            resolve_permission(Some(Permission::Ask), None, None, Some(&list));
-        assert_eq!(perm, Permission::Ask);
+    fn resolve_permission_cli_override_enabled_wins() {
+        let list = [
+            Permission::None,
+            Permission::Read,
+            Permission::Workspace,
+            Permission::Unrestricted,
+        ];
+        let (permission, _enabled, _requested) =
+            resolve_permission(Some(Permission::Workspace), None, None, Some(&list));
+        assert_eq!(permission, Permission::Workspace);
     }
 
     #[test]
-    fn test_resolve_permission_env_override_used() {
-        let (perm, _enabled, _requested) =
+    fn resolve_permission_env_override_used() {
+        let (permission, _enabled, _requested) =
             resolve_permission(None, Some("unrestricted"), None, None);
-        assert_eq!(perm, Permission::Unrestricted);
+        assert_eq!(permission, Permission::Unrestricted);
     }
 
     #[test]
-    fn test_resolve_permission_env_override_disabled_clamps() {
-        // env asks for ask, but ask isn't in DEFAULT enabled set.
-        let (perm, _enabled, _requested) = resolve_permission(None, Some("ask"), None, None);
-        assert_eq!(perm, Permission::Read);
+    fn resolve_permission_env_override_disabled_clamps() {
+        // env asks for `unrestricted`, which this config does not enable.
+        let list = [Permission::Read];
+        let (permission, _enabled, _requested) =
+            resolve_permission(None, Some("unrestricted"), None, Some(&list));
+        assert_eq!(permission, Permission::Read);
     }
 
     /// The env value has to be one meka still accepts, or this proves nothing: an unparseable
     /// `MEKA_PERMISSION` is dropped before the precedence rule is ever consulted, so the CLI wins
     /// by default rather than by rule, and reversing the precedence leaves the test green.
     #[test]
-    fn test_resolve_permission_cli_beats_env() {
-        let (perm, _enabled, _requested) =
+    fn resolve_permission_cli_beats_env() {
+        let (permission, _enabled, _requested) =
             resolve_permission(Some(Permission::None), Some("unrestricted"), None, None);
-        assert_eq!(perm, Permission::None);
+        assert_eq!(permission, Permission::None);
     }
 
     #[test]
-    fn test_permissions_config_deserialization() {
+    fn permissions_config_deserialization() {
         let toml_str = r#"
 [permissions]
 default = "workspace"
 enabled = ["read", "workspace"]
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("parse toml");
-        let perms = config.permissions.expect("permissions present");
-        assert_eq!(perms.default.as_deref(), Some("workspace"));
+        let permissions = config.permissions.expect("permissions present");
+        assert_eq!(permissions.default, Some(Permission::Workspace));
         assert_eq!(
-            perms.enabled.as_deref(),
-            Some(&[String::from("read"), String::from("workspace")][..])
+            permissions.enabled,
+            Some(vec![Permission::Read, Permission::Workspace])
         );
     }
 
@@ -6760,7 +5191,7 @@ enabled = ["read", "workspace"]
     /// including the obvious abbreviation `"bwrap"`, must be rejected; we don't want alias creep
     /// that would silently desync generated configs from hand-edited ones.
     #[test]
-    fn test_sandbox_backend_deserializes_strict_values() {
+    fn sandbox_backend_deserializes_strict_values() {
         let bubblewrap: ShellConfig =
             toml::from_str(r#"sandbox_backend = "bubblewrap""#).expect("deserialize bubblewrap");
         assert_eq!(bubblewrap.sandbox_backend, Some(SandboxBackend::Bubblewrap));
@@ -6778,7 +5209,7 @@ enabled = ["read", "workspace"]
     /// otherwise.
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_resolve_sandbox_backend_explicit_value_is_binding() {
+    fn resolve_sandbox_backend_explicit_value_is_binding() {
         let (backend, auto_resolved, _probe) =
             resolve_sandbox_backend(Some(SandboxBackend::Landlock));
         assert_eq!(backend, SandboxBackend::Landlock);
@@ -6796,7 +5227,7 @@ enabled = ["read", "workspace"]
     /// came back.
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_resolve_sandbox_backend_auto_resolves_when_unset() {
+    fn resolve_sandbox_backend_auto_resolves_when_unset() {
         let (backend, auto_resolved, _probe) = resolve_sandbox_backend(None);
         assert!(auto_resolved);
         assert!(matches!(
@@ -6812,7 +5243,7 @@ enabled = ["read", "workspace"]
     /// surfaces when only the Linux probe paths are wired up.
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn test_resolve_sandbox_backend_uses_platform_sandbox_on_non_linux() {
+    fn resolve_sandbox_backend_uses_platform_sandbox_on_non_linux() {
         use crate::sandbox::{BackendProbe, SandboxCapability};
 
         // Explicit `Some(...)` is ignored on non-Linux; the field is documented as Linux-only.
@@ -6828,5 +5259,101 @@ enabled = ["read", "workspace"]
             BackendProbe::Ok(_) | BackendProbe::Missing { .. } => {}
             other => panic!("unexpected probe variant on non-Linux: {:?}", other),
         }
+    }
+
+    /// `[display] stream` is the standing preference and `--no-stream` the per-run one; either
+    /// saying no wins.
+    #[test]
+    fn streaming_follows_the_file_and_the_flag() {
+        assert!(streaming_enabled(false, None));
+        assert!(!streaming_enabled(false, Some(false)));
+        assert!(!streaming_enabled(true, Some(true)));
+        assert!(streaming_enabled(false, Some(true)));
+    }
+
+    /// The redacting `Debug` impls exist to keep a secret out of a log; without this, each could be
+    /// deleted and the suite would stay green while `{:?}` started printing secrets again.
+    ///
+    /// `McpAuthConfig` is not among them and needs no redaction: its secret lives in
+    /// `mcp_credentials`, so every field it carries is public configuration.
+    // The serve half needs the resolved token type, which exists only with the feature.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn a_secret_never_reaches_a_debug_rendering() {
+        use crate::host::http::config::{ResolvedServeToken, TokenSource};
+        let mut server = fixture_server("s");
+        server.headers = Some(std::collections::HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer HEADERSECRET".to_string(),
+        )]));
+        server.env = Some(std::collections::HashMap::from([(
+            "API_KEY".to_string(),
+            "ENVSECRET".to_string(),
+        )]));
+        server.auth = Some(McpAuthConfig::ClientCredentials {
+            client_id: "public-client-id".to_string(),
+            scopes: None,
+            resource: None,
+        });
+
+        let rendered = format!("{server:?}");
+        for secret in ["HEADERSECRET", "ENVSECRET"] {
+            assert!(
+                !rendered.contains(secret),
+                "'{secret}' leaked into {rendered}"
+            );
+        }
+        // The names around the secrets are the diagnostic, and must survive.
+        assert!(rendered.contains("Authorization"), "{rendered}");
+        assert!(rendered.contains("API_KEY"), "{rendered}");
+        assert!(rendered.contains("public-client-id"), "{rendered}");
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+
+        let serve_token = ResolvedServeToken {
+            token: "SERVETOKEN".to_string(),
+            description: None,
+            scopes: Default::default(),
+            source: TokenSource::Inline,
+        };
+        let rendered = format!("{serve_token:?}");
+        assert!(!rendered.contains("SERVETOKEN"), "{rendered}");
+
+        // The *raw* config form too, and by the route that actually reaches a log: `ResolvedConfig`
+        // derives `Debug` and owns the whole `[serve]` table, so redacting only the resolved token
+        // left every configured bearer token one `{:?}` away. Asserting on the raw struct alone
+        // would not have caught that; this walks the containment chain.
+        let raw_token = ServeTokenConfig {
+            token: Some("RAWSERVETOKEN".to_string()),
+            token_file: None,
+            description: Some("ci".to_string()),
+            scopes: vec!["sessions:r".to_string()],
+        };
+        let rendered = format!("{raw_token:?}");
+        assert!(!rendered.contains("RAWSERVETOKEN"), "{rendered}");
+        assert!(
+            rendered.contains("ci"),
+            "the label must survive: {rendered}"
+        );
+
+        let serve = ServeConfig {
+            tokens: Some(vec![raw_token]),
+            ..Default::default()
+        };
+        let rendered = format!("{serve:?}");
+        assert!(
+            !rendered.contains("RAWSERVETOKEN"),
+            "a token must not reach a log through the enclosing [serve] table: {rendered}"
+        );
+
+        let webhook = WebhookConfig {
+            url: "https://example/hook".to_string(),
+            secret: Some("WEBHOOKSECRET".to_string()),
+            secret_file: None,
+            events: Vec::new(),
+            timeout: None,
+            max_retries: None,
+        };
+        let rendered = format!("{webhook:?}");
+        assert!(!rendered.contains("WEBHOOKSECRET"), "{rendered}");
     }
 }

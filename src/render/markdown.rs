@@ -227,7 +227,7 @@ impl Builder {
             // text is the honest rendering.
             Event::Html(text) | Event::InlineHtml(text) => self.push_text(&text),
             Event::InlineMath(text) | Event::DisplayMath(text) => self.push_text(&text),
-            Event::FootnoteReference(text) => self.push_text(&format!("[{}]", text)),
+            Event::FootnoteReference(text) => self.push_text(&format!("[{text}]")),
         }
     }
 
@@ -323,7 +323,7 @@ impl Builder {
                         .last()
                         .is_some_and(|last| last.text.trim() == target);
                     if !already_shown && !target.is_empty() {
-                        self.push_text(&format!(" ({})", target));
+                        self.push_text(&format!(" ({target})"));
                     }
                 }
             }
@@ -355,7 +355,7 @@ impl Builder {
                 // number would renumber the model's instructions.
                 self.style = CompositeStyle::Paragraph;
                 let indent = "  ".repeat(depth as usize);
-                self.push_text(&format!("{}{}. ", indent, number));
+                self.push_text(&format!("{indent}{number}. "));
             }
             _ => self.style = CompositeStyle::ListItem(depth),
         }

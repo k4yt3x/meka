@@ -1,18 +1,21 @@
 //! In-memory ledger of resources that have been reported as changed via
 //! `notifications/resources/updated`. The agent can query this via the `mcp_resource_updates_list`
-//! builtin tool to see which resources need refreshing without subscribing again.
+//! builtin tool to see which resources need refreshing without subscribing again. One per
+//! [`McpClientContext`], which is what a notification arrives on.
+//!
+//! [`McpClientContext`]: crate::mcp::McpClientContext
 
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 type Ledger = HashMap<(String /* server */, String /* uri */), u64>;
 
-fn ledger() -> &'static Mutex<Ledger> {
-    static STATE: OnceLock<Mutex<Ledger>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+pub(crate) struct ResourceUpdates {
+    ledger: Mutex<Ledger>,
 }
 
 /// The most entries the ledger will hold. Keyed by `(server, uri)`, so a server that invents a
@@ -21,13 +24,14 @@ fn ledger() -> &'static Mutex<Ledger> {
 /// lifetime is not one the agent can act on resource by resource anyway.
 const MAX_LEDGER_ENTRIES: usize = 10_000;
 
-/// Record that a resource was updated. Stamp is unix seconds.
-pub fn record(server_name: &str, uri: &str) {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Ok(mut state) = ledger().lock() {
+impl ResourceUpdates {
+    /// Record that a resource was updated. Stamp is unix seconds.
+    pub(crate) fn record(&self, server_name: &str, uri: &str) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut state = crate::sync::lock(&self.ledger);
         let key = (server_name.to_string(), uri.to_string());
         // Re-recording a URI already in the ledger is just a restamp and cannot grow it.
         if state.len() >= MAX_LEDGER_ENTRIES && !state.contains_key(&key) {
@@ -40,36 +44,26 @@ pub fn record(server_name: &str, uri: &str) {
             {
                 state.remove(&oldest);
                 tracing::debug!(
-                    "resource update ledger is full at {} entries; evicted {}:{}",
-                    MAX_LEDGER_ENTRIES,
-                    oldest.0,
-                    oldest.1
+                    "resource update ledger is full at {MAX_LEDGER_ENTRIES} entries; evicted {server}:{uri}",
+                    server = oldest.0,
+                    uri = oldest.1
                 );
             }
         }
         state.insert(key, stamp);
     }
-}
 
-/// Snapshot every recorded update. Returned entries are sorted by server name then URI for stable
-/// output.
-pub fn snapshot() -> Vec<(String, String, u64)> {
-    let Ok(state) = ledger().lock() else {
-        return Vec::new();
-    };
-    let mut out: Vec<(String, String, u64)> = state
-        .iter()
-        .map(|((server, uri), stamp)| (server.clone(), uri.clone(), *stamp))
-        .collect();
-    out.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
-    out
-}
-
-/// Drop every entry for a given server, used when the server is disconnected or removed via `meka
-/// mcp remove`.
-pub fn clear_for_server(server_name: &str) {
-    if let Ok(mut state) = ledger().lock() {
-        state.retain(|(name, _), _| name != server_name);
+    /// Snapshot every recorded update. Returned entries are sorted by server name then URI for
+    /// stable output.
+    pub(crate) fn snapshot(&self) -> Vec<(String, String, u64)> {
+        let state = crate::sync::lock(&self.ledger);
+        let mut out: Vec<(String, String, u64)> = state
+            .iter()
+            .map(|((server, uri), stamp)| (server.clone(), uri.clone(), *stamp))
+            .collect();
+        drop(state);
+        out.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
+        out
     }
 }
 
@@ -78,36 +72,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_and_snapshot() {
-        record("srv", "file:///a");
-        let snap = snapshot();
+    fn a_recorded_update_appears_in_the_snapshot() {
+        let updates = ResourceUpdates::default();
+        updates.record("srv", "file:///a");
+        let snap = updates.snapshot();
         assert!(snap.iter().any(|(s, u, _)| s == "srv" && u == "file:///a"));
     }
 
-    #[test]
-    fn clear_removes_matching() {
-        record("srv-clear", "file:///b");
-        clear_for_server("srv-clear");
-        let snap = snapshot();
-        assert!(!snap.iter().any(|(s, ..)| s == "srv-clear"));
-    }
-
-    /// The ledger is a process-lifetime map fed by a *server's* notifications, so an unbounded one
-    /// is memory a remote peer decides the size of. Raising `MAX_LEDGER_ENTRIES` to `usize::MAX`
-    /// left every suite green.
-    ///
-    /// Scoped to its own server name and cleaned up, because the ledger is process-global and the
-    /// suite runs in parallel; the assertion is on the global total, which the cap governs.
+    /// The ledger lives as long as its context and is fed by a *server's* notifications, so an
+    /// unbounded one is memory a remote peer decides the size of. Raising `MAX_LEDGER_ENTRIES` to
+    /// `usize::MAX` left every suite green.
     #[test]
     fn the_ledger_stops_growing_at_its_ceiling() {
+        let updates = ResourceUpdates::default();
         for index in 0..MAX_LEDGER_ENTRIES + 500 {
-            record("srv-flood", &format!("file:///{}", index));
+            updates.record("srv-flood", &format!("file:///{index}"));
         }
-        let total = snapshot().len();
+        let total = updates.snapshot().len();
         assert!(
             total <= MAX_LEDGER_ENTRIES,
             "the ledger grew past its ceiling: {total} > {MAX_LEDGER_ENTRIES}"
         );
-        clear_for_server("srv-flood");
     }
 }

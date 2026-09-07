@@ -11,7 +11,7 @@ use crate::{
 /// Build a [`Command`] for a stdio MCP server, wrapping shell shims in `cmd /c` on Windows so
 /// `npx`, `*.cmd`, and `*.bat` executables can be launched directly as a command string. Unix paths
 /// pass through unchanged.
-pub fn build_stdio_command(command_str: &str, args: &[String]) -> Command {
+pub(crate) fn build_stdio_command(command_str: &str, args: &[String]) -> Command {
     #[cfg(windows)]
     {
         let lower = command_str.to_ascii_lowercase();
@@ -77,13 +77,13 @@ pub(super) fn build_http_transport_config(
                 reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
                     MekaError::McpConnection {
                         server_name: server_name.to_string(),
-                        message: format!("invalid header name '{}': {}", key, error),
+                        message: format!("invalid header name '{key}': {error}"),
                     }
                 })?;
             let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
                 MekaError::McpConnection {
                     server_name: server_name.to_string(),
-                    message: format!("invalid header value for '{}': {}", key, error),
+                    message: format!("invalid header value for '{key}': {error}"),
                 }
             })?;
             header_map.insert(header_name, header_value);
@@ -106,9 +106,9 @@ fn run_headers_helper(
     script: &str,
 ) -> Result<std::collections::HashMap<String, String>> {
     use std::process::Stdio;
-    let err_ctx = |msg: String| MekaError::McpConnection {
+    let connection_error = |message: String| MekaError::McpConnection {
         server_name: server_name.to_string(),
-        message: msg,
+        message,
     };
 
     // Resolve the script path. If it's relative and doesn't exist as-is, try resolving against the
@@ -116,7 +116,7 @@ fn run_headers_helper(
     let script_path = std::path::Path::new(script);
     let resolved: std::path::PathBuf = if script_path.is_absolute() || script_path.exists() {
         script_path.to_path_buf()
-    } else if let Some(config_dir) = crate::config::meka_config_dir() {
+    } else if let Some(config_dir) = crate::paths::meka_config_dir() {
         let candidate = config_dir.join(script);
         if candidate.exists() {
             candidate
@@ -135,10 +135,7 @@ fn run_headers_helper(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
-        err_ctx(format!(
-            "headers_helper '{}' spawn failed: {}",
-            script, error
-        ))
+        connection_error(format!("headers_helper '{script}' spawn failed: {error}"))
     })?;
 
     // Poll for exit with a 15-second budget. std::process::Child doesn't expose a blocking
@@ -149,18 +146,18 @@ fn run_headers_helper(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    return Err(err_ctx(format!(
-                        "headers_helper '{}' timed out after 15s",
-                        script
+                    if let Err(error) = child.kill() {
+                        tracing::debug!("failed to kill the headers helper: {error}");
+                    }
+                    return Err(connection_error(format!(
+                        "headers_helper '{script}' timed out after 15s"
                     )));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
-                return Err(err_ctx(format!(
-                    "headers_helper '{}' wait failed: {}",
-                    script, error
+                return Err(connection_error(format!(
+                    "headers_helper '{script}' wait failed: {error}"
                 )));
             }
         }
@@ -168,19 +165,22 @@ fn run_headers_helper(
 
     // Caps on how much helper output we're willing to buffer. stdout is the header list (rarely
     // more than a few KiB); stderr is surfaced verbatim in the error message so keep it tight.
-    const MAX_HELPER_STDOUT_BYTES: u64 = 64 * 1024;
-    const MAX_HELPER_STDERR_BYTES: u64 = 4 * 1024;
+    const MAX_HELPER_STDOUT_BYTES: u64 = 64 * crate::text::KIB as u64;
+    const MAX_HELPER_STDERR_BYTES: u64 = 4 * crate::text::KIB as u64;
 
     if !status.success() {
-        let mut stderr_buf = Vec::new();
+        let mut stderr_buffer = Vec::new();
         if let Some(stderr) = child.stderr.take() {
             use std::io::Read;
-            let _ = stderr
+            if let Err(error) = stderr
                 .take(MAX_HELPER_STDERR_BYTES)
-                .read_to_end(&mut stderr_buf);
+                .read_to_end(&mut stderr_buffer)
+            {
+                tracing::debug!("failed to read the headers helper's stderr: {error}");
+            }
         }
-        let stderr_text = String::from_utf8_lossy(&stderr_buf);
-        return Err(err_ctx(format!(
+        let stderr_text = String::from_utf8_lossy(&stderr_buffer);
+        return Err(connection_error(format!(
             "headers_helper '{}' exited with status {}: {}",
             script,
             status.code().unwrap_or(-1),
@@ -188,22 +188,21 @@ fn run_headers_helper(
         )));
     }
 
-    let mut stdout_buf = Vec::new();
+    let mut stdout_buffer = Vec::new();
     if let Some(pipe) = child.stdout.take() {
         use std::io::Read;
         pipe.take(MAX_HELPER_STDOUT_BYTES)
-            .read_to_end(&mut stdout_buf)
+            .read_to_end(&mut stdout_buffer)
             .map_err(|error| {
-                err_ctx(format!(
-                    "headers_helper '{}' stdout read failed: {}",
-                    script, error
+                connection_error(format!(
+                    "headers_helper '{script}' stdout read failed: {error}"
                 ))
             })?;
     }
-    let stdout = String::from_utf8_lossy(&stdout_buf);
+    let stdout = String::from_utf8_lossy(&stdout_buffer);
 
     parse_header_lines(&stdout)
-        .map_err(|msg| err_ctx(format!("headers_helper '{}' output: {}", script, msg)))
+        .map_err(|message| connection_error(format!("headers_helper '{script}' output: {message}")))
 }
 
 fn parse_header_lines(
@@ -233,8 +232,7 @@ mod tests {
         // Parsed rather than constructed field-by-field, so a field added to `McpServerConfig`
         // does not silently make this fixture unrepresentative of what a user actually writes.
         let toml = format!(
-            "name = \"{}\"\ntransport = \"http\"\nurl = \"https://api.example.com/mcp\"\n",
-            name
+            "name = \"{name}\"\ntransport = \"http\"\nurl = \"https://api.example.com/mcp\"\n"
         );
         toml::from_str(&toml).expect("the fixture parses")
     }
@@ -327,7 +325,7 @@ mod tests {
     #[test]
     fn parse_header_lines_rejects_missing_separator() {
         let err = parse_header_lines("Valid: ok\nbroken line\n").expect_err("must fail");
-        assert!(err.contains("line 2"), "error should cite line 2: {}", err);
+        assert!(err.contains("line 2"), "error should cite line 2: {err}");
     }
 
     #[test]

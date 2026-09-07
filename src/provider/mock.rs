@@ -2,7 +2,7 @@
 //! integration test can drive a multi-round `Agent::run_turn` (tool-use round → tool-result round →
 //! final text round) without touching the network.
 //!
-//! Activated when `MEKA_MOCK_PROVIDER` is set to `1`, which every surface honours: `meka acp`,
+//! Activated when `MEKA_MOCK_PROVIDER` is set to `1`, which every surface honors: `meka acp`,
 //! `meka serve`, and the CLI entry point behind the REPL and `--oneshot`. That last one is what
 //! lets a test ask what two `meka` processes do to each other's sessions. A second variable,
 //! `MEKA_MOCK_PROVIDER_SCRIPT`, names the file holding the JSON-encoded script (see
@@ -22,10 +22,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    conversation::{ContentBlock, Message, Role},
     error::Result,
     provider::{
-        ContentBlock, Message, Provider, Role, StopReason, StreamEvent, TokenUsage, ToolDefinition,
+        CompletionRequest, Provider, StopReason, StreamEvent, ThinkingOverride, ToolDefinition,
     },
+    stats::TokenUsage,
 };
 
 /// Serialized event used by [`MockProvider`]. Mirrors the runtime [`StreamEvent`] enum but uses
@@ -34,8 +36,8 @@ use crate::{
 /// variants; both delay the mock so a test can act mid-turn, and they differ in whether
 /// cancellation cuts them short.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MockEvent {
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum MockEvent {
     Text {
         text: String,
     },
@@ -60,14 +62,11 @@ pub enum MockEvent {
     /// scripts keep loading.
     ThinkingComplete {
         #[serde(default)]
-        opaque: Option<crate::provider::OpaqueReasoning>,
+        opaque: Option<crate::conversation::OpaqueReasoning>,
     },
     ToolUseStart {
         id: String,
         name: String,
-    },
-    ToolInputDelta {
-        delta: String,
     },
     ToolUseEnd {
         input: serde_json::Value,
@@ -99,7 +98,7 @@ pub enum MockEvent {
     /// `Err(MekaError::RetryableProvider { .. })` immediately, exercising `Agent::run_streaming`'s
     /// retry-with-backoff path. Each retry consumes one more round from the script, so a
     /// `[FailRetryable, ..success events..]` script simulates "first attempt overloaded, retry
-    /// succeeds" — the same shape a real transient 429/529 followed by success takes.
+    /// succeeds", the same shape a real transient 429/529 followed by success takes.
     FailRetryable {
         message: String,
         retry_after_secs: Option<u64>,
@@ -118,6 +117,14 @@ pub enum MockEvent {
     Notice {
         message: String,
     },
+    /// An image-redaction advisory carrying what it removed, which the agent counts against the
+    /// session, and where it sat, which the agent records on the conversation.
+    Redaction {
+        images: u64,
+        bytes: u64,
+        #[serde(default)]
+        positions: Vec<crate::image::RedactedImage>,
+    },
     /// Synthetic *transport* failure: the stream returns `Err(MekaError::StreamError(message))`,
     /// which the agent retries only while nothing user-visible has been emitted. Each attempt
     /// consumes one round.
@@ -125,8 +132,8 @@ pub enum MockEvent {
         message: String,
     },
     /// Synthetic *context-window overflow*. The stream returns `Err(MekaError::ContextOverflow)`,
-    /// which is the one recovery path in `Agent::run_turn` no test could previously reach: the
-    /// emergency compact-and-retry only fires on this error, and nothing could produce it. Each
+    /// which is the one recovery path in `Agent::run_turn` nothing else can drive: the emergency
+    /// compact-and-retry only fires on this error. Each
     /// attempt consumes one round, so `[FailContextOverflow, ..success events..]` is "the request
     /// was too large, the compacted retry fit".
     FailContextOverflow {
@@ -136,7 +143,7 @@ pub enum MockEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MockStopReason {
+pub(crate) enum MockStopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
@@ -161,19 +168,21 @@ impl From<MockStopReason> for StopReason {
 /// after tool results return. The two paths share the one queue, so a script that spawns a
 /// sub-agent (which runs non-streaming) must budget a round for each of the sub-agent's turns.
 #[derive(Debug, Default)]
-pub struct MockProvider {
+pub(crate) struct MockProvider {
     rounds: Mutex<VecDeque<Vec<MockEvent>>>,
     /// Messages handed to each [`Provider::complete`] call, in order.
     ///
-    /// Recorded because some behaviour is only observable in the *request*: whether the checkpoint
+    /// Recorded because some behavior is only observable in the *request*: whether the checkpoint
     /// turn respects `context_messages`, or emits two consecutive user turns. A test that rebuilds
     /// the expected list itself asserts on its own arithmetic and passes even when the production
     /// path is reverted, which is worse than no test at all.
     completions: Mutex<Vec<Vec<Message>>>,
+    /// The thinking override each `complete` call carried, in call order.
+    completion_thinking: Mutex<Vec<ThinkingOverride>>,
     /// What each [`Provider::stream`] call was handed, in order.
     ///
     /// The streaming counterpart to [`Self::completions`], and added for the same reason plus one
-    /// more: some behaviour is only observable in the request and only on the streaming path.
+    /// more: some behavior is only observable in the request and only on the streaming path.
     /// Whether `[session].context_messages` is re-applied on every round of a turn, for instance,
     /// cannot be seen in the response at all, so a test that did not record this had nothing to
     /// assert against and passed with the production path reverted.
@@ -189,10 +198,11 @@ pub struct MockProvider {
 /// whole mock.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
-pub struct StreamRequest {
-    pub system_prompt: String,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolDefinition>,
+pub(crate) struct StreamRequest {
+    pub(crate) system_prompt: String,
+    pub(crate) thinking: ThinkingOverride,
+    pub(crate) messages: Vec<Message>,
+    pub(crate) tools: Vec<ToolDefinition>,
     /// The prompt this request was attributed to, read the way a real provider reads it while
     /// building its billing header.
     ///
@@ -200,29 +210,28 @@ pub struct StreamRequest {
     /// streaming path hands `stream` to `tokio::spawn`, task-locals do not cross a spawn, and
     /// nothing in the response reveals whether the attribution made it. Without this the wrapper
     /// that carries it over can be deleted and every test still passes.
-    pub prompt_id: Option<uuid::Uuid>,
+    pub(crate) prompt_id: Option<uuid::Uuid>,
 }
 
 impl MockProvider {
     /// What each `stream` call was handed so far, in order.
     #[cfg(test)]
-    pub fn streams(&self) -> Vec<StreamRequest> {
-        self.streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+    pub(crate) fn streams(&self) -> Vec<StreamRequest> {
+        crate::sync::lock(&self.streams).clone()
     }
 
     /// The messages behind each `complete` call so far, in order.
     #[cfg(test)]
-    pub fn completions(&self) -> Vec<Vec<Message>> {
-        self.completions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+    pub(crate) fn completion_thinking(&self) -> Vec<ThinkingOverride> {
+        crate::sync::lock(&self.completion_thinking).clone()
     }
 
-    pub fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn completions(&self) -> Vec<Vec<Message>> {
+        crate::sync::lock(&self.completions).clone()
+    }
+
+    pub(crate) fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into()),
             ..Default::default()
@@ -237,25 +246,20 @@ impl Provider for MockProvider {
     /// sets `streaming: false`), as does auto-compaction.
     async fn complete(
         &self,
-        _system_prompt: &str,
-        messages: &[Message],
-        _tools: &[ToolDefinition],
-    ) -> Result<(
-        Message,
-        StopReason,
-        TokenUsage,
-        Vec<crate::provider::Notice>,
-    )> {
-        self.completions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(messages.to_vec());
+        request: CompletionRequest<'_>,
+    ) -> Result<crate::provider::Completion> {
+        let CompletionRequest {
+            system_prompt: _,
+            messages,
+            tools: _,
+            thinking,
+            ..
+        } = request;
+        crate::sync::lock(&self.completion_thinking).push(thinking);
+        crate::sync::lock(&self.completions).push(messages.to_vec());
 
         let events = {
-            let mut rounds = self
-                .rounds
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut rounds = crate::sync::lock(&self.rounds);
             rounds.pop_front().unwrap_or_default()
         };
 
@@ -264,6 +268,7 @@ impl Provider for MockProvider {
         let mut thinking = String::new();
         let mut pending_tool: Option<(String, String)> = None;
         let mut stop_reason = StopReason::EndTurn;
+        let mut notices = Vec::new();
 
         for event in events {
             match event {
@@ -273,8 +278,18 @@ impl Provider for MockProvider {
                 MockEvent::FailStream { message } => {
                     return Err(crate::error::MekaError::StreamError(message));
                 }
-                // No frontend on the non-streaming path, so there is nothing to forward it to.
-                MockEvent::Notice { .. } => {}
+                // No channel on the non-streaming path: advisories ride on the return, as the real
+                // providers' do, and the agent forwards them from there.
+                MockEvent::Notice { message } => {
+                    notices.push(crate::frontend::Notice::info(message))
+                }
+                MockEvent::Redaction {
+                    images,
+                    bytes,
+                    positions,
+                } => {
+                    notices.push(redaction_notice(images, bytes, positions));
+                }
                 MockEvent::FailContextOverflow { message } => {
                     return Err(crate::error::MekaError::ContextOverflow(message));
                 }
@@ -333,7 +348,6 @@ impl Provider for MockProvider {
                     }
                     pending_tool = Some((id, name));
                 }
-                MockEvent::ToolInputDelta { .. } => {}
                 MockEvent::ToolUseEnd { input } => {
                     if let Some((id, name)) = pending_tool.take() {
                         content.push(ContentBlock::ToolUse { id, name, input });
@@ -349,40 +363,41 @@ impl Provider for MockProvider {
             content.push(ContentBlock::Text { text });
         }
 
-        Ok((
-            Message {
+        Ok(crate::provider::Completion {
+            message: Message {
                 role: Role::Assistant,
                 content,
             },
             stop_reason,
-            TokenUsage::default(),
-            Vec::new(),
-        ))
+            usage: TokenUsage::default(),
+            notices,
+        })
     }
 
     async fn stream(
         &self,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[ToolDefinition],
+        request: CompletionRequest<'_>,
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        self.streams
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(StreamRequest {
-                system_prompt: system_prompt.to_string(),
-                messages: messages.to_vec(),
-                tools: tools.to_vec(),
-                prompt_id: crate::provider::current_prompt_id(),
-            });
+        let CompletionRequest {
+            system_prompt,
+            messages,
+            tools,
+            thinking,
+            attribution,
+            ..
+        } = request;
+        crate::sync::lock(&self.streams).push(StreamRequest {
+            thinking,
+            system_prompt: system_prompt.to_string(),
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+            prompt_id: attribution.prompt_id,
+        });
 
         let events = {
-            let mut rounds = self
-                .rounds
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut rounds = crate::sync::lock(&self.rounds);
             rounds.pop_front().unwrap_or_default()
         };
         for event in events {
@@ -404,7 +419,22 @@ impl Provider for MockProvider {
                 }
                 MockEvent::Notice { message } => {
                     if event_sender
-                        .send(StreamEvent::Notice(crate::provider::Notice::info(message)))
+                        .send(StreamEvent::Notice(crate::frontend::Notice::info(message)))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                MockEvent::Redaction {
+                    images,
+                    bytes,
+                    positions,
+                } => {
+                    if event_sender
+                        .send(StreamEvent::Notice(redaction_notice(
+                            images, bytes, positions,
+                        )))
                         .await
                         .is_err()
                     {
@@ -449,8 +479,13 @@ impl Provider for MockProvider {
                 event => {
                     let stream_event = match event {
                         MockEvent::Notice { message } => {
-                            StreamEvent::Notice(crate::provider::Notice::info(message))
+                            StreamEvent::Notice(crate::frontend::Notice::info(message))
                         }
+                        MockEvent::Redaction {
+                            images,
+                            bytes,
+                            positions,
+                        } => StreamEvent::Notice(redaction_notice(images, bytes, positions)),
                         MockEvent::Text { text } => StreamEvent::TextDelta(text),
                         MockEvent::ThinkingDelta { text } => StreamEvent::ThinkingDelta(text),
                         MockEvent::ThinkingProgress { estimated_tokens } => {
@@ -462,11 +497,14 @@ impl Provider for MockProvider {
                         MockEvent::ToolUseStart { id, name } => {
                             StreamEvent::ToolUseStart { id, name }
                         }
-                        MockEvent::ToolInputDelta { delta } => StreamEvent::ToolInputDelta(delta),
                         MockEvent::ToolUseEnd { input } => StreamEvent::ToolUseEnd { input },
                         MockEvent::MessageEnd { stop_reason } => StreamEvent::MessageEnd {
                             stop_reason: stop_reason.into(),
                         },
+                        #[allow(
+                            clippy::unreachable,
+                            reason = "the control events are consumed by the match above this one"
+                        )]
                         MockEvent::Sleep { .. }
                         | MockEvent::Stall { .. }
                         | MockEvent::Fail { .. }
@@ -486,29 +524,23 @@ impl Provider for MockProvider {
         }
         Ok(())
     }
-
-    fn name(&self) -> &str {
-        "mock"
-    }
 }
 
 /// Read the JSON script from the path named in `MEKA_MOCK_PROVIDER_SCRIPT`. Returns `Ok(None)`
 /// when the env var is unset; `Err` only on actual parse failure (so the meka startup path can
 /// choose to log+abort vs proceed).
-pub fn load_script_from_env() -> Result<Option<Vec<Vec<MockEvent>>>> {
+pub(crate) fn load_script_from_env() -> Result<Option<Vec<Vec<MockEvent>>>> {
     let Ok(path) = std::env::var("MEKA_MOCK_PROVIDER_SCRIPT") else {
         return Ok(None);
     };
     let body = std::fs::read_to_string(&path).map_err(|error| {
         crate::error::MekaError::Config(format!(
-            "MEKA_MOCK_PROVIDER_SCRIPT='{}' could not be read: {}",
-            path, error,
+            "failed to read MEKA_MOCK_PROVIDER_SCRIPT='{path}': {error}",
         ))
     })?;
     let rounds: Vec<Vec<MockEvent>> = serde_json::from_str(&body).map_err(|error| {
         crate::error::MekaError::Config(format!(
-            "MEKA_MOCK_PROVIDER_SCRIPT='{}' is not valid JSON: {}",
-            path, error,
+            "MEKA_MOCK_PROVIDER_SCRIPT='{path}' is not valid JSON: {error}",
         ))
     })?;
     Ok(Some(rounds))
@@ -526,12 +558,39 @@ async fn send_stream_error(event_sender: &mpsc::Sender<StreamEvent>, message: &s
     }
 }
 
+/// The notice a Claude provider sends when it redacts old images, with the report the agent counts.
+fn redaction_notice(
+    images: u64,
+    bytes: u64,
+    positions: Vec<crate::image::RedactedImage>,
+) -> crate::frontend::Notice {
+    crate::frontend::Notice::info(format!("Redacted {images} old image(s)")).reporting(
+        crate::stats::Redaction {
+            images,
+            bytes,
+            positions,
+        },
+    )
+}
+/// One scripted round of assistant text that ends the turn.
+#[cfg(test)]
+pub(crate) fn text_round(text: &str) -> Vec<MockEvent> {
+    vec![
+        MockEvent::Text {
+            text: text.to_string(),
+        },
+        MockEvent::MessageEnd {
+            stop_reason: MockStopReason::EndTurn,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_mock_provider_drains_one_round_per_stream_call() {
+    async fn mock_provider_drains_one_round_per_stream_call() {
         let provider = MockProvider::from_rounds(vec![
             vec![
                 MockEvent::Text {
@@ -548,7 +607,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(8);
         provider
-            .stream("", &[], &[], tx, CancellationToken::new())
+            .stream(
+                CompletionRequest::new("", &[], &[]),
+                tx,
+                CancellationToken::new(),
+            )
             .await
             .expect("first round");
         // First round emits two events then the channel sender drops.
@@ -564,7 +627,11 @@ mod tests {
         // Second call drains the second round.
         let (tx2, mut rx2) = mpsc::channel(8);
         provider
-            .stream("", &[], &[], tx2, CancellationToken::new())
+            .stream(
+                CompletionRequest::new("", &[], &[]),
+                tx2,
+                CancellationToken::new(),
+            )
             .await
             .expect("second round");
         assert!(matches!(
@@ -574,11 +641,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_provider_completes_when_script_exhausted() {
+    async fn mock_provider_completes_when_script_exhausted() {
         let provider = MockProvider::from_rounds(vec![]);
         let (tx, mut rx) = mpsc::channel(8);
         provider
-            .stream("", &[], &[], tx, CancellationToken::new())
+            .stream(
+                CompletionRequest::new("", &[], &[]),
+                tx,
+                CancellationToken::new(),
+            )
             .await
             .expect("empty script");
         assert!(rx.recv().await.is_none(), "exhausted script emits nothing");
@@ -589,19 +660,22 @@ mod tests {
     /// the typed error into a non-Interrupted `run_turn` error, which the ACP layer maps to a
     /// JSON-RPC `internal_error` response.
     #[tokio::test]
-    async fn test_mock_provider_fail_event_returns_error() {
+    async fn mock_provider_fail_event_returns_error() {
         let provider = MockProvider::from_rounds(vec![vec![MockEvent::Fail {
             message: "boom".into(),
         }]]);
         let (tx, mut rx) = mpsc::channel(8);
         let result = provider
-            .stream("", &[], &[], tx, CancellationToken::new())
+            .stream(
+                CompletionRequest::new("", &[], &[]),
+                tx,
+                CancellationToken::new(),
+            )
             .await;
         let error = result.expect_err("Fail must propagate as Err");
         assert!(
             matches!(&error, crate::error::MekaError::Provider(message) if message == "boom"),
-            "unexpected error: {:?}",
-            error
+            "unexpected error: {error:?}"
         );
         // The error rides the channel first, then the channel closes. `Agent` depends on that
         // ordering: its `StreamEvent::Error` arm deliberately does not return, because the typed
@@ -614,17 +688,21 @@ mod tests {
     }
 
     /// `FailRetryable` returns `Err(MekaError::RetryableProvider { .. })` carrying the configured
-    /// `retry_after` — mirrors `Fail`'s shape, including the preceding `StreamEvent::Error`, but
+    /// `retry_after`. It mirrors `Fail`'s shape, including the preceding `StreamEvent::Error`, but
     /// with the typed variant `Agent::run_streaming`'s retry loop pattern-matches on.
     #[tokio::test]
-    async fn test_mock_provider_fail_retryable_event_returns_typed_error() {
+    async fn mock_provider_fail_retryable_event_returns_typed_error() {
         let provider = MockProvider::from_rounds(vec![vec![MockEvent::FailRetryable {
             message: "overloaded".into(),
             retry_after_secs: Some(3),
         }]]);
         let (tx, mut rx) = mpsc::channel(8);
         let result = provider
-            .stream("", &[], &[], tx, CancellationToken::new())
+            .stream(
+                CompletionRequest::new("", &[], &[]),
+                tx,
+                CancellationToken::new(),
+            )
             .await;
         match result.expect_err("FailRetryable must propagate as Err") {
             crate::error::MekaError::RetryableProvider {
@@ -648,7 +726,7 @@ mod tests {
     /// call stays ahead of it and text between two calls stays between them. Sub-agents take this
     /// path, so a reordering here would show up as a sub-agent's narration landing after its work.
     #[tokio::test]
-    async fn test_mock_provider_complete_folds_a_round_preserving_block_order() {
+    async fn mock_provider_complete_folds_a_round_preserving_block_order() {
         let provider = MockProvider::from_rounds(vec![
             vec![
                 MockEvent::Text {
@@ -673,7 +751,14 @@ mod tests {
             }],
         ]);
 
-        let (message, stop_reason, ..) = provider.complete("", &[], &[]).await.expect("complete");
+        let crate::provider::Completion {
+            message,
+            stop_reason,
+            ..
+        } = provider
+            .complete(CompletionRequest::new("", &[], &[]))
+            .await
+            .expect("complete");
         assert!(matches!(message.role, Role::Assistant));
         assert_eq!(message.content.len(), 3);
         assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "before "));
@@ -684,18 +769,29 @@ mod tests {
         assert!(matches!(stop_reason, StopReason::ToolUse));
 
         // The queue is shared with `stream`, so the first round is gone for both paths.
-        let (message, ..) = provider.complete("", &[], &[]).await.expect("second round");
+        let message = provider
+            .complete(CompletionRequest::new("", &[], &[]))
+            .await
+            .expect("second round")
+            .message;
         assert!(
             matches!(&message.content[0], ContentBlock::Text { text } if text == "second round")
         );
     }
 
     /// An exhausted script yields an empty assistant message rather than an error, matching
-    /// `stream`'s "drains nothing, returns Ok" behaviour.
+    /// `stream`'s "drains nothing, returns Ok" behavior.
     #[tokio::test]
-    async fn test_mock_provider_complete_on_exhausted_script_is_empty() {
+    async fn mock_provider_complete_on_exhausted_script_is_empty() {
         let provider = MockProvider::from_rounds(vec![]);
-        let (message, stop_reason, ..) = provider.complete("", &[], &[]).await.expect("complete");
+        let crate::provider::Completion {
+            message,
+            stop_reason,
+            ..
+        } = provider
+            .complete(CompletionRequest::new("", &[], &[]))
+            .await
+            .expect("complete");
         assert!(message.content.is_empty());
         assert!(matches!(stop_reason, StopReason::EndTurn));
     }
@@ -704,7 +800,7 @@ mod tests {
     /// variants. The agent loop collapses the pair into a single `FrontendEvent::ThinkingBlock`,
     /// which the ACP frontend renders as a `SessionUpdate::AgentThoughtChunk` notification.
     #[tokio::test]
-    async fn test_mock_provider_emits_thinking_delta_and_complete() {
+    async fn mock_provider_emits_thinking_delta_and_complete() {
         let provider = MockProvider::from_rounds(vec![vec![
             MockEvent::ThinkingDelta {
                 text: "let me think...".into(),
@@ -720,7 +816,11 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(8);
         provider
-            .stream("", &[], &[], tx, CancellationToken::new())
+            .stream(
+                CompletionRequest::new("", &[], &[]),
+                tx,
+                CancellationToken::new(),
+            )
             .await
             .expect("stream");
         assert!(matches!(

@@ -3,7 +3,7 @@
 A general-purpose AI agent harness.
 
 > [!CAUTION]
-> Agents can perform potentially destructive actions. Exercise caution when granting a permission mode that can modify files or run commands.
+> Agents can perform potentially destructive actions. Exercise caution when granting a permission level that can modify files or run commands.
 
 > [!IMPORTANT]
 > meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats change between releases. Read the changelog before upgrading.
@@ -16,13 +16,13 @@ A general-purpose AI agent harness.
 - **Proactive context management**: the agent watches its own usage and compacts when it chooses.
 - **Memory**: notes the agent keeps, tagged, ranked, and searchable across sessions.
 - **Sandboxed shell**: write access confined by the operating system itself.
-- **Sub-agents**: resumable workers the parent seeds with a skill; several run in parallel.
+- **Sub-agents**: the parent seeds one with a skill and can follow up on it later; several run in parallel.
 - **Background tasks**: detached tool calls that report back when they finish.
 - **Skills**: [Agent Skills](https://agentskills.io/specification) compliant, portable across clients.
 - **MCP**: any standard-compliant server, over streamable HTTP or stdio.
 - **Sessions**: resume, fork, rewind, export, or import.
 
-## Supported Providers
+## Supported backends
 
 - **Anthropic Messages**: Anthropic's own API. Also served by Bedrock, LiteLLM, Ollama, and others.
 - **OpenAI Chat Completions**: the industry standard. Supported by almost every provider.
@@ -33,7 +33,7 @@ A general-purpose AI agent harness.
 
 The same agent core is available through several interfaces:
 
-- **CLI**: an interactive REPL, or one-shot commands for scripts.
+- **CLI**: a REPL, or one-shot commands for scripts.
 - **ACP**: runs inside editors like Zed via the [Agent Client Protocol](https://agentclientprotocol.com/).
 - **HTTP API**: use meka to power your own apps and bots.
 
@@ -53,26 +53,27 @@ Tagged releases also publish a container image, which the [`mekabox`](contrib/co
 docker run --rm -it ghcr.io/k4yt3x/meka:latest --help
 ```
 
-## Quick Start
+## Quick start
 
-Add a provider profile with `meka provider add`. It runs the OAuth login (or prompts for an API key), stores the secret in the database, and writes the profile to `~/.config/meka/config.toml`:
+Add an account with `meka account add`, then a profile on it with `meka profile add`. The first runs the OAuth login (or prompts for an API key), saves the secret to the store, and writes the account to `~/.config/meka/config.toml`; the second names the model:
 
 ```bash
-meka provider add work --type claude-subscription --model claude-opus-5
+meka account add anthropic --backend claude-subscription
+meka profile add work --account anthropic --model claude-opus-5
 ```
 
-A profile pins a backend and a model. The backend is either a wire protocol (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) or a subscription account (`claude-subscription`, `chatgpt-subscription`). Add several and switch with `meka provider use <name>` or `--provider <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url`:
+An account is a backend, an endpoint and a login. The backend is either a wire protocol (`anthropic-messages`, `openai-chat-completions`, `openai-responses`) or a subscription (`claude-subscription`, `chatgpt-subscription`). A profile is an account plus a model, so one login can serve several models. Add several and switch with `meka profile use <name>` or `--profile <name>`. For an OpenAI-compatible endpoint like OpenRouter, set `--base-url` on the account:
 
 ```bash
-meka provider add openrouter --type openai-chat-completions --model anthropic/claude-opus-5 \
-    --base-url https://openrouter.ai/api/v1
+meka account add openrouter --backend openai-chat-completions --base-url https://openrouter.ai/api/v1
+meka profile add opus --account openrouter --model anthropic/claude-opus-5
 ```
 
 Run `meka` and start typing. Press Shift+Tab to cycle permissions (none, read, workspace, unrestricted):
 
 ```console
-meka [r] > find all TODO comments in this project
-meka [u] > install and start nginx
+meka ~/project [r] > find all TODO comments in this project
+meka ~/project [u] > install and start nginx
 ```
 
 See the [documentation](https://docs.meka.so) for the full usage guide.
@@ -104,35 +105,36 @@ Run `meka tools list` for the current set with descriptions. Long-output tools t
 
 ## Permissions
 
-The prompt indicator shows the current permission mode. Press **Shift+Tab** to cycle between modes:
+The prompt indicator shows the current permission level. Press **Shift+Tab** to cycle between levels:
 
 - `[n]` **none**: no tools; the model can only reply with text
 - `[r]` **read**: read-only tools, and a shell sandboxed against writes
 - `[w]` **workspace**: every tool; writes confined to the cwd and any `--writable-root`
-- `[a]` **ask**: every tool, each call approved by you; enable it under `[permissions]`
 - `[u]` **unrestricted**: every tool, with no boundary on where writes land
+
+A call the level does not cover is refused, or, with `/approvals on`, put to you for approval.
 
 ## Sessions
 
-Conversations are persisted in a local SQLite database and can be resumed:
+Conversations are persisted in the store, a local SQLite file, and can be resumed:
 
 - `meka -c` continues the last session
-- `meka -r <UUID>` resumes a session by UUID, or by a leading prefix of one
+- `meka -r <id>` resumes a session by id, or by any unique prefix of one
 - `meka session list` / `delete` / `export` manage and export past sessions
 - `/compact`, `/fork`, `/rewind`, `/export` act on the current session from the shell
 
-## Shell Escape
+## Shell escape
 
 Prefix input with `!` to execute a command directly, bypassing the LLM:
 
 ```console
-meka [r] > !uname -a
-meka [r] > !docker ps
+meka ~/project [r] > !uname -a
+meka ~/project [r] > !docker ps
 ```
 
-Type `exit`, `quit`, or press **Ctrl+D** to leave the shell.
+Type `/exit`, `/quit`, `exit` or `quit`, or press **Ctrl+D** on an empty line, to leave the shell.
 
-## AI Use Declaration
+## AI use declaration
 
 AI tools were used to assist the design and implementation of this project. All design decisions were made by humans, and every change was reviewed and approved by a human maintainer.
 

@@ -1,45 +1,45 @@
+// The server under test needs the `serve` feature, and every turn it runs needs the scripted
+// provider, which a release build has only with `mock-provider`; without either there is nothing
+// here to run.
+#![cfg(all(feature = "serve", any(debug_assertions, feature = "mock-provider")))]
 // See the matching allow in `tests/acp.rs` for the rationale: integration tests panic on
-// failure by design.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// failure by design, and `body["field"]` on a JSON value is the same idiom.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests panic on failure by design, and indexing a JSON document is the readable form"
+)]
 
 //! End-to-end integration tests for `meka serve`. Spawns the real `meka serve` binary against
 //! a tempdir and a scripted mock provider, then drives it over HTTP via `reqwest`.
 
-// Only the `#[cfg(unix)]` shutdown tests read an SSE body directly; importing it
-// unconditionally made the Windows build warn about an import nothing there uses.
+// Only the `#[cfg(unix)]` shutdown tests read an SSE body directly; importing it unconditionally
+// made the Windows build warn about an import nothing there uses.
 #[cfg(unix)]
 use std::io::Read;
 use std::{
-    io::{BufRead, BufReader},
+    io::BufRead,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
-fn meka() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_meka"))
-}
+#[path = "harness/support.rs"]
+mod support;
 
-/// Bind to an OS-assigned ephemeral port, then immediately close so the OS hands the port back.
-/// The server we're about to spawn re-claims it; brief TIME_WAIT-style races are tolerated by
-/// the test runner's retry-on-startup-failure path (build_harness retries a few times).
-fn ephemeral_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
+use support::Install;
 
 struct ServeTestHarness {
-    _temp: tempfile::TempDir,
-    /// The server's `MEKA_DATA_DIR`. Exposed so a test can reach the session lock directory
-    /// underneath it, which is the only way to create the cross-process lock contention that
+    /// The server's directories. Exposed so a test can reach the session lock directory under the
+    /// data dir, which is the only way to create the cross-process lock contention that
     /// distinguishes a refusal placed before `lock_session` from one placed after.
-    data_dir: std::path::PathBuf,
+    install: Install,
     child: Child,
     base_url: String,
     token: String,
-    /// Drained by the spawned reader thread; kept alive so the thread can exit cleanly.
-    #[allow(dead_code)]
+    /// Drained by the spawned reader thread and kept alive so that thread can exit cleanly.
+    #[allow(dead_code, reason = "held so the reader thread can finish; never read")]
     stderr_handle: std::thread::JoinHandle<String>,
     client: reqwest::blocking::Client,
 }
@@ -57,7 +57,7 @@ impl ServeTestHarness {
     /// [`Self::spawn`] plus a top-level prelude, for the keys that cannot live inside a table.
     ///
     /// `extra_config` is injected *inside* `[serve]`, which is right for `max_body_bytes` and its
-    /// neighbours and impossible for `default_provider`: a second profile makes the default
+    /// neighbors and impossible for `default_profile`: a second profile makes the default
     /// ambiguous, and the key that resolves it has to precede every table header.
     fn spawn_with_prelude(prelude: &str, config_toml: &str, script: serde_json::Value) -> Self {
         Self::spawn_with(prelude, config_toml, script, "sk_test_token", &[
@@ -73,36 +73,33 @@ impl ServeTestHarness {
         token: &str,
         scopes: &[&str],
     ) -> Self {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_dir = temp.path().join("meka");
-        let data_dir = temp.path().join("data").join("meka");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
-
-        let script_path = temp.path().join("script.json");
-        std::fs::write(&script_path, script.to_string()).expect("write script");
+        let install = Install::new();
+        install.write_script(&script);
 
         let scopes_str = scopes
             .iter()
-            .map(|s| format!("\"{}\"", s))
+            .map(|s| format!("\"{s}\""))
             .collect::<Vec<_>>()
             .join(", ");
 
-        // Startup is retried: a parallel test can re-claim our just-freed ephemeral port before
-        // the server binds it, so the server fails to bind and exits. That surfaces here as a
-        // `Disconnected` recv (stderr EOFs) rather than a timeout, and waiting longer wouldn't
-        // help; only a fresh port does. Retry a few times before giving up.
+        // A parallel test can re-claim our just-freed ephemeral port before the server binds it.
+        // That is the one startup failure a fresh port fixes, so it is the only one retried; any
+        // other exit is reported at once with the logs that explain it, rather than after five
+        // twenty-second waits.
         const MAX_ATTEMPTS: usize = 5;
-        let mut last_logs = String::new();
         for _ in 0..MAX_ATTEMPTS {
-            let port = ephemeral_port();
-            let bind = format!("127.0.0.1:{}", port);
+            let port = support::ephemeral_port();
+            let bind = format!("127.0.0.1:{port}");
             // `extra_config` is injected into the top-level `[serve]` table (before the
             // `[[serve.tokens]]` array-of-tables) so callers can set `max_body_bytes`,
             // `idle_timeout`, etc. without colliding with the per-token block.
             let config = format!(
                 r#"{prelude}
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -112,7 +109,7 @@ default = "unrestricted"
 # enabled, so no test could create a `workspace` session even deliberately. `none` is here for the
 # same reason and it was found the same way: the scheduler refuses every job on a session at
 # `none`, and no test could reach that state to check what the endpoints then say.
-enabled = ["none", "read", "workspace", "unrestricted", "ask"]
+enabled = ["none", "read", "workspace", "unrestricted"]
 
 [serve]
 bind = "{bind}"
@@ -122,21 +119,11 @@ bind = "{bind}"
 token = "{token}"
 scopes = [{scopes_str}]
 "#,
-                prelude = prelude,
-                bind = bind,
-                token = token,
-                scopes_str = scopes_str,
-                extra_config = extra_config,
             );
-            std::fs::write(config_dir.join("config.toml"), &config).expect("write config.toml");
+            install.write_config(&config);
 
-            let mut child = meka()
-                .arg("serve")
-                .env("MEKA_CONFIG_DIR", &config_dir)
-                .env("MEKA_DATA_DIR", &data_dir)
-                .env("HOME", temp.path())
-                .env("MEKA_MOCK_PROVIDER", "1")
-                .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+            let mut child = install
+                .meka(&["serve"])
                 .env("RUST_LOG", "meka=info")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -144,68 +131,42 @@ scopes = [{scopes_str}]
                 .spawn()
                 .expect("spawn meka serve");
 
-            // Drain stdout in the background; the server doesn't write to it.
-            let stdout = child.stdout.take().expect("stdout");
-            std::thread::spawn(move || {
-                let mut buf = String::new();
-                let mut r = BufReader::new(stdout);
-                while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            });
-
-            // Watch stderr for the "listening on" line so we know the server has bound. Also
-            // drains the rest of stderr to keep the pipe from blocking the child.
+            // The server writes nothing to stdout; stderr carries the announcement and the logs.
+            support::drain(child.stdout.take().expect("stdout"));
             let stderr_pipe = child.stderr.take().expect("stderr");
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-            let stderr_handle = std::thread::spawn(move || {
-                let mut buf = String::new();
-                let mut r = BufReader::new(stderr_pipe);
-                let mut ready_sent = false;
-                let mut accumulated = String::new();
-                loop {
-                    buf.clear();
-                    let n = r.read_line(&mut buf).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    accumulated.push_str(&buf);
-                    if !ready_sent && buf.contains("listening on") {
-                        let _ = ready_tx.send(());
-                        ready_sent = true;
-                    }
+
+            match support::wait_for_serve(&bind, &mut child, stderr_pipe, Duration::from_secs(20)) {
+                support::Started::Ready(stderr_handle) => {
+                    let client = reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(60))
+                        .build()
+                        .expect("reqwest client");
+
+                    return Self {
+                        install,
+                        child,
+                        base_url: format!("http://{bind}"),
+                        token: token.to_string(),
+                        stderr_handle,
+                        client,
+                    };
                 }
-                accumulated
-            });
-
-            // Wait for the server to bind. `Ok` means ready; any error (timeout, or the server
-            // exited and dropped the sender) means this attempt failed: kill it, collect its
-            // logs, and retry with a fresh port.
-            if ready_rx.recv_timeout(Duration::from_secs(20)).is_ok() {
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(Duration::from_secs(60))
-                    .build()
-                    .expect("reqwest client");
-
-                return Self {
-                    _temp: temp,
-                    data_dir: data_dir.clone(),
-                    child,
-                    base_url: format!("http://{}", bind),
-                    token: token.to_string(),
-                    stderr_handle,
-                    client,
-                };
+                support::Started::Exited(_, logs) if logs.contains("failed to bind") => continue,
+                support::Started::Exited(status, logs) => panic!(
+                    "meka serve exited with {status} before announcing its address; stderr:\n{logs}"
+                ),
+                support::Started::TimedOut(stderr_handle) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let logs = stderr_handle.join().unwrap_or_default();
+                    panic!(
+                        "meka serve did not announce `listening on {bind}` within 20s; stderr:\n{logs}"
+                    );
+                }
             }
-
-            let _ = child.kill();
-            let _ = child.wait();
-            last_logs = stderr_handle.join().unwrap_or_default();
         }
 
-        panic!(
-            "meka serve failed to log `listening on` within 20s across {} attempts; \
-             last stderr:\n{}",
-            MAX_ATTEMPTS, last_logs,
-        );
+        panic!("meka serve lost the port race {MAX_ATTEMPTS} times in a row");
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
@@ -215,20 +176,13 @@ scopes = [{scopes_str}]
     }
 
     /// The temp root this server's config and data live under, so a test can seed files inside it.
-    ///
-    /// Reach meka's own store through this (`home().join("meka")` is `MEKA_CONFIG_DIR`), not a
-    /// directory outside it. This used to be described as "the `HOME` this server runs under",
-    /// which held only on Unix: `dirs::home_dir` on Windows is
-    /// `SHGetKnownFolderPath(FOLDERID_Profile)` and never reads the environment, so a config `~/…`
-    /// path resolved to the runner's real profile while the test seeded a temp directory. A test
-    /// that needs a root outside meka's store should make its own and name it absolutely.
-    fn home(&self) -> &std::path::Path {
-        self._temp.path()
+    fn root(&self) -> &std::path::Path {
+        self.install.root()
     }
 
     /// Block until a turn is actually running on `id`.
     ///
-    /// Every test that asserts in-flight behaviour (409, 429, cancel, delete-refusal) needs the
+    /// Every test that asserts in-flight behavior (409, 429, cancel, delete-refusal) needs the
     /// turn *admitted* first, and a fixed sleep is a bet on how fast admission is. It is normally
     /// tens of milliseconds, but on a loaded machine it overruns any constant small enough to keep
     /// the suite quick, and the test then fails claiming the server did not reject a turn that had
@@ -238,7 +192,7 @@ scopes = [{scopes_str}]
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let body: serde_json::Value = self
-                .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+                .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
                 .send()
                 .expect("in-flight probe")
                 .json()
@@ -248,7 +202,49 @@ scopes = [{scopes_str}]
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!("no turn became in flight on session {} within 10s", id);
+        panic!("no turn became in flight on session {id} within 10s");
+    }
+
+    /// Block until the GC has dropped `id` from the live map.
+    ///
+    /// `/context` answers from the live entry while the session is resident and omits
+    /// `message_count` once it is not, which is the one observable that says "evicted" without
+    /// reviving the session to ask. Sleeping past `idle_timeout` plus a scan is a bet on the
+    /// scanner's timing that passes vacuously when it loses: the re-attach under test never runs.
+    fn wait_until_evicted(&self, id: &str) {
+        let path = format!("/v1/sessions/{id}/context");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            let context: serde_json::Value = self
+                .request(reqwest::Method::GET, &path)
+                .send()
+                .expect("eviction probe")
+                .json()
+                .expect("parse");
+            if context["message_count"].is_null() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("session {id} never left the live map; GC is not evicting it");
+    }
+
+    /// Block until `id` answers 404, for a session the GC deletes rather than evicts.
+    fn wait_until_gone(&self, id: &str) {
+        let path = format!("/v1/sessions/{id}");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            let status = self
+                .request(reqwest::Method::GET, &path)
+                .send()
+                .expect("deletion probe")
+                .status();
+            if status == 404 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("session {id} was never deleted by the GC");
     }
 }
 
@@ -262,8 +258,8 @@ impl Drop for ServeTestHarness {
 fn mock_simple_turn() -> serde_json::Value {
     serde_json::json!([
         [
-            { "kind": "text", "text": "hello from agent" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "hello from agent" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ])
 }
@@ -380,7 +376,7 @@ fn create_and_list_session_round_trip() {
     );
 
     let delete = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send");
     assert_eq!(delete.status(), 204);
@@ -399,7 +395,7 @@ fn blocking_turn_returns_final_text_from_mock_provider() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": false}))
         .send()
         .expect("send");
@@ -410,15 +406,30 @@ fn blocking_turn_returns_final_text_from_mock_provider() {
     assert_eq!(body["session_id"], id);
 }
 
+/// Every text a message carries, the turn's context block included: what the model was sent.
+fn message_text(message: &serde_json::Value) -> String {
+    message["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
+}
+
 /// End-to-end shape of the per-turn context, through a real server and real turns rather than the
-/// renderer in isolation: the first turn carries the tool catalogue, the second carries none of it.
+/// renderer in isolation: the first turn carries the tool catalog, the second carries none of it.
 ///
-/// This is the observable form of the whole cache-prefix design. The catalogue used to live in the
-/// system prompt, where anything that changed re-cached the entire conversation; it now rides in
-/// the user's own message, which is appended. If it ever reappears on every turn, the change is
-/// costing tokens instead of saving them, and this fails.
+/// This is the observable form of the whole cache-prefix design. The catalog rides in the first
+/// turn's context block rather than in the system prompt, where anything that changed would
+/// re-cache the entire conversation; a later turn carries only the user's own message, which is
+/// appended. If the catalog ever reappears on every turn, the design is costing tokens instead of
+/// saving them, and this fails.
 #[test]
-fn per_turn_context_states_the_catalogue_once_not_every_turn() {
+fn per_turn_context_states_the_catalog_once_not_every_turn() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
@@ -432,7 +443,7 @@ fn per_turn_context_states_the_catalogue_once_not_every_turn() {
 
     for message in ["first question", "second question"] {
         let response = harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
             .json(&serde_json::json!({"message": message, "stream": false}))
             .send()
             .expect("send");
@@ -440,10 +451,7 @@ fn per_turn_context_states_the_catalogue_once_not_every_turn() {
     }
 
     let body: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json()
@@ -453,17 +461,16 @@ fn per_turn_context_states_the_catalogue_once_not_every_turn() {
         .expect("messages array")
         .iter()
         .filter(|message| message["role"] == "user")
-        .filter_map(|message| message["content"][0]["text"].as_str().map(str::to_string))
+        .map(message_text)
         .collect();
     assert!(
         user_texts.len() >= 2,
-        "expected both user turns; got {:?}",
-        user_texts,
+        "expected both user turns; got {user_texts:?}",
     );
 
     assert!(
         user_texts[0].contains("[Available tools]") && user_texts[0].contains("**read_file**"),
-        "the first turn must state the catalogue; got: {}",
+        "the first turn must state the catalog; got: {}",
         user_texts[0],
     );
     assert!(
@@ -473,7 +480,7 @@ fn per_turn_context_states_the_catalogue_once_not_every_turn() {
     );
     // Both still carry the cheap per-turn state, so this isn't passing because the block vanished.
     for text in &user_texts[..2] {
-        assert!(text.contains("[Permission context]"), "got: {}", text);
+        assert!(text.contains("[Permission context]"), "got: {text}");
     }
 }
 
@@ -496,14 +503,14 @@ fn fork_copies_the_conversation_into_a_new_session() {
         .expect("id")
         .to_string();
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": false}))
         .send()
         .expect("send");
 
     // An empty body is the common case: inherit everything from the source.
     let fork = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
         .send()
         .expect("send");
     assert_eq!(fork.status(), 201);
@@ -516,7 +523,7 @@ fn fork_copies_the_conversation_into_a_new_session() {
         harness
             .request(
                 reqwest::Method::GET,
-                &format!("/v1/sessions/{}/messages", session),
+                &format!("/v1/sessions/{session}/messages"),
             )
             .send()
             .expect("send")
@@ -533,7 +540,7 @@ fn fork_copies_the_conversation_into_a_new_session() {
     let turn = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/turn", fork_id),
+            &format!("/v1/sessions/{fork_id}/turn"),
         )
         .json(&serde_json::json!({"message": "again", "stream": false}))
         .send()
@@ -552,21 +559,21 @@ fn fork_copies_the_conversation_into_a_new_session() {
     );
 }
 
-/// Forking reads the database directly while the source's runtime mutex is held by a running
-/// turn. It must neither block on that mutex nor produce a broken copy: the fork's own first turn
-/// has to succeed, which is only true if the conversation it copied loaded cleanly.
+/// A fork of a source with a turn in flight is refused, like every other write to it. The turn
+/// persisted its prompt before the provider answered, so the copy would end on a prompt nothing
+/// answered and restore as an unusable session, which is the copy the probe already refuses
+/// another process. Refused rather than made to wait: the source's conversation mutex is held for
+/// the length of the turn.
 #[test]
-fn fork_during_an_in_flight_turn_does_not_block_or_corrupt() {
-    let slow = serde_json::json!([
-        { "kind": "sleep", "ms": 1500 },
-        { "kind": "text", "text": "source done" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+fn fork_during_an_in_flight_turn_is_refused_with_409() {
+    let script = serde_json::json!([
+        [
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "source done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
     ]);
-    let quick = serde_json::json!([
-        { "kind": "text", "text": "fork done" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
-    ]);
-    let harness = ServeTestHarness::spawn("", serde_json::json!([slow, quick]));
+    let harness = ServeTestHarness::spawn("", script);
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
@@ -586,50 +593,127 @@ fn fork_during_an_in_flight_turn_does_not_block_or_corrupt() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_turn))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_for_turn}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "slow one"}))
             .send()
             .expect("turn send")
     });
 
-    // Let the turn acquire the source's runtime mutex and enter the mock provider's sleep.
-    std::thread::sleep(Duration::from_millis(300));
-    let started = std::time::Instant::now();
+    // Admitted first, or the refusal proves nothing.
+    harness.wait_until_in_flight(&id);
     let fork = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
         .send()
         .expect("send");
-    let elapsed = started.elapsed();
-
-    assert_eq!(fork.status(), 201);
+    assert_eq!(fork.status(), 409, "a fork mid-turn must 409");
+    let body: serde_json::Value = fork.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/turn-in-flight");
     assert!(
-        elapsed < Duration::from_millis(1000),
-        "fork must not wait on the source's runtime mutex; took {:?}",
-        elapsed,
+        body["detail"].as_str().unwrap_or_default().contains("fork"),
+        "the detail names what was refused: {body}"
     );
-    let fork_id = fork.json::<serde_json::Value>().expect("parse")["id"]
-        .as_str()
-        .expect("id")
-        .to_string();
+    assert_eq!(
+        turn.join().expect("join").status(),
+        200,
+        "and the turn it declined to interrupt completes"
+    );
 
-    // The copy is usable despite having been taken mid-turn.
-    let fork_turn = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/turn", fork_id),
-        )
-        .json(&serde_json::json!({"message": "on the fork", "stream": false}))
+    let listed: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listed["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "no copy was written: {listed}"
+    );
+    let messages: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        messages["messages"].as_array().map(Vec::len),
+        Some(2),
+        "the source's conversation is what the turn alone produced: {messages}"
+    );
+
+    // Between turns the same request is what it always was.
+    let fork = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
         .send()
         .expect("send");
-    assert_eq!(
-        fork_turn.status(),
-        200,
-        "a fork taken mid-turn must still run: {}",
-        fork_turn.text().unwrap_or_default(),
-    );
+    assert_eq!(fork.status(), 201, "a source between turns forks");
+}
 
-    assert_eq!(turn.join().expect("join").status(), 200);
+/// A path as meka records it: canonical, without the `\\?\` prefix Windows' `canonicalize` adds.
+fn canonical_spelling(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .expect("canonicalize")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string()
+}
+
+/// `cwd` is recorded in its canonical spelling on every door, and the listing filter is compared
+/// the same way, so a session created through a symlinked directory is found by either spelling;
+/// a file is refused before a row exists.
+#[cfg(unix)]
+#[test]
+fn a_session_cwd_is_recorded_canonically_and_found_by_either_spelling() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let real = temp.path().join("real");
+    std::fs::create_dir(&real).expect("mkdir");
+    let link = temp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": link.to_string_lossy()}))
+        .send()
+        .expect("send");
+    assert_eq!(create.status(), 201);
+    let created: serde_json::Value = create.json().expect("parse");
+    assert_eq!(created["cwd"], canonical_spelling(&real));
+    let id = created["id"].as_str().expect("id").to_string();
+
+    for spelling in [&link, &real] {
+        let listed: serde_json::Value = harness
+            .request(reqwest::Method::GET, "/v1/sessions")
+            .query(&[("cwd", spelling.to_string_lossy().as_ref())])
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        let ids: Vec<&str> = listed["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .filter_map(|session| session["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec![id.as_str()], "filter spelled {spelling:?}");
+    }
+
+    let file = temp.path().join("file");
+    std::fs::write(&file, b"x").expect("write");
+    let refused = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": file.to_string_lossy()}))
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 422);
+    let problem: serde_json::Value = refused.json().expect("problem");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("not a directory")),
+        "{problem}"
+    );
 }
 
 #[test]
@@ -648,13 +732,13 @@ fn fork_accepts_a_cwd_override() {
     let elsewhere = std::env::temp_dir().join("meka-fork-cwd");
     std::fs::create_dir_all(&elsewhere).expect("mkdir");
     let fork = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
         .json(&serde_json::json!({"cwd": elsewhere.to_string_lossy()}))
         .send()
         .expect("send");
     assert_eq!(fork.status(), 201);
     let forked: serde_json::Value = fork.json().expect("parse");
-    assert_eq!(forked["cwd"], elsewhere.to_string_lossy().as_ref());
+    assert_eq!(forked["cwd"], canonical_spelling(&elsewhere));
 }
 
 #[test]
@@ -671,7 +755,7 @@ fn fork_rejects_a_relative_cwd_and_an_unknown_session() {
         .to_string();
 
     let relative = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/fork", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
         .json(&serde_json::json!({"cwd": "relative/path"}))
         .send()
         .expect("send");
@@ -718,7 +802,7 @@ fn idempotency_key_replays_return_cached_body() {
 
     let body = serde_json::json!({"message": "hi", "stream": false});
     let first = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", "test-key-1")
         .json(&body)
         .send()
@@ -728,7 +812,7 @@ fn idempotency_key_replays_return_cached_body() {
 
     // Replay with the same key + same body → identical response (cached envelope).
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", "test-key-1")
         .json(&body)
         .send()
@@ -758,7 +842,7 @@ fn patch_session_updates_permission_and_cwd() {
     let new_cwd = std::env::temp_dir().join("patched-cwd-test");
     std::fs::create_dir_all(&new_cwd).expect("create new cwd");
     let patched = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
         .json(&serde_json::json!({
             "permission": "read",
             "cwd": new_cwd.to_string_lossy(),
@@ -768,7 +852,42 @@ fn patch_session_updates_permission_and_cwd() {
     assert_eq!(patched.status(), 200);
     let body: serde_json::Value = patched.json().expect("parse");
     assert_eq!(body["permission"], "read");
-    assert_eq!(body["cwd"], new_cwd.to_string_lossy().as_ref());
+    assert_eq!(body["cwd"], canonical_spelling(&new_cwd));
+}
+
+/// `approvals` is a row field like the level: `PATCH` writes it and the session reads it back, so a
+/// resume and a scheduled fire see what the client set.
+#[test]
+fn patch_session_sets_approvals_and_the_session_reports_it() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let created: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        created["approvals"], false,
+        "off unless asked for: {created}"
+    );
+
+    let patched = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"approvals": true}))
+        .send()
+        .expect("send");
+    assert_eq!(patched.status(), 200);
+    let body: serde_json::Value = patched.json().expect("parse");
+    assert_eq!(body["approvals"], true, "{body}");
+
+    let after: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(after["approvals"], true, "read back off the row: {after}");
 }
 
 /// The docs routes are the only unauthenticated ones that describe the deployment rather than
@@ -860,7 +979,7 @@ fn patch_session_rejects_relative_cwd() {
         .to_string();
 
     let response = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
         .json(&serde_json::json!({"cwd": "relative/path"}))
         .send()
         .expect("send");
@@ -881,7 +1000,7 @@ fn idempotency_key_with_different_body_returns_409_conflict() {
         .to_string();
 
     let first = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", "conflict-key")
         .json(&serde_json::json!({"message": "first body", "stream": false}))
         .send()
@@ -889,7 +1008,7 @@ fn idempotency_key_with_different_body_returns_409_conflict() {
     assert_eq!(first.status(), 200);
 
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", "conflict-key")
         .json(&serde_json::json!({"message": "different body", "stream": false}))
         .send()
@@ -903,9 +1022,9 @@ fn idempotency_key_with_different_body_returns_409_conflict() {
 fn streaming_turn_emits_turn_started_text_delta_and_finished() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "streamed " },
-            { "kind": "text", "text": "response" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "streamed " },
+            { "type": "text", "text": "response" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -919,7 +1038,7 @@ fn streaming_turn_emits_turn_started_text_delta_and_finished() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send");
@@ -954,23 +1073,19 @@ fn streaming_turn_emits_turn_started_text_delta_and_finished() {
     // The body is an SSE stream; coarse-grained string assertions are enough here.
     assert!(
         body.contains("event: turn.started"),
-        "stream must include turn.started; body was:\n{}",
-        body
+        "stream must include turn.started; body was:\n{body}"
     );
     assert!(
         body.contains("event: assistant_text.delta"),
-        "stream must include assistant_text.delta events; body was:\n{}",
-        body
+        "stream must include assistant_text.delta events; body was:\n{body}"
     );
     assert!(
         body.contains("event: turn.finished"),
-        "stream must include turn.finished; body was:\n{}",
-        body
+        "stream must include turn.finished; body was:\n{body}"
     );
     assert!(
         body.contains("\"stop_reason\":\"end_turn\""),
-        "turn.finished must carry the stop reason; body was:\n{}",
-        body
+        "turn.finished must carry the stop reason; body was:\n{body}"
     );
 }
 
@@ -982,13 +1097,13 @@ fn streaming_turn_emits_turn_started_text_delta_and_finished() {
 fn retrying_after_a_timeout_replays_the_turn_instead_of_repeating_it() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 2000 },
-            { "kind": "text", "text": "FIRST-TURN-ANSWER" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "FIRST-TURN-ANSWER" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "SECOND-TURN-RAN" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "SECOND-TURN-RAN" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -1005,7 +1120,7 @@ fn retrying_after_a_timeout_replays_the_turn_instead_of_repeating_it() {
 
     let key = "timed-out-then-retried";
     let timed_out = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", key)
         .timeout(Duration::from_millis(500))
         .json(&serde_json::json!({"message": "do the thing"}))
@@ -1017,7 +1132,7 @@ fn retrying_after_a_timeout_replays_the_turn_instead_of_repeating_it() {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
             .send()
             .expect("send")
             .json()
@@ -1028,7 +1143,7 @@ fn retrying_after_a_timeout_replays_the_turn_instead_of_repeating_it() {
     }
 
     let retried = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", key)
         .json(&serde_json::json!({"message": "do the thing"}))
         .send()
@@ -1037,13 +1152,11 @@ fn retrying_after_a_timeout_replays_the_turn_instead_of_repeating_it() {
     let text = retried.text().expect("body");
     assert!(
         text.contains("FIRST-TURN-ANSWER"),
-        "the retry must replay the first turn's cached answer: {}",
-        text
+        "the retry must replay the first turn's cached answer: {text}"
     );
     assert!(
         !text.contains("SECOND-TURN-RAN"),
-        "the retry must not have run a second turn: {}",
-        text
+        "the retry must not have run a second turn: {text}"
     );
 }
 
@@ -1051,13 +1164,13 @@ fn retrying_after_a_timeout_replays_the_turn_instead_of_repeating_it() {
 /// exotic. axum drops a handler's future when the connection closes, and dropping this one would
 /// abandon the turn partway: the running tool's future goes with it, the in-memory conversation
 /// keeps an assistant `tool_use` whose result never arrives, and no webhook ever reports the end.
-/// The turn must run to completion, exactly as the streaming path's already-documented behaviour.
+/// The turn must run to completion, exactly as the streaming path's already-documented behavior.
 #[test]
 fn a_blocking_turn_survives_the_client_hanging_up() {
     let script = serde_json::json!([[
-        { "kind": "sleep", "ms": 2000 },
-        { "kind": "text", "text": "finished anyway" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "sleep", "ms": 2000 },
+        { "type": "text", "text": "finished anyway" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let harness = ServeTestHarness::spawn("", script);
     let id = harness
@@ -1074,7 +1187,7 @@ fn a_blocking_turn_survives_the_client_hanging_up() {
     // Hang up well before the turn can finish. The 500ms timeout is the client's, not the
     // server's: the request is gone from this side while the turn is still running.
     let hung_up = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .timeout(Duration::from_millis(500))
         .json(&serde_json::json!({"message": "take your time"}))
         .send();
@@ -1090,7 +1203,7 @@ fn a_blocking_turn_survives_the_client_hanging_up() {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
             .send()
             .expect("send")
             .json()
@@ -1101,10 +1214,7 @@ fn a_blocking_turn_survives_the_client_hanging_up() {
     }
 
     let messages: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json()
@@ -1112,21 +1222,19 @@ fn a_blocking_turn_survives_the_client_hanging_up() {
     let text = messages.to_string();
     assert!(
         text.contains("finished anyway"),
-        "the turn must have completed and persisted despite the client leaving: {}",
-        text
+        "the turn must have completed and persisted despite the client leaving: {text}"
     );
 
     // And the session must be usable again rather than stuck holding the runtime mutex.
     let next = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
         .expect("parse");
     assert_eq!(
         next["turn_in_flight"], false,
-        "the abandoned turn must have released the session: {}",
-        next
+        "the abandoned turn must have released the session: {next}"
     );
 }
 
@@ -1136,13 +1244,13 @@ fn second_turn_on_same_session_returns_409_turn_in_flight() {
     // POST tries to acquire it.
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "text", "text": "first done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "first done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -1166,8 +1274,8 @@ fn second_turn_on_same_session_returns_409_turn_in_flight() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_a))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_a}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "first"}))
             .send()
             .expect("first send")
@@ -1176,7 +1284,7 @@ fn second_turn_on_same_session_returns_409_turn_in_flight() {
     // Give the first turn time to acquire the runtime mutex.
     harness.wait_until_in_flight(&id);
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "second"}))
         .send()
         .expect("second send");
@@ -1194,9 +1302,9 @@ fn second_turn_on_same_session_returns_409_turn_in_flight() {
 fn concurrent_streaming_turns_return_409() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "text", "text": "first done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "first done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -1219,8 +1327,8 @@ fn concurrent_streaming_turns_return_409() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_clone))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_clone}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "first", "stream": true}))
             .send()
             .expect("first send")
@@ -1228,7 +1336,7 @@ fn concurrent_streaming_turns_return_409() {
 
     harness.wait_until_in_flight(&id);
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "second", "stream": true}))
         .send()
         .expect("send");
@@ -1261,10 +1369,7 @@ fn cancel_idempotent_when_no_turn_in_flight() {
         .to_string();
 
     let response = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("send");
     assert_eq!(response.status(), 204);
@@ -1313,9 +1418,9 @@ fn oversize_body_returns_413() {
 
 /// A path segment axum's `Path<Uuid>` extractor rejects must still answer RFC 9457.
 ///
-/// The rejection happens before any handler runs, so it used to escape the error taxonomy entirely
-/// and answer `400 text/plain` -- one response shape a client parsing `application/problem+json`
-/// could not read, for the most ordinary mistake there is.
+/// The rejection happens before any handler runs, so without a rejection handler it escapes the
+/// error taxonomy entirely and answers `400 text/plain`: one response shape a client parsing
+/// `application/problem+json` cannot read, for the most ordinary mistake there is.
 #[test]
 fn a_malformed_path_parameter_is_a_problem_detail() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
@@ -1360,7 +1465,7 @@ fn discovery_endpoints_round_trip() {
     }
 }
 
-/// `GET /v1/health/ready` includes the session_db + provider_configured + mcp_servers
+/// `GET /v1/health/ready` includes the session_db + profile_configured + mcp_servers
 /// fields and reports `ok` against a healthy default deployment.
 #[test]
 fn ready_probe_reports_subsystem_health() {
@@ -1374,7 +1479,7 @@ fn ready_probe_reports_subsystem_health() {
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(body["status"], "ok");
     assert_eq!(body["session_db"], true);
-    assert_eq!(body["provider_configured"], true);
+    assert_eq!(body["profile_configured"], true);
     assert_eq!(
         body["mcp_servers_healthy"], true,
         "mcp_servers_healthy must be a boolean (true when no servers configured)"
@@ -1412,12 +1517,12 @@ fn patch_without_write_scope_returns_403() {
 fn re_attach_to_evicted_session_continues_conversation() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn_with(
@@ -1444,18 +1549,17 @@ fn re_attach_to_evicted_session_continues_conversation() {
         .to_string();
 
     let first = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hello"}))
         .send()
         .expect("first");
     assert_eq!(first.status(), 200);
 
-    // Wait long enough for GC to evict the in-memory entry (idle_timeout=1s, scan=1s).
-    std::thread::sleep(Duration::from_secs(3));
+    harness.wait_until_evicted(&id);
 
     // Re-attach: the next turn should succeed via the reconstruction path, not 404.
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "again"}))
         .send()
         .expect("second");
@@ -1468,7 +1572,7 @@ fn re_attach_to_evicted_session_continues_conversation() {
 
     // The persisted permission survived eviction + reattach.
     let get = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("get");
     assert_eq!(get.status(), 200);
@@ -1480,10 +1584,7 @@ fn re_attach_to_evicted_session_continues_conversation() {
 
     // Both turns appear in the conversation history.
     let messages = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("messages");
     assert_eq!(messages.status(), 200);
@@ -1493,17 +1594,15 @@ fn re_attach_to_evicted_session_continues_conversation() {
         .expect("messages array")
         .iter()
         .filter(|m| m["role"] == "user")
-        .filter_map(|m| m["content"][0]["text"].as_str().map(|s| s.to_string()))
+        .map(message_text)
         .collect();
     assert!(
         user_messages.iter().any(|t| t.contains("hello")),
-        "first turn's user message should be in history; got {:?}",
-        user_messages,
+        "first turn's user message should be in history; got {user_messages:?}",
     );
     assert!(
         user_messages.iter().any(|t| t.contains("again")),
-        "post-reattach turn's user message should be in history; got {:?}",
-        user_messages,
+        "post-reattach turn's user message should be in history; got {user_messages:?}",
     );
 }
 
@@ -1514,8 +1613,8 @@ fn re_attach_to_evicted_session_continues_conversation() {
 #[test]
 fn idempotency_does_not_cache_server_errors() {
     let script = serde_json::json!([
-        [{ "kind": "fail", "message": "scripted upstream 502" }],
-        [{ "kind": "text", "text": "recovered" }]
+        [{ "type": "fail", "message": "scripted upstream 502" }],
+        [{ "type": "text", "text": "recovered" }]
     ]);
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
@@ -1530,7 +1629,7 @@ fn idempotency_does_not_cache_server_errors() {
 
     let body = serde_json::json!({"message": "go", "stream": false});
     let first = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", "5xx-retry-key")
         .json(&body)
         .send()
@@ -1543,7 +1642,7 @@ fn idempotency_does_not_cache_server_errors() {
 
     // Retry with the same key re-executes the turn instead of replaying the cached 502.
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", "5xx-retry-key")
         .json(&body)
         .send()
@@ -1562,9 +1661,9 @@ fn idempotency_does_not_cache_server_errors() {
 fn cancel_during_in_flight_turn_emits_cancelled_event() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 2000 },
-            { "kind": "text", "text": "should never reach client" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "should never reach client" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -1587,20 +1686,17 @@ fn cancel_during_in_flight_turn_emits_cancelled_event() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_clone))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_clone}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "long", "stream": true}))
             .send()
             .expect("stream send")
     });
 
-    // Let the agent enter its 2-second mock-provider sleep before cancelling.
+    // Let the agent enter its 2-second mock-provider sleep before canceling.
     harness.wait_until_in_flight(&id);
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("cancel");
     assert_eq!(cancel.status(), 204);
@@ -1609,13 +1705,11 @@ fn cancel_during_in_flight_turn_emits_cancelled_event() {
     let body = response.text().expect("body");
     assert!(
         body.contains("event: turn.cancelled"),
-        "stream must emit turn.cancelled when /cancel fires mid-turn; body was:\n{}",
-        body,
+        "stream must emit turn.cancelled when /cancel fires mid-turn; body was:\n{body}",
     );
     assert!(
         body.contains("\"reason\":\"client\""),
-        "cancellation reason must be 'client' when triggered by POST /cancel; body was:\n{}",
-        body,
+        "cancellation reason must be 'client' when triggered by POST /cancel; body was:\n{body}",
     );
 }
 
@@ -1625,14 +1719,14 @@ fn cancel_during_in_flight_turn_emits_cancelled_event() {
 fn max_concurrent_turns_returns_429_across_sessions() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn_with(
@@ -1668,8 +1762,8 @@ fn max_concurrent_turns_returns_429_across_sessions() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_a))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_a}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "a"}))
             .send()
             .expect("first send")
@@ -1710,9 +1804,9 @@ fn graceful_shutdown_emits_server_shutdown_cancelled() {
     // Long-sleep script so the streaming turn is still in flight when the signal arrives.
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 5000 },
-            { "kind": "text", "text": "would-be-text" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "would-be-text" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -1738,15 +1832,16 @@ fn graceful_shutdown_emits_server_shutdown_cancelled() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_clone))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_clone}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "stall me", "stream": true}))
             .send()
             .expect("stream send")
     });
 
-    // Let the agent enter its mock-provider sleep, then SIGTERM the server.
-    std::thread::sleep(Duration::from_millis(500));
+    // The turn has to be admitted before the signal lands, or there is nothing to cancel and
+    // the drain emits no `turn.cancelled` at all.
+    harness.wait_until_in_flight(&id);
     let kill_status = Command::new("kill")
         .arg("-TERM")
         .arg(server_pid.to_string())
@@ -1758,13 +1853,11 @@ fn graceful_shutdown_emits_server_shutdown_cancelled() {
     let body = response.text().expect("body");
     assert!(
         body.contains("event: turn.cancelled"),
-        "drained server must emit turn.cancelled; body was:\n{}",
-        body,
+        "drained server must emit turn.cancelled; body was:\n{body}",
     );
     assert!(
         body.contains("\"reason\":\"server_shutdown\""),
-        "cancellation reason must be 'server_shutdown' on SIGTERM; body was:\n{}",
-        body,
+        "cancellation reason must be 'server_shutdown' on SIGTERM; body was:\n{body}",
     );
 }
 
@@ -1792,10 +1885,10 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
     // for the drain to wait for. Reading this event back proves the stream is live.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "turn-has-started" },
-            { "kind": "stall", "ms": STALL_MS },
-            { "kind": "text", "text": "finished after the signal" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "turn-has-started" },
+            { "type": "stall", "ms": STALL_MS },
+            { "type": "text", "text": "finished after the signal" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = ServeTestHarness::spawn("", script);
@@ -1813,7 +1906,7 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
     // response closes the socket, which is what leaves the turn genuinely unattended rather than
     // merely slow to read.
     let mut response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "stall me", "stream": true}))
         .send()
         .expect("stream send");
@@ -1829,7 +1922,7 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
 
     harness.wait_until_in_flight(&id);
 
-    let signalled = Instant::now();
+    let signaled = Instant::now();
     let kill_status = Command::new("kill")
         .arg("-TERM")
         .arg(harness.child.id().to_string())
@@ -1838,23 +1931,19 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
     assert!(kill_status.success(), "kill should succeed");
 
     let status = harness.child.wait().expect("wait for exit");
-    let elapsed = signalled.elapsed();
+    let elapsed = signaled.elapsed();
     assert!(
         status.success(),
-        "a drain that completes exits 0; got {:?} after {:?}",
-        status,
-        elapsed,
+        "a drain that completes exits 0; got {status:?} after {elapsed:?}",
     );
     assert!(
         elapsed >= Duration::from_millis(1500),
-        "shutdown must wait for the detached turn: the process exited {:?} after SIGTERM while \
-         the turn still had most of its {}ms left to run",
-        elapsed,
-        STALL_MS,
+        "shutdown must wait for the detached turn: the process exited {elapsed:?} after SIGTERM while \
+         the turn still had most of its {STALL_MS}ms left to run",
     );
 }
 
-/// Mid-turn permission flow: a session in `permission = "ask"` mode scripts a tool call,
+/// Mid-turn permission flow: a session at `read` with approvals on scripts a tool call,
 /// the SSE stream emits `permission_required`, the test posts `/responses/{id}` with
 /// `outcome: "deny"`, and the agent continues into a follow-up assistant message that ends
 /// the turn cleanly.
@@ -1863,13 +1952,13 @@ fn mid_turn_permission_round_trips() {
     // Round 1: model asks to run write_file; round 2: after deny, model gives up.
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {"path": "/tmp/meka-test.txt", "content": "x"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": "/tmp/meka-test.txt", "content": "x"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "ok, skipping" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ok, skipping" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -1877,7 +1966,8 @@ fn mid_turn_permission_round_trips() {
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "permission": "ask",
+            "permission": "read",
+            "approvals": true,
         }))
         .send()
         .expect("create");
@@ -1894,15 +1984,15 @@ fn mid_turn_permission_round_trips() {
     // need (the streaming POST blocks until the server closes the connection).
     let base_url = harness.base_url.clone();
     let token = harness.token.clone();
-    let id_for_stream = id.clone();
+    let id_for_stream = id;
     let stream_handle = std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("client");
         let response = client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_stream))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_for_stream}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "please write", "stream": true}))
             .send()
             .expect("stream POST");
@@ -1938,21 +2028,32 @@ fn mid_turn_permission_round_trips() {
             {
                 let payload: serde_json::Value =
                     serde_json::from_str(data.trim()).expect("parse data");
+                // The prompt has to show what is being written, not only where: a client
+                // rendering `tool_name` alone would ask for a write without showing the write.
+                assert_eq!(payload["tool_name"], "write_file", "{payload}");
+                assert_eq!(
+                    payload["input"],
+                    serde_json::json!({"path": "/tmp/meka-test.txt", "content": "x"}),
+                    "every argument of the call rides on the event: {payload}"
+                );
+                assert_eq!(
+                    payload["expires_in_seconds"], 1800,
+                    "the approval timeout is the thirty minutes every host shares: {payload}"
+                );
                 let request_id = payload["request_id"]
                     .as_str()
                     .expect("request_id")
                     .to_string();
-                let resp = respond_client
+                let response = respond_client
                     .post(format!(
-                        "{}/v1/sessions/{}/responses/{}",
-                        base_url, id_for_stream, request_id,
+                        "{base_url}/v1/sessions/{id_for_stream}/responses/{request_id}",
                     ))
-                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Authorization", format!("Bearer {token}"))
                     .json(&serde_json::json!({"outcome": "deny"}))
                     .send()
                     .expect("respond send");
                 assert_eq!(
-                    resp.status(),
+                    response.status(),
                     204,
                     "POST /responses must accept the deny outcome"
                 );
@@ -1966,8 +2067,7 @@ fn mid_turn_permission_round_trips() {
         stream_handle.join().expect("stream worker join");
     assert!(
         saw_permission_required,
-        "streaming turn must emit `permission_required`; body was:\n{}",
-        body,
+        "streaming turn must emit `permission_required`; body was:\n{body}",
     );
     assert!(
         posted_deny,
@@ -1975,8 +2075,7 @@ fn mid_turn_permission_round_trips() {
     );
     assert!(
         saw_finished,
-        "stream must reach `turn.finished` after the deny resolves; body was:\n{}",
-        body,
+        "stream must reach `turn.finished` after the deny resolves; body was:\n{body}",
     );
 }
 
@@ -1987,13 +2086,13 @@ fn streaming_tool_call_emits_executing_and_completed_events() {
     // Mock provider scripts a tool_use round, then a follow-up text round so the turn ends.
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "list_directory" },
-            { "kind": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "listed" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "listed" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2007,7 +2106,7 @@ fn streaming_tool_call_emits_executing_and_completed_events() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "list it", "stream": true}))
         .send()
         .expect("send");
@@ -2015,23 +2114,19 @@ fn streaming_tool_call_emits_executing_and_completed_events() {
     let body = response.text().expect("body");
     assert!(
         body.contains("event: tool_call.executing"),
-        "stream must emit tool_call.executing; body was:\n{}",
-        body,
+        "stream must emit tool_call.executing; body was:\n{body}",
     );
     assert!(
         body.contains("event: tool_call.completed"),
-        "stream must emit tool_call.completed; body was:\n{}",
-        body,
+        "stream must emit tool_call.completed; body was:\n{body}",
     );
     assert!(
         body.contains("\"name\":\"list_directory\""),
-        "tool_call.executing must include the tool name; body was:\n{}",
-        body,
+        "tool_call.executing must include the tool name; body was:\n{body}",
     );
     assert!(
         body.contains("\"id\":\"tu_1\""),
-        "tool_call events must propagate the tool_use id from the provider; body was:\n{}",
-        body,
+        "tool_call events must propagate the tool_use id from the provider; body was:\n{body}",
     );
 }
 
@@ -2043,13 +2138,13 @@ fn streaming_tool_call_emits_executing_and_completed_events() {
 fn streaming_tool_call_announces_composition_before_it_executes() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "list_directory" },
-            { "kind": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "listed" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "listed" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2063,7 +2158,7 @@ fn streaming_tool_call_announces_composition_before_it_executes() {
         .expect("id")
         .to_string();
     let body = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "list it", "stream": true}))
         .send()
         .expect("send")
@@ -2072,20 +2167,18 @@ fn streaming_tool_call_announces_composition_before_it_executes() {
 
     let composing = body
         .find("event: tool_call.composing")
-        .unwrap_or_else(|| panic!("stream must emit tool_call.composing; body was:\n{}", body));
+        .unwrap_or_else(|| panic!("stream must emit tool_call.composing; body was:\n{body}"));
     let executing = body
         .find("event: tool_call.executing")
-        .unwrap_or_else(|| panic!("stream must emit tool_call.executing; body was:\n{}", body));
+        .unwrap_or_else(|| panic!("stream must emit tool_call.executing; body was:\n{body}"));
     assert!(
         composing < executing,
-        "composition must be announced before the dispatch; body was:\n{}",
-        body,
+        "composition must be announced before the dispatch; body was:\n{body}",
     );
     assert!(
         body[composing..executing].contains("{\"id\":\"tu_1\",\"name\":\"list_directory\"}"),
         "tool_call.composing carries the id to pair on and the name, and nothing else has \
-         streamed yet; body was:\n{}",
-        body,
+         streamed yet; body was:\n{body}",
     );
 }
 
@@ -2101,17 +2194,17 @@ fn unknown_session_returns_404_on_every_mutating_endpoint() {
     for (method, path, body) in [
         (
             reqwest::Method::PATCH,
-            format!("/v1/sessions/{}", unknown),
+            format!("/v1/sessions/{unknown}"),
             Some(serde_json::json!({"permission": "read"})),
         ),
         (
             reqwest::Method::POST,
-            format!("/v1/sessions/{}/turn", unknown),
+            format!("/v1/sessions/{unknown}/turn"),
             Some(serde_json::json!({"message": "hi"})),
         ),
         (
             reqwest::Method::GET,
-            format!("/v1/sessions/{}/messages", unknown),
+            format!("/v1/sessions/{unknown}/messages"),
             None,
         ),
     ] {
@@ -2123,9 +2216,7 @@ fn unknown_session_returns_404_on_every_mutating_endpoint() {
         assert_eq!(
             response.status(),
             404,
-            "{} {} on a non-existent session must return 404",
-            method,
-            path,
+            "{method} {path} on a non-existent session must return 404",
         );
         let problem: serde_json::Value = response.json().expect("parse");
         assert_eq!(
@@ -2136,10 +2227,7 @@ fn unknown_session_returns_404_on_every_mutating_endpoint() {
 
     // DELETE returns 204 (idempotent) per the utoipa annotation contract.
     let delete = harness
-        .request(
-            reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}", unknown),
-        )
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{unknown}"))
         .send()
         .expect("send");
     assert_eq!(
@@ -2182,7 +2270,7 @@ fn malformed_turn_body_missing_message_returns_422() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"stream": false}))
         .send()
         .expect("send");
@@ -2216,7 +2304,7 @@ fn blocking_turn_accepts_inline_image_attachment() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = create_session_id(&harness);
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "what is in this image?",
             "images": [{"media_type": "image/png", "data": TINY_PNG_BASE64}],
@@ -2229,6 +2317,70 @@ fn blocking_turn_accepts_inline_image_attachment() {
     assert_eq!(body["final_text"], "hello from agent");
 }
 
+/// An image a turn attached is served back by its hash to the session that carries it and to no
+/// other: the scope is the reference row, not the token.
+#[test]
+fn a_sessions_image_is_served_by_hash_and_scoped_to_it() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "look",
+            "images": [{"media_type": "image/png", "data": TINY_PNG_BASE64}],
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(turn.status(), 200);
+
+    let messages: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let hash = messages["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .find(|block| block["type"] == "image")
+        .and_then(|block| block["hash"].as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("the image block carries its hash: {messages}"));
+
+    let blob = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{id}/blobs/{hash}"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(blob.status(), 200);
+    assert_eq!(
+        blob.headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let bytes = blob.bytes().expect("body");
+    assert!(bytes.starts_with(b"\x89PNG"), "the stored bytes, whole");
+
+    let other = create_session_id(&harness);
+    let refused = harness
+        .request(
+            reqwest::Method::GET,
+            &format!("/v1/sessions/{other}/blobs/{hash}"),
+        )
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        404,
+        "a session that never referenced the blob cannot read it"
+    );
+}
+
 /// An image with no text is a complete request against prior context ("look at this"), so the
 /// empty-`message` check must not reject it.
 #[test]
@@ -2236,7 +2388,7 @@ fn turn_with_only_an_image_and_no_text_is_accepted() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = create_session_id(&harness);
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "",
             "images": [{"media_type": "image/png", "data": TINY_PNG_BASE64}],
@@ -2253,7 +2405,7 @@ fn turn_with_neither_message_nor_images_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = create_session_id(&harness);
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "  ", "images": [], "stream": false}))
         .send()
         .expect("send");
@@ -2277,7 +2429,7 @@ fn turn_with_truncated_image_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = create_session_id(&harness);
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "look",
             "images": [{"media_type": "image/png", "data": truncated}],
@@ -2303,7 +2455,7 @@ fn turn_with_unparseable_image_returns_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = create_session_id(&harness);
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "look",
             "images": [{"media_type": "image/png", "data": "!!!not-base64!!!"}],
@@ -2331,7 +2483,7 @@ fn get_session_reports_turn_in_flight() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = create_session_id(&harness);
     let idle = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send");
     assert_eq!(idle.status(), 200);
@@ -2344,9 +2496,9 @@ fn get_session_reports_turn_in_flight() {
 #[test]
 fn get_session_reports_turn_in_flight_during_a_turn() {
     let script = serde_json::json!([[
-        { "kind": "sleep", "ms": 2000 },
-        { "kind": "text", "text": "done" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "sleep", "ms": 2000 },
+        { "type": "text", "text": "done" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let harness = ServeTestHarness::spawn("", script);
     let id = create_session_id(&harness);
@@ -2356,7 +2508,7 @@ fn get_session_reports_turn_in_flight_during_a_turn() {
     let worker = std::thread::spawn(move || {
         reqwest::blocking::Client::new()
             .post(&turn_url)
-            .header("Authorization", format!("Bearer {}", token))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "hi", "stream": false}))
             .timeout(std::time::Duration::from_secs(30))
             .send()
@@ -2371,7 +2523,7 @@ fn get_session_reports_turn_in_flight_during_a_turn() {
     let mut seen_in_flight = false;
     while std::time::Instant::now() < deadline {
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
             .send()
             .expect("send")
             .json()
@@ -2390,7 +2542,7 @@ fn get_session_reports_turn_in_flight_during_a_turn() {
     assert_eq!(worker.join().expect("worker panicked"), 200);
 
     let after: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send")
         .json()
@@ -2400,10 +2552,9 @@ fn get_session_reports_turn_in_flight_during_a_turn() {
 
 /// A session created at `workspace` writes inside its cwd and is refused outside it.
 ///
-/// The whole integration surface of this mode was uncovered: every session in `tests/serve.rs`,
-/// `tests/acp.rs` and `tests/multiprocess.rs` runs at `read`, `ask` or `unrestricted`, and the two
-/// `workspace` mentions in the tree assert a config string and a catalogue field. So the mode this
-/// change set exists to introduce had no end-to-end test on any surface -- the boundary could stop
+/// The one end-to-end test of this level: every other session in `tests/serve.rs`, `tests/acp.rs`
+/// and `tests/multiprocess.rs` runs at `read` or `unrestricted`, and the other `workspace` mentions
+/// in the tree assert a config string and a catalog field. Without this, the boundary could stop
 /// being applied to a session `POST /v1/sessions` created and nothing here would notice.
 ///
 /// Asserts filesystem ground truth rather than the turn's narration: a tool that never ran reports
@@ -2417,18 +2568,18 @@ fn a_workspace_session_writes_inside_its_cwd_and_is_refused_outside() {
 
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {"path": inside, "content": "in"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": inside, "content": "in"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "tool_use_start", "id": "tu_2", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {"path": outside, "content": "out"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_2", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": outside, "content": "out"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
 
@@ -2451,7 +2602,7 @@ fn a_workspace_session_writes_inside_its_cwd_and_is_refused_outside() {
     let id = body["id"].as_str().expect("id").to_string();
 
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "write both"}))
         .send()
         .expect("send");
@@ -2469,18 +2620,18 @@ fn a_workspace_session_writes_inside_its_cwd_and_is_refused_outside() {
 }
 
 /// A streaming client that declared it has no approval interface must get an immediate deny, not
-/// a 60-second park. The turn completes well inside the timeout if the flag is honoured.
+/// a 60-second park. The turn completes well inside the timeout if the flag is honored.
 #[test]
 fn streaming_session_without_prompt_support_does_not_park_on_permission() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {"path": "/tmp/meka-test-noprompt.txt", "content": "x"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": "/tmp/meka-test-noprompt.txt", "content": "x"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "denied then" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "denied then" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2488,7 +2639,8 @@ fn streaming_session_without_prompt_support_does_not_park_on_permission() {
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "permission": "ask",
+            "permission": "read",
+            "approvals": true,
             "capabilities": {"supports_permission_prompts": false},
         }))
         .send()
@@ -2500,7 +2652,7 @@ fn streaming_session_without_prompt_support_does_not_park_on_permission() {
 
     let started = std::time::Instant::now();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it", "stream": true}))
         .send()
         .expect("send");
@@ -2510,18 +2662,78 @@ fn streaming_session_without_prompt_support_does_not_park_on_permission() {
 
     assert!(
         elapsed < std::time::Duration::from_secs(30),
-        "turn took {:?}; it parked on the permission channel instead of denying",
-        elapsed
+        "turn took {elapsed:?}; it parked on the permission channel instead of denying"
     );
     assert!(
         !body.contains("permission_required"),
-        "no permission_required event should be emitted; body was:\n{}",
-        body
+        "no permission_required event should be emitted; body was:\n{body}"
     );
 }
 
-/// `vision` on `/v1/info` is how a client discovers whether attaching an image is worth the
-/// base64 payload, instead of finding out from a 422.
+/// `vision` on `/v1/info` is how a client discovers whether attaching an image is worth the base64
+/// payload, instead of finding out from a 422. `POST /turn` asks the session whether it takes an
+/// image, off the profile the turn runs on: a session on a text-only profile refuses the
+/// attachment, and moving it onto a seeing profile with `PATCH` admits the same attachment on the
+/// next turn.
+#[test]
+fn an_image_is_judged_against_the_profile_the_session_runs_on() {
+    let harness = ServeTestHarness::spawn_with_prelude(
+        "default_profile = \"mock\"\n",
+        "\n[accounts.blind]\nbackend = \"anthropic-messages\"\n\n[profiles.blind]\naccount = \"blind\"\n\
+         model = \"model-without-eyes\"\nvision = false\n",
+        mock_simple_turn(),
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "profile": "blind",
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let with_image = serde_json::json!({
+        "message": "what is this?",
+        "images": [{"media_type": "image/png", "data": TINY_PNG_BASE64}],
+    });
+
+    let refused = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&with_image)
+        .send()
+        .expect("send");
+    assert_eq!(refused.status(), 422);
+    let problem: serde_json::Value = refused.json().expect("problem");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("vision")),
+        "the refusal names why: {problem}"
+    );
+
+    let moved = harness
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"profile": "mock"}))
+        .send()
+        .expect("send");
+    assert_eq!(moved.status(), 200, "{}", moved.text().expect("text"));
+    let admitted = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&with_image)
+        .send()
+        .expect("send");
+    assert_eq!(
+        admitted.status(),
+        200,
+        "the attachment follows the profile the session now runs on: {}",
+        admitted.text().expect("text")
+    );
+}
+
 #[test]
 fn info_reports_the_vision_capability() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
@@ -2534,19 +2746,21 @@ fn info_reports_the_vision_capability() {
     assert_eq!(body["vision"], true);
 }
 
-/// `/v1/info` carries no provider or model, and `/v1/providers` answers both.
+/// `/v1/info` carries no provider or model, and `/v1/profiles` answers both.
 ///
-/// It used to report the default profile's backend under the name `provider`, while the `provider`
-/// field on `POST /v1/sessions` names a *profile*: one word, two meanings, one API, and a client
-/// that read one and posted it to the other got a 422. The fields were also duplicates, since the
-/// `active: true` row below already carries the same two facts under names that tell them apart.
+/// Reporting the default profile's backend here would duplicate what the `active: true` row below
+/// already carries under a name that tells backend and profile apart; a client that read a
+/// `provider` field here and posted it as the profile of `POST /v1/sessions` would get a 422.
 #[test]
-fn info_carries_no_provider_or_model_because_providers_does() {
+fn info_carries_no_profile_or_model_because_profiles_does() {
     let harness = ServeTestHarness::spawn_with_prelude(
-        "default_provider = \"mock\"\n",
+        "default_profile = \"mock\"\n",
         r#"
-[providers.side]
-type = "openai-chat-completions"
+[accounts.side]
+backend = "openai-chat-completions"
+
+[profiles.side]
+account = "side"
 model = "gpt-5"
 "#,
         mock_simple_turn(),
@@ -2560,27 +2774,28 @@ model = "gpt-5"
         .expect("parse");
     assert!(
         info.get("provider").is_none() && info.get("model").is_none(),
-        "neither belongs here; `/v1/providers` names them apart: {info}"
+        "neither belongs here; `/v1/profiles` names them apart: {info}"
     );
 
-    let providers: serde_json::Value = harness
-        .request(reqwest::Method::GET, "/v1/providers")
+    let profiles: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/profiles")
         .send()
         .expect("send")
         .json()
         .expect("parse");
-    let rows = providers["providers"].as_array().expect("providers");
+    let rows = profiles["profiles"].as_array().expect("profiles");
     let active = rows
         .iter()
         .find(|row| row["active"] == true)
         .expect("one profile is the default");
-    // `name` is the profile, which is what `POST /v1/sessions` takes; `type` is the backend. Both
-    // present, and distinguishable, which is the whole reason `/v1/info` need not repeat them.
-    assert_eq!(active["name"], "mock", "{providers}");
-    assert!(active["type"].is_string(), "{providers}");
+    // `name` is the profile, which is what `POST /v1/sessions` takes; `backend` is its account's.
+    // Both present, and distinguishable, which is the whole reason `/v1/info` need not repeat
+    // them.
+    assert_eq!(active["name"], "mock", "{profiles}");
+    assert!(active["backend"].is_string(), "{profiles}");
     assert!(
         rows.iter().any(|row| row["name"] == "side"),
-        "every configured profile is listed, not just the default: {providers}"
+        "every configured profile is listed, not just the default: {profiles}"
     );
 }
 
@@ -2590,14 +2805,14 @@ model = "gpt-5"
 fn multi_session_parallel_happy_path() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 2000 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "sleep", "ms": 2000 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2627,13 +2842,13 @@ fn multi_session_parallel_happy_path() {
                     .timeout(Duration::from_secs(30))
                     .build()
                     .expect("client");
-                let resp = client
-                    .post(format!("{}/v1/sessions/{}/turn", base, id))
-                    .header("Authorization", format!("Bearer {}", tok))
+                let response = client
+                    .post(format!("{base}/v1/sessions/{id}/turn"))
+                    .header("Authorization", format!("Bearer {tok}"))
                     .json(&serde_json::json!({"message": "go"}))
                     .send()
                     .expect("send");
-                assert_eq!(resp.status(), 200, "parallel turn must succeed");
+                assert_eq!(response.status(), 200, "parallel turn must succeed");
             })
         })
         .collect();
@@ -2641,13 +2856,12 @@ fn multi_session_parallel_happy_path() {
         handle.join().expect("join");
     }
     let elapsed = started_at.elapsed();
-    // Each turn sleeps ~2000ms, so a serialised run would take ≥4000ms. The 3500ms bound
+    // Each turn sleeps ~2000ms, so a serialized run would take ≥4000ms. The 3500ms bound
     // clears the ~2000ms parallel time plus process-spawn and connection overhead (notably
     // higher on Windows CI) while staying well under the serial time.
     assert!(
         elapsed < Duration::from_millis(3500),
-        "parallel turns should complete in <3500ms; elapsed={:?}",
-        elapsed,
+        "parallel turns should complete in <3500ms; elapsed={elapsed:?}",
     );
 }
 
@@ -2657,10 +2871,10 @@ fn multi_session_parallel_happy_path() {
 fn thinking_delta_streams_with_capability_enabled() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "let me check" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "answer" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "let me check" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "answer" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2677,7 +2891,7 @@ fn thinking_delta_streams_with_capability_enabled() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "ponder", "stream": true}))
         .send()
         .expect("stream");
@@ -2686,16 +2900,14 @@ fn thinking_delta_streams_with_capability_enabled() {
     assert!(
         body.contains("event: thinking.delta"),
         "with supports_reasoning_stream: true the SSE wire must include thinking.delta; \
-         body was:\n{}",
-        body,
+         body was:\n{body}",
     );
     // The agent emits the deltas *and* the whole block behind them, for the consumers that want
     // reasoning in one piece. Forwarding both here would put the same text on the wire twice.
     assert_eq!(
         body.matches("let me check").count(),
         1,
-        "the reasoning reached the wire more than once; body was:\n{}",
-        body,
+        "the reasoning reached the wire more than once; body was:\n{body}",
     );
 }
 
@@ -2709,14 +2921,14 @@ fn thinking_delta_streams_with_capability_enabled() {
 fn a_retry_does_not_send_the_reasoning_twice() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "weighing the options" },
-            { "kind": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
+            { "type": "thinking_delta", "text": "weighing the options" },
+            { "type": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
         ],
         [
-            { "kind": "thinking_delta", "text": "weighing the options" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "answer" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "weighing the options" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "answer" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2733,7 +2945,7 @@ fn a_retry_does_not_send_the_reasoning_twice() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "ponder", "stream": true}))
         .send()
         .expect("stream");
@@ -2741,8 +2953,7 @@ fn a_retry_does_not_send_the_reasoning_twice() {
     assert_eq!(
         body.matches("weighing the options").count(),
         1,
-        "the retry re-sent reasoning the client had already been given; body was:\n{}",
-        body,
+        "the retry re-sent reasoning the client had already been given; body was:\n{body}",
     );
 }
 
@@ -2757,14 +2968,14 @@ fn a_retry_does_not_send_the_reasoning_twice() {
 fn a_blocking_turn_retries_even_with_reasoning_enabled() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "weighing the options" },
-            { "kind": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
+            { "type": "thinking_delta", "text": "weighing the options" },
+            { "type": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
         ],
         [
-            { "kind": "thinking_delta", "text": "weighing the options" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "answer" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "weighing the options" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "answer" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2781,7 +2992,7 @@ fn a_blocking_turn_retries_even_with_reasoning_enabled() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "ponder", "stream": false}))
         .send()
         .expect("turn");
@@ -2806,20 +3017,20 @@ fn a_blocking_turn_retries_even_with_reasoning_enabled() {
 fn a_blocking_turn_after_a_streamed_one_keeps_its_retry() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "first turn" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "one" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "first turn" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "one" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "thinking_delta", "text": "second turn" },
-            { "kind": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
+            { "type": "thinking_delta", "text": "second turn" },
+            { "type": "fail_retryable", "message": "transient", "retry_after_secs": 0 }
         ],
         [
-            { "kind": "thinking_delta", "text": "second turn" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "two" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "second turn" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "two" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2837,7 +3048,7 @@ fn a_blocking_turn_after_a_streamed_one_keeps_its_retry() {
         .to_string();
 
     let streamed = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "one", "stream": true}))
         .send()
         .expect("stream");
@@ -2845,7 +3056,7 @@ fn a_blocking_turn_after_a_streamed_one_keeps_its_retry() {
     drop(streamed.text());
 
     let blocking = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "two", "stream": false}))
         .send()
         .expect("turn");
@@ -2864,11 +3075,11 @@ fn a_blocking_turn_after_a_streamed_one_keeps_its_retry() {
 fn thinking_deltas_stream_one_event_per_chunk() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "first thought " },
-            { "kind": "thinking_delta", "text": "second thought" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "answer" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "first thought " },
+            { "type": "thinking_delta", "text": "second thought" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "answer" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2885,7 +3096,7 @@ fn thinking_deltas_stream_one_event_per_chunk() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "ponder", "stream": true}))
         .send()
         .expect("stream");
@@ -2893,11 +3104,10 @@ fn thinking_deltas_stream_one_event_per_chunk() {
     assert_eq!(
         body.matches("event: thinking.delta").count(),
         2,
-        "one event per chunk; body was:\n{}",
-        body,
+        "one event per chunk; body was:\n{body}",
     );
-    assert_eq!(body.matches("first thought").count(), 1, "{}", body);
-    assert_eq!(body.matches("second thought").count(), 1, "{}", body);
+    assert_eq!(body.matches("first thought").count(), 1, "{body}");
+    assert_eq!(body.matches("second thought").count(), 1, "{body}");
 }
 
 /// With the default `capabilities.supports_reasoning_stream: false`, scripted thinking
@@ -2906,10 +3116,10 @@ fn thinking_deltas_stream_one_event_per_chunk() {
 fn thinking_delta_filtered_when_capability_disabled() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "let me check" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "answer" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "let me check" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "answer" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2923,15 +3133,14 @@ fn thinking_delta_filtered_when_capability_disabled() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "ponder", "stream": true}))
         .send()
         .expect("stream");
     let body = response.text().expect("body");
     assert!(
         !body.contains("event: thinking.delta"),
-        "default capabilities must exclude thinking.delta; body was:\n{}",
-        body,
+        "default capabilities must exclude thinking.delta; body was:\n{body}",
     );
 }
 
@@ -2941,8 +3150,8 @@ fn thinking_delta_filtered_when_capability_disabled() {
 fn streaming_provider_failure_emits_turn_failed_event() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "before failure " },
-            { "kind": "fail", "message": "scripted upstream 529" }
+            { "type": "text", "text": "before failure " },
+            { "type": "fail", "message": "scripted upstream 529" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -2956,7 +3165,7 @@ fn streaming_provider_failure_emits_turn_failed_event() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "go", "stream": true}))
         .send()
         .expect("send");
@@ -2964,8 +3173,7 @@ fn streaming_provider_failure_emits_turn_failed_event() {
     let body = response.text().expect("body");
     assert!(
         body.contains("event: turn.failed"),
-        "stream must emit turn.failed when provider errors mid-stream; body was:\n{}",
-        body,
+        "stream must emit turn.failed when provider errors mid-stream; body was:\n{body}",
     );
     // Quoted, so the match ends where the type does. Bare, this is a *prefix* of
     // `/errors/provider-unavailable` and passes against either one, which is exactly the shape
@@ -2973,8 +3181,7 @@ fn streaming_provider_failure_emits_turn_failed_event() {
     // apart. The `fail` kind is `MekaError::Provider`, so this one is the permanent type.
     assert!(
         body.contains("\"https://meka.so/errors/provider\""),
-        "turn.failed payload must carry the provider error type; body was:\n{}",
-        body,
+        "turn.failed payload must carry the provider error type; body was:\n{body}",
     );
 }
 
@@ -3006,7 +3213,7 @@ fn the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one() {
         ),
     ] {
         let round = serde_json::json!([
-            { "kind": kind, "message": "scripted upstream failure", "retry_after_secs": null }
+            { "type": kind, "message": "scripted upstream failure", "retry_after_secs": null }
         ]);
         let script = serde_json::Value::Array(vec![round; rounds]);
         let harness = ServeTestHarness::spawn("", script);
@@ -3020,7 +3227,7 @@ fn the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one() {
             .expect("id")
             .to_string();
         let body = harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
             .json(&serde_json::json!({"message": "go", "stream": true}))
             .send()
             .expect("send")
@@ -3059,16 +3266,16 @@ fn the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one() {
 fn permission_allow_outcome_resumes_turn() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {
                 "path": std::env::temp_dir().join("meka-permission-allow-test.txt").to_string_lossy(),
                 "content": "hello"
             } },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "wrote it" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "wrote it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3076,7 +3283,8 @@ fn permission_allow_outcome_resumes_turn() {
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "permission": "ask",
+            "permission": "read",
+            "approvals": true,
         }))
         .send()
         .expect("create");
@@ -3087,15 +3295,15 @@ fn permission_allow_outcome_resumes_turn() {
 
     let base_url = harness.base_url.clone();
     let token = harness.token.clone();
-    let id_for_stream = id.clone();
+    let id_for_stream = id;
     let stream_handle = std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("client");
         let response = client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_stream))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_for_stream}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "write please", "stream": true}))
             .send()
             .expect("stream POST");
@@ -3132,10 +3340,9 @@ fn permission_allow_outcome_resumes_turn() {
                     .to_string();
                 respond_client
                     .post(format!(
-                        "{}/v1/sessions/{}/responses/{}",
-                        base_url, id_for_stream, request_id,
+                        "{base_url}/v1/sessions/{id_for_stream}/responses/{request_id}",
                     ))
-                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Authorization", format!("Bearer {token}"))
                     .json(&serde_json::json!({"outcome": "allow"}))
                     .send()
                     .expect("respond");
@@ -3152,8 +3359,7 @@ fn permission_allow_outcome_resumes_turn() {
     );
     assert!(
         saw_finished,
-        "after `allow`, the turn must proceed to turn.finished; body was:\n{}",
-        body,
+        "after `allow`, the turn must proceed to turn.finished; body was:\n{body}",
     );
 }
 
@@ -3162,16 +3368,16 @@ fn permission_allow_outcome_resumes_turn() {
 fn messages_pagination_offset_limit() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first response" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first response" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second response" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second response" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "third response" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "third response" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3186,7 +3392,7 @@ fn messages_pagination_offset_limit() {
         .to_string();
     for message in ["one", "two", "three"] {
         let response = harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
             .json(&serde_json::json!({"message": message}))
             .send()
             .expect("turn");
@@ -3194,24 +3400,20 @@ fn messages_pagination_offset_limit() {
     }
 
     let all = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("messages all");
     let body: serde_json::Value = all.json().expect("parse");
     let total = body["total"].as_u64().expect("total");
     assert!(
         total >= 6,
-        "three turns × (user + assistant) ⇒ ≥6 messages; got {}",
-        total,
+        "three turns × (user + assistant) ⇒ ≥6 messages; got {total}",
     );
 
     let page = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages?limit=2&offset=1", id),
+            &format!("/v1/sessions/{id}/messages?limit=2&offset=1"),
         )
         .send()
         .expect("messages page");
@@ -3220,11 +3422,7 @@ fn messages_pagination_offset_limit() {
         .as_array()
         .expect("messages array")
         .len();
-    assert_eq!(
-        page_len, 2,
-        "limit=2 must yield 2 messages; got {}",
-        page_len
-    );
+    assert_eq!(page_len, 2, "limit=2 must yield 2 messages; got {page_len}");
     assert_eq!(
         page_body["total"].as_u64(),
         Some(total),
@@ -3248,7 +3446,7 @@ fn unknown_request_id_returns_404_request_not_found() {
     let response = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/responses/req-nonexistent", id),
+            &format!("/v1/sessions/{id}/responses/req-nonexistent"),
         )
         .json(&serde_json::json!({"outcome": "allow"}))
         .send()
@@ -3258,15 +3456,251 @@ fn unknown_request_id_returns_404_request_not_found() {
     assert_eq!(body["type"], "https://meka.so/errors/request-not-found");
 }
 
+/// Answering a prompt at a sub-agent's id is refused as undrivable, not reported as an unknown
+/// request.
+///
+/// A worker is never resident in the server's map, so the resident lookup answered 404
+/// `request-not-found` for it, which invites the client to check the id and try again: no request
+/// will ever be found under that id, because a worker's prompts are parked on its parent. The
+/// documented answer, and the one every sibling door gives, is 422 `session-not-drivable`.
+#[test]
+fn answering_a_prompt_at_a_worker_id_is_refused_as_undrivable() {
+    // The parent's `agent_spawn` call, the worker's reply, then the parent's closing text.
+    let harness = ServeTestHarness::spawn(
+        "",
+        serde_json::json!([
+            [
+                { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+                { "type": "tool_use_end", "input": {"prompt": "count the files"} },
+                { "type": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "type": "text", "text": "worker done" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ],
+            [
+                { "type": "text", "text": "dispatched" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]),
+    );
+    let parent = session_with_one_turn(&harness);
+    let listing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions?include_children=true")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let worker = listing["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|row| row["parent_id"].as_str() == Some(parent.as_str()))
+        .map(|row| row["id"].as_str().expect("id").to_string())
+        .unwrap_or_else(|| panic!("the spawn should have left a worker under {parent}: {listing}"));
+
+    let refused = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{worker}/responses/req-anything"),
+        )
+        .json(&serde_json::json!({"outcome": "allow"}))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        422,
+        "a worker has no prompt of its own to answer, and never will"
+    );
+    let problem: serde_json::Value = refused.json().expect("parse");
+    assert_eq!(
+        problem["type"].as_str(),
+        Some("https://meka.so/errors/session-not-drivable"),
+        "and it says so, rather than inviting a retry with another request id: {problem}"
+    );
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&parent),
+        "the refusal must name the session the prompt is parked on: {problem}"
+    );
+}
+
+/// A session whose row records no level omits `permission` rather than answering `""`.
+///
+/// No door of this meka writes such a row, so the test makes one by hand, on a session the GC has
+/// evicted: while a session is resident the level comes from its cells and the column is never
+/// read. An empty string is not a level, and a client that parsed it as one got a value nothing
+/// ever ran at.
+#[test]
+fn a_row_that_records_no_level_omits_permission() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let id = create_session_id(&harness);
+    harness.wait_until_evicted(&id);
+
+    let store =
+        rusqlite::Connection::open(harness.install.database()).expect("open the server's store");
+    store
+        .busy_timeout(Duration::from_secs(5))
+        .expect("set a busy timeout");
+    let erased = store
+        .execute("UPDATE sessions SET permission = NULL WHERE id = ?1", [&id])
+        .expect("erase the recorded level");
+    assert_eq!(erased, 1, "the session row must exist to be made bare");
+
+    let shown: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        shown.get("permission").is_none(),
+        "a level nobody recorded must be omitted, not invented: {shown}"
+    );
+
+    let listing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let row = listing["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|row| row["id"].as_str() == Some(id.as_str()))
+        .unwrap_or_else(|| panic!("the session should still be listed: {listing}"));
+    assert!(
+        row.get("permission").is_none(),
+        "and the listing agrees with the single-session view: {row}"
+    );
+}
+
+/// A session whose row records no working directory omits `cwd` rather than answering `null`.
+///
+/// Every door of this meka records one, so the test erases it by hand on an evicted session, the
+/// state an archive that carried no `cwd` imports into. The row's fields are one shape shared with
+/// `meka session show --format json`, and this is the rule that shape keeps for every optional.
+#[test]
+fn a_row_that_records_no_cwd_omits_it() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let id = create_session_id(&harness);
+    harness.wait_until_evicted(&id);
+
+    let store =
+        rusqlite::Connection::open(harness.install.database()).expect("open the server's store");
+    store
+        .busy_timeout(Duration::from_secs(5))
+        .expect("set a busy timeout");
+    let erased = store
+        .execute("UPDATE sessions SET cwd = NULL WHERE id = ?1", [&id])
+        .expect("erase the recorded working directory");
+    assert_eq!(erased, 1, "the session row must exist to be made bare");
+
+    let shown: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert!(
+        shown.get("cwd").is_none(),
+        "a working directory nobody recorded must be omitted, not null: {shown}"
+    );
+    assert_eq!(
+        shown["id"], id,
+        "the rest of the row is still answered: {shown}"
+    );
+    assert_eq!(shown["turn_in_flight"], false);
+
+    let listing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let row = listing["sessions"]
+        .as_array()
+        .expect("a sessions array")
+        .iter()
+        .find(|row| row["id"].as_str() == Some(id.as_str()))
+        .unwrap_or_else(|| panic!("the session should still be listed: {listing}"));
+    assert!(
+        row.get("cwd").is_none(),
+        "the listing omits it on the same terms: {row}"
+    );
+}
+
+/// Answering a prompt on an evicted session does not revive it. A pending request can only live in
+/// a resident frontend, so a non-resident session has nothing to resolve; reconstructing it to
+/// learn that took its cross-process lock for `idle_timeout` and pinned it in memory, which let a
+/// `sessions:w` holder lock an operator out of every session with bogus request ids.
+#[test]
+fn answering_a_prompt_on_an_evicted_session_does_not_revive_it() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    harness.wait_until_evicted(&id);
+
+    let response = harness
+        .request(
+            reqwest::Method::POST,
+            &format!("/v1/sessions/{id}/responses/req-nonexistent"),
+        )
+        .json(&serde_json::json!({"outcome": "allow"}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 404);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(body["type"], "https://meka.so/errors/request-not-found");
+
+    // Still evicted: `/context` answers with no `message_count` for a session that is not resident.
+    let context: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
+        .send()
+        .expect("probe")
+        .json()
+        .expect("parse");
+    assert!(
+        context["message_count"].is_null(),
+        "the answer revived the session: {context}"
+    );
+}
+
 /// A second concurrent POST with the same Idempotency-Key receives 409 idempotency-conflict
 /// while the first request is still running (Pending sentinel).
 #[test]
 fn idempotency_key_in_flight_returns_409() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 1200 },
-            { "kind": "text", "text": "first done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1200 },
+            { "type": "text", "text": "first done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3289,8 +3723,8 @@ fn idempotency_key_in_flight_returns_409() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_first))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_for_first}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .header("Idempotency-Key", "in-flight-key")
             .json(&serde_json::json!({"message": "first"}))
             .send()
@@ -3301,7 +3735,7 @@ fn idempotency_key_in_flight_returns_409() {
     // cache, since it is written before the turn is dispatched.
     harness.wait_until_in_flight(&id);
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", "in-flight-key")
         .json(&serde_json::json!({"message": "first"}))
         .send()
@@ -3333,7 +3767,7 @@ fn turn_options_unknown_skill_returns_422() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "go",
             "options": {"skill": "this-skill-does-not-exist"},
@@ -3356,7 +3790,7 @@ fn turn_options_unknown_skill_returns_422() {
 fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
     let harness =
         ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
-    let broken = harness.home().join("meka").join("skills").join("wrecked");
+    let broken = harness.root().join("meka").join("skills").join("wrecked");
     std::fs::create_dir_all(&broken).expect("mkdir");
     std::fs::write(
         broken.join("SKILL.md"),
@@ -3375,7 +3809,7 @@ fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
         .to_string();
 
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "go",
             "options": {"skill": "wrecked"},
@@ -3392,6 +3826,61 @@ fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
     assert!(detail.contains("frontmatter"), "{body}");
 }
 
+/// A skill invoked with no message runs the skill body alone, the way `--skill` with no prompt and
+/// the REPL's `/skill` do, rather than being refused as an empty turn or sent under a blank line.
+#[test]
+fn a_turn_naming_a_skill_with_no_message_runs_the_skill_body_alone() {
+    let harness =
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+    let borrowed = harness.root().join("meka").join("skills").join("borrowed");
+    std::fs::create_dir_all(&borrowed).expect("mkdir");
+    std::fs::write(
+        borrowed.join("SKILL.md"),
+        "---\nname: borrowed\ndescription: theirs\n---\nTHEIRS\n",
+    )
+    .expect("seed");
+    let id = create_session_id(&harness);
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "",
+            "options": {"skill": "borrowed"},
+            "stream": false,
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(
+        response.status(),
+        200,
+        "a skill is a prompt: {}",
+        response.text().unwrap_or_default()
+    );
+
+    let messages: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    let first_user = messages["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("the turn's user message");
+    let text = message_text(first_user);
+    // The agent's context block precedes the words; the words are the skill body and nothing else.
+    let (_, words) = text
+        .rsplit_once("</context>")
+        .expect("the context block precedes the words");
+    assert!(
+        words.starts_with("\n\nBase directory for this skill"),
+        "no blank line above the body: {words:?}"
+    );
+    assert!(words.trim_end().ends_with("THEIRS"), "{words:?}");
+}
+
 /// Unknown fields under `options` produce 422 invalid-body.
 #[test]
 fn turn_options_unknown_field_returns_422() {
@@ -3406,7 +3895,7 @@ fn turn_options_unknown_field_returns_422() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "go",
             "options": {"definitely_not_a_real_field": true},
@@ -3418,15 +3907,15 @@ fn turn_options_unknown_field_returns_422() {
     assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
 }
 
-/// DELETE on a session with an active turn returns 409 turn-in-flight.
-/// Clients are expected to POST /cancel first.
+/// DELETE on a session with an active turn returns 409 turn-in-flight. Clients are expected to POST
+/// /cancel first.
 #[test]
 fn delete_while_turn_in_flight_returns_409() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3449,8 +3938,8 @@ fn delete_while_turn_in_flight_returns_409() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_clone))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_clone}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "go"}))
             .send()
             .expect("turn send")
@@ -3459,7 +3948,7 @@ fn delete_while_turn_in_flight_returns_409() {
     // Wait for the turn to enter its mock sleep, then attempt DELETE.
     harness.wait_until_in_flight(&id);
     let delete = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
         .send()
         .expect("delete");
     assert_eq!(
@@ -3475,7 +3964,7 @@ fn delete_while_turn_in_flight_returns_409() {
 
     // Now DELETE should succeed (turn has finished).
     let delete_after = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
         .send()
         .expect("delete after");
     assert_eq!(delete_after.status(), 204);
@@ -3504,12 +3993,12 @@ fn delete_without_write_scope_returns_403() {
 fn created_at_survives_gc_and_reattach() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn_with(
@@ -3534,18 +4023,17 @@ fn created_at_survives_gc_and_reattach() {
 
     // Run a turn to ensure the session has DB activity.
     let first = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi"}))
         .send()
         .expect("first turn");
     assert_eq!(first.status(), 200);
 
-    // Wait for GC eviction.
-    std::thread::sleep(Duration::from_secs(3));
+    harness.wait_until_evicted(&id);
 
     // Trigger re-attach.
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "again"}))
         .send()
         .expect("second turn");
@@ -3553,7 +4041,7 @@ fn created_at_survives_gc_and_reattach() {
 
     // GET the session and verify created_at is unchanged.
     let get = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("get");
     assert_eq!(get.status(), 200);
@@ -3579,7 +4067,7 @@ fn turn_request_unknown_top_level_field_returns_422() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({
             "message": "hi",
             "streem": false,  // typo
@@ -3591,8 +4079,8 @@ fn turn_request_unknown_top_level_field_returns_422() {
     assert_eq!(body["type"], "https://meka.so/errors/invalid-body");
 }
 
-/// A PATCH that mixes a valid field with an invalid one must reject the request
-/// without applying *either* change (atomic validation).
+/// A PATCH that mixes a valid field with an invalid one must reject the request without applying
+/// *either* change (atomic validation).
 #[test]
 fn patch_session_atomic_rejects_when_cwd_is_invalid() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
@@ -3610,7 +4098,7 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
 
     // Mixed-validity PATCH: permission flips to "unrestricted" (valid), cwd is relative (invalid).
     let patch = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
         .json(&serde_json::json!({
             "permission": "unrestricted",
             "cwd": "relative/path",
@@ -3623,7 +4111,7 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
 
     // GET the session and verify the permission change did NOT leak through.
     let get = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("get");
     assert_eq!(get.status(), 200);
@@ -3634,8 +4122,8 @@ fn patch_session_atomic_rejects_when_cwd_is_invalid() {
     );
 }
 
-/// The three discovery endpoints share a single read-scope helper. A token
-/// holding any one of `sessions:r`, `mcp:r`, or `skills:r` must be admitted on all three.
+/// The three discovery endpoints share a single read-scope helper. A token holding any one of
+/// `sessions:r`, `mcp:r`, or `skills:r` must be admitted on all three.
 #[test]
 fn discovery_endpoints_share_read_scope_set() {
     // Token scoped to `mcp:r` only: must be admitted on all three discovery endpoints.
@@ -3649,8 +4137,7 @@ fn discovery_endpoints_share_read_scope_set() {
         assert_eq!(
             response.status(),
             200,
-            "mcp:r token must be admitted on {}",
-            path,
+            "mcp:r token must be admitted on {path}",
         );
     }
 }
@@ -3671,8 +4158,7 @@ fn discovery_endpoints_admit_skills_only_token() {
         assert_eq!(
             response.status(),
             200,
-            "skills:r token must be admitted on {}",
-            path,
+            "skills:r token must be admitted on {path}",
         );
     }
 }
@@ -3699,12 +4185,11 @@ fn delete_on_idle_true_removes_db_row_on_eviction() {
         .expect("id")
         .to_string();
 
-    // Wait past the idle timeout for GC to fire.
-    std::thread::sleep(Duration::from_secs(3));
+    harness.wait_until_gone(&id);
 
-    // The DB row should now be gone; GET returns 404 (not a re-attach).
+    // The DB row is gone; GET keeps answering 404 rather than re-attaching.
     let get = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("get");
     assert_eq!(
@@ -3723,13 +4208,13 @@ fn delete_on_idle_true_removes_db_row_on_eviction() {
 fn idempotency_cache_does_not_persist_turn_in_flight_409() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 1200 },
-            { "kind": "text", "text": "first done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1200 },
+            { "type": "text", "text": "first done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "retry done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "retry done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3753,8 +4238,8 @@ fn idempotency_cache_does_not_persist_turn_in_flight_409() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_a))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_for_a}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "long"}))
             .send()
             .expect("first send")
@@ -3767,7 +4252,7 @@ fn idempotency_cache_does_not_persist_turn_in_flight_409() {
     // turn-in-flight. The Pending entry must be dropped, not committed to the cache.
     let key = "retry-after-in-flight";
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", key)
         .json(&serde_json::json!({"message": "second"}))
         .send()
@@ -3787,7 +4272,7 @@ fn idempotency_cache_does_not_persist_turn_in_flight_409() {
     // Replay turn C with the same key. The Pending entry was dropped (no cache commit on
     // TurnInFlight), so this re-executes and the mock returns the second round.
     let third = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", key)
         .json(&serde_json::json!({"message": "second"}))
         .send()
@@ -3808,13 +4293,13 @@ fn idempotency_cache_does_not_persist_turn_in_flight_409() {
 fn blocking_turn_response_carries_tool_calls_messages_and_usage() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "list_directory" },
-            { "kind": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done listing" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done listing" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3828,7 +4313,7 @@ fn blocking_turn_response_carries_tool_calls_messages_and_usage() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "list it"}))
         .send()
         .expect("turn");
@@ -3898,8 +4383,8 @@ fn write_only_token_cannot_read_sessions() {
 fn refusal_stop_reason_propagates_through_blocking_response() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "I can't help with that." },
-            { "kind": "message_end", "stop_reason": "refusal" }
+            { "type": "text", "text": "I can't help with that." },
+            { "type": "message_end", "stop_reason": "refusal" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3913,7 +4398,7 @@ fn refusal_stop_reason_propagates_through_blocking_response() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "do something disallowed"}))
         .send()
         .expect("turn");
@@ -3937,14 +4422,14 @@ fn streaming_turn_event_ids_are_dense_and_monotonic() {
     // adding more "lifecycle" events the streaming handler emits directly.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "thinking aloud " },
-            { "kind": "tool_use_start", "id": "tu_1", "name": "list_directory" },
-            { "kind": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "text", "text": "thinking aloud " },
+            { "type": "tool_use_start", "id": "tu_1", "name": "list_directory" },
+            { "type": "tool_use_end", "input": {"path": std::env::temp_dir().to_string_lossy()} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -3958,7 +4443,7 @@ fn streaming_turn_event_ids_are_dense_and_monotonic() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "go", "stream": true}))
         .send()
         .expect("send");
@@ -3974,50 +4459,46 @@ fn streaming_turn_event_ids_are_dense_and_monotonic() {
         .collect();
     assert!(
         !ids.is_empty(),
-        "streaming turn must emit at least one id-bearing event; body was:\n{}",
-        body,
+        "streaming turn must emit at least one id-bearing event; body was:\n{body}",
     );
     assert_eq!(
         ids[0], 0,
-        "first event id must be 0 per spec example; ids were {:?}",
-        ids,
+        "first event id must be 0 per spec example; ids were {ids:?}",
     );
     for window in ids.windows(2) {
         let [a, b] = [window[0], window[1]];
         assert_eq!(
             b,
             a + 1,
-            "event ids must be dense (no gaps from filtered events); saw {:?}",
-            ids,
+            "event ids must be dense (no gaps from filtered events); saw {ids:?}",
         );
     }
 }
 
-/// Sticky `allow_always` short-circuits subsequent same-tool prompts.  After
-/// the client resolves the first `permission_required` with `outcome: allow_always`, the
-/// SECOND tool call in the same turn must auto-allow without emitting another
-/// `permission_required` event.
+/// Sticky `allow_always` short-circuits subsequent same-tool prompts.  After the client resolves
+/// the first `permission_required` with `outcome: allow_always`, the SECOND tool call in the same
+/// turn must auto-allow without emitting another `permission_required` event.
 #[test]
 fn sticky_allow_always_short_circuits_second_tool_call() {
     // Two tool_use rounds of the same write-tier tool + a terminal text round. `write_file`
-    // is gated by ask mode; `list_directory` would short-circuit as read-tier without
-    // prompting and miss the point of the test.
+    // is above `read`, so approvals gate it; `list_directory` would short-circuit as read-tier
+    // without prompting and miss the point of the test.
     let write_path = std::env::temp_dir().join("meka-test-sticky.txt");
     let _ = std::fs::remove_file(&write_path);
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {"path": write_path.to_string_lossy(), "content": "first"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": write_path.to_string_lossy(), "content": "first"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "tool_use_start", "id": "tu_2", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {"path": write_path.to_string_lossy(), "content": "second"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_2", "name": "write_file" },
+            { "type": "tool_use_end", "input": {"path": write_path.to_string_lossy(), "content": "second"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done twice" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done twice" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -4025,7 +4506,8 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "permission": "ask",
+            "permission": "read",
+            "approvals": true,
         }))
         .send()
         .expect("create");
@@ -4035,15 +4517,15 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
         .to_string();
     let base_url = harness.base_url.clone();
     let token = harness.token.clone();
-    let id_for_stream = id.clone();
+    let id_for_stream = id;
     let stream_handle = std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("client");
         let response = client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_stream))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_for_stream}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "do it twice", "stream": true}))
             .send()
             .expect("stream POST");
@@ -4083,16 +4565,15 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
                     .as_str()
                     .expect("request_id")
                     .to_string();
-                let resp = respond_client
+                let response = respond_client
                     .post(format!(
-                        "{}/v1/sessions/{}/responses/{}",
-                        base_url, id_for_stream, request_id,
+                        "{base_url}/v1/sessions/{id_for_stream}/responses/{request_id}",
                     ))
-                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Authorization", format!("Bearer {token}"))
                     .json(&serde_json::json!({"outcome": "allow_always"}))
                     .send()
                     .expect("respond send");
-                assert_eq!(resp.status(), 204);
+                assert_eq!(response.status(), 204);
                 posted_resolution = true;
             }
         }
@@ -4109,27 +4590,25 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
     assert!(posted_resolution, "client must have posted allow_always");
     assert!(
         saw_finished,
-        "turn must finish after both tool calls; body was:\n{}",
-        body
+        "turn must finish after both tool calls; body was:\n{body}"
     );
     assert_eq!(
         permission_required_count, 1,
-        "sticky allow_always must short-circuit the second tool prompt, saw {} \
-         permission_required events; body was:\n{}",
-        permission_required_count, body
+        "sticky allow_always must short-circuit the second tool prompt, saw {permission_required_count} \
+         permission_required events; body was:\n{body}"
     );
 }
 
-/// When `supports_reasoning_stream` is on, the blocking response includes
-/// thinking content blocks in `messages[].content`.
+/// When `supports_reasoning_stream` is on, the blocking response includes thinking content blocks
+/// in `messages[].content`.
 #[test]
 fn blocking_turn_with_reasoning_stream_includes_thinking() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "let me reason about this" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "answer." },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "let me reason about this" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "answer." },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -4147,7 +4626,7 @@ fn blocking_turn_with_reasoning_stream_includes_thinking() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "think then answer"}))
         .send()
         .expect("turn");
@@ -4172,9 +4651,9 @@ fn blocking_turn_with_reasoning_stream_includes_thinking() {
 fn cancel_during_blocking_turn_returns_409_turn_cancelled() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 2000 },
-            { "kind": "text", "text": "never reaches client" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "never reaches client" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -4198,8 +4677,8 @@ fn cancel_during_blocking_turn_returns_409_turn_cancelled() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_for_turn))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_for_turn}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "go"}))
             .send()
             .expect("turn send")
@@ -4207,10 +4686,7 @@ fn cancel_during_blocking_turn_returns_409_turn_cancelled() {
 
     harness.wait_until_in_flight(&id);
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("cancel send");
     assert_eq!(cancel.status(), 204);
@@ -4225,18 +4701,80 @@ fn cancel_during_blocking_turn_returns_409_turn_cancelled() {
     assert_eq!(problem["type"], "https://meka.so/errors/turn-cancelled");
 }
 
-/// Ask mode + `stream: false` is a non-functional combination (every tool would auto-deny).
-/// Ask-mode + blocking turn runs to completion; tool prompts are auto-denied with notices.
-/// (No tool calls in this fixture, so the turn succeeds cleanly; the auto-deny pathway is
-/// exercised by `ask_mode_blocking_turn_auto_denies_with_notice`.)
+/// The auto-deny path itself: a scripted tool call above the level, with approvals on and
+/// `stream: false`, has no channel to approve on, so the call is refused and the response says so
+/// in a notice rather than silently.
 #[test]
-fn ask_mode_blocking_turn_succeeds() {
+fn blocking_turn_with_approvals_auto_denies_with_notice() {
+    let harness = ServeTestHarness::spawn(
+        "",
+        serde_json::json!([
+            [
+                { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+                { "type": "tool_use_end", "input": {"path": "denied.txt", "content": "x"} },
+                { "type": "message_end", "stop_reason": "tool_use" }
+            ],
+            [
+                { "type": "text", "text": "denied, stopping" },
+                { "type": "message_end", "stop_reason": "end_turn" }
+            ]
+        ]),
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({
+            "cwd": harness.root().to_string_lossy(),
+            "permission": "read",
+            "approvals": true,
+        }))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let turn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "write it", "stream": false}))
+        .send()
+        .expect("turn");
+    assert_eq!(turn.status(), 200);
+    let body: serde_json::Value = turn.json().expect("parse");
+    let notices = body["notices"].as_array().expect("notices array");
+    assert!(
+        notices.iter().any(|notice| {
+            notice["level"] == "warn"
+                && notice["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("auto-denied"))
+        }),
+        "the denial must be announced as a warn notice; got {body}"
+    );
+    assert_eq!(
+        body["tool_calls"][0]["is_error"], true,
+        "the refused call is reported as an error, not as having run"
+    );
+    assert!(
+        !harness.root().join("denied.txt").exists(),
+        "the tool must not have run"
+    );
+}
+
+/// Approvals on + `stream: false` is a non-functional combination (every tool would auto-deny).
+/// The blocking turn still runs to completion; tool prompts are auto-denied with notices.
+/// No tool calls in this fixture, so the turn succeeds cleanly; the auto-deny pathway is
+/// exercised by `blocking_turn_with_approvals_auto_denies_with_notice` above.
+#[test]
+fn blocking_turn_with_approvals_succeeds() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "permission": "ask",
+            "permission": "read",
+            "approvals": true,
         }))
         .send()
         .expect("create");
@@ -4246,25 +4784,25 @@ fn ask_mode_blocking_turn_succeeds() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "do it", "stream": false}))
         .send()
         .expect("turn");
     assert_eq!(
         response.status(),
         200,
-        "ask-mode + blocking should succeed (tools auto-denied with notices, not rejected)"
+        "approvals + blocking should succeed (tools auto-denied with notices, not rejected)"
     );
 }
 
-/// All terminal SSE events carry `turn_id` and `session_id` so clients can
-/// correlate the terminal frame back to its `turn.started`.
+/// All terminal SSE events carry `turn_id` and `session_id` so clients can correlate the terminal
+/// frame back to its `turn.started`.
 #[test]
 fn terminal_sse_events_carry_turn_id_and_session_id() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "ok" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ok" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -4278,7 +4816,7 @@ fn terminal_sse_events_carry_turn_id_and_session_id() {
         .expect("id")
         .to_string();
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send");
@@ -4294,8 +4832,7 @@ fn terminal_sse_events_carry_turn_id_and_session_id() {
     assert_eq!(payload["session_id"], id);
     assert!(
         payload["turn_id"].is_string(),
-        "turn.finished must include turn_id; payload: {}",
-        payload,
+        "turn.finished must include turn_id; payload: {payload}",
     );
 }
 
@@ -4304,12 +4841,12 @@ fn terminal_sse_events_carry_turn_id_and_session_id() {
 fn responses_body_unknown_field_returns_422() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {
                 "path": std::env::temp_dir().join("meka-l10-test").to_string_lossy(),
                 "content": "x"
             }},
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -4317,7 +4854,8 @@ fn responses_body_unknown_field_returns_422() {
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "permission": "ask",
+            "permission": "read",
+            "approvals": true,
         }))
         .send()
         .expect("create");
@@ -4325,13 +4863,13 @@ fn responses_body_unknown_field_returns_422() {
         .as_str()
         .expect("id")
         .to_string();
-    // Fire a stream so the permission_required event hits the channel, then post a
-    // request_id with an unknown extra field. The request_id doesn't even have to be valid;
-    // the body-parse rejection happens first.
+    // Fire a stream so the permission_required event hits the channel, then post a request_id with
+    // an unknown extra field. The request_id doesn't even have to be valid; the body-parse
+    // rejection happens first.
     let response = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/responses/req_bogus", id),
+            &format!("/v1/sessions/{id}/responses/req_bogus"),
         )
         .json(&serde_json::json!({"outcome": "allow", "extra": "garbage"}))
         .send()
@@ -4345,21 +4883,25 @@ fn responses_body_unknown_field_returns_422() {
     assert_eq!(problem["type"], "https://meka.so/errors/invalid-body");
 }
 
-/// When a turn is cancelled mid-tool-execution, `ToolCallStarted` arrives without a matching
-/// `ToolCallCompleted`. Orphan entries are marked `is_error: true` with an explanatory text block.
+/// A cancel that lands while the model is still composing a tool call must not leave that
+/// `tool_use` in the store: the next request would carry it without a result and be refused.
+///
+/// The observable is the conversation afterwards, read back over `GET /messages`, because a
+/// canceled blocking turn answers 409 with a problem body and carries no `tool_calls` view to
+/// inspect. The turn is held open by the mock's sleep after `tool_use_end`, so the cancel arrives
+/// with the call composed and nothing run.
 #[test]
-fn orphan_tool_call_marked_as_interrupted_in_blocking_response() {
-    // Two-round script: round 1 starts a tool, the agent loop runs it, then we cancel.
-    // The mock has a sleep after tool_use_end so the cancel fires during execution.
+fn cancel_mid_tool_call_leaves_no_orphaned_tool_use_in_the_store() {
+    let target = std::env::temp_dir().join(format!("meka-orphan-{}.txt", uuid::Uuid::new_v4()));
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "kind": "tool_use_end", "input": {
-                "path": std::env::temp_dir().join("meka-l8.txt").to_string_lossy(),
+            { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
+            { "type": "tool_use_end", "input": {
+                "path": target.to_string_lossy(),
                 "content": "x"
             }},
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "sleep", "ms": 1500 },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -4373,7 +4915,6 @@ fn orphan_tool_call_marked_as_interrupted_in_blocking_response() {
         .expect("id")
         .to_string();
 
-    // Fire a blocking turn in a thread, cancel from main thread after a beat.
     let base = harness.base_url.clone();
     let token = harness.token.clone();
     let id_for_turn = id.clone();
@@ -4383,37 +4924,53 @@ fn orphan_tool_call_marked_as_interrupted_in_blocking_response() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base, id_for_turn))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base}/v1/sessions/{id_for_turn}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "go", "stream": false}))
             .send()
             .expect("turn send")
     });
 
-    // Sleep so the mock starts emitting the tool_use_start (recorder captures it), then
-    // cancel before the mock's sleep finishes.
     harness.wait_until_in_flight(&id);
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("cancel");
     assert_eq!(cancel.status(), 204);
 
     let response = turn_handle.join().expect("join");
-    // Cancelled turns return 409 with a Problem Detail body (not a TurnResponse), so the
-    // orphan-tool content assertion can't be checked via the cancel path here.
-    assert!(
-        response.status() == 409 || response.status() == 200,
-        "expected 409 (turn-cancelled) or 200 (turn finished before cancel); got {}",
+    assert_eq!(
         response.status(),
+        409,
+        "a turn cancelled mid-composition is reported as cancelled"
+    );
+    let problem: serde_json::Value = response.json().expect("parse");
+    assert_eq!(problem["type"], "https://meka.so/errors/turn-cancelled");
+
+    let messages: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("messages")
+        .json()
+        .expect("parse");
+    let blocks: Vec<&serde_json::Value> = messages["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        blocks.iter().all(|block| block["type"] != "tool_use"),
+        "an interrupted turn must not persist a tool_use with no result; got {messages}"
+    );
+    assert!(
+        !target.exists(),
+        "the tool must not have run: the cancel arrived before dispatch"
     );
 }
 
-/// Authenticated handlers' OpenAPI annotations include 403/409/500 where applicable,
-/// and `delete_session` no longer documents 404 (it returns 204 idempotently).
+/// Authenticated handlers' OpenAPI annotations include 403/409/500 where applicable, and
+/// `delete_session` documents no 404 (it returns 204 idempotently).
 #[test]
 fn openapi_spec_documents_403_409_and_no_stale_404_on_delete() {
     let harness = ServeTestHarness::spawn("docs = true\n", mock_simple_turn());
@@ -4441,10 +4998,7 @@ fn openapi_spec_documents_403_409_and_no_stale_404_on_delete() {
         let responses = &paths[path][method]["responses"];
         assert!(
             responses["403"].is_object(),
-            "OpenAPI {} {} should declare a 403 response; got {:?}",
-            method,
-            path,
-            responses
+            "OpenAPI {method} {path} should declare a 403 response; got {responses:?}"
         );
     }
 
@@ -4461,14 +5015,13 @@ fn openapi_spec_documents_403_409_and_no_stale_404_on_delete() {
     // DELETE returns 204 idempotently; no 404 in the spec.
     assert!(
         paths["/v1/sessions/{id}"]["delete"]["responses"]["404"].is_null(),
-        "DELETE should no longer document 404 (idempotent, 204 for unknown ids)",
+        "DELETE must not document 404 (idempotent, 204 for unknown ids)",
     );
 }
 
-/// Every `Option<T>` in the wire-shape structs is absent (not `null`)
-/// when `None`. `cwd` on GET is always populated (it defaults to the server's cwd), so
-/// the cleaner assertion is to check `display_summary` and `refusal_text` on a turn that
-/// produces neither.
+/// Every `Option<T>` in the wire-shape structs is absent (not `null`) when `None`. `cwd` on GET is
+/// always populated (it defaults to the server's cwd), so the cleaner assertion is to check
+/// `display_summary` and `refusal_text` on a turn that produces neither.
 #[test]
 fn option_fields_are_absent_not_null_when_unset() {
     // mock_simple_turn produces a turn with no tool calls and no refusal; refusal_text
@@ -4485,18 +5038,17 @@ fn option_fields_are_absent_not_null_when_unset() {
         .to_string();
     // Before the first turn, last_turn_at should be absent (not serialized as null).
     let pre_turn = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("pre-turn get");
     let pre_turn_text = pre_turn.text().expect("text");
     assert!(
         !pre_turn_text.contains("\"last_turn_at\""),
-        "last_turn_at must be absent before the first turn; body was:\n{}",
-        pre_turn_text,
+        "last_turn_at must be absent before the first turn; body was:\n{pre_turn_text}",
     );
 
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi"}))
         .send()
         .expect("turn");
@@ -4505,13 +5057,12 @@ fn option_fields_are_absent_not_null_when_unset() {
     // refusal_text must be absent (not serialized as null) on non-refusal outcomes.
     assert!(
         !body_text.contains("\"refusal_text\":null"),
-        "refusal_text must be absent (not null) on non-refusal turns; body was:\n{}",
-        body_text,
+        "refusal_text must be absent (not null) on non-refusal turns; body was:\n{body_text}",
     );
     // tool_calls is an empty array for this turn, so display_summary won't appear at all
     // here, but verify that the SessionResponse.cwd field on GET is a string, not null.
     let get = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("get");
     let session_text = get.text().expect("text");
@@ -4536,19 +5087,19 @@ fn option_fields_are_absent_not_null_when_unset() {
 fn a_scheduled_turn_marks_the_session_in_flight() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
-            { "kind": "tool_use_end", "input": { "prompt": "later", "at": "2s" }},
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": { "prompt": "later", "at": "2s" }},
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "scheduled it" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "scheduled it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // The fire itself, held open long enough to observe the flag from outside.
         [
-            { "kind": "sleep", "ms": 3000 },
-            { "kind": "text", "text": "fired" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 3000 },
+            { "type": "text", "text": "fired" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"1s\"\n", script);
@@ -4564,7 +5115,7 @@ fn a_scheduled_turn_marks_the_session_in_flight() {
         .to_string();
     assert_eq!(
         harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
             .json(&serde_json::json!({"message": "schedule something"}))
             .send()
             .expect("send")
@@ -4578,7 +5129,7 @@ fn a_scheduled_turn_marks_the_session_in_flight() {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
             .send()
             .expect("send")
             .json()
@@ -4587,7 +5138,7 @@ fn a_scheduled_turn_marks_the_session_in_flight() {
             seen_in_flight = true;
             // And the guards that read it must actually refuse while it is set.
             let deleted = harness
-                .request(reqwest::Method::DELETE, &format!("/v1/sessions/{}", id))
+                .request(reqwest::Method::DELETE, &format!("/v1/sessions/{id}"))
                 .send()
                 .expect("send");
             assert_eq!(
@@ -4616,21 +5167,21 @@ fn scheduled_job_fires_without_a_client_request() {
     let script = serde_json::json!([
         // Turn 1: the agent schedules a one-shot two seconds out.
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
-            { "kind": "tool_use_end", "input": {
+            { "type": "tool_use_start", "id": "tu_1", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
                 "prompt": "DELIVERED_PROMPT_MARKER",
                 "at": "2s"
             }},
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "scheduled it" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "scheduled it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // Turn 2 is the fire. Nothing on the client side asks for this one.
         [
-            { "kind": "text", "text": "SCHEDULED_REPLY_MARKER" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "SCHEDULED_REPLY_MARKER" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("\n[schedule]\npoll_interval = \"1s\"\n", script);
@@ -4646,7 +5197,7 @@ fn scheduled_job_fires_without_a_client_request() {
         .to_string();
 
     let scheduled = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "remind me in two seconds"}))
         .send()
         .expect("send");
@@ -4659,10 +5210,7 @@ fn scheduled_job_fires_without_a_client_request() {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
         let messages = harness
-            .request(
-                reqwest::Method::GET,
-                &format!("/v1/sessions/{}/messages", id),
-            )
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
             .send()
             .expect("messages");
         body = messages.text().expect("body");
@@ -4677,20 +5225,17 @@ fn scheduled_job_fires_without_a_client_request() {
     assert!(
         body.matches("DELIVERED_PROMPT_MARKER").count() >= 2,
         "the job's prompt must be delivered as a turn nobody requested, not just appear in the \
-         tool call that created it; messages were:\n{}",
-        body,
+         tool call that created it; messages were:\n{body}",
     );
     assert!(
         body.contains("Scheduled job"),
         "the delivered prompt must be marked as scheduled so the model knows no human is \
-         waiting; messages were:\n{}",
-        body,
+         waiting; messages were:\n{body}",
     );
     assert!(
         body.contains("SCHEDULED_REPLY_MARKER"),
         "the agent's reply to the scheduled turn must be persisted for a client to read back; \
-         messages were:\n{}",
-        body,
+         messages were:\n{body}",
     );
 }
 
@@ -4722,7 +5267,7 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
     let refused = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({
             "prompt": "check the feed",
@@ -4743,7 +5288,7 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
     let accepted = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "check the feed", "every": "1h"}))
         .send()
@@ -4757,9 +5302,8 @@ fn a_request_still_asking_for_isolation_is_refused_by_name() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Session capability endpoints: compact, context, rewind, export, import, and
-// the schedule / background-task surfaces.
+// --------------------------------------------------------------------------- Session capability
+// endpoints: compact, context, rewind, export, import, and the schedule / background-task surfaces.
 // ---------------------------------------------------------------------------
 
 /// Create a session and run one turn against it, returning the session id. Several of the
@@ -4775,7 +5319,7 @@ fn session_with_one_turn(harness: &ServeTestHarness) -> String {
     let id = created["id"].as_str().expect("id").to_string();
 
     let turn = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "first question"}))
         .send()
         .expect("send");
@@ -4794,8 +5338,8 @@ fn mock_turns(n: usize) -> serde_json::Value {
         (0..n)
             .map(|i| {
                 serde_json::json!([
-                    { "kind": "text", "text": format!("reply {}", i) },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": format!("reply {}", i) },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ])
             })
             .collect(),
@@ -4808,10 +5352,7 @@ fn context_endpoint_reports_window_and_totals() {
     let id = session_with_one_turn(&harness);
 
     let response = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send");
     assert_eq!(response.status(), 200);
@@ -4819,8 +5360,7 @@ fn context_endpoint_reports_window_and_totals() {
     assert_eq!(body["session_id"], id);
     assert!(
         body["message_count"].as_u64().expect("message_count") >= 2,
-        "one turn leaves at least a user and an assistant message: {}",
-        body
+        "one turn leaves at least a user and an assistant message: {body}"
     );
     assert_eq!(
         body["totals"]["turns"], 1,
@@ -4837,10 +5377,13 @@ fn context_endpoint_reports_window_and_totals() {
 #[test]
 fn context_window_follows_the_session_profile_not_the_server_default() {
     let harness = ServeTestHarness::spawn_with_prelude(
-        "default_provider = \"mock\"\n",
+        "default_profile = \"mock\"\n",
         r#"
-[providers.small]
-type = "anthropic-messages"
+[accounts.small]
+backend = "anthropic-messages"
+
+[profiles.small]
+account = "small"
 model = "claude-sonnet-4-5"
 context_window = 32000
 "#,
@@ -4853,7 +5396,7 @@ context_window = 32000
             .request(reqwest::Method::POST, "/v1/sessions")
             .json(&serde_json::json!({
                 "cwd": std::env::temp_dir().to_string_lossy(),
-                "provider": provider,
+                "profile": provider,
             }))
             .send()
             .expect("send");
@@ -4869,10 +5412,7 @@ context_window = 32000
             .to_string();
 
         let context: serde_json::Value = harness
-            .request(
-                reqwest::Method::GET,
-                &format!("/v1/sessions/{}/context", id),
-            )
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
             .send()
             .expect("send")
             .json()
@@ -4905,23 +5445,18 @@ fn context_endpoint_omits_used_before_any_turn() {
     let id = created["id"].as_str().expect("id");
 
     let body: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
     assert!(
         body.get("used").is_none(),
-        "an unmeasured window must omit `used`, not report 0: {}",
-        body
+        "an unmeasured window must omit `used`, not report 0: {body}"
     );
     assert!(
         body.get("used_percent").is_none(),
-        "occupancy cannot be computed without `used`: {}",
-        body
+        "occupancy cannot be computed without `used`: {body}"
     );
 }
 
@@ -4938,10 +5473,7 @@ fn context_endpoint_requires_sessions_read_scope() {
     let id = created["id"].as_str().expect("id");
 
     let response = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send");
     assert_eq!(response.status(), 403);
@@ -4952,12 +5484,11 @@ fn context_endpoint_requires_sessions_read_scope() {
             .as_str()
             .unwrap_or_default()
             .contains("sessions:r"),
-        "the rejection must name the scope the caller is missing: {}",
-        body
+        "the rejection must name the scope the caller is missing: {body}"
     );
 }
 
-/// Compaction with the checkpoint turn off exercises the standalone summariser, which needs one
+/// Compaction with the checkpoint turn off exercises the standalone summarizer, which needs one
 /// extra provider round beyond the turn itself.
 #[test]
 fn compact_replaces_the_window_with_a_summary() {
@@ -4966,10 +5497,7 @@ fn compact_replaces_the_window_with_a_summary() {
     let id = session_with_one_turn(&harness);
 
     let before: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json()
@@ -4977,10 +5505,7 @@ fn compact_replaces_the_window_with_a_summary() {
     let before_total = before["total"].as_u64().expect("total");
 
     let response = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/compact", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
         .json(&serde_json::json!({"instructions": "keep the question"}))
         .send()
         .expect("send");
@@ -4993,13 +5518,12 @@ fn compact_replaces_the_window_with_a_summary() {
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(
         body["source"], "summarizer",
-        "with compact_checkpoint = false the summariser is the only strategy left",
+        "with compact_checkpoint = false the summarizer is the only strategy left",
     );
     assert_eq!(body["messages_before"].as_u64(), Some(before_total));
     assert!(
         body["messages_after"].as_u64().expect("after") >= 1,
-        "compaction always leaves at least the summary: {}",
-        body
+        "compaction always leaves at least the summary: {body}"
     );
 }
 
@@ -5011,10 +5535,7 @@ fn compact_accepts_an_empty_body() {
         ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", mock_turns(3));
     let id = session_with_one_turn(&harness);
     let response = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/compact", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
         .send()
         .expect("send");
     assert_eq!(
@@ -5054,10 +5575,7 @@ fn rewind_drops_the_last_turn_and_persists_it() {
     let id = session_with_one_turn(&harness);
 
     let response = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/rewind", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
         .json(&serde_json::json!({"turns": 1}))
         .send()
         .expect("send");
@@ -5071,25 +5589,20 @@ fn rewind_drops_the_last_turn_and_persists_it() {
     assert_eq!(body["turns_removed"], 1);
     assert_eq!(
         body["messages_after"], 0,
-        "rewinding the only turn empties the window: {}",
-        body
+        "rewinding the only turn empties the window: {body}"
     );
 
     // The event has to reach the DB, not just the in-memory conversation, or the rewind is
     // undone the moment the session is evicted.
     let messages: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
     assert_eq!(
         messages["total"], 0,
-        "the persisted log must reflect the rewind: {}",
-        messages
+        "the persisted log must reflect the rewind: {messages}"
     );
 }
 
@@ -5099,10 +5612,7 @@ fn rewind_past_the_start_is_422() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = session_with_one_turn(&harness);
     let response = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/rewind", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
         .json(&serde_json::json!({"turns": 99}))
         .send()
         .expect("send");
@@ -5116,10 +5626,7 @@ fn rewind_rejects_zero_turns() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = session_with_one_turn(&harness);
     let response = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/rewind", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
         .json(&serde_json::json!({"turns": 0}))
         .send()
         .expect("send");
@@ -5132,7 +5639,7 @@ fn export_returns_markdown_by_default_and_json_on_request() {
     let id = session_with_one_turn(&harness);
 
     let markdown = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/export", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/export"))
         .send()
         .expect("send");
     assert_eq!(markdown.status(), 200);
@@ -5146,14 +5653,13 @@ fn export_returns_markdown_by_default_and_json_on_request() {
     let body = markdown.text().expect("text");
     assert!(
         body.contains("first question"),
-        "the markdown export must carry the conversation: {}",
-        body
+        "the markdown export must carry the conversation: {body}"
     );
 
     let json = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/export?format=json", id),
+            &format!("/v1/sessions/{id}/export?format=json"),
         )
         .send()
         .expect("send");
@@ -5175,7 +5681,7 @@ fn export_rejects_an_unknown_format() {
     let response = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/export?format=pdf", id),
+            &format!("/v1/sessions/{id}/export?format=pdf"),
         )
         .send()
         .expect("send");
@@ -5192,7 +5698,7 @@ fn export_json_round_trips_through_import() {
     let envelope: serde_json::Value = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/export?format=json", id),
+            &format!("/v1/sessions/{id}/export?format=json"),
         )
         .send()
         .expect("send")
@@ -5221,7 +5727,7 @@ fn export_json_round_trips_through_import() {
     let messages: serde_json::Value = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", new_id),
+            &format!("/v1/sessions/{new_id}/messages"),
         )
         .send()
         .expect("send")
@@ -5229,8 +5735,7 @@ fn export_json_round_trips_through_import() {
         .expect("parse");
     assert!(
         messages["total"].as_u64().expect("total") >= 2,
-        "the imported session must carry the conversation: {}",
-        messages
+        "the imported session must carry the conversation: {messages}"
     );
 }
 
@@ -5250,7 +5755,7 @@ fn import_rejects_a_malformed_envelope() {
 }
 
 /// Every surface that prints a job id to a human prints the 8-character short form, so that is
-/// what gets pasted here. Cancelling on it must work, and an id matching nothing must say so
+/// what gets pasted here. Canceling on it must work, and an id matching nothing must say so
 /// rather than answering 204 over a job that is still firing.
 #[test]
 fn cancelling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
@@ -5273,7 +5778,7 @@ fn cancelling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
     let job_id = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "check the build", "every": "30m"}))
         .send()
@@ -5301,7 +5806,7 @@ fn cancelling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
 
     let short = &job_id[..8];
     let cancel = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/schedule/{}", short))
+        .request(reqwest::Method::DELETE, &format!("/v1/schedule/{short}"))
         .send()
         .expect("send");
     assert_eq!(
@@ -5318,8 +5823,7 @@ fn cancelling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
         .expect("parse");
     assert!(
         after["jobs"].as_array().expect("jobs").is_empty(),
-        "the job must actually be gone: {}",
-        after
+        "the job must actually be gone: {after}"
     );
 }
 
@@ -5349,14 +5853,20 @@ fn creating_a_job_is_refused_when_scheduling_is_disabled() {
     let created = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "never runs", "every": "10s"}))
         .send()
         .expect("send");
-    assert_eq!(created.status(), 422);
+    // `not-found`, the answer a disabled skill or memory store already gives: nothing is wrong
+    // with the request, there is nowhere for the job to go. As a 422 `invalid-body` it told a
+    // client to correct a payload that was never the problem, and two subsystems answered the same
+    // condition two different ways.
+    assert_eq!(created.status(), 404);
+    let problem: serde_json::Value = created.json().expect("parse");
+    assert_eq!(problem["type"], "https://meka.so/errors/not-found");
 
-    // Listing and cancelling stay open: clearing out jobs left from before the flag was flipped is
+    // Listing and canceling stay open: clearing out jobs left from before the flag was flipped is
     // exactly what an operator does next.
     let listed = harness
         .request(reqwest::Method::GET, "/v1/schedule")
@@ -5396,8 +5906,7 @@ fn a_skill_body_round_trips_through_get_and_put() {
     let fetched = first["body"].as_str().expect("body").to_string();
     assert!(
         !fetched.contains("Base directory for this skill"),
-        "the agent-facing header must not leak into the stored body: {}",
-        fetched
+        "the agent-facing header must not leak into the stored body: {fetched}"
     );
 
     // The read-modify-write an editing client performs.
@@ -5444,8 +5953,7 @@ fn omitting_priority_keeps_it_rather_than_resetting_to_the_default() {
             .expect("parse");
         assert_eq!(
             updated["priority"], 1,
-            "{} priority must survive an update that does not mention it: {}",
-            store, updated
+            "{store} priority must survive an update that does not mention it: {updated}"
         );
         // And it is still settable, so preservation has not made the field inert.
         let reset: serde_json::Value = harness
@@ -5455,11 +5963,7 @@ fn omitting_priority_keeps_it_rather_than_resetting_to_the_default() {
             .expect("update")
             .json()
             .expect("parse");
-        assert_eq!(
-            reset["priority"], 7,
-            "{} priority must stay settable",
-            store
-        );
+        assert_eq!(reset["priority"], 7, "{store} priority must stay settable");
     }
 }
 
@@ -5559,7 +6063,7 @@ fn a_job_that_could_never_fire_is_refused_and_an_existing_one_is_reported() {
 /// A shell gate below `unrestricted` is a 403 `session-permission`, whose documented remedy --
 /// `PATCH /v1/sessions/{id}` -- is the real one. A misspelled or write-capable tool is not: no
 /// level and no token changes the answer, so sending a client to raise a session is a wild goose
-/// chase. Both used to be 403 `session-permission`, which meant `{"tool": 5}` was a 422 and
+/// chase. Answering both with 403 `session-permission` would make `{"tool": 5}` a 422 and
 /// `{"tool": "typo"}` a 403 saying the session sat too low.
 #[test]
 fn a_gate_refusal_is_a_422_when_no_permission_would_help() {
@@ -5811,7 +6315,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
     let gated = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({
             "prompt": "report",
@@ -5831,7 +6335,7 @@ fn planting_a_gate_needs_more_than_the_schedule_scope() {
     let plain = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "report", "every": "30m"}))
         .send()
@@ -5870,7 +6374,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
     let response = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({
             "prompt": "report",
@@ -5883,8 +6387,7 @@ fn a_gate_below_write_permission_is_not_reported_as_a_scope_failure() {
     let body: serde_json::Value = response.json().expect("parse");
     assert_eq!(
         body["type"], "https://meka.so/errors/session-permission",
-        "the remedy is PATCH the session, not a better token: {}",
-        body
+        "the remedy is PATCH the session, not a better token: {body}"
     );
 }
 
@@ -5907,7 +6410,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     let response = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         // Far enough out that the scheduler cannot fire it mid-test.
         .json(&serde_json::json!({"prompt": "check the build", "every": "6h"}))
@@ -5924,8 +6427,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     assert_eq!(job["session_id"], id);
     assert!(
         job["schedule"].as_str().unwrap_or_default().contains("6h"),
-        "the rendered schedule should describe the interval: {}",
-        job
+        "the rendered schedule should describe the interval: {job}"
     );
 
     // Visible both server-wide and scoped to the session.
@@ -5941,15 +6443,11 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
             .expect("jobs")
             .iter()
             .any(|j| j["id"] == job_id.as_str()),
-        "the job must appear in the server-wide listing: {}",
-        all
+        "the job must appear in the server-wide listing: {all}"
     );
 
     let scoped: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/schedule", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/schedule"))
         .send()
         .expect("send")
         .json()
@@ -5957,16 +6455,13 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     assert_eq!(scoped["jobs"].as_array().expect("jobs").len(), 1);
 
     let cancel = harness
-        .request(reqwest::Method::DELETE, &format!("/v1/schedule/{}", job_id))
+        .request(reqwest::Method::DELETE, &format!("/v1/schedule/{job_id}"))
         .send()
         .expect("send");
     assert_eq!(cancel.status(), 204);
 
     let after: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/schedule", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/schedule"))
         .send()
         .expect("send")
         .json()
@@ -5974,7 +6469,7 @@ fn scheduled_job_create_list_and_cancel_round_trip() {
     assert!(after["jobs"].as_array().expect("jobs").is_empty());
 }
 
-/// Giving two schedules is refused rather than resolved by precedence: silently honouring one
+/// Giving two schedules is refused rather than resolved by precedence: silently honoring one
 /// would produce a job firing on a schedule nobody asked for.
 #[test]
 fn scheduled_job_rejects_two_schedules() {
@@ -5995,7 +6490,7 @@ fn scheduled_job_rejects_two_schedules() {
     let response = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "x", "every": "6h", "cron": "0 9 * * *"}))
         .send()
@@ -6037,7 +6532,7 @@ fn schedule_endpoints_require_the_schedule_scopes() {
     let creating = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "x", "every": "6h"}))
         .send()
@@ -6050,7 +6545,7 @@ fn background_tasks_endpoint_lists_an_empty_session() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = session_with_one_turn(&harness);
     let response = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
         .send()
         .expect("send");
     assert_eq!(response.status(), 200);
@@ -6065,7 +6560,7 @@ fn background_task_cancel_on_unknown_id_is_404() {
     let response = harness
         .request(
             reqwest::Method::DELETE,
-            &format!("/v1/sessions/{}/tasks/does-not-exist", id),
+            &format!("/v1/sessions/{id}/tasks/does-not-exist"),
         )
         .send()
         .expect("send");
@@ -6079,15 +6574,15 @@ fn capability_endpoints_404_on_unknown_session() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let missing = uuid::Uuid::new_v4();
     for path in [
-        format!("/v1/sessions/{}/export", missing),
-        format!("/v1/sessions/{}/tasks", missing),
-        format!("/v1/sessions/{}/context", missing),
+        format!("/v1/sessions/{missing}/export"),
+        format!("/v1/sessions/{missing}/tasks"),
+        format!("/v1/sessions/{missing}/context"),
     ] {
         let response = harness
             .request(reqwest::Method::GET, &path)
             .send()
             .expect("send");
-        assert_eq!(response.status(), 404, "{} should 404", path);
+        assert_eq!(response.status(), 404, "{path} should 404");
         let body: serde_json::Value = response.json().expect("parse");
         assert_eq!(body["type"], "https://meka.so/errors/session-not-found");
     }
@@ -6103,19 +6598,13 @@ fn compaction_marks_the_summary_in_the_message_history() {
     let id = session_with_one_turn(&harness);
 
     let compact = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/compact", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
         .send()
         .expect("send");
     assert_eq!(compact.status(), 200);
 
     let messages: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json()
@@ -6129,8 +6618,7 @@ fn compaction_marks_the_summary_in_the_message_history() {
     assert_eq!(
         marked.len(),
         1,
-        "exactly the summary carries the marker: {}",
-        messages
+        "exactly the summary carries the marker: {messages}"
     );
     assert_eq!(marked[0]["compaction"]["generation"], 1);
     assert!(
@@ -6150,10 +6638,7 @@ fn ordinary_messages_carry_no_compaction_marker() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = session_with_one_turn(&harness);
     let messages: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json()
@@ -6161,14 +6646,13 @@ fn ordinary_messages_carry_no_compaction_marker() {
     for message in messages["messages"].as_array().expect("messages") {
         assert!(
             message.get("compaction").is_none(),
-            "an uncompacted session must have no markers: {}",
-            message
+            "an uncompacted session must have no markers: {message}"
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// Store endpoints: skills, memory, tools, instructions, providers.
+// --------------------------------------------------------------------------- Store endpoints:
+// skills, memory, tools, instructions, providers.
 // ---------------------------------------------------------------------------
 
 /// Scopes for a token that can drive both stores plus sessions.
@@ -6223,8 +6707,7 @@ fn skill_write_read_and_delete_round_trip() {
     assert_eq!(entry["priority"], 2);
     assert!(
         entry.get("body").is_none(),
-        "the palette listing must not carry bodies: {}",
-        entry
+        "the palette listing must not carry bodies: {entry}"
     );
 
     let detail: serde_json::Value = harness
@@ -6238,8 +6721,7 @@ fn skill_write_read_and_delete_round_trip() {
             .as_str()
             .unwrap_or_default()
             .contains("Say hello"),
-        "the single-skill view must carry the body: {}",
-        detail
+        "the single-skill view must carry the body: {detail}"
     );
 
     let delete = harness
@@ -6302,7 +6784,7 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
 
     for name in ["borrowed", "wrecked"] {
         let write = harness
-            .request(reqwest::Method::PUT, &format!("/v1/skills/{}", name))
+            .request(reqwest::Method::PUT, &format!("/v1/skills/{name}"))
             .json(&serde_json::json!({"description": "mine now"}))
             .send()
             .expect("send");
@@ -6313,24 +6795,30 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
             write.text().unwrap_or_default()
         );
         let problem: serde_json::Value = harness
-            .request(reqwest::Method::PUT, &format!("/v1/skills/{}", name))
+            .request(reqwest::Method::PUT, &format!("/v1/skills/{name}"))
             .json(&serde_json::json!({"description": "mine now"}))
             .send()
             .expect("send")
             .json()
             .expect("parse");
         assert_eq!(problem["type"], "https://meka.so/errors/store-read-only");
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        // The skill, and the class of root it came from -- not the path. Whoever holds this token
+        // is not necessarily whoever wrote `config.toml`, and an absolute path out of it is a fact
+        // about the operator's machine that the caller can do nothing with. The server logs it.
+        // `meka skill` still prints the location, because its reader is the person who configured
+        // the root; `ForeignSkill` carries it as data so the two doors can differ.
         assert!(
-            problem["detail"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(&shared.join(name).display().to_string()),
-            "the refusal must name the file it is protecting: {}",
-            problem
+            detail.contains(&format!("'{name}'")) && detail.contains("extra_paths"),
+            "the refusal must say which skill and why: {problem}"
+        );
+        assert!(
+            !detail.contains(&shared.display().to_string()),
+            "the operator's path reached the caller: {problem}"
         );
 
         let delete = harness
-            .request(reqwest::Method::DELETE, &format!("/v1/skills/{}", name))
+            .request(reqwest::Method::DELETE, &format!("/v1/skills/{name}"))
             .send()
             .expect("send");
         assert_eq!(delete.status(), 409, "DELETE must not reach a foreign root");
@@ -6350,7 +6838,7 @@ fn a_skill_in_a_read_only_root_is_refused_by_put_and_delete() {
 fn getting_a_broken_skill_says_why_rather_than_404() {
     let harness =
         ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
-    let broken = harness.home().join("meka").join("skills").join("wrecked");
+    let broken = harness.root().join("meka").join("skills").join("wrecked");
     std::fs::create_dir_all(&broken).expect("mkdir");
     std::fs::write(
         broken.join("SKILL.md"),
@@ -6364,13 +6852,13 @@ fn getting_a_broken_skill_says_why_rather_than_404() {
         .expect("send");
     assert_eq!(response.status(), 422, "a present file is not a 404");
     let problem: serde_json::Value = response.json().expect("parse");
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("could not be read"), "{problem}");
+    // The reason, without the file it came from: discovery logs the path, and this body goes to
+    // whoever holds a token. The reason itself is what the caller acts on.
     assert!(
-        problem["detail"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("could not be read"),
-        "{}",
-        problem
+        !detail.contains(&broken.display().to_string()),
+        "the skills directory reached the caller: {problem}"
     );
 
     let absent = harness
@@ -6409,20 +6897,19 @@ fn skill_write_without_a_body_preserves_the_existing_one() {
             .as_str()
             .unwrap_or_default()
             .contains("original body"),
-        "omitting `body` must preserve it: {}",
-        detail
+        "omitting `body` must preserve it: {detail}"
     );
 }
 
 /// The name reaches the filesystem, so it needs the same character-class guard the tools apply.
-/// A traversal must be refused before any path join, not sanitised after one.
+/// A traversal must be refused before any path join, not sanitized after one.
 #[test]
 fn skill_write_rejects_a_traversing_name() {
     let harness =
         ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
     for bad in ["..", "a%2Fb", "has space"] {
         let response = harness
-            .request(reqwest::Method::PUT, &format!("/v1/skills/{}", bad))
+            .request(reqwest::Method::PUT, &format!("/v1/skills/{bad}"))
             .json(&serde_json::json!({"description": "nope"}))
             .send()
             .expect("send");
@@ -6451,7 +6938,7 @@ fn skill_write_rejects_an_empty_description() {
     );
 }
 
-/// A read scope must not admit a write. The catalogue is flat: neither implies the other.
+/// A read scope must not admit a write. The catalog is flat: neither implies the other.
 #[test]
 fn skill_write_requires_the_write_scope() {
     let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
@@ -6538,21 +7025,18 @@ fn memory_write_read_list_and_delete_round_trip() {
         detail["recorded_at"]
             .as_str()
             .is_some_and(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().is_ok()),
-        "recorded_at must be an RFC 3339 stamp: {}",
-        detail
+        "recorded_at must be an RFC 3339 stamp: {detail}"
     );
     assert!(
         detail["updated_at"]
             .as_str()
             .is_some_and(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().is_ok()),
-        "updated_at must be an RFC 3339 stamp: {}",
-        detail
+        "updated_at must be an RFC 3339 stamp: {detail}"
     );
     assert_eq!(
         detail["tags"],
         serde_json::json!(["deploy", "policy"]),
-        "tags round-trip through the write: {}",
-        detail
+        "tags round-trip through the write: {detail}"
     );
     let listed_entry = listed["memories"]
         .as_array()
@@ -6563,8 +7047,7 @@ fn memory_write_read_list_and_delete_round_trip() {
     assert_eq!(
         listed_entry["tags"],
         serde_json::json!(["deploy", "policy"]),
-        "and the list carries them too: {}",
-        listed_entry
+        "and the list carries them too: {listed_entry}"
     );
     assert!(
         listed_entry["recorded_at"].as_str().is_some(),
@@ -6645,11 +7128,11 @@ fn memory_read_scope_does_not_grant_writes() {
 }
 
 #[test]
-fn session_tools_endpoint_lists_the_catalogue_with_permissions() {
+fn session_tools_endpoint_lists_the_catalog_with_permissions() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = session_with_one_turn(&harness);
     let response = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tools", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tools"))
         .send()
         .expect("send");
     assert_eq!(response.status(), 200);
@@ -6668,7 +7151,7 @@ fn session_tools_endpoint_lists_the_catalogue_with_permissions() {
         .expect("write_file must be registered");
     assert_eq!(
         write_file["required_permission"], "workspace",
-        "the catalogue must report the tier a client needs to render an approval prompt"
+        "the catalog must report the tier a client needs to render an approval prompt"
     );
 }
 
@@ -6676,7 +7159,7 @@ fn session_tools_endpoint_lists_the_catalogue_with_permissions() {
 /// actually built rather than what a test assembled by hand.
 fn session_tool_names(harness: &ServeTestHarness, id: &str) -> Vec<String> {
     let response = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tools", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tools"))
         .send()
         .expect("send");
     assert_eq!(response.status(), 200);
@@ -6770,37 +7253,103 @@ fn instructions_endpoint_reports_absence_rather_than_failing() {
     let body: serde_json::Value = response.json().expect("parse");
     assert!(
         body.get("content").is_none(),
-        "an unconfigured server reports no instructions, not an error: {}",
-        body
+        "an unconfigured server reports no instructions, not an error: {body}"
     );
 }
 
 #[test]
-fn providers_endpoint_lists_profiles_and_marks_the_active_one() {
+fn profiles_endpoint_lists_profiles_and_marks_the_active_one() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let response = harness
-        .request(reqwest::Method::GET, "/v1/providers")
+        .request(reqwest::Method::GET, "/v1/profiles")
         .send()
         .expect("send");
     assert_eq!(response.status(), 200);
     let body: serde_json::Value = response.json().expect("parse");
-    let providers = body["providers"].as_array().expect("providers");
-    let mock = providers
+    let profiles = body["profiles"].as_array().expect("profiles");
+    let mock = profiles
         .iter()
         .find(|p| p["name"] == "mock")
         .expect("the harness configures a 'mock' profile");
-    assert_eq!(mock["type"], "anthropic-messages");
+    assert_eq!(mock["backend"], "anthropic-messages");
+    assert_eq!(mock["account"], "mock");
     assert_eq!(mock["active"], true);
     // Credentials live in the database keyed by profile name and must never transit this API.
     let serialized = body.to_string();
     for secret_key in ["api_key", "token", "secret", "credential"] {
         assert!(
             !serialized.contains(secret_key),
-            "provider listing must carry no credential-shaped fields, found '{}': {}",
-            secret_key,
-            serialized
+            "profile listing must carry no credential-shaped fields, found '{secret_key}': {serialized}"
         );
     }
+}
+
+/// `GET /v1/mcp` and `GET /v1/mcp/{name}/tools` against a real stdio peer: the stub under
+/// `tests/fixtures` speaks enough of the protocol to connect and list tools, so the two routes are
+/// exercised end to end rather than only on their 404s.
+#[test]
+fn mcp_routes_report_a_connected_server_and_its_tools() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp_stub_server.py"
+    );
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let state_path = state_dir.path().join("state.json");
+    std::fs::write(
+        &state_path,
+        r#"{"tools": ["search", "create_page"], "instructions": "call search first"}"#,
+    )
+    .expect("write state");
+    let prelude = format!(
+        "[[mcp.servers]]\nname = \"stub\"\ntransport = \"stdio\"\ncommand = \"python3\"\nargs = \
+         [{fixture:?}, {:?}]\n",
+        state_path.to_string_lossy()
+    );
+    let harness =
+        ServeTestHarness::spawn_with(&prelude, "", mock_simple_turn(), "sk_test_token", &[
+            "sessions:r",
+            "mcp:r",
+        ]);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let servers = loop {
+        let servers: serde_json::Value = harness
+            .request(reqwest::Method::GET, "/v1/mcp")
+            .send()
+            .expect("list servers")
+            .json()
+            .expect("parse");
+        let connected = servers
+            .as_array()
+            .expect("an array of servers")
+            .iter()
+            .any(|server| server["name"] == "stub" && server["state"] == "connected");
+        if connected {
+            break servers;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stub never reached `connected`: {servers}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(servers.as_array().map(Vec::len), Some(1));
+
+    let tools: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/mcp/stub/tools")
+        .send()
+        .expect("list tools")
+        .json()
+        .expect("parse");
+    assert_eq!(tools["server"], "stub");
+    let names: Vec<&str> = tools["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["raw_name"].as_str())
+        .collect();
+    // Sorted by name, as the catalog is.
+    assert_eq!(names, vec!["create_page", "search"], "{tools}");
 }
 
 #[test]
@@ -6852,8 +7401,7 @@ fn mcp_reconnect_requires_the_mcp_write_scope() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// SSE re-attach.
+// --------------------------------------------------------------------------- SSE re-attach.
 // ---------------------------------------------------------------------------
 
 /// Collect the `event: <name>` lines from an SSE body, in order.
@@ -6890,15 +7438,15 @@ fn start_streaming_session(harness: &ServeTestHarness) -> String {
 fn reattach_after_the_turn_ends_replays_the_tail_and_the_terminal() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "streamed reply" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "streamed reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
     let id = start_streaming_session(&harness);
 
     let first = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send");
@@ -6906,7 +7454,7 @@ fn reattach_after_the_turn_ends_replays_the_tail_and_the_terminal() {
     assert!(original.contains("event: turn.finished"), "{}", original);
 
     let rejoined = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/stream", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
         .send()
         .expect("send");
     assert_eq!(rejoined.status(), 200);
@@ -6915,28 +7463,23 @@ fn reattach_after_the_turn_ends_replays_the_tail_and_the_terminal() {
     assert_eq!(
         names.first().map(String::as_str),
         Some("turn.started"),
-        "a rejoin announces which turn it attached to first: {}",
-        body
+        "a rejoin announces which turn it attached to first: {body}"
     );
     assert!(
         body.contains("\"resumed\":true"),
-        "the re-issued turn.started must be marked as a resume, not a new turn: {}",
-        body
+        "the re-issued turn.started must be marked as a resume, not a new turn: {body}"
     );
     assert!(
         names.iter().any(|name| name == "assistant_text.delta"),
-        "the ring must replay the turn's content: {}",
-        body
+        "the ring must replay the turn's content: {body}"
     );
     assert!(
         names.last().map(String::as_str) == Some("turn.finished"),
-        "a rejoin must terminate, and with the outcome the turn actually had: {}",
-        body
+        "a rejoin must terminate, and with the outcome the turn actually had: {body}"
     );
     assert!(
         body.contains("\"stop_reason\":\"end_turn\""),
-        "the replayed terminal carries the real stop reason: {}",
-        body
+        "the replayed terminal carries the real stop reason: {body}"
     );
 }
 
@@ -6946,16 +7489,16 @@ fn reattach_after_the_turn_ends_replays_the_tail_and_the_terminal() {
 fn reattach_with_last_event_id_skips_what_was_already_delivered() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "one " },
-            { "kind": "text", "text": "two " },
-            { "kind": "text", "text": "three" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "one " },
+            { "type": "text", "text": "two " },
+            { "type": "text", "text": "three" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
     let id = start_streaming_session(&harness);
     let original = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send")
@@ -6964,13 +7507,12 @@ fn reattach_with_last_event_id_skips_what_was_already_delivered() {
     let original_ids = sse_event_ids(&original);
     assert!(
         original_ids.len() >= 3,
-        "need several events to resume from the middle: {}",
-        original
+        "need several events to resume from the middle: {original}"
     );
     let resume_from = original_ids[1];
 
     let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/stream", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
         .header("Last-Event-ID", resume_from.to_string())
         .send()
         .expect("send")
@@ -6979,16 +7521,11 @@ fn reattach_with_last_event_id_skips_what_was_already_delivered() {
     let replayed = sse_event_ids(&body);
     assert!(
         replayed.iter().all(|value| *value > resume_from),
-        "replay must start strictly after the client's last id {}: got {:?}\n{}",
-        resume_from,
-        replayed,
-        body
+        "replay must start strictly after the client's last id {resume_from}: got {replayed:?}\n{body}"
     );
     assert!(
         replayed.contains(original_ids.last().expect("last id")),
-        "the tail through the terminal must still arrive: {:?}\n{}",
-        replayed,
-        body
+        "the tail through the terminal must still arrive: {replayed:?}\n{body}"
     );
 }
 
@@ -6999,7 +7536,7 @@ fn reattach_accepts_last_event_id_as_a_query_parameter() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = start_streaming_session(&harness);
     let original = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send")
@@ -7011,7 +7548,7 @@ fn reattach_accepts_last_event_id_as_a_query_parameter() {
     let body = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/stream?last_event_id={}", id, resume_from),
+            &format!("/v1/sessions/{id}/stream?last_event_id={resume_from}"),
         )
         .send()
         .expect("send")
@@ -7019,8 +7556,7 @@ fn reattach_accepts_last_event_id_as_a_query_parameter() {
         .expect("body");
     assert!(
         sse_event_ids(&body).iter().all(|v| *v > resume_from),
-        "the query parameter must behave exactly like the header: {}",
-        body
+        "the query parameter must behave exactly like the header: {body}"
     );
 }
 
@@ -7030,18 +7566,18 @@ fn reattach_accepts_last_event_id_as_a_query_parameter() {
 fn reattach_warns_when_the_replay_buffer_cannot_reach_back_far_enough() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "a" },
-            { "kind": "text", "text": "b" },
-            { "kind": "text", "text": "c" },
-            { "kind": "text", "text": "d" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "a" },
+            { "type": "text", "text": "b" },
+            { "type": "text", "text": "c" },
+            { "type": "text", "text": "d" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     // A ring of 2 cannot cover a turn that emits more than that.
     let harness = ServeTestHarness::spawn("stream_replay_events = 2\n", script);
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send")
@@ -7049,7 +7585,7 @@ fn reattach_warns_when_the_replay_buffer_cannot_reach_back_far_enough() {
         .expect("body");
 
     let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/stream", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
         .header("Last-Event-ID", "0")
         .send()
         .expect("send")
@@ -7057,8 +7593,7 @@ fn reattach_warns_when_the_replay_buffer_cannot_reach_back_far_enough() {
         .expect("body");
     assert!(
         body.contains("event: notice") && body.contains("Replay buffer does not reach"),
-        "a truncated replay must be announced, not silently delivered: {}",
-        body
+        "a truncated replay must be announced, not silently delivered: {body}"
     );
 }
 
@@ -7067,7 +7602,7 @@ fn reattach_on_a_session_that_never_streamed_is_404() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = start_streaming_session(&harness);
     let response = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/stream", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
         .send()
         .expect("send");
     assert_eq!(response.status(), 404);
@@ -7082,8 +7617,7 @@ fn reattach_on_a_session_that_never_streamed_is_404() {
             .as_str()
             .unwrap_or_default()
             .contains("submit a turn"),
-        "the 404 must say how to get a stream, not just that there isn't one: {}",
-        body
+        "the 404 must say how to get a stream, not just that there isn't one: {body}"
     );
 }
 
@@ -7117,17 +7651,17 @@ fn reattach_requires_sessions_read_scope() {
 }
 
 /// The headline of the re-attach work: a streaming turn whose consumer goes away keeps running for
-/// `stream_reattach_grace` instead of being cancelled with it. The existing re-attach tests all
+/// `stream_reattach_grace` instead of being canceled with it. The existing re-attach tests all
 /// keep the original consumer alive, so they would still pass if the grace regressed to zero;
 /// this one drops the connection outright and asserts the turn finished and persisted anyway.
 #[test]
 fn a_streaming_turn_survives_its_consumer_disconnecting() {
     let script = serde_json::json!([[
-        { "kind": "sleep", "ms": 2500 },
-        { "kind": "text", "text": "finished without a listener" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "sleep", "ms": 2500 },
+        { "type": "text", "text": "finished without a listener" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
-    // `stream_reattach_grace` defaults to 30s, which is the behaviour under test.
+    // `stream_reattach_grace` defaults to 30s, which is the behavior under test.
     let harness = ServeTestHarness::spawn("", script);
     let id = start_streaming_session(&harness);
 
@@ -7135,14 +7669,14 @@ fn a_streaming_turn_survives_its_consumer_disconnecting() {
     // the response without reading it closes the connection mid-turn, which is what a closed
     // browser tab or a dead network looks like from the server's side.
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "go", "stream": true}))
         .send()
         .expect("send");
     assert_eq!(response.status(), 200, "the turn must have been admitted");
     drop(response);
 
-    // The turn must still be running, not cancelled along with the connection.
+    // The turn must still be running, not canceled along with the connection.
     harness.wait_until_in_flight(&id);
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -7150,10 +7684,7 @@ fn a_streaming_turn_survives_its_consumer_disconnecting() {
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
         transcript = harness
-            .request(
-                reqwest::Method::GET,
-                &format!("/v1/sessions/{}/messages", id),
-            )
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
             .send()
             .expect("send")
             .text()
@@ -7164,8 +7695,7 @@ fn a_streaming_turn_survives_its_consumer_disconnecting() {
     }
     assert!(
         transcript.contains("finished without a listener"),
-        "the turn must have completed and persisted with nobody watching: {}",
-        transcript
+        "the turn must have completed and persisted with nobody watching: {transcript}"
     );
 }
 
@@ -7175,10 +7705,10 @@ fn a_streaming_turn_survives_its_consumer_disconnecting() {
 fn reattach_mid_turn_follows_the_live_stream() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "before " },
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "text", "text": "after" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "before " },
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "after" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -7193,8 +7723,8 @@ fn reattach_mid_turn_follows_the_live_stream() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "hi", "stream": true}))
             .send()
             .expect("send")
@@ -7202,10 +7732,11 @@ fn reattach_mid_turn_follows_the_live_stream() {
             .expect("body")
     });
 
-    // Join mid-turn, while the mock is sleeping.
-    std::thread::sleep(Duration::from_millis(600));
+    // Join mid-turn: once the turn is admitted the mock is inside its sleep, so the stream is
+    // installed and still open.
+    harness.wait_until_in_flight(&id);
     let rejoined = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/stream", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
         .send()
         .expect("send")
         .text()
@@ -7214,28 +7745,23 @@ fn reattach_mid_turn_follows_the_live_stream() {
 
     assert!(
         original_body.contains("event: turn.finished"),
-        "the original consumer must still complete normally: {}",
-        original_body
+        "the original consumer must still complete normally: {original_body}"
     );
     assert!(
         rejoined.contains("\"resumed\":true"),
-        "the rejoin must identify itself as one: {}",
-        rejoined
+        "the rejoin must identify itself as one: {rejoined}"
     );
     assert!(
         rejoined.contains("event: turn.finished"),
-        "a mid-turn rejoin must follow the live stream through to the terminal: {}",
-        rejoined
+        "a mid-turn rejoin must follow the live stream through to the terminal: {rejoined}"
     );
     assert!(
         rejoined.contains("after"),
-        "the rejoin must receive text emitted after it attached: {}",
-        rejoined
+        "the rejoin must receive text emitted after it attached: {rejoined}"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Outbound webhooks.
+// --------------------------------------------------------------------------- Outbound webhooks.
 // ---------------------------------------------------------------------------
 
 /// One received delivery, as the listener below captured it.
@@ -7250,7 +7776,7 @@ struct CapturedDelivery {
 /// A minimal blocking HTTP listener that records one POST and answers `204`.
 ///
 /// Hand-rolled rather than pulled from a crate because the whole point is to observe the exact
-/// bytes and headers meka put on the wire; anything that parses and re-serialises would hide the
+/// bytes and headers meka put on the wire; anything that parses and re-serializes would hide the
 /// thing under test.
 fn spawn_webhook_listener() -> (u16, std::sync::mpsc::Receiver<CapturedDelivery>) {
     spawn_webhook_listener_rejecting(0, "")
@@ -7262,58 +7788,39 @@ fn spawn_webhook_listener_rejecting(
     reject_count: usize,
     status_line: &'static str,
 ) -> (u16, std::sync::mpsc::Receiver<CapturedDelivery>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
-    let port = listener.local_addr().expect("addr").port();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut served = 0usize;
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let tx = tx.clone();
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let mut headers = std::collections::HashMap::new();
-            let mut line = String::new();
-            // Request line, then headers until the blank line.
-            let _ = reader.read_line(&mut line);
-            let mut content_length = 0usize;
-            loop {
-                let mut header = String::new();
-                if reader.read_line(&mut header).unwrap_or(0) == 0 {
-                    break;
-                }
-                if header.trim().is_empty() {
-                    break;
-                }
-                if let Some((name, value)) = header.split_once(':') {
-                    let name = name.trim().to_ascii_lowercase();
-                    let value = value.trim().to_string();
-                    if name == "content-length" {
-                        content_length = value.parse().unwrap_or(0);
-                    }
-                    headers.insert(name, value);
-                }
-            }
-            let mut body = vec![0u8; content_length];
-            if content_length > 0 {
-                use std::io::Read as _;
-                let _ = reader.read_exact(&mut body);
-            }
-            use std::io::Write as _;
-            let response = if served < reject_count {
-                status_line
-            } else {
-                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
-            };
-            served += 1;
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-            let _ = tx.send(CapturedDelivery {
-                event: headers.get("x-meka-event").cloned().unwrap_or_default(),
-                delivery_id: headers.get("x-meka-delivery").cloned().unwrap_or_default(),
-                timestamp: headers.get("x-meka-timestamp").cloned().unwrap_or_default(),
-                signature: headers.get("x-meka-signature").cloned(),
-                body: String::from_utf8_lossy(&body).to_string(),
-            });
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let port = support::spawn_http_listener(move |request| {
+        let attempt = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // A test that stopped counting is not this listener's failure to report.
+        if tx
+            .send(CapturedDelivery {
+                event: request
+                    .headers
+                    .get("x-meka-event")
+                    .cloned()
+                    .unwrap_or_default(),
+                delivery_id: request
+                    .headers
+                    .get("x-meka-delivery")
+                    .cloned()
+                    .unwrap_or_default(),
+                timestamp: request
+                    .headers
+                    .get("x-meka-timestamp")
+                    .cloned()
+                    .unwrap_or_default(),
+                signature: request.headers.get("x-meka-signature").cloned(),
+                body: request.body.clone(),
+            })
+            .is_err()
+        {
+            return "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string();
+        }
+        if attempt < reject_count {
+            status_line.to_string()
+        } else {
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string()
         }
     });
     (port, rx)
@@ -7330,7 +7837,7 @@ fn expected_signature(secret: &str, timestamp: &str, body: &str) -> String {
     let digest = mac.finalize().into_bytes();
     let mut out = String::from("sha256=");
     for byte in digest.iter() {
-        out.push_str(&format!("{:02x}", byte));
+        out.push_str(&format!("{byte:02x}"));
     }
     out
 }
@@ -7339,14 +7846,13 @@ fn expected_signature(secret: &str, timestamp: &str, body: &str) -> String {
 fn turn_finished_webhook_is_delivered_and_signed() {
     let (port, rx) = spawn_webhook_listener();
     let config = format!(
-        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nsecret = \"topsecret\"\n\
-         events = [\"turn.finished\"]\n",
-        port
+        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"topsecret\"\n\
+         events = [\"turn.finished\"]\n"
     );
     let harness = ServeTestHarness::spawn(&config, mock_simple_turn());
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi"}))
         .send()
         .expect("send");
@@ -7387,14 +7893,13 @@ fn a_rate_limited_webhook_is_retried() {
         "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n",
     );
     let config = format!(
-        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nsecret = \"s\"\n\
-         events = [\"turn.finished\"]\n",
-        port
+        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\n\
+         events = [\"turn.finished\"]\n"
     );
     let harness = ServeTestHarness::spawn(&config, mock_simple_turn());
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi"}))
         .send()
         .expect("send");
@@ -7440,14 +7945,13 @@ fn a_webhook_rejected_as_malformed_is_not_retried() {
         "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
     );
     let config = format!(
-        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nsecret = \"s\"\n\
-         events = [\"turn.finished\"]\n",
-        port
+        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\n\
+         events = [\"turn.finished\"]\n"
     );
     let harness = ServeTestHarness::spawn(&config, mock_simple_turn());
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi"}))
         .send()
         .expect("send");
@@ -7468,19 +7972,18 @@ fn webhook_payloads_carry_no_message_content() {
     let (port, rx) = spawn_webhook_listener();
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "SECRET-ASSISTANT-TEXT" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "SECRET-ASSISTANT-TEXT" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let config = format!(
-        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nsecret = \"s\"\n\
-         events = [\"turn.finished\"]\n",
-        port
+        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\n\
+         events = [\"turn.finished\"]\n"
     );
     let harness = ServeTestHarness::spawn(&config, script);
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "SECRET-USER-PROMPT"}))
         .send()
         .expect("send");
@@ -7501,7 +8004,7 @@ fn webhook_payloads_carry_no_message_content() {
 }
 
 /// The real cancel path, which the unknown-id and empty-list tests never reach: resolving an
-/// 8-character prefix, recording the cancellation *before* signalling, and signalling through the
+/// 8-character prefix, recording the cancellation *before* signaling, and signaling through the
 /// `BackgroundTasks` handle hoisted onto `SessionEntry`. That hoist is what lets the endpoint
 /// answer while a turn holds the runtime mutex, and if it ever captured a different registry than
 /// the agent dispatches through, this endpoint would report 204 over a task that kept running.
@@ -7509,19 +8012,19 @@ fn webhook_payloads_carry_no_message_content() {
 fn cancelling_a_running_background_task_stops_it() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("\n[background]\nenabled = true\n", script);
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
@@ -7531,7 +8034,7 @@ fn cancelling_a_running_background_task_stops_it() {
     let mut task_id = String::new();
     while Instant::now() < deadline {
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
             .send()
             .expect("send")
             .json()
@@ -7558,7 +8061,7 @@ fn cancelling_a_running_background_task_stops_it() {
     assert_eq!(cancel.status(), 204, "a prefix must resolve to the task");
 
     let after: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
         .send()
         .expect("send")
         .json()
@@ -7571,12 +8074,11 @@ fn cancelling_a_running_background_task_stops_it() {
         .expect("the task must still be listed");
     assert_eq!(
         task["status"], "cancelled",
-        "the cancellation must be recorded, not just signalled: {}",
-        after
+        "the cancellation must be recorded, not just signaled: {after}"
     );
 }
 
-/// A cancelled task reports on the next turn, without spending one of its own.
+/// A canceled task reports on the next turn, without spending one of its own.
 ///
 /// The predicate test in `background.rs` covers only `wakes_a_host`; every branch that consults it
 /// could be deleted with the suite still green. This one is written against the two that meet in
@@ -7591,17 +8093,17 @@ fn cancelling_a_running_background_task_stops_it() {
 fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "answered the question" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "answered the question" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     // Polled fast, so "the poller did not deliver" is a fact about the branch rather than about
@@ -7612,7 +8114,7 @@ fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
     );
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
@@ -7621,7 +8123,7 @@ fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
     let mut task_id = String::new();
     while Instant::now() < deadline {
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
             .send()
             .expect("send")
             .json()
@@ -7639,10 +8141,7 @@ fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
 
     let messages = |harness: &ServeTestHarness| -> Vec<serde_json::Value> {
         let body: serde_json::Value = harness
-            .request(
-                reqwest::Method::GET,
-                &format!("/v1/sessions/{}/messages", id),
-            )
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
             .send()
             .expect("send")
             .json()
@@ -7670,7 +8169,7 @@ fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
     );
 
     let turn: serde_json::Value = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "what is in this CSV?"}))
         .send()
         .expect("send")
@@ -7678,8 +8177,7 @@ fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
         .expect("parse");
     assert_eq!(
         turn["stop_reason"], "end_turn",
-        "the round the poller must not have eaten is this turn's: {}",
-        turn
+        "the round the poller must not have eaten is this turn's: {turn}"
     );
 
     let after = messages(&harness);
@@ -7688,18 +8186,16 @@ fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
         .rev()
         .find(|message| message["role"] == "user")
         .expect("the turn's own user message");
-    let text = carrier["content"][0]["text"].as_str().unwrap_or_default();
+    let text = message_text(carrier);
     assert!(
-        text.contains("was cancelled") && text.contains("what is in this CSV?"),
-        "the outcome must ride inside the user's own message, not beside it: {}",
-        text
+        text.contains("was canceled") && text.contains("what is in this CSV?"),
+        "the outcome must ride inside the user's own message, not beside it: {text}"
     );
     assert!(
         !after
             .windows(2)
             .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user"),
-        "two consecutive user turns must never reach the provider: {:#?}",
-        after
+        "two consecutive user turns must never reach the provider: {after:#?}"
     );
 }
 
@@ -7718,17 +8214,17 @@ fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
 fn a_session_with_a_running_background_task_is_not_evicted() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 30", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 30", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second turn" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second turn" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn(
@@ -7737,14 +8233,14 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
     );
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
 
     let tasks = |harness: &ServeTestHarness| -> serde_json::Value {
         harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
             .send()
             .expect("send")
             .json()
@@ -7765,7 +8261,7 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
     std::thread::sleep(Duration::from_millis(3500));
     // A second turn is what re-attaches, and re-attaching is what runs the sweep.
     let second = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "still there?"}))
         .send()
         .expect("send");
@@ -7783,8 +8279,7 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
         .expect("the task must still be listed");
     assert_eq!(
         task["status"], "running",
-        "a command that is still running must not be reported as interrupted: {}",
-        after
+        "a command that is still running must not be reported as interrupted: {after}"
     );
 }
 
@@ -7799,17 +8294,17 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
 fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // The fire's own round, which fails after the prompt has been persisted.
         [
-            { "kind": "fail", "message": "error sending request: connection refused" }
+            { "type": "fail", "message": "error sending request: connection refused" }
         ]
     ]);
     let harness = ServeTestHarness::spawn_with(
@@ -7821,7 +8316,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     );
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
@@ -7830,7 +8325,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     let mut task_id = String::new();
     while Instant::now() < deadline {
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
             .send()
             .expect("send")
             .json()
@@ -7849,7 +8344,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     let job = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "PROBE_FAILING_FIRE", "every": "1s"}))
         .send()
@@ -7869,10 +8364,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let body: serde_json::Value = harness
-            .request(
-                reqwest::Method::GET,
-                &format!("/v1/sessions/{}/messages", id),
-            )
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
             .send()
             .expect("send")
             .json()
@@ -7882,10 +8374,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
             .expect("messages")
             .iter()
             .any(|message| {
-                message["role"] == "user"
-                    && message["content"][0]["text"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("was cancelled"))
+                message["role"] == "user" && message_text(message).contains("was canceled")
             });
         if carried {
             return;
@@ -7893,8 +8382,7 @@ fn a_fire_that_fails_keeps_the_outcome_riding_on_it() {
         assert!(
             Instant::now() < deadline,
             "a failed fire withdrew the prompt and took the outcome with it; the row is stamped \
-             delivered and will never be handed out again: {}",
-            body
+             delivered and will never be handed out again: {body}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -7918,23 +8406,22 @@ fn a_scheduled_fire_announces_what_it_claims() {
     let config = format!(
         "idle_timeout = \"1s\"\ngc_scan_interval = \"200ms\"\n\
          \n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"10s\"\n\n\
-         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nsecret = \"s\"\n\
-         events = [\"task.finished\"]\n",
-        port
+         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\n\
+         events = [\"task.finished\"]\n"
     );
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "ran the job" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ran the job" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn_with("", &config, script, "sk_test_token", &[
@@ -7945,7 +8432,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
     ]);
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
@@ -7954,7 +8441,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
     let mut task_id = String::new();
     while Instant::now() < deadline {
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
             .send()
             .expect("send")
             .json()
@@ -7975,7 +8462,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
     let job = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "PROBE_ANNOUNCE", "every": "1s"}))
         .send()
@@ -7996,30 +8483,30 @@ fn a_scheduled_fire_announces_what_it_claims() {
         .expect("the fire that claimed the outcome must also announce it");
     let body: serde_json::Value = serde_json::from_str(&delivery.body).expect("json");
     assert_eq!(body["event"], "task.finished");
-    assert_eq!(body["status"], "cancelled", "body was {}", body);
+    assert_eq!(body["status"], "cancelled", "body was {body}");
 }
 
 /// A scheduled fire carries a cancellation that has been waiting for a turn.
 ///
 /// The third door. A user turn and the poller's own report were both folded; a scheduled job runs a
 /// turn too, and a session whose only traffic is scheduled work would otherwise never learn its
-/// task was cancelled -- which is the promise `TaskStatus::wakes_a_host` makes when it declines to
+/// task was canceled -- which is the promise `TaskStatus::wakes_a_host` makes when it declines to
 /// wake one. `meka serve` and ACP both had the gap; this pins the serve half.
 #[test]
 fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "ran the job" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ran the job" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn_with(
@@ -8031,7 +8518,7 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     );
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
@@ -8040,7 +8527,7 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let mut task_id = String::new();
     while Instant::now() < deadline {
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
             .send()
             .expect("send")
             .json()
@@ -8069,7 +8556,7 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let job = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/schedule", id),
+            &format!("/v1/sessions/{id}/schedule"),
         )
         .json(&serde_json::json!({"prompt": "PROBE_SCHEDULED_PROMPT", "every": "1s"}))
         .send()
@@ -8079,10 +8566,7 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let body: serde_json::Value = harness
-            .request(
-                reqwest::Method::GET,
-                &format!("/v1/sessions/{}/messages", id),
-            )
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
             .send()
             .expect("send")
             .json()
@@ -8093,30 +8577,26 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
             .iter()
             .find(|message| {
                 message["role"] == "user"
-                    && message["content"][0]["text"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("PROBE_SCHEDULED_PROMPT"))
+                    && message_text(message).contains("PROBE_SCHEDULED_PROMPT")
             })
             .cloned();
         if let Some(fired) = fired {
-            let text = fired["content"][0]["text"].as_str().unwrap_or_default();
+            let text = message_text(&fired);
             assert!(
-                text.contains("was cancelled"),
-                "the job's prompt must carry the outcome that was waiting for a turn: {}",
-                text
+                text.contains("was canceled"),
+                "the job's prompt must carry the outcome that was waiting for a turn: {text}"
             );
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the scheduled job never fired: {}",
-            body
+            "the scheduled job never fired: {body}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// A cancelled task is announced to subscribers without being delivered to the model.
+/// A canceled task is announced to subscribers without being delivered to the model.
 ///
 /// This is the whole point of splitting `announced_at` from `delivered_at`, and the two halves fail
 /// in opposite directions: without the split, deferring the model's copy re-fires the webhook on
@@ -8127,24 +8607,23 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
 fn a_cancelled_task_is_announced_without_being_delivered() {
     let (port, rx) = spawn_webhook_listener();
     let config = format!(
-        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n\n         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\n         secret = \"s\"\nevents = [\"task.finished\"]\n",
-        port
+        "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n\n         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\n         secret = \"s\"\nevents = [\"task.finished\"]\n"
     );
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn(&config, script);
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
@@ -8153,7 +8632,7 @@ fn a_cancelled_task_is_announced_without_being_delivered() {
     let mut task_id = String::new();
     while Instant::now() < deadline {
         let body: serde_json::Value = harness
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tasks", id))
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tasks"))
             .send()
             .expect("send")
             .json()
@@ -8170,10 +8649,7 @@ fn a_cancelled_task_is_announced_without_being_delivered() {
     assert!(!task_id.is_empty(), "no background task started");
 
     let messages_before = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
@@ -8196,7 +8672,7 @@ fn a_cancelled_task_is_announced_without_being_delivered() {
         .expect("a cancelled task must still reach subscribers");
     let body: serde_json::Value = serde_json::from_str(&delivery.body).expect("json");
     assert_eq!(body["event"], "task.finished");
-    assert_eq!(body["status"], "cancelled", "body was {}", body);
+    assert_eq!(body["status"], "cancelled", "body was {body}");
 
     // Announcing must not have delivered: the conversation is untouched, and a second delivery must
     // not arrive on any later poll.
@@ -8205,10 +8681,7 @@ fn a_cancelled_task_is_announced_without_being_delivered() {
         "a task is announced once, not on every poll"
     );
     let messages_after = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .json::<serde_json::Value>()
@@ -8228,27 +8701,26 @@ fn a_cancelled_task_is_announced_without_being_delivered() {
 fn task_webhook_payload_omits_the_command_line() {
     let (port, rx) = spawn_webhook_listener();
     let config = format!(
-        "\n[background]\nenabled = true\n\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\n\
-         secret = \"s\"\nevents = [\"task.finished\"]\n",
-        port
+        "\n[background]\nenabled = true\n\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\n\
+         secret = \"s\"\nevents = [\"task.finished\"]\n"
     );
     // The mock provider drives the tool call; the payload shape is what is under test.
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end",
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end",
               "input": {"command": "echo SECRET-TOKEN-IN-COMMAND", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn(&config, script);
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "run it"}))
         .send()
         .expect("send");
@@ -8280,14 +8752,13 @@ fn task_webhook_payload_omits_the_command_line() {
 fn webhook_only_fires_for_subscribed_events() {
     let (port, rx) = spawn_webhook_listener();
     let config = format!(
-        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nsecret = \"s\"\n\
-         events = [\"schedule.fired\"]\n",
-        port
+        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nsecret = \"s\"\n\
+         events = [\"schedule.fired\"]\n"
     );
     let harness = ServeTestHarness::spawn(&config, mock_simple_turn());
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi"}))
         .send()
         .expect("send");
@@ -8302,14 +8773,14 @@ fn webhook_only_fires_for_subscribed_events() {
 /// subscription is misspelled is silently never called, which is the worst way to discover it.
 #[test]
 fn unknown_webhook_event_is_a_startup_error() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
-    std::fs::write(
-        config_dir.join("config.toml"),
+    let install = Install::new();
+    install.write_config(
         r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [serve]
@@ -8323,23 +8794,14 @@ events = ["turn.finished", "turn.exploded"]
 token = "sk_test_token"
 scopes = ["sessions:r"]
 "#,
-    )
-    .expect("write config");
+    );
 
-    let output = meka()
-        .arg("serve")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", temp.path().join("data"))
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .output()
-        .expect("run meka serve");
+    let output = install.meka(&["serve"]).output().expect("run meka serve");
     assert!(!output.status.success(), "startup must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("turn.exploded"),
-        "the error must name the offending event: {}",
-        stderr
+        "the error must name the offending event: {stderr}"
     );
 }
 
@@ -8349,13 +8811,12 @@ scopes = ["sessions:r"]
 fn webhook_without_a_secret_sends_no_signature_header() {
     let (port, rx) = spawn_webhook_listener();
     let config = format!(
-        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{}/hook\"\nevents = [\"turn.finished\"]\n",
-        port
+        "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\nevents = [\"turn.finished\"]\n"
     );
     let harness = ServeTestHarness::spawn(&config, mock_simple_turn());
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi"}))
         .send()
         .expect("send");
@@ -8381,12 +8842,11 @@ fn missing_store_resources_report_not_found_rather_than_session_not_found() {
             .request(reqwest::Method::GET, path)
             .send()
             .expect("send");
-        assert_eq!(response.status(), 404, "{}", path);
+        assert_eq!(response.status(), 404, "{path}");
         let body: serde_json::Value = response.json().expect("parse");
         assert_eq!(
             body["type"], "https://meka.so/errors/not-found",
-            "{} must not claim the session is gone: {}",
-            path, body
+            "{path} must not claim the session is gone: {body}"
         );
     }
 }
@@ -8430,7 +8890,7 @@ fn reattach_does_not_redeliver_a_terminal_the_client_already_has() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = start_streaming_session(&harness);
     let original = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hi", "stream": true}))
         .send()
         .expect("send")
@@ -8439,12 +8899,11 @@ fn reattach_does_not_redeliver_a_terminal_the_client_already_has() {
     let last = *sse_event_ids(&original).last().expect("terminal id");
     assert!(
         original.contains("event: turn.finished"),
-        "the last id must be the terminal's: {}",
-        original
+        "the last id must be the terminal's: {original}"
     );
 
     let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/stream", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
         .header("Last-Event-ID", last.to_string())
         .send()
         .expect("send")
@@ -8452,19 +8911,15 @@ fn reattach_does_not_redeliver_a_terminal_the_client_already_has() {
         .expect("body");
     assert!(
         sse_event_ids(&body).iter().all(|value| *value > last),
-        "nothing at or before id {} may be replayed: {}",
-        last,
-        body
+        "nothing at or before id {last} may be replayed: {body}"
     );
     assert!(
         !body.contains("event: turn.finished"),
-        "the client already has the terminal; sending it again makes the turn look finished twice: {}",
-        body
+        "the client already has the terminal; sending it again makes the turn look finished twice: {body}"
     );
     assert!(
         !body.contains("stream-detached"),
-        "a client that is simply up to date is not a detached stream: {}",
-        body
+        "a client that is simply up to date is not a detached stream: {body}"
     );
 }
 
@@ -8479,7 +8934,7 @@ fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
 
     // Turn one: a long id sequence.
     let first = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "one", "stream": true}))
         .send()
         .expect("send")
@@ -8489,7 +8944,7 @@ fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
 
     // Turn two: a fresh sequence starting back at 0.
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "two", "stream": true}))
         .send()
         .expect("send")
@@ -8497,7 +8952,7 @@ fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
         .expect("body");
 
     let body = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/stream", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/stream"))
         .header("Last-Event-ID", stale.to_string())
         .send()
         .expect("send")
@@ -8505,13 +8960,11 @@ fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
         .expect("body");
     assert!(
         body.contains("event: turn.finished"),
-        "a stale id must not swallow the terminal: {}",
-        body
+        "a stale id must not swallow the terminal: {body}"
     );
     assert!(
         body.contains("event: notice") && body.contains("Replay buffer does not reach"),
-        "and the client must be told its position was unreachable: {}",
-        body
+        "and the client must be told its position was unreachable: {body}"
     );
 }
 
@@ -8522,9 +8975,9 @@ fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
 fn context_and_tools_answer_while_a_turn_is_in_flight() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 2500 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 2500 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -8539,25 +8992,22 @@ fn context_and_tools_answer_while_a_turn_is_in_flight() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "hi"}))
             .send()
             .expect("send")
             .status()
     });
 
-    std::thread::sleep(Duration::from_millis(800));
+    harness.wait_until_in_flight(&id);
     let started = Instant::now();
     let context = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send");
     let tools = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tools", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tools"))
         .send()
         .expect("send");
     let elapsed = started.elapsed();
@@ -8566,19 +9016,16 @@ fn context_and_tools_answer_while_a_turn_is_in_flight() {
     assert_eq!(tools.status(), 200);
     assert!(
         elapsed < Duration::from_millis(1200),
-        "both must answer immediately, not wait out the turn; took {:?}",
-        elapsed
+        "both must answer immediately, not wait out the turn; took {elapsed:?}"
     );
     let body: serde_json::Value = context.json().expect("parse");
     assert!(
         body.get("message_count").is_none(),
-        "the one field that needs the conversation is omitted while it is locked: {}",
-        body
+        "the one field that needs the conversation is omitted while it is locked: {body}"
     );
     assert!(
         body["totals"].is_object(),
-        "everything read from atomics and the DB is still present: {}",
-        body
+        "everything read from atomics and the DB is still present: {body}"
     );
     assert_eq!(turn.join().expect("turn thread"), 200);
 }
@@ -8593,7 +9040,7 @@ fn compact_marks_the_session_in_flight() {
     let id = session_with_one_turn(&harness);
 
     let before: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send")
         .json()
@@ -8601,29 +9048,25 @@ fn compact_marks_the_session_in_flight() {
     assert_eq!(before["turn_in_flight"], false);
 
     let compact = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/compact", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
         .send()
         .expect("send");
     assert_eq!(compact.status(), 200);
 
     // The guard must release afterwards, or the session is wedged for good.
     let after: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
     assert_eq!(
         after["turn_in_flight"], false,
-        "the in-flight guard must be released when compaction returns: {}",
-        after
+        "the in-flight guard must be released when compaction returns: {after}"
     );
 
     let next = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "still usable?"}))
         .send()
         .expect("send");
@@ -8668,10 +9111,7 @@ fn context_counters_are_wired_to_the_handles_the_agent_writes() {
     let harness = ServeTestHarness::spawn("", mock_simple_turn());
     let id = session_with_one_turn(&harness);
     let body: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send")
         .json()
@@ -8684,40 +9124,33 @@ fn context_counters_are_wired_to_the_handles_the_agent_writes() {
         body["overhead"]
             .as_u64()
             .is_some_and(|overhead| overhead > 0),
-        "`overhead` must be the counter the agent stamps with prompt + schema cost: {}",
-        body
+        "`overhead` must be the counter the agent stamps with prompt + schema cost: {body}"
     );
     assert!(
         body["window"].as_u64().is_some_and(|window| window > 0),
-        "`window` must be the resolved window, not the unresolved config Option: {}",
-        body
+        "`window` must be the resolved window, not the unresolved config Option: {body}"
     );
     assert_eq!(
         body["window"], 1_000_000,
         "the harness configures no context_window, so this is the documented default; reading \
-         `config.session_context_window` instead would have reported nothing at all: {}",
-        body
+         `config.session_context_window` instead would have reported nothing at all: {body}"
     );
 
-    // And the configured value actually reaches the agent. Since meka no longer infers a window
+    // And the configured value actually reaches the agent. Since meka never infers a window
     // from the model name or probes for it, this config key is the *only* way to state the real
     // one, so a call site that dropped it would silently budget every session against the default.
     let configured =
         ServeTestHarness::spawn("\n[session]\ncontext_window = 262144\n", mock_simple_turn());
     let id = session_with_one_turn(&configured);
     let body: serde_json::Value = configured
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
     assert_eq!(
         body["window"], 262_144,
-        "`[session].context_window` must reach the agent, not just the config struct: {}",
-        body
+        "`[session].context_window` must reach the agent, not just the config struct: {body}"
     );
 }
 
@@ -8747,8 +9180,7 @@ fn a_same_length_rewrite_is_visible_immediately() {
         .expect("parse");
     assert_eq!(
         second["priority"], 7,
-        "the write's own read-back must not be served a stale cache: {}",
-        second
+        "the write's own read-back must not be served a stale cache: {second}"
     );
 
     let listed: serde_json::Value = harness
@@ -8763,11 +9195,7 @@ fn a_same_length_rewrite_is_visible_immediately() {
         .iter()
         .find(|s| s["name"] == "tick")
         .expect("listed");
-    assert_eq!(
-        entry["priority"], 7,
-        "and agents must see it too: {}",
-        entry
-    );
+    assert_eq!(entry["priority"], 7, "and agents must see it too: {entry}");
 }
 
 /// A rewind removes messages with nothing left behind to carry a marker, so `total` shrinking is
@@ -8787,35 +9215,28 @@ fn revision_advances_on_rewind_as_well_as_compaction() {
             .json()
             .expect("parse")
     };
-    let before = read(format!("/v1/sessions/{}/messages", id));
+    let before = read(format!("/v1/sessions/{id}/messages"));
     assert_eq!(
         before["revision"], 0,
         "an append-only log has never been rewritten"
     );
 
     harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/compact", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
         .send()
         .expect("send");
-    let after_compact = read(format!("/v1/sessions/{}/messages", id));
+    let after_compact = read(format!("/v1/sessions/{id}/messages"));
     assert_eq!(after_compact["revision"], 1, "compaction rewrites the log");
 
     harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/rewind", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
         .json(&serde_json::json!({"turns": 1}))
         .send()
         .expect("send");
-    let after_rewind = read(format!("/v1/sessions/{}/messages", id));
+    let after_rewind = read(format!("/v1/sessions/{id}/messages"));
     assert_eq!(
         after_rewind["revision"], 2,
-        "and so does a rewind, which leaves no marker behind: {}",
-        after_rewind
+        "and so does a rewind, which leaves no marker behind: {after_rewind}"
     );
 }
 
@@ -8830,14 +9251,11 @@ fn read_only_endpoints_do_not_revive_an_evicted_session() {
         mock_simple_turn(),
     );
     let id = session_with_one_turn(&harness);
-    std::thread::sleep(Duration::from_millis(3500));
+    harness.wait_until_evicted(&id);
 
     // `/context` still answers from the database, without reviving.
     let context = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send");
     assert_eq!(context.status(), 200);
@@ -8845,45 +9263,42 @@ fn read_only_endpoints_do_not_revive_an_evicted_session() {
     assert!(
         body.get("used").is_none() && body.get("overhead").is_none(),
         "an evicted session has no live counters, and must say so by omission rather than \
-         reporting zero: {}",
-        body
+         reporting zero: {body}"
     );
     assert_eq!(
         body["totals"]["turns"], 1,
-        "the durable figures still come back: {}",
-        body
+        "the durable figures still come back: {body}"
     );
 
     // `/tools` needs a live registry, so it refuses rather than reviving or guessing.
     let tools = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}/tools", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/tools"))
         .send()
         .expect("send");
     assert_eq!(
         tools.status(),
         409,
-        "a catalogue needs a loaded session; reviving one would pin its file lock for a read"
+        "a catalog needs a loaded session; reviving one would pin its file lock for a read"
     );
     let problem: serde_json::Value = tools.json().expect("parse");
     assert_eq!(
         problem["type"], "https://meka.so/errors/session-not-loaded",
         "not `turn-in-flight`: that type tells a client to cancel a turn, and `POST /cancel` \
          would return 204 forever because there is no turn. The remedy is the opposite -- submit \
-         one. Body was: {}",
-        problem
+         one. Body was: {problem}"
     );
 }
 
 /// `max_body_bytes` above axum's own 2 MiB extractor default was silently inert, and the 413 then
 /// named a limit that had not fired.
 #[test]
-fn max_body_bytes_above_two_mebibytes_is_honoured() {
+fn max_body_bytes_above_two_mebibytes_is_honored() {
     let harness = ServeTestHarness::spawn("max_body_bytes = 8388608\n", mock_simple_turn());
     let id = start_streaming_session(&harness);
     // 3 MiB of message: over axum's default, under the configured limit.
     let message = "x".repeat(3 * 1024 * 1024);
     let response = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": message}))
         .send()
         .expect("send");
@@ -8902,62 +9317,47 @@ fn zero_valued_serve_knobs_are_rejected_at_startup() {
         ("gc_scan_interval = \"0s\"\n", "gc_scan_interval"),
         ("", "timeout"),
     ] {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_dir = temp.path().join("meka");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let install = Install::new();
         let webhook = if probe == "timeout" {
             "\n[[serve.webhooks]]\nurl = \"http://127.0.0.1:1/h\"\nevents = [\"turn.finished\"]\n\
              timeout = \"0s\"\n"
         } else {
             ""
         };
-        std::fs::write(
-            config_dir.join("config.toml"),
-            format!(
-                "[providers.mock]\ntype = \"anthropic-messages\"\nmodel = \"claude-sonnet-4-5\"\n\n\
-                 [serve]\nbind = \"127.0.0.1:0\"\n{}{}\n\
-                 [[serve.tokens]]\ntoken = \"t\"\nscopes = [\"sessions:r\"]\n",
-                snippet, webhook
-            ),
-        )
-        .expect("write config");
-        let output = meka()
-            .arg("serve")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", temp.path().join("data"))
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .output()
-            .expect("run meka serve");
-        assert!(!output.status.success(), "{} must fail startup", probe);
+        install.write_config(&format!(
+            "[accounts.mock]\nbackend = \"anthropic-messages\"\n\n[profiles.mock]\naccount = \
+             \"mock\"\nmodel = \"claude-sonnet-4-5\"\n\n\
+             [serve]\nbind = \"127.0.0.1:0\"\n{snippet}{webhook}\n\
+             [[serve.tokens]]\ntoken = \"t\"\nscopes = [\"sessions:r\"]\n"
+        ));
+        let output = install.meka(&["serve"]).output().expect("run meka serve");
+        assert!(!output.status.success(), "{probe} must fail startup");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains(probe),
-            "the error must name {}: {}",
-            probe,
-            stderr
+            "the error must name {probe}: {stderr}"
         );
     }
 }
 
-/// Cancelling a slow turn and then compacting is an ordinary sequence: the turn is going nowhere,
+/// Canceling a slow turn and then compacting is an ordinary sequence: the turn is going nowhere,
 /// so free the window. It broke silently, because `POST /compact` cloned whatever token the last
-/// turn left in the session's cell, and a cancelled turn leaves that token fired. The checkpoint
-/// turn then returned instantly and compaction fell back to the standalone summariser -- no
+/// turn left in the session's cell, and a canceled turn leaves that token fired. The checkpoint
+/// turn then returned instantly and compaction fell back to the standalone summarizer -- no
 /// memories written, a worse summary, and a `warn` as the only trace.
 #[test]
 fn compacting_after_a_cancelled_turn_still_runs_the_checkpoint() {
     let script = serde_json::json!([
         // Turn one: slow enough to cancel.
         [
-            { "kind": "sleep", "ms": 4000 },
-            { "kind": "text", "text": "never seen" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 4000 },
+            { "type": "text", "text": "never seen" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // The checkpoint turn the compaction should run.
         [
-            { "kind": "text", "text": "summary of the conversation so far" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "summary of the conversation so far" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -8972,8 +9372,8 @@ fn compacting_after_a_cancelled_turn_still_runs_the_checkpoint() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "something slow"}))
             .send()
             .expect("send")
@@ -8982,20 +9382,14 @@ fn compacting_after_a_cancelled_turn_still_runs_the_checkpoint() {
 
     harness.wait_until_in_flight(&id);
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("send");
     assert_eq!(cancel.status(), 204);
     let _ = turn.join().expect("turn thread");
 
     let response = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/compact", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/compact"))
         .send()
         .expect("send");
     assert_eq!(
@@ -9009,45 +9403,44 @@ fn compacting_after_a_cancelled_turn_still_runs_the_checkpoint() {
     assert!(
         source.starts_with("checkpoint"),
         "the checkpoint turn must actually run after a cancelled turn, not be skipped because it \
-         inherited the fired token; source was {:?}",
-        source
+         inherited the fired token; source was {source:?}"
     );
 }
 
 /// The agent chose the moment, so it gets to act on the result: a compaction it asked for lands
 /// before its next step, not after its last one.
 ///
-/// The round order is the evidence. `context_compact` is answered by the summariser *first*, and
+/// The round order is the evidence. `context_compact` is answered by the summarizer *first*, and
 /// only then does the model produce "after the compaction", a round it could not have reached at
 /// all while the request was drained after the tool loop, because by then the turn was over.
 #[test]
 fn a_requested_compaction_lets_the_turn_continue() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
-            { "kind": "tool_use_end", "input": {} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "a summary" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "a summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "after the compaction" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "after the compaction" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // A spare round, so the count assertion below is real. With exactly three, a second
         // compaction draws an exhausted round, fails on the empty summary, and emits nothing --
         // and the assertion would hold whether or not the slot had been emptied.
         [
-            { "kind": "text", "text": "a spare round" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "a spare round" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
     let id = start_streaming_session(&harness);
     let body = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "compact yourself", "stream": true}))
         .send()
         .expect("send")
@@ -9056,8 +9449,7 @@ fn a_requested_compaction_lets_the_turn_continue() {
 
     assert!(
         body.contains("after the compaction"),
-        "the turn has to resume against the compacted context, not end at the request: {}",
-        body
+        "the turn has to resume against the compacted context, not end at the request: {body}"
     );
     // Exactly one, which is also what keeps the post-loop drain from compacting a second time: it
     // takes unconditionally, and the in-loop drain has already emptied the slot.
@@ -9071,40 +9463,39 @@ fn a_requested_compaction_lets_the_turn_continue() {
             .filter(|name| *name == "context.compacted")
             .count(),
         1,
-        "one request, one compaction, and the client told about it: {}",
-        body
+        "one request, one compaction, and the client told about it: {body}"
     );
 }
 
-/// One turn honours one request. Now that a compaction lands mid-turn, an agent that asks on every
-/// iteration would summarise on every iteration, each round costing a summariser call and, with a
+/// One turn honors one request. Now that a compaction lands mid-turn, an agent that asks on every
+/// iteration would summarize on every iteration, each round costing a summarizer call and, with a
 /// checkpoint configured, several more. The second ask is answered and deferred, not run.
 #[test]
-fn a_turn_honours_one_compaction_request_however_many_it_gets() {
+fn a_turn_honors_one_compaction_request_however_many_it_gets() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
-            { "kind": "tool_use_end", "input": {} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "first summary" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "tool_use_start", "id": "tu_2", "name": "context_compact" },
-            { "kind": "tool_use_end", "input": {} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_2", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
     let id = start_streaming_session(&harness);
     let body = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "compact twice", "stream": true}))
         .send()
         .expect("send")
@@ -9117,8 +9508,7 @@ fn a_turn_honours_one_compaction_request_however_many_it_gets() {
         .count();
     assert_eq!(
         compactions, 1,
-        "the second request in one turn must be deferred, not honoured: {}",
-        body
+        "the second request in one turn must be deferred, not honored: {body}"
     );
 }
 
@@ -9126,7 +9516,7 @@ fn a_turn_honours_one_compaction_request_however_many_it_gets() {
 ///
 /// The request is parked by a tool that ignores its cancellation token, so it survives the
 /// interrupt. Running it anyway replaces the whole window and -- because a fired token makes
-/// `run_checkpoint_turn` return early -- does it through the standalone summariser, writing nothing
+/// `run_checkpoint_turn` return early -- does it through the standalone summarizer, writing nothing
 /// to memory. That is the failure `compacting_after_a_cancelled_turn_still_runs_the_checkpoint`
 /// exists to prevent, reached through a different door.
 ///
@@ -9142,15 +9532,15 @@ fn an_interrupt_stops_a_requested_compaction_before_it_replaces_the_window() {
     // window only a running tool batch holds open.
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
-            { "kind": "tool_use_end", "input": {} },
-            { "kind": "tool_use_start", "id": "tu_2", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 5"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "tool_use_start", "id": "tu_2", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 5"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "a summary" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "a summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -9165,8 +9555,8 @@ fn an_interrupt_stops_a_requested_compaction_before_it_replaces_the_window() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "compact then stop"}))
             .send()
             .expect("send")
@@ -9175,28 +9565,21 @@ fn an_interrupt_stops_a_requested_compaction_before_it_replaces_the_window() {
 
     harness.wait_until_in_flight(&id);
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("send");
     assert_eq!(cancel.status(), 204);
     let _ = turn.join().expect("turn thread");
 
     let messages = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .text()
         .expect("body");
     assert!(
         !messages.contains("a summary"),
-        "the interrupted turn must not have had its window replaced by a summariser: {}",
-        messages
+        "the interrupted turn must not have had its window replaced by a summarizer: {messages}"
     );
 }
 
@@ -9204,7 +9587,7 @@ fn an_interrupt_stops_a_requested_compaction_before_it_replaces_the_window() {
 ///
 /// Guarding only the drain's entry covers the narrow case. Nothing between there and the rewrite
 /// is cancellable: `run_checkpoint_turn` answers a fired token with `Ok(None)` and hands on to the
-/// summariser, and `provider.complete` takes no token, so the compaction reports success and the
+/// summarizer, and `provider.complete` takes no token, so the compaction reports success and the
 /// window goes anyway. The checkpoint is skipped precisely because the token fired, so what
 /// replaces the conversation is a summary written without the agent, with nothing saved.
 #[test]
@@ -9213,22 +9596,22 @@ fn an_interrupt_inside_a_requested_compaction_still_spares_the_window() {
     // already passed and the compaction is under way.
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
-            { "kind": "tool_use_end", "input": {} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         // Ends on a tool call, not `end_turn`: that sends `run_checkpoint_turn` round the loop to
         // its per-round token check, which is where a fired token turns into `Ok(None)` and hands
-        // the compaction to the standalone summariser below.
+        // the compaction to the standalone summarizer below.
         [
-            { "kind": "sleep", "ms": 4000 },
-            { "kind": "tool_use_start", "id": "tu_2", "name": "memory_search" },
-            { "kind": "tool_use_end", "input": {"query": "anything"} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "sleep", "ms": 4000 },
+            { "type": "tool_use_start", "id": "tu_2", "name": "memory_search" },
+            { "type": "tool_use_end", "input": {"query": "anything"} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "STANDALONE SUMMARY" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "STANDALONE SUMMARY" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -9243,8 +9626,8 @@ fn an_interrupt_inside_a_requested_compaction_still_spares_the_window() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "compact then stop mid-compaction"}))
             .send()
             .expect("send")
@@ -9254,20 +9637,14 @@ fn an_interrupt_inside_a_requested_compaction_still_spares_the_window() {
     harness.wait_until_in_flight(&id);
     std::thread::sleep(Duration::from_millis(800));
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("send");
     assert_eq!(cancel.status(), 204);
     let _ = turn.join().expect("turn thread");
 
     let messages = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
         .send()
         .expect("send")
         .text()
@@ -9275,8 +9652,7 @@ fn an_interrupt_inside_a_requested_compaction_still_spares_the_window() {
     assert!(
         !messages.contains("STANDALONE SUMMARY"),
         "a stop landing inside the compaction must not still replace the window with a summary \
-         written without the agent: {}",
-        messages
+         written without the agent: {messages}"
     );
 }
 
@@ -9289,33 +9665,33 @@ fn an_interrupt_inside_a_requested_compaction_still_spares_the_window() {
 /// telling them to shorten a conversation that was never the problem.
 ///
 /// Emergency skips the checkpoint by design, so the only window a cancel can land in is the
-/// summariser call; the mock holds it open with a sleep.
+/// summarizer call; the mock holds it open with a sleep.
 #[test]
 fn an_interrupt_during_an_emergency_compaction_is_not_reported_as_an_overflow() {
     // A first, ordinary turn: the emergency path is gated on `messages.len() > 1`, so a
     // conversation that is still just its opening prompt never reaches the compaction at all.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first turn" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first turn" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "fail_context_overflow", "message": "too large" }
+            { "type": "fail_context_overflow", "message": "too large" }
         ],
         [
-            { "kind": "sleep", "ms": 4000 },
-            { "kind": "text", "text": "an emergency summary" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 4000 },
+            { "type": "text", "text": "an emergency summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "recovered" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "recovered" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
     let id = start_streaming_session(&harness);
     harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "warm up"}))
         .send()
         .expect("send");
@@ -9329,8 +9705,8 @@ fn an_interrupt_during_an_emergency_compaction_is_not_reported_as_an_overflow() 
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, session))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{session}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "overflow then stop"}))
             .send()
             .expect("send")
@@ -9341,10 +9717,7 @@ fn an_interrupt_during_an_emergency_compaction_is_not_reported_as_an_overflow() 
     harness.wait_until_in_flight(&id);
     std::thread::sleep(Duration::from_millis(800));
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("send");
     assert_eq!(cancel.status(), 204);
@@ -9352,8 +9725,7 @@ fn an_interrupt_during_an_emergency_compaction_is_not_reported_as_an_overflow() 
 
     assert!(
         !body.contains("context-overflow"),
-        "a stop during the emergency compaction must not be reported as a context overflow: {}",
-        body
+        "a stop during the emergency compaction must not be reported as a context overflow: {body}"
     );
 }
 
@@ -9363,25 +9735,25 @@ fn an_interrupt_during_an_emergency_compaction_is_not_reported_as_an_overflow() 
 fn a_compaction_during_a_streaming_turn_emits_context_compacted() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "context_compact" },
-            { "kind": "tool_use_end", "input": {} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
-        // The summariser draws first now that the drain runs mid-loop; the model's own reply is
-        // the round after it. Labelled in that order so the fixture reads as what happens.
+        // The summarizer draws first now that the drain runs mid-loop; the model's own reply is
+        // the round after it. Labeled in that order so the fixture reads as what happens.
         [
-            { "kind": "text", "text": "a summary" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "a summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "the reply" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "the reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("\n[session]\ncompact_checkpoint = false\n", script);
     let id = start_streaming_session(&harness);
     let body = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "compact yourself", "stream": true}))
         .send()
         .expect("send")
@@ -9391,28 +9763,25 @@ fn a_compaction_during_a_streaming_turn_emits_context_compacted() {
     let names = sse_event_names(&body);
     assert!(
         names.iter().any(|name| name == "context.compacted"),
-        "a compaction inside a streaming turn must reach the client: {}",
-        body
+        "a compaction inside a streaming turn must reach the client: {body}"
     );
     assert!(
         body.contains("\"generation\":1"),
-        "and carry which compaction it was: {}",
-        body
+        "and carry which compaction it was: {body}"
     );
     assert_eq!(
         names.last().map(String::as_str),
         Some("turn.finished"),
-        "the event must land before the terminal, not after: {}",
-        body
+        "the event must land before the terminal, not after: {body}"
     );
 }
 
 /// A malformed body is answered as malformed, even while the session is busy.
 ///
-/// `TurnGuard::acquire` used to run before the body was validated, so a request meka was going to
-/// refuse anyway was admitted first -- and on a session already running a turn, `acquire` fails,
-/// so the caller was told 409 `turn-in-flight` about a request whose real problem was that it had
-/// no message in it. Retrying that (which is what a 409 invites) reproduces it forever.
+/// If `TurnGuard::acquire` ran before the body was validated, a request meka was going to refuse
+/// anyway would be admitted first; on a session already running a turn `acquire` fails, so the
+/// caller would be told 409 `turn-in-flight` about a request whose real problem is that it has no
+/// message in it. Retrying that (which is what a 409 invites) reproduces it forever.
 ///
 /// Asserted against a *running* turn deliberately. A sequential version of this test passes either
 /// way: the guard is RAII, so a rejected request that took one released it again before the next
@@ -9421,9 +9790,9 @@ fn a_compaction_during_a_streaming_turn_emits_context_compacted() {
 fn a_malformed_body_is_refused_as_malformed_even_while_a_turn_runs() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 1500 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 1500 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -9446,8 +9815,8 @@ fn a_malformed_body_is_refused_as_malformed_even_while_a_turn_runs() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, running_id))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{running_id}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&serde_json::json!({"message": "the real turn"}))
             .send()
             .expect("send")
@@ -9455,7 +9824,7 @@ fn a_malformed_body_is_refused_as_malformed_even_while_a_turn_runs() {
 
     harness.wait_until_in_flight(&id);
     let rejected = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "   "}))
         .send()
         .expect("send");
@@ -9472,7 +9841,7 @@ fn a_malformed_body_is_refused_as_malformed_even_while_a_turn_runs() {
 
 /// Two requests arriving together for a session this process has evicted must both be served.
 ///
-/// Reconstruction takes the session's cross-process file lock, so without serialisation the loser
+/// Reconstruction takes the session's cross-process file lock, so without serialization the loser
 /// raced the winner for it and got a `session-locked` 409 whose documented remedy ("retry against
 /// the process that holds it") pointed at this very process. `lock_session_reconstruction` makes
 /// the loser wait and then find the winner's entry.
@@ -9501,9 +9870,9 @@ fn two_requests_for_an_evicted_session_are_both_served() {
         .expect("id")
         .to_string();
 
-    // Outlast `idle_timeout` plus a scan, so the session is dropped from the in-memory map and the
-    // requests below have to go through `ensure_session_loaded`.
-    std::thread::sleep(Duration::from_secs(2));
+    // Once the session is dropped from the in-memory map, the requests below have to go through
+    // `ensure_session_loaded`, which is the path under test.
+    harness.wait_until_evicted(&id);
 
     let mut handles = Vec::new();
     for _ in 0..2 {
@@ -9516,8 +9885,8 @@ fn two_requests_for_an_evicted_session_are_both_served() {
                 .build()
                 .expect("client");
             client
-                .patch(format!("{}/v1/sessions/{}", base_url, id))
-                .header("Authorization", format!("Bearer {}", token))
+                .patch(format!("{base_url}/v1/sessions/{id}"))
+                .header("Authorization", format!("Bearer {token}"))
                 .json(&serde_json::json!({"permission": "read"}))
                 .send()
                 .expect("send")
@@ -9531,19 +9900,18 @@ fn two_requests_for_an_evicted_session_are_both_served() {
         .collect();
     assert!(
         statuses.iter().all(|status| status.is_success()),
-        "both requests must be served; one lost the race to rebuild the session: {:?}",
-        statuses
+        "both requests must be served; one lost the race to rebuild the session: {statuses:?}"
     );
 }
 
-/// A cancelled turn is not cached against its `Idempotency-Key`, and the cancel actually lands.
+/// A canceled turn is not cached against its `Idempotency-Key`, and the cancel actually lands.
 ///
 /// Two properties in one run, because they were entangled. The key exists so a client whose
 /// connection died can retry; cancellation is the case that most invites a retry, and caching it
 /// answered every retry "cancelled" for the full 24h TTL. But an earlier version of this test was
 /// flaky at about one run in four, and the cause was a second defect rather than the test: the
 /// turn's cancellation token is published *after* `TurnGuard::acquire`, so a `POST /cancel` landing
-/// in that window cancelled the previous turn's token, answered 204, and left this turn running to
+/// in that window canceled the previous turn's token, answered 204, and left this turn running to
 /// completion. Poll `turn_in_flight` then cancel -- what this test does, and what the HTTP docs
 /// describe -- walked straight into it. `SessionEntry::cancel_epoch` closes the window, and this is
 /// the test that exercises the wiring rather than the helper.
@@ -9551,13 +9919,13 @@ fn two_requests_for_an_evicted_session_are_both_served() {
 fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
     let script = serde_json::json!([
         [
-            { "kind": "sleep", "ms": 4000 },
-            { "kind": "text", "text": "should never reach client" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "sleep", "ms": 4000 },
+            { "type": "text", "text": "should never reach client" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "the retry actually ran" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "the retry actually ran" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -9584,8 +9952,8 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
             .build()
             .expect("client");
         client
-            .post(format!("{}/v1/sessions/{}/turn", base_url, id_clone))
-            .header("Authorization", format!("Bearer {}", token))
+            .post(format!("{base_url}/v1/sessions/{id_clone}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
             .header("Idempotency-Key", key)
             .json(&body_clone)
             .send()
@@ -9594,10 +9962,7 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
 
     harness.wait_until_in_flight(&id);
     let cancel = harness
-        .request(
-            reqwest::Method::POST,
-            &format!("/v1/sessions/{}/cancel", id),
-        )
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
         .send()
         .expect("cancel");
     assert_eq!(cancel.status(), 204);
@@ -9607,14 +9972,14 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
     let cancelled_body = cancelled.text().expect("text");
     assert!(
         !cancelled_status.is_success(),
-        "the 204 said the turn was cancelled, but it ran to completion: \
+        "the 204 said the turn was canceled, but it ran to completion: \
          {cancelled_status} {cancelled_body}"
     );
 
     // Same key, same body. A cached cancellation would replay verbatim and the mock's second round
     // would never be consumed.
     let retry = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .header("Idempotency-Key", key)
         .json(&body)
         .send()
@@ -9624,10 +9989,10 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
         200,
         "the retry must run rather than replay the cancellation"
     );
-    // Deliberately not asserting *which* mock round the retry consumes. Whether the cancelled turn
+    // Deliberately not asserting *which* mock round the retry consumes. Whether the canceled turn
     // consumed round one depends on how far it got before the token fired, so pinning the retry to
     // round two's text made this fail about one full-suite run in three -- a property of the mock's
-    // round counter, not of the behaviour under test. What distinguishes "ran" from "replayed the
+    // round counter, not of the behavior under test. What distinguishes "ran" from "replayed the
     // cache" is that a cached cancellation is a non-2xx problem document: it has no `stop_reason`
     // and carries the cancellation type URI.
     let retry_body = retry.text().expect("text");
@@ -9661,11 +10026,11 @@ fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
         ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
 
     // Names that survive routing as a single path segment but cannot name a directory in the store.
-    // `..` is deliberately not among them: axum normalises it away before the handler sees it, so
+    // `..` is deliberately not among them: axum normalizes it away before the handler sees it, so
     // it tests the router rather than this endpoint.
     for name in [".hidden", "tab%09name", "null%00name"] {
         let response = harness
-            .request(reqwest::Method::DELETE, &format!("/v1/skills/{}", name))
+            .request(reqwest::Method::DELETE, &format!("/v1/skills/{name}"))
             .send()
             .expect("send");
         let status = response.status();
@@ -9685,7 +10050,7 @@ fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
     // what makes such a skill removable at all.
     for name in ["not.a.skill", "has%20space"] {
         let response = harness
-            .request(reqwest::Method::DELETE, &format!("/v1/skills/{}", name))
+            .request(reqwest::Method::DELETE, &format!("/v1/skills/{name}"))
             .send()
             .expect("send");
         assert_eq!(
@@ -9707,12 +10072,12 @@ fn deleting_an_invalid_skill_name_is_refused_before_the_filesystem_is_probed() {
 fn one_idempotency_key_across_two_sessions_answers_each_with_its_own_turn() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first session speaking" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first session speaking" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second session speaking" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second session speaking" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let harness = ServeTestHarness::spawn("", script);
@@ -9737,7 +10102,7 @@ fn one_idempotency_key_across_two_sessions_answers_each_with_its_own_turn() {
 
     let turn = |id: &str| -> serde_json::Value {
         let response = harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
             .header("Idempotency-Key", key)
             .json(&body)
             .send()
@@ -9769,17 +10134,20 @@ fn one_idempotency_key_across_two_sessions_answers_each_with_its_own_turn() {
 ///
 /// The rescue path for a session whose recorded profile has left `config.toml`. Reviving it to
 /// apply the change is the one thing that cannot work in that state, because rebuilding the agent
-/// resolves the very profile that is gone, so the documented recovery used to be refused by the
-/// failure it was meant to repair. Exercised on a *healthy* dormant session, since a genuinely
+/// resolves the very profile that is gone, so the documented recovery would be refused by the
+/// failure it is meant to repair. Exercised on a *healthy* dormant session, since a genuinely
 /// stranded one cannot be created through this API; what it pins is that no agent is built, which
 /// is what makes the stranded case work.
 #[test]
 fn patch_moves_a_dormant_session_without_reviving_it() {
     let harness = ServeTestHarness::spawn_with_prelude(
-        "default_provider = \"mock\"\n",
+        "default_profile = \"mock\"\n",
         r#"
-[providers.other]
-type = "anthropic-messages"
+[accounts.other]
+backend = "anthropic-messages"
+
+[profiles.other]
+account = "other"
 model = "claude-sonnet-4-5"
 context_window = 32000
 "#,
@@ -9800,7 +10168,7 @@ context_window = 32000
     let envelope: serde_json::Value = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/export?format=json", source),
+            &format!("/v1/sessions/{source}/export?format=json"),
         )
         .send()
         .expect("send")
@@ -9819,8 +10187,8 @@ context_window = 32000
         .to_string();
 
     let patched = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
-        .json(&serde_json::json!({"provider": "other"}))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"profile": "other"}))
         .send()
         .expect("send");
     assert_eq!(
@@ -9830,7 +10198,7 @@ context_window = 32000
         patched.text().unwrap_or_default()
     );
     let body: serde_json::Value = patched.json().expect("parse");
-    assert_eq!(body["provider"], "other", "{body}");
+    assert_eq!(body["profile"], "other", "{body}");
     assert_eq!(
         body["turn_in_flight"], false,
         "a session with no agent has no turn: {body}"
@@ -9845,10 +10213,7 @@ context_window = 32000
     // body. Every assertion above still passed. Verified by prefixing the branch with `if false
     // &&`.
     let context: serde_json::Value = harness
-        .request(
-            reqwest::Method::GET,
-            &format!("/v1/sessions/{}/context", id),
-        )
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
         .send()
         .expect("send")
         .json()
@@ -9860,12 +10225,12 @@ context_window = 32000
 
     // The row moved, and reading it back does not depend on an entry either.
     let fetched: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
-    assert_eq!(fetched["provider"], "other", "{fetched}");
+    assert_eq!(fetched["profile"], "other", "{fetched}");
 }
 
 /// A dormant repin and the reconstruction that follows it must agree about the profile.
@@ -9873,27 +10238,30 @@ context_window = 32000
 /// `repin_dormant_session` decides what to write on the strength of the session not being resident,
 /// then awaits five times before writing: `require_session_exists`, resolving the profile (which
 /// may build a provider and load a credential), reading the recorded binding, the write itself, and
-/// the re-read. Nothing re-checked residency and nothing serialised against reconstruction, so any
-/// turn, scheduler fire, compaction or rewind arriving in that window rebuilt the agent from the
-/// *old* profile and inserted it. The row then moved and the response quoted the new profile, while
-/// the session ran, billed and gauged the old one until it was evicted again -- hours, at the
-/// default idle timeout.
+/// the re-read. Without a residency re-check serialized against reconstruction, any turn, scheduler
+/// fire, compaction or rewind arriving in that window would rebuild the agent from the *old*
+/// profile and insert it. The row would then move and the response quote the new profile, while the
+/// session ran, billed and gauged the old one until it was evicted again: hours, at the default
+/// idle timeout.
 ///
 /// The race itself is not reproducible from out here: it needs a reconstruction to land inside
 /// those five awaits, and nothing over HTTP can be timed that precisely. What is asserted is the
 /// post-condition the fix guarantees -- that after the repin, the row and the *live agent* rebuilt
-/// from it name the same profile -- which is exactly what the race broke. The serialisation itself
+/// from it name the same profile -- which is exactly what the race broke. The serialization itself
 /// lives in `repin_dormant_session`, which now holds `lock_session_reconstruction` for its whole
 /// body and re-checks residency under it.
 #[test]
 fn a_dormant_repin_and_the_agent_rebuilt_after_it_agree() {
     let harness = ServeTestHarness::spawn_with_prelude(
-        "default_provider = \"mock\"\n",
+        "default_profile = \"mock\"\n",
         r#"idle_timeout = "1s"
 gc_scan_interval = "1s"
 
-[providers.small]
-type = "anthropic-messages"
+[accounts.small]
+backend = "anthropic-messages"
+
+[profiles.small]
+account = "small"
 model = "claude-sonnet-4-5"
 context_window = 32000
 "#,
@@ -9904,7 +10272,7 @@ context_window = 32000
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "provider": "mock",
+            "profile": "mock",
         }))
         .send()
         .expect("send");
@@ -9924,13 +10292,13 @@ context_window = 32000
     // is gone, and `/context` deliberately never revives a session, so polling it cannot keep this
     // one alive.
     let turn = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hello"}))
         .send()
         .expect("send");
     assert_eq!(turn.status(), 200, "{}", turn.text().unwrap_or_default());
 
-    let context_path = format!("/v1/sessions/{}/context", id);
+    let context_path = format!("/v1/sessions/{id}/context");
     let context: serde_json::Value = harness
         .request(reqwest::Method::GET, &context_path)
         .send()
@@ -9964,8 +10332,8 @@ context_window = 32000
     }
 
     let patched = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
-        .json(&serde_json::json!({"provider": "small"}))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"profile": "small"}))
         .send()
         .expect("send");
     assert_eq!(
@@ -9975,7 +10343,7 @@ context_window = 32000
         patched.text().unwrap_or_default()
     );
     let patched: serde_json::Value = patched.json().expect("parse");
-    assert_eq!(patched["provider"], "small", "{patched}");
+    assert_eq!(patched["profile"], "small", "{patched}");
 
     // The PATCH must have taken the dormant path, not revived the session and used the resident
     // one. Without this the test could not tell the two apart: the resident path reaches the same
@@ -9996,7 +10364,7 @@ context_window = 32000
     // Reconstructs the agent from the row. Before the fix this is the request that, arriving a
     // moment earlier, would have raced the repin and won.
     let turn = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "hello"}))
         .send()
         .expect("send");
@@ -10015,12 +10383,12 @@ context_window = 32000
          {context}"
     );
     let session: serde_json::Value = harness
-        .request(reqwest::Method::GET, &format!("/v1/sessions/{}", id))
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
         .send()
         .expect("send")
         .json()
         .expect("parse");
-    assert_eq!(session["provider"], "small", "{session}");
+    assert_eq!(session["profile"], "small", "{session}");
 }
 
 /// A `PATCH` naming a provider on a session that is still **resident** must move both the row and
@@ -10037,10 +10405,13 @@ context_window = 32000
 #[test]
 fn a_resident_patch_moves_the_agent_and_refuses_an_unconfigured_profile() {
     let harness = ServeTestHarness::spawn_with_prelude(
-        "default_provider = \"mock\"\n",
+        "default_profile = \"mock\"\n",
         r#"
-[providers.small]
-type = "anthropic-messages"
+[accounts.small]
+backend = "anthropic-messages"
+
+[profiles.small]
+account = "small"
 model = "claude-sonnet-4-5"
 context_window = 32000
 "#,
@@ -10059,7 +10430,7 @@ context_window = 32000
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "provider": "ghost",
+            "profile": "ghost",
         }))
         .send()
         .expect("send");
@@ -10085,7 +10456,7 @@ context_window = 32000
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
             "cwd": std::env::temp_dir().to_string_lossy(),
-            "provider": "mock",
+            "profile": "mock",
         }))
         .send()
         .expect("send");
@@ -10094,7 +10465,7 @@ context_window = 32000
         .as_str()
         .expect("id")
         .to_string();
-    let context_path = format!("/v1/sessions/{}/context", id);
+    let context_path = format!("/v1/sessions/{id}/context");
 
     // Resident, and never evicted: no GC wait here, which is what makes this the other branch.
     let before: serde_json::Value = harness
@@ -10109,8 +10480,8 @@ context_window = 32000
     );
 
     let refused = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
-        .json(&serde_json::json!({"provider": "ghost"}))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"profile": "ghost"}))
         .send()
         .expect("send");
     assert_eq!(
@@ -10121,8 +10492,8 @@ context_window = 32000
     );
 
     let patched = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", id))
-        .json(&serde_json::json!({"provider": "small"}))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{id}"))
+        .json(&serde_json::json!({"profile": "small"}))
         .send()
         .expect("send");
     assert_eq!(
@@ -10132,7 +10503,7 @@ context_window = 32000
         patched.text().unwrap_or_default()
     );
     let body: serde_json::Value = patched.json().expect("parse");
-    assert_eq!(body["provider"], "small", "the row must move: {body}");
+    assert_eq!(body["profile"], "small", "the row must move: {body}");
 
     let after: serde_json::Value = harness
         .request(reqwest::Method::GET, &context_path)
@@ -10161,17 +10532,17 @@ fn a_sub_agent_transcript_can_be_rewound_over_http() {
         "",
         serde_json::json!([
             [
-                { "kind": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
-                { "kind": "tool_use_end", "input": {"prompt": "count the files"} },
-                { "kind": "message_end", "stop_reason": "tool_use" }
+                { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+                { "type": "tool_use_end", "input": {"prompt": "count the files"} },
+                { "type": "message_end", "stop_reason": "tool_use" }
             ],
             [
-                { "kind": "text", "text": "worker done" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "worker done" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ],
             [
-                { "kind": "text", "text": "dispatched" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "dispatched" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ]
         ]),
     );
@@ -10194,7 +10565,7 @@ fn a_sub_agent_transcript_can_be_rewound_over_http() {
     let rewound = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/rewind", worker),
+            &format!("/v1/sessions/{worker}/rewind"),
         )
         .json(&serde_json::json!({"turns": 1}))
         .send()
@@ -10216,7 +10587,7 @@ fn a_sub_agent_transcript_can_be_rewound_over_http() {
     let refused = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/compact", worker),
+            &format!("/v1/sessions/{worker}/compact"),
         )
         .json(&serde_json::json!({}))
         .send()
@@ -10246,17 +10617,17 @@ fn a_locked_worker_is_refused_as_undrivable_rather_than_as_busy() {
         "",
         serde_json::json!([
             [
-                { "kind": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
-                { "kind": "tool_use_end", "input": {"prompt": "count the files"} },
-                { "kind": "message_end", "stop_reason": "tool_use" }
+                { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+                { "type": "tool_use_end", "input": {"prompt": "count the files"} },
+                { "type": "message_end", "stop_reason": "tool_use" }
             ],
             [
-                { "kind": "text", "text": "worker done" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "worker done" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ],
             [
-                { "kind": "text", "text": "dispatched" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "dispatched" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ]
         ]),
     );
@@ -10278,9 +10649,10 @@ fn a_locked_worker_is_refused_as_undrivable_rather_than_as_busy() {
 
     // Hold the worker's lock the way its parent would while running it.
     let lock_path = harness
-        .data_dir
+        .install
+        .data_dir()
         .join("locks")
-        .join(format!("{}.lock", worker));
+        .join(format!("{worker}.lock"));
     let held = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -10295,7 +10667,7 @@ fn a_locked_worker_is_refused_as_undrivable_rather_than_as_busy() {
     let refused = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/turn", worker),
+            &format!("/v1/sessions/{worker}/turn"),
         )
         .json(&serde_json::json!({"message": "drive the worker while its lock is held"}))
         .send()
@@ -10333,17 +10705,17 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
         "",
         serde_json::json!([
             [
-                { "kind": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
-                { "kind": "tool_use_end", "input": {"prompt": "count the files"} },
-                { "kind": "message_end", "stop_reason": "tool_use" }
+                { "type": "tool_use_start", "id": "tu_1", "name": "agent_spawn" },
+                { "type": "tool_use_end", "input": {"prompt": "count the files"} },
+                { "type": "message_end", "stop_reason": "tool_use" }
             ],
             [
-                { "kind": "text", "text": "worker done" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "worker done" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ],
             [
-                { "kind": "text", "text": "dispatched" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "dispatched" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ]
         ]),
     );
@@ -10366,7 +10738,7 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
     let refused = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/turn", worker),
+            &format!("/v1/sessions/{worker}/turn"),
         )
         .json(&serde_json::json!({"message": "drive the worker directly"}))
         .send()
@@ -10387,7 +10759,7 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
     let messages = harness
         .request(
             reqwest::Method::GET,
-            &format!("/v1/sessions/{}/messages", worker),
+            &format!("/v1/sessions/{worker}/messages"),
         )
         .send()
         .expect("send");
@@ -10397,14 +10769,14 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
         "a worker's transcript stays readable"
     );
 
-    // And the copy door is not a way round the refusal. `fork_session` used to write a NULL
-    // parent, so this handed a `sessions:w` holder a drivable copy of the worker's whole
-    // conversation with no spawn terms and the host's permission -- the very escalation the
-    // refusal above exists to stop, one call to the side of it.
+    // And the copy door is not a way round the refusal. A fork that wrote a NULL parent would hand
+    // a `sessions:w` holder a drivable copy of the worker's whole conversation with no spawn terms
+    // and the host's permission: the very escalation the refusal above exists to stop, one call to
+    // the side of it.
     let forked = harness
         .request(
             reqwest::Method::POST,
-            &format!("/v1/sessions/{}/fork", worker),
+            &format!("/v1/sessions/{worker}/fork"),
         )
         .send()
         .expect("send");
@@ -10439,13 +10811,13 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
     );
 
     // And neither is the metadata door. A provider-only `PATCH` takes `repin_dormant_session`,
-    // the one branch of that handler which writes `sessions.provider` without building an agent --
+    // the one branch of that handler which writes `sessions.profile` without building an agent --
     // so the refusal in the builders could not answer for it, and a worker is exactly the session
     // that branch always gets, since `build_subagent` runs one under its parent's runtime rather
     // than registering it with the server. It answered 200 and moved the row.
     let patched = harness
-        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{}", worker))
-        .json(&serde_json::json!({"provider": "mock"}))
+        .request(reqwest::Method::PATCH, &format!("/v1/sessions/{worker}"))
+        .json(&serde_json::json!({"profile": "mock"}))
         .send()
         .expect("send");
     assert_eq!(
@@ -10458,6 +10830,261 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
         problem["type"].as_str(),
         Some("https://meka.so/errors/session-not-drivable"),
         "and it says which kind of 422 it is, so a client stops rewriting its payload: {problem}"
+    );
+}
+
+/// A `[web]` client that cannot be built fails the process at startup, with the message at the
+/// terminal.
+///
+/// The registry built one per session, so a `ca_cert_file` that is not there surfaced on the first
+/// turn of every session, per host, as whatever that host reports a registry failure as -- which on
+/// `serve` was a 422 handing the operator's filesystem path to whoever holds a token. Building it
+/// once in `build_shared_deps` is what makes the operator the one who reads it, before a session
+/// exists to be answered at all.
+///
+/// The bind address is real and free: the point is that the server never reaches it.
+#[test]
+fn a_bad_web_client_fails_the_process_before_it_serves() {
+    let install = Install::new();
+    install.write_script(mock_simple_turn());
+    let missing = install.root().join("no-such-ca.pem");
+    let port = support::ephemeral_port();
+    let bind = format!("127.0.0.1:{port}");
+    install.write_config(&format!(
+        r#"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[web]
+ca_cert_file = "{ca}"
+
+[serve]
+bind = "{bind}"
+
+[[serve.tokens]]
+token = "sk_test_token"
+scopes = ["sessions:r", "sessions:w"]
+"#,
+        ca = missing.display().to_string().replace('\\', "\\\\"),
+    ));
+
+    let mut child = install
+        .meka(&["serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn meka serve");
+    support::drain(child.stdout.take().expect("stdout"));
+    let stderr_pipe = child.stderr.take().expect("stderr");
+
+    match support::wait_for_serve(&bind, &mut child, stderr_pipe, Duration::from_secs(20)) {
+        support::Started::Exited(status, logs) => {
+            assert!(
+                !status.success(),
+                "a configuration meka cannot build a client from must fail the run: {logs}"
+            );
+            assert!(
+                logs.contains("[web].ca_cert_file"),
+                "and the operator must be told which key: {logs}"
+            );
+            assert!(
+                logs.contains(&missing.display().to_string()),
+                "naming the file, since this reader is the one who wrote it: {logs}"
+            );
+        }
+        support::Started::Ready(_) | support::Started::TimedOut(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the server started with a `[web]` client it could not build");
+        }
+    }
+}
+
+/// A lock file meka cannot open is a server fault, not another process holding the session.
+///
+/// Both dormant write paths mapped every `lock_session` failure to `409 session-locked` with the
+/// error's text in `detail`, so an unreadable lock file answered "another meka process is running
+/// this session" -- advice no retry ever satisfies -- and published the lock directory's path while
+/// doing it. Only the variant that means what the 409 says keeps it.
+///
+/// Both doors in one test, because they are one rule with two sites: the rewind path was written
+/// after the repin path and arrived with a copy of its mistake.
+#[cfg(unix)]
+#[test]
+fn an_unopenable_lock_is_a_server_fault_rather_than_a_conflict() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    // Dormant: both paths under test are the ones taken when the session is not resident, and a
+    // resident session never asks for the lock again.
+    let id = session_with_one_turn(&harness);
+    harness.wait_until_evicted(&id);
+
+    let lock_path = harness
+        .install
+        .data_dir()
+        .join("locks")
+        .join(format!("{id}.lock"));
+    // Unopenable rather than held: a held lock is the case the 409 is *for*, and it already has a
+    // test. This is the other branch of the same `Result`, which was folded into it.
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000))
+        .expect("seal the lock file");
+
+    for (method, path, body) in [
+        (
+            reqwest::Method::POST,
+            format!("/v1/sessions/{id}/rewind"),
+            serde_json::json!({"turns": 1}),
+        ),
+        (
+            reqwest::Method::PATCH,
+            format!("/v1/sessions/{id}"),
+            serde_json::json!({"profile": "mock"}),
+        ),
+    ] {
+        let response = harness
+            .request(method.clone(), &path)
+            .json(&body)
+            .send()
+            .expect("send");
+        let status = response.status();
+        let problem: serde_json::Value = response.json().expect("parse");
+        assert_eq!(
+            status, 500,
+            "{method} {path}: a lock meka cannot open is meka's problem, not another process's: \
+             {problem}"
+        );
+        assert_eq!(
+            problem["type"], "https://meka.so/errors/internal",
+            "{problem}"
+        );
+        assert!(
+            !problem.to_string().contains(".lock"),
+            "{method} {path}: the lock directory reached the caller: {problem}"
+        );
+    }
+
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restore the lock file");
+}
+
+/// A skill whose file stops being readable between the catalog and the turn is a sanitized 500.
+///
+/// The reason names the file, so composing it into `detail` published the skills directory -- and
+/// meka's config directory with it -- to whoever holds `sessions:w`. It is a server fault either
+/// way; the operator reads the reason in the log.
+#[cfg(unix)]
+#[test]
+fn a_skill_that_cannot_be_read_mid_turn_is_a_sanitized_500() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let harness =
+        ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", STORE_SCOPES);
+    let skill_dir = harness.root().join("meka").join("skills").join("doomed");
+    std::fs::create_dir_all(&skill_dir).expect("mkdir");
+    let skill_md = skill_dir.join("SKILL.md");
+    std::fs::write(
+        &skill_md,
+        "---\nname: doomed\ndescription: will become unreadable\n---\nBODY\n",
+    )
+    .expect("seed");
+
+    // Warm the cache while the file is readable, so the turn below finds the skill in the index
+    // and fails on the body read rather than on the lookup: a `(mtime, size)` snapshot cannot see
+    // a permission change.
+    let listed = harness
+        .request(reqwest::Method::GET, "/v1/skills")
+        .send()
+        .expect("send");
+    assert_eq!(listed.status(), 200, "the skill must be discovered first");
+    std::fs::set_permissions(&skill_md, std::fs::Permissions::from_mode(0o000)).expect("chmod 0");
+
+    let id = create_session_id(&harness);
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "go",
+            "options": {"skill": "doomed"},
+        }))
+        .send()
+        .expect("send");
+    let status = response.status();
+    let problem: serde_json::Value = response.json().expect("parse");
+    std::fs::set_permissions(&skill_md, std::fs::Permissions::from_mode(0o644)).expect("restore");
+
+    assert_eq!(status, 500, "{problem}");
+    assert!(
+        !problem
+            .to_string()
+            .contains(&skill_dir.display().to_string()),
+        "the skills directory reached the caller: {problem}"
+    );
+}
+
+/// A session whose row has gone answers 404 rather than 200 with an empty profile.
+///
+/// `session_info(...).ok().flatten()` folded "the store failed" and "the row is not there" into
+/// "no title and no profile", so both doors reported a live-looking session on a profile named
+/// `""` -- which is not a profile, and which a client cannot tell from a real answer. The row is
+/// the billing record; a reader that cannot produce it has no answer to give.
+///
+/// The row is deleted underneath a *resident* entry, which is the only way to reach the branch:
+/// these are the two handlers that answer from the live map and consult the row for the fields the
+/// map does not hold. A second connection to the store stands in for the other process, as
+/// `tests/multiprocess.rs` does throughout.
+#[test]
+fn a_resident_session_whose_row_vanished_is_a_404_rather_than_an_empty_profile() {
+    let harness = ServeTestHarness::spawn("", mock_simple_turn());
+    let id = create_session_id(&harness);
+    let patched_id = create_session_id(&harness);
+
+    let store = rusqlite::Connection::open(harness.install.database()).expect("open the store");
+    for gone in [&id, &patched_id] {
+        let removed = store
+            .execute("DELETE FROM sessions WHERE id = ?1", [gone])
+            .expect("delete the row");
+        assert_eq!(removed, 1, "the row must have been there to delete");
+    }
+    drop(store);
+
+    let got = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+        .send()
+        .expect("send");
+    assert_eq!(
+        got.status(),
+        404,
+        "a session with no row is not a session: {}",
+        got.text().unwrap_or_default()
+    );
+
+    // The same read, on the door that answers a `PATCH`. An empty body changes nothing, so this
+    // reaches the read without depending on what a write to a missing row does.
+    let patched = harness
+        .request(
+            reqwest::Method::PATCH,
+            &format!("/v1/sessions/{patched_id}"),
+        )
+        .json(&serde_json::json!({}))
+        .send()
+        .expect("send");
+    let status = patched.status();
+    let body = patched.text().unwrap_or_default();
+    assert_eq!(status, 404, "{body}");
+    assert!(
+        !body.contains("\"profile\":\"\""),
+        "an empty profile is not an answer: {body}"
     );
 }
 
@@ -10477,7 +11104,7 @@ fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
 fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() {
     let secret = "acct-0f3c-operator-only";
     let script = serde_json::json!([[
-        { "kind": "fail", "message": "API returned status 401: {\"account_uuid\":\"acct-0f3c-operator-only\"}" }
+        { "type": "fail", "message": "API returned status 401: {\"account_uuid\":\"acct-0f3c-operator-only\"}" }
     ]]);
 
     let mut details = Vec::new();
@@ -10493,7 +11120,7 @@ fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() 
             .expect("id")
             .to_string();
         let body: serde_json::Value = harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
             .json(&serde_json::json!({"message": "go"}))
             .send()
             .expect("send")
@@ -10511,7 +11138,7 @@ fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() 
             "with `{extra}` the upstream body must {} the caller: {body}",
             if expect_relayed { "reach" } else { "not reach" }
         );
-        // The whole serialised body, so a member renamed or moved elsewhere in the payload still
+        // The whole serialized body, so a member renamed or moved elsewhere in the payload still
         // counts as reaching the caller rather than slipping past a check on one field.
         if !expect_relayed {
             assert!(
@@ -10536,10 +11163,10 @@ fn relay_provider_errors_decides_whether_the_upstream_body_reaches_the_caller() 
 /// the config key exists for. This test reads the `POST /turn` stream rather than reattaching, so
 /// it covers the payload the retained terminal is built from.
 #[test]
-fn relay_provider_errors_is_honoured_on_the_streaming_path() {
+fn relay_provider_errors_is_honored_on_the_streaming_path() {
     let secret = "acct-0f3c-operator-only";
     let script = serde_json::json!([[
-        { "kind": "fail", "message": "API returned status 401: {\"account_uuid\":\"acct-0f3c-operator-only\"}" }
+        { "type": "fail", "message": "API returned status 401: {\"account_uuid\":\"acct-0f3c-operator-only\"}" }
     ]]);
 
     for (extra, expect_relayed) in [("", true), ("relay_provider_errors = false", false)] {
@@ -10554,7 +11181,7 @@ fn relay_provider_errors_is_honoured_on_the_streaming_path() {
             .expect("id")
             .to_string();
         let body = harness
-            .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
             .json(&serde_json::json!({"message": "go", "stream": true}))
             .send()
             .expect("send")
@@ -10587,7 +11214,7 @@ fn relay_provider_errors_is_honoured_on_the_streaming_path() {
 fn a_relayed_upstream_body_is_size_bounded() {
     let head = "UPSTREAM-ERROR-TYPE-HERE";
     let script = serde_json::json!([[
-        { "kind": "fail", "message": format!("{head}{}", "x".repeat(64 * 1024)) }
+        { "type": "fail", "message": format!("{head}{}", "x".repeat(64 * 1024)) }
     ]]);
     let harness = ServeTestHarness::spawn("", script);
     let create = harness
@@ -10600,7 +11227,7 @@ fn a_relayed_upstream_body_is_size_bounded() {
         .expect("id")
         .to_string();
     let body: serde_json::Value = harness
-        .request(reqwest::Method::POST, &format!("/v1/sessions/{}/turn", id))
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "go"}))
         .send()
         .expect("send")
@@ -10623,5 +11250,76 @@ fn a_relayed_upstream_body_is_size_bounded() {
     assert!(
         relayed.contains("truncated"),
         "and the cut must be visible to the reader"
+    );
+}
+
+/// `POST /v1/sessions/{id}/fork` refuses a source another process is writing, like `meka session
+/// fork` always has: `Agent::run_turn` persists the user message before the provider answers, so a
+/// copy taken mid-turn ends on a message nothing answered. The probe lives in the store's one fork
+/// door, so the HTTP door gets it without remembering to ask. A second descriptor from this test
+/// stands in for the other process: `flock` conflicts across descriptors either way.
+#[test]
+fn fork_refuses_a_source_another_process_holds() {
+    let harness = ServeTestHarness::spawn_with(
+        "",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        mock_simple_turn(),
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    // Evicted first: while the session is resident it is this server's own, held through its
+    // entry, and the probe is not asked.
+    let id = create_session_id(&harness);
+    harness.wait_until_evicted(&id);
+
+    let lock_path = harness
+        .install
+        .data_dir()
+        .join("locks")
+        .join(format!("{id}.lock"));
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
+    held.try_lock()
+        .expect("the evicted session's lock is free for this test to take");
+
+    let refused = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
+        .send()
+        .expect("send");
+    assert_eq!(
+        refused.status(),
+        409,
+        "a source another process holds must be refused, not copied half-written"
+    );
+    let problem: serde_json::Value = refused.json().expect("problem body");
+    assert_eq!(problem["type"], "https://meka.so/errors/session-locked");
+    let listing: serde_json::Value = harness
+        .request(reqwest::Method::GET, "/v1/sessions")
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    assert_eq!(
+        listing["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "and no copy was left behind: {listing}"
+    );
+
+    // Once the other process lets go, the same request copies.
+    drop(held);
+    let forked = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/fork"))
+        .send()
+        .expect("send");
+    assert_eq!(
+        forked.status(),
+        201,
+        "a released source forks: {}",
+        forked.text().unwrap_or_default()
     );
 }

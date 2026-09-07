@@ -6,7 +6,6 @@ use std::sync::LazyLock;
 use async_trait::async_trait;
 use futures::StreamExt;
 use html2md::rewrite_html_custom_with_url;
-use tokio_util::sync::CancellationToken;
 
 use super::{
     Tool, ToolOutput,
@@ -15,35 +14,42 @@ use super::{
 use crate::{
     config::{MinTlsVersion, WebClientConfig},
     error::{MekaError, Result},
-    image::{ImageHandling, build_image_tool_output, classify_content_type},
+    image::{ImageHandling, classify_content_type},
     permission::Permission,
     provider::ToolDefinition,
+    tools::util::build_image_tool_output,
 };
 
 /// Build the shared `reqwest::Client` for `fetch_url` + `search_web` from the resolved
-/// [`WebClientConfig`]. Errors propagate so startup fails cleanly on a bad proxy URL or unreadable
-/// CA file, safer than silently falling back to an unconfigured client that ignores user intent.
-pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client> {
+/// [`WebClientConfig`].
+///
+/// Refused as [`MekaError::Installation`] rather than built from a fallback that ignores the
+/// user's intent. `crate::host::build_shared_deps` builds one at startup, which is what makes a bad
+/// proxy URL or CA file fail the process with the message at the terminal before any session
+/// exists; each session's registry then builds its own from the same settings. The message names
+/// a path or a URL out of `config.toml`, which is why its class keeps it off the wire on the hosts
+/// a remote caller reaches.
+pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .user_agent(&cfg.user_agent)
-        .timeout(cfg.request_timeout);
+        .user_agent(&config.user_agent)
+        .timeout(config.request_timeout);
 
-    if let Some(t) = cfg.connect_timeout {
-        builder = builder.connect_timeout(t);
+    if let Some(timeout) = config.connect_timeout {
+        builder = builder.connect_timeout(timeout);
     }
-    if let Some(t) = cfg.read_timeout {
-        builder = builder.read_timeout(t);
+    if let Some(timeout) = config.read_timeout {
+        builder = builder.read_timeout(timeout);
     }
 
     // `0` → no redirects at all (Policy::none). Any non-zero cap maps to Policy::limited(n).
-    let policy = if cfg.max_redirects == 0 {
+    let policy = if config.max_redirects == 0 {
         reqwest::redirect::Policy::none()
     } else {
-        reqwest::redirect::Policy::limited(cfg.max_redirects)
+        reqwest::redirect::Policy::limited(config.max_redirects)
     };
     builder = builder.redirect(policy);
 
-    match cfg.proxy.as_deref() {
+    match config.proxy.as_deref() {
         None => {}
         Some("") | Some("none") => {
             // Explicit opt-out of reqwest's env-proxy auto-detection. Useful to override a
@@ -62,22 +68,22 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
                 "socks4://",
             ];
             if !ALLOWED_SCHEMES.iter().any(|s| url.starts_with(s)) {
-                return Err(MekaError::Config(format!(
+                return Err(MekaError::Installation(format!(
                     "[web].proxy: invalid URL '{}': expected one of {}",
                     url,
                     ALLOWED_SCHEMES.join(", ")
                 )));
             }
             let proxy = reqwest::Proxy::all(url).map_err(|error| {
-                MekaError::Config(format!("[web].proxy: invalid URL '{}': {}", url, error))
+                MekaError::Installation(format!("[web].proxy: invalid URL '{url}': {error}"))
             })?;
             builder = builder.proxy(proxy);
         }
     }
 
-    if let Some(path) = &cfg.ca_cert_file {
+    if let Some(path) = &config.ca_cert_file {
         let bytes = std::fs::read(path).map_err(|error| {
-            MekaError::Config(format!(
+            MekaError::Installation(format!(
                 "[web].ca_cert_file '{}': {}",
                 path.display(),
                 error
@@ -86,7 +92,7 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
         // Handles both single-cert and bundle PEM files (multiple concatenated `-----BEGIN/END
         // CERTIFICATE-----` blocks).
         let certs = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|error| {
-            MekaError::Config(format!(
+            MekaError::Installation(format!(
                 "[web].ca_cert_file '{}': not a valid PEM: {}",
                 path.display(),
                 error
@@ -96,7 +102,7 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
         // That's not what the user asked for. Reject explicitly so typos don't ship a client
         // with zero added CAs.
         if certs.is_empty() {
-            return Err(MekaError::Config(format!(
+            return Err(MekaError::Installation(format!(
                 "[web].ca_cert_file '{}': no PEM certificates found in file",
                 path.display()
             )));
@@ -106,27 +112,27 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
         }
     }
 
-    if cfg.https_only {
+    if config.https_only {
         builder = builder.https_only(true);
     }
 
-    if let Some(v) = cfg.min_tls_version {
-        let ver = match v {
+    if let Some(version) = config.min_tls_version {
+        let minimum = match version {
             MinTlsVersion::V1_0 => reqwest::tls::Version::TLS_1_0,
             MinTlsVersion::V1_1 => reqwest::tls::Version::TLS_1_1,
             MinTlsVersion::V1_2 => reqwest::tls::Version::TLS_1_2,
             MinTlsVersion::V1_3 => reqwest::tls::Version::TLS_1_3,
         };
-        builder = builder.min_tls_version(ver);
+        builder = builder.min_tls_version(minimum);
     }
 
-    if cfg.danger_accept_invalid_certs {
+    if config.danger_accept_invalid_certs {
         tracing::warn!(
             "[web].danger_accept_invalid_certs is enabled; any HTTPS response could be spoofed"
         );
         builder = builder.danger_accept_invalid_certs(true);
     }
-    if cfg.danger_accept_invalid_hostnames {
+    if config.danger_accept_invalid_hostnames {
         tracing::warn!(
             "[web].danger_accept_invalid_hostnames is enabled; any HTTPS response with a valid \
              certificate for any name could be spoofed"
@@ -136,27 +142,40 @@ pub(crate) fn build_web_client(cfg: &WebClientConfig) -> Result<reqwest::Client>
 
     builder
         .build()
-        .map_err(|error| MekaError::Config(format!("failed to build web client: {}", error)))
+        .map_err(|error| MekaError::Installation(format!("failed to build web client: {error}")))
 }
 
 // Static CSS selectors for search result parsing (parsed once, reused on every call).
-// `expect()` is correct here: the selector strings are compile-time literals, so a parse failure
-// would mean we shipped a typo, caught on the first test run, not in production.
-#[allow(clippy::expect_used)]
+#[allow(
+    clippy::expect_used,
+    reason = "a literal selector; a parse failure is a typo the first test run catches"
+)]
 static DDG_RESULT: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result").expect("static CSS selector"));
-#[allow(clippy::expect_used)]
+#[allow(
+    clippy::expect_used,
+    reason = "a literal selector; a parse failure is a typo the first test run catches"
+)]
 static DDG_LINK: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse("a.result__a").expect("static CSS selector"));
-#[allow(clippy::expect_used)]
+#[allow(
+    clippy::expect_used,
+    reason = "a literal selector; a parse failure is a typo the first test run catches"
+)]
 static DDG_URL: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result__url").expect("static CSS selector"));
-#[allow(clippy::expect_used)]
+#[allow(
+    clippy::expect_used,
+    reason = "a literal selector; a parse failure is a typo the first test run catches"
+)]
 static DDG_SNIPPET: LazyLock<scraper::Selector> =
     LazyLock::new(|| scraper::Selector::parse(".result__snippet").expect("static CSS selector"));
 /// DDG's bot-challenge modal uses this id (and also a `data-testid` of the same value). Either
 /// marker being present in the DOM means the endpoint gated us rather than returning results.
-#[allow(clippy::expect_used)]
+#[allow(
+    clippy::expect_used,
+    reason = "a literal selector; a parse failure is a typo the first test run catches"
+)]
 static DDG_CAPTCHA: LazyLock<scraper::Selector> = LazyLock::new(|| {
     scraper::Selector::parse("#anomaly-modal, [data-testid=\"anomaly-modal\"]")
         .expect("static CSS selector")
@@ -165,7 +184,10 @@ static DDG_CAPTCHA: LazyLock<scraper::Selector> = LazyLock::new(|| {
 /// Matches the open/close tags of `<nav>` and `<footer>` elements (with any attributes). The name
 /// is anchored by the trailing `(\s|>|/)` group so sibling elements like `<navbar>` or a custom
 /// `<nav-menu>` are left untouched.
-#[allow(clippy::expect_used)]
+#[allow(
+    clippy::expect_used,
+    reason = "a literal regex; a parse failure is a typo the first test run catches"
+)]
 static BOILERPLATE_CONTAINER_TAG: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)<(/?)(?:nav|footer)(\s[^>]*)?>").expect("static regex")
 });
@@ -201,9 +223,9 @@ fn html_to_markdown(html: &str, base_url: &Option<url::Url>) -> String {
 /// `fetch_url` on the result URL.
 const SNIPPET_MAX_CHARS: usize = 300;
 
-/// Default `max_length` applied when the caller doesn't pass one. Single source of truth for both
-/// the parameter unwrap and the description shown to the agent. Pass `0` to disable the cap.
-const DEFAULT_MAX_LENGTH: usize = 30_000;
+/// Default `limit` applied when the caller doesn't pass one. Single source of truth for both the
+/// parameter unwrap and the description shown to the agent. Pass `0` to disable the cap.
+const DEFAULT_LIMIT_CHARS: usize = 30_000;
 
 fn apply_headers(
     mut builder: reqwest::RequestBuilder,
@@ -220,7 +242,7 @@ fn apply_headers(
 }
 
 pub(super) struct FetchUrlTool {
-    pub client: reqwest::Client,
+    pub(crate) client: reqwest::Client,
 }
 
 #[async_trait]
@@ -234,7 +256,7 @@ impl Tool for FetchUrlTool {
                           ICO, HDR, EXR, TGA, PNM, QOI, DDS, or Farbfeld), the image \
                           is returned as a multimodal content block directly. \
                           Non-native formats are transparently converted to PNG. \
-                          `max_length`, `regex`, and `raw` do not apply to image \
+                          `limit`, `regex`, and `raw` do not apply to image \
                           responses. Only fetch image URLs if the current model \
                           supports vision input."
                 .to_string(),
@@ -243,13 +265,14 @@ impl Tool for FetchUrlTool {
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "The URL to fetch"
+                        "description": "The URL to fetch."
                     },
-                    "max_length": {
+                    "limit": {
                         "type": "integer",
+                        "minimum": 0,
+                        "default": DEFAULT_LIMIT_CHARS,
                         "description": format!(
-                            "Maximum number of characters to return. Default: {}. Set to 0 for no limit.",
-                            DEFAULT_MAX_LENGTH,
+                            "Maximum number of characters to return. Default: {DEFAULT_LIMIT_CHARS}. Set to 0 for no limit."
                         )
                     },
                     "headers": {
@@ -263,7 +286,8 @@ impl Tool for FetchUrlTool {
                     },
                     "raw": {
                         "type": "boolean",
-                        "description": "If true, return raw HTML instead of converting to markdown. Defaults to false."
+                        "default": false,
+                        "description": "Return raw HTML instead of converting it to markdown. Default: false."
                     },
                     "scratchpad": {
                         "type": "string",
@@ -283,7 +307,7 @@ impl Tool for FetchUrlTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let url = require_str(&input, "url", "fetch_url")?;
 
@@ -302,10 +326,7 @@ impl Tool for FetchUrlTool {
 
         let status = response.status();
         if !status.is_success() {
-            return Ok(ToolOutput::text(
-                format!("HTTP {} for '{}'", status, url),
-                true,
-            ));
+            return Ok(ToolOutput::text(format!("HTTP {status} for '{url}'"), true));
         }
 
         let content_type = response
@@ -322,7 +343,7 @@ impl Tool for FetchUrlTool {
 
         let body_bytes = read_body_capped(response, "fetch_url").await?;
 
-        // A response the server labelled as an image becomes a multimodal Image block rather than
+        // A response the server labeled as an image becomes a multimodal Image block rather than
         // going through html2md. `Content-Type` only gates whether to try: the media type comes
         // from the bytes, and a body that isn't an image at all (an HTML error page served
         // as `image/png`, which is common) falls through to the text path below instead of
@@ -333,7 +354,7 @@ impl Tool for FetchUrlTool {
         ) {
             let sniffed = crate::image::classify_bytes(&body_bytes);
             if !matches!(sniffed, ImageHandling::Unsupported) {
-                let marker = format!("Image fetched from {}", url);
+                let marker = format!("Image fetched from {url}");
                 // Off the runtime, for the reason `read_file` documents at src/tools/file.rs:
                 // decoding and re-encoding a multi-megapixel image is tens of milliseconds of pure
                 // CPU, and on the runtime it blocks every other task on that worker -- a `serve`
@@ -346,7 +367,7 @@ impl Tool for FetchUrlTool {
                 .await
                 .map_err(|error| MekaError::ToolExecution {
                     tool_name: "fetch_url".to_string(),
-                    message: format!("image decode task failed: {}", error),
+                    message: format!("image decode task failed: {error}"),
                 });
             }
         }
@@ -365,24 +386,24 @@ impl Tool for FetchUrlTool {
                 .await
                 .map_err(|error| MekaError::ToolExecution {
                     tool_name: "fetch_url".to_string(),
-                    message: format!("HTML conversion task failed: {}", error),
+                    message: format!("HTML conversion task failed: {error}"),
                 })?
         };
 
         // When the caller redirects to the scratchpad we produce full content regardless of
-        // max_length; the scratchpad is the overflow buffer.
-        let max_length = if redirects_to_scratchpad(&input) {
+        // `limit`; the scratchpad is the overflow buffer.
+        let limit = if redirects_to_scratchpad(&input) {
             0
         } else {
-            input["max_length"]
+            input["limit"]
                 .as_u64()
                 .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
-                .unwrap_or(DEFAULT_MAX_LENGTH)
+                .unwrap_or(DEFAULT_LIMIT_CHARS)
         };
 
         // The regex runs against the whole document, before any truncation.
         //
-        // Running it after meant `max_length` silently decided which matches existed: a pattern
+        // Running it after meant `limit` silently decided which matches existed: a pattern
         // whose only hit sat past the cut returned "No matches found", which reads as a fact about
         // the page rather than about the window. The truncation notice was discarded along with it,
         // so nothing said a cut had happened at all. The cap then applies to the match list, which
@@ -403,11 +424,10 @@ impl Tool for FetchUrlTool {
         };
         let content = matched.unwrap_or(body);
 
-        let content = if max_length > 0 && content.len() > max_length {
+        let content = if limit > 0 && content.len() > limit {
             format!(
-                "{}\n\n... (truncated, showing first {} characters)",
-                &content[..content.floor_char_boundary(max_length)],
-                max_length
+                "{}\n\n... (truncated, showing first {limit} characters)",
+                &content[..content.floor_char_boundary(limit)],
             )
         } else {
             content
@@ -418,7 +438,7 @@ impl Tool for FetchUrlTool {
 }
 
 /// The most a single HTTP response body may occupy in memory, decompressed.
-const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 10 * crate::text::MIB;
 
 /// Read a response body into memory, refusing to grow past [`MAX_RESPONSE_BYTES`].
 ///
@@ -434,8 +454,7 @@ async fn read_body_capped(response: reqwest::Response, tool_name: &str) -> Resul
         return Err(MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: format!(
-                "response Content-Length {} exceeds cap {} bytes",
-                len, MAX_RESPONSE_BYTES
+                "response Content-Length {len} exceeds cap {MAX_RESPONSE_BYTES} bytes"
             ),
         });
     }
@@ -445,15 +464,14 @@ async fn read_body_capped(response: reqwest::Response, tool_name: &str) -> Resul
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
-            message: format!("failed to read response body: {}", error),
+            message: format!("failed to read response body: {error}"),
         })?;
         if body_bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(MekaError::ToolExecution {
                 tool_name: tool_name.to_string(),
                 message: format!(
-                    "response body exceeded {} bytes during streaming \
-                     (possible decompression bomb)",
-                    MAX_RESPONSE_BYTES
+                    "response body exceeded {MAX_RESPONSE_BYTES} bytes during streaming \
+                     (possible decompression bomb)"
                 ),
             });
         }
@@ -463,7 +481,7 @@ async fn read_body_capped(response: reqwest::Response, tool_name: &str) -> Resul
 }
 
 pub(super) struct WebSearchTool {
-    pub client: reqwest::Client,
+    pub(crate) client: reqwest::Client,
 }
 
 #[async_trait]
@@ -479,7 +497,7 @@ impl Tool for WebSearchTool {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query"
+                        "description": "The search query."
                     },
                     "headers": {
                         "type": "object",
@@ -504,7 +522,7 @@ impl Tool for WebSearchTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let query = require_str(&input, "query", "search_web")?;
 
@@ -533,7 +551,7 @@ impl Tool for WebSearchTool {
         if !status.is_success() {
             return Err(MekaError::ToolExecution {
                 tool_name: "search_web".to_string(),
-                message: format!("search request returned HTTP {}", status),
+                message: format!("search request returned HTTP {status}"),
             });
         }
 
@@ -544,7 +562,7 @@ impl Tool for WebSearchTool {
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "search_web".to_string(),
-                message: format!("result parsing task failed: {}", error),
+                message: format!("result parsing task failed: {error}"),
             })?;
         match parsed {
             DdgOutcome::Results(text) => Ok(ToolOutput::text(text, false)),
@@ -578,7 +596,7 @@ enum DdgOutcome {
     Captcha,
 }
 
-/// Normalise arbitrary text-node content into a single-line string. Collapses runs of whitespace
+/// Normalize arbitrary text-node content into a single-line string. Collapses runs of whitespace
 /// (including newlines and tabs) into a single ASCII space and trims. Applied to every user-visible
 /// field (title, source domain, snippet) so the rendered output isn't broken up by DDG's layout
 /// whitespace.
@@ -612,10 +630,11 @@ fn render_snippet(snippet_el: scraper::ElementRef<'_>) -> String {
             Node::Element(element) => {
                 // Collect the inner text and wrap in `**` iff this is a `<b>` or `<strong>`. Other
                 // elements (rare, e.g. `<a>` inside snippets) fall through as plain text so we
-                // don't miss content. `ElementRef::wrap` returns `Some` for any node whose
-                // `value()` is `Node::Element`, which is exactly the arm we're in, so the
-                // `expect` documents an unconditionally-true invariant rather than a runtime check.
-                #[allow(clippy::expect_used)]
+                // don't miss content.
+                #[allow(
+                    clippy::expect_used,
+                    reason = "`ElementRef::wrap` is `Some` for every `Node::Element`, which is this arm"
+                )]
                 let inner_el =
                     scraper::ElementRef::wrap(node).expect("element node wraps element ref");
                 let inner_text: String = inner_el.text().collect();
@@ -646,9 +665,8 @@ fn clip_snippet(text: &str, max_chars: usize) -> String {
     format!("{}…", clipped.trim_end())
 }
 
-/// Return true when a `.result` block is a sponsored ad rather than an
-/// organic result. DDG marks ads two independent ways and we check
-/// both; any match filters the block out. Confirmed in
+/// Return true when a `.result` block is a sponsored ad rather than an organic result. DDG marks
+/// ads two independent ways and we check both; any match filters the block out. Confirmed in
 /// `tests/fixtures/ddg_with_ad.html`:
 ///
 /// 1. **Wrapper class**: ads carry `result--ad` on the outer `<div class="result …">`. Organic
@@ -661,7 +679,7 @@ fn is_ad_result(block: scraper::ElementRef<'_>, resolved_url: Option<&str>) -> b
         return true;
     }
     if let Some(url) = resolved_url {
-        // Normalise leading `//` (schemeless) so `.contains` matches on the host+path portion only.
+        // Normalize leading `//` (schemeless) so `.contains` matches on the host+path portion only.
         // The `y.js?ad_domain=` combo is specific enough that false-positives on organic URLs are
         // effectively impossible.
         if url.contains("duckduckgo.com/y.js") || url.contains("/y.js?ad_domain=") {
@@ -733,13 +751,13 @@ fn parse_duckduckgo_results(html: &str) -> DdgOutcome {
         if let Some(source) = &source_domain
             && !source.is_empty()
         {
-            result_text.push_str(&format!("\n   Source: {}", source));
+            result_text.push_str(&format!("\n   Source: {source}"));
         }
         if let Some(url) = &url {
-            result_text.push_str(&format!("\n   URL: {}", url));
+            result_text.push_str(&format!("\n   URL: {url}"));
         }
         if let Some(snippet) = &snippet {
-            result_text.push_str(&format!("\n   {}", snippet));
+            result_text.push_str(&format!("\n   {snippet}"));
         }
         results.push(result_text);
         if results.len() >= 10 {
@@ -774,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_results() {
+    fn duckduckgo_results_are_parsed_with_title_url_and_snippet() {
         let html = r#"<html><body>
             <div class="result">
                 <a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.com%2Fpage1&rut=x">
@@ -803,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_empty_is_empty_outcome() {
+    fn parse_duckduckgo_empty_is_empty_outcome() {
         assert!(matches!(
             parse_duckduckgo_results("<html><body></body></html>"),
             DdgOutcome::Empty
@@ -811,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_detects_captcha_fixture() {
+    fn parse_duckduckgo_detects_captcha_fixture() {
         // The saved CAPTCHA response: `#anomaly-modal` is the primary marker. Any future
         // regression in detection fails this test against the real DDG bot-challenge page.
         let html = include_str!("../../tests/fixtures/ddg_captcha.html");
@@ -822,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_detects_captcha_by_testid_alone() {
+    fn parse_duckduckgo_detects_captcha_by_testid_alone() {
         // Guard against DDG renaming the `id` but keeping the `data-testid`. The second marker
         // should still catch it.
         let html = r#"<html><body>
@@ -835,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_parses_real_results_fixture() {
+    fn parse_duckduckgo_parses_real_results_fixture() {
         // A real 10-result response captured via a clean-IP WARP proxy. Guards against structural
         // regressions the snippet here can't cover (`<b>` highlights, direct-URL hrefs,
         // trailing-whitespace domain text, etc.).
@@ -844,10 +862,8 @@ mod tests {
         // Expect all 10 numbered results.
         for i in 1..=10 {
             assert!(
-                text.contains(&format!("{}. **", i)),
-                "result {} missing; output was:\n{}",
-                i,
-                text
+                text.contains(&format!("{i}. **")),
+                "result {i} missing; output was:\n{text}"
             );
         }
         // At least one result carries the Source line (every real DDG result has `.result__url`).
@@ -855,13 +871,12 @@ mod tests {
         // `<b>` emphasis in the snippet becomes markdown bold.
         assert!(
             text.contains("**Rust**") || text.contains("**rust**"),
-            "expected **Rust**/**rust** markdown-bold in:\n{}",
-            text
+            "expected **Rust**/**rust** markdown-bold in:\n{text}"
         );
     }
 
     #[test]
-    fn test_parse_duckduckgo_trims_whitespace_in_title() {
+    fn parse_duckduckgo_trims_whitespace_in_title() {
         let html = r#"<html><body>
             <div class="result">
                 <a class="result__a" href="https://example.com/">
@@ -881,13 +896,12 @@ mod tests {
             .expect("title line");
         assert!(
             !title_line.contains("  "),
-            "double-space in title: {}",
-            title_line
+            "double-space in title: {title_line}"
         );
     }
 
     #[test]
-    fn test_parse_duckduckgo_omits_source_when_missing() {
+    fn parse_duckduckgo_omits_source_when_missing() {
         // No `.result__url` sibling → no `Source:` line.
         let html = r#"<html><body>
             <div class="result">
@@ -896,15 +910,11 @@ mod tests {
         </body></html>"#;
         let text = expect_results(parse_duckduckgo_results(html));
         assert!(text.contains("**Title**"));
-        assert!(
-            !text.contains("Source:"),
-            "unexpected Source line: {}",
-            text
-        );
+        assert!(!text.contains("Source:"), "unexpected Source line: {text}");
     }
 
     #[test]
-    fn test_parse_duckduckgo_preserves_bold_as_markdown() {
+    fn parse_duckduckgo_preserves_bold_as_markdown() {
         let html = r#"<html><body>
             <div class="result">
                 <a class="result__a" href="https://example.com/">Title</a>
@@ -917,20 +927,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_caps_long_snippet() {
+    fn parse_duckduckgo_caps_long_snippet() {
         // 500-char snippet → capped at 300 and suffixed with `…`.
         let long_snippet = "word ".repeat(200); // ~1000 chars
         let html = format!(
             r#"<html><body>
                 <div class="result">
                     <a class="result__a" href="https://example.com/">Title</a>
-                    <a class="result__snippet">{}</a>
+                    <a class="result__snippet">{long_snippet}</a>
                 </div>
-            </body></html>"#,
-            long_snippet
+            </body></html>"#
         );
         let text = expect_results(parse_duckduckgo_results(&html));
-        assert!(text.contains('…'), "expected ellipsis; got:\n{}", text);
+        assert!(text.contains('…'), "expected ellipsis; got:\n{text}");
         // The capped snippet + surrounding format exceeds 300, but the snippet portion itself
         // shouldn't carry more than ~305 chars (300 + `…` allowance).
         let snippet_line = text
@@ -947,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duckduckgo_skips_ad_by_wrapper_class() {
+    fn parse_duckduckgo_skips_ad_by_wrapper_class() {
         // Ad block identified by `result--ad`; organic block follows. Only the organic result
         // should come through.
         let html = r#"<html><body>
@@ -963,19 +972,15 @@ mod tests {
             </div>
         </body></html>"#;
         let text = expect_results(parse_duckduckgo_results(html));
-        assert!(text.contains("Organic"), "organic result missing: {}", text);
-        assert!(
-            !text.contains("Sponsored"),
-            "ad leaked into output: {}",
-            text
-        );
-        assert!(!text.contains("ad_domain"), "ad URL leaked: {}", text);
+        assert!(text.contains("Organic"), "organic result missing: {text}");
+        assert!(!text.contains("Sponsored"), "ad leaked into output: {text}");
+        assert!(!text.contains("ad_domain"), "ad URL leaked: {text}");
         // Ad was dropped, so organic becomes result #1.
         assert!(text.starts_with("1. **Organic**"), "{}", text);
     }
 
     #[test]
-    fn test_parse_duckduckgo_skips_ad_by_y_js_url() {
+    fn parse_duckduckgo_skips_ad_by_y_js_url() {
         // Ad without the `result--ad` class, caught via the resolved-URL signal. Guards against
         // DDG silently renaming the class but keeping the y.js ad-click tracker.
         let html = r#"<html><body>
@@ -990,11 +995,11 @@ mod tests {
         </body></html>"#;
         let text = expect_results(parse_duckduckgo_results(html));
         assert!(text.contains("Organic"), "{}", text);
-        assert!(!text.contains("Sponsored"), "y.js ad leaked: {}", text);
+        assert!(!text.contains("Sponsored"), "y.js ad leaked: {text}");
     }
 
     #[test]
-    fn test_parse_duckduckgo_real_ad_fixture_drops_only_ad() {
+    fn parse_duckduckgo_real_ad_fixture_drops_only_ad() {
         // 11 result blocks total (1 ad + 10 organic) captured from `best mechanical keyboard 2026`.
         // The ad advertises `oneclearwinner.ca` via a Bing-backed y.js redirect. Expect exactly 10
         // organic results, zero ad leakage.
@@ -1002,33 +1007,28 @@ mod tests {
         let text = expect_results(parse_duckduckgo_results(html));
         assert!(
             !text.contains("oneclearwinner"),
-            "ad domain leaked into output: {}",
-            text
+            "ad domain leaked into output: {text}"
         );
-        assert!(!text.contains("y.js"), "y.js tracker URL leaked: {}", text);
+        assert!(!text.contains("y.js"), "y.js tracker URL leaked: {text}");
         assert!(
             !text.contains("ad_domain"),
-            "ad_domain param leaked: {}",
-            text
+            "ad_domain param leaked: {text}"
         );
         // 10 organic results should remain after filtering.
         for i in 1..=10 {
             assert!(
-                text.contains(&format!("{}. **", i)),
-                "result {} missing; output:\n{}",
-                i,
-                text
+                text.contains(&format!("{i}. **")),
+                "result {i} missing; output:\n{text}"
             );
         }
         assert!(
             !text.contains("11. **"),
-            "too many results; ad wasn't dropped: {}",
-            text
+            "too many results; ad wasn't dropped: {text}"
         );
     }
 
     #[test]
-    fn test_resolve_result_href_decodes_uddg_redirect() {
+    fn resolve_result_href_decodes_uddg_redirect() {
         assert_eq!(
             resolve_result_href("/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=x"),
             "https://example.com/page"
@@ -1036,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_result_href_passes_direct_url_through() {
+    fn resolve_result_href_passes_direct_url_through() {
         assert_eq!(
             resolve_result_href("https://example.com/page"),
             "https://example.com/page"
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nav_links_survive_markdown_conversion() {
+    fn nav_links_survive_markdown_conversion() {
         // Regression: fast_html2md drops the whole subtree of <nav>/<footer>, taking link text and
         // href with it. The pre-pass rewrites those containers to <div> so the links survive.
         let html = r#"<nav class="x"><a href="/docs">Docs</a></nav>"#;
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn test_keep_boilerplate_container_content_is_bounded() {
+    fn keep_boilerplate_container_content_is_bounded() {
         // <navbar> / custom <nav-menu> share a prefix with <nav> but must not be rewritten.
         assert_eq!(
             keep_boilerplate_container_content("<navbar>x</navbar>"),
@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn test_html_to_markdown_resolves_relative_links() {
+    fn html_to_markdown_resolves_relative_links() {
         let html = r#"<a href="/docs">Docs</a>"#;
         // With a base URL, root-relative hrefs become absolute and followable.
         let base = url::Url::parse("https://example.test/").expect("base url");
@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_html_to_markdown_synthetic_page_end_to_end() {
+    fn html_to_markdown_synthetic_page_end_to_end() {
         // Synthetic page (not a real site) exercising the full fetch_url conversion: a nav and a
         // footer holding the only links, plus a script that must be stripped. Mirrors the layout of
         // modern SPA sites where primary navigation lives in <nav>/<footer>.
@@ -1154,134 +1154,144 @@ mod tests {
     }
 
     #[test]
-    fn test_build_web_client_defaults_succeeds() {
-        let cfg = WebClientConfig::default();
-        assert!(build_web_client(&cfg).is_ok());
+    fn build_web_client_defaults_succeeds() {
+        let config = WebClientConfig::default();
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_build_web_client_with_socks_proxy_succeeds() {
-        let cfg = WebClientConfig {
+    fn build_web_client_with_socks_proxy_succeeds() {
+        let config = WebClientConfig {
             proxy: Some("socks5h://127.0.0.1:1080".to_string()),
             ..WebClientConfig::default()
         };
         // We don't actually connect; we just verify reqwest accepts the proxy URL shape.
-        assert!(build_web_client(&cfg).is_ok());
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_build_web_client_with_http_proxy_succeeds() {
-        let cfg = WebClientConfig {
+    fn build_web_client_with_http_proxy_succeeds() {
+        let config = WebClientConfig {
             proxy: Some("http://proxy.local:8080".to_string()),
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&cfg).is_ok());
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_build_web_client_explicit_none_proxy_succeeds() {
+    fn build_web_client_explicit_none_proxy_succeeds() {
         // `"none"` → `.no_proxy()`, suppresses env-var auto-detection.
-        let cfg = WebClientConfig {
+        let config = WebClientConfig {
             proxy: Some("none".to_string()),
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&cfg).is_ok());
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_build_web_client_rejects_bad_proxy() {
-        let cfg = WebClientConfig {
+    fn build_web_client_rejects_bad_proxy() {
+        let config = WebClientConfig {
             proxy: Some("not-a-url".to_string()),
             ..WebClientConfig::default()
         };
-        let err = build_web_client(&cfg).expect_err("bad proxy URL should fail");
-        let msg = format!("{}", err);
+        let error = build_web_client(&config).expect_err("bad proxy URL should fail");
+        let message = format!("{error}");
         assert!(
-            msg.contains("[web].proxy") && msg.contains("not-a-url"),
-            "expected proxy error naming the bad value, got: {}",
-            msg
+            message.contains("[web].proxy") && message.contains("not-a-url"),
+            "expected proxy error naming the bad value, got: {message}"
+        );
+        // The class, not just the words. As `Config` this is a refusal every host relays verbatim,
+        // and `meka serve` published the operator's proxy URL in a 422 to whoever holds a token.
+        assert!(
+            matches!(error, MekaError::Installation(_)),
+            "a client meka cannot build is the operator's to fix: {error:?}"
         );
     }
 
     #[test]
-    fn test_build_web_client_missing_ca_cert_errors() {
-        let cfg = WebClientConfig {
+    fn build_web_client_missing_ca_cert_errors() {
+        let config = WebClientConfig {
             ca_cert_file: Some(std::path::PathBuf::from(
                 "/definitely/does/not/exist/ca.pem",
             )),
             ..WebClientConfig::default()
         };
-        let err = build_web_client(&cfg).expect_err("missing CA file should fail");
-        let msg = format!("{}", err);
+        let error = build_web_client(&config).expect_err("missing CA file should fail");
+        let message = format!("{error}");
         assert!(
-            msg.contains("[web].ca_cert_file") && msg.contains("/definitely/does/not/exist"),
-            "expected CA error naming the path, got: {}",
-            msg
+            message.contains("[web].ca_cert_file")
+                && message.contains("/definitely/does/not/exist"),
+            "expected CA error naming the path, got: {message}"
+        );
+        // See `build_web_client_rejects_bad_proxy`: the path in that message is exactly why the
+        // class matters.
+        assert!(
+            matches!(error, MekaError::Installation(_)),
+            "a CA file the operator named is the operator's to fix: {error:?}"
         );
     }
 
     #[test]
-    fn test_build_web_client_non_pem_ca_cert_errors() {
+    fn build_web_client_non_pem_ca_cert_errors() {
         // An existing but non-PEM file produces a clear parse error rather than a silent failure.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("not-a-cert.bin");
         std::fs::write(&path, b"this is definitely not a PEM").expect("write");
-        let cfg = WebClientConfig {
+        let config = WebClientConfig {
             ca_cert_file: Some(path),
             ..WebClientConfig::default()
         };
-        let err = build_web_client(&cfg).expect_err("non-PEM CA file should fail");
-        let msg = format!("{}", err);
+        let error = build_web_client(&config).expect_err("non-PEM CA file should fail");
+        let message = format!("{error}");
         assert!(
-            msg.contains("[web].ca_cert_file"),
-            "expected CA error, got: {}",
-            msg
+            message.contains("[web].ca_cert_file"),
+            "expected CA error, got: {message}"
         );
     }
 
     #[test]
-    fn test_build_web_client_zero_redirects_builds() {
+    fn build_web_client_zero_redirects_builds() {
         // max_redirects = 0 → Policy::none(); reqwest accepts it.
-        let cfg = WebClientConfig {
+        let config = WebClientConfig {
             max_redirects: 0,
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&cfg).is_ok());
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_build_web_client_https_only_builds() {
-        let cfg = WebClientConfig {
+    fn build_web_client_https_only_builds() {
+        let config = WebClientConfig {
             https_only: true,
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&cfg).is_ok());
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_build_web_client_with_min_tls_1_2_succeeds() {
-        let cfg = WebClientConfig {
+    fn build_web_client_with_min_tls_1_2_succeeds() {
+        let config = WebClientConfig {
             min_tls_version: Some(MinTlsVersion::V1_2),
             ..WebClientConfig::default()
         };
         // rustls (our pinned backend) supports TLS 1.2; must build.
-        assert!(build_web_client(&cfg).is_ok());
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_build_web_client_with_danger_flags_builds() {
+    fn build_web_client_with_danger_flags_builds() {
         // Builds successfully; the function also logs a warn! per flag, which we don't assert here
         // (tracing capture would add plumbing for negligible test value).
-        let cfg = WebClientConfig {
+        let config = WebClientConfig {
             danger_accept_invalid_certs: true,
             danger_accept_invalid_hostnames: true,
             ..WebClientConfig::default()
         };
-        assert!(build_web_client(&cfg).is_ok());
+        assert!(build_web_client(&config).is_ok());
     }
 
     #[test]
-    fn test_apply_headers_adds_headers() {
+    fn apply_headers_adds_headers() {
         let client = reqwest::Client::new();
         let input = serde_json::json!({
             "url": "https://example.com",
@@ -1298,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_headers_overrides_user_agent() {
+    fn apply_headers_overrides_user_agent() {
         let client = reqwest::Client::builder()
             .user_agent("default-agent")
             .build()
@@ -1313,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_headers_no_headers() {
+    fn apply_headers_no_headers() {
         let client = reqwest::Client::new();
         let input = serde_json::json!({"url": "https://example.com"});
         let request = apply_headers(client.get("https://example.com"), &input)
@@ -1323,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_headers_skips_non_string_values() {
+    fn apply_headers_skips_non_string_values() {
         let client = reqwest::Client::new();
         let input = serde_json::json!({
             "headers": {
@@ -1339,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_regex_filters_content() {
+    fn regex_filters_content() {
         let content = "Hello world\nfoo 123 bar\nbaz 456 qux\nend";
         let re = Regex::new(r"\d+").unwrap();
         let matches: Vec<&str> = re.find_iter(content).map(|m| m.as_str()).collect();
@@ -1347,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_regex_no_matches() {
+    fn regex_no_matches() {
         let content = "Hello world";
         let re = Regex::new(r"\d+").unwrap();
         let matches: Vec<&str> = re.find_iter(content).map(|m| m.as_str()).collect();
@@ -1359,12 +1369,12 @@ mod tests {
         clippy::invalid_regex,
         reason = "intentionally invalid: tests parser rejection"
     )]
-    fn test_regex_invalid_pattern() {
+    fn regex_invalid_pattern() {
         assert!(Regex::new(r"[invalid").is_err());
     }
 
     #[test]
-    fn test_fetch_url_definition_has_headers_regex_and_raw() {
+    fn fetch_url_definition_has_headers_regex_and_raw() {
         let tool = FetchUrlTool {
             client: reqwest::Client::new(),
         };
@@ -1379,22 +1389,22 @@ mod tests {
     /// catches an accidental bump in either direction; end-to-end coverage of the streaming check
     /// itself needs a real server and lives in the manual verification step.
     #[test]
-    fn test_fetch_url_size_cap_is_10_mib() {
+    fn fetch_url_size_cap_is_10_mib() {
         assert_eq!(MAX_RESPONSE_BYTES, 10_485_760);
     }
 
     #[test]
-    fn test_redirects_to_scratchpad_logic() {
-        // Mirrors the branch used in fetch_url::execute. When redirecting, we force max_length = 0
+    fn redirects_to_scratchpad_logic() {
+        // Mirrors the branch used in fetch_url::execute. When redirecting, we force `limit` to 0
         // (unlimited).
-        let with = serde_json::json!({ "scratchpad": "out", "max_length": 100 });
-        let without = serde_json::json!({ "max_length": 100 });
+        let with = serde_json::json!({ "scratchpad": "out", "limit": 100 });
+        let without = serde_json::json!({ "limit": 100 });
         assert!(redirects_to_scratchpad(&with));
         assert!(!redirects_to_scratchpad(&without));
     }
 
     #[test]
-    fn test_search_web_definition_has_headers() {
+    fn search_web_definition_has_headers() {
         let tool = WebSearchTool {
             client: reqwest::Client::new(),
         };

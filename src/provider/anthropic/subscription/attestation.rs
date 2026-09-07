@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    conversation::{ContentBlock, Message, Role},
     error::{MekaError, Result},
-    provider::{ContentBlock, Message, Role},
 };
 
 /// Claude Code version string. Single source of truth defined in `build.rs`.
@@ -25,7 +25,7 @@ pub(super) const CC_VERSION: &str = env!("CC_VERSION");
 /// Fingerprint salt. `MHE` in the shipped 2.1.241 binary.
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
 
-/// `SHA256(SALT + msg[4] + msg[7] + msg[20] + version)[:3]`.
+/// `SHA256(SALT + message[4] + message[7] + message[20] + version)[:3]`.
 fn compute_fingerprint(message_text: &str, version: &str) -> String {
     let indices = [4, 7, 20];
     let chars: String = indices
@@ -33,14 +33,14 @@ fn compute_fingerprint(message_text: &str, version: &str) -> String {
         .map(|&index| message_text.chars().nth(index).unwrap_or('0'))
         .collect();
 
-    let input = format!("{}{}{}", FINGERPRINT_SALT, chars, version);
+    let input = format!("{FINGERPRINT_SALT}{chars}{version}");
     let hash = Sha256::digest(input.as_bytes());
     // Match Claude Code's `SHA256(...)[:3]`: take the first 3 hex chars of the byte-by-byte
     // 2-digit-hex encoding. Two bytes give us 4 chars, enough to slice 3 and drop the rest.
     let hex: String = hash
         .iter()
         .take(2)
-        .map(|byte| format!("{:02x}", byte))
+        .map(|byte| format!("{byte:02x}"))
         .collect();
     hex[..3].to_string()
 }
@@ -70,24 +70,29 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 }
 
 /// Generates the billing header with a `cch=00000` placeholder. The 3-char fingerprint suffix is
-/// derived from the first user message per Claude Code's behaviour. The `cch` is replaced with the
+/// derived from the first user message per Claude Code's behavior. The `cch` is replaced with the
 /// real attestation by [`patch_request_body`] after serialization.
 ///
 /// The optional segments follow in the order Claude Code's builder emits them (2.1.241, verified
 /// against a wire capture): `cch`, then `cc_workload`, `cc_is_subagent`, `cc_prev_req`,
 /// `cc_prompt_id`. meka never has a workload, so that one is always absent; the rest appear
 /// exactly when their source does.
-pub(super) fn generate_billing_header(messages: &[Message]) -> String {
-    let subagent = if crate::provider::is_subagent() {
+pub(super) fn generate_billing_header(
+    messages: &[Message],
+    attribution: &crate::provider::Attribution,
+) -> String {
+    let subagent = if attribution.subagent {
         " cc_is_subagent=true;"
     } else {
         ""
     };
-    let previous_request = crate::provider::previous_request_id()
-        .map(|id| format!(" cc_prev_req={};", id))
+    let previous_request = attribution
+        .previous_request_id()
+        .map(|id| format!(" cc_prev_req={id};"))
         .unwrap_or_default();
-    let prompt = crate::provider::current_prompt_id()
-        .map(|id| format!(" cc_prompt_id={};", id))
+    let prompt = attribution
+        .prompt_id
+        .map(|id| format!(" cc_prompt_id={id};"))
         .unwrap_or_default();
     format!(
         "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli; cch=00000;{}{}{}",
@@ -117,8 +122,8 @@ fn xxh64_round(acc: u64, lane: u64) -> u64 {
         .wrapping_mul(XXH64_PRIME1)
 }
 
-fn xxh64_merge_round(acc: u64, val: u64) -> u64 {
-    (acc ^ xxh64_round(0, val))
+fn xxh64_merge_round(acc: u64, value: u64) -> u64 {
+    (acc ^ xxh64_round(0, value))
         .wrapping_mul(XXH64_PRIME1)
         .wrapping_add(XXH64_PRIME4)
 }
@@ -132,25 +137,25 @@ fn xxh64_avalanche(mut h: u64) -> u64 {
     h
 }
 
-fn read_u32_le(buf: &[u8], offset: usize) -> u64 {
+fn read_u32_le(buffer: &[u8], offset: usize) -> u64 {
     u32::from_le_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
+        buffer[offset],
+        buffer[offset + 1],
+        buffer[offset + 2],
+        buffer[offset + 3],
     ]) as u64
 }
 
-fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+fn read_u64_le(buffer: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-        buf[offset + 4],
-        buf[offset + 5],
-        buf[offset + 6],
-        buf[offset + 7],
+        buffer[offset],
+        buffer[offset + 1],
+        buffer[offset + 2],
+        buffer[offset + 3],
+        buffer[offset + 4],
+        buffer[offset + 5],
+        buffer[offset + 6],
+        buffer[offset + 7],
     ])
 }
 
@@ -279,7 +284,7 @@ fn filter_edit(body: &[u8], i: usize) -> Option<(usize, &'static [u8], bool)> {
 }
 
 /// Computes the edit that deletes the field spanning `start..end`, consuming a trailing comma if
-/// present, otherwise signalling that a preceding comma must be trimmed.
+/// present, otherwise signaling that a preceding comma must be trimmed.
 fn skip_field(body: &[u8], start: usize, end: usize) -> (usize, &'static [u8], bool) {
     if body.get(end) == Some(&b',') {
         (end + 1, b"", false)
@@ -399,7 +404,7 @@ pub(super) fn patch_request_body(body_json: &str) -> Result<String> {
             MekaError::Provider("x-anthropic-billing-header not found in request body".into())
         })?;
 
-    let idx = body_json[billing_start..]
+    let index = body_json[billing_start..]
         .find(PLACEHOLDER)
         .map(|relative| billing_start + relative)
         .ok_or_else(|| {
@@ -413,15 +418,15 @@ pub(super) fn patch_request_body(body_json: &str) -> Result<String> {
     let token = format!("{:05x}", digest & 0xfffff);
 
     let mut patched = String::with_capacity(body_json.len());
-    patched.push_str(&body_json[..idx + 4]); // up to and including "cch="
+    patched.push_str(&body_json[..index + 4]); // up to and including "cch="
     patched.push_str(&token);
-    patched.push_str(&body_json[idx + 9..]); // skip past "00000"
+    patched.push_str(&body_json[index + 9..]); // skip past "00000"
     Ok(patched)
 }
 
 /// Builds the User-Agent string matching claude-code's format.
 fn claude_user_agent() -> String {
-    format!("claude-cli/{} (external, cli)", CC_VERSION)
+    format!("claude-cli/{CC_VERSION} (external, cli)")
 }
 
 /// Stainless SDK / runtime versions. Must match the release corresponding to `CC_VERSION`. Values
@@ -458,12 +463,12 @@ fn stainless_os() -> &'static str {
 ///
 /// The order is not cosmetic: HTTP/2 preserves it, so it is as much a client signature as the
 /// values are. What the 2.1.241 wire capture shows is the Stainless SDK's `Headers` object
-/// serialised in a case-sensitive sort (uppercase before lowercase), then the transport's own
+/// serialized in a case-sensitive sort (uppercase before lowercase), then the transport's own
 /// `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it. `reqwest`'s `HeaderMap`
 /// iterates in insertion order, so inserting in that order reproduces it.
 ///
 /// Two parts of it are outside meka's reach and stay different. Header *names* go out lowercased
-/// (`http::HeaderName` normalises, and HTTP/2 requires it anyway, so this is invisible on the real
+/// (`http::HeaderName` normalizes, and HTTP/2 requires it anyway, so this is invisible on the real
 /// wire), and `reqwest` places `Accept-Encoding` first because its decompression layer installs it
 /// before any per-request header.
 ///
@@ -519,7 +524,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compute_fingerprint_from_messages_matches_manual() {
+    fn compute_fingerprint_from_messages_matches_manual() {
         let messages = vec![Message::user("hello world, this is a test message!")];
         let from_messages = compute_fingerprint_from_messages(&messages);
         let first_text = extract_first_user_message_text(&messages);
@@ -528,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_known_values() {
+    fn fingerprint_known_values() {
         let fingerprint = compute_fingerprint("hello", CC_VERSION);
         assert_eq!(fingerprint.len(), 3);
         assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
@@ -541,14 +546,14 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_empty_message() {
+    fn fingerprint_empty_message() {
         let fingerprint = compute_fingerprint("", CC_VERSION);
         assert_eq!(fingerprint.len(), 3);
         assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn test_extract_first_user_message_text() {
+    fn the_first_user_message_text_skips_assistant_and_non_text_blocks() {
         let messages = vec![
             Message {
                 role: Role::Assistant,
@@ -565,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_boundary_length_messages() {
+    fn fingerprint_boundary_length_messages() {
         let fp5 = compute_fingerprint("abcde", CC_VERSION);
         assert_eq!(fp5.len(), 3);
 
@@ -580,27 +585,27 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint_short_message_all_fallback() {
+    fn fingerprint_short_message_all_fallback() {
         let fp_short = compute_fingerprint("abc", CC_VERSION);
         let fp_empty = compute_fingerprint("", CC_VERSION);
         assert_eq!(fp_short, fp_empty);
     }
 
     #[test]
-    fn test_fingerprint_multibyte_chars() {
-        let msg = "日本語のテスト文字列を使ったメッセージです！！！";
-        assert!(msg.chars().count() > 20);
-        let fp = compute_fingerprint(msg, CC_VERSION);
+    fn fingerprint_multibyte_chars() {
+        let message = "日本語のテスト文字列を使ったメッセージです！！！";
+        assert!(message.chars().count() > 20);
+        let fp = compute_fingerprint(message, CC_VERSION);
         assert_eq!(fp.len(), 3);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
 
-        assert_eq!(msg.chars().nth(4), Some('テ'));
-        assert_eq!(msg.chars().nth(7), Some('文'));
-        assert_eq!(msg.chars().nth(20), Some('す'));
+        assert_eq!(message.chars().nth(4), Some('テ'));
+        assert_eq!(message.chars().nth(7), Some('文'));
+        assert_eq!(message.chars().nth(20), Some('す'));
     }
 
     #[test]
-    fn test_fingerprint_different_version() {
+    fn fingerprint_different_version() {
         let fp_a = compute_fingerprint("hello", "1.0.0");
         let fp_b = compute_fingerprint("hello", "2.0.0");
         assert_eq!(fp_a.len(), 3);
@@ -609,8 +614,8 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_first_user_message_text_no_text_block() {
-        use crate::provider::ToolResultContent;
+    fn extract_first_user_message_text_no_text_block() {
+        use crate::conversation::ToolResultContent;
         let messages = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
@@ -625,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_first_user_message_text_multiple_users() {
+    fn extract_first_user_message_text_multiple_users() {
         let messages = vec![
             Message::user("first user message"),
             Message::user("second user message"),
@@ -637,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_first_user_message_text_only_assistants() {
+    fn extract_first_user_message_text_only_assistants() {
         let messages = vec![
             Message::assistant_text("hello"),
             Message::assistant_text("world"),
@@ -646,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_fingerprint_from_messages_empty() {
+    fn compute_fingerprint_from_messages_empty() {
         let empty: Vec<Message> = vec![];
         assert_eq!(
             compute_fingerprint_from_messages(&empty),
@@ -655,7 +660,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_fingerprint_from_messages_no_user() {
+    fn compute_fingerprint_from_messages_no_user() {
         let messages = vec![Message::assistant_text("I'm an assistant")];
         assert_eq!(
             compute_fingerprint_from_messages(&messages),
@@ -666,13 +671,13 @@ mod tests {
     // All xxHash64 expected values cross-validated against Python xxhash.
 
     #[test]
-    fn test_xxh64_basic() {
+    fn xxh64_matches_the_reference_digests_for_empty_and_abc() {
         assert_eq!(xxh64(b"", 0), 0xef46db3751d8e999);
         assert_eq!(xxh64(b"abc", 0), 0x44bc2cf5ad770999);
     }
 
     #[test]
-    fn test_xxh64_claude_seed_short_body() {
+    fn xxh64_claude_seed_short_body() {
         // No volatile fields, so the preimage equals the raw body; pins the seed.
         let body = r#"{"test":"cch=00000"}"#;
         let digest = xxh64(body.as_bytes(), CCH_XXH64_SEED);
@@ -681,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filtered_preimage_strips_volatile_fields() {
+    fn filtered_preimage_strips_volatile_fields() {
         // model emptied; max_tokens, fallbacks, fallback_credit_token removed with their commas.
         let body = br#"{"model":"claude-x","max_tokens":1024,"a":1,"fallbacks":[{"x":1}],"fallback_credit_token":"tok","b":2}"#;
         let preimage = String::from_utf8(filtered_preimage(body)).unwrap();
@@ -689,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_request_body_realistic() {
+    fn patch_request_body_realistic() {
         let body = concat!(
             r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: "#,
             r#"cc_version=2.1.185.abc; cc_entrypoint=cli; cch=00000;"}],"model""#,
@@ -703,51 +708,51 @@ mod tests {
     }
 
     #[test]
-    fn test_xxh64_one_byte() {
+    fn xxh64_one_byte() {
         assert_eq!(xxh64(b"x", 0), 0x5c80c09683041123);
     }
 
     #[test]
-    fn test_xxh64_three_bytes() {
+    fn xxh64_three_bytes() {
         assert_eq!(xxh64(b"abc", 0), 0x44bc2cf5ad770999);
     }
 
     #[test]
-    fn test_xxh64_four_bytes() {
+    fn xxh64_four_bytes() {
         assert_eq!(xxh64(b"abcd", 0), 0xde0327b0d25d92cc);
     }
 
     #[test]
-    fn test_xxh64_seven_bytes() {
+    fn xxh64_seven_bytes() {
         assert_eq!(xxh64(b"abcdefg", 0), 0x1860940e2902822d);
     }
 
     #[test]
-    fn test_xxh64_eight_bytes() {
+    fn xxh64_eight_bytes() {
         assert_eq!(xxh64(b"abcdefgh", 0), 0x3ad351775b4634b7);
     }
 
     #[test]
-    fn test_xxh64_sixteen_bytes() {
+    fn xxh64_sixteen_bytes() {
         assert_eq!(xxh64(b"abcdefghijklmnop", 0), 0x71ce8137ca2dd53d);
     }
 
     #[test]
-    fn test_xxh64_thirty_one_bytes() {
+    fn xxh64_thirty_one_bytes() {
         let input = b"abcdefghijklmnopqrstuvwxyz01234";
         assert_eq!(input.len(), 31);
         assert_eq!(xxh64(input, 0), 0x16058c7b947da137);
     }
 
     #[test]
-    fn test_xxh64_thirty_two_bytes() {
+    fn xxh64_thirty_two_bytes() {
         let input = b"abcdefghijklmnopqrstuvwxyz012345";
         assert_eq!(input.len(), 32);
         assert_eq!(xxh64(input, 0), 0xbf2cd639b4143b80);
     }
 
     #[test]
-    fn test_xxh64_with_nonzero_seed() {
+    fn xxh64_with_nonzero_seed() {
         let input = b"hello world";
         let h0 = xxh64(input, 0);
         let h1 = xxh64(input, 1);
@@ -758,25 +763,25 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_request_body_missing_billing_header() {
+    fn patch_request_body_missing_billing_header() {
         let body = r#"{"system":[],"messages":[]}"#;
         let result = patch_request_body(body);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("x-anthropic-billing-header not found"));
+        let error_message = result.unwrap_err().to_string();
+        assert!(error_message.contains("x-anthropic-billing-header not found"));
     }
 
     #[test]
-    fn test_patch_request_body_billing_header_without_placeholder() {
+    fn patch_request_body_billing_header_without_placeholder() {
         let body = r#"{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.86.abc; cc_entrypoint=cli;"}]}"#;
         let result = patch_request_body(body);
         assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("cch=00000"));
+        let error_message = result.unwrap_err().to_string();
+        assert!(error_message.contains("cch=00000"));
     }
 
     #[test]
-    fn test_claude_user_agent_format() {
+    fn claude_user_agent_format() {
         let ua = claude_user_agent();
         assert!(ua.starts_with("claude-cli/"));
         assert!(ua.contains(CC_VERSION));
@@ -784,24 +789,26 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_billing_header_format() {
+    fn generate_billing_header_format() {
         let messages = vec![Message::user("hello")];
-        let header = generate_billing_header(&messages);
+        let header = generate_billing_header(&messages, &crate::provider::Attribution::default());
         assert!(header.starts_with("x-anthropic-billing-header:"));
-        assert!(header.contains(&format!("cc_version={}", CC_VERSION)));
+        assert!(header.contains(&format!("cc_version={CC_VERSION}")));
         assert!(header.contains("cc_entrypoint=cli"));
         assert!(header.contains("cch=00000"));
         assert!(header.ends_with("cch=00000;"));
 
         // Fingerprint suffix is dynamic per first user message: different first message →
         // different suffix.
-        let other =
-            generate_billing_header(&[Message::user("totally different first user message text")]);
+        let other = generate_billing_header(
+            &[Message::user("totally different first user message text")],
+            &crate::provider::Attribution::default(),
+        );
         assert_ne!(header, other);
     }
 
     #[test]
-    fn test_stainless_arch_returns_nonempty() {
+    fn stainless_arch_returns_nonempty() {
         assert!(!stainless_arch().is_empty());
     }
 }

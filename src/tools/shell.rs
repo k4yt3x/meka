@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolOutput, util::require_str};
 use crate::{
@@ -18,9 +17,9 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// Default `timeout_ms` applied when the caller doesn't pass one. Single source of truth for both
-/// the parameter unwrap and the description shown to the agent.
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+/// `timeout_ms` when the caller passes none. Single source of truth for both the parameter unwrap
+/// and the description shown to the agent.
+const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Every bwrap argument up to the `--` separator, for `writable` roots.
 ///
@@ -29,10 +28,14 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// applies operations onto the new root in sequence and the last one to touch a path wins, so a
 /// bind placed before the tmpfs masks is silently undone by them. A workspace under `/tmp` -- where
 /// every test fixture and a fair number of real scratch directories live -- would come out
-/// read-only with no error from bwrap, no error from meka, and a mode that quietly confines the
+/// read-only with no error from bwrap, no error from meka, and a level that quietly confines the
 /// shell to nothing.
 #[cfg(target_os = "linux")]
-fn bwrap_args(writable: &[std::path::PathBuf], cwd: &std::path::Path) -> Vec<std::ffi::OsString> {
+fn bwrap_args(
+    writable: &[std::path::PathBuf],
+    cwd: &std::path::Path,
+    private: &[std::path::PathBuf],
+) -> Vec<std::ffi::OsString> {
     // `--ro-bind /` enforces "no writes", `--unshare-*` cuts off PID / user / UTS / IPC views, and
     // the tmpfs masks over `/run`, `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR` make the dbus and
     // systemd-user sockets unreachable so the agent cannot `dbus-send` state-changing methods.
@@ -81,7 +84,7 @@ fn bwrap_args(writable: &[std::path::PathBuf], cwd: &std::path::Path) -> Vec<std
     // exited 0 with empty stderr. Meanwhile `read_file` and `search_contents` run in-process and
     // saw the real files, so the model was handed two contradictory views of one session.
     //
-    // Read-only because this is the `read`-mode fix: a writable root that happens to be the cwd is
+    // Read-only because this is the `read`-level fix: a writable root that happens to be the cwd is
     // bound read-write by the loop below, and a later mount wins.
     //
     // Skipped when the cwd *is* a masked directory, or an ancestor of one, because the same
@@ -113,6 +116,15 @@ fn bwrap_args(writable: &[std::path::PathBuf], cwd: &std::path::Path) -> Vec<std
         args.push(root.into());
     }
 
+    // meka's own directories, masked after every bind so they stay hidden under a writable root
+    // that contains them: later mounts win, which is what would otherwise let a root at `$HOME`
+    // hand `~/.config/meka` and the credential store beside it to a confined shell. See
+    // `workspace::private_directories` for what is in the list and why.
+    for directory in private {
+        args.push("--tmpfs".into());
+        args.push(directory.into());
+    }
+
     // Asked for explicitly rather than inherited through the pre-`execve` chdir, so that a cwd
     // bwrap cannot enter is a loud failure the model can read instead of a silent relocation to
     // `$HOME`. Last, so it applies to the mounts above it.
@@ -128,30 +140,29 @@ pub(super) struct ExecuteCommandTool {
     /// field because that is how the tool reaches it, and the distinction matters: an ACE is
     /// machine state, so a per-registry ledger had a sub-agent's teardown revoke the ACEs its
     /// parent was still writing through. Released by `release_process_grants` at process exit
-    /// rather than by `Drop`; see [`crate::sandbox::windows_impl::WindowsGrants`] for what
+    /// rather than by `Drop`; see [`crate::sandbox::windows::WindowsGrants`] for what
     /// that does and does not cover.
     #[cfg(windows)]
-    pub windows_grants: std::sync::Arc<crate::sandbox::windows_impl::WindowsGrants>,
+    pub(crate) windows_grants: std::sync::Arc<crate::sandbox::windows::WindowsGrants>,
     /// The write boundary, shared with `write_file`. The shell derives its sandbox allow-list from
     /// the same [`crate::workspace::WriteScope`] the file tools fence against, so the two cannot
     /// disagree about where a write may land.
-    pub scope: crate::workspace::WriteScope,
-    pub sandbox_capability: crate::sandbox::SandboxCapability,
+    pub(crate) scope: crate::workspace::WriteScope,
+    pub(crate) sandbox_capability: crate::sandbox::SandboxCapability,
     /// Backend chosen in config (or auto-resolved). Read only by the Linux hard-error message in
     /// [`Tool::execute`]; on macOS / Windows the field is populated but unused, so suppress the
     /// "never read" lint there without hiding regressions on Linux.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub sandbox_backend: crate::config::SandboxBackend,
-    /// Probe outcome for [`Self::sandbox_backend`]. Drives the hard-error path in read mode when
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read only on the Linux spawn path")
+    )]
+    pub(crate) sandbox_backend: crate::config::SandboxBackend,
+    /// Probe outcome for [`Self::sandbox_backend`]. Drives the hard-error path at `read` when
     /// the backend isn't usable (bwrap missing, user namespaces denied, etc.). When `Ok(_)`,
     /// [`Self::sandbox_capability`] mirrors the inner capability and the spawn path runs normally.
-    pub backend_probe: crate::sandbox::BackendProbe,
-    pub shared_permission: crate::permission::SharedPermission,
-    pub sandbox_enabled: bool,
-    pub cwd: crate::workspace::SharedCwd,
-    /// Sink for [`crate::frontend::FrontendEvent::ToolCallOutputDelta`], so a frontend can show
-    /// output as the command produces it rather than only once it exits.
-    pub frontend: Arc<dyn crate::frontend::Frontend>,
+    pub(crate) backend_probe: crate::sandbox::BackendProbe,
+    pub(crate) sandbox_enabled: bool,
+    pub(crate) site: crate::session::ToolSite,
 }
 
 #[async_trait]
@@ -165,8 +176,8 @@ impl Tool for ExecuteCommandTool {
                 the command runs via `powershell.exe -Command <command>`. Use \
                 PowerShell syntax directly (e.g. `$var = ...`, `$env:PATH`); do NOT \
                 wrap with another `powershell -Command` or the outer PowerShell will \
-                expand your inner `$var` references to empty strings. In read mode \
-                the command runs in a read-only sandbox where filesystem writes are \
+                expand your inner `$var` references to empty strings. At the read \
+                permission level the command runs in a read-only sandbox where filesystem writes are \
                 blocked. Multiple independent execute_command calls in one assistant \
                 message run in parallel; use this for read-only commands and \
                 serialize anything that mutates shared state (files, git, packages)."
@@ -176,14 +187,15 @@ impl Tool for ExecuteCommandTool {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute"
+                        "description": "The shell command to execute."
                     },
                     "timeout_ms": {
                         "type": "integer",
+                        "default": DEFAULT_TIMEOUT.as_millis(),
                         "description": format!(
-                            "Timeout in milliseconds. Defaults to {} ({} seconds).",
-                            DEFAULT_TIMEOUT_MS,
-                            DEFAULT_TIMEOUT_MS / 1000,
+                            "Timeout in milliseconds. Default: {} ({} seconds).",
+                            DEFAULT_TIMEOUT.as_millis(),
+                            DEFAULT_TIMEOUT.as_secs(),
                         )
                     },
                     "scratchpad": {
@@ -213,11 +225,15 @@ impl Tool for ExecuteCommandTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let command = require_str(&input, "command", "execute_command")?;
-        let timeout_ms = input["timeout_ms"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
-        let permission = self.shared_permission.get();
+        let timeout = input["timeout_ms"]
+            .as_u64()
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(DEFAULT_TIMEOUT);
+        let permission = self.site.permission.get();
         // Three states, resolved once: the rest of this function asks the `Confinement` rather than
         // re-deriving "is it sandboxed" from the level, which is how the read-only and
         // workspace-writable cases would drift apart.
@@ -225,7 +241,7 @@ impl Tool for ExecuteCommandTool {
             self.sandbox_enabled,
             permission,
             &self.scope,
-            &self.cwd,
+            &self.site.cwd,
         );
         let sandboxed = confinement.is_sandboxed();
 
@@ -237,17 +253,16 @@ impl Tool for ExecuteCommandTool {
         // Refused rather than hidden. `required_permission` cannot hide it: `Workspace.allows` is
         // true for everything by design, because scope is meant to be enforced at the door rather
         // than by withholding tools. Refusing at that door is the same shape as the write fence,
-        // and it can say what to do about it where a missing tool could not.
-        // Any level that promises confinement, not just `workspace`.
+        // and it can say what to do about it where a missing tool could not. Any level that
+        // promises confinement, not just `workspace`.
         //
-        // `ask` and `unrestricted` are the only two whose *intent* is `Unconfined`; every other
-        // level reaching an unconfined spawn is a configuration that cannot deliver what the level
-        // says. Keyed on `workspace` alone, the sibling case stayed open:
-        // `[tools.tool_permissions]` overrides a tool's required level with no floor, so
-        // `execute_command = "read"` plus `[shell].sandbox = false` ran a plain `sh -c` at
-        // `read` -- with the full parent environment, since the scrub is gated on
-        // `sandboxed` too.
-        if !matches!(permission, Permission::Ask | Permission::Unrestricted) && !sandboxed {
+        // `unrestricted` is the only level whose *intent* is `Unconfined`; every other level
+        // reaching an unconfined spawn is a configuration that cannot deliver what the level says.
+        // Keyed on `workspace` alone, the sibling case stayed open: `[tools.tool_permissions]`
+        // overrides a tool's required level with no floor, so `execute_command = "read"` plus
+        // `[shell].sandbox = false` ran a plain `sh -c` at `read` -- with the full parent
+        // environment, since the scrub is gated on `sandboxed` too.
+        if permission != Permission::Unrestricted && !sandboxed {
             return Err(MekaError::ToolExecution {
                 tool_name: "execute_command".to_string(),
                 message: "[shell].sandbox = false leaves nothing to confine this command, \
@@ -299,7 +314,7 @@ impl Tool for ExecuteCommandTool {
             // needs the ACEs in place *before* the token names them, so the grant happens here
             // rather than inside the spawn.
             let windows_confinement = match confinement.writable() {
-                [] => crate::sandbox::windows_impl::WindowsConfinement::LowIntegrity,
+                [] => crate::sandbox::windows::WindowsConfinement::LowIntegrity,
                 roots => {
                     // Off the async executor. `ensure` calls `SetNamedSecurityInfoW`, which
                     // propagates the inheritable ACE over the *entire* existing tree -- seconds to
@@ -327,7 +342,7 @@ impl Tool for ExecuteCommandTool {
                         return Err(MekaError::ToolExecution {
                             tool_name: "execute_command".to_string(),
                             message: format!(
-                                "could not make '{}' writable for the sandboxed shell: {}. \
+                                "failed to make '{}' writable for the sandboxed shell: {}. \
                                  meka needs to own the directory to grant itself write access \
                                  there; a network share or another user's folder cannot be a \
                                  workspace root on Windows.",
@@ -336,17 +351,15 @@ impl Tool for ExecuteCommandTool {
                             ),
                         });
                     }
-                    crate::sandbox::windows_impl::WindowsConfinement::WriteRestricted(
-                        roots.to_vec(),
-                    )
+                    crate::sandbox::windows::WindowsConfinement::WriteRestricted(roots.to_vec())
                 }
             };
-            let relay = OutputRelay::for_current_call(&self.frontend);
+            let relay = OutputRelay::for_call(&context);
             return run_windows_sandboxed(
                 &command,
                 &windows_confinement,
-                crate::workspace::cwd_snapshot(&self.cwd),
-                timeout_ms,
+                self.site.cwd.get(),
+                timeout,
                 cancellation,
                 relay,
             )
@@ -374,8 +387,11 @@ impl Tool for ExecuteCommandTool {
                 self.sandbox_capability,
                 crate::sandbox::SandboxCapability::SandboxExec
             ) {
-            let (profile, params) = crate::sandbox::sandbox_profile_for(confinement.writable());
-            let mut cmd = tokio::process::Command::new(crate::sandbox::SANDBOX_EXEC_PATH);
+            let (profile, params) = crate::sandbox::seatbelt::sandbox_profile_for(
+                confinement.writable(),
+                &crate::workspace::private_directories(),
+            );
+            let mut cmd = tokio::process::Command::new(crate::sandbox::seatbelt::SANDBOX_EXEC_PATH);
             cmd.arg("-p").arg(&profile);
             // `-D KEY=value` pairs, so a path never has to survive SBPL string quoting.
             cmd.args(&params);
@@ -400,7 +416,8 @@ impl Tool for ExecuteCommandTool {
             let mut cmd = tokio::process::Command::new(bwrap_path);
             cmd.args(bwrap_args(
                 confinement.writable(),
-                &crate::workspace::cwd_snapshot(&self.cwd),
+                &self.site.cwd.get(),
+                &crate::workspace::private_directories(),
             ));
             cmd.arg("--").arg("sh").arg("-c").arg(&command);
             cmd
@@ -419,10 +436,10 @@ impl Tool for ExecuteCommandTool {
         // kernels.
         #[cfg(unix)]
         {
-            // Built here, in the parent, because `pre_exec` runs after `fork` in a
-            // single-threaded child where allocating is not async-signal-safe. A root whose bytes
-            // contain a NUL cannot become a `CString`; dropping it leaves that root read-only,
-            // which is the restrictive direction.
+            // Built here, in the parent, because `pre_exec` runs after `fork` in a single-threaded
+            // child where allocating is not async-signal-safe. A root whose bytes contain a NUL
+            // cannot become a `CString`; dropping it leaves that root read-only, which is the
+            // restrictive direction.
             #[cfg(target_os = "linux")]
             let landlock_writable: Vec<std::ffi::CString> = confinement
                 .writable()
@@ -458,15 +475,13 @@ impl Tool for ExecuteCommandTool {
                         crate::sandbox::apply_landlock(abi, &landlock_writable)
                             .map_err(std::io::Error::from_raw_os_error)?;
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    let _ = (); // landlock_abi unused on non-Linux Unix
                     Ok(())
                 });
             }
         }
 
         // Scrub env before spawn so secrets in the parent process (`ANTHROPIC_API_KEY`, `AWS_*`,
-        // `GITHUB_TOKEN`, …) can't ride along into the read-mode child. Sandboxes block writes/IPC
+        // `GITHUB_TOKEN`, …) can't ride along into the child at `read`. Sandboxes block writes/IPC
         // but leave the network open, so leaked env is a live exfil vector under prompt injection.
         // `ask` and `unrestricted` keep the full parent environment, and for `ask` that is a
         // deliberate widening rather than a consequence nobody noticed: this predicate is the same
@@ -485,7 +500,7 @@ impl Tool for ExecuteCommandTool {
 
         // Resolve commands against the agent's per-session cwd, not the process cwd. `/cd` mutates
         // the agent's cwd; this is how it actually reaches the child.
-        command_builder.current_dir(crate::workspace::cwd_snapshot(&self.cwd));
+        command_builder.current_dir(self.site.cwd.get());
 
         let mut child = command_builder
             .stdin(std::process::Stdio::null())
@@ -494,10 +509,8 @@ impl Tool for ExecuteCommandTool {
             .spawn()
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "execute_command".to_string(),
-                message: format!("failed to spawn command: {}", error),
+                message: format!("failed to spawn command: {error}"),
             })?;
-
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
 
         // Drain stdout/stderr on dedicated tasks that start *before* the wait.
         // `tokio::process::Child::wait()` does not read the pipes; a child writing past the OS pipe
@@ -506,7 +519,7 @@ impl Tool for ExecuteCommandTool {
         // write ends close and the drains hit EOF.
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let relay = OutputRelay::for_current_call(&self.frontend);
+        let relay = OutputRelay::for_call(&context);
         let stdout_task = tokio::spawn({
             let relay = relay.clone();
             async move { read_to_string_best_effort(stdout, relay).await }
@@ -525,14 +538,14 @@ impl Tool for ExecuteCommandTool {
                 stderr_task.abort();
                 Err(MekaError::Interrupted)
             }
-            _ = tokio::time::sleep(timeout_duration) => {
+            _ = tokio::time::sleep(timeout) => {
                 kill_child_tree(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
                 // Timed out means we killed it, so report the kill rather than inventing an exit
                 // code; a frontend rendering a terminal shows "terminated" instead of "exit 0".
                 Ok(ToolOutput::text(
-                    format!("Command timed out after {}ms", timeout_ms),
+                    format!("Command timed out after {}ms", timeout.as_millis()),
                     true,
                 )
                 .with_metadata(timed_out_exit_metadata()))
@@ -540,7 +553,7 @@ impl Tool for ExecuteCommandTool {
             status = child.wait() => {
                 let status = status.map_err(|error| MekaError::ToolExecution {
                     tool_name: "execute_command".to_string(),
-                    message: format!("failed to wait for command: {}", error),
+                    message: format!("failed to wait for command: {error}"),
                 })?;
 
                 let exit_code = status.code().unwrap_or(-1);
@@ -582,27 +595,21 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
             // without spamming default verbosity.
             let term_result = unsafe { libc::kill(-pgid, libc::SIGTERM) };
             if term_result != 0 {
-                tracing::debug!(
-                    "libc::kill(-{}, SIGTERM) failed: {}",
-                    pgid,
-                    std::io::Error::last_os_error()
-                );
+                let error = std::io::Error::last_os_error();
+                tracing::debug!("libc::kill(-{pgid}, SIGTERM) failed: {error}");
             }
             // Brief grace period so well-behaved children can shut down cleanly before SIGKILL
             // lands.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let kill_result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             if kill_result != 0 {
-                tracing::debug!(
-                    "libc::kill(-{}, SIGKILL) failed: {}",
-                    pgid,
-                    std::io::Error::last_os_error()
-                );
+                let error = std::io::Error::last_os_error();
+                tracing::debug!("libc::kill(-{pgid}, SIGKILL) failed: {error}");
             }
         }
     }
     if let Err(error) = child.kill().await {
-        tracing::debug!("failed to kill child process: {}", error);
+        tracing::debug!("failed to kill child process: {error}");
     }
 }
 
@@ -625,10 +632,11 @@ struct OutputRelay {
 impl OutputRelay {
     /// The id has to be captured here rather than inside the drain task: it lives in a task-local
     /// scoped by `Agent::resolve_and_execute_tool`, and `tokio::spawn` does not inherit
-    /// task-locals.
-    fn for_current_call(frontend: &Arc<dyn crate::frontend::Frontend>) -> Option<Self> {
-        crate::tools::current_tool_call_id().map(|tool_call_id| Self {
-            frontend: Arc::clone(frontend),
+    /// task-locals. The relay for a call a model made; a call with no tool-use id has nothing to
+    /// tag chunks with.
+    fn for_call(context: &crate::tools::ToolContext) -> Option<Self> {
+        context.tool_call_id.clone().map(|tool_call_id| Self {
+            frontend: Arc::clone(&context.frontend),
             tool_call_id,
         })
     }
@@ -650,7 +658,7 @@ impl OutputRelay {
 /// `Vec<u8>` takes the process down with any command that writes faster than the turn ends, `cat
 /// /dev/zero` being the extreme. Past this point the bytes go to disk and the result names the
 /// file, so the output is still complete and still reachable, just not resident.
-const MAX_RESIDENT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESIDENT_OUTPUT_BYTES: usize = 8 * crate::text::MIB;
 
 /// How much of each end of an overflowing stream stays in the result inline. Enough that the model
 /// can see how the command started and how it ended without opening the capture.
@@ -659,7 +667,7 @@ const MAX_RESIDENT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// keeps only the head. A backgrounded command's *delivered outcome* therefore shows less than its
 /// tool result would have, and shows a different part of it. See that constant for why the
 /// asymmetry is intended and what it costs.
-const OUTPUT_WINDOW_BYTES: usize = 32 * 1024;
+const OUTPUT_WINDOW_BYTES: usize = 32 * crate::text::KIB;
 
 /// Where an overflowing stream's bytes are going.
 ///
@@ -719,11 +727,17 @@ const CAPTURE_RETENTION: std::time::Duration = std::time::Duration::from_secs(24
 ///
 /// Matches only meka's own names, so a file someone else left in a shared temp directory is not
 /// meka's to delete.
-fn sweep_stale_captures(directory: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
+async fn sweep_stale_captures(directory: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
         return;
     };
-    for entry in entries.flatten() {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            // An entry that cannot be read is skipped, not a reason to stop sweeping the rest.
+            Err(_) => continue,
+        };
         let path = entry.path();
         let is_ours = path
             .file_name()
@@ -737,15 +751,13 @@ fn sweep_stale_captures(directory: &std::path::Path) {
         }
         let stale = entry
             .metadata()
+            .await
             .and_then(|metadata| metadata.modified())
             .map(|modified| modified.elapsed().is_ok_and(|age| age > CAPTURE_RETENTION))
             .unwrap_or(false);
-        if stale && let Err(error) = std::fs::remove_file(&path) {
-            tracing::debug!(
-                "could not remove stale capture '{}': {}",
-                path.display(),
-                error
-            );
+        if stale && let Err(error) = tokio::fs::remove_file(&path).await {
+            let path = path.display();
+            tracing::warn!("failed to remove stale capture '{path}': {error}");
         }
     }
 }
@@ -763,7 +775,7 @@ fn sweep_stale_captures(directory: &std::path::Path) {
 /// may still refer to -- but they are 8 MiB or more each and nothing else ever removes them, so a
 /// machine that runs long builds accumulates them until the disk notices. A day is well past the
 /// point where the conversation that produced one is still acting on it.
-fn capture_path() -> std::path::PathBuf {
+async fn capture_path() -> std::path::PathBuf {
     #[cfg(test)]
     if FORCE_CAPTURE_FAILURE.with(std::cell::Cell::get) {
         // A parent that does not exist, so `File::create` fails on every platform.
@@ -772,40 +784,21 @@ fn capture_path() -> std::path::PathBuf {
             .join("capture.log");
     }
 
-    // `MEKA_DATA_DIR` first, so a run isolated to a scratch directory keeps its captures there too
-    // rather than dropping them in the real user's cache.
-    //
-    // Empty and relative values are rejected here rather than assumed away. `default_database_path`
-    // does not guarantee absoluteness: it *warns* and falls back to the platform data dir
-    // (src/session.rs), so meka starts normally with its database in the right place while a
-    // relative or empty value reaches this join and scatters capture files, holding whole command
-    // outputs, under whatever directory meka started in. Same guard, same reason, applied to the
-    // sibling that missed it.
-    let directory = std::env::var_os("MEKA_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|path| {
-            if path.as_os_str().is_empty() || !path.is_absolute() {
-                tracing::warn!(
-                    "MEKA_DATA_DIR '{}' is not an absolute path; keeping command-output captures \
-                     in the cache directory instead",
-                    path.display()
-                );
-                return false;
-            }
-            true
-        })
-        .map(|path| path.join("command-output"))
-        .or_else(|| dirs::cache_dir().map(|directory| directory.join("meka")))
-        .unwrap_or_else(std::env::temp_dir);
-    sweep_stale_captures(&directory);
-    if let Err(error) = std::fs::create_dir_all(&directory) {
-        tracing::debug!(
-            "could not create '{}' for command output capture ({}); using the temp directory",
-            directory.display(),
-            error
+    // One resolver, shared with the sandbox masks that hide this directory from the confined
+    // shell: a capture holds a command's whole output, which is as sensitive as the command.
+    let directory = crate::paths::command_output_dir();
+    sweep_stale_captures(&directory).await;
+    if let Err(error) = tokio::fs::create_dir_all(&directory).await {
+        let path = directory.display();
+        tracing::warn!(
+            "failed to create '{path}' for command output capture ({error}); using the temp \
+             directory"
         );
-        return std::env::temp_dir()
-            .join(format!("meka-command-output-{}.log", uuid::Uuid::new_v4()));
+        // Swept too, or a host whose cache directory cannot be created accumulates captures
+        // there for good: the retention rule holds for whichever directory the captures land in.
+        let fallback = std::env::temp_dir();
+        sweep_stale_captures(&fallback).await;
+        return fallback.join(format!("meka-command-output-{}.log", uuid::Uuid::new_v4()));
     }
     directory.join(format!("command-output-{}.log", uuid::Uuid::new_v4()))
 }
@@ -893,10 +886,9 @@ where
                     Capture::Writing(path, file) => {
                         if let Some(error) = file.write_all(chunk).await.err() {
                             let path = path.clone();
+                            let displayed = path.display();
                             tracing::warn!(
-                                "failed to write command output capture '{}': {}",
-                                path.display(),
-                                error
+                                "failed to write command output capture '{displayed}': {error}"
                             );
                             capture = Capture::Failed;
                             // The notice below stops naming this file, so nothing would ever come
@@ -905,10 +897,9 @@ where
                             // directory after a write failure -- most often a full disk -- is the
                             // wrong moment to be untidy.
                             if let Err(error) = tokio::fs::remove_file(&path).await {
-                                tracing::debug!(
-                                    "could not remove the partial capture '{}': {}",
-                                    path.display(),
-                                    error
+                                let path = path.display();
+                                tracing::warn!(
+                                    "failed to remove the partial capture '{path}': {error}"
                                 );
                             }
                         }
@@ -930,24 +921,22 @@ where
                     // held only the bytes from that point on while the notice called it complete.
                     Capture::NotNeeded if content.len() > MAX_RESIDENT_OUTPUT_BYTES => {
                         head = content[..OUTPUT_WINDOW_BYTES.min(content.len())].to_vec();
-                        let path = capture_path();
+                        let path = capture_path().await;
                         capture = match create_capture_file(&path).await {
                             Ok(mut file) => match file.write_all(&content).await {
                                 Ok(()) => Capture::Writing(path, file),
                                 Err(error) => {
+                                    let path = path.display();
                                     tracing::warn!(
-                                        "failed to write command output capture '{}': {}",
-                                        path.display(),
-                                        error
+                                        "failed to write command output capture '{path}': {error}"
                                     );
                                     Capture::Failed
                                 }
                             },
                             Err(error) => {
+                                let path = path.display();
                                 tracing::warn!(
-                                    "failed to create command output capture '{}': {}",
-                                    path.display(),
-                                    error
+                                    "failed to create command output capture '{path}': {error}"
                                 );
                                 Capture::Failed
                             }
@@ -959,7 +948,7 @@ where
                 }
             }
             Err(error) => {
-                tracing::debug!("failed to read child output: {}", error);
+                tracing::debug!("failed to read child output: {error}");
                 break;
             }
         }
@@ -972,18 +961,12 @@ where
         && let Err(error) = file.flush().await
     {
         let path = path.clone();
-        tracing::warn!(
-            "failed to flush command output capture '{}': {}",
-            path.display(),
-            error
-        );
+        let displayed = path.display();
+        tracing::warn!("failed to flush command output capture '{displayed}': {error}");
         capture = Capture::Failed;
         if let Err(error) = tokio::fs::remove_file(&path).await {
-            tracing::debug!(
-                "could not remove the unflushed capture '{}': {}",
-                path.display(),
-                error
-            );
+            let path = path.display();
+            tracing::warn!("failed to remove the unflushed capture '{path}': {error}");
         }
     }
 
@@ -1002,8 +985,7 @@ where
             path.display()
         ),
         Capture::Failed | Capture::NotNeeded => format!(
-            "\n\n... ({} bytes elided; capturing them to a file failed, see the log) ...\n\n",
-            elided
+            "\n\n... ({elided} bytes elided; capturing them to a file failed, see the log) ...\n\n"
         ),
     };
     format!(
@@ -1045,7 +1027,7 @@ fn signal_name(number: i32) -> String {
         libc::SIGSEGV => "SIGSEGV".to_string(),
         libc::SIGPIPE => "SIGPIPE".to_string(),
         libc::SIGTERM => "SIGTERM".to_string(),
-        other => format!("SIG{}", other),
+        other => format!("SIG{other}"),
     }
 }
 
@@ -1075,7 +1057,7 @@ fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOu
         result_text.push_str(stderr);
     }
     if exit_code != 0 {
-        result_text.push_str(&format!("\nExit code: {}", exit_code));
+        result_text.push_str(&format!("\nExit code: {exit_code}"));
     }
 
     ToolOutput::text(
@@ -1110,9 +1092,9 @@ fn assemble_command_output(stdout: &str, stderr: &str, exit_code: i32) -> ToolOu
 #[cfg(windows)]
 async fn run_windows_sandboxed(
     command: &str,
-    confinement: &crate::sandbox::windows_impl::WindowsConfinement,
+    confinement: &crate::sandbox::windows::WindowsConfinement,
     cwd: std::path::PathBuf,
-    timeout_ms: u64,
+    timeout: std::time::Duration,
     cancellation: CancellationToken,
     relay: Option<OutputRelay>,
 ) -> Result<ToolOutput> {
@@ -1124,7 +1106,7 @@ async fn run_windows_sandboxed(
     const POST_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
     let mut sandboxed =
-        crate::sandbox::windows_impl::spawn_sandboxed_command(command, confinement, &cwd).map_err(
+        crate::sandbox::windows::spawn_sandboxed_command(command, confinement, &cwd).map_err(
             |error| MekaError::ToolExecution {
                 tool_name: "execute_command".to_string(),
                 message: format!("failed to spawn sandboxed command: {}", error),
@@ -1135,8 +1117,6 @@ async fn run_windows_sandboxed(
     let stderr = sandboxed.take_stderr().map(tokio::fs::File::from_std);
 
     let child = Arc::new(sandboxed);
-    let timeout_duration = Duration::from_millis(timeout_ms);
-
     let stdout_task = tokio::spawn({
         let relay = relay.clone();
         async move { read_to_string_best_effort(stdout, relay).await }
@@ -1154,22 +1134,22 @@ async fn run_windows_sandboxed(
     tokio::select! {
         _ = cancellation.cancelled() => {
             if let Err(error) = child.kill() {
-                tracing::debug!("failed to kill sandboxed child: {}", error);
+                tracing::debug!("failed to kill sandboxed child: {error}");
             }
             abort_after_timeout(wait_handle, POST_KILL_TIMEOUT).await;
             abort_after_timeout(stdout_task, POST_KILL_TIMEOUT).await;
             abort_after_timeout(stderr_task, POST_KILL_TIMEOUT).await;
             Err(MekaError::Interrupted)
         }
-        _ = tokio::time::sleep(timeout_duration) => {
+        _ = tokio::time::sleep(timeout) => {
             if let Err(error) = child.kill() {
-                tracing::debug!("failed to kill sandboxed child: {}", error);
+                tracing::debug!("failed to kill sandboxed child: {error}");
             }
             abort_after_timeout(wait_handle, POST_KILL_TIMEOUT).await;
             abort_after_timeout(stdout_task, POST_KILL_TIMEOUT).await;
             abort_after_timeout(stderr_task, POST_KILL_TIMEOUT).await;
             Ok(ToolOutput::text(
-                format!("Command timed out after {}ms", timeout_ms),
+                format!("Command timed out after {}ms", timeout.as_millis()),
                 true,
             )
             .with_metadata(timed_out_exit_metadata()))
@@ -1192,10 +1172,8 @@ async fn run_windows_sandboxed(
                 join_drain_with_timeout(stderr_task, DRAIN_TIMEOUT).await;
             if stdout_timed_out || stderr_timed_out {
                 tracing::warn!(
-                    "sandboxed command output drain timed out after {:?}; \
-                     a background process may be holding the pipe open",
-                    DRAIN_TIMEOUT
-                );
+                    "sandboxed command output drain timed out after {DRAIN_TIMEOUT:?}; \
+                     a background process may be holding the pipe open");
             }
             let mut output =
                 assemble_command_output(&stdout_content, &stderr_content, exit_code);
@@ -1221,7 +1199,7 @@ async fn join_drain_with_timeout(
         result = &mut task => match result {
             Ok(content) => (content, false),
             Err(error) => {
-                tracing::debug!("drain task failed: {}", error);
+                tracing::debug!("drain task failed: {error}");
                 (String::new(), false)
             }
         },
@@ -1264,17 +1242,18 @@ fn append_drain_truncation_note(
         }
         (false, false) => return,
     };
-    if let Some(crate::provider::ToolResultContent::Text { text }) = output.content.last_mut() {
+    if let Some(crate::conversation::ToolResultContent::Text { text }) = output.content.last_mut() {
         text.push_str(note);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tools::tests::text_content;
+    use tokio_util::sync::CancellationToken;
 
-    fn test_shared_permission() -> crate::permission::SharedPermission {
+    use super::*;
+
+    fn shared_permission_for_test() -> crate::permission::SharedPermission {
         crate::permission::SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
@@ -1285,7 +1264,7 @@ mod tests {
     /// actually supports. Tests that need a specific probe state (e.g. exercising the "backend
     /// unavailable" hard-error path) should build `ExecuteCommandTool` directly with the desired
     /// `BackendProbe` rather than going through this helper.
-    pub(super) fn test_tool(
+    pub(super) fn tool_for_test(
         shared_permission: crate::permission::SharedPermission,
         sandbox_enabled: bool,
     ) -> ExecuteCommandTool {
@@ -1293,17 +1272,15 @@ mod tests {
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         ExecuteCommandTool {
             #[cfg(windows)]
-            windows_grants: std::sync::Arc::new(
-                crate::sandbox::windows_impl::WindowsGrants::default(),
-            ),
+            windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
             sandbox_capability,
             sandbox_backend: crate::config::SandboxBackend::Landlock,
             backend_probe,
-            shared_permission,
             sandbox_enabled,
-            cwd: crate::workspace::test_cwd(),
-            frontend: Arc::new(crate::frontend::SilentFrontend),
+            site: crate::session::ToolSite::for_test()
+                .with_permission(shared_permission)
+                .with_cwd(crate::workspace::cwd_for_test()),
         }
     }
 
@@ -1312,7 +1289,7 @@ mod tests {
     /// as two different failures.
     #[cfg(unix)]
     #[test]
-    fn test_signal_naming_is_consistent_between_a_real_kill_and_a_timeout() {
+    fn signal_naming_is_consistent_between_a_real_kill_and_a_timeout() {
         assert_eq!(signal_name(libc::SIGKILL), "SIGKILL");
         assert_eq!(signal_name(libc::SIGTERM), "SIGTERM");
         assert_eq!(
@@ -1341,12 +1318,12 @@ mod tests {
     /// reads, so a frontend rendering a terminal can show the real code instead of guessing from
     /// the error flag.
     #[tokio::test]
-    async fn test_execute_command_reports_its_exit_code_as_metadata() {
-        let tool = test_tool(test_shared_permission(), false);
+    async fn execute_command_reports_its_exit_code_as_metadata() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
         let result = tool
             .execute(
                 serde_json::json!({"command": "exit 42"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("tool runs");
@@ -1368,7 +1345,7 @@ mod tests {
     /// to wait for the read that completes it. Feeds the reader one byte at a time to force the
     /// split on every character.
     #[tokio::test]
-    async fn test_reader_relays_chunks_without_splitting_characters() {
+    async fn reader_relays_chunks_without_splitting_characters() {
         #[derive(Default)]
         struct ChunkRecorder {
             chunks: std::sync::Mutex<Vec<String>>,
@@ -1539,8 +1516,8 @@ mod tests {
     /// long builds accumulates one per overflow until the disk notices. The sweep runs on the
     /// overflow path, so it costs a directory read only when something is about to be written
     /// anyway, and it touches only meka's own names.
-    #[test]
-    fn stale_captures_are_swept_and_other_files_are_left_alone() {
+    #[tokio::test]
+    async fn stale_captures_are_swept_and_other_files_are_left_alone() {
         let directory = tempfile::tempdir().expect("tempdir");
         let old =
             std::time::SystemTime::now() - (CAPTURE_RETENTION + std::time::Duration::from_secs(60));
@@ -1556,7 +1533,7 @@ mod tests {
                 .expect("age the file");
         }
 
-        sweep_stale_captures(directory.path());
+        sweep_stale_captures(directory.path()).await;
 
         assert!(!stale.exists(), "an old capture must go");
         assert!(
@@ -1666,18 +1643,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_command() {
-        let tool = test_tool(test_shared_permission(), true);
+    async fn execute_command_runs_a_command_and_returns_its_output() {
+        let tool = tool_for_test(shared_permission_for_test(), true);
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo hello"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
         assert!(!result.is_error);
-        assert_eq!(text_content(&result).trim(), "hello");
+        assert_eq!(result.text_content().trim(), "hello");
     }
 
     /// Regression test for the orphaned-grandchild bug: a command that backgrounds a long-running
@@ -1686,50 +1663,46 @@ mod tests {
     /// the whole tree via `kill(-pgid, …)`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_execute_command_timeout_kills_grandchild() {
+    async fn execute_command_timeout_kills_grandchild() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let marker = temp_dir.path().join("marker");
         let marker_str = marker.to_str().expect("utf-8 path").to_string();
 
-        let tool = test_tool(test_shared_permission(), false);
+        let tool = tool_for_test(shared_permission_for_test(), false);
 
         // The grandchild sleeps 3s then touches `marker`. If it survived the timeout, the marker
         // file will appear. The timeout is 300ms and we wait 5s below for a definitive "did it
         // survive?" answer.
-        let script = format!(
-            "( sleep 3 && : > '{}' ) & echo backgrounded; sleep 30",
-            marker_str
-        );
+        let script = format!("( sleep 3 && : > '{marker_str}' ) & echo backgrounded; sleep 30");
         let result = tool
             .execute(
                 serde_json::json!({ "command": script, "timeout_ms": 300u64 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("execute should not error");
 
         // Tool reports timeout.
         assert!(result.is_error);
-        let text = text_content(&result);
-        assert!(text.contains("timed out"), "got: {:?}", text);
+        let text = result.text_content();
+        assert!(text.contains("timed out"), "got: {text:?}");
 
         // Wait well past the grandchild's sleep-3s. If the marker materializes, the grandchild
         // wasn't killed; the bug is back.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         assert!(
             !marker.exists(),
-            "grandchild survived timeout and created marker at {:?}",
-            marker
+            "grandchild survived timeout and created marker at {marker:?}"
         );
     }
 
     #[tokio::test]
-    async fn test_execute_command_failure() {
-        let tool = test_tool(test_shared_permission(), true);
+    async fn execute_command_failure() {
+        let tool = tool_for_test(shared_permission_for_test(), true);
         let result = tool
             .execute(
                 serde_json::json!({"command": "false"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -1750,10 +1723,10 @@ mod tests {
         // Every level that promises confinement, not just `workspace`.
         //
         // The guard is keyed on "any level that is not `ask` or `unrestricted`" precisely because
-        // narrowing it to `workspace` alone left a hole: `[tools.tool_permissions]
-        // execute_command = "read"` plus `[shell].sandbox = false` ran a plain `sh -c` at `read`,
-        // with the full parent environment since the scrub is gated on the same flag. This test
-        // only ever exercised `workspace`, so narrowing the guard back survived it.
+        // narrowing it to `workspace` alone left a hole: `[tools.tool_permissions] execute_command
+        // = "read"` plus `[shell].sandbox = false` ran a plain `sh -c` at `read`, with the full
+        // parent environment since the scrub is gated on the same flag. This test only ever
+        // exercised `workspace`, so narrowing the guard back survived it.
         for level in [Permission::None, Permission::Read, Permission::Workspace] {
             refuses_at(level).await;
         }
@@ -1766,22 +1739,22 @@ mod tests {
         );
         let tool = ExecuteCommandTool {
             #[cfg(windows)]
-            windows_grants: std::sync::Arc::clone(crate::sandbox::windows_impl::process_grants()),
+            windows_grants: std::sync::Arc::clone(crate::sandbox::windows::process_grants()),
             scope: crate::workspace::WriteScope::confined(vec![]),
             sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
             sandbox_backend: crate::config::SandboxBackend::Bubblewrap,
             backend_probe: crate::sandbox::BackendProbe::Missing {
                 reason: "sandbox disabled in config".to_string(),
             },
-            shared_permission: workspace_perm,
             sandbox_enabled: false,
-            cwd: crate::workspace::test_cwd(),
-            frontend: Arc::new(crate::frontend::SilentFrontend),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_permission(workspace_perm),
         };
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo nope"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         match result {
@@ -1789,8 +1762,7 @@ mod tests {
                 assert_eq!(tool_name, "execute_command");
                 assert!(
                     message.contains("[shell].sandbox = false"),
-                    "the refusal must name the key responsible: {}",
-                    message
+                    "the refusal must name the key responsible: {message}"
                 );
             }
             other => {
@@ -1799,36 +1771,34 @@ mod tests {
         }
     }
 
-    /// When the configured sandbox backend isn't usable, read-mode `execute_command` must return
+    /// When the configured sandbox backend isn't usable, `execute_command` at `read` must return
     /// `Err(MekaError::ToolExecution)`, *not* `Ok(ToolOutput { is_error: true })`. The hard error
     /// path is how the model is forced to surface the failure to the user rather than just retrying
     /// or describing it as a tool result.
     #[tokio::test]
-    async fn test_execute_command_hard_errors_when_backend_unavailable() {
+    async fn execute_command_hard_errors_when_backend_unavailable() {
         let read_only_perm = crate::permission::SharedPermission::new(
             Permission::Read,
             crate::permission::EnabledPermissions::ALL,
         );
         let tool = ExecuteCommandTool {
             #[cfg(windows)]
-            windows_grants: std::sync::Arc::new(
-                crate::sandbox::windows_impl::WindowsGrants::default(),
-            ),
+            windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
             sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
             sandbox_backend: crate::config::SandboxBackend::Bubblewrap,
             backend_probe: crate::sandbox::BackendProbe::Missing {
                 reason: "bwrap not found on PATH".to_string(),
             },
-            shared_permission: read_only_perm,
             sandbox_enabled: true,
-            cwd: crate::workspace::test_cwd(),
-            frontend: Arc::new(crate::frontend::SilentFrontend),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_permission(read_only_perm),
         };
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo nope"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         match result {
@@ -1841,17 +1811,15 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 assert!(
                     message.contains("Bubblewrap"),
-                    "expected backend display name in error: {}",
-                    message
+                    "expected backend display name in error: {message}"
                 );
                 assert!(
                     message.contains("bwrap not found on PATH"),
-                    "expected probe reason in error: {}",
-                    message
+                    "expected probe reason in error: {message}"
                 );
             }
-            Err(other) => panic!("expected ToolExecution, got {:?}", other),
-            Ok(output) => panic!("expected hard error, got Ok({:?})", text_content(&output)),
+            Err(other) => panic!("expected ToolExecution, got {other:?}"),
+            Ok(output) => panic!("expected hard error, got Ok({:?})", output.text_content()),
         }
     }
 
@@ -1860,43 +1828,41 @@ mod tests {
     /// `workspace` and `read` are the opposite case and are refused outright, which is what makes
     /// this arm worth pinning separately.
     #[tokio::test]
-    async fn test_execute_command_runs_without_sandbox_when_unrestricted() {
+    async fn execute_command_runs_without_sandbox_when_unrestricted() {
         let unrestricted_perm = crate::permission::SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
         let tool = ExecuteCommandTool {
             #[cfg(windows)]
-            windows_grants: std::sync::Arc::new(
-                crate::sandbox::windows_impl::WindowsGrants::default(),
-            ),
+            windows_grants: std::sync::Arc::new(crate::sandbox::windows::WindowsGrants::default()),
             scope: crate::workspace::WriteScope::unconfined(),
             sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
             sandbox_backend: crate::config::SandboxBackend::Bubblewrap,
             backend_probe: crate::sandbox::BackendProbe::Missing {
                 reason: "bwrap not found on PATH".to_string(),
             },
-            shared_permission: unrestricted_perm,
             sandbox_enabled: true,
-            cwd: crate::workspace::test_cwd(),
-            frontend: Arc::new(crate::frontend::SilentFrontend),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_permission(unrestricted_perm),
         };
         let result = tool
             .execute(
                 serde_json::json!({"command": "echo hello"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed at unrestricted");
         assert!(!result.is_error);
-        assert_eq!(text_content(&result).trim(), "hello");
+        assert_eq!(result.text_content().trim(), "hello");
     }
 
     #[tokio::test]
-    async fn test_execute_command_large_output_not_truncated() {
-        // Output well over the old 30 KB cap: the tool must return it in full. The agent layer
-        // handles oversize downstream.
-        let tool = test_tool(test_shared_permission(), true);
+    async fn execute_command_large_output_not_truncated() {
+        // Output well over any plausible inline cap: the tool must return it in full. The agent
+        // layer handles oversize downstream.
+        let tool = tool_for_test(shared_permission_for_test(), true);
         let result = tool
             .execute(
                 // 50 000 "x" characters, in each host shell's own vocabulary. The Unix spelling
@@ -1910,16 +1876,15 @@ mod tests {
                         "head -c 50000 /dev/zero | tr '\\0' x"
                     }
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             !text.contains("(output truncated"),
-            "no truncation marker expected, got: {:.200}...",
-            text
+            "no truncation marker expected, got: {text:.200}..."
         );
         assert!(
             text.trim().len() >= 50_000,
@@ -1935,25 +1900,24 @@ mod tests {
     /// output.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_execute_command_large_output_no_deadlock() {
-        let tool = test_tool(test_shared_permission(), true);
+    async fn execute_command_large_output_no_deadlock() {
+        let tool = tool_for_test(shared_permission_for_test(), true);
         // 5 MiB of 'x', two orders of magnitude past any pipe buffer.
         let result = tool
             .execute(
                 serde_json::json!({
                     "command": "head -c 5242880 /dev/zero | tr '\\0' x"
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
         assert!(!result.is_error, "large output spuriously flagged as error");
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             !text.contains("drain timed out"),
-            "unexpected drain-timeout note: {:.200}",
-            text
+            "unexpected drain-timeout note: {text:.200}"
         );
         assert!(
             text.trim().len() >= 5_242_880,
@@ -1999,7 +1963,7 @@ mod tests {
         }
 
         /// Build an `ExecuteCommandTool` for the Low-integrity Windows path. Mirrors
-        /// `super::test_tool` (which always calls `sandbox::detect()` and would resolve to
+        /// `super::tool_for_test` (which always calls `sandbox::detect()` and would resolve to
         /// `LowIntegrity` on Windows anyway) but constructs the fields explicitly so the tests
         /// document the intended state.
         fn windows_test_tool(
@@ -2010,7 +1974,7 @@ mod tests {
             ExecuteCommandTool {
                 scope: crate::workspace::WriteScope::unconfined(),
                 windows_grants: std::sync::Arc::new(
-                    crate::sandbox::windows_impl::WindowsGrants::default(),
+                    crate::sandbox::windows::WindowsGrants::default(),
                 ),
                 sandbox_capability,
                 // `sandbox_backend` is Linux-only metadata; on Windows the value is never read but
@@ -2019,14 +1983,14 @@ mod tests {
                 backend_probe,
                 shared_permission,
                 sandbox_enabled: true,
-                cwd: crate::workspace::test_cwd(),
+                cwd: crate::workspace::cwd_for_test(),
                 frontend: Arc::new(crate::frontend::SilentFrontend),
             }
         }
 
         /// The `workspace` restricted-token path, end to end, on real Windows.
         ///
-        /// This is the whole Windows half of the mode and nothing in the suite reached it: the two
+        /// This is the whole Windows half of the level and nothing in the suite reached it: the two
         /// tests below drive the Low-integrity path, which is a different token, a different set of
         /// spawn flags, and no ACE at all. Everything specific to `workspace` -- the
         /// `WRITE_RESTRICTED` token, the synthesized capability SID, the inheritable ACE, the
@@ -2048,7 +2012,7 @@ mod tests {
                 Permission::Workspace,
                 crate::permission::EnabledPermissions::ALL,
             ));
-            tool.cwd = std::sync::Arc::new(std::sync::RwLock::new(work.clone()));
+            tool.cwd = crate::workspace::SharedCwd::new(work.clone());
             tool.scope = crate::workspace::WriteScope::confined(vec![work.clone()]);
 
             let result = tool
@@ -2199,7 +2163,7 @@ mod tests {
                     permission,
                     crate::permission::EnabledPermissions::ALL,
                 ));
-                tool.cwd = std::sync::Arc::new(std::sync::RwLock::new(work.clone()));
+                tool.cwd = crate::workspace::SharedCwd::new(work.clone());
                 tool.scope = crate::workspace::WriteScope::confined(vec![work.clone()]);
 
                 let result = tool
@@ -2245,7 +2209,7 @@ mod tests {
         /// Under Low integrity, writing to the user's profile directory must be denied by the OS.
         /// The test probes a path under `%USERPROFILE%` and asserts the file is never created.
         #[tokio::test]
-        async fn test_windows_sandbox_blocks_write_to_userprofile() {
+        async fn windows_sandbox_blocks_write_to_userprofile() {
             let probe_path = format!(
                 "{}\\meka-sandbox-probe.txt",
                 std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows")
@@ -2279,7 +2243,7 @@ mod tests {
         /// the child would block in `WriteFile` past the buffer, the wait would never return, and
         /// the tool would report a spurious timeout.
         #[tokio::test]
-        async fn test_windows_sandbox_large_output_under_sandbox() {
+        async fn windows_sandbox_large_output_under_sandbox() {
             let tool = windows_test_tool(read_permission());
             // PowerShell builds a 262144-char string in memory then emits it as one line. Total
             // output is ~256 KB, well past any plausible pipe buffer.
@@ -2298,7 +2262,7 @@ mod tests {
                 !result.is_error,
                 "large-output command should not be flagged as an error"
             );
-            let text = text_content(&result);
+            let text = result.text_content();
             let x_count = text.matches('x').count();
             assert!(
                 x_count >= 262144,
@@ -2312,7 +2276,7 @@ mod tests {
         /// zero objects. The command must complete promptly rather than hanging on a dangling
         /// stdin.
         #[tokio::test]
-        async fn test_windows_sandbox_stdin_is_null() {
+        async fn windows_sandbox_stdin_is_null() {
             let tool = windows_test_tool(read_permission());
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -2329,7 +2293,7 @@ mod tests {
             .expect("execute should not error");
 
             assert!(!result.is_error);
-            let text = text_content(&result);
+            let text = result.text_content();
             assert!(
                 text.trim().starts_with('0'),
                 "expected stdin-object count of 0, got {:?}",
@@ -2342,7 +2306,7 @@ mod tests {
         /// single-quote literals internally so the test exercises our command-line encoding, not PS
         /// string rules.
         #[tokio::test]
-        async fn test_windows_sandbox_quoting_roundtrip() {
+        async fn windows_sandbox_quoting_roundtrip() {
             let tool = windows_test_tool(read_permission());
 
             let cases: &[&str] = &[
@@ -2364,7 +2328,7 @@ mod tests {
                     .await
                     .expect("execute should not error");
                 assert!(!result.is_error, "command for marker {:?} errored", marker);
-                let text = text_content(&result);
+                let text = result.text_content();
                 assert!(
                     text.contains(marker),
                     "marker {:?} missing from output {:?}",
@@ -2378,7 +2342,7 @@ mod tests {
         /// keys, OAuth tokens) must not appear in the sandboxed child's environment, because a
         /// Low-integrity child can still open outbound sockets and exfiltrate them.
         #[tokio::test]
-        async fn test_windows_sandbox_scrubs_provider_api_keys() {
+        async fn windows_sandbox_scrubs_provider_api_keys() {
             // SAFETY: tests run under `cargo test`, which is single-threaded per target by default
             // for integration tests, and this env var is scoped to the test's probe command.
             // Acceptable for a test.
@@ -2402,7 +2366,7 @@ mod tests {
                 std::env::remove_var("ANTHROPIC_API_KEY");
             }
 
-            let text = text_content(&result);
+            let text = result.text_content();
             assert!(
                 !text.contains("probe-12345-leaked"),
                 "parent API key leaked into sandboxed child env: {:?}",
@@ -2413,7 +2377,7 @@ mod tests {
         /// Reads must still succeed under Low integrity. The hosts file is readable by Everyone on
         /// stock Windows, so it's a good probe.
         #[tokio::test]
-        async fn test_windows_sandbox_allows_read() {
+        async fn windows_sandbox_allows_read() {
             let tool = windows_test_tool(read_permission());
             let result = tool
                 .execute(
@@ -2431,401 +2395,492 @@ mod tests {
             );
         }
     }
-}
 
-/// The Bubblewrap workspace binding, exercised against a real `bwrap`.
-///
-/// The Landlock dialect had a live confinement test and Bubblewrap had none, which left the
-/// ordering rule in `bwrap_args` unguarded: bind before the tmpfs masks and every workspace under
-/// `/tmp` silently comes out read-only, with bwrap reporting success. Both halves are checked here,
-/// the order in the argument list and the outcome on disk, because the first is what a future edit
-/// would break and the second is what a user would feel.
-#[cfg(all(test, target_os = "linux"))]
-mod bubblewrap_boundary {
-    use std::path::PathBuf;
-
-    /// The level `execute_command` needs depends on whether a sandbox can actually confine it.
+    /// The Bubblewrap workspace binding, exercised against a real `bwrap`.
     ///
-    /// `read` only when the sandbox is both enabled *and* backed by a working backend; otherwise
-    /// `unrestricted`, because a command meka cannot confine is a command only the boundary-free
-    /// level may authorise. The conjunction is the whole rule and flipping it to `||` survived the
-    /// suite: the tool would be offered at `read` with `[shell].sandbox = false`, or with the
-    /// sandbox on but no usable backend. The runtime guard in `execute` still refuses the command
-    /// in both cases, so this is a wrong catalogue entry rather than an escape -- but the catalogue
-    /// is what the model plans against.
-    #[test]
-    fn the_shell_needs_unrestricted_whenever_nothing_can_confine_it() {
-        use crate::{permission::Permission, sandbox::SandboxCapability, tools::Tool};
+    /// The Landlock dialect had a live confinement test and Bubblewrap had none, which left the
+    /// ordering rule in `bwrap_args` unguarded: bind before the tmpfs masks and every workspace
+    /// under `/tmp` silently comes out read-only, with bwrap reporting success. Both halves are
+    /// checked here, the order in the argument list and the outcome on disk, because the first
+    /// is what a future edit would break and the second is what a user would feel.
+    #[cfg(target_os = "linux")]
+    mod bubblewrap_boundary {
+        use std::path::PathBuf;
 
-        let check = |sandbox_enabled: bool, capability: SandboxCapability, expected: Permission| {
-            let mut tool = super::tests::test_tool(
-                crate::permission::SharedPermission::new(
-                    Permission::Read,
-                    crate::permission::EnabledPermissions::ALL,
-                ),
-                sandbox_enabled,
+        /// The level `execute_command` needs depends on whether a sandbox can actually confine it.
+        ///
+        /// `read` only when the sandbox is both enabled *and* backed by a working backend;
+        /// otherwise `unrestricted`, because a command meka cannot confine is a command only the
+        /// boundary-free level may authorize. The conjunction is the whole rule and flipping it to
+        /// `||` survived the suite: the tool would be offered at `read` with `[shell].sandbox =
+        /// false`, or with the sandbox on but no usable backend. The runtime guard in `execute`
+        /// still refuses the command in both cases, so this is a wrong catalog entry rather than an
+        /// escape -- but the catalog is what the model plans against.
+        #[test]
+        fn the_shell_needs_unrestricted_whenever_nothing_can_confine_it() {
+            use crate::{permission::Permission, sandbox::SandboxCapability, tools::Tool};
+
+            let check =
+                |sandbox_enabled: bool, capability: SandboxCapability, expected: Permission| {
+                    let mut tool = super::tool_for_test(
+                        crate::permission::SharedPermission::new(
+                            Permission::Read,
+                            crate::permission::EnabledPermissions::ALL,
+                        ),
+                        sandbox_enabled,
+                    );
+                    tool.sandbox_capability = capability.clone();
+                    assert_eq!(
+                        tool.required_permission(),
+                        expected,
+                        "sandbox_enabled={sandbox_enabled}, capability={capability:?}"
+                    );
+                };
+
+            // Nothing can confine: either meka was told not to, or the host offers no backend.
+            check(
+                true,
+                SandboxCapability::Unavailable,
+                Permission::Unrestricted,
             );
-            tool.sandbox_capability = capability.clone();
-            assert_eq!(
-                tool.required_permission(),
-                expected,
-                "sandbox_enabled={sandbox_enabled}, capability={capability:?}"
+            check(
+                false,
+                SandboxCapability::Unavailable,
+                Permission::Unrestricted,
             );
-        };
 
-        // Nothing can confine: either meka was told not to, or the host offers no backend.
-        check(
-            true,
-            SandboxCapability::Unavailable,
-            Permission::Unrestricted,
-        );
-        check(
-            false,
-            SandboxCapability::Unavailable,
-            Permission::Unrestricted,
-        );
-
-        // Which backend is available does not enter the rule, and the variants are per-platform, so
-        // the positive leg uses whatever this host actually has. Skipped rather than faked where
-        // there is none: an invented variant would assert against a state meka cannot reach here.
-        let available = crate::sandbox::detect();
-        if matches!(available, SandboxCapability::Unavailable) {
-            eprintln!("skipping the confined leg: no sandbox backend on this host");
-            return;
+            // Which backend is available does not enter the rule, and the variants are
+            // per-platform, so the positive leg uses whatever this host actually has.
+            // Skipped rather than faked where there is none: an invented variant would
+            // assert against a state meka cannot reach here.
+            let available = crate::sandbox::detect();
+            if matches!(available, SandboxCapability::Unavailable) {
+                eprintln!("skipping the confined leg: no sandbox backend on this host");
+                return;
+            }
+            check(true, available.clone(), Permission::Read);
+            check(false, available, Permission::Unrestricted);
         }
-        check(true, available.clone(), Permission::Read);
-        check(false, available, Permission::Unrestricted);
-    }
 
-    /// A cwd that *is* a masked directory must not be bound back over its own mask.
-    ///
-    /// The cwd bind and the tmpfs masks obey the same rule -- last mount wins -- so the fix that
-    /// made a masked-directory session usable also handed it the host directory. Measured against
-    /// real bwrap before the guard: a session at `/tmp` saw 1330 host entries instead of 0 and
-    /// could `connect()` the tmux socket, one at `$XDG_RUNTIME_DIR` reached the session bus, and
-    /// one at `/` saw 455 host PIDs instead of 4, which defeats `--unshare-pid` as well. A
-    /// read-only bind does not help, because `connect(2)` on a socket inode is not a write.
-    ///
-    /// `/` is in the table because it is systemd's default working directory for a daemon, so `meka
-    /// serve` under a unit file lands there without anyone choosing it.
-    ///
-    /// The counterpart is `the_child_is_given_a_working_directory_it_can_reach`: a path merely
-    /// *under* a mask still needs its bind, and still gets one.
-    #[test]
-    fn a_masked_working_directory_is_not_bound_back_over_its_own_mask() {
-        let masked = [
-            std::path::PathBuf::from("/tmp"),
-            std::path::PathBuf::from("/var/tmp"),
-            std::path::PathBuf::from("/run"),
-            std::path::PathBuf::from("/"),
-        ];
-        for cwd in masked {
-            let text: Vec<String> = super::bwrap_args(&[], &cwd)
+        /// A cwd that *is* a masked directory must not be bound back over its own mask.
+        ///
+        /// The cwd bind and the tmpfs masks obey the same rule -- last mount wins -- so the fix
+        /// that made a masked-directory session usable also handed it the host directory. Measured
+        /// against real bwrap before the guard: a session at `/tmp` saw 1330 host entries instead
+        /// of 0 and could `connect()` the tmux socket, one at `$XDG_RUNTIME_DIR` reached the
+        /// session bus, and one at `/` saw 455 host PIDs instead of 4, which defeats
+        /// `--unshare-pid` as well. A read-only bind does not help, because `connect(2)` on a
+        /// socket inode is not a write.
+        ///
+        /// `/` is in the table because it is systemd's default working directory for a daemon, so
+        /// `meka serve` under a unit file lands there without anyone choosing it.
+        ///
+        /// The counterpart is `the_child_is_given_a_working_directory_it_can_reach`: a path merely
+        /// *under* a mask still needs its bind, and still gets one.
+        #[test]
+        fn a_masked_working_directory_is_not_bound_back_over_its_own_mask() {
+            let masked = [
+                std::path::PathBuf::from("/tmp"),
+                std::path::PathBuf::from("/var/tmp"),
+                std::path::PathBuf::from("/run"),
+                std::path::PathBuf::from("/"),
+            ];
+            for cwd in masked {
+                let text: Vec<String> = super::bwrap_args(&[], &cwd, &[])
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+
+                // The bind is what undoes the mask, so its absence is the property. Checked as an
+                // adjacent pair rather than by searching for the path alone, because `/tmp` also
+                // appears as a `--tmpfs` operand and `/` as the `--ro-bind / /` operand.
+                let rebound = text.windows(3).any(|window| {
+                    window[0] == "--ro-bind-try"
+                        && window[1] == cwd.to_string_lossy()
+                        && window[2] == cwd.to_string_lossy()
+                });
+                assert!(
+                    !rebound,
+                    "binding {} back over its own mask restores the host directory the mask hides, \
+                     which is the sandbox escape `is_system_root` exists to prevent: {text:?}",
+                    cwd.display()
+                );
+
+                // And the child still has somewhere to stand: the mask leaves an empty tmpfs at
+                // that path, so `--chdir` succeeds and nothing is silently relocated to `$HOME`.
+                let chdir = text
+                    .iter()
+                    .position(|arg| arg == "--chdir")
+                    .expect("the cwd must still be requested explicitly");
+                assert_eq!(
+                    text.get(chdir + 1).map(String::as_str),
+                    Some(cwd.to_string_lossy().as_ref()),
+                    "the masked cwd is still where the child starts"
+                );
+            }
+        }
+
+        /// The child is told which directory to start in, and can read it.
+        ///
+        /// bwrap's fallback when it cannot enter the pre-`execve` cwd is silent and lands the child
+        /// in `$HOME`. Confirmed against real bwrap with a cwd under `/tmp`: without these
+        /// two arguments `pwd` reported the user's home directory and the workspace was
+        /// unreachable even by absolute path, with exit 0 and empty stderr; with them `pwd`
+        /// is correct, the file reads, and a write is still refused read-only at `read`.
+        ///
+        /// The bind sits after the masks and before the writable binds, so a cwd under `/tmp` is
+        /// restored, and a cwd that is also a writable root is upgraded to read-write by the loop
+        /// that follows -- last mount wins.
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn the_child_is_given_a_working_directory_it_can_reach() {
+            let cwd = PathBuf::from("/tmp/session-cwd");
+            let args = super::bwrap_args(&[], &cwd, &[]);
+            let text: Vec<String> = args
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
 
-            // The bind is what undoes the mask, so its absence is the property. Checked as an
-            // adjacent pair rather than by searching for the path alone, because `/tmp` also
-            // appears as a `--tmpfs` operand and `/` as the `--ro-bind / /` operand.
-            let rebound = text.windows(3).any(|window| {
-                window[0] == "--ro-bind-try"
-                    && window[1] == cwd.to_string_lossy()
-                    && window[2] == cwd.to_string_lossy()
-            });
+            let chdir = text.iter().position(|arg| arg == "--chdir");
             assert!(
-                !rebound,
-                "binding {} back over its own mask restores the host directory the mask hides, \
-                 which is the sandbox escape `is_system_root` exists to prevent: {text:?}",
-                cwd.display()
+                chdir.is_some(),
+                "the cwd must be requested explicitly: {text:?}"
+            );
+            assert_eq!(
+                text.get(chdir.expect("checked above") + 1)
+                    .map(String::as_str),
+                Some("/tmp/session-cwd")
             );
 
-            // And the child still has somewhere to stand: the mask leaves an empty tmpfs at that
-            // path, so `--chdir` succeeds and nothing is silently relocated to `$HOME`.
-            let chdir = text
+            let bind = text
+                .iter()
+                .position(|arg| arg == "--ro-bind-try")
+                .expect("the cwd must be bound back in, or `read` cannot see it");
+            let last_mask = text
+                .iter()
+                .rposition(|arg| arg == "--tmpfs")
+                .expect("the masks are always present");
+            assert!(
+                bind > last_mask,
+                "a cwd bound before the masks is undone by them: {text:?}"
+            );
+
+            // A cwd that is also a writable root ends up read-write, because the rw bind comes
+            // later.
+            let rw = super::bwrap_args(std::slice::from_ref(&cwd), &cwd, &[]);
+            let rw: Vec<String> = rw
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            let ro_at = rw.iter().position(|arg| arg == "--ro-bind-try");
+            let rw_at = rw.iter().position(|arg| arg == "--bind-try");
+            assert!(
+                ro_at < rw_at,
+                "the writable bind must win over the read-only one: {rw:?}"
+            );
+        }
+
+        #[test]
+        fn every_workspace_bind_comes_after_every_mask() {
+            let args = super::bwrap_args(
+                &[PathBuf::from("/tmp/work")],
+                std::path::Path::new("/tmp/work"),
+                &[],
+            );
+            let last_mask = args
+                .iter()
+                .rposition(|arg| arg == "--tmpfs")
+                .expect("the masks are part of the recipe");
+            let bind = args
+                .iter()
+                .position(|arg| arg == "--bind-try")
+                .expect("the workspace root is bound");
+            assert!(
+                bind > last_mask,
+                "a bind before a mask is undone by it, silently: {args:?}"
+            );
+        }
+
+        #[test]
+        fn a_bubblewrapped_shell_writes_inside_the_root_and_is_refused_outside() {
+            let Some(bwrap) = which_bwrap() else {
+                // Not `#[ignore]`: this must run wherever bwrap exists, and skipping loudly beats a
+                // test that silently never runs on the machines that have the backend.
+                eprintln!("skipping: bwrap is not on PATH");
+                return;
+            };
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let base = crate::workspace::canonical_for_test(temp.path());
+            let work = base.join("work");
+            std::fs::create_dir(&work).expect("work");
+
+            // The "outside" target lives in `$HOME`, not beside the workspace.
+            //
+            // A sibling under the tempdir is itself under `/tmp`, which the recipe masks with a
+            // tmpfs, so a write there fails with ENOENT -- the directory does not exist inside the
+            // namespace at all. That is not the boundary refusing anything, and it would keep
+            // passing with the boundary removed. `$HOME` is present and writable outside the
+            // sandbox, so a refusal there is the ruleset's doing.
+            let outside = crate::workspace::canonical_for_test(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+            )
+            .join(format!("meka-bwrap-probe-{}", uuid::Uuid::new_v4()));
+            assert!(!outside.exists(), "the probe target must start absent");
+
+            // `base` is under `/tmp` on virtually every machine, so this is also the regression:
+            // the root has to survive the `--tmpfs /tmp` that the recipe applies before
+            // binding it.
+            let script = format!(
+                "echo in > {}/inside.txt 2>/dev/null || exit 3\n\
+                 if echo out > {} 2>/dev/null; then exit 4; fi\n\
+                 exit 0",
+                work.display(),
+                outside.display()
+            );
+
+            let status = std::process::Command::new(bwrap)
+                .args(super::bwrap_args(std::slice::from_ref(&work), &work, &[]))
+                .arg("--")
+                .arg("sh")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("spawn bwrap");
+
+            match status.code() {
+                Some(0) => {}
+                Some(3) => panic!("the write inside the workspace root was refused"),
+                Some(4) => panic!("the write outside every root was permitted"),
+                other => panic!("bwrap did not run the command: exit {other:?}"),
+            }
+            // The bytes are visible outside the namespace, which is what makes the bind a bind
+            // rather than a tmpfs the child happened to be able to write.
+            assert_eq!(
+                std::fs::read_to_string(work.join("inside.txt")).expect("read back"),
+                "in\n"
+            );
+            assert!(
+                !outside.exists(),
+                "the write outside every root must not have landed in $HOME: {}",
+                outside.display()
+            );
+            let _ = std::fs::remove_file(&outside);
+        }
+
+        /// The masks over meka's own directories come after every bind, so a writable root that
+        /// contains the store does not hand it back: later mounts win.
+        #[test]
+        fn meka_s_own_directories_are_masked_after_every_writable_bind() {
+            let root = std::path::PathBuf::from("/home/someone");
+            let store = root.join(".local/share/meka");
+            let text: Vec<String> = super::bwrap_args(
+                std::slice::from_ref(&root),
+                &root,
+                std::slice::from_ref(&store),
+            )
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+            let bind_at = text
+                .windows(3)
+                .position(|window| {
+                    window[0] == "--bind-try"
+                        && window[1] == root.to_string_lossy()
+                        && window[2] == root.to_string_lossy()
+                })
+                .expect("the root is bound writable");
+            let mask_at = text
+                .windows(2)
+                .position(|window| window[0] == "--tmpfs" && window[1] == store.to_string_lossy())
+                .expect("the store is masked");
+            let chdir_at = text
                 .iter()
                 .position(|arg| arg == "--chdir")
-                .expect("the cwd must still be requested explicitly");
-            assert_eq!(
-                text.get(chdir + 1).map(String::as_str),
-                Some(cwd.to_string_lossy().as_ref()),
-                "the masked cwd is still where the child starts"
+                .expect("the working directory is entered last");
+            assert!(
+                bind_at < mask_at && mask_at < chdir_at,
+                "the mask must come after the bind it has to beat and before the chdir: {text:?}"
             );
         }
-    }
 
-    /// The child is told which directory to start in, and can read it.
-    ///
-    /// bwrap's fallback when it cannot enter the pre-`execve` cwd is silent and lands the child in
-    /// `$HOME`. Confirmed against real bwrap with a cwd under `/tmp`: without these two arguments
-    /// `pwd` reported the user's home directory and the workspace was unreachable even by absolute
-    /// path, with exit 0 and empty stderr; with them `pwd` is correct, the file reads, and a write
-    /// is still refused read-only at `read`.
-    ///
-    /// The bind sits after the masks and before the writable binds, so a cwd under `/tmp` is
-    /// restored, and a cwd that is also a writable root is upgraded to read-write by the loop that
-    /// follows -- last mount wins.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn the_child_is_given_a_working_directory_it_can_reach() {
-        let cwd = PathBuf::from("/tmp/session-cwd");
-        let args = super::bwrap_args(&[], &cwd);
-        let text: Vec<String> = args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        /// The store stays hidden under a writable root that contains it, on real bubblewrap.
+        #[test]
+        fn a_confined_shell_cannot_read_meka_s_store_under_a_writable_root() {
+            let Some(bwrap) = which_bwrap() else {
+                eprintln!("bwrap not installed; skipping");
+                return;
+            };
+            let temp = tempfile::tempdir().expect("tempdir");
+            let root = crate::workspace::canonical_for_test(temp.path());
+            let store = root.join("meka-store");
+            std::fs::create_dir(&store).expect("store");
+            std::fs::write(store.join("meka.db"), "secret").expect("seed the store");
+            let work = root.join("work");
+            std::fs::create_dir(&work).expect("work");
 
-        let chdir = text.iter().position(|arg| arg == "--chdir");
-        assert!(
-            chdir.is_some(),
-            "the cwd must be requested explicitly: {text:?}"
-        );
-        assert_eq!(
-            text.get(chdir.expect("checked above") + 1)
-                .map(String::as_str),
-            Some("/tmp/session-cwd")
-        );
-
-        let bind = text
-            .iter()
-            .position(|arg| arg == "--ro-bind-try")
-            .expect("the cwd must be bound back in, or read mode cannot see it");
-        let last_mask = text
-            .iter()
-            .rposition(|arg| arg == "--tmpfs")
-            .expect("the masks are always present");
-        assert!(
-            bind > last_mask,
-            "a cwd bound before the masks is undone by them: {text:?}"
-        );
-
-        // A cwd that is also a writable root ends up read-write, because the rw bind comes later.
-        let rw = super::bwrap_args(std::slice::from_ref(&cwd), &cwd);
-        let rw: Vec<String> = rw
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        let ro_at = rw.iter().position(|arg| arg == "--ro-bind-try");
-        let rw_at = rw.iter().position(|arg| arg == "--bind-try");
-        assert!(
-            ro_at < rw_at,
-            "the writable bind must win over the read-only one: {rw:?}"
-        );
-    }
-
-    #[test]
-    fn every_workspace_bind_comes_after_every_mask() {
-        let args = super::bwrap_args(
-            &[PathBuf::from("/tmp/work")],
-            std::path::Path::new("/tmp/work"),
-        );
-        let last_mask = args
-            .iter()
-            .rposition(|arg| arg == "--tmpfs")
-            .expect("the masks are part of the recipe");
-        let bind = args
-            .iter()
-            .position(|arg| arg == "--bind-try")
-            .expect("the workspace root is bound");
-        assert!(
-            bind > last_mask,
-            "a bind before a mask is undone by it, silently: {args:?}"
-        );
-    }
-
-    #[test]
-    fn a_bubblewrapped_shell_writes_inside_the_root_and_is_refused_outside() {
-        let Some(bwrap) = which_bwrap() else {
-            // Not `#[ignore]`: this must run wherever bwrap exists, and skipping loudly beats a
-            // test that silently never runs on the machines that have the backend.
-            eprintln!("skipping: bwrap is not on PATH");
-            return;
-        };
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let base = crate::workspace::canonical_for_test(temp.path());
-        let work = base.join("work");
-        std::fs::create_dir(&work).expect("work");
-
-        // The "outside" target lives in `$HOME`, not beside the workspace.
-        //
-        // A sibling under the tempdir is itself under `/tmp`, which the recipe masks with a tmpfs,
-        // so a write there fails with ENOENT -- the directory does not exist inside the namespace
-        // at all. That is not the boundary refusing anything, and it would keep passing with the
-        // boundary removed. `$HOME` is present and writable outside the sandbox, so a refusal there
-        // is the ruleset's doing.
-        let outside = crate::workspace::canonical_for_test(
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir),
-        )
-        .join(format!("meka-bwrap-probe-{}", uuid::Uuid::new_v4()));
-        assert!(!outside.exists(), "the probe target must start absent");
-
-        // `base` is under `/tmp` on virtually every machine, so this is also the regression: the
-        // root has to survive the `--tmpfs /tmp` that the recipe applies before binding it.
-        let script = format!(
-            "echo in > {}/inside.txt 2>/dev/null || exit 3\n\
-             if echo out > {} 2>/dev/null; then exit 4; fi\n\
-             exit 0",
-            work.display(),
-            outside.display()
-        );
-
-        let status = std::process::Command::new(bwrap)
-            .args(super::bwrap_args(std::slice::from_ref(&work), &work))
-            .arg("--")
-            .arg("sh")
-            .arg("-c")
-            .arg(&script)
-            .status()
-            .expect("spawn bwrap");
-
-        match status.code() {
-            Some(0) => {}
-            Some(3) => panic!("the write inside the workspace root was refused"),
-            Some(4) => panic!("the write outside every root was permitted"),
-            other => panic!("bwrap did not run the command: exit {other:?}"),
-        }
-        // The bytes are visible outside the namespace, which is what makes the bind a bind rather
-        // than a tmpfs the child happened to be able to write.
-        assert_eq!(
-            std::fs::read_to_string(work.join("inside.txt")).expect("read back"),
-            "in\n"
-        );
-        assert!(
-            !outside.exists(),
-            "the write outside every root must not have landed in $HOME: {}",
-            outside.display()
-        );
-        let _ = std::fs::remove_file(&outside);
-    }
-
-    fn which_bwrap() -> Option<std::path::PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("bwrap"))
-            .find(|candidate| candidate.is_file())
-    }
-}
-
-/// `execute_command` at `workspace`, end to end, on a real Unix sandbox.
-///
-/// The Linux dialects are each tested through their *helpers* (`bwrap_args`, `apply_landlock`) with
-/// a hand-built root list, so nothing exercised the wire between `Confinement` and the backend.
-/// Cutting it -- `bwrap_args(&[])` and `apply_landlock(abi, &[])` -- left the whole suite green
-/// while making the workspace shell silently read-only, which is the mode's central promise. The
-/// only end-to-end test of this path was `#[cfg(windows)]`.
-#[cfg(all(test, unix))]
-mod workspace_shell_boundary {
-    use std::sync::Arc;
-
-    use tokio_util::sync::CancellationToken;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn a_workspace_shell_writes_inside_the_root_and_is_refused_outside() {
-        // Every backend this host can actually run, not just the one `detect()` names.
-        //
-        // `detect()` on Linux only consults `probe_landlock`, so it never returns `Bubblewrap` --
-        // while production resolves the backend through `resolve_sandbox_backend`, which
-        // auto-prefers Bubblewrap whenever `bwrap` probes OK. Testing only what `detect()` returns
-        // therefore left `Confinement::writable() -> bwrap_args` unexercised end to end on the
-        // backend most hosts actually use: the argv could be cut entirely and this stayed green.
-        let mut backends = Vec::new();
-        let detected = crate::sandbox::detect();
-        if !matches!(detected, crate::sandbox::SandboxCapability::Unavailable) {
-            backends.push(detected);
-        }
-        backends.extend(a_backend_detect_does_not_name());
-        // Skip rather than fail where no backend exists: this asserts what confinement does, and a
-        // host without one has nothing to assert against. Loud, so it cannot silently never run.
-        if backends.is_empty() {
-            eprintln!("skipping: no usable sandbox backend on this host");
-            return;
+            let script = format!(
+                "if cat {}/meka.db >/dev/null 2>&1; then exit 4; fi\n\
+                 echo ok > {}/inside.txt 2>/dev/null || exit 3\n\
+                 exit 0",
+                store.display(),
+                work.display()
+            );
+            let status = std::process::Command::new(bwrap)
+                .args(super::bwrap_args(
+                    std::slice::from_ref(&root),
+                    &work,
+                    std::slice::from_ref(&store),
+                ))
+                .arg("--")
+                .arg("sh")
+                .arg("-c")
+                .arg(&script)
+                .status()
+                .expect("spawn bwrap");
+            match status.code() {
+                Some(0) => {}
+                Some(4) => panic!("the store was readable inside a root that contains it"),
+                Some(3) => panic!("the write inside the workspace root was refused"),
+                other => panic!("bwrap did not run the command: exit {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_to_string(work.join("inside.txt")).expect("read back"),
+                "ok\n"
+            );
         }
 
-        for capability in backends {
-            eprintln!("workspace boundary against {:?}", capability);
-            a_workspace_shell_boundary_holds_for(capability).await;
+        fn which_bwrap() -> Option<std::path::PathBuf> {
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("bwrap"))
+                .find(|candidate| candidate.is_file())
         }
     }
 
-    /// A backend production would choose that [`crate::sandbox::detect`] does not name.
+    /// `execute_command` at `workspace`, end to end, on a real Unix sandbox.
     ///
-    /// Linux only. `detect()` there consults `probe_landlock` alone, so it never returns
-    /// `Bubblewrap`, while production resolves through `resolve_sandbox_backend`, which
-    /// auto-prefers Bubblewrap whenever `bwrap` probes OK.
-    ///
-    /// Split behind a `cfg` rather than pushed inline because `SandboxCapability::Bubblewrap` is
-    /// itself `cfg(target_os = "linux")`: this module is `cfg(all(test, unix))`, so naming the
-    /// variant unconditionally compiled here and failed the macOS build with `E0599`, which no
-    /// amount of local Linux testing could have shown.
-    #[cfg(target_os = "linux")]
-    fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
-        // Deliberately not `sandbox::bwrap_on_path`, which demands a root-owned binary: this only
-        // answers "can this test spawn it", and a developer with a local build in `~/.local/bin`
-        // should still get the leg run rather than silently skipped.
-        let path = std::env::var_os("PATH")?;
-        let bwrap_path = std::env::split_paths(&path)
-            .map(|dir| dir.join("bwrap"))
-            .find(|candidate| candidate.is_file())?;
-        Some(crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path })
-    }
+    /// The Linux dialects are each tested through their *helpers* (`bwrap_args`, `apply_landlock`)
+    /// with a hand-built root list, so nothing exercised the wire between `Confinement` and the
+    /// backend. Cutting it -- `bwrap_args(&[])` and `apply_landlock(abi, &[])` -- left the
+    /// whole suite green while making the workspace shell silently read-only, which is the
+    /// level's central promise. The only end-to-end test of this path was `#[cfg(windows)]`.
+    #[cfg(unix)]
+    mod workspace_shell_boundary {
 
-    /// macOS has one read-mode backend and `detect()` names it, so there is nothing to add.
-    #[cfg(not(target_os = "linux"))]
-    fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
-        None
-    }
+        use tokio_util::sync::CancellationToken;
 
-    /// One backend's worth of the boundary check above.
-    async fn a_workspace_shell_boundary_holds_for(capability: crate::sandbox::SandboxCapability) {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let base = crate::workspace::canonical_for_test(temp.path());
-        let work = base.join("work");
-        let outside = base.join("outside");
-        std::fs::create_dir(&work).expect("work");
-        std::fs::create_dir(&outside).expect("outside");
+        use super::*;
 
-        let mut tool = super::tests::test_tool(
-            crate::permission::SharedPermission::new(
-                Permission::Workspace,
-                crate::permission::EnabledPermissions::ALL,
-            ),
-            true,
-        );
-        // The backend under test, not whatever `detect()` picked.
-        tool.backend_probe = crate::sandbox::BackendProbe::Ok(capability.clone());
-        tool.sandbox_capability = capability;
-        tool.cwd = Arc::new(std::sync::RwLock::new(work.clone()));
-        tool.scope = crate::workspace::WriteScope::confined(vec![work.clone()]);
+        #[tokio::test]
+        async fn a_workspace_shell_writes_inside_the_root_and_is_refused_outside() {
+            // Every backend this host can actually run, not just the one `detect()` names.
+            //
+            // `detect()` on Linux only consults `probe_landlock`, so it never returns `Bubblewrap`
+            // -- while production resolves the backend through `resolve_sandbox_backend`, which
+            // auto-prefers Bubblewrap whenever `bwrap` probes OK. Testing only what `detect()`
+            // returns therefore left `Confinement::writable() -> bwrap_args` unexercised end to end
+            // on the backend most hosts actually use: the argv could be cut entirely and this
+            // stayed green.
+            let mut backends = Vec::new();
+            let detected = crate::sandbox::detect();
+            if !matches!(detected, crate::sandbox::SandboxCapability::Unavailable) {
+                backends.push(detected);
+            }
+            backends.extend(a_backend_detect_does_not_name());
+            // Skip rather than fail where no backend exists: this asserts what confinement does,
+            // and a host without one has nothing to assert against. Loud, so it cannot
+            // silently never run.
+            if backends.is_empty() {
+                eprintln!("skipping: no usable sandbox backend on this host");
+                return;
+            }
 
-        let result = tool
-            .execute(
-                serde_json::json!({
-                    "command": format!(
-                        "echo in > {}/inside.txt 2>/dev/null; \
-                         echo out > {}/escaped.txt 2>/dev/null; true",
-                        work.display(),
-                        outside.display()
-                    ),
-                }),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("the shell itself must run");
+            for capability in backends {
+                eprintln!("workspace boundary against {capability:?}");
+                a_workspace_shell_boundary_holds_for(capability).await;
+            }
+        }
 
-        // Ground truth on disk, not the tool's narration: a shell that never started would report
-        // failure just as convincingly as one the sandbox confined.
-        assert!(
-            work.join("inside.txt").exists(),
-            "a write inside the workspace root must land: {result:?}"
-        );
-        assert!(
-            !outside.join("escaped.txt").exists(),
-            "a write outside every root must be refused by the backend: {result:?}"
-        );
+        /// A backend production would choose that [`crate::sandbox::detect`] does not name.
+        ///
+        /// Linux only. `detect()` there consults `probe_landlock` alone, so it never returns
+        /// `Bubblewrap`, while production resolves through `resolve_sandbox_backend`, which
+        /// auto-prefers Bubblewrap whenever `bwrap` probes OK.
+        ///
+        /// Split behind a `cfg` rather than pushed inline because `SandboxCapability::Bubblewrap`
+        /// is itself `cfg(target_os = "linux")`: this module is `cfg(all(test, unix))`, so
+        /// naming the variant unconditionally compiled here and failed the macOS build with
+        /// `E0599`, which no amount of local Linux testing could have shown.
+        #[cfg(target_os = "linux")]
+        fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
+            // Deliberately not `sandbox::bwrap_on_path`, which demands a root-owned binary: this
+            // only answers "can this test spawn it", and a developer with a local build in
+            // `~/.local/bin` should still get the leg run rather than silently skipped.
+            let path = std::env::var_os("PATH")?;
+            let bwrap_path = std::env::split_paths(&path)
+                .map(|dir| dir.join("bwrap"))
+                .find(|candidate| candidate.is_file())?;
+            Some(crate::sandbox::SandboxCapability::Bubblewrap { bwrap_path })
+        }
+
+        /// macOS has one `read`-level backend and `detect()` names it, so there is nothing to add.
+        #[cfg(not(target_os = "linux"))]
+        fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
+            None
+        }
+
+        /// One backend's worth of the boundary check above.
+        async fn a_workspace_shell_boundary_holds_for(
+            capability: crate::sandbox::SandboxCapability,
+        ) {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let base = crate::workspace::canonical_for_test(temp.path());
+            let work = base.join("work");
+            let outside = base.join("outside");
+            std::fs::create_dir(&work).expect("work");
+            std::fs::create_dir(&outside).expect("outside");
+
+            let mut tool = super::tool_for_test(
+                crate::permission::SharedPermission::new(
+                    Permission::Workspace,
+                    crate::permission::EnabledPermissions::ALL,
+                ),
+                true,
+            );
+            // The backend under test, not whatever `detect()` picked.
+            tool.backend_probe = crate::sandbox::BackendProbe::Ok(capability.clone());
+            tool.sandbox_capability = capability;
+            tool.site.cwd = crate::workspace::SharedCwd::new(work.clone());
+            tool.scope = crate::workspace::WriteScope::confined(vec![work.clone()]);
+
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "command": format!(
+                            "echo in > {}/inside.txt 2>/dev/null; \
+                             echo out > {}/escaped.txt 2>/dev/null; true",
+                            work.display(),
+                            outside.display()
+                        ),
+                    }),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("the shell itself must run");
+
+            // Ground truth on disk, not the tool's narration: a shell that never started would
+            // report failure just as convincingly as one the sandbox confined.
+            assert!(
+                work.join("inside.txt").exists(),
+                "a write inside the workspace root must land: {result:?}"
+            );
+            assert!(
+                !outside.join("escaped.txt").exists(),
+                "a write outside every root must be refused by the backend: {result:?}"
+            );
+        }
     }
 }

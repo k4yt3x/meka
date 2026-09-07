@@ -1,8 +1,8 @@
 //! `load_tool` meta-tool: makes a deferred tool's full schema visible to the model on subsequent
 //! turns. The active tool set is derived by scanning the conversation for successful `load_tool`
-//! calls ([`crate::conversation::extract_loaded_tool_names_from_events`]); this tool's `execute`
-//! only renders the description
-//! and schema as `tool_result` text. It never mutates the registry.
+//! calls ([`crate::tools::load_tool::extract_loaded_tool_names_from_events`]); this tool's
+//! `execute` only renders the description and schema as `tool_result` text. It never mutates the
+//! registry.
 
 use std::{
     collections::HashSet,
@@ -10,10 +10,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 
 use super::{LOAD_TOOL_NAME, Tool, ToolOutput, util::require_str};
-use crate::{error::Result, permission::Permission, provider::ToolDefinition};
+use crate::{
+    conversation::{ContentBlock, Event, Message},
+    error::Result,
+    permission::Permission,
+    provider::ToolDefinition,
+};
 
 /// Meta-tool that makes a deferred tool's schema visible for use. Held by the
 /// [`super::ToolRegistry`] like any other tool, so the same `Arc` lifecycle applies. The `Weak`
@@ -44,9 +48,7 @@ impl LoadToolTool {
         name: &str,
         tools: &std::sync::Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     ) -> String {
-        let registered: Vec<String> = tools
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let registered: Vec<String> = crate::sync::read(tools)
             .iter()
             .map(|tool| tool.definition().name)
             .collect();
@@ -73,7 +75,7 @@ impl Tool for LoadToolTool {
                         "type": ["string", "array"],
                         "items": {"type": "string"},
                         "description": format!(
-                            "Exact name of the tool to load, or an array of up to {} names",
+                            "Exact name of the tool to load, or an array of up to {} names.",
                             crate::tools::MAX_LOAD_TOOL_BATCH,
                         ),
                     }
@@ -91,7 +93,7 @@ impl Tool for LoadToolTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let names = crate::tools::load_tool_names(&input);
         if names.is_empty() {
@@ -111,9 +113,7 @@ impl Tool for LoadToolTool {
         let mut resolved = 0usize;
         for name in &names {
             let definition = {
-                let guard = tools
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let guard = crate::sync::read(&tools);
                 guard
                     .iter()
                     .find(|t| t.definition().name == *name)
@@ -140,18 +140,13 @@ impl Tool for LoadToolTool {
             let is_deferred = self
                 .deferred
                 .upgrade()
-                .map(|d| {
-                    d.read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .contains(name)
-                })
+                .map(|d| crate::sync::read(&d).contains(name))
                 .unwrap_or(false);
 
             resolved += 1;
             if !is_deferred {
                 sections.push(format!(
-                    "Tool '{}' is already available. Call it directly.",
-                    name
+                    "Tool '{name}' is already available. Call it directly."
                 ));
                 continue;
             }
@@ -207,12 +202,107 @@ impl Tool for LoadToolTool {
     }
 }
 
+/// Walk events and collect the names of tools loaded via successful `load_tool` calls. **The only
+/// door for this question**: a scan of the materialized slice cannot see a load whose exchange a
+/// compaction has summarized away or a repair has emptied, and this absorbs
+/// [`Event::CompactBoundary::loaded_tools_snapshot`] when it crosses a boundary. Pending uses
+/// inside the summarized window are cleared at the boundary (the actual tool_use/tool_result rows
+/// for those uses are still in the log on disk, but they're below the materialized view's "logical
+/// start" so the model can't act on them).
+/// Returns names in **load order**, de-duplicated. The order is what makes the tools array a stable
+/// cache prefix: `load_tool` calls only ever append to the conversation, so appending each newly
+/// loaded tool to the tail means the array can only grow at the end. Returning an unordered set and
+/// letting the registry impose its own order would reinsert an earlier-registered tool ahead of a
+/// later-registered one that was loaded first, which is a mid-array edit and re-caches the whole
+/// conversation behind it.
+pub(crate) fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut loaded: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending: HashMap<String, Vec<String>> = HashMap::new();
+
+    let absorb = |message: &Message,
+                  pending: &mut HashMap<String, Vec<String>>,
+                  seen: &mut HashSet<String>,
+                  loaded: &mut Vec<String>| {
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, name, input }
+                    if name == crate::tools::LOAD_TOOL_NAME =>
+                {
+                    let names = crate::tools::load_tool_names(input);
+                    if !names.is_empty() {
+                        pending.insert(id.clone(), names);
+                    }
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => {
+                    if let Some(loaded_names) = pending.remove(tool_use_id)
+                        && !is_error
+                    {
+                        // A batch load appends its names in call order, keeping the tools array's
+                        // growth append-only exactly as a sequence of single loads would.
+                        for loaded_name in loaded_names {
+                            if seen.insert(loaded_name.clone()) {
+                                loaded.push(loaded_name);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+
+    for event in events {
+        match event {
+            Event::Append(message) => absorb(message, &mut pending, &mut seen, &mut loaded),
+            // A repair never *un*-loads a tool: the array is a cache prefix that may only grow, and
+            // rewinding past a `load_tool` would drop an entry from its middle and re-cache the
+            // whole conversation behind it. Pending uses inside the replaced window are dropped the
+            // same way a boundary drops them, since their results are gone from the view.
+            Event::Repair { messages, .. } => {
+                pending.clear();
+                for message in messages {
+                    absorb(message, &mut pending, &mut seen, &mut loaded);
+                }
+            }
+            // Touches images only; no tool call is added or removed by it.
+            Event::Redact { .. } => {}
+            Event::CompactBoundary {
+                loaded_tools_snapshot,
+                ..
+            } => {
+                // Pending uses inside the summarized window are gone from the model's view; their
+                // would-be results are also gone. Drop them and absorb the snapshot.
+                pending.clear();
+                // The snapshot is an unordered set, so sort it for a deterministic tail. Continuity
+                // with the pre-boundary order isn't needed: compaction rewrites the head of the
+                // conversation and re-caches everything anyway. What matters is that every turn
+                // *after* the boundary agrees on the order.
+                let mut absorbed: Vec<&String> = loaded_tools_snapshot.iter().collect();
+                absorbed.sort();
+                for name in absorbed {
+                    if seen.insert(name.clone()) {
+                        loaded.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    loaded
+}
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
-    use crate::provider::ContentBlock;
 
     /// Minimal fake tool for testing the registry-lookup paths of `LoadToolTool` without dragging
     /// in `ToolRegistry::build_default`.
@@ -240,7 +330,7 @@ mod tests {
         async fn execute(
             &self,
             _input: serde_json::Value,
-            _cancellation: CancellationToken,
+            _context: crate::tools::ToolContext,
         ) -> Result<crate::tools::ToolOutput> {
             Ok(crate::tools::ToolOutput::text(String::new(), false))
         }
@@ -261,7 +351,7 @@ mod tests {
     fn fake_tool(name: &str) -> Arc<dyn Tool> {
         Arc::new(FakeTool {
             name: name.to_string(),
-            description: format!("Fixture tool {}.", name),
+            description: format!("Fixture tool {name}."),
             schema: serde_json::json!({
                 "type": "object",
                 "properties": {"url": {"type": "string", "description": "Page URL"}},
@@ -290,18 +380,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_tool_unknown_name() {
+    async fn load_tool_unknown_name() {
         let fixture = build_test_tool(Vec::new(), &[]);
         let load_tool = &fixture.load_tool;
         let result = load_tool
             .execute(
                 serde_json::json!({"name": "nonexistent"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
         assert!(result.is_error);
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("not registered"));
         assert!(text.contains("[Tool discovery]"));
         // And it must not also claim the schema arrived. Appended whatever happened, the trailer
@@ -315,17 +405,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_tool_missing_name_field() {
+    async fn load_tool_missing_name_field() {
         let fixture = build_test_tool(Vec::new(), &[]);
         let load_tool = &fixture.load_tool;
         let result = load_tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_load_tool_returns_schema_for_deferred_tool() {
+    async fn load_tool_returns_schema_for_deferred_tool() {
         let fake = Arc::new(FakeTool {
             name: "mcp__notion__fetch".to_string(),
             description: "Fetch a Notion page by URL or ID.".to_string(),
@@ -343,13 +436,13 @@ mod tests {
         let result = load_tool
             .execute(
                 serde_json::json!({"name": "mcp__notion__fetch"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
 
         assert!(!result.is_error, "deferred-tool load should succeed");
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("mcp__notion__fetch"));
         assert!(text.contains("Fetch a Notion page"));
         assert!(text.contains("## Schema"));
@@ -360,7 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_tool_already_available_tool() {
+    async fn load_tool_already_available_tool() {
         // Registered but not in the deferred set: model should be told to call it directly.
         // Returned as success so the scanner records the name harmlessly (it was already in the
         // active set).
@@ -375,13 +468,13 @@ mod tests {
         let result = load_tool
             .execute(
                 serde_json::json!({"name": "read_file"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
 
         assert!(!result.is_error);
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("already available"));
         assert!(text.contains("read_file"));
         // Must NOT render the schema block; the model already has it.
@@ -389,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_tool_accepts_an_array_of_names() {
+    async fn load_tool_accepts_an_array_of_names() {
         let fixture = build_test_tool(
             vec![
                 fake_tool("mcp__notion__fetch"),
@@ -402,13 +495,13 @@ mod tests {
             .load_tool
             .execute(
                 serde_json::json!({"name": ["mcp__notion__fetch", "mcp__notion__search"]}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
 
         assert!(!result.is_error);
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("# mcp__notion__fetch"), "{text}");
         assert!(text.contains("# mcp__notion__search"), "{text}");
         assert!(text.contains("schemas are"), "plural wording: {text}");
@@ -417,7 +510,7 @@ mod tests {
     /// A batch must not lose the tools that did resolve just because one name was wrong: the
     /// non-error result is what records them in the active set.
     #[tokio::test]
-    async fn test_load_tool_batch_survives_one_bad_name() {
+    async fn load_tool_batch_survives_one_bad_name() {
         let fixture = build_test_tool(vec![fake_tool("mcp__notion__fetch")], &[
             "mcp__notion__fetch",
         ]);
@@ -426,21 +519,21 @@ mod tests {
             .load_tool
             .execute(
                 serde_json::json!({"name": ["mcp__notion__fetch", "nope"]}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
 
         assert!(!result.is_error, "one resolved, so the call succeeded");
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("# mcp__notion__fetch"), "{text}");
         assert!(text.contains("'nope' is not registered"), "{text}");
     }
 
-    /// Half-honouring an over-long batch while reporting plain success would leave the model
+    /// Half-honoring an over-long batch while reporting plain success would leave the model
     /// believing it holds schemas it has never seen.
     #[tokio::test]
-    async fn test_load_tool_reports_names_dropped_by_the_cap() {
+    async fn load_tool_reports_names_dropped_by_the_cap() {
         let names: Vec<String> = (0..crate::tools::MAX_LOAD_TOOL_BATCH + 3)
             .map(|index| format!("tool_{index}"))
             .collect();
@@ -452,13 +545,13 @@ mod tests {
             .load_tool
             .execute(
                 serde_json::json!({ "name": names }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
 
         assert!(!result.is_error);
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("3 more were not"), "{text}");
         assert!(!text.contains("# tool_12"), "past the cap: {text}");
     }
@@ -466,7 +559,7 @@ mod tests {
     /// Dropping the `mcp__<server>__` prefix is the likeliest way to get a tool name wrong, and
     /// pure edit distance would never suggest the right answer.
     #[tokio::test]
-    async fn test_load_tool_suggests_the_namespaced_name() {
+    async fn load_tool_suggests_the_namespaced_name() {
         let fixture = build_test_tool(vec![fake_tool("mcp__notion__fetch")], &[
             "mcp__notion__fetch",
         ]);
@@ -475,13 +568,13 @@ mod tests {
             .load_tool
             .execute(
                 serde_json::json!({"name": "fetch"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok");
 
         assert!(result.is_error);
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(
             text.contains("Did you mean `mcp__notion__fetch`?"),
             "{text}"
@@ -489,7 +582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_tool_registry_dropped() {
+    async fn load_tool_registry_dropped() {
         // Simulate the registry going away while the LoadToolTool is still held somewhere. Both
         // Weak upgrades should fail gracefully, returning a plain error tool_result, not
         // panicking.
@@ -501,12 +594,12 @@ mod tests {
             .load_tool
             .execute(
                 serde_json::json!({"name": "anything"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok with error tool_result");
         assert!(result.is_error);
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("no longer available"));
     }
 }

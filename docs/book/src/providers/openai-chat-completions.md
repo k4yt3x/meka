@@ -10,63 +10,70 @@ For the same key against OpenAI's newer protocol, see [`openai-responses`](./ope
 
 | Setting | Value |
 |---------|-------|
-| Profile `type` | `openai-chat-completions` |
+| Account `backend` | `openai-chat-completions` |
 | Default base URL | `https://api.openai.com/v1` |
-| Credential | API key (`sk-...`) stored in the database |
+| Credential | API key (`sk-...`) kept in the store |
 | Auth method | Bearer token (`Authorization: Bearer <key>`) |
 
-### Quickest Start
+### Quickest start
 
 ```bash
-meka provider add openai --type openai-chat-completions --model gpt-5.6-sol
+meka account add openai --backend openai-chat-completions
+meka profile add work --account openai --model gpt-5.6-sol
 ```
 
-`meka provider add` prompts for your OpenAI API key, stores it in the database, and writes the
-`[providers.openai]` profile. To read the key from a pipe instead of prompting, pass
-`--api-key-stdin`.
+`meka account add` prompts for your OpenAI API key, saves it to the store, and writes the
+`[accounts.openai]` table. To read the key from a pipe instead of prompting, pass
+`--api-key-stdin`. `meka profile add` then writes the profile that names the model.
 
-### Config File
+### Config file
 
-`meka provider add` writes this for you (the key stays in the database, not here):
+The two commands write this for you (the key stays in the store, not here):
 
 ```toml
-default_provider = "openai"
+default_profile = "work"
 
-[providers.openai]
-type = "openai-chat-completions"
-model = "gpt-5.6-sol"
+[accounts.openai]
+backend = "openai-chat-completions"
+
+[profiles.work]
+account = "openai"
+model   = "gpt-5.6-sol"
 ```
 
-## Supported Models
+## Supported models
 
-Any model reachable over the Chat Completions API that supports tool calling. For OpenAI's current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models) - `meka provider add` suggests `gpt-5.6-sol` for new OpenAI profiles. Against a compatible endpoint the valid names are that server's: whatever Ollama, vLLM, LM Studio or OpenRouter serves. meka forwards the model string verbatim and doesn't gate which strings are valid.
+Any model reachable over the Chat Completions API that supports tool calling. For OpenAI's current line-up, see [OpenAI's models overview](https://platform.openai.com/docs/models); `meka profile add` suggests `gpt-5.6-sol` for a profile on an OpenAI account. Against a compatible endpoint the valid names are that server's: whatever Ollama, vLLM, LM Studio or OpenRouter serves. meka forwards the model string verbatim and doesn't gate which strings are valid.
 
-## Custom Base URL
+## Custom base URL
 
-To use an OpenAI-compatible endpoint, set the profile's `base_url`. Add it when creating the profile:
+To use an OpenAI-compatible endpoint, set the account's `base_url` when creating it:
 
 ```bash
 # Ollama (no real key; pipe a placeholder)
-printf 'unused' | meka provider add ollama --type openai-chat-completions --model llama3 \
+printf 'unused' | meka account add ollama --backend openai-chat-completions \
     --base-url http://localhost:11434/v1 --api-key-stdin
+meka profile add llama --account ollama --model llama3
 
 # OpenRouter
-meka provider add openrouter --type openai-chat-completions --model anthropic/claude-sonnet-4.6 \
+meka account add openrouter --backend openai-chat-completions \
     --base-url https://openrouter.ai/api/v1
+meka profile add sonnet --account openrouter --model anthropic/claude-sonnet-4.6
 ```
 
-The resulting profile (the key, if any, lives in the database):
+The resulting tables (the key, if any, lives in the store):
 
 ```toml
-[providers.ollama]
-type = "openai-chat-completions"
-model = "llama3"
+[accounts.ollama]
+backend  = "openai-chat-completions"
 base_url = "http://localhost:11434/v1"
+
+[profiles.llama]
+account = "ollama"
+model   = "llama3"
 ```
 
-Change it later with `meka provider set <name> base_url <url>`.
-
-## API Details
+## API details
 
 **Endpoint:** `POST {base_url}/chat/completions`
 

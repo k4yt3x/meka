@@ -1,14 +1,16 @@
-# Account Info
+# Account info
 
-`meka account` exposes read-only account information obtained through a provider's OAuth API, so you
-can script things that aren't otherwise reachable (a status bar, a cron alert). Every subcommand
-takes an optional profile (defaults to the active provider, same as `--provider`) and a
-`--format plain|json`. The requested data goes to **stdout**; notes and errors go to **stderr**, so
-`meka account … 2>/dev/null | jq` stays clean.
+`meka account usage`, `whoami` and `stats` expose read-only account information obtained through a
+provider's OAuth API, so you can script things that aren't otherwise reachable (a status bar, a cron
+alert). Each takes an optional `--profile <name>` (defaults to the active profile, the way a run
+does) and a `--format plain|json`, and reports on the account that profile bills: a request needs
+a model, which is the profile's. The requested data goes to **stdout**; notes and errors go to
+**stderr**, so `meka account … 2>/dev/null | jq` stays clean. The rest of the `meka account` suite
+(`add`, `login`, `list`, `remove`) is documented under [Config file](../configuration/config-file.md#meka-account-cli).
 
 Availability is per backend: `claude-subscription` and `chatgpt-subscription` (subscription OAuth) support these;
 for `usage` and `stats`, API-key backends, OpenAI-compatible endpoints and Ollama print a short
-"not available" note and exit non-zero. `whoami` works on any profile: it fills the fields it can
+"not available" note and exit non-zero. `whoami` works on any account: it fills the fields it can
 and fails only when the credential itself is invalid.
 
 ## `meka account usage`
@@ -23,7 +25,8 @@ Account usage
 
 $ meka account usage --format json
 {
-  "provider": "claude-max",
+  "profile": "work",
+  "account": "claude-max",
   "windows": [
     { "label": "5-hour (session)", "used_percent": 23.0, "resets_at": 1782958200 },
     { "label": "Weekly", "used_percent": 4.0, "resets_at": 1782997200 }
@@ -47,7 +50,7 @@ credential (no network), so even when the identity call fails because the token 
 
 ```console
 $ meka account whoami
-Account: claude-max (claude-subscription)
+Account: claude-max (claude-subscription, via profile work)
   Auth:          valid (5h 45m)
   Plan:          claude_max
   Tier:          default_claude_max_20x
@@ -56,7 +59,8 @@ Account: claude-max (claude-subscription)
 
 $ meka account whoami --format json
 {
-  "provider": "claude-max",
+  "profile": "work",
+  "account": "claude-max",
   "backend": "claude-subscription",
   "auth": { "valid": true, "expires_at": 1782971829, "expires_in_seconds": 20709 },
   "identity": { "plan": "claude_max", "tier": "default_claude_max_20x",
@@ -65,7 +69,7 @@ $ meka account whoami --format json
 ```
 
 `identity` is `null` when the backend has no identity endpoint. `expires_at` / `expires_in_seconds`
-are in seconds; a negative `expires_in_seconds` (or `valid: false`) means "run `meka provider login`".
+are in seconds; a negative `expires_in_seconds` (or `valid: false`) means "run `meka account login`".
 
 ## `meka account stats`
 
@@ -74,11 +78,11 @@ counts); `claude-subscription` reports only a first-used date:
 
 ```console
 $ meka account stats
-Account history: claude-max
+Account history: claude-max (work)
   First used:        2026-04-01
 
 $ meka account stats --format json
-{ "provider": "claude-max", "lifetime_tokens": null, "peak_daily_tokens": null,
+{ "profile": "work", "account": "claude-max", "lifetime_tokens": null, "peak_daily_tokens": null,
   "current_streak_days": null, "longest_streak_days": null,
   "first_used": "2026-04-01T17:36:16.996974Z", "daily": [] }
 ```
@@ -92,7 +96,7 @@ A block that shows the Claude 5-hour and weekly usage, refreshed every 5 minutes
 ```sh
 #!/bin/sh
 # ~/.config/i3blocks/meka-usage   (set interval=300)
-u=$(meka account usage claude-max --format json 2>/dev/null) || { echo "claude ?"; exit 0; }
+u=$(meka account usage --profile work --format json 2>/dev/null) || { echo "claude ?"; exit 0; }
 echo "$u" | jq -r '
   (.windows[] | select(.label|startswith("5-hour")).used_percent) as $s |
   (.windows[] | select(.label=="Weekly").used_percent) as $w |
@@ -100,5 +104,5 @@ echo "$u" | jq -r '
 ```
 
 Each invocation makes one API call, so keep the poll interval sane (minutes, not seconds). The token
-is refreshed automatically when near expiry and written back to the database, exactly as during a
+is refreshed automatically when near expiry and written back to the store, exactly as during a
 normal session.

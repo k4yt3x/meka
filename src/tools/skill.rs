@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 
 use super::{
     Tool, ToolOutput,
@@ -28,7 +27,7 @@ use crate::{
 pub(super) struct SkillReadTool {
     /// Shared skill cache with the agent. Dispatch reads through `current().await` so the tool
     /// sees any auto-reloads that happened during the turn.
-    pub skills: Arc<SkillCache>,
+    pub(crate) skills: Arc<SkillCache>,
 }
 
 #[async_trait]
@@ -46,7 +45,7 @@ impl Tool for SkillReadTool {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "The name of the skill to load"
+                        "description": "The name of the skill to load."
                     }
                 },
                 "required": ["name"]
@@ -62,7 +61,7 @@ impl Tool for SkillReadTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "skill_read")?;
         let skills = self.skills.current().await;
@@ -77,9 +76,8 @@ impl Tool for SkillReadTool {
             None => {
                 let hint = match skills.skip_reason(&name) {
                     Some(reason) => format!(
-                        "Error: skill '{}' exists on disk but could not be read: {}. Tell the user; \
-                         they need to fix that file. Do not substitute your own version of it.",
-                        name, reason
+                        "Error: skill '{name}' exists on disk but could not be read: {reason}. Tell the user; \
+                         they need to fix that file. Do not substitute your own version of it."
                     ),
                     None => {
                         let available: Vec<&str> =
@@ -89,7 +87,7 @@ impl Tool for SkillReadTool {
                         } else {
                             format!("Available skills: {}", available.join(", "))
                         };
-                        format!("Error: skill '{}' not found. {}", name, hint)
+                        format!("Error: skill '{name}' not found. {hint}")
                     }
                 };
                 return Ok(ToolOutput::text(hint, true));
@@ -146,9 +144,9 @@ fn reject_unreadable(
 ) -> Option<ToolOutput> {
     // A skill that *loaded* is not here, and that is [`skills::SkillIndex`]'s disjointness
     // invariant rather than a check of this function's own. Without it, a working `deploy` in
-    // meka's store beside a broken `deploy/` in a read-only root put the name in both halves,
-    // and this refused to write a skill sitting in the index -- claiming its contents could not
-    // be shown, and offering `meka skill remove deploy`, which reaches the working copy.
+    // meka's store beside a broken `deploy/` in a read-only root would put the name in both
+    // halves, and this would refuse to write a skill sitting in the index, claiming its contents
+    // cannot be shown and offering `meka skill remove deploy`, which reaches the working copy.
     // Re-checking `find` here would fix this door and leave the other readers of `skipped` to
     // each remember the same thing.
     //
@@ -166,23 +164,21 @@ fn reject_unreadable(
         ),
         _ => format!(
             "Use a different name, or ask the user to fix or remove it with \
-             `meka skill remove {}`.",
-            name
+             `meka skill remove {name}`."
         ),
     };
     Some(ToolOutput::text(
         format!(
-            "Error: '{}' exists on disk but its SKILL.md is not a valid skill ({}), so it is in no \
+            "Error: '{name}' exists on disk but its SKILL.md is not a valid skill ({reason}), so it is in no \
              index and its contents cannot be shown. Leaving it untouched rather than overwriting \
-             something neither of us can see. {}",
-            name, reason, remedy
+             something neither of us can see. {remedy}"
         ),
         true,
     ))
 }
 
 pub(super) struct SkillSearchTool {
-    pub skills: Arc<SkillCache>,
+    pub(crate) skills: Arc<SkillCache>,
 }
 
 #[async_trait]
@@ -199,7 +195,7 @@ impl Tool for SkillSearchTool {
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Rust regex matched against each line of every skill"
+                        "description": "Rust regex matched against each line of every skill."
                     }
                 },
                 "required": ["pattern"]
@@ -215,7 +211,7 @@ impl Tool for SkillSearchTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let pattern = require_str(&input, "pattern", "skill_search")?;
         let regex = compile_user_regex(&pattern, "skill_search")?;
@@ -227,11 +223,8 @@ impl Tool for SkillSearchTool {
             let content = match tokio::fs::read_to_string(&skill.body_path).await {
                 Ok(content) => content,
                 Err(error) => {
-                    tracing::warn!(
-                        "skill_search skipping {}: {}",
-                        skill.body_path.display(),
-                        error
-                    );
+                    let path = skill.body_path.display();
+                    tracing::warn!("skill_search skipping {path}: {error}");
                     continue;
                 }
             };
@@ -260,8 +253,7 @@ impl Tool for SkillSearchTool {
         let mut out = matches.join("\n");
         if truncated {
             out.push_str(&format!(
-                "\n\n(stopped at {} matches; narrow the pattern to see the rest)",
-                MAX_SEARCH_MATCHES
+                "\n\n(stopped at {MAX_SEARCH_MATCHES} matches; narrow the pattern to see the rest)"
             ));
         }
         Ok(ToolOutput::text(out, false))
@@ -269,7 +261,7 @@ impl Tool for SkillSearchTool {
 }
 
 pub(super) struct SkillWriteTool {
-    pub skills: Arc<SkillCache>,
+    pub(crate) skills: Arc<SkillCache>,
 }
 
 #[async_trait]
@@ -287,28 +279,29 @@ impl Tool for SkillWriteTool {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Identifier: lowercase letters, digits and hyphens (e.g. 'triage-build-failure')"
+                        "description": "Identifier: lowercase letters, digits and hyphens (e.g. 'triage-build-failure')."
                     },
                     "description": {
                         "type": "string",
                         "description": "One line stating what the skill is for, shown in every \
                                         future session's skill index. Required when creating a \
                                         skill; omit it to leave an existing skill's description \
-                                        untouched"
+                                        untouched."
                     },
                     "priority": {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 9,
+                        "default": crate::entry::DEFAULT_PRIORITY,
                         "description": "Lower sorts higher in the index and survives truncation. \
                                         0-2 procedures you reach for constantly, 5 default, 6-9 \
-                                        rarely relevant"
+                                        rarely relevant."
                     },
                     "body": {
                         "type": "string",
                         "description": "The procedure itself, loaded only when skill_read is \
                                         called or the skill is spawned. Omit it to leave an \
-                                        existing skill's body untouched"
+                                        existing skill's body untouched."
                     }
                 },
                 "required": ["name"]
@@ -324,7 +317,7 @@ impl Tool for SkillWriteTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let root = require_root(&self.skills, "skill_write")?;
         let name = require_str(&input, "name", "skill_write")?;
@@ -356,7 +349,7 @@ impl Tool for SkillWriteTool {
             Some(value) => {
                 return Err(MekaError::ToolExecution {
                     tool_name: "skill_write".to_string(),
-                    message: format!("'description' must be a string, got {}", value),
+                    message: format!("'description' must be a string, got {value}"),
                 });
             }
         };
@@ -370,7 +363,7 @@ impl Tool for SkillWriteTool {
             Some(value) => {
                 return Err(MekaError::ToolExecution {
                     tool_name: "skill_write".to_string(),
-                    message: format!("'body' must be a string, got {}", value),
+                    message: format!("'body' must be a string, got {value}"),
                 });
             }
         };
@@ -379,22 +372,22 @@ impl Tool for SkillWriteTool {
             Some(value) => {
                 let raw = value.as_i64().ok_or_else(|| MekaError::ToolExecution {
                     tool_name: "skill_write".to_string(),
-                    message: format!("'priority' must be a whole number, got {}", value),
+                    message: format!("'priority' must be a whole number, got {value}"),
                 })?;
-                Some(crate::store::parse_priority(Some(raw), "skill", &name))
+                Some(crate::entry::parse_priority(Some(raw), "skill", &name))
             }
         };
 
         let installed = self.skills.current().await;
         // Omitted means "leave it alone", the rule `PUT /v1/skills` already applies and this tool's
         // own description promises ("omit body and whatever the skill already documented is kept").
-        // Reading the absence as the default silently demoted a prioritised skill every time the
+        // Reading the absence as the default silently demoted a prioritized skill every time the
         // agent refined its text -- and priority both orders the `[Skills]` index the model reads
         // and decides which entries the index cap drops, so the demotion can remove it from view.
         let priority = requested_priority.unwrap_or_else(|| {
             installed
                 .find(&name)
-                .map_or(crate::store::DEFAULT_PRIORITY, |skill| skill.priority)
+                .map_or(crate::entry::DEFAULT_PRIORITY, |skill| skill.priority)
         });
         // Unreadable first, because it is the more specific answer: a file that is both foreign and
         // unparseable needs its parse error named, and `reject_unreadable` carries the read-only
@@ -411,7 +404,10 @@ impl Tool for SkillWriteTool {
             return Ok(refusal);
         }
         if let Some(refusal) = skills::refuse_foreign_write(&installed, &name, &root) {
-            return Ok(ToolOutput::text(format!("Error: {}", refusal), true));
+            return Ok(ToolOutput::text(
+                format!("Error: {}", refusal.where_it_lives()),
+                true,
+            ));
         }
 
         let existing = installed.find(&name);
@@ -436,7 +432,7 @@ impl Tool for SkillWriteTool {
                 Some(skill) => skill
                     .description
                     .char_indices()
-                    .nth(skills::MAX_DESCRIPTION_LEN)
+                    .nth(skills::MAX_DESCRIPTION_CHARS)
                     .map_or_else(
                         || skill.description.clone(),
                         |(cut, _)| skill.description[..cut].to_string(),
@@ -445,8 +441,7 @@ impl Tool for SkillWriteTool {
                     return Err(MekaError::ToolExecution {
                         tool_name: "skill_write".to_string(),
                         message: format!(
-                            "no skill named '{}' exists, so a description is required to create it",
-                            name
+                            "no skill named '{name}' exists, so a description is required to create it"
                         ),
                     });
                 }
@@ -460,15 +455,16 @@ impl Tool for SkillWriteTool {
         // about content that does not exist, on the one line whose whole job is to distinguish a
         // metadata update from a rewrite. `memory_write` already reads it this way and its comment
         // describes the same defect.
-        let kept_existing_body = body.is_none()
-            && existing.is_some_and(|skill| {
-                std::fs::read_to_string(&skill.body_path)
-                    .ok()
-                    .and_then(|text| {
-                        crate::store::split_frontmatter(&text).map(|(_, body)| body.to_string())
-                    })
-                    .is_some_and(|body| !body.trim().is_empty())
-            });
+        let kept_existing_body = match existing {
+            Some(skill) if body.is_none() => tokio::fs::read_to_string(&skill.body_path)
+                .await
+                .ok()
+                .and_then(|text| {
+                    crate::entry::split_frontmatter(&text).map(|(_, body)| body.to_string())
+                })
+                .is_some_and(|body| !body.trim().is_empty()),
+            _ => false,
+        };
 
         // On the blocking pool, for the same reason `memory_write` is: the write goes through
         // `write_file_atomic`, which `fsync`s, and a `fsync` parks the calling thread for as long
@@ -491,7 +487,7 @@ impl Tool for SkillWriteTool {
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "skill_write".to_string(),
-                message: format!("write task failed: {}", error),
+                message: format!("write task failed: {error}"),
             })?
             .map_err(|message| MekaError::ToolExecution {
                 tool_name: "skill_write".to_string(),
@@ -504,13 +500,13 @@ impl Tool for SkillWriteTool {
         // `agent_spawn(skill:)` milliseconds later, in the same turn.
         self.skills.invalidate().await;
 
-        tracing::info!("saved skill to {}", written.body_path.display());
+        let path = written.body_path.display();
+        tracing::info!("saved skill to {path}");
         Ok(ToolOutput::text(
             // The rank the *file* now carries, read back from the bytes rather than echoed from
-            // the request. Deliberately promises reachability by name rather than a
-            // place in the index: the index is capped, so a low-priority skill in a
-            // large store may not be listed there, and `skill_read` / `agent_spawn`
-            // work either way.
+            // the request. Deliberately promises reachability by name rather than a place in the
+            // index: the index is capped, so a low-priority skill in a large store may not be
+            // listed there, and `skill_read` / `agent_spawn` work either way.
             format!(
                 "Saved skill '{}' (priority {}){}. From the next turn on you can load it with \
                  skill_read, or hand it to a worker with agent_spawn(skill: \"{}\").",
@@ -537,7 +533,7 @@ impl Tool for SkillWriteTool {
 const AGENT_AUTHOR: &str = "meka (agent-authored)";
 
 pub(super) struct SkillDeleteTool {
-    pub skills: Arc<SkillCache>,
+    pub(crate) skills: Arc<SkillCache>,
 }
 
 #[async_trait]
@@ -553,7 +549,7 @@ impl Tool for SkillDeleteTool {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Name of the skill to delete"
+                        "description": "Name of the skill to delete."
                     }
                 },
                 "required": ["name"]
@@ -569,7 +565,7 @@ impl Tool for SkillDeleteTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let root = require_root(&self.skills, "skill_delete")?;
         let name = require_str(&input, "name", "skill_delete")?;
@@ -586,11 +582,14 @@ impl Tool for SkillDeleteTool {
             return Ok(refusal);
         }
         if let Some(refusal) = skills::refuse_foreign_delete(&installed, &name, &root) {
-            return Ok(ToolOutput::text(format!("Error: {}", refusal), true));
+            return Ok(ToolOutput::text(
+                format!("Error: {}", refusal.where_it_lives()),
+                true,
+            ));
         }
         if installed.find(&name).is_none() {
             return Ok(ToolOutput::text(
-                format!("Error: skill '{}' not found.", name),
+                format!("Error: skill '{name}' not found."),
                 true,
             ));
         }
@@ -603,9 +602,10 @@ impl Tool for SkillDeleteTool {
         // See the note in `skill_write`: the index must not keep listing a skill that is gone.
         self.skills.invalidate().await;
 
-        tracing::info!("deleted skill {}", dir.display());
+        let path = dir.display();
+        tracing::info!("deleted skill {path}");
         Ok(ToolOutput::text(
-            format!("Deleted skill '{}' and everything in its directory.", name),
+            format!("Deleted skill '{name}' and everything in its directory."),
             false,
         ))
     }
@@ -614,6 +614,8 @@ impl Tool for SkillDeleteTool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
@@ -624,36 +626,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_tool_unknown_skill() {
+    async fn skill_tool_unknown_skill() {
         let tool = SkillReadTool {
             skills: SkillCache::for_root(None),
         };
         let result = tool
             .execute(
                 serde_json::json!({"name": "nonexistent-skill-xyz"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should return Ok with error output");
 
         assert!(result.is_error);
-        let text = crate::provider::ContentBlock::tool_result_text_content(&result.content);
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&result.content);
         assert!(text.contains("not found"));
     }
 
     #[tokio::test]
-    async fn test_skill_tool_missing_name() {
+    async fn skill_tool_missing_name() {
         let tool = SkillReadTool {
             skills: SkillCache::for_root(None),
         };
         let result = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_skill_tool_prepends_context_header() {
+    async fn skill_tool_prepends_context_header() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -666,13 +671,13 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({"name": "demo"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should load");
 
         assert!(!result.is_error);
-        let text = crate::provider::ContentBlock::tool_result_text_content(&result.content);
+        let text = crate::conversation::ContentBlock::tool_result_text_content(&result.content);
         assert!(text.starts_with("Base directory for this skill and its bundled files:"));
         assert!(text.contains(&temp.path().join("demo").display().to_string()));
         assert!(text.contains("Run helper.py to do the thing."));
@@ -687,7 +692,7 @@ mod tests {
             license: None,
             compatibility: None,
             allowed_tools: None,
-            priority: crate::store::DEFAULT_PRIORITY,
+            priority: crate::entry::DEFAULT_PRIORITY,
             metadata: None,
             extra: serde_norway::Mapping::new(),
             conformance: crate::skills::Conformance::default(),
@@ -715,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_skill_helper() {
+    fn write_skill_helper() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -747,7 +752,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("root");
 
         // Longer than the spec's cap, which discovery accepts with a warning.
-        let long = "d".repeat(skills::MAX_DESCRIPTION_LEN + 76);
+        let long = "d".repeat(skills::MAX_DESCRIPTION_CHARS + 76);
         let dir = root.join("imported");
         std::fs::create_dir_all(&dir).expect("skill dir");
         std::fs::write(
@@ -769,7 +774,7 @@ mod tests {
         assert!(
             !refined.is_error,
             "a body-only write must not be refused over the description it is carrying: {}",
-            text_of(&refined)
+            refined.text_content()
         );
         let stored = std::fs::read_to_string(dir.join("SKILL.md")).expect("read back");
         assert!(
@@ -788,7 +793,7 @@ mod tests {
         skills_cache.invalidate().await;
 
         let result = run(&write, serde_json::json!({"name": "broken", "body": "new"})).await;
-        let message = text_of(&result);
+        let message = result.text_content();
         assert!(
             !message.contains("does not exist") && !message.contains("is required to create it"),
             "a skill whose file is on disk must not be reported as absent: {message}"
@@ -816,12 +821,12 @@ mod tests {
                     "description": "d",
                     "body": ["line one", "line two"],
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         let message = match result {
             Err(error) => error.to_string(),
-            Ok(output) => text_of(&output),
+            Ok(output) => output.text_content(),
         };
         assert!(
             message.contains("'body' must be a string"),
@@ -853,20 +858,20 @@ mod tests {
             serde_json::json!({"name": "triage", "description": long, "body": "FIRST"}),
         )
         .await;
-        assert!(!created.is_error, "{}", text_of(&created));
+        assert!(!created.is_error, "{}", created.text_content());
 
         let refined = run(
             &write,
             serde_json::json!({"name": "triage", "body": "SECOND"}),
         )
         .await;
-        assert!(!refined.is_error, "{}", text_of(&refined));
+        assert!(!refined.is_error, "{}", refined.text_content());
 
         let stored = skills.current().await;
         let skill = stored.find("triage").expect("still installed");
         assert_eq!(
             skill.description,
-            crate::store::normalize_description(&long),
+            crate::entry::normalize_description(&long),
             "refining the body must not rewrite the description"
         );
 
@@ -874,12 +879,12 @@ mod tests {
         let missing = write
             .execute(
                 serde_json::json!({"name": "brand-new", "body": "text"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         let message = match missing {
             Err(error) => error.to_string(),
-            Ok(output) => text_of(&output),
+            Ok(output) => output.text_content(),
         };
         assert!(
             message.contains("description is required to create it"),
@@ -915,9 +920,9 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(
-            text_of(&result).contains("does not write to"),
+            result.text_content().contains("does not write to"),
             "{}",
-            text_of(&result)
+            result.text_content()
         );
 
         let delete = SkillDeleteTool {
@@ -925,7 +930,7 @@ mod tests {
         };
         let result = run(&delete, serde_json::json!({"name": "borrowed"})).await;
         assert!(result.is_error);
-        assert!(text_of(&result).contains("does not write to"));
+        assert!(result.text_content().contains("does not write to"));
 
         // Neither refusal touched the foreign file, and neither created a shadow copy.
         assert!(
@@ -944,7 +949,7 @@ mod tests {
             serde_json::json!({"name": "ours", "description": "d", "body": "b"}),
         )
         .await;
-        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(!result.is_error, "{}", result.text_content());
     }
 
     /// The read-only rule covers a foreign skill whose `SKILL.md` does not parse, and the refusal
@@ -976,8 +981,8 @@ mod tests {
             serde_json::json!({"name": "wrecked", "description": "mine", "body": "MINE"}),
         )
         .await;
-        assert!(result.is_error, "{}", text_of(&result));
-        let text = text_of(&result);
+        assert!(result.is_error, "{}", result.text_content());
+        let text = result.text_content();
         assert!(
             text.contains(&shared.join("wrecked").display().to_string()),
             "the refusal must name where the file is: {text}"
@@ -1001,9 +1006,11 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(
-            text_of(&result).contains("meka skill remove ours-wrecked"),
+            result
+                .text_content()
+                .contains("meka skill remove ours-wrecked"),
             "{}",
-            text_of(&result)
+            result.text_content()
         );
     }
 
@@ -1048,7 +1055,7 @@ mod tests {
             serde_json::json!({"name": "deploy", "description": "refined", "body": "MINE2"}),
         )
         .await;
-        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(!result.is_error, "{}", result.text_content());
         assert!(
             std::fs::read_to_string(native.join("deploy/SKILL.md"))
                 .expect("still there")
@@ -1067,7 +1074,7 @@ mod tests {
             skills: skills.clone(),
         };
         let result = run(&delete, serde_json::json!({"name": "deploy"})).await;
-        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(!result.is_error, "{}", result.text_content());
         assert!(!native.join("deploy").exists(), "removed from meka's store");
         assert!(shared.join("deploy").exists(), "left alone elsewhere");
     }
@@ -1091,7 +1098,7 @@ mod tests {
         };
         let result = run(&read, serde_json::json!({"name": "broken"})).await;
         assert!(result.is_error);
-        let text = text_of(&result);
+        let text = result.text_content();
         assert!(
             text.contains("could not be read"),
             "reported as missing: {text}"
@@ -1105,7 +1112,7 @@ mod tests {
 
         // A name that really is absent still gets the plain answer, with the available list.
         let result = run(&read, serde_json::json!({"name": "absent"})).await;
-        let text = text_of(&result);
+        let text = result.text_content();
         assert!(text.contains("not found"), "{text}");
         assert!(text.contains("fine"), "{text}");
     }
@@ -1131,7 +1138,7 @@ mod tests {
         let error = write
             .execute(
                 serde_json::json!({"name": "verbatim", "description": "refined", "priority": 1}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("must refuse rather than write and explain");
@@ -1144,24 +1151,23 @@ mod tests {
         )
         .await;
         assert!(
-            text_of(&result).contains("(priority 1)"),
+            result.text_content().contains("(priority 1)"),
             "{}",
-            text_of(&result)
+            result.text_content()
         );
     }
 
     async fn run(tool: &dyn Tool, input: serde_json::Value) -> ToolOutput {
-        tool.execute(input, CancellationToken::new())
-            .await
-            .expect("tool should return Ok")
-    }
-
-    fn text_of(output: &ToolOutput) -> String {
-        crate::provider::ContentBlock::tool_result_text_content(&output.content)
+        tool.execute(
+            input,
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("tool should return Ok")
     }
 
     #[tokio::test]
-    async fn test_skill_write_creates_a_loadable_skill() {
+    async fn skill_write_creates_a_loadable_skill() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
@@ -1178,7 +1184,7 @@ mod tests {
             }),
         )
         .await;
-        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(!result.is_error, "{}", result.text_content());
 
         // Round-trips through discovery rather than just checking the bytes: what matters is that
         // the file this wrote is one the parser accepts, since a skill that fails to parse is
@@ -1194,15 +1200,17 @@ mod tests {
         assert_eq!(skill.author().as_deref(), Some(AGENT_AUTHOR));
 
         let read = SkillReadTool { skills };
-        let body = text_of(&run(&read, serde_json::json!({"name": "triage"})).await);
+        let body = run(&read, serde_json::json!({"name": "triage"}))
+            .await
+            .text_content();
         assert!(body.contains("1. Read the log."), "{}", body);
     }
 
-    /// An omitted `body` is "leave it alone", not "make it empty". A call that only re-prioritises
+    /// An omitted `body` is "leave it alone", not "make it empty". A call that only re-prioritizes
     /// a skill is one the schema invites, and treating the absent field as an empty string would
     /// delete the whole procedure on exactly that call.
     #[tokio::test]
-    async fn test_skill_write_without_body_keeps_the_existing_one() {
+    async fn skill_write_without_body_keeps_the_existing_one() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
@@ -1223,12 +1231,14 @@ mod tests {
             serde_json::json!({"name": "keep", "description": "second", "priority": 1}),
         )
         .await;
-        assert!(text_of(&result).contains("keeping the existing body"));
+        assert!(result.text_content().contains("keeping the existing body"));
 
         let read = SkillReadTool {
             skills: skills.clone(),
         };
-        let body = text_of(&run(&read, serde_json::json!({"name": "keep"})).await);
+        let body = run(&read, serde_json::json!({"name": "keep"}))
+            .await
+            .text_content();
         assert!(body.contains("PRECIOUS PROCEDURE"), "{}", body);
 
         let discovered = skills.current().await;
@@ -1242,7 +1252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_write_clears_the_body_on_an_explicit_empty_string() {
+    async fn skill_write_clears_the_body_on_an_explicit_empty_string() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
@@ -1261,7 +1271,9 @@ mod tests {
         .await;
 
         let read = SkillReadTool { skills };
-        let body = text_of(&run(&read, serde_json::json!({"name": "clear"})).await);
+        let body = run(&read, serde_json::json!({"name": "clear"}))
+            .await
+            .text_content();
         assert!(!body.contains("GONE"), "{}", body);
         // Pinned, not merely "GONE is absent": a skill *is* its body, so an emptied one falls back
         // to a bare heading rather than leaving `skill_read` with only the directory header.
@@ -1271,7 +1283,7 @@ mod tests {
     /// The name is joined onto the skills root, so this is the guard that keeps a read-permission
     /// tool from writing anywhere on disk.
     #[tokio::test]
-    async fn test_skill_write_rejects_a_traversing_name() {
+    async fn skill_write_rejects_a_traversing_name() {
         let temp = tempfile::tempdir().expect("tempdir");
         let write = SkillWriteTool {
             skills: cache_at(&temp),
@@ -1279,7 +1291,7 @@ mod tests {
         let result = write
             .execute(
                 serde_json::json!({"name": "../escape", "description": "d"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err(), "a traversing name must not reach the disk");
@@ -1294,7 +1306,7 @@ mod tests {
     /// Bundled files are part of a skill, so a delete that left them behind would produce a broken
     /// half-skill that discovery keeps warning about.
     #[tokio::test]
-    async fn test_skill_delete_removes_bundled_files_too() {
+    async fn skill_delete_removes_bundled_files_too() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "bundled", "---\ndescription: x\n---\nbody\n");
         std::fs::write(temp.path().join("bundled/helper.sh"), "#!/bin/sh\n").expect("write helper");
@@ -1303,25 +1315,25 @@ mod tests {
             skills: cache_at(&temp),
         };
         let result = run(&delete, serde_json::json!({"name": "bundled"})).await;
-        assert!(!result.is_error, "{}", text_of(&result));
+        assert!(!result.is_error, "{}", result.text_content());
         assert!(!temp.path().join("bundled").exists());
     }
 
     #[tokio::test]
-    async fn test_skill_delete_reports_a_missing_skill() {
+    async fn skill_delete_reports_a_missing_skill() {
         let temp = tempfile::tempdir().expect("tempdir");
         let delete = SkillDeleteTool {
             skills: cache_at(&temp),
         };
         let result = run(&delete, serde_json::json!({"name": "absent"})).await;
         assert!(result.is_error);
-        assert!(text_of(&result).contains("not found"));
+        assert!(result.text_content().contains("not found"));
     }
 
     /// A directory whose `SKILL.md` does not parse is absent from every index, so "not found" is a
     /// lie the user can disprove with `ls`. Both tools refuse it, and say which case it is.
     #[tokio::test]
-    async fn test_both_tools_distinguish_a_broken_skill_from_a_missing_one() {
+    async fn both_tools_distinguish_a_broken_skill_from_a_missing_one() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "broken", "no frontmatter at all\nKEEP ME\n");
         let skills = cache_at(&temp);
@@ -1331,7 +1343,7 @@ mod tests {
         };
         let result = run(&delete, serde_json::json!({"name": "broken"})).await;
         assert!(result.is_error);
-        let text = text_of(&result);
+        let text = result.text_content();
         assert!(text.contains("not a valid skill"), "{text}");
         assert!(!text.contains("not found"), "{text}");
 
@@ -1342,7 +1354,7 @@ mod tests {
         )
         .await;
         assert!(result.is_error);
-        assert!(text_of(&result).contains("not a valid skill"));
+        assert!(result.text_content().contains("not a valid skill"));
 
         assert!(
             std::fs::read_to_string(temp.path().join("broken/SKILL.md"))
@@ -1354,7 +1366,7 @@ mod tests {
     /// Searching bodies is the whole point: a skill whose description says nothing about the term
     /// is exactly the one the pushed index cannot help with.
     #[tokio::test]
-    async fn test_skill_search_matches_bodies_not_just_descriptions() {
+    async fn skill_search_matches_bodies_not_just_descriptions() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -1370,11 +1382,15 @@ mod tests {
         let search = SkillSearchTool {
             skills: cache_at(&temp),
         };
-        let text = text_of(&run(&search, serde_json::json!({"pattern": "kubectl"})).await);
+        let text = run(&search, serde_json::json!({"pattern": "kubectl"}))
+            .await
+            .text_content();
         assert!(text.contains("deploy:"), "{}", text);
         assert!(!text.contains("unrelated"), "{}", text);
 
-        let text = text_of(&run(&search, serde_json::json!({"pattern": "zzz-no-match"})).await);
+        let text = run(&search, serde_json::json!({"pattern": "zzz-no-match"}))
+            .await
+            .text_content();
         assert!(text.contains("No skills matched"), "{}", text);
     }
 
@@ -1382,7 +1398,7 @@ mod tests {
     /// agree by accident: a number outside the range is clamped, but a non-number is refused
     /// outright rather than silently becoming the default.
     #[tokio::test]
-    async fn test_skill_write_clamps_a_wild_priority_and_refuses_a_non_number() {
+    async fn skill_write_clamps_a_wild_priority_and_refuses_a_non_number() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
@@ -1408,7 +1424,7 @@ mod tests {
         let result = write
             .execute(
                 serde_json::json!({"name": "words", "description": "d", "priority": "high"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err(), "a non-number priority must not be guessed");
@@ -1417,7 +1433,7 @@ mod tests {
     /// The tail matters as much as the matches: without it a truncated result reads as the whole
     /// answer, which is the same failure the capped index exists to avoid.
     #[tokio::test]
-    async fn test_skill_search_reports_when_it_stopped_early() {
+    async fn skill_search_reports_when_it_stopped_early() {
         let temp = tempfile::tempdir().expect("tempdir");
         let body: String = (0..MAX_SEARCH_MATCHES + 20)
             .map(|index| format!("needle line {index}\n"))
@@ -1425,13 +1441,15 @@ mod tests {
         write_skill(
             temp.path(),
             "haystack",
-            &format!("---\ndescription: x\n---\n{}", body),
+            &format!("---\ndescription: x\n---\n{body}"),
         );
 
         let search = SkillSearchTool {
             skills: cache_at(&temp),
         };
-        let text = text_of(&run(&search, serde_json::json!({"pattern": "needle"})).await);
+        let text = run(&search, serde_json::json!({"pattern": "needle"}))
+            .await
+            .text_content();
         assert_eq!(
             text.lines().filter(|l| l.contains("needle")).count(),
             MAX_SEARCH_MATCHES
@@ -1440,7 +1458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_search_rejects_an_invalid_regex() {
+    async fn skill_search_rejects_an_invalid_regex() {
         let temp = tempfile::tempdir().expect("tempdir");
         let search = SkillSearchTool {
             skills: cache_at(&temp),
@@ -1448,7 +1466,7 @@ mod tests {
         let result = search
             .execute(
                 serde_json::json!({"pattern": "[unclosed"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err());
@@ -1457,14 +1475,14 @@ mod tests {
     /// A rootless cache means "nowhere to write to", which is a different failure from an empty
     /// store and has to say so rather than reporting success against a path that does not exist.
     #[tokio::test]
-    async fn test_write_without_a_root_fails_with_a_reason() {
+    async fn write_without_a_root_fails_with_a_reason() {
         let write = SkillWriteTool {
             skills: SkillCache::for_root(None),
         };
         let error = write
             .execute(
                 serde_json::json!({"name": "x", "description": "d"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a rootless cache has nowhere to write");
@@ -1474,11 +1492,11 @@ mod tests {
     /// An omitted priority keeps the one the skill already has, matching `PUT /v1/skills` and this
     /// tool's own "omit body and whatever the skill already documented is kept".
     ///
-    /// Reading the absence as the default demoted a prioritised skill every time the agent refined
+    /// Reading the absence as the default demoted a prioritized skill every time the agent refined
     /// its text. Priority orders the `[Skills]` index the model reads *and* decides which entries
     /// the index cap drops, so the demotion can take the skill out of view entirely.
     #[tokio::test]
-    async fn test_skill_write_keeps_an_omitted_priority() {
+    async fn skill_write_keeps_an_omitted_priority() {
         let temp = tempfile::tempdir().expect("tempdir");
         let skills = cache_at(&temp);
         let write = SkillWriteTool {
@@ -1496,9 +1514,9 @@ mod tests {
         )
         .await;
         assert!(
-            text_of(&result).contains("(priority 1)"),
+            result.text_content().contains("(priority 1)"),
             "the confirmation must state what landed: {}",
-            text_of(&result)
+            result.text_content()
         );
 
         let discovered = skills.current().await;

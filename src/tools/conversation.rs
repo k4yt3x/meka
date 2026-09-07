@@ -8,23 +8,18 @@
 //! exists to take a turn back, and a search that could hand it straight back to the model would
 //! defeat it. Those turns remain on disk and in `meka session export`.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::{
     Tool, ToolOutput,
     util::{MAX_SEARCH_MATCHES, compile_user_regex, require_str, resolve_session_id},
 };
 use crate::{
-    conversation::Event,
+    conversation::{ContentBlock, Event, Message, Role},
     error::{MekaError, Result},
     permission::Permission,
-    provider::{ContentBlock, Message, Role, ToolDefinition},
-    session::SessionManager,
+    provider::ToolDefinition,
+    store::Store,
 };
 
 /// Default number of matches `conversation_search` returns when the caller doesn't set `limit`.
@@ -51,6 +46,8 @@ fn append_messages(events: &[Event]) -> Vec<&Message> {
         match event {
             Event::Append(message) => messages.push(message),
             Event::CompactBoundary { .. } => {}
+            // Skipped: it changes an image into a note, and images are not searchable either way.
+            Event::Redact { .. } => {}
             // Applied rather than skipped: a repaired message is what the model actually saw, so
             // searching the superseded original would surface content that is no longer in the
             // conversation. Unlike a boundary this can shift indices, but only across a repair,
@@ -75,6 +72,8 @@ fn searchable_text(message: &Message) -> String {
     for block in &message.content {
         match block {
             ContentBlock::Text { text } => segments.push(text.clone()),
+            // meka's own per-turn preamble, restated every turn; not part of the conversation.
+            ContentBlock::TurnContext { .. } => {}
             ContentBlock::Thinking { thinking, .. } => {
                 segments.push(format!("[thinking] {thinking}"))
             }
@@ -109,6 +108,8 @@ fn render_message_full(message: &Message) -> String {
     for block in &message.content {
         match block {
             ContentBlock::Text { text } => segments.push(text.clone()),
+            // meka's own per-turn preamble, restated every turn; not part of the conversation.
+            ContentBlock::TurnContext { .. } => {}
             ContentBlock::Thinking { thinking, .. } => {
                 segments.push(format!("[thinking]\n{thinking}"))
             }
@@ -260,8 +261,13 @@ fn read_messages(events: &[Event], start: usize, count: usize) -> Result<String>
 
     let mut output = String::new();
     writeln!(output, "Messages #{start}..#{end} of {total}:\n").ok();
-    for index in start..=end {
-        let message = messages[index - 1];
+    for (position, message) in messages
+        .iter()
+        .enumerate()
+        .skip(start - 1)
+        .take(end - start + 1)
+    {
+        let index = position + 1;
         writeln!(output, "#{index} [{}]", role_label(&message.role)).ok();
         output.push_str(&render_message_full(message));
         output.push_str("\n\n");
@@ -270,8 +276,8 @@ fn read_messages(events: &[Event], start: usize, count: usize) -> Result<String>
 }
 
 pub(super) struct ConversationSearchTool {
-    pub session_manager: SessionManager,
-    pub session_id: Arc<RwLock<Option<Uuid>>>,
+    pub(crate) store: Store,
+    pub(crate) site: crate::session::ToolSite,
 }
 
 #[async_trait]
@@ -284,7 +290,7 @@ impl Tool for ConversationSearchTool {
                  compaction summarized away and removed from your context. Returns matching lines, \
                  each tagged with its message index (#N) and role; follow up with `conversation_read` to \
                  read a full turn. Use this to recover a detail the compaction summary may have \
-                 omitted. Substring matching is case-insensitive; set `regex: true` to match \
+                 omitted. Substring matching is case-insensitive; set `is_regex: true` to match \
                  `query` as a case-sensitive regular expression. Large tool outputs appear as \
                  <large-output> references here; read their full content with `scratchpad_read`. \
                  Returns at most {MAX_SEARCH_MATCHES} matches."
@@ -294,14 +300,18 @@ impl Tool for ConversationSearchTool {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Text to search for (a literal substring unless `regex` is true)."
+                        "description": "Text to search for (a literal substring unless `is_regex` is true)."
                     },
-                    "regex": {
+                    "is_regex": {
                         "type": "boolean",
-                        "description": "Treat `query` as a regular expression instead of a literal substring. Default: false."
+                        "default": false,
+                        "description": "Treat `query` as a case-sensitive regular expression instead of a case-insensitive literal substring. Default: false."
                     },
                     "limit": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_SEARCH_MATCHES,
+                        "default": DEFAULT_CONVERSATION_SEARCH_LIMIT,
                         "description": format!("Maximum matches to return (max {MAX_SEARCH_MATCHES}). Default: {DEFAULT_CONVERSATION_SEARCH_LIMIT}.")
                     }
                 },
@@ -318,11 +328,11 @@ impl Tool for ConversationSearchTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let query = require_str(&input, "query", "conversation_search")?;
         let use_regex = input
-            .get("regex")
+            .get("is_regex")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         let limit = input
@@ -331,8 +341,8 @@ impl Tool for ConversationSearchTool {
             .map(|value| value as usize)
             .unwrap_or(DEFAULT_CONVERSATION_SEARCH_LIMIT);
 
-        let session_id = resolve_session_id(&self.session_id, "conversation_search").await?;
-        let events = self.session_manager.load_events(session_id).await?;
+        let session_id = resolve_session_id(&self.site.session_id, "conversation_search")?;
+        let events = self.store.load_events(session_id).await?;
         Ok(ToolOutput::text(
             search_events(&events, &query, use_regex, limit)?,
             false,
@@ -341,8 +351,8 @@ impl Tool for ConversationSearchTool {
 }
 
 pub(super) struct ConversationReadTool {
-    pub session_manager: SessionManager,
-    pub session_id: Arc<RwLock<Option<Uuid>>>,
+    pub(crate) store: Store,
+    pub(crate) site: crate::session::ToolSite,
 }
 
 #[async_trait]
@@ -353,7 +363,8 @@ impl Tool for ConversationReadTool {
             description: format!(
                 "Read the full content of conversation turns by message index, including turns \
                  compaction removed from your context. Use the #N indices reported by `conversation_search`. \
-                 Reads up to {MAX_CONVERSATION_READ_MESSAGES} messages starting at `start`."
+                 Reads `limit` consecutive messages starting at `start`, at most \
+                 {MAX_CONVERSATION_READ_MESSAGES} per call."
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -362,8 +373,11 @@ impl Tool for ConversationReadTool {
                         "type": "integer",
                         "description": "1-based message index to start reading from (the #N from `conversation_search`)."
                     },
-                    "count": {
+                    "limit": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_CONVERSATION_READ_MESSAGES,
+                        "default": 1,
                         "description": format!("Number of consecutive messages to read (max {MAX_CONVERSATION_READ_MESSAGES}). Default: 1.")
                     },
                     "scratchpad": {
@@ -384,7 +398,7 @@ impl Tool for ConversationReadTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let start = input
             .get("start")
@@ -394,16 +408,16 @@ impl Tool for ConversationReadTool {
                 tool_name: "conversation_read".to_string(),
                 message: "missing or invalid 'start' parameter".to_string(),
             })?;
-        let count = input
-            .get("count")
+        let limit = input
+            .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as usize)
             .unwrap_or(1);
 
-        let session_id = resolve_session_id(&self.session_id, "conversation_read").await?;
-        let events = self.session_manager.load_events(session_id).await?;
+        let session_id = resolve_session_id(&self.site.session_id, "conversation_read")?;
+        let events = self.store.load_events(session_id).await?;
         Ok(ToolOutput::text(
-            read_messages(&events, start, count)?,
+            read_messages(&events, start, limit)?,
             false,
         ))
     }

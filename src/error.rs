@@ -6,9 +6,14 @@ use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum MekaError {
+pub(crate) enum MekaError {
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// The caller asked for something that cannot be done as asked, in words meant for them: a
+    /// malformed archive, an id that names nothing, an option that contradicts another.
+    #[error("{0}")]
+    Usage(String),
 
     #[error("database error: {0}")]
     Database(String),
@@ -35,9 +40,23 @@ pub enum MekaError {
     /// *provider* refused a body and arms the turn's degrade path.
     ///
     /// Raised by the two agent builders as a backstop, and by the doors that have to refuse before
-    /// they write anything. Mapped to 422 by [`crate::server::reattach::agent_build_problem`].
+    /// they write anything. Mapped to 422 by [`crate::host::http::reattach::agent_build_problem`].
     #[error("{0}")]
     SessionNotDrivable(String),
+
+    /// The operator's installation is wrong in a way no caller can remedy: a `[web]` client that
+    /// cannot be built from its proxy URL or CA file, or a `base_url` whose shape a backend
+    /// refuses.
+    ///
+    /// Its own variant rather than [`Self::Config`] because the two travel differently. `Config`
+    /// is a refusal the caller can act on and every host relays it verbatim: a profile with no
+    /// stored credential names the login that fixes it. This one names paths and endpoints out of
+    /// `config.toml`, which are for the operator's terminal and not for a remote caller, so HTTP
+    /// answers a sanitized 500, ACP an `InternalError` without the text, and the REPL and CLI
+    /// print it. `crate::host::build_shared_deps` raises the web client's at startup, before any
+    /// session exists.
+    #[error("{0}")]
+    Installation(String),
 
     /// The provider rejected the request as malformed (HTTP 400 / 422 that isn't an overflow).
     /// Deterministic on the request body, so retrying it unchanged is pointless; distinct from
@@ -47,6 +66,18 @@ pub enum MekaError {
     /// fails the same way.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    /// meka's own refusal to send a body still over the profile's `max_request_bytes` once every
+    /// older image has been redacted.
+    ///
+    /// Not [`Self::InvalidRequest`], which means the *provider* refused a body and is published
+    /// with the provider's response beside it: this request never left the process and the
+    /// sentence is meka's own, naming the ceiling and the remedy, so every host relays it verbatim
+    /// as the caller's to act on. The agent loop answers it as it answers `InvalidRequest`, by
+    /// degrading what the turn appended, because once the older images are gone the newest content
+    /// is what is left to blame.
+    #[error("{0}")]
+    RequestTooLarge(String),
 
     /// A transient provider failure that is safe to retry with backoff. Distinct from
     /// [`Self::Provider`] so the agent loop can retry by type instead of matching error strings.
@@ -86,6 +117,34 @@ pub enum MekaError {
     #[error("session already attached by another process: {0}")]
     SessionLocked(uuid::Uuid),
 
+    /// The id names no session in the store. Raised by every door that looks a session up on a
+    /// caller's behalf, so each host maps it once: 404 on HTTP, `InvalidParams` on ACP, a non-zero
+    /// exit on the CLI.
+    #[error("session '{0}' not found")]
+    SessionNotFound(uuid::Uuid),
+
+    /// A turn holds the session's conversation and what the caller asked for cannot share it.
+    /// `doing` is the caller's verb phrase, so the sentence names the thing refused rather than
+    /// the thing running.
+    #[error("cannot {doing} while a turn is in flight; cancel it first")]
+    TurnInFlight { doing: &'static str },
+
+    /// A prompt with nothing in it: no text and no image. Refused before admission, which is why
+    /// it is not [`Self::InvalidRequest`]; that one means the provider rejected a body.
+    #[error("the prompt must contain non-empty text, or at least one image")]
+    EmptyPrompt,
+
+    /// A level `[permissions].enabled` does not admit, named beside the ones it does.
+    ///
+    /// Strings rather than `Permission` and `EnabledPermissions`: this module is a leaf and may
+    /// not name `crate::permission`, so the doors render both before raising it.
+    #[error("permission level '{level}' is not enabled (enabled: {})", enabled.join(", "))]
+    DisabledLevel { level: String, enabled: Vec<String> },
+
+    /// A profile name `config.toml` does not have, with the names it does.
+    #[error("{}", crate::text::unknown_name("profile", name, known))]
+    ProfileNotConfigured { name: String, known: Vec<String> },
+
     #[error("agent interrupted by user")]
     Interrupted,
 
@@ -117,15 +176,62 @@ pub enum MekaError {
     },
 
     /// MCP readiness gate rejected the turn: at least one server marked
-    /// [`crate::config::McpServerConfig::required`] wasn't `Connected` within the configured grace
-    /// period. Servers that aren't required never appear here. Turn contents haven't been sent to
-    /// the provider. The REPL catches this and loops back to the prompt; one-shot mode propagates
-    /// to a non-zero process exit.
-    #[error("mcp: {} server(s) not ready: {}", .servers.len(), .servers.iter().map(|(n, s)| format!("{} ({})", n, s)).collect::<Vec<_>>().join(", "))]
+    /// [`crate::config::McpServerConfig::required`] wasn't `Connected` within the configured
+    /// grace period. Servers that aren't required never appear here. Turn contents haven't been
+    /// sent to the provider. The REPL catches this and loops back to the prompt; one-shot mode
+    /// propagates to a non-zero process exit.
+    #[error("mcp: {} server(s) not ready: {}", .servers.len(), .servers.iter().map(|(n, s)| format!("{n} ({s})")).collect::<Vec<_>>().join(", "))]
     McpTurnGated { servers: Vec<(String, String)> },
 }
 
-pub type Result<T> = std::result::Result<T, MekaError>;
+pub(crate) type Result<T> = std::result::Result<T, MekaError>;
+
+/// The most of an upstream's response a host will repeat to a caller, in bytes.
+///
+/// Not a redaction measure: a length bound keeps the *start*, which is where an identifier sits in
+/// a JSON error object, so whether the text travels at all is `relay_provider_errors`'s decision
+/// and this only bounds what does. Bounded at all because the text is attacker-influenced and
+/// repeated to more than one reader: it arrives from `response.text()` with no cap of its own, it
+/// is copied into every failure a host reports, and the HTTP host retains the terminal event
+/// carrying it for reconnects. A `base_url` is user-supplied, so a misconfigured endpoint answering
+/// a multi-megabyte error page should cost a truncated string rather than a copy per reader.
+///
+/// Far above any real provider error, which run to a few hundred bytes of JSON.
+pub(crate) const RELAYED_BODY_CAP: usize = 4 * crate::text::KIB;
+
+/// Truncation marker, charged against [`RELAYED_BODY_CAP`] rather than added on top of it.
+pub(crate) const TRUNCATION_MARKER: &str = "… (truncated; the full text is in the log)";
+
+/// The two constants above are subtracted from each other, so their relationship is load-bearing
+/// rather than incidental. Asserted at compile time because the failure is otherwise a runtime
+/// panic inside a handler, on attacker-influenced input: the subtraction underflows, and a wrapped
+/// `usize` then indexes far past the end of the string.
+const _: () = assert!(
+    RELAYED_BODY_CAP > TRUNCATION_MARKER.len() + 4,
+    "RELAYED_BODY_CAP must exceed the marker by at least one UTF-8 character, or \
+     `bounded_upstream_body` underflows its budget"
+);
+
+/// Repeat at most [`RELAYED_BODY_CAP`] bytes of `message`, marking the cut when one happens.
+///
+/// Shared by the HTTP host's `provider_response` member and the ACP host's `error.data`, so the
+/// two cannot disagree about how much of an upstream a caller sees. The result never exceeds the
+/// cap and is never longer than the input, because the marker comes out of the budget instead of
+/// being appended to it. Added on top, a body a few bytes over the cap came back larger than it
+/// went in, while telling the reader it had been shortened.
+///
+/// Cuts on a character boundary. Multi-byte text is ordinary here -- a provider error in Japanese,
+/// an emoji in a proxy's HTML page -- and slicing mid-codepoint panics.
+pub(crate) fn bounded_upstream_body(message: &str) -> String {
+    if message.len() <= RELAYED_BODY_CAP {
+        return message.to_string();
+    }
+    let mut end = RELAYED_BODY_CAP - TRUNCATION_MARKER.len();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &message[..end], TRUNCATION_MARKER)
+}
 
 /// What a response is answering, which decides whether a 400 or 422 is worth
 /// [`MekaError::InvalidRequest`].
@@ -140,7 +246,7 @@ pub(crate) enum ProviderRequest {
     /// Only this one lets [`provider_http_error`] answer [`MekaError::InvalidRequest`], because
     /// that variant does not mean "the request was malformed". It means "degrade the content this
     /// turn appended and try again", which is a coherent instruction only when the request carries
-    /// turn content. (`crate::memory::store` constructs the variant too, for a different reason;
+    /// turn content. (`crate::store::memory` constructs the variant too, for a different reason;
     /// its errors are absorbed into a tool result and never reach the agent loop's repair arm.)
     Completion,
     /// Anything else meka asks a provider: a usage or identity probe, a history fetch.
@@ -170,7 +276,7 @@ pub(crate) enum ProviderRequest {
 /// why the status is the half worth trusting when the two disagree.
 ///
 /// The 400 / 422 bucket deliberately makes no attempt to tell a content problem from a parameter
-/// problem: a `max_tokens` above the model's ceiling, an unknown beta header and a mislabelled
+/// problem: a `max_tokens` above the model's ceiling, an unknown beta header and a mislabeled
 /// image all arrive in the same shape. The agent loop restores what it degraded when the retry also
 /// fails, so classifying too broadly here costs one round trip and destroys nothing.
 ///
@@ -227,7 +333,7 @@ pub(crate) fn provider_http_error(
 ///
 /// The companion to [`provider_http_error`]: a call either yields a response to judge by status,
 /// which that function does, or leaves the caller nothing to act on, which this one judges. The
-/// default is [`MekaError::RetryableProvider`], and an unrecognised reqwest error kind inherits it
+/// default is [`MekaError::RetryableProvider`], and an unrecognized reqwest error kind inherits it
 /// rather than becoming terminal.
 ///
 /// Retrying is not free at every site. A body read that fails on a completion was already generated
@@ -266,48 +372,89 @@ pub(crate) fn provider_transport_error(
     }
 }
 
-/// Classify an OAuth token exchange the authorisation server *answered*, whether by rejecting it or
-/// by returning a success meka could not read back.
+/// Classify an OAuth token exchange the authorization server *answered*, whether by rejecting it or
+/// by returning a success meka failed to read back.
 ///
-/// The third member of the family, and it exists because a refresh consumes its request.
-/// [`provider_transport_error`]'s rule rests on an attempt leaving the request unchanged, so that
-/// asking again costs another round trip and nothing else. A refresh token under RFC 9700 rotation
-/// is single-use: once the server has read it, it is spent and its replacement is in a response
-/// meka may not be holding. Sending it a second time is a replay rather than a repeat, and §4.14.2
-/// has the server revoke the whole token family when it detects one, which costs a browser login
-/// rather than a round trip.
+/// A refresh consumes its request: under RFC 9700 rotation the refresh token is single-use, so once
+/// the server has read it, it is spent and its replacement is in a response meka may not be
+/// holding. Sending it again is a replay, and §4.14.2 has the server revoke the whole token family
+/// on one, which costs a browser login rather than a round trip. So the split is by what the answer
+/// implies about the token, not by whether one arrived: a 429 was refused before the grant was
+/// read and a 5xx usually means the server is unwell rather than that the grant is bad, so both
+/// retry in the ordinary way; that accepts the issuer that rotates and *then* fails. Everything
+/// else is terminal *and says how to recover*, because the user of a dead grant is otherwise handed
+/// `OAuth token refresh failed (400): {"error":"invalid_grant"}` with no hint that a login is the
+/// remedy. A success whose body cannot be decoded is terminal too: the server accepted the token,
+/// so it is certainly spent.
 ///
-/// So the split here is by what the answer most likely implies about the token, not by whether one
-/// arrived. A 429 was refused before the grant was read; a 5xx usually means the server is unwell
-/// rather than that the grant is bad, so both retry in the ordinary way. Without it a 503 from the
-/// token endpoint ends the turn while a 503 from the completions endpoint two lines later is
-/// retried. "Usually" is doing real work in that sentence and is not worth rounding off: an issuer
-/// that rotates the grant and *then* fails, or a gateway answering 502 in front of one that already
-/// committed, leaves the retries replaying a spent token with the consequence described above. The
-/// trade is deliberate rather than free, and it is the same one the transport branch makes for the
-/// same reason. Everything else is terminal *and says how to recover*, because the user of a dead
-/// grant is otherwise handed `OAuth token refresh failed (400): {"error":"invalid_grant"}` with no
-/// hint that a login is the remedy. A success whose body could not be decoded belongs on that side
-/// too, and is the sharpest case of all: the server accepted the token, so it is certainly spent
-/// and no retry can succeed.
+/// A transport failure stays with [`provider_transport_error`]: the token's fate is unknown, and a
+/// token spent without meka seeing the replacement is already dead, so retrying is right when the
+/// request never landed and no worse than inaction when it did. Not [`provider_http_error`] with
+/// [`ProviderRequest::Auxiliary`] either: that one sniffs the body for the model's context-window
+/// phrases first, which is meaningless from a token endpoint, and has no remedy to attach.
+/// A mid-stream error event, classified by the code the backend put on it. The codes each backend
+/// documents as transient are retryable; anything else, including a code this build does not know,
+/// is permanent, so a real problem surfaces at once instead of burning the retry budget first.
 ///
-/// The transport failure that precedes all of this stays with [`provider_transport_error`]. It is
-/// the one case where the token's fate is unknown -- usually the request never landed, occasionally
-/// it landed and the reply was lost -- and retrying is right for the first and no worse than
-/// inaction for the second, since a token spent without meka seeing the replacement is already dead
-/// and the next turn would replay it anyway. What this function adds is that the replay's rejection
-/// now names its own remedy instead of looking like an outage.
+/// Never `server_error_on_completion`, even though a completion was in flight: the event arrives
+/// on the stream, where an overload cannot be told from a failure to handle the body, so it does
+/// not license deleting content.
+pub(crate) fn provider_stream_error(code: &str, message: String) -> MekaError {
+    match code {
+        // Anthropic `error.type`.
+        "overloaded_error" | "rate_limit_error" | "api_error"
+        // OpenAI Responses `error.code`.
+        | "server_error" | "rate_limit_exceeded" | "overloaded" => MekaError::RetryableProvider {
+            message,
+            retry_after: None,
+            server_error_on_completion: false,
+        },
+        _ => MekaError::Provider(message),
+    }
+}
+
+/// [`provider_stream_error`] for an OpenAI-shaped error object: `{"code", "type", "message"}`.
 ///
-/// Not [`provider_http_error`] with [`ProviderRequest::Auxiliary`], which splits on the same
-/// statuses: that one sniffs the body for the model's context-window phrases first, which is
-/// meaningless from a token endpoint, and it has no remedy to attach and no business knowing a
-/// profile name.
+/// `code` is read as a string when it is one, and as an HTTP status when it is a number, which is
+/// how OpenRouter and other gateways relay the upstream status inside a 200 stream; a numeric 429
+/// or 5xx is then retried as the same status arriving as a response would be. Read as a string
+/// only, every numeric code was "unknown" and a mid-stream rate limit ended the turn where the
+/// same limit on the headers would have backed off. `type` is the fallback when there is no string
+/// code, and `fallback_message` stands in for a missing `message`.
+pub(crate) fn provider_stream_error_object(
+    error: &serde_json::Value,
+    fallback_message: &str,
+) -> MekaError {
+    let message = error
+        .get("message")
+        .and_then(|value| value.as_str())
+        .unwrap_or(fallback_message)
+        .to_string();
+    if let Some(status) = error.get("code").and_then(|value| value.as_u64()) {
+        return if status == 429 || (500..600).contains(&status) {
+            MekaError::RetryableProvider {
+                message,
+                retry_after: None,
+                server_error_on_completion: false,
+            }
+        } else {
+            MekaError::Provider(message)
+        };
+    }
+    let code = error
+        .get("code")
+        .and_then(|value| value.as_str())
+        .or_else(|| error.get("type").and_then(|value| value.as_str()))
+        .unwrap_or("unknown");
+    provider_stream_error(code, message)
+}
+
 pub(crate) fn oauth_refresh_error(
     context: &str,
     status: reqwest::StatusCode,
     detail: &str,
     retry_after: Option<Duration>,
-    profile: &str,
+    account: &str,
 ) -> MekaError {
     let message = format!("{} ({}): {}", context, status, render_error_body(detail));
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
@@ -319,7 +466,7 @@ pub(crate) fn oauth_refresh_error(
         }
     } else {
         MekaError::Provider(format!(
-            "{message}; run `meka provider login {profile}` to sign in again"
+            "{message}; run `meka account login {account}` to sign in again"
         ))
     }
 }
@@ -396,8 +543,166 @@ pub(crate) fn format_reqwest_error(error: &reqwest::Error) -> String {
 mod tests {
     use super::*;
 
+    /// A missing profile is refused in the one "no such name" sentence, with what exists beside it.
     #[test]
-    fn test_provider_http_error_maps_overflow() {
+    fn a_missing_profile_is_refused_beside_the_configured_ones() {
+        assert_eq!(
+            MekaError::ProfileNotConfigured {
+                name: "ghost".to_string(),
+                known: vec!["work".to_string(), "personal".to_string()],
+            }
+            .to_string(),
+            "no profile named 'ghost' (configured: work, personal)"
+        );
+        assert_eq!(
+            MekaError::ProfileNotConfigured {
+                name: "ghost".to_string(),
+                known: Vec::new(),
+            }
+            .to_string(),
+            "no profile named 'ghost' (none configured)"
+        );
+    }
+
+    /// The size bound never exceeds the cap, never grows the input, and cuts on a character
+    /// boundary.
+    ///
+    /// The four-byte case carries a one-byte prefix on purpose: `RELAYED_BODY_CAP` is 4096, which
+    /// is itself divisible by four, so an unprefixed run of four-byte characters lands the cut on a
+    /// boundary already and a naive slice would pass. Only a misaligned input exercises the walk.
+    #[test]
+    fn the_relayed_body_is_bounded_and_cut_on_a_character_boundary() {
+        for (label, body) in [
+            ("three-byte", "\u{3042}".repeat(RELAYED_BODY_CAP)),
+            (
+                "four-byte misaligned",
+                format!("a{}", "\u{1F642}".repeat(RELAYED_BODY_CAP)),
+            ),
+            (
+                "mixed",
+                format!(
+                    "{}{}",
+                    "a".repeat(RELAYED_BODY_CAP - 1),
+                    "\u{3042}".repeat(16)
+                ),
+            ),
+            // Just over the cap, which is the one size a bound must not grow: adding a marker on
+            // top would return more bytes than it was given.
+            ("one byte over", "a".repeat(RELAYED_BODY_CAP + 1)),
+        ] {
+            let out = bounded_upstream_body(&body);
+            assert!(
+                out.len() <= RELAYED_BODY_CAP,
+                "{label}: a bound that can be exceeded is not one; got {} bytes",
+                out.len()
+            );
+            assert!(
+                out.len() <= body.len(),
+                "{label}: truncation must not grow the input; {} -> {}",
+                body.len(),
+                out.len()
+            );
+            assert!(out.contains("truncated"), "{label} must mark the cut");
+            assert!(
+                body.starts_with(&out[..out.len() - TRUNCATION_MARKER.len()]),
+                "{label}: the kept part must be the input's own prefix, which is where a \
+                 provider's error type sits"
+            );
+        }
+        let exact = "x".repeat(RELAYED_BODY_CAP);
+        assert_eq!(
+            bounded_upstream_body(&exact),
+            exact,
+            "a body exactly at the cap is relayed whole, not marked truncated"
+        );
+    }
+
+    /// A gateway relaying the upstream status as a numeric `code` inside a 200 stream is read like
+    /// the status itself: 429 and 5xx retry, anything else is permanent. Read as a string only,
+    /// every number was "unknown" and a mid-stream rate limit ended the turn.
+    #[test]
+    fn a_numeric_stream_error_code_is_read_as_a_status() {
+        for status in [429, 500, 502, 529] {
+            let error = provider_stream_error_object(
+                &serde_json::json!({"code": status, "message": "later"}),
+                "fallback",
+            );
+            assert!(
+                matches!(error, MekaError::RetryableProvider { ref message, .. } if message == "later"),
+                "{status}: {error:?}"
+            );
+        }
+        for status in [400, 401, 404] {
+            let error = provider_stream_error_object(
+                &serde_json::json!({"code": status, "message": "no"}),
+                "fallback",
+            );
+            assert!(
+                matches!(error, MekaError::Provider(ref message) if message == "no"),
+                "{status}: {error:?}"
+            );
+        }
+        // A string code goes through the documented list; `type` stands in when there is none, and
+        // the fallback message when the object names none.
+        assert!(matches!(
+            provider_stream_error_object(&serde_json::json!({"code": "server_error"}), "fallback"),
+            MekaError::RetryableProvider { ref message, .. } if message == "fallback"
+        ));
+        assert!(matches!(
+            provider_stream_error_object(&serde_json::json!({"type": "overloaded_error"}), "x"),
+            MekaError::RetryableProvider { .. }
+        ));
+        assert!(matches!(
+            provider_stream_error_object(
+                &serde_json::json!({"type": "invalid_request_error"}),
+                "x"
+            ),
+            MekaError::Provider(_)
+        ));
+    }
+
+    #[test]
+    fn a_stream_error_is_retryable_only_for_a_documented_transient_code() {
+        for code in [
+            "overloaded_error",
+            "rate_limit_error",
+            "api_error",
+            "server_error",
+            "rate_limit_exceeded",
+            "overloaded",
+        ] {
+            assert!(
+                matches!(
+                    provider_stream_error(code, "x".to_string()),
+                    MekaError::RetryableProvider {
+                        server_error_on_completion: false,
+                        ..
+                    }
+                ),
+                "{code} is documented as transient"
+            );
+        }
+        for code in [
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "not_found_error",
+            "invalid_prompt",
+            "unknown",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    provider_stream_error(code, "x".to_string()),
+                    MekaError::Provider(_)
+                ),
+                "{code} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_http_error_maps_overflow() {
         // Anthropic: 400 invalid_request_error / "prompt is too long".
         assert!(matches!(
             provider_http_error(
@@ -440,7 +745,7 @@ mod tests {
     /// call's outage licenses a degrade whose successful retry is then written to the store as
     /// proven-good.
     #[test]
-    fn test_only_a_server_error_answering_a_completion_may_blame_the_content() {
+    fn only_a_server_error_answering_a_completion_may_blame_the_content() {
         let flag = |status, request| match provider_http_error(
             status,
             "upstream said no",
@@ -489,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_http_error_maps_other_as_provider() {
+    fn provider_http_error_maps_other_as_provider() {
         // Nothing the agent loop can repair: the credentials or the endpoint are wrong.
         assert!(matches!(
             provider_http_error(
@@ -512,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_http_error_maps_malformed_request() {
+    fn provider_http_error_maps_malformed_request() {
         assert!(matches!(
             provider_http_error(
                 reqwest::StatusCode::BAD_REQUEST,
@@ -536,7 +841,7 @@ mod tests {
     /// An overflow also arrives as a 400 `invalid_request_error`, and compacting is the right
     /// response to it rather than degrading content.
     #[test]
-    fn test_provider_http_error_overflow_takes_priority_over_invalid_request() {
+    fn provider_http_error_overflow_takes_priority_over_invalid_request() {
         assert!(matches!(
             provider_http_error(
                 reqwest::StatusCode::BAD_REQUEST,
@@ -796,7 +1101,7 @@ mod tests {
     /// A rejected refresh is terminal, and says what to do about it.
     ///
     /// Two failures in one, and they are separate. Treating a dead grant as retryable sends the
-    /// agent loop back at the authorisation server three more times with a token it has already
+    /// agent loop back at the authorization server three more times with a token it has already
     /// refused, and a terminal error with no remedy leaves the user reading `invalid_grant` with
     /// nothing to act on. The profile has to be named because two accounts of one backend can
     /// coexist, so "log in again" alone does not say where.
@@ -813,7 +1118,7 @@ mod tests {
             panic!("a refused grant must not be retried, got: {error:?}");
         };
         assert!(message.contains("invalid_grant"), "{message}");
-        assert!(message.contains("meka provider login work"), "{message}");
+        assert!(message.contains("meka account login work"), "{message}");
     }
 
     /// A token endpoint that is merely unwell is retried, hint and all.
@@ -821,8 +1126,8 @@ mod tests {
     /// The bug the split exists for: without it a 503 here ends the turn while a 503 from the
     /// completions endpoint two lines later is retried, and since the refresh runs inside
     /// `complete`/`stream` it takes the turn down with it. Neither status usually means the grant
-    /// was read, which is the judgement `oauth_refresh_error` documents and hedges; this asserts
-    /// the classification that follows from it, not the judgement itself.
+    /// was read, which is the judgment `oauth_refresh_error` documents and hedges; this asserts
+    /// the classification that follows from it, not the judgment itself.
     #[test]
     fn an_unwell_token_endpoint_is_retried() {
         for status in [
@@ -857,7 +1162,7 @@ mod tests {
     #[test]
     fn a_success_that_could_not_be_read_back_is_terminal() {
         let error = oauth_refresh_error(
-            "OAuth token refresh returned a response that could not be read",
+            "OAuth token refresh failed to read the response",
             reqwest::StatusCode::OK,
             "error decoding response body",
             None,
@@ -866,10 +1171,7 @@ mod tests {
         let MekaError::Provider(message) = error else {
             panic!("the grant was accepted, so nothing is left to retry: {error:?}");
         };
-        assert!(
-            message.contains("meka provider login personal"),
-            "{message}"
-        );
+        assert!(message.contains("meka account login personal"), "{message}");
     }
 
     /// A route that loops is not retried either, for the same reason: it is a property of the
@@ -931,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_http_error_maps_retryable() {
+    fn provider_http_error_maps_retryable() {
         // 429 rate limit.
         assert!(matches!(
             provider_http_error(
@@ -956,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_http_error_retryable_carries_retry_after() {
+    fn provider_http_error_retryable_carries_retry_after() {
         let delay = Duration::from_secs(7);
         match provider_http_error(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -975,7 +1277,7 @@ mod tests {
     ///
     /// Consulting the body before the status classifies a 500 mentioning the context window as an
     /// overflow. The body is not meka's to trust that far. A server that fails while echoing the
-    /// request back -- which this module's own callers record as real behaviour -- turned a
+    /// request back -- which this module's own callers record as real behavior -- turned a
     /// transient 500 into an emergency compaction, so a turn whose text merely discussed
     /// `context_length_exceeded` had its context destroyed to answer a blip, and skipped both the
     /// retry and the outage reprieve on the way.
@@ -1036,7 +1338,7 @@ mod tests {
                     ),
                     MekaError::ContextOverflow(_)
                 ),
-                "'{phrase}' is a shape a backend actually sends and has to be recognised alone"
+                "'{phrase}' is a shape a backend actually sends and has to be recognized alone"
             );
         }
         assert!(
@@ -1088,20 +1390,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_retry_after_present_integer_seconds() {
+    fn parse_retry_after_present_integer_seconds() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
         assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(30)));
     }
 
     #[test]
-    fn test_parse_retry_after_absent() {
+    fn parse_retry_after_absent() {
         let headers = reqwest::header::HeaderMap::new();
         assert_eq!(parse_retry_after(&headers), None);
     }
 
     #[test]
-    fn test_parse_retry_after_ignores_http_date_form() {
+    fn parse_retry_after_ignores_http_date_form() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::RETRY_AFTER,
@@ -1111,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_retry_after_ignores_malformed_value() {
+    fn parse_retry_after_ignores_malformed_value() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::RETRY_AFTER,

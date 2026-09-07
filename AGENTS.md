@@ -69,7 +69,7 @@ A hardcoded fact about an external system expires, and nothing in the build noti
 - **The user owns it**: anything neither side can determine, or where a wrong guess is invisible. One
   config key, one documented default. Don't infer, probe, or cache. State that default in the docs
   and, where a setup flow exists, on screen.
-- **We own it**: our own names, schema, and defaults for our own behaviour. Encoding these is fine.
+- **We own it**: our own names, schema, and defaults for our own behavior. Encoding these is fine.
 
 A guess is tolerable when its wrong answer is a *rejected request* and it fails toward omission. A
 guess that fails toward *sending* survives only where the endpoint cannot vary, so never introduce one
@@ -87,14 +87,17 @@ assumption is the entire return, and it is lost the moment a second place tolera
 - Update `CHANGELOG.md` for every meaningful change, under `[Unreleased]`.
 - [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). Only Added, Changed, Deprecated,
   Removed, Fixed and Security, grouped by type.
-- `Fixed` = the behaviour was wrong. `Changed` = it worked as intended and now works differently.
+- `Fixed` = the behavior was wrong. `Changed` = it worked as intended and now works differently.
 - Around 100 characters per entry.
 - Breaking changes get an inline `**Breaking:**` prefix inside their type, not a separate section.
 - Lead a `Security` entry with its CVE id when one exists.
 
 ## Prose style
 
-Avoid em dashes (`—`).
+- American spelling (behavior, color, canceled, catalog) in prose, comments, docs and strings.
+  Protocol and API names keep their own (`initialize`, `authorization_code`, `serde::Serialize`).
+- No em dashes (`—`). Prefer a colon, a comma or parentheses.
+- Sentence-case headings in the book; product names keep their case.
 
 ---
 
@@ -124,6 +127,25 @@ Avoid em dashes (`—`).
   });
   ```
 
+## Names and visibility
+
+- Test names read as sentences: `a_fork_keeps_its_images_when_the_source_is_deleted`, never a
+  `test_` prefix. A test-only constructor is `for_test()` or ends in `_for_test`.
+- `new` is infallible; `open`, `from_*` and `resolve` are fallible. No `fresh`, `try_new` or
+  `from_connection`. Predicates are `is_*`; the feature-on question is `is_enabled()`.
+- `pub(crate)` for anything another module reads, `pub(super)` for a parent alone, never bare `pub`
+  in this binary crate; child modules are `pub(crate) mod`.
+- Every public item has a `///` comment, except an axum handler (its route documents it) and a
+  tool's struct (its `definition()` does).
+- Time is a `Duration` constant; `_MILLIS`/`_SECONDS` only for an integer that goes on a wire. Sizes
+  are `_BYTES` or `_CHARS`, never `_LEN`, `_LIMIT` or `_CAP`; a MiB literal goes through the named
+  `MIB`. Terminal display goes through `text::format_timestamp` and `text::format_size`; the wire
+  carries RFC 3339 and raw byte counts.
+- A value enum with a wire spelling follows `Backend`: one `const fn name()`, `Display` and
+  `FromStr` derived from an `ALL` table plus `name()`, serde through `try_from = "String"` and
+  `into = "String"`, clap parsers `.parse()`. One spelling per value; no aliases, no alternates.
+  Values a model emits (todo status words) are the one exception.
+
 ## Build gate
 
 Run after editing: `cargo +nightly fmt` and `cargo sort -w`.
@@ -136,9 +158,10 @@ cargo +nightly fmt --check
 cargo sort -w --check
 cargo clippy --locked --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
-cargo test --locked
+cargo test --locked                  # CI adds --features mock-provider; debug builds carry it anyway
 cargo check --locked --all-targets   # on the MSRV in Cargo.toml's rust-version
 mdbook build docs/book
+python3 scripts/migrate-0.45-to-0.46.py --self-test   # needs tomlkit; CI also dry-runs the fixture
 ```
 
 `--all-targets` matters: plain clippy skips tests and benches. In rustdoc, watch
@@ -152,18 +175,46 @@ what it prints, or break it by hand.
 
 ## Clap help text
 
-`///` doc comments must render within 80 columns under `-h`. Verify by running the binary for every
-changed subcommand: source length ignores clap's indent, value-name width, and auto-appended hints.
-Adding flags widens the whole column, so a new flag can push existing lines over.
+`///` doc comments must render within 120 columns under `-h`, and stay as short as they can: no
+examples, no tautology, one line where one line says it. Verify by running the binary with
+`COLUMNS=120` for every changed subcommand: source length ignores clap's indent, value-name width,
+and auto-appended hints. Adding flags widens the whole column, so a new flag can push existing lines
+over.
 
-Put `Examples:` and other long-form prose after a blank `///` line so it appears only under `--help`.
-When that prose is multi-line or indented, add `#[command(verbatim_doc_comment)]`.
+Long-form prose goes after a blank `///` line so it appears only under `--help`. When that prose is
+multi-line or indented, add `#[command(verbatim_doc_comment)]`.
 
 Command summaries take no trailing period; multi-sentence prose is punctuated normally.
 
 ---
 
 # meka
+
+## Vocabulary
+
+One word per concept, everywhere it is written or read:
+
+- **permission level**, never "mode": `level` in prose, `permission` in identifiers. ACP's own
+  `set_mode` and `mode_id` keep their protocol names.
+- **profile**, **account**, **backend**. "Provider" is only the upstream service and the `Provider`
+  trait: "provider temporarily unavailable" is right, "provider profile" is not.
+- **store** for the `Store`: `store` in identifiers, "the store" in prose, `meka.db` for the file.
+  `manager` is only `McpClientManager`.
+- **sub-agent** as the noun; "worker" only when the orchestration role is the point; never
+  "delegate" as a noun. Depth 0 is the **root**, the spawner is the **parent**.
+- **scratchpad entry** in every string and identifier; the SQL table `tool_outputs` keeps its name.
+- **approvals** is the switch; the prompt is an **approval prompt** with the header `[approval]`;
+  its answers are allow and deny.
+- **standing instructions** for the concept; "instructions file" only for the file on disk.
+- **id** lowercase; "UUID" only where the format is the point.
+- Refusal verbs: *refuse* is meka's own decision; *reject* is a remote party (a provider, an MCP
+  server); *deny* is the OS, a permission, or the user's answer; *decline* is a gate or the model.
+- Quoting in a message: backticks for keys, commands and code (`` `[permissions].default` ``,
+  `` `meka profile use` ``); single quotes for values and names (`'work'`). An unknown name is
+  reported through `text::unknown_name`, never a per-door sentence.
+- An empty list says "No <nouns>." on stderr. A status line that is a full sentence ends in a
+  period ("Connected to 'exa'."); one that ends in a value, id or path does not ("Profile set
+  to: work").
 
 ## Output: prints vs. tracing
 
@@ -182,56 +233,69 @@ The stream is a contract:
 
 Litmus test: `meka ... 2>/dev/null | next-tool` must leave only the requested data on stdout.
 
-Levels: `error!` for an unrecoverable failure about to propagate; `warn!` for a recoverable fallback
-or rollback the user should see by default; `info!` for lifecycle signposts; `debug!` for
-module-level diagnostics.
+Levels: `error!` for an unrecoverable failure about to propagate or a turn whose outcome is lost;
+`warn!` for a recoverable fallback, a rollback, or a lost write the user can act on (never `debug!`
+for one); `info!` for lifecycle signposts; `debug!` for module-level diagnostics. Every log string
+uses inline captures (`{name}`), and a failure reads "failed to <verb>", never "could not".
 
 Don't invert it either: a command's primary output must not be a `tracing::info!`, or the user needs
 `-v` to see what they asked for. `ok:` confirmations are logs, not prints; the exit code carries
-success. Drop preambles before the actionable line. Honour a config flag that asks for visible
+success. Drop preambles before the actionable line. Honor a config flag that asks for visible
 output; don't demote it to `info!`.
 
 ## Configuration surfaces
 
 - **`config.toml` is the complete source of truth** for non-secret settings. Every persistent
   setting lives there.
-- **Provider configuration is config-only, never env.** An ambient variable must never silently rebind
-  which account a named profile bills. A session runs on the profile its own row names; the row moves
-  only by an explicit act (`--provider` on a resume, `/provider`, `PATCH /v1/sessions/{id}`, ACP
-  `session/set_config_option`). What a *new* session records follows `--provider` > `default_provider`
-  > the sole profile. Profiles are managed by the `meka provider` suite (`add`/`list`/`set`/`use`/
-  `login`/`remove`), mirroring `meka mcp`: `use` is the only writer of `default_provider`, and `login`
-  rotates a credential without rebuilding the profile, which `remove` + `add` would discard.
-- **Secrets live in the database**: `provider_credentials` keyed by profile name and
+- **Accounts and profiles are config-only, never env.** An ambient variable must never silently
+  rebind which account a named profile bills. An account (`[accounts.<name>]`) is a backend, an
+  endpoint and the credential a login produced; a profile (`[profiles.<name>]`) is an account plus a
+  model and every model-tied setting. A session runs on the profile its own row names; the row moves
+  only by an explicit act (`--profile` on a resume, `/profile`, `PATCH /v1/sessions/{id}`, ACP
+  `session/set_config_option`). What a *new* session records follows `--profile` > `default_profile`
+  > the sole profile. Accounts are managed by `meka account` (`add`/`login`/`list`/`remove`) and
+  profiles by `meka profile` (`add`/`set`/`use`/`list`/`remove`), mirroring `meka mcp`: `use` is the
+  only command that sets `default_profile` (`profile remove` unsets it when it named the removed
+  profile), `account login` rotates a credential without touching the account or its profiles, and
+  `account remove` refuses while a profile names the account.
+- **Secrets live in the database**: `account_credentials` keyed by account name and
   `mcp_credentials` keyed by `(server_name, kind)`, so two accounts, or a client secret and its
   refreshable bundle, can coexist. Every secret is read from stdin, never taken
   as an argument, because arguments are visible in `ps` and shell history.
   - A field that may *contain* a secret is not itself one; it stays in `config.toml` with `${VAR}`
     expansion.
-  - Retiring a config key that held a secret gets no compatibility shim. It stops being modelled and
+  - Retiring a config key that held a secret gets no compatibility shim. It stops being modeled and
     `deny_unknown_fields` names the key and line; the upgrade guide carries the remedy.
 - **Environment variables are operational only**: `MEKA_CONFIG_DIR`, `MEKA_DATA_DIR`, permission,
-  instructions, sandbox backend, render mode, MCP timeout, `RUST_LOG`. Precedence is CLI > env > file,
-  written as `cli.x.or_else(env).or(file)` in `ResolvedConfig::from_cli`.
+  instructions, sandbox backend, render mode, MCP tool timeout, `RUST_LOG`. Precedence is CLI > env
+  > file, written as `cli.x.or_else(env).or(file)` in `ResolvedConfig::resolve`.
 - **Session and display tuning is config-only.** No env vars or flags for set-once preferences.
+  Render mode is the one exception, because the program that launches meka, not the user, knows
+  whether its output is a terminal.
 
 ## A profile is indivisible
 
-A provider profile is a named bundle: backend, endpoint, credential, model, and every model-tied knob.
-A session selects one by name and records that name. **Nothing overrides a field inside one**, or the
-run gets a combination nobody configured and no field states the mismatch.
+A profile is a named bundle: the account it bills, the model, and every model-tied knob; the account
+is the backend, the endpoint, the OAuth settings and the credential. A session selects a profile by
+name and records that name. **Nothing overrides a field inside either**, or the run gets a
+combination nobody configured and no field states the mismatch.
 
-- **`--provider <name>` selects**, and is the only provider flag on a run.
-- **`provider add` / `set` write profile fields.** `set` edits one key in place via `toml_edit`,
-  preserving comments and order. It has no session scope.
-- **A field belongs on the profile when it is user-owned and model-tracking**, per "Whose fact is
-  it". Such a field gets a `provider add` flag and a `provider set` key, never a global CLI flag, env
-  var, or session column. `type` and `device_id` are excluded: the first because the stored
-  credential was acquired for the current backend, the second because meka resolves it itself.
+- **`--profile <name>` selects**, and is the only profile flag on a run. `-p` is the prompt.
+- **`profile add` / `set` write profile fields; `account add` writes account fields.** `set` edits
+  one key in place via `toml_edit`, preserving comments and order. It has no session scope. There is
+  no `account set`: an account's settings are what a login was made against.
+- **A field belongs on the profile when it is user-owned and model-tracking**, and on the account
+  when two models on one endpoint would state it the same, per "Whose fact is it". A profile field
+  gets a `profile add` flag and a `profile set` key, never a global CLI flag, env var, or session
+  column. `account` is not settable on a profile, because moving it moves every session on the
+  profile onto another credential; `device_id` is not settable at all, because meka resolves it.
+- **`backend` names the driver**, not a protocol: API-key backends are named for the protocol
+  because `base_url` decides the endpoint, subscription backends for the product because the
+  endpoint is fixed.
 
 ## Schema and migrations
 
-`src/session/migrations.rs` is an append-only ledger applied on open inside the schema lock, in one
+`src/store/migrations.rs` is an append-only ledger applied on open inside the schema lock, in one
 transaction, behind an automatic backup. Four rules:
 
 1. **Only the migration module may know an older meka wrote the store.** No fallback readers, version
@@ -255,10 +319,10 @@ existing ones.
 
 Rule 1 has two sanctioned exceptions, both of which converge on the current shape rather than
 interpreting an old one: `classify_by_shape`, which runs once per store and stamps its answer, and
-`memory::store::reconcile_index`, which makes this database's FTS triggers the ones this build
-requires. Rule 1 is also about *the store*, which has a ledger. Config-format evolution belongs where
-config is parsed, in serde defaults and value aliases; tolerance for what a model might emit is out of
-scope entirely.
+`store::memory::reconcile_index`, which makes this database's FTS triggers the ones this build
+requires. Rule 1 is also about *the store*, which has a ledger. `config.toml` has none and gets no
+tolerance either: a shape change ships with a one-shot conversion script attached to the release, never
+a serde alias or a parse-door fallback. Tolerance for what a model might emit is out of scope entirely.
 
 **Integrity guards are not compatibility.** A check that is equally true of a store created five
 minutes ago defends against corruption and hand-editing; deleting it turns a fail-closed path into a
@@ -271,7 +335,7 @@ the most recent schema-changing upgrade is undoable.
 
 ## Built-in tool naming
 
-Names are read by the model every turn and `tool_catalogue` is sorted, so a name is both label and
+Names are read by the model every turn and `tool_catalog` is sorted, so a name is both label and
 sort key.
 
 - **A family shares a noun prefix**: `<subsystem>_<verb>`, which is what makes the family arrive as
@@ -282,16 +346,33 @@ sort key.
   use the bare noun.
 
 Two exceptions. **An industry-standard name beats internal consistency**: models reach for
-`read_file` and `execute_command` zero-shot, and renaming them trades accuracy for tidiness. And
-**`load_tool` stays verb-first** despite acting on meka's own registry, because the name appears
-verbatim in the `[Tool discovery]` preamble the model reads every turn.
+`read_file`, `write_file`, `edit_file` and `execute_command` zero-shot, and renaming them trades
+accuracy for tidiness. And **`load_tool` stays verb-first** despite acting on meka's own registry,
+because the name appears verbatim in the `[Tool discovery]` preamble the model reads every turn.
+`scratchpad_load_file` and `scratchpad_save_file` carry a trailing object because `load` and `save`
+alone would read as acting on the scratchpad itself; accepted as names, not as a pattern.
 
 Renaming a tool is breaking: names appear in config lists, user-authored skills, and the history of
 every existing session. Prefer getting it right at introduction. When renaming anyway, add a
 `**Breaking:**` changelog line and update `BUILTIN_TOOL_NAMES` (sorted), `MCP_META_TOOL_NAMES`, and
-`tool_display_name` in `src/render.rs`. Two silent traps: a blanket find-and-replace rewrites MCP tool names containing a
-built-in as a substring, so anchor every substitution to a name boundary; and reversing word order
-defeats the edit-distance `did_you_mean_hint`, so nothing points a resumed model at the new name.
+`tool_display_name` and `builtin_primary_param` in `src/tools.rs`. Two silent traps: a blanket
+find-and-replace rewrites MCP tool names containing a built-in as a substring, so anchor every
+substitution to a name boundary; and reversing word order defeats the edit-distance hint
+(`did_you_mean_hint`, behind `builtin_name_hint` and `near_miss_hint`), so nothing points a resumed
+model at the new name.
+
+## Layering
+
+The tree reads top-down. `src/main.rs` dispatches to `host/` and `cli/`; the REPL's slash commands
+run the `cli` handlers, so `host` sits above `cli`. Both call `agent`, which calls `tools`, which
+calls `provider` and `mcp`, which call `store`. `mcp` publishes its tools and never names a registry;
+`tools/mcp_adapter.rs` is where they become `Tool`s. `render` and `console` are reached only from
+`host`, `cli` and the frontend implementations; `streams` is the leaf that writes stderr for
+everyone. `tests/layering.rs` ranks every top-level module and lets a `crate::<module>` edge point
+only at a strictly lower rank, so siblings cannot name each other. Its tolerated list is empty; one
+edge is by design, `tools/subagent` reaching up to `agent`, because a sub-agent is an agent. A new
+module fails the test until it is placed. Put new code where its callers already are: a type
+read by `store` and `host` belongs in `store` or below, never in `host`.
 
 ## Documentation
 

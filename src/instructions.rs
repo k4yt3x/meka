@@ -32,19 +32,19 @@ const LARGE_INSTRUCTIONS_TOKENS: u64 = 8_000;
 const MAX_INSTRUCTION_FILES: usize = 100;
 
 /// `<config>/instructions.md`, the single-file form.
-pub fn instructions_file() -> Option<PathBuf> {
-    crate::config::meka_config_dir().map(|dir| dir.join("instructions.md"))
+pub(crate) fn instructions_file() -> Option<PathBuf> {
+    crate::paths::meka_config_dir().map(|dir| dir.join("instructions.md"))
 }
 
 /// `<config>/instructions/`, the split form.
-pub fn instructions_dir() -> Option<PathBuf> {
-    crate::config::meka_config_dir().map(|dir| dir.join("instructions"))
+pub(crate) fn instructions_dir() -> Option<PathBuf> {
+    crate::paths::meka_config_dir().map(|dir| dir.join("instructions"))
 }
 
 /// Where a resolved instruction set came from, so `meka instructions show` can answer "why is the
 /// model being told this" without the user guessing at precedence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstructionsSource {
+pub(crate) enum InstructionsSource {
     /// `--instructions`.
     Flag,
     /// `MEKA_INSTRUCTIONS`.
@@ -72,9 +72,9 @@ impl std::fmt::Display for InstructionsSource {
 
 /// A resolved instruction set and where it came from.
 #[derive(Debug, Clone)]
-pub struct Instructions {
-    pub text: String,
-    pub source: InstructionsSource,
+pub(crate) struct Instructions {
+    pub(crate) text: String,
+    pub(crate) source: InstructionsSource,
 }
 
 /// Read the conventional location. `<config>/instructions/` takes precedence over
@@ -83,7 +83,7 @@ pub struct Instructions {
 /// A missing path is simply "no instructions" and returns `None`; an unreadable one warns and is
 /// skipped, so a single bad file never hides the rest of a directory. Returns `None` for a set that
 /// is entirely whitespace, matching the treatment of an empty `--instructions`.
-pub fn discover() -> Option<Instructions> {
+pub(crate) fn discover() -> Option<Instructions> {
     if let Some(dir) = instructions_dir()
         && dir.is_dir()
         && let Some(found) = read_dir(&dir, FileFilter::MarkdownOnly)
@@ -104,7 +104,7 @@ pub fn discover() -> Option<Instructions> {
 /// Unlike [`discover`] a missing or unreadable path is an error rather than silence: the user named
 /// it explicitly, so failing quietly would leave the agent running without the guidance they
 /// believe they supplied.
-pub fn read_explicit(path: &Path) -> crate::error::Result<Instructions> {
+pub(crate) fn read_explicit(path: &Path) -> crate::error::Result<Instructions> {
     if path.is_dir() {
         // Any regular file counts here, not just `*.md`. The user named this directory and nothing
         // else lives in it, whereas the conventional `instructions/` sits among meka's other
@@ -155,11 +155,8 @@ fn read_dir(root: &Path, filter: FileFilter) -> Option<Instructions> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) => {
-            tracing::warn!(
-                "failed to read instructions directory '{}': {}",
-                root.display(),
-                error
-            );
+            let path = root.display();
+            tracing::warn!("failed to read instructions directory '{path}': {error}");
             return None;
         }
     };
@@ -168,7 +165,7 @@ fn read_dir(root: &Path, filter: FileFilter) -> Option<Instructions> {
         .filter_map(|entry| match entry {
             Ok(entry) => Some(entry.path()),
             Err(error) => {
-                tracing::warn!("skipping unreadable instructions entry: {}", error);
+                tracing::warn!("skipping unreadable instructions entry: {error}");
                 None
             }
         })
@@ -187,11 +184,11 @@ fn read_dir(root: &Path, filter: FileFilter) -> Option<Instructions> {
     paths.sort();
 
     if paths.len() > MAX_INSTRUCTION_FILES {
+        let path = root.display();
+        let count = paths.len();
         tracing::warn!(
-            "instructions directory '{}' holds {} files; reading the first {}",
-            root.display(),
-            paths.len(),
-            MAX_INSTRUCTION_FILES,
+            "instructions directory '{path}' holds {count} files; reading the first \
+             {MAX_INSTRUCTION_FILES}"
         );
         paths.truncate(MAX_INSTRUCTION_FILES);
     }
@@ -229,11 +226,8 @@ fn read_file(path: &Path) -> Option<String> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            tracing::warn!(
-                "failed to read instructions file '{}': {}",
-                path.display(),
-                error
-            );
+            let path = path.display();
+            tracing::warn!("failed to read instructions file '{path}': {error}");
             None
         }
     }
@@ -244,18 +238,67 @@ fn read_file(path: &Path) -> Option<String> {
 /// It rides the cached system-prompt prefix so the ongoing cost is small, but it still occupies
 /// window that the conversation can't use, and a set this size is usually a surprise (a whole
 /// document pasted in, or a directory pointed somewhere unintended) rather than a decision.
-pub fn warn_if_large(instructions: &Instructions) {
+pub(crate) fn warn_if_large(instructions: &Instructions) {
     let estimate = crate::tokens::estimate_text(&instructions.text);
     if estimate > LARGE_INSTRUCTIONS_TOKENS {
+        let source = &instructions.source;
         tracing::warn!(
-            "instructions from {} are large (~{} tokens); they occupy that much of every request's \
-             context window",
-            instructions.source,
-            estimate,
+            "instructions from {source} are large (~{estimate} tokens); they occupy that much of \
+             every request's context window"
         );
     }
 }
 
+/// Resolve the user's standing instructions across the tiers that can carry them, most specific
+/// first: `--instructions`, then `MEKA_INSTRUCTIONS`, then `MEKA_INSTRUCTIONS_FILE`, then the
+/// conventional path under the config directory.
+///
+/// Inline and file are two *transports* for one setting rather than two ways of saying the same
+/// thing, which is why both survive. Which is natural follows from the channel: a filesystem
+/// channel (the config directory) points at content, while a string channel (argv, environment)
+/// carries it. Demanding a file from the latter can be impossible, not merely inconvenient: the
+/// `mekabox` wrapper mounts the host config directory read-only and then overrides the instructions
+/// for the container, which it can do with one `-e` and could not do at all if a path were the only
+/// accepted form.
+///
+/// Setting both environment variables is refused rather than silently resolved. There is no reading
+/// under which someone meant both, so picking one would just hide the mistake until the agent
+/// behaved unexpectedly. [`resolve`] over the persistent tiers only, for `meka instructions show`.
+/// A per-run `--instructions` isn't part of what a standalone query is asking about.
+pub(crate) fn resolve_for_display() -> crate::error::Result<Option<Instructions>> {
+    resolve(None)
+}
+pub(crate) fn resolve(flag: Option<&str>) -> crate::error::Result<Option<Instructions>> {
+    if let Some(text) = flag {
+        let text = text.trim();
+        return Ok((!text.is_empty()).then(|| Instructions {
+            text: text.to_string(),
+            source: InstructionsSource::Flag,
+        }));
+    }
+
+    let inline = std::env::var("MEKA_INSTRUCTIONS").ok();
+    let from_file = std::env::var("MEKA_INSTRUCTIONS_FILE").ok();
+    if inline.is_some() && from_file.is_some() {
+        return Err(crate::error::MekaError::Config(
+            "MEKA_INSTRUCTIONS and MEKA_INSTRUCTIONS_FILE are both set; keep one. The first \
+             carries the text itself, the second a path to it."
+                .to_string(),
+        ));
+    }
+
+    if let Some(text) = inline {
+        let text = text.trim();
+        return Ok((!text.is_empty()).then(|| Instructions {
+            text: text.to_string(),
+            source: InstructionsSource::Env,
+        }));
+    }
+    if let Some(path) = from_file {
+        return read_explicit(Path::new(&path)).map(Some);
+    }
+    Ok(discover())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_dir_concatenates_in_lexical_order() {
+    fn read_dir_concatenates_in_lexical_order() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(temp.path(), "20-second.md", "second");
         write(temp.path(), "10-first.md", "first");
@@ -278,12 +321,12 @@ mod tests {
                 assert_eq!(paths.len(), 2, "only the *.md files contribute");
                 assert!(paths[0].ends_with("10-first.md"));
             }
-            other => panic!("expected Files, got {:?}", other),
+            other => panic!("expected Files, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_read_dir_skips_blank_files() {
+    fn read_dir_skips_blank_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(temp.path(), "10-real.md", "real content");
         write(temp.path(), "20-blank.md", "   \n\t\n");
@@ -293,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_dir_on_empty_directory_is_none() {
+    fn read_dir_on_empty_directory_is_none() {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(read_dir(temp.path(), FileFilter::MarkdownOnly).is_none());
     }
@@ -301,7 +344,7 @@ mod tests {
     /// An explicitly named path failing quietly would leave the agent running without the guidance
     /// the user believes they supplied, so it errors where discovery would shrug.
     #[test]
-    fn test_read_explicit_errors_on_a_missing_path() {
+    fn read_explicit_errors_on_a_missing_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         let missing = temp.path().join("nope.md");
         let error = read_explicit(&missing).expect_err("must not be silent");
@@ -309,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_explicit_errors_on_an_empty_file() {
+    fn read_explicit_errors_on_an_empty_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(temp.path(), "empty.md", "  \n ");
         let error = read_explicit(&temp.path().join("empty.md")).expect_err("must not be silent");
@@ -318,7 +361,7 @@ mod tests {
 
     /// A ConfigMap mounts as a directory of keys, so an explicit path has to accept one.
     #[test]
-    fn test_read_explicit_accepts_a_directory() {
+    fn read_explicit_accepts_a_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(temp.path(), "10-a.md", "alpha");
         write(temp.path(), "20-b.md", "beta");
@@ -330,7 +373,7 @@ mod tests {
     /// A ConfigMap key is frequently just `instructions`, with no extension. Requiring one would
     /// turn a naming choice made in someone else's YAML into a startup failure inside a pod.
     #[test]
-    fn test_read_explicit_directory_takes_files_without_a_markdown_extension() {
+    fn read_explicit_directory_takes_files_without_a_markdown_extension() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(temp.path(), "instructions", "no extension here");
 
@@ -347,7 +390,7 @@ mod tests {
     /// one symlink per key beside it. The directories have to drop out without being listed.
     #[test]
     #[cfg(unix)]
-    fn test_read_explicit_handles_a_configmap_symlink_farm() {
+    fn read_explicit_handles_a_configmap_symlink_farm() {
         let temp = tempfile::tempdir().expect("tempdir");
         let versioned = temp.path().join("..2026_08_11_00_00_00.123456789");
         std::fs::create_dir(&versioned).expect("mkdir");
@@ -367,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_file_trims_and_reports_blank_as_none() {
+    fn read_file_trims_and_reports_blank_as_none() {
         let temp = tempfile::tempdir().expect("tempdir");
         write(temp.path(), "padded.md", "\n\n  body  \n\n");
         assert_eq!(

@@ -1,15 +1,27 @@
-//! Per-session counters surfaced by `/status`. Shared across the agent (which records tokens and
-//! turn count) and the Claude providers (which record image-redaction events).
+//! Per-session counters surfaced by `/status`, recorded by the agent: tokens and turn count from
+//! the provider's usage, image redactions from the [`Redaction`] a Claude provider reports.
 //!
 //! All fields are lock-free atomics so any task can update without contention; readers take a
 //! [`SessionStatsSnapshot`] for display.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use crate::provider::TokenUsage;
+/// What one image-redaction pass removed from a request body.
+///
+/// Reported by the provider that did it, on the notice it sends, and counted by the agent: the
+/// provider is cached per profile and serves every session on it, so it cannot know whose
+/// statistics the pass belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Redaction {
+    pub(crate) images: u64,
+    pub(crate) bytes: u64,
+    /// Where in the request's messages the images sat, for the agent to record on the
+    /// conversation so the next request does not redact them again.
+    pub(crate) positions: Vec<crate::image::RedactedImage>,
+}
 
 #[derive(Debug, Default)]
-pub struct SessionStats {
+pub(crate) struct SessionStats {
     turns: AtomicU64,
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
@@ -23,7 +35,7 @@ pub struct SessionStats {
 impl SessionStats {
     /// Rebuild the counters from a persisted snapshot, so a resumed session continues its lifetime
     /// totals instead of restarting at zero.
-    pub fn from_snapshot(snapshot: &SessionStatsSnapshot) -> Self {
+    pub(crate) fn from_snapshot(snapshot: &SessionStatsSnapshot) -> Self {
         Self {
             turns: AtomicU64::new(snapshot.turns),
             input_tokens: AtomicU64::new(snapshot.input_tokens),
@@ -37,7 +49,7 @@ impl SessionStats {
     }
 
     /// Roll a successful turn's usage into the running totals.
-    pub fn record_turn(&self, usage: &TokenUsage) {
+    pub(crate) fn record_turn(&self, usage: &TokenUsage) {
         self.turns.fetch_add(1, Relaxed);
         self.input_tokens.fetch_add(usage.input_tokens, Relaxed);
         self.output_tokens.fetch_add(usage.output_tokens, Relaxed);
@@ -55,7 +67,7 @@ impl SessionStats {
     /// totals regardless: compaction is the most expensive thing meka does without being asked,
     /// and leaving it out made `/status` disagree with the provider's bill by exactly the amount
     /// the user would most want explained.
-    pub fn record_untracked_tokens(&self, usage: &TokenUsage) {
+    pub(crate) fn record_untracked_tokens(&self, usage: &TokenUsage) {
         self.input_tokens.fetch_add(usage.input_tokens, Relaxed);
         self.output_tokens.fetch_add(usage.output_tokens, Relaxed);
         self.cache_creation_input_tokens
@@ -64,15 +76,14 @@ impl SessionStats {
             .fetch_add(usage.cache_read_input_tokens, Relaxed);
     }
 
-    /// Record a single body-redaction event from one of the Claude providers. Called when
-    /// image-block redaction fires on an oversized request body.
-    pub fn record_redaction(&self, images: u64, bytes: u64) {
+    /// Record one body-redaction pass a provider reported.
+    pub(crate) fn record_redaction(&self, redaction: &Redaction) {
         self.redactions.fetch_add(1, Relaxed);
-        self.redacted_images.fetch_add(images, Relaxed);
-        self.redacted_bytes.fetch_add(bytes, Relaxed);
+        self.redacted_images.fetch_add(redaction.images, Relaxed);
+        self.redacted_bytes.fetch_add(redaction.bytes, Relaxed);
     }
 
-    pub fn snapshot(&self) -> SessionStatsSnapshot {
+    pub(crate) fn snapshot(&self) -> SessionStatsSnapshot {
         SessionStatsSnapshot {
             turns: self.turns.load(Relaxed),
             input_tokens: self.input_tokens.load(Relaxed),
@@ -87,21 +98,21 @@ impl SessionStats {
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct SessionStatsSnapshot {
-    pub turns: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
-    pub redactions: u64,
-    pub redacted_images: u64,
-    pub redacted_bytes: u64,
+pub(crate) struct SessionStatsSnapshot {
+    pub(crate) turns: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+    pub(crate) redactions: u64,
+    pub(crate) redacted_images: u64,
+    pub(crate) redacted_bytes: u64,
 }
 
 impl SessionStatsSnapshot {
     /// Sum of all three input-token tiers (live, cache-write, cache-read). Matches what Anthropic
     /// bills against "input".
-    pub fn total_input_tokens(&self) -> u64 {
+    pub(crate) fn total_input_tokens(&self) -> u64 {
         self.input_tokens
             .saturating_add(self.cache_creation_input_tokens)
             .saturating_add(self.cache_read_input_tokens)
@@ -109,7 +120,7 @@ impl SessionStatsSnapshot {
 
     /// Cache-hit ratio as an integer percent (0–100). Returns 0 when no input tokens have been
     /// recorded yet.
-    pub fn cache_hit_pct(&self) -> u64 {
+    pub(crate) fn cache_hit_pct(&self) -> u64 {
         let total = self.total_input_tokens();
         if total == 0 {
             0
@@ -119,6 +130,39 @@ impl SessionStatsSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct TokenUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    /// Tokens billed at the cache-write tier (content newly cached this turn). Anthropic-only;
+    /// OpenAI providers leave this at 0.
+    pub(crate) cache_creation_input_tokens: u64,
+    /// Tokens served from the prompt cache (cache-read tier). Anthropic returns this in
+    /// `usage.cache_read_input_tokens`; OpenAI providers leave it at 0 today.
+    pub(crate) cache_read_input_tokens: u64,
+}
+impl TokenUsage {
+    /// Fold a streamed usage update into the running per-round total, taking each field from
+    /// `update` only when it is non-zero. Providers split usage across events: Anthropic reports
+    /// the input/cache tiers on `message_start` and the final `output_tokens` on
+    /// `message_delta` (the other fields absent, i.e. parsed as 0), while OpenAI/Codex send a
+    /// single usage event. The non-zero rule keeps the `message_start` input/cache values
+    /// instead of letting a later event that omits them clobber the count back to 0.
+    pub(crate) fn merge_stream(&mut self, update: &TokenUsage) {
+        if update.input_tokens > 0 {
+            self.input_tokens = update.input_tokens;
+        }
+        if update.output_tokens > 0 {
+            self.output_tokens = update.output_tokens;
+        }
+        if update.cache_creation_input_tokens > 0 {
+            self.cache_creation_input_tokens = update.cache_creation_input_tokens;
+        }
+        if update.cache_read_input_tokens > 0 {
+            self.cache_read_input_tokens = update.cache_read_input_tokens;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn record_turn_accumulates() {
+    fn recorded_turns_accumulate_token_usage() {
         let stats = SessionStats::default();
         stats.record_turn(&TokenUsage {
             input_tokens: 100,
@@ -170,10 +214,18 @@ mod tests {
     }
 
     #[test]
-    fn record_redaction_accumulates() {
+    fn recorded_redactions_accumulate_images_and_bytes() {
         let stats = SessionStats::default();
-        stats.record_redaction(2, 4_000_000);
-        stats.record_redaction(1, 2_000_000);
+        stats.record_redaction(&Redaction {
+            images: 2,
+            bytes: 4_000_000,
+            positions: Vec::new(),
+        });
+        stats.record_redaction(&Redaction {
+            images: 1,
+            bytes: 2_000_000,
+            positions: Vec::new(),
+        });
         let snap = stats.snapshot();
         assert_eq!(snap.redactions, 2);
         assert_eq!(snap.redacted_images, 3);

@@ -8,9 +8,9 @@
 use std::{sync::Arc, time::Duration};
 
 use super::{
-    MAX_MCP_DESCRIPTION_LENGTH, McpClientContext, McpClientManager, McpRunningService,
+    MAX_MCP_DESCRIPTION_CHARS, McpClientContext, McpClientManager, McpRunningService,
     McpRuntimeConfig, ServerEntry, ServerState,
-    handler::{McpToolAdapter, MekaClientHandler},
+    handler::{McpTool, MekaClientHandler},
     resolve_tool_permission, tool_is_allowed,
     transport::{build_http_transport_config, build_stdio_command},
     truncate, warn_on_stale_tool_config,
@@ -19,7 +19,7 @@ use crate::{
     config::{McpServerConfig, McpTransport},
     error::{MekaError, Result},
     permission::Permission,
-    session::TokenStore,
+    store::TokenStore,
 };
 
 /// First delay after a failed initial connect. Doubles per attempt up to [`MAX_RETRY_BACKOFF`].
@@ -49,7 +49,7 @@ pub(super) async fn run_connector(
     use futures::StreamExt;
 
     if pending.is_empty() {
-        let _ = settled.send(true);
+        settled.send_replace(true);
         return;
     }
 
@@ -88,7 +88,7 @@ pub(super) async fn run_connector(
         .for_each(|_| async {});
 
     tokio::join!(stdio_stream, http_stream);
-    let _ = settled.send(true);
+    settled.send_replace(true);
 
     // `Failed` is only ever set by `connect_one`, and only from this function, so once both
     // streams have drained the failed set is complete and final. Without the retry below nothing
@@ -123,10 +123,10 @@ pub(super) async fn run_connector(
 /// to every attached per-session registry, so sessions created while the server was down pick up
 /// its tools when it recovers.
 ///
-/// The manager is held weakly so this loop can't outlive it. `mcp::cli::run_reconnect` builds a
-/// throwaway manager per invocation, and it is reachable from the REPL's `/mcp reconnect` in a
-/// process that keeps running; a strong reference there would leave a task respawning a failing
-/// server every five minutes for a manager nobody is using.
+/// The manager is held weakly so this loop can't outlive it. `crate::cli::mcp::run_reconnect`
+/// builds a throwaway manager per invocation, and it is reachable from the REPL's `/mcp reconnect`
+/// in a process that keeps running; a strong reference there would leave a task respawning a
+/// failing server every five minutes for a manager nobody is using.
 async fn retry_until_connected(
     entry: Arc<ServerEntry>,
     manager: std::sync::Weak<McpClientManager>,
@@ -149,12 +149,11 @@ async fn retry_until_connected(
         }
 
         tracing::debug!(
-            "retrying initial connect to MCP server '{}' after {:?}",
-            entry.server_name(),
-            backoff,
+            "retrying initial connect to MCP server '{server_name}' after {backoff:?}",
+            server_name = entry.server_name(),
         );
 
-        // Serialise against `ServerEntry::reconnect`, which takes the same lock, so a tool call
+        // Serialize against `ServerEntry::reconnect`, which takes the same lock, so a tool call
         // and this loop can't drive two connects into the same entry at once. Re-check under the
         // lock: the winner of a race leaves the entry `Connected` and the loser must not clobber
         // it with a second connection.
@@ -174,8 +173,8 @@ async fn retry_until_connected(
 
         if !matches!(entry.state().await, ServerState::Failed { .. }) {
             tracing::info!(
-                "MCP server '{}' recovered after a failed initial connect",
-                entry.server_name(),
+                "MCP server '{server_name}' recovered after a failed initial connect",
+                server_name = entry.server_name(),
             );
             return;
         }
@@ -204,13 +203,9 @@ async fn record_connect_failure(entry: &Arc<ServerEntry>, server_name: &str, cau
         is_repeat_failure(&state, &cause)
     };
     if repeat {
-        tracing::debug!("MCP server '{}' still unavailable: {}", server_name, cause);
+        tracing::debug!("MCP server '{server_name}' still unavailable: {cause}");
     } else {
-        tracing::warn!(
-            "failed to connect to MCP server '{}': {}",
-            server_name,
-            cause
-        );
+        tracing::warn!("failed to connect to MCP server '{server_name}': {cause}");
     }
     *entry.state.write().await = ServerState::Failed {
         error: cause,
@@ -234,6 +229,13 @@ pub(crate) async fn connect_one(
     connect_timeout: std::time::Duration,
 ) {
     let server_name = entry.server_name.clone();
+
+    // The one door every connect goes through, so the refusal `prepare` recorded holds for the
+    // initial sweep, the cold-start retry and a reconnect alike; the state already says why.
+    if let Some(reason) = &entry.refused {
+        tracing::debug!("MCP server '{server_name}' is not connected: {reason}");
+        return;
+    }
 
     // connect_server's future can be `!Send` for OAuth-authenticated servers (rmcp 1.5 holds a
     // `form_urlencoded::Serializer` across an await in its auth module, whose `Option<&dyn Fn(&str)
@@ -272,18 +274,18 @@ pub(crate) async fn connect_one(
             return;
         }
         Ok(Err(_elapsed)) => {
-            let cause = format!("connect timed out after {:?}", connect_timeout);
+            let cause = format!("connect timed out after {connect_timeout:?}");
             record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
         Err(join_error) => {
-            let cause = format!("connect task join error: {}", join_error);
+            let cause = format!("connect task join error: {join_error}");
             record_connect_failure(&entry, &server_name, cause).await;
             return;
         }
     };
 
-    tracing::info!("connected to MCP server '{}'", server_name);
+    tracing::info!("connected to MCP server '{server_name}'");
 
     // rmcp 2.1: `peer_info()` returns `Option<Arc<InitializeResult>>` (owned) rather than a borrow,
     // so the instructions string is cloned out of the `Arc`.
@@ -315,18 +317,16 @@ pub(crate) async fn connect_one(
     .unwrap_or_else(|_elapsed| {
         Err(MekaError::McpConnection {
             server_name: server_name.clone(),
-            message: format!("tool discovery timed out after {:?}", connect_timeout),
+            message: format!("tool discovery timed out after {connect_timeout:?}"),
         })
     });
     match discovery {
         Ok(count) => {
-            tracing::info!("MCP server '{}' registered {} tool(s)", server_name, count);
+            tracing::info!("MCP server '{server_name}' registered {count} tool(s)");
         }
         Err(error) => {
             tracing::warn!(
-                "MCP server '{}' connected but tool discovery failed: {}",
-                server_name,
-                error
+                "MCP server '{server_name}' connected but tool discovery failed: {error}"
             );
         }
     }
@@ -340,7 +340,12 @@ async fn discover_and_register_tools(
     mcp_default_permission: Option<Permission>,
     manager: &Arc<McpClientManager>,
 ) -> Result<usize> {
-    let adapters = build_mcp_adapters(entry, mcp_default_permission).await?;
+    let adapters = build_mcp_tools(
+        entry,
+        mcp_default_permission,
+        super::DEFAULT_MCP_REQUEST_TIMEOUT,
+    )
+    .await?;
     let registered_count = adapters.len();
     manager
         .register_server_tools(&entry.server_name, adapters)
@@ -348,20 +353,22 @@ async fn discover_and_register_tools(
     Ok(registered_count)
 }
 
-/// Core adapter-construction logic shared between initial discovery (via the connector) and ad-hoc
-/// discovery (via [`super::McpClientManager::discover_tools_for_server`]).
-async fn build_mcp_adapters(
+/// One server's [`McpTool`]s from a fresh `tools/list`.
+///
+/// The one door for every listing: the connector's first, the refresh a `tools/list_changed`
+/// notification triggers, the re-list after a reconnect, and a sub-agent's install. So none of them
+/// can admit, name or classify a tool differently from the others.
+pub(super) async fn build_mcp_tools(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,
-) -> Result<Vec<McpToolAdapter>> {
+    timeout: std::time::Duration,
+) -> Result<Vec<McpTool>> {
     let server_name = entry.server_name.clone();
     let server_config = &entry.config;
     // Bounded like every other `tools/list`. This one already sat inside the connect timeout, but
     // the tool *count* is unbounded there too, and the cap belongs to meka rather than to the
     // server's pagination.
-    let tools = entry
-        .list_tools_bounded(super::DEFAULT_MCP_REQUEST_TIMEOUT)
-        .await?;
+    let tools = entry.list_tools_bounded(timeout).await?;
 
     let advertised: std::collections::HashSet<&str> =
         tools.iter().map(|t| t.name.as_ref()).collect();
@@ -374,8 +381,8 @@ async fn build_mcp_adapters(
             continue;
         }
 
-        let sanitised_tool_name = crate::mcp::sanitize::normalize_server_name(&raw_tool_name);
-        let namespaced_name = format!("mcp__{}__{}", server_name, sanitised_tool_name);
+        let sanitized_tool_name = crate::mcp::sanitize::normalize_server_name(&raw_tool_name);
+        let namespaced_name = format!("mcp__{server_name}__{sanitized_tool_name}");
 
         let raw_description = tool
             .description
@@ -383,31 +390,27 @@ async fn build_mcp_adapters(
             .map(|d| d.as_ref().to_string())
             .unwrap_or_default();
         let description = truncate(
-            &crate::mcp::sanitize::sanitize_text(&raw_description),
-            MAX_MCP_DESCRIPTION_LENGTH,
+            &crate::text::sanitize_text(&raw_description),
+            MAX_MCP_DESCRIPTION_CHARS,
         );
 
         let parameters = match serde_json::to_value(&*tool.input_schema) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(
-                    "MCP server '{}' tool '{}' has unserializable input schema ({}); \
-                     skipping registration",
-                    server_name,
-                    raw_tool_name,
-                    error
+                    "MCP server '{server_name}' tool '{raw_tool_name}' has unserializable input schema ({error}); \
+                     skipping registration"
                 );
                 continue;
             }
         };
 
         let permission = resolve_tool_permission(
-            &server_name,
             &raw_tool_name,
             tool.annotations.as_ref(),
             server_config,
             mcp_default_permission,
-        )?;
+        );
 
         // Annotations carry permission hints (`readOnlyHint`, `destructiveHint`); silently dropping
         // them on a serialization failure could quietly relax permission resolution. Log so the
@@ -419,9 +422,7 @@ async fn build_mcp_adapters(
                     Ok(value) => Some(value),
                     Err(error) => {
                         tracing::warn!(
-                            "failed to serialize annotations for tool '{}': {}",
-                            namespaced_name,
-                            error
+                            "failed to serialize annotations for tool '{namespaced_name}': {error}"
                         );
                         None
                     }
@@ -433,29 +434,24 @@ async fn build_mcp_adapters(
                 Ok(value) => Some(value),
                 Err(error) => {
                     tracing::warn!(
-                        "failed to serialize meta for tool '{}': {}",
-                        namespaced_name,
-                        error
+                        "failed to serialize meta for tool '{namespaced_name}': {error}"
                     );
                     None
                 }
             });
-        let title = tool
-            .title
-            .as_ref()
-            .map(|t| crate::mcp::sanitize::sanitize_text(t));
+        let title = tool.title.as_ref().map(|t| crate::text::sanitize_text(t));
 
-        adapters.push(McpToolAdapter::new(
+        adapters.push(McpTool {
             namespaced_name,
-            raw_tool_name,
+            remote_tool_name: raw_tool_name,
             description,
             parameters,
             permission,
-            Arc::clone(entry),
+            entry: Arc::clone(entry),
             annotations,
             meta,
             title,
-        ));
+        });
     }
 
     Ok(adapters)
@@ -479,11 +475,11 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
     fn emit(server_name: &str, line: &[u8], overlong: bool) {
         // The text is the child's, so it can carry escapes that would repaint the terminal of
         // anyone running with `-v`.
-        let text = crate::mcp::sanitize::sanitize_text(&String::from_utf8_lossy(line));
+        let text = crate::text::sanitize_text(&String::from_utf8_lossy(line));
         if overlong {
-            tracing::debug!(server = %server_name, "{}... (line truncated)", text);
+            tracing::debug!("MCP server '{server_name}' stderr: {text}... (line truncated)");
         } else {
-            tracing::debug!(server = %server_name, "{}", text);
+            tracing::debug!("MCP server '{server_name}' stderr: {text}");
         }
     }
 
@@ -497,7 +493,7 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(error) => {
-                    tracing::debug!(server = %server_name, "stderr read error: {}", error);
+                    tracing::debug!("failed to read MCP server '{server_name}' stderr: {error}");
                     break;
                 }
             };
@@ -527,7 +523,7 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
 /// unused -- a server that fails while holding a valid credential. `mcp add` and `mcp login` both
 /// refuse to *create* that pairing, but `config.toml` is a supported surface: adding an `[auth]`
 /// block by hand to a server that already has a stored bearer reaches it without passing either
-/// door. This is the point where the ambiguity would do harm, so it is resolved here, in favour of
+/// door. This is the point where the ambiguity would do harm, so it is resolved here, in favor of
 /// the block the user can see in their config over the row they cannot.
 ///
 /// A free function rather than three lines inside [`connect_server`], because that function needs a
@@ -541,11 +537,9 @@ fn bearer_for_transport(
     match (bearer, auth) {
         (Some(_), Some(_)) => {
             tracing::warn!(
-                "server '{}' has both a stored bearer and an [auth] block; ignoring the bearer and \
-                 authenticating through the block. Run `meka mcp logout {}` to drop the bearer, or \
-                 remove the [auth] block to use it",
-                server_name,
-                server_name
+                "server '{server_name}' has both a stored bearer and an [auth] block; ignoring the bearer and \
+                 authenticating through the block. Run `meka mcp logout {server_name}` to drop the bearer, or \
+                 remove the [auth] block to use it"
             );
             None
         }
@@ -626,9 +620,9 @@ pub(super) async fn connect_server(
                     // `NotFound` from spawn means the program isn't on PATH, which reads as a
                     // bare "No such file or directory" without saying which file. Name it.
                     message: if error.kind() == std::io::ErrorKind::NotFound {
-                        format!("failed to spawn process: '{}' not found", command_str)
+                        format!("failed to spawn process: '{command_str}' not found")
                     } else {
-                        format!("failed to spawn process: {}", error)
+                        format!("failed to spawn process: {error}")
                     },
                 })?;
             if let Some(stderr) = stderr {
@@ -640,7 +634,7 @@ pub(super) async fn connect_server(
                 .await
                 .map_err(|error| MekaError::McpConnection {
                     server_name: server_name.to_string(),
-                    message: format!("handshake failed: {}", error),
+                    message: format!("handshake failed: {error}"),
                 })
         }
         McpTransport::Http => {
@@ -658,10 +652,7 @@ pub(super) async fn connect_server(
             let bearer = match token_store {
                 Some(store) => {
                     store
-                        .load_mcp_credentials(
-                            server_name,
-                            crate::session::McpCredentialKind::Bearer,
-                        )
+                        .load_mcp_credentials(server_name, crate::store::McpCredentialKind::Bearer)
                         .await?
                 }
                 None => None,
@@ -678,6 +669,7 @@ pub(super) async fn connect_server(
                     auth_config,
                     transport_config,
                     token_store,
+                    client_context.login_prompt(),
                     handler,
                 )
                 .await
@@ -690,7 +682,7 @@ pub(super) async fn connect_server(
                     .await
                     .map_err(|error| MekaError::McpConnection {
                         server_name: server_name.to_string(),
-                        message: format!("HTTP connection failed: {}", error),
+                        message: format!("HTTP connection failed: {error}"),
                     })
             }
         }
@@ -706,7 +698,7 @@ mod tests {
     use super::*;
     use crate::config::{McpAuthConfig, McpServerConfig, McpTransport};
 
-    /// A stored bearer and an `[auth]` block cannot both be honoured, and rmcp resolves the tie the
+    /// A stored bearer and an `[auth]` block cannot both be honored, and rmcp resolves the tie the
     /// wrong way round: it consults the authorization flow only when the transport carries no
     /// `auth_header`, so passing both sends the bearer and wastes the token the flow obtained.
     ///
@@ -747,7 +739,7 @@ mod tests {
     /// attempt buried an idle REPL prompt in identical warnings long after the user had read the
     /// first one, so only a new or changed cause is worth saying out loud.
     #[test]
-    fn repeat_failure_is_recognised_and_a_changed_cause_is_not() {
+    fn repeat_failure_is_recognized_and_a_changed_cause_is_not() {
         let same = ServerState::Failed {
             error: "'ida-mcp' not found".to_string(),
             at: std::time::Instant::now(),
@@ -784,37 +776,16 @@ mod tests {
     fn bare_entry(name: &str) -> Arc<ServerEntry> {
         Arc::new(ServerEntry {
             server_name: name.to_string(),
-            config: bare_server_config(name),
+            config: McpServerConfig::for_test(name),
             token_store: None,
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
         })
-    }
-
-    fn bare_server_config(name: &str) -> McpServerConfig {
-        McpServerConfig {
-            name: name.to_string(),
-            transport: McpTransport::Http,
-            command: None,
-            args: None,
-            env: None,
-            url: Some("https://example".to_string()),
-            headers: None,
-            headers_helper: None,
-            auth: None,
-            permission: None,
-            allowed_tools: None,
-            disabled_tools: None,
-            eager_load_tools: None,
-            tool_permissions: None,
-            trust_read_only_hint: None,
-            disabled: false,
-            required: None,
-        }
     }
 
     /// The container case: the configured command simply isn't installed. A bare "No such file or
@@ -826,7 +797,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_stdio_binary_names_the_command() {
-        let mut config = bare_server_config("ida");
+        let mut config = McpServerConfig::for_test("ida");
         config.transport = McpTransport::Stdio;
         config.command = Some("meka-no-such-binary-xyz".to_string());
         config.url = None;
@@ -838,6 +809,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: std::sync::OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
@@ -862,13 +834,74 @@ mod tests {
         }
     }
 
+    /// A server whose `headers` or `env` name an unset variable is marked failed by `prepare` and
+    /// was then connected anyway, sending the literal `${VAR}`: the connector took every
+    /// non-disabled entry, and its retry loop kept reconnecting for the life of the process.
+    #[tokio::test]
+    async fn a_refused_entry_is_never_connected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let local = listener.local_addr().expect("addr");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(socket);
+                }
+            }
+        });
+        let mut config = McpServerConfig::for_test("tenant");
+        config.url = Some(format!("http://{local}/mcp"));
+        let reason =
+            "environment variable(s) [\"TOKEN\"] are unset and named in `headers` or `env`";
+        let entry = Arc::new(ServerEntry {
+            server_name: "tenant".to_string(),
+            config,
+            token_store: None,
+            client_context: McpClientContext::new(),
+            state: RwLock::new(ServerState::Failed {
+                error: reason.to_string(),
+                at: std::time::Instant::now(),
+            }),
+            reconnect_lock: Mutex::new(()),
+            refused: Some(reason.to_string()),
+            instructions: std::sync::RwLock::new(None),
+            request_timeout: std::sync::OnceLock::new(),
+            dropped_tools: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = McpClientManager::prepare(&[], None, None, McpClientContext::new())
+            .await
+            .expect("empty manager");
+
+        connect_one(
+            Arc::clone(&entry),
+            manager,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing may reach the endpoint"
+        );
+        assert!(
+            matches!(&*entry.state.read().await, ServerState::Failed { error, .. } if error == reason),
+            "the refusal stands as recorded"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn connect_one_timeout_marks_entry_failed() {
         use std::sync::OnceLock;
         // A hung stdio process (`sleep 999`) forces `connect_server`'s initialize handshake to
         // never complete. With a 50 ms timeout, `connect_one` must bail and mark the entry Failed.
-        let mut config = bare_server_config("hung");
+        let mut config = McpServerConfig::for_test("hung");
         config.transport = McpTransport::Stdio;
         config.command = Some("/bin/sleep".to_string());
         config.args = Some(vec!["999".to_string()]);
@@ -881,6 +914,7 @@ mod tests {
             client_context: McpClientContext::new(),
             state: RwLock::new(ServerState::Pending),
             reconnect_lock: Mutex::new(()),
+            refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
@@ -905,8 +939,7 @@ mod tests {
             ServerState::Failed { error, .. } => {
                 assert!(
                     error.contains("timed out"),
-                    "expected 'timed out' in Failed error, got: {}",
-                    error
+                    "expected 'timed out' in Failed error, got: {error}"
                 );
             }
             other => panic!("expected Failed, got: {}", other.label()),
@@ -918,7 +951,7 @@ mod tests {
     #[cfg(unix)]
     async fn failed_entry(name: &str, command: &str) -> (Arc<ServerEntry>, Arc<McpClientManager>) {
         use std::sync::OnceLock;
-        let mut config = bare_server_config(name);
+        let mut config = McpServerConfig::for_test(name);
         config.transport = McpTransport::Stdio;
         config.command = Some(command.to_string());
         config.url = None;
@@ -933,6 +966,7 @@ mod tests {
                 at: std::time::Instant::now(),
             }),
             reconnect_lock: Mutex::new(()),
+            refused: None,
             instructions: std::sync::RwLock::new(None),
             request_timeout: OnceLock::new(),
             dropped_tools: std::sync::atomic::AtomicUsize::new(0),
@@ -968,7 +1002,7 @@ mod tests {
         handle.abort();
     }
 
-    /// The retry must not outlive its manager. `mcp::cli::run_reconnect` builds a throwaway
+    /// The retry must not outlive its manager. `crate::cli::mcp::run_reconnect` builds a throwaway
     /// manager per invocation and is reachable from the REPL's `/mcp reconnect`, so a strong
     /// reference here would leave a task respawning a failing server for the life of the process.
     #[cfg(unix)]

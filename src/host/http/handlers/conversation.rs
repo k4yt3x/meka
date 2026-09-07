@@ -1,0 +1,838 @@
+//! Operations that reshape or read out a session's conversation log: compaction, rewind, context
+//! occupancy, and export / import.
+//!
+//! What the four share is that they are the HTTP surface for machinery the server already runs
+//! (auto-compaction) or the CLI already exposes (`meka session export`), and that the REPL reaches
+//! through `/compact`, `/rewind` and `/export`. None of them are new capability; they are the
+//! missing way to ask for it over the wire.
+//!
+//! Compaction and rewind rewrite the conversation rather than appending to it, so on a session this
+//! process holds they take its runtime mutex and refuse while a turn is in flight. Reading the DB
+//! copy and writing it back would be wrong in a way that is silent: a resident session holds its
+//! own `Conversation` in memory and would overwrite the change on its next turn.
+//!
+//! Rewind alone also has a path for a session that is *not* resident, which writes the store
+//! directly instead of reviving anything, and so guards that same hazard with the on-disk
+//! `lock_session` that `meka session rewind` has always used for it (`src/session/cli.rs`). That is
+//! what lets a rewind reach a sub-agent's transcript, which no other operation here can.
+
+use axum::{
+    Json,
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::{
+    agent::CompactSource,
+    host::http::{
+        errors::{ErrorKind, ProblemDetail},
+        handlers::sessions::turn_in_flight_conflict,
+        reattach::{ensure_session_loaded, require_session_exists},
+        scope,
+        state::ServerState,
+    },
+    session::{CompactOrigin, CompactRequest},
+};
+
+#[derive(Debug, Deserialize, ToSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompactRequestBody {
+    /// Free-text guidance on what to preserve or drop, the wire equivalent of `/compact
+    /// <instructions>`. Reaches the checkpoint turn and the fallback summarizer alike.
+    #[serde(default)]
+    pub(crate) instructions: Option<String>,
+    /// Whether to keep the most recent turns verbatim after the summary. Omit to let meka decide;
+    /// the checkpoint turn overrides this when it knows better, having just read the conversation.
+    #[serde(default)]
+    pub(crate) keep_recent: Option<bool>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CompactResponse {
+    pub(crate) session_id: Uuid,
+    /// Which strategy produced the summary: `checkpoint`, `checkpoint_text`, or `summarizer`.
+    /// Reported because they differ in fidelity, not just in mechanism: `summarizer` means the
+    /// checkpoint turn was disabled, failed, or produced nothing usable.
+    pub(crate) source: String,
+    /// Memories the checkpoint turn wrote, observed from its `memory_write` calls rather than
+    /// self-reported, so this cannot disagree with what actually landed on disk.
+    pub(crate) memories_written: Vec<String>,
+    /// Whether the recent turns were kept verbatim after the summary.
+    pub(crate) kept_recent: bool,
+    pub(crate) messages_before: usize,
+    pub(crate) messages_after: usize,
+}
+
+/// `POST /v1/sessions/{id}/compact`: summarize the conversation now.
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{id}/compact",
+    tag = "conversation",
+    params(("id" = Uuid, Path, description = "Session UUID")),
+    request_body = CompactRequestBody,
+    responses(
+        (status = 200, description = "Compaction completed", body = CompactResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "Session not found", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
+        (status = 422, description = "Invalid body, nothing to compact, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
+        (status = 502, description = "The provider refused or failed the summarizing turn. Read `type`: `/errors/provider-unavailable` is worth resending after a pause, `/errors/provider` covers everything meka does not classify, and `/errors/context-overflow` here means the conversation will not fit even to summarize it", body = ProblemDetail),
+        (status = 503, description = "An MCP server the checkpoint turn needed was unavailable (`/errors/mcp-unavailable`)", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:w"]))
+)]
+pub(crate) async fn compact(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsWrite>,
+    Path(id): Path<Uuid>,
+    raw_body: Bytes,
+) -> Result<Json<CompactResponse>, ProblemDetail> {
+    // An empty body means "compact with no guidance", which is the common case; `serde_json` would
+    // reject the zero-length slice, so treat it as `{}` rather than making every client send one.
+    let body: CompactRequestBody = if raw_body.is_empty() {
+        CompactRequestBody::default()
+    } else {
+        serde_json::from_slice(&raw_body)
+            .map_err(|error| ProblemDetail::invalid_body("compact", error))?
+    };
+
+    // Acquired under the sessions read-lock, the way `submit_turn` does it (see the note there).
+    // `DELETE`'s write-lock blocks behind any reader, so taking the guard inside the read lock is
+    // what makes DELETE's own `in_flight` re-check see this operation. Acquiring it after the lock
+    // is dropped would let a concurrent DELETE remove the row and the map entry first, leaving
+    // this to run a multi-minute checkpoint against a session that no longer exists and to persist
+    // a boundary event for it.
+    let (entry, in_flight) = {
+        let map = state.sessions.read().await;
+        match map.get(&id).cloned() {
+            Some(entry) => {
+                let guard = entry
+                    .claim_idle()
+                    .ok_or_else(|| turn_in_flight_conflict(id, "compact the conversation"))?;
+                (entry, guard)
+            }
+            // Not resident: `ensure_session_loaded` below re-attaches it, and a session that is
+            // not in the map cannot be racing a turn, so there is nothing to guard against yet.
+            None => {
+                drop(map);
+                let entry = ensure_session_loaded(&state, id).await?;
+                let guard = entry
+                    .claim_idle()
+                    .ok_or_else(|| turn_in_flight_conflict(id, "compact the conversation"))?;
+                (entry, guard)
+            }
+        }
+    };
+
+    // `try_lock`, not `lock().await`. The CAS above catches a turn that started first, but a turn
+    // that starts in the window between the CAS and here wins the mutex, and blocking would then
+    // park this request for the length of that turn -- and, for rewind, drop the turn that just
+    // succeeded instead of the one the caller meant. Out-of-band turns (the scheduler,
+    // background-outcome delivery) take the mutex before marking themselves busy, so this is the
+    // check that catches one in that window.
+    let mut conversation = entry
+        .conversation
+        .try_lock()
+        .map_err(|_| turn_in_flight_conflict(id, "compact the conversation"))?;
+    let messages_before = conversation.len();
+    let request = CompactRequest {
+        // `Manual` and not `Requested`: the origin distinguishes who asked, and an API caller is
+        // standing in for the human at the keyboard, not for the model asking on its own behalf.
+        origin: CompactOrigin::Manual,
+        instructions: body.instructions,
+        keep_recent: body.keep_recent,
+        prompt_id: None,
+    };
+    // A *fresh* token, published the way `submit_turn` publishes one, rather than a clone of
+    // whatever the last turn left behind.
+    //
+    // `entry.cancellation` holds the previous turn's token, and a turn that was canceled leaves
+    // it in the fired state. Inheriting it would start the checkpoint turn already canceled, so
+    // `run_checkpoint_turn` returns immediately and compaction silently falls back to the
+    // standalone summarizer -- no memories written, a worse summary, and a `warn` as the only
+    // trace. "Cancel the slow turn, then compact to free the window" is an ordinary thing to do.
+    //
+    // Publishing it keeps `POST /cancel` and the shutdown drain working: both fire whatever token
+    // is in this cell, which is now this compaction's.
+    let cancellation = CancellationToken::new();
+    let _published = entry
+        .cancel
+        .publish(cancellation.clone(), in_flight.admission);
+    let outcome = entry
+        .agent
+        .compact_session(&mut conversation, request, cancellation)
+        .await
+        .map_err(|error| {
+            ProblemDetail::for_error(&error, state.config.relay_provider_errors)
+                .with("session_id", id.to_string())
+        })?;
+    let messages_after = conversation.len();
+    drop(conversation);
+    // The checkpoint turn emits provider notices and the `Compacted` event into the session's
+    // recorder, and nothing here consumes them. Every other path that runs a turn outside a
+    // request drains for the same reason (`schedule::run_prompt_in_session`): left alone they
+    // accumulate across repeated compactions and then surface in whichever turn drains next.
+    let _checkpoint_events = entry.frontend.drain();
+    // Same reason every turn path touches: this both advances the `updated_at` clients poll for
+    // change detection, which the boundary write already moved on the DB row, and resets the GC
+    // idle timer. Without it a session compacted just shy of `idle_timeout` is evicted on the next
+    // scan, throwing away the context gauge `compact_session` has just re-seeded.
+    entry.touch();
+
+    tracing::info!(
+        "compacted session {id} via HTTP: {messages_before} -> {messages_after} messages"
+    );
+
+    Ok(Json(CompactResponse {
+        session_id: id,
+        source: match outcome.source {
+            CompactSource::Checkpoint => "checkpoint",
+            CompactSource::CheckpointText => "checkpoint_text",
+            CompactSource::Summarizer => "summarizer",
+        }
+        .to_string(),
+        memories_written: outcome.memories_written,
+        kept_recent: outcome.kept_recent,
+        messages_before,
+        messages_after,
+    }))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ContextResponse {
+    pub(crate) session_id: Uuid,
+    /// Tokens behind the most recent provider round, omitted when no turn has run since this
+    /// process loaded the session.
+    ///
+    /// Absent rather than zero, deliberately. A re-attached session has a full conversation and an
+    /// unmeasured window, and reporting `0` there would read as "empty" to every client that
+    /// divides by `window`. Run a turn, or read `total_input_tokens` for the cumulative figure
+    /// that does survive a restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) used: Option<u64>,
+    /// The model's context window, omitted when meka has no metadata for it. A percentage of an
+    /// unknown denominator is worse than silence, so clients should suppress occupancy rather than
+    /// assume a default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) window: Option<u64>,
+    /// Occupancy percent, present only when both `used` and `window` are known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) used_percent: Option<u64>,
+    /// Estimated system prompt + tool schemas: the part of the window compaction cannot reclaim.
+    ///
+    /// Absent, not zero, when nothing has measured it. Same reasoning as `used`: the counter is
+    /// only stamped mid-turn, so a session evicted or re-attached since its last turn has a real
+    /// overhead of several thousand tokens and a recorded one of zero. Reporting `0` would make a
+    /// client computing `used - overhead` confidently wrong rather than visibly uninformed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) overhead: Option<u64>,
+    /// Occupancy at which auto-compaction fires, omitted when it is switched off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) compact_at_percent: Option<u64>,
+    /// How many times this session has already been compacted. Fidelity degrades with each pass,
+    /// so a client deciding whether to fork rather than compact again wants this.
+    pub(crate) generation: u64,
+    /// Messages currently in the materialised window (post-compaction), not the full history.
+    ///
+    /// Absent while a turn holds the conversation. Everything else here is read from atomics and
+    /// the database, so occupancy stays answerable during a turn; this one field genuinely needs
+    /// the log, and blocking the whole response on it would defeat the point of asking.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message_count: Option<usize>,
+    /// Cumulative turns and tokens for this session, read from the DB and so unaffected by
+    /// eviction or restart.
+    pub(crate) totals: SessionTotals,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct SessionTotals {
+    pub(crate) turns: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_creation_input_tokens: u64,
+    pub(crate) cache_read_input_tokens: u64,
+}
+
+/// `GET /v1/sessions/{id}/context`: live window occupancy plus cumulative usage.
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{id}/context",
+    tag = "conversation",
+    params(("id" = Uuid, Path, description = "Session UUID")),
+    responses(
+        (status = 200, description = "Context occupancy", body = ContextResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "Session not found", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r"]))
+)]
+pub(crate) async fn context(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsRead>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ContextResponse>, ProblemDetail> {
+    // Deliberately does NOT revive. Re-attaching takes the session's cross-process file lock and
+    // holds it until the GC evicts the entry, which defaults to 24 hours -- so a `sessions:r`
+    // token calling this once would lock the operator out of `meka -r` on their own session for a
+    // day, and could do it to every session it can list. A read scope must not be able to seize a
+    // write-exclusive resource. An evicted session still answers from the database; only the live
+    // counters are missing, and they are already `Option` for exactly that reason.
+    require_session_exists(&state, id).await?;
+    let entry = state.sessions.read().await.get(&id).cloned();
+    let stats = state
+        .shared
+        .store
+        .load_session_stats(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to load session stats", error)
+                .with("session_id", id.to_string())
+        })?;
+    // Counted from the database rather than the agent's cache, because the cache lives behind the
+    // runtime mutex and this is the same figure `Agent::compaction_generation` would seed itself
+    // from.
+    let generation = state
+        .shared
+        .store
+        .count_compactions(id)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to count compactions", error)
+                .with("session_id", id.to_string())
+        })?;
+
+    // Atomics, so no lock. `try_lock` for the message count alone: a turn in flight is exactly
+    // when headroom is worth asking about, and waiting on it would turn this into a request that
+    // hangs for the length of a turn.
+    let used_raw = entry
+        .as_ref()
+        .map(|entry| {
+            entry
+                .cells()
+                .context_tokens
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .unwrap_or(0);
+    let overhead_raw = entry
+        .as_ref()
+        .map(|entry| {
+            entry
+                .cells()
+                .context_overhead
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .unwrap_or(0);
+    let message_count = entry
+        .as_ref()
+        .and_then(|entry| entry.conversation.try_lock().ok())
+        .map(|conversation| conversation.len());
+
+    // Per session, not per process: a session runs on the profile it recorded, and two sessions on
+    // one server can have different windows. Reading the shared `agent_options` reported the
+    // *default* profile's window for every one of them, which is the denominator every percentage
+    // below is divided by.
+    // A session GC has evicted is the common case, not the edge one: the default idle timeout is
+    // hours, and any session the CLI created was never resident here at all. Falling back to the
+    // shared `agent_options` reported the *server default's* window for every one of them, which is
+    // the very thing the per-session handle above exists to stop. The row is the answer, and this
+    // handler already holds it.
+    let window_raw = match entry.as_ref() {
+        Some(entry) => Some(entry.cells().profile.context_window()),
+        None => {
+            let recorded = state
+                .shared
+                .store
+                .recorded_profile(id)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to read session profile", error)
+                        .with("session_id", id.to_string())
+                })?;
+            // `None` for a session whose row is gone, and for one whose profile no longer resolves.
+            // Both answer "meka cannot say", which `window` already encodes; the server default
+            // would be a number about a different profile.
+            recorded.and_then(|profile| {
+                crate::provider::profile_context_window(&state.shared.providers, &profile)
+            })
+        }
+    };
+    let compact_at_percent = state
+        .shared
+        .agent_options
+        .auto_compact
+        .then_some(crate::session::AUTO_COMPACT_THRESHOLD_PERCENT);
+    let used = (used_raw > 0).then_some(used_raw);
+    let overhead = (overhead_raw > 0).then_some(overhead_raw);
+    let window = window_raw.filter(|window| *window > 0);
+    Ok(Json(ContextResponse {
+        session_id: id,
+        used,
+        window,
+        used_percent: match (used, window) {
+            (Some(used), Some(window)) => Some(used.saturating_mul(100) / window),
+            _ => None,
+        },
+        overhead,
+        compact_at_percent,
+        generation,
+        message_count,
+        totals: SessionTotals {
+            turns: stats.turns,
+            input_tokens: stats.input_tokens,
+            output_tokens: stats.output_tokens,
+            cache_creation_input_tokens: stats.cache_creation_input_tokens,
+            cache_read_input_tokens: stats.cache_read_input_tokens,
+        },
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RewindRequestBody {
+    /// How many trailing turns to drop. A turn starts at a user message that is not a tool result,
+    /// so dropping one removes that message and every assistant / tool-result message after it.
+    #[serde(default = "default_turns")]
+    pub(crate) turns: usize,
+}
+
+fn default_turns() -> usize {
+    1
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct RewindResponse {
+    pub(crate) session_id: Uuid,
+    pub(crate) turns_removed: usize,
+    pub(crate) messages_before: usize,
+    pub(crate) messages_after: usize,
+}
+
+/// `POST /v1/sessions/{id}/rewind`: drop trailing turns from the conversation.
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/{id}/rewind",
+    tag = "conversation",
+    params(("id" = Uuid, Path, description = "Session UUID")),
+    request_body = RewindRequestBody,
+    responses(
+        (status = 200, description = "Turns removed", body = RewindResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "Session not found", body = ProblemDetail),
+        (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session, as a running sub-agent's parent does (`/errors/session-locked`)", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
+        (status = 422, description = "Invalid body, or fewer turns than requested", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:w"]))
+)]
+pub(crate) async fn rewind(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsWrite>,
+    Path(id): Path<Uuid>,
+    raw_body: Bytes,
+) -> Result<Json<RewindResponse>, ProblemDetail> {
+    let body: RewindRequestBody = if raw_body.is_empty() {
+        RewindRequestBody { turns: 1 }
+    } else {
+        serde_json::from_slice(&raw_body)
+            .map_err(|error| ProblemDetail::invalid_body("rewind", error))?
+    };
+    if body.turns == 0 {
+        return Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`turns` must be at least 1",
+        ));
+    }
+
+    // Acquired under the sessions read-lock, the way `submit_turn` does it (see the note there).
+    // `DELETE`'s write-lock blocks behind any reader, so taking the guard inside the read lock is
+    // what makes DELETE's own `in_flight` re-check see this operation. Acquiring it after the lock
+    // is dropped would let a concurrent DELETE remove the row and the map entry first, leaving
+    // this to run a multi-minute checkpoint against a session that no longer exists and to persist
+    // a boundary event for it.
+    let (entry, _in_flight) = {
+        let map = state.sessions.read().await;
+        match map.get(&id).cloned() {
+            Some(entry) => {
+                let guard = entry
+                    .claim_idle()
+                    .ok_or_else(|| turn_in_flight_conflict(id, "rewind the conversation"))?;
+                (entry, guard)
+            }
+            // Not resident: rewound straight on the store, without reviving anything. A rewind is
+            // an edit to the event log, not a turn, so an agent built here would be needed only to
+            // hold the result, and a session with no runtime has nothing to hold. This is also what
+            // makes the endpoint symmetrical with `meka session rewind`, which has always been a
+            // store-only operation and therefore always worked on a sub-agent.
+            None => {
+                drop(map);
+                if let Some(response) = rewind_dormant_session(&state, id, body.turns).await? {
+                    return Ok(response);
+                }
+                // It became resident while we looked; fall through so the rewind lands in the
+                // live conversation rather than under it.
+                let entry = ensure_session_loaded(&state, id).await?;
+                let guard = entry
+                    .claim_idle()
+                    .ok_or_else(|| turn_in_flight_conflict(id, "rewind the conversation"))?;
+                (entry, guard)
+            }
+        }
+    };
+
+    // `try_lock` for the same reason as `compact`; see the note there. Rewind is the sharper case:
+    // blocking here would drop whichever turn won the race rather than the one the caller saw.
+    let mut conversation = entry
+        .conversation
+        .try_lock()
+        .map_err(|_| turn_in_flight_conflict(id, "rewind the conversation"))?;
+    let messages_before = conversation.len();
+    let Some(event) = conversation.rewind(body.turns) else {
+        return Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "nothing to rewind: session has fewer than {} turn(s)",
+                body.turns
+            ),
+        )
+        .with("session_id", id.to_string()));
+    };
+    let messages_after = conversation.len();
+    // The in-memory log is already rewound; persisting is what makes it survive eviction.
+    if let Err(error) = state.shared.store.save_event(id, &event).await {
+        // Put the turns back rather than leave memory and disk disagreeing, exactly as the REPL's
+        // `/rewind` does. Left diverged, `GET /messages` reads the DB and still shows the turns
+        // with `revision` unmoved -- so the counter added to make a rewrite detectable reports
+        // that nothing happened -- while the model no longer sees them, and a client retrying the
+        // 500 eats another turn per attempt. `pop_repair` is the exact inverse of the
+        // `replace_tail` that `rewind` just performed.
+        conversation.pop_repair();
+        return Err(
+            ProblemDetail::internal_sanitized("failed to persist rewind event", error)
+                .with("session_id", id.to_string()),
+        );
+    }
+    // The conversation was rewritten under the agent, which indexes two markers by message
+    // position. Left stale, `last_accepted_len` makes the degrade-and-retry repair compute an
+    // empty suspect window and silently stop firing for the rest of the session, and
+    // `last_rendered_world` makes `run_turn` believe it already announced a tool or MCP server
+    // whose announcement the rewind just deleted. `compact_session` clears both inline; this is
+    // the other path that rewrites the log, and the REPL's `/rewind` has always called this.
+    entry.agent.reset_conversation_markers().await;
+    drop(conversation);
+    // See the note in `compact`. `save_event` has already moved `updated_at` on the row, so
+    // without this the resident entry reports an older timestamp than `meka session list` does for
+    // the same session, and only agrees again once the GC evicts it.
+    entry.touch();
+
+    tracing::info!(
+        "rewound {turns} turn(s) from session {id} via HTTP: {messages_before} -> \
+         {messages_after} messages",
+        turns = body.turns,
+    );
+
+    Ok(Json(RewindResponse {
+        session_id: id,
+        turns_removed: body.turns,
+        messages_before,
+        messages_after,
+    }))
+}
+
+/// Rewind a session this server has not loaded, without loading it.
+///
+/// `Ok(None)` means the session became resident while this was deciding, and the caller must take
+/// the resident path so the rewind lands in the live conversation rather than underneath it. The
+/// reconstruction lock is held for the whole body so that answer cannot go stale between the check
+/// and the write, exactly as `repin_dormant_session` holds it.
+///
+/// **The session lock is what makes this safe on a sub-agent.** A sub-agent holds its own lock for
+/// as long as its parent is running it, so a rewind aimed at a live sub-agent fails here with
+/// `session-locked` rather than truncating a log its parent is still appending to. A sub-agent is
+/// never resident in this map -- `build_subagent` runs it under its parent's runtime -- so this is
+/// the only path a rewind on one can take, and it is the same one `meka session rewind` has always
+/// used.
+///
+/// Deliberately unlike `/compact`, which stays refused for a sub-agent: compaction runs the model,
+/// which is driving a conversation only the parent may drive. A rewind writes no request and reads
+/// no provider; it truncates an event log the caller can already read in full through `/export`.
+async fn rewind_dormant_session(
+    state: &ServerState,
+    id: Uuid,
+    turns: usize,
+) -> Result<Option<Json<RewindResponse>>, ProblemDetail> {
+    let _reconstruction = state.reconstruction_locks.lock(id).await;
+    if state.sessions.read().await.contains_key(&id) {
+        return Ok(None);
+    }
+    require_session_exists(state, id).await?;
+
+    // Held across the read-modify-write, for the reason the CLI holds it: another host with this
+    // session open has its own in-memory conversation and would write over the rewind on its next
+    // turn.
+    //
+    // Only a held lock is `session-locked`. The lock directory failing to open is the operator's
+    // fault and names their path, so it goes to the log as a 500 rather than to the caller as a
+    // conflict a retry would never resolve.
+    let _session = state
+        .shared
+        .store
+        .lock_session(id)
+        .map_err(|error| match error {
+            crate::error::MekaError::SessionLocked(_) => ProblemDetail::new(
+                ErrorKind::SessionLocked,
+                StatusCode::CONFLICT,
+                "another meka process is running this session, so its conversation cannot be \
+             rewound from here",
+            )
+            .with("session_id", id.to_string()),
+            other => ProblemDetail::internal_sanitized("failed to lock session for rewind", other)
+                .with("session_id", id.to_string()),
+        })?;
+
+    let events = state.shared.store.load_events(id).await.map_err(|error| {
+        ProblemDetail::internal_sanitized("failed to load session events", error)
+            .with("session_id", id.to_string())
+    })?;
+    let mut conversation = crate::conversation::Conversation::from_events(events);
+    let messages_before = conversation.len();
+    let Some(event) = conversation.rewind(turns) else {
+        return Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("nothing to rewind: session has fewer than {turns} turn(s)"),
+        )
+        .with("session_id", id.to_string()));
+    };
+    let messages_after = conversation.len();
+    state
+        .shared
+        .store
+        .save_event(id, &event)
+        .await
+        .map_err(|error| {
+            ProblemDetail::internal_sanitized("failed to persist rewind event", error)
+                .with("session_id", id.to_string())
+        })?;
+
+    tracing::info!(
+        "rewound {turns} turn(s) from dormant session {id} via HTTP: {messages_before} -> {messages_after} messages"
+    );
+
+    Ok(Some(Json(RewindResponse {
+        session_id: id,
+        turns_removed: turns,
+        messages_before,
+        messages_after,
+    })))
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub(crate) struct ExportQuery {
+    /// `markdown` (default) or `json`. Markdown is a rendered transcript for a human; JSON is the
+    /// round-trippable envelope `POST /v1/sessions/import` accepts.
+    #[serde(default)]
+    pub(crate) format: Option<String>,
+}
+
+/// `GET /v1/sessions/{id}/export`: the full conversation, including pre-compaction turns.
+///
+/// Reads the raw event log rather than the materialised view, so turns that compaction hid from
+/// the model are still in the export. That is the whole point of having it: `GET /messages` shows
+/// what the model can see, and this shows what actually happened.
+#[utoipa::path(
+    get,
+    path = "/v1/sessions/{id}/export",
+    tag = "conversation",
+    params(
+        ("id" = Uuid, Path, description = "Session UUID"),
+        ExportQuery,
+    ),
+    responses(
+        (status = 200, description = "Rendered transcript (text/markdown) or export envelope (application/json)"),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 404, description = "Session not found", body = ProblemDetail),
+        (status = 422, description = "Unknown format", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:r"]))
+)]
+pub(crate) async fn export(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsRead>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ExportQuery>,
+) -> Result<Response, ProblemDetail> {
+    // Read-only: never revive the runtime. Exporting a spawn tree would otherwise rebuild an agent
+    // per sub-agent session just to read rows back out of SQLite.
+    require_session_exists(&state, id).await?;
+
+    let manager = &state.shared.store;
+    match query.format.as_deref().unwrap_or("markdown") {
+        "markdown" => {
+            let events = manager.load_events(id).await.map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to load session events", error)
+                    .with("session_id", id.to_string())
+            })?;
+            let tool_outputs: std::collections::HashMap<String, String> = manager
+                .load_all_scratchpad_entries(id)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to load scratchpad entries", error)
+                        .with("session_id", id.to_string())
+                })?
+                .into_iter()
+                .collect();
+            let body = crate::conversation::format_session_as_markdown(id, &events, &tool_outputs);
+            Ok((
+                [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+                body,
+            )
+                .into_response())
+        }
+        "json" => {
+            let export = crate::store::export::build_session_export(manager, id)
+                .await
+                .map_err(|error| {
+                    ProblemDetail::internal_sanitized("failed to build session export", error)
+                        .with("session_id", id.to_string())
+                })?;
+            Ok(Json(export).into_response())
+        }
+        other => Err(ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            crate::text::unknown_name("export format", other, ["markdown", "json"]),
+        )),
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ImportResponse {
+    /// Freshly minted id for the imported root. Import never reuses the exported ids, so the same
+    /// envelope can be imported twice without collision.
+    pub(crate) session_id: Uuid,
+    /// Total sessions written, including sub-agent descendants.
+    pub(crate) sessions_imported: usize,
+}
+
+/// Refuse an envelope large enough to hold the database against every other request.
+fn store_too_large(count: usize) -> ProblemDetail {
+    ProblemDetail::new(
+        ErrorKind::InvalidBody,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "session export contains {} sessions, more than the {} this server imports in one \
+             request; import it with `meka session import`, which has no such limit",
+            count,
+            crate::store::export::MAX_IMPORT_SESSIONS
+        ),
+    )
+}
+
+/// `POST /v1/sessions/import`: recreate a session tree from an export envelope.
+#[utoipa::path(
+    post,
+    path = "/v1/sessions/import",
+    tag = "conversation",
+    request_body(content = String, description = "A `format=json` export envelope", content_type = "application/json"),
+    responses(
+        (status = 201, description = "Session tree imported", body = ImportResponse),
+        (status = 401, description = "Authorization missing or invalid", body = ProblemDetail),
+        (status = 403, description = "Insufficient scope", body = ProblemDetail),
+        (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
+        (status = 422, description = "Malformed or unsupported envelope", body = ProblemDetail),
+        (status = 500, description = "Internal server error", body = ProblemDetail),
+    ),
+    security(("bearerAuth" = ["sessions:w"]))
+)]
+pub(crate) async fn import(
+    State(state): State<ServerState>,
+    _scoped: scope::Scoped<scope::SessionsWrite>,
+    raw_body: Bytes,
+) -> Result<(StatusCode, Json<ImportResponse>), ProblemDetail> {
+    let export: crate::store::export::SessionExport = serde_json::from_slice(&raw_body)
+        .map_err(|error| ProblemDetail::invalid_body("session import", error))?;
+    if export.sessions.len() > crate::store::export::MAX_IMPORT_SESSIONS {
+        return Err(store_too_large(export.sessions.len()));
+    }
+    // Version mismatch and an empty session list both surface here, as 422 rather than 500: the
+    // envelope is the caller's, so a rejection is a statement about their input.
+    // An archive that names no profile adopts this server's default, which is the same profile
+    // `POST /v1/sessions` gives a body that names none.
+    let crate::store::export::ImportPlan {
+        records,
+        blobs,
+        root_new_id,
+    } = crate::store::export::plan_import(
+        export,
+        state.shared.default_profile.as_deref(),
+        Some(state.shared.config.permission),
+    )
+    .map_err(|error| {
+        ProblemDetail::new(
+            ErrorKind::InvalidBody,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error.to_string(),
+        )
+    })?;
+    let count = records.len();
+    state
+        .shared
+        .store
+        .import_sessions(records, blobs)
+        .await
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to import sessions", error))?;
+
+    tracing::info!("imported {count} session(s) via HTTP as root {root_new_id}");
+    Ok((
+        StatusCode::CREATED,
+        Json(ImportResponse {
+            session_id: root_new_id,
+            sessions_imported: count,
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The dormant rewind must hold both locks; see
+    /// [`crate::host::http::reattach::assert_dormant_fast_path_is_serialized`] for why this is
+    /// asserted against the source.
+    ///
+    /// What it defends here is the whole reason a rewind may touch a sub-agent's transcript when
+    /// every other operation in this module refuses one. That permission rests entirely on
+    /// `lock_session`: a sub-agent holds its own lock for as long as its parent is running it, so a
+    /// rewind aimed at a live one answers `session-locked` instead of truncating an event log the
+    /// parent is still appending to. Nothing else stops it, because a sub-agent is never resident
+    /// and so never reaches the in-flight guard or the runtime mutex that protect a host's
+    /// session.
+    ///
+    /// `tests/serve.rs`'s `a_sub_agent_transcript_can_be_rewound_over_http` covers what is
+    /// reachable, that the sub-agent's log really shrinks. It does not cover this: deleting the
+    /// `lock_session` call outright left all 3056 tests green.
+    #[test]
+    fn the_dormant_rewind_serializes_against_reconstruction() {
+        crate::host::http::reattach::assert_dormant_fast_path_is_serialized(
+            include_str!("conversation.rs"),
+            "async fn rewind_dormant_session(",
+            "from dormant session",
+            "save_event(id, &event)",
+        );
+    }
+}

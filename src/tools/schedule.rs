@@ -5,7 +5,7 @@
 //! -checked when it runs, so scheduling one grants nothing the session did not already have.
 //!
 //! The `gate` field is the exception, and is checked inside [`ScheduleCreateTool::execute`]
-//! against [`crate::schedule::gate_probe_is_authorised`]. A gate runs unattended, on a timer, until
+//! against [`crate::schedule::gate_probe_is_authorized`]. A gate runs unattended, on a timer, until
 //! someone cancels it -- persistent in a way a tool call inside a turn is not, since that at least
 //! ends with the turn that made it. The bar depends on what the gate runs: a shell command needs
 //! `unrestricted` because it is unsandboxed, while a read-only tool call needs only what that tool
@@ -18,9 +18,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{Local, Utc};
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
+use chrono::Utc;
 use uuid::Uuid;
 
 use super::{
@@ -33,24 +31,22 @@ use crate::{
     permission::Permission,
     provider::ToolDefinition,
     schedule::{Gate, GatePredicate, GateProbe, Schedule, ScheduledJob},
-    session::SessionManager,
+    store::Store,
 };
 
 /// Shared by all three tools.
 pub(super) struct ScheduleContext {
-    session_manager: SessionManager,
-    session_id: Arc<RwLock<Option<Uuid>>>,
+    store: Store,
+    site: crate::session::ToolSite,
 }
 
-/// Absolute local time plus a relative offset, e.g.
-/// `Wed 2026-08-12 08:57 CEST (in 17h 35m)`.
+/// Absolute local time plus a relative offset, e.g. `Wed 2026-08-12 08:57 +02:00 (in 17h 35m)`.
 ///
 /// Both halves earn their place: the absolute form is what the user can check against a calendar,
 /// and the relative form is what catches a schedule that parsed successfully but means something
 /// other than intended. A model that writes `0 9 * * 1-5` believing it fires "in a few minutes"
 /// sees `in 17h 35m` and can correct itself before the user ever finds out.
 fn describe_fire_time(at: chrono::DateTime<Utc>) -> String {
-    let local = at.with_timezone(&Local);
     let delta = at - Utc::now();
     let relative = match delta.to_std() {
         Ok(std) => format!(
@@ -62,14 +58,20 @@ fn describe_fire_time(at: chrono::DateTime<Utc>) -> String {
         // Negative: the instant has already passed, which the scheduler will treat as due.
         Err(_) => "overdue".to_string(),
     };
-    format!("{} ({})", local.format("%a %Y-%m-%d %H:%M %Z"), relative)
+    format!(
+        "{} ({})",
+        crate::text::format_timestamp(at, crate::text::Precision::WeekdayMinutes),
+        relative
+    )
 }
 
 pub(super) struct ScheduleCreateTool {
-    pub session_manager: SessionManager,
-    pub session_id: Arc<RwLock<Option<Uuid>>>,
-    pub config: ResolvedScheduleConfig,
-    pub shared_permission: crate::permission::SharedPermission,
+    /// The dispatcher a tool gate resolves against, for the `[Scheduled]` reporting; `None` where
+    /// the host has none.
+    pub(crate) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
+    pub(crate) store: Store,
+    pub(crate) site: crate::session::ToolSite,
+    pub(crate) config: ResolvedScheduleConfig,
 }
 
 #[async_trait]
@@ -79,7 +81,7 @@ impl Tool for ScheduleCreateTool {
             name: "schedule_create".to_string(),
             description: "Arrange for a prompt to be delivered to you at a future time, so you can \
                 act without the user asking again. Use for reminders (\"remind me in 20 minutes\"), \
-                recurring work (\"summarise my calendar every weekday morning\"), and watching \
+                recurring work (\"summarize my calendar every weekday morning\"), and watching \
                 something change. Give exactly one of `at`, `every`, or `cron`. The prompt is \
                 delivered as a turn with no human present, so write it as an instruction to \
                 yourself, including any context you will need and no longer have."
@@ -101,7 +103,7 @@ impl Tool for ScheduleCreateTool {
                     "every": {
                         "type": "string",
                         "description": "Recurring fixed interval ('30m', '1h', '1d'). Runs until \
-                                        cancelled."
+                                        canceled."
                     },
                     "cron": {
                         "type": "string",
@@ -131,6 +133,7 @@ impl Tool for ScheduleCreateTool {
                                 }
                             },
                             "when": {
+                                "default": "changed",
                                 "description": "What counts as 'something happened'. \"changed\" \
                                                 (default) fires when the whole result differs from \
                                                 last time. \"succeeded\" fires while the command \
@@ -161,10 +164,10 @@ impl Tool for ScheduleCreateTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let tool_name = "schedule_create";
-        let session_id = resolve_session_id(&self.session_id, tool_name).await?;
+        let session_id = resolve_session_id(&self.site.session_id, tool_name)?;
         let prompt = require_str(&input, "prompt", tool_name)?;
 
         let now = Utc::now();
@@ -172,7 +175,7 @@ impl Tool for ScheduleCreateTool {
         let gate = self.parse_gate(&input, tool_name)?;
 
         let existing = self
-            .session_manager
+            .store
             .schedule_store()
             .list_scheduled_jobs(session_id)
             .await?
@@ -181,9 +184,8 @@ impl Tool for ScheduleCreateTool {
             return Err(MekaError::ToolExecution {
                 tool_name: tool_name.to_string(),
                 message: format!(
-                    "this session already has {} scheduled jobs (the limit). Cancel one with \
-                     schedule_cancel first.",
-                    existing
+                    "this session already has {existing} scheduled jobs (the limit). Cancel one with \
+                     schedule_cancel first."
                 ),
             });
         }
@@ -208,17 +210,15 @@ impl Tool for ScheduleCreateTool {
             next_fire_at,
             attempts: 0,
         };
-        self.session_manager
+        self.store
             .schedule_store()
             .create_scheduled_job(&job)
             .await?;
 
-        tracing::info!(
-            "scheduled job {} ({}), next fire {}",
-            job.short_id(),
-            job.schedule.describe(),
-            next_fire_at.to_rfc3339()
-        );
+        let short_id = job.short_id();
+        let schedule = job.schedule.describe();
+        let next_fire = next_fire_at.to_rfc3339();
+        tracing::info!("scheduled job {short_id} ({schedule}), next fire {next_fire}");
 
         let mut summary = format!(
             "Created job {} ({}). Next fire: {}.",
@@ -254,11 +254,11 @@ impl ScheduleCreateTool {
         // `required_permission` so an ungated reminder still works at read, and because the bar
         // depends on the probe: a shell command needs `unrestricted`, a read-only tool call needs
         // only what that tool needs.
-        let permission = self.shared_permission.get();
-        if let Err(refusal) = crate::schedule::gate_probe_is_authorised(
+        let permission = self.site.permission.get();
+        if let Err(refusal) = crate::schedule::gate_probe_is_authorized(
             &probe,
             permission,
-            self.config.gate_tools.as_deref(),
+            self.gate_tools.as_deref(),
         ) {
             return Err(refuse(format!(
                 "{}. Create the job without `gate` and check the condition inside the prompt \
@@ -306,7 +306,7 @@ fn parse_schedule(
                     .to_string(),
             });
         }
-        // Ambiguity is refused rather than resolved by precedence: silently honouring one and
+        // Ambiguity is refused rather than resolved by precedence: silently honoring one and
         // dropping the other would produce a job that fires on a schedule nobody asked for.
         several => {
             return Err(MekaError::ToolExecution {
@@ -335,11 +335,10 @@ fn parse_schedule(
 }
 
 pub(super) struct ScheduleListTool {
-    pub context: ScheduleContext,
-    /// Carried only to resolve a gate's tool when reporting whether the gate can still fire. The
-    /// listing itself creates nothing, so none of the creation limits in here apply to it.
-    pub config: ResolvedScheduleConfig,
-    pub shared_permission: crate::permission::SharedPermission,
+    /// Carried only to resolve a gate's tool when reporting whether the gate can still fire;
+    /// `None` where the host has no dispatcher.
+    pub(crate) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
+    pub(crate) context: ScheduleContext,
 }
 
 #[async_trait]
@@ -366,12 +365,12 @@ impl Tool for ScheduleListTool {
     async fn execute(
         &self,
         _input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let session_id = resolve_session_id(&self.context.session_id, "schedule_list").await?;
+        let session_id = resolve_session_id(&self.context.site.session_id, "schedule_list")?;
         let jobs = self
             .context
-            .session_manager
+            .store
             .schedule_store()
             .list_scheduled_jobs(session_id)
             .await?;
@@ -393,7 +392,7 @@ impl Tool for ScheduleListTool {
             if let Some(fired) = job.last_fired_at {
                 rendered.push_str(&format!(
                     "  last fired: {}\n",
-                    fired.with_timezone(&Local).format("%Y-%m-%d %H:%M %Z")
+                    crate::text::format_timestamp(fired, crate::text::Precision::Minutes)
                 ));
             }
             if let Some(gate) = &job.gate {
@@ -412,11 +411,12 @@ impl Tool for ScheduleListTool {
             // can act on it -- `schedule_cancel` needs only `read` -- where until now the only
             // trace was a `warn!` in the operator's log.
             if let Some(reason) = crate::schedule::job_withheld_reason(
+                self.context.store.scheduler_memory(),
                 job,
-                self.shared_permission.get(),
-                self.config.gate_tools.as_deref(),
+                self.context.site.permission.get(),
+                self.gate_tools.as_deref(),
             ) {
-                rendered.push_str(&format!("  NOT FIRING: {}\n", reason));
+                rendered.push_str(&format!("  NOT FIRING: {reason}\n"));
             }
             rendered.push_str(&format!("  prompt: {}\n", job.prompt));
         }
@@ -425,7 +425,7 @@ impl Tool for ScheduleListTool {
 }
 
 pub(super) struct ScheduleCancelTool {
-    pub context: ScheduleContext,
+    pub(crate) context: ScheduleContext,
 }
 
 #[async_trait]
@@ -441,7 +441,7 @@ impl Tool for ScheduleCancelTool {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Job id, or any unique prefix of one"
+                        "description": "Job id, or any unique prefix of one."
                     }
                 },
                 "required": ["id"]
@@ -457,31 +457,30 @@ impl Tool for ScheduleCancelTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let tool_name = "schedule_cancel";
-        let session_id = resolve_session_id(&self.context.session_id, tool_name).await?;
+        let session_id = resolve_session_id(&self.context.site.session_id, tool_name)?;
         let id = require_str(&input, "id", tool_name)?;
 
         match self
             .context
-            .session_manager
+            .store
             .schedule_store()
             .cancel_scheduled_job(session_id, &id)
             .await?
         {
-            Some(cancelled) => {
-                tracing::info!("cancelled scheduled job {}", cancelled);
+            Some(canceled) => {
+                tracing::info!("canceled scheduled job {canceled}");
                 Ok(ToolOutput::text(
-                    format!("Cancelled job {}.", &cancelled[..8.min(cancelled.len())]),
+                    format!("Canceled job {}.", &canceled[..8.min(canceled.len())]),
                     false,
                 ))
             }
             None => Ok(ToolOutput::text(
                 format!(
-                    "No scheduled job matching '{}' in this session. Use schedule_list to see \
-                     what is there.",
-                    id
+                    "No scheduled job matching '{id}' in this session. Use schedule_list to see \
+                     what is there."
                 ),
                 false,
             )),
@@ -491,77 +490,69 @@ impl Tool for ScheduleCancelTool {
 
 /// Build the three tools. Kept here so `crate::tools` does not need to know their field shapes.
 pub(super) fn build(
-    session_manager: SessionManager,
-    session_id: Arc<RwLock<Option<Uuid>>>,
+    store: Store,
+    site: crate::session::ToolSite,
     config: ResolvedScheduleConfig,
-    shared_permission: crate::permission::SharedPermission,
+    gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
 ) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ScheduleCreateTool {
-            session_manager: session_manager.clone(),
-            session_id: session_id.clone(),
-            config: config.clone(),
-            shared_permission: shared_permission.clone(),
+            gate_tools: gate_tools.clone(),
+            store: store.clone(),
+            config,
+            site: site.clone(),
         }),
         Arc::new(ScheduleListTool {
+            gate_tools,
             context: ScheduleContext {
-                session_manager: session_manager.clone(),
-                session_id: session_id.clone(),
+                store: store.clone(),
+                site: site.clone(),
             },
-            config,
-            shared_permission,
         }),
         Arc::new(ScheduleCancelTool {
-            context: ScheduleContext {
-                session_manager,
-                session_id,
-            },
+            context: ScheduleContext { store, site },
         }),
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tools::tests::text_content;
+    use tokio_util::sync::CancellationToken;
 
-    async fn harness() -> (
-        ScheduleCreateTool,
-        Arc<RwLock<Option<Uuid>>>,
-        SessionManager,
-    ) {
-        let manager =
-            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
-                .await
-                .expect("open in-memory database");
+    use super::*;
+
+    async fn harness() -> (ScheduleCreateTool, crate::session::SharedSessionId, Store) {
+        let manager = Store::for_test().await;
         let session = manager
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create session");
-        let session_id = Arc::new(RwLock::new(Some(session)));
+        let session_id = crate::session::SharedSessionId::new(Some(session));
         let tool = ScheduleCreateTool {
-            session_manager: manager.clone(),
-            session_id: session_id.clone(),
+            store: manager.clone(),
             config: ResolvedScheduleConfig::default(),
-            shared_permission: crate::permission::SharedPermission::new(
-                Permission::Unrestricted,
-                crate::permission::EnabledPermissions::ALL,
-            ),
+            gate_tools: None,
+            site: crate::session::ToolSite::for_test()
+                .with_permission(crate::permission::SharedPermission::new(
+                    Permission::Unrestricted,
+                    crate::permission::EnabledPermissions::ALL,
+                ))
+                .with_session_id(session_id.clone()),
         };
         (tool, session_id, manager)
     }
 
     #[tokio::test]
-    async fn test_create_reports_the_resolved_fire_time() {
+    async fn create_reports_the_resolved_fire_time() {
         let (tool, _session_id, _manager) = harness().await;
         let output = tool
             .execute(
                 serde_json::json!({"prompt": "check the deploy", "at": "20m"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("creates");
-        let text = text_content(&output);
+        let text = output.text_content();
         assert!(text.contains("Next fire:"), "{text}");
         // The relative half is the part that catches a schedule meaning something other than
         // intended, so it must actually be present.
@@ -569,10 +560,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_requires_exactly_one_schedule() {
+    async fn create_requires_exactly_one_schedule() {
         let (tool, _session_id, _manager) = harness().await;
         let none = tool
-            .execute(serde_json::json!({"prompt": "x"}), CancellationToken::new())
+            .execute(
+                serde_json::json!({"prompt": "x"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect_err("no schedule is an error");
         assert!(none.to_string().contains("one of"), "{none}");
@@ -580,7 +574,7 @@ mod tests {
         let both = tool
             .execute(
                 serde_json::json!({"prompt": "x", "at": "20m", "every": "1h"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("two schedules is an error");
@@ -589,27 +583,21 @@ mod tests {
 
     /// The permission rule that cannot live in `required_permission`, since that is per-tool.
     #[tokio::test]
-    async fn test_a_gate_is_refused_below_write_but_the_reminder_is_not() {
+    async fn a_gate_is_refused_below_write_but_the_reminder_is_not() {
         // Every level below `unrestricted`, not just `read`.
         //
         // `workspace` is the one that matters: letting it *pass* this door is a one-call escape,
         // since `schedule_create` with a gate runs arbitrary unconfined commands from inside the
-        // confined mode within one poll interval. `ask` matters for the other reason: nobody is
-        // present at fire time to answer the prompt its safety rests on. Exercising only `read`
-        // left both of those unguarded at the tool door.
-        for level in [
-            Permission::None,
-            Permission::Read,
-            Permission::Workspace,
-            Permission::Ask,
-        ] {
+        // confined level within one poll interval. Exercising only `read` left it unguarded at the
+        // tool door.
+        for level in [Permission::None, Permission::Read, Permission::Workspace] {
             refuses_a_gate_at(level).await;
         }
     }
 
     async fn refuses_a_gate_at(level: Permission) {
         let (mut tool, _session_id, _manager) = harness().await;
-        tool.shared_permission = crate::permission::SharedPermission::new(
+        tool.site.permission = crate::permission::SharedPermission::new(
             level,
             crate::permission::EnabledPermissions::ALL,
         );
@@ -621,7 +609,7 @@ mod tests {
                     "every": "1h",
                     "gate": {"check": {"command": "true"}}
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a gate needs an unattended-write level");
@@ -634,14 +622,14 @@ mod tests {
         // the turn it produces is permission-checked when it runs.
         tool.execute(
             serde_json::json!({"prompt": "x", "every": "1h"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .unwrap_or_else(|error| panic!("an ungated reminder is allowed at {level}: {error}"));
     }
 
     #[tokio::test]
-    async fn test_create_enforces_the_job_ceiling() {
+    async fn create_enforces_the_job_ceiling() {
         let (mut tool, _session_id, _manager) = harness().await;
         tool.config = ResolvedScheduleConfig {
             max_jobs: 1,
@@ -649,14 +637,14 @@ mod tests {
         };
         tool.execute(
             serde_json::json!({"prompt": "first", "every": "1h"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("first fits");
         let error = tool
             .execute(
                 serde_json::json!({"prompt": "second", "every": "1h"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("second exceeds the ceiling");
@@ -664,12 +652,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_rejects_a_one_shot_in_the_past() {
+    async fn create_rejects_a_one_shot_in_the_past() {
         let (tool, _session_id, _manager) = harness().await;
         let error = tool
             .execute(
                 serde_json::json!({"prompt": "x", "at": "2020-01-01T00:00:00Z"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a past instant has no next occurrence");
@@ -686,8 +674,8 @@ mod tests {
     async fn list_shows_a_tool_gate_s_arguments_to_the_model_that_wrote_them() {
         let (_tool, session_id, manager) = harness().await;
         // Planted through the store rather than `schedule_create`: the creation door needs a live
-        // tool dispatcher to authorise a tool gate, and what is under test here is the rendering.
-        let id = session_id.read().await.expect("harness made a session");
+        // tool dispatcher to authorize a tool gate, and what is under test here is the rendering.
+        let id = session_id.get().expect("harness made a session");
         let schedule = Schedule::parse_every("1h").expect("parses");
         let now = Utc::now();
         manager
@@ -716,21 +704,24 @@ mod tests {
 
         let list = ScheduleListTool {
             context: ScheduleContext {
-                session_manager: manager.clone(),
-                session_id: session_id.clone(),
+                store: manager.clone(),
+                site: crate::session::ToolSite::for_test()
+                    .with_session_id(session_id.clone())
+                    .with_permission(crate::permission::SharedPermission::new(
+                        Permission::Unrestricted,
+                        crate::permission::EnabledPermissions::DEFAULT,
+                    )),
             },
-            config: ResolvedScheduleConfig::default(),
-            shared_permission: crate::permission::SharedPermission::new(
-                Permission::Unrestricted,
-                crate::permission::EnabledPermissions::DEFAULT,
-            ),
+            gate_tools: None,
         };
-        let listed = text_content(
-            &list
-                .execute(serde_json::json!({}), CancellationToken::new())
-                .await
-                .expect("lists"),
-        );
+        let listed = list
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("lists")
+            .text_content();
         assert!(listed.contains("mcp__bridge__unseen"), "{listed}");
         assert!(
             listed.contains("sentinel-9c3f"),
@@ -750,7 +741,7 @@ mod tests {
                 "every": "1h",
                 "gate": {"check": {"command": "gh pr checks"}, "when": "changed"}
             }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("creates at unrestricted");
@@ -758,21 +749,24 @@ mod tests {
         // What the operator did afterwards: dropped the session to `read`.
         let list = ScheduleListTool {
             context: ScheduleContext {
-                session_manager: manager.clone(),
-                session_id: session_id.clone(),
+                store: manager.clone(),
+                site: crate::session::ToolSite::for_test()
+                    .with_session_id(session_id.clone())
+                    .with_permission(crate::permission::SharedPermission::new(
+                        Permission::Read,
+                        crate::permission::EnabledPermissions::DEFAULT,
+                    )),
             },
-            config: ResolvedScheduleConfig::default(),
-            shared_permission: crate::permission::SharedPermission::new(
-                Permission::Read,
-                crate::permission::EnabledPermissions::DEFAULT,
-            ),
+            gate_tools: None,
         };
-        let listed = text_content(
-            &list
-                .execute(serde_json::json!({}), CancellationToken::new())
-                .await
-                .expect("lists"),
-        );
+        let listed = list
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("lists")
+            .text_content();
         assert!(
             listed.contains("NOT FIRING"),
             "a withheld gate must say so: {listed}"
@@ -784,32 +778,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_and_cancel_round_trip() {
+    async fn list_and_cancel_round_trip() {
         let (tool, session_id, manager) = harness().await;
         tool.execute(
             serde_json::json!({"prompt": "watch the build", "every": "1h"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("creates");
 
         let list = ScheduleListTool {
             context: ScheduleContext {
-                session_manager: manager.clone(),
-                session_id: session_id.clone(),
+                store: manager.clone(),
+                site: crate::session::ToolSite::for_test()
+                    .with_session_id(session_id.clone())
+                    .with_permission(crate::permission::SharedPermission::new(
+                        Permission::Unrestricted,
+                        crate::permission::EnabledPermissions::DEFAULT,
+                    )),
             },
-            config: ResolvedScheduleConfig::default(),
-            shared_permission: crate::permission::SharedPermission::new(
-                Permission::Unrestricted,
-                crate::permission::EnabledPermissions::DEFAULT,
-            ),
+            gate_tools: None,
         };
-        let listed = text_content(
-            &list
-                .execute(serde_json::json!({}), CancellationToken::new())
-                .await
-                .expect("lists"),
-        );
+        let listed = list
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("lists")
+            .text_content();
         assert!(listed.contains("watch the build"), "{listed}");
 
         let short = listed
@@ -819,45 +816,48 @@ mod tests {
             .to_string();
         let cancel = ScheduleCancelTool {
             context: ScheduleContext {
-                session_manager: manager,
-                session_id,
+                store: manager,
+                site: crate::session::ToolSite::for_test().with_session_id(session_id),
             },
         };
-        let cancelled = text_content(
-            &cancel
-                .execute(serde_json::json!({"id": short}), CancellationToken::new())
-                .await
-                .expect("cancels"),
-        );
-        assert!(cancelled.contains("Cancelled job"), "{cancelled}");
+        let canceled = cancel
+            .execute(
+                serde_json::json!({"id": short}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("cancels")
+            .text_content();
+        assert!(canceled.contains("Canceled job"), "{canceled}");
 
-        let after = text_content(
-            &list
-                .execute(serde_json::json!({}), CancellationToken::new())
-                .await
-                .expect("lists"),
-        );
+        let after = list
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("lists")
+            .text_content();
         assert!(after.contains("No scheduled jobs"), "{after}");
     }
 
     #[tokio::test]
-    async fn test_cancel_reports_a_miss_rather_than_failing() {
+    async fn cancel_reports_a_miss_rather_than_failing() {
         let (_tool, session_id, manager) = harness().await;
         let cancel = ScheduleCancelTool {
             context: ScheduleContext {
-                session_manager: manager,
-                session_id,
+                store: manager,
+                site: crate::session::ToolSite::for_test().with_session_id(session_id),
             },
         };
-        let text = text_content(
-            &cancel
-                .execute(
-                    serde_json::json!({"id": "deadbeef"}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("a miss is not an error"),
-        );
+        let text = cancel
+            .execute(
+                serde_json::json!({"id": "deadbeef"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a miss is not an error")
+            .text_content();
         assert!(text.contains("No scheduled job matching"), "{text}");
     }
 }

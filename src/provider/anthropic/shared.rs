@@ -1,21 +1,23 @@
 //! Helpers shared by [`super::messages::AnthropicMessagesProvider`] and
 //! [`super::subscription::ClaudeSubscriptionProvider`]. Everything in this module is independent of
 //! the authentication scheme: message/tool conversion to the Claude wire format, SSE streaming,
-//! response parsing, per-model capability detection, and the thinking-suppression helper.
+//! response parsing, per-model capability detection, the thinking override, and the one driver
+//! both providers send through.
 
-use std::{borrow::Cow, sync::atomic::AtomicBool};
+use std::borrow::Cow;
 
-use eventsource_stream::Eventsource;
-use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    config::ThinkingMode,
+    conversation::{ContentBlock, Message, OpaqueReasoning, Role, ToolResultContent},
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, OpaqueReasoning, Role, StopReason, StreamEvent, ThinkingMode,
-        TokenUsage, ToolDefinition, ToolResultContent,
+        CompletionRequest, StopReason, StreamEvent, ThinkingOverride, ToolDefinition,
+        sse::{End, Step},
     },
+    stats::TokenUsage,
 };
 
 /// Normalize a Claude-family base URL: trailing slashes, then one trailing `/v1`.
@@ -42,8 +44,7 @@ pub(crate) fn normalize_claude_base_url(url: &str) -> String {
             // logged `url` -> `trimmed`, so quoting the original again would read as two unrelated
             // rewrites of the same string rather than one chain.
             tracing::debug!(
-                "dropped the trailing '/v1' from Claude base URL '{}'; meka appends it per request",
-                trimmed
+                "dropped the trailing '/v1' from Claude base URL '{trimmed}'; meka appends it per request"
             );
             without_version.to_string()
         }
@@ -51,20 +52,18 @@ pub(crate) fn normalize_claude_base_url(url: &str) -> String {
     }
 }
 
-/// Anthropic's hard request-body cap is 32 MiB; we reserve ~2 MiB headroom for headers, URL,
-/// attestation patches, and serialization slack. Bodies above this threshold are reactively shrunk
-/// by [`redact_oldest_images`] before they're posted.
-pub(super) const MAX_REQUEST_BYTES: usize = 30 * 1024 * 1024;
+/// The Messages API request size limit documented by Anthropic is 32 MiB; ~2 MiB is held back for
+/// headers, URL, attestation patches, and serialization slack. Bodies above this threshold are
+/// reactively shrunk by `redact_oldest_images` in `crate::provider::budget` before they're posted.
+pub(super) const MAX_REQUEST_BYTES: usize = 30 * crate::text::MIB;
 
-/// When redaction fires, drop the body to roughly this size, which leaves a ~6 MiB buffer below
-/// [`MAX_REQUEST_BYTES`] so the next several turns don't re-trigger redaction. Mirrors Claude
-/// Code's `apiMicrocompact` watermark (180k → 140k = ~78% of trigger). Stable cache prefix between
-/// redactions matters more than minimum-impact redaction per event.
-pub(super) const REDACTION_TARGET_BYTES: usize = 24 * 1024 * 1024;
-
-/// Placeholder text that replaces a `ToolResultContent::Image` payload when the request body would
-/// otherwise exceed [`MAX_REQUEST_BYTES`].
-pub(super) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
+// The redaction itself, its stopping point and the refusal live in `crate::provider::budget`, since
+// every backend applies them; the constant above is the Anthropic default ceiling they run against.
+// The redaction tests stayed beside the downscale tests they were written with, hence the test-only
+// import.
+pub(super) use crate::provider::budget::serialize_body;
+#[cfg(test)]
+pub(super) use crate::provider::budget::{IMAGE_REDACTION_PLACEHOLDER, redact_oldest_images};
 
 /// Anthropic accepts up to 8000 px per axis on a *single*-image request, but rejects anything over
 /// 2000 px on either axis once the request contains more than one image. We always downscale to fit
@@ -72,19 +71,6 @@ pub(super) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit req
 /// at the Claude provider layer only; non-Claude providers don't need it (and shouldn't pay the
 /// resize cost).
 pub(super) const MAX_IMAGE_DIMENSION_PX: u32 = 2000;
-
-/// The request body's size in MiB, to one decimal, for the error a failed send reports.
-///
-/// One decimal rather than integer division, which truncates: every body from 2.0 to just under 3.0
-/// MiB reported "2 MiB", and this is the number a user quotes in a bug report about a request the
-/// provider would not take.
-///
-/// Called from inside the `map_err` closure rather than beside the length it reads, so the `String`
-/// is allocated on the failure path only. Every provider request pays for what happens here, and
-/// the value is read by none of the ones that succeed.
-pub(super) fn body_size_mib(bytes: usize) -> String {
-    format!("{:.1}", bytes as f64 / 1_048_576.0)
-}
 
 /// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both the non-streaming response
 /// parser and the SSE driver. Anthropic emits the same shape (`input_tokens`, `output_tokens`,
@@ -100,17 +86,16 @@ pub(super) fn parse_usage_object(usage: &serde_json::Value) -> TokenUsage {
     }
 }
 
-/// The mode a request actually uses: the profile's, unless something has suppressed thinking for
-/// the call in flight (compaction does, so a summary doesn't pay for reasoning). Suppression only
-/// ever turns thinking *off*, never on, so it cannot resurrect a mode the profile disabled.
+/// The mode a request actually uses: the profile's, unless the request turned thinking off for
+/// this call (the compaction summary does, so it doesn't pay for reasoning). An override only ever
+/// turns thinking *off*, never on, so it cannot resurrect a mode the profile disabled.
 pub(super) fn effective_thinking(
-    suppressed: &AtomicBool,
+    thinking: ThinkingOverride,
     configured: ThinkingMode,
 ) -> ThinkingMode {
-    if suppressed.load(std::sync::atomic::Ordering::Relaxed) {
-        ThinkingMode::Off
-    } else {
-        configured
+    match thinking {
+        ThinkingOverride::Off => ThinkingMode::Off,
+        ThinkingOverride::Inherit => configured,
     }
 }
 
@@ -151,6 +136,11 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 ///
 /// No `display` field is set: real Claude Code 2.1.241 sends `{type:"adaptive"}` with no `display`
 /// (verified by wire capture), so the model default applies.
+///
+/// The `max_tokens` sent when the profile states no `max_output_tokens` are Claude Code 2.1.241's
+/// (verified by wire capture): 64000 under adaptive thinking, 32000 otherwise, raised to twice
+/// the budget under budgeted thinking when that is more. The API requires the field, so omitting
+/// it is not a way to ask for a default.
 pub(super) fn insert_thinking_fields(
     body: &mut serde_json::Map<String, serde_json::Value>,
     thinking: ThinkingMode,
@@ -167,7 +157,7 @@ pub(super) fn insert_thinking_fields(
             );
         }
         ThinkingMode::Budgeted => {
-            let default_max = std::cmp::max(budget_tokens * 2, 32_000);
+            let default_max = std::cmp::max(budget_tokens.saturating_mul(2), 32_000);
             // Clamp above the budget so an override that's too small can't produce a 400.
             let max_tokens = max_output_tokens
                 .unwrap_or(default_max)
@@ -201,7 +191,7 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 /// params: the Claude 3.x line, Opus 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6, and Haiku 4.5. Everything
 /// newer (Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5) rejects `temperature` with a 400.
 ///
-/// The allowlist direction is the point: an unrecognised model, which in practice means one newer
+/// The allowlist direction is the point: an unrecognized model, which in practice means one newer
 /// than this list, resolves to `false` and the parameter is omitted. A denylist would instead send
 /// `temperature` to every future model and earn a 400 until the list was updated. Matching is by
 /// family + [`parse_model_version`] rather than Claude Code's exact string equality because meka
@@ -230,7 +220,7 @@ pub(super) fn model_supports_temperature(model: &str) -> bool {
 /// A denylist mirroring Claude Code 2.1.241's own gate, which excludes the Claude 3.x line, Opus
 /// 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5 and sends the field to everything else on the first-party
 /// endpoint. Same reasoning and same single caller as
-/// [`model_supports_mid_conversation_system`]: an unrecognised name here is one *newer* than the
+/// [`model_supports_mid_conversation_system`]: an unrecognized name here is one *newer* than the
 /// list, and effort is what those models are for.
 pub(super) fn model_supports_effort(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
@@ -272,10 +262,10 @@ pub(super) const DEFAULT_EFFORT: &str = "high";
 /// 4.0/4.1/4.5/4.6/4.7, Sonnet 4.0/4.5/4.6 and Haiku 4.5 are excluded, and everything else on the
 /// first-party endpoint is sent it. The direction is the opposite of
 /// [`model_supports_temperature`]'s and deliberately so, because the two fail in opposite ways: an
-/// unrecognised model here is one *newer* than the list, which Claude Code sends the beta to, and
+/// unrecognized model here is one *newer* than the list, which Claude Code sends the beta to, and
 /// withholding it would silently drop the mid-conversation system messages meka relies on. It is
 /// safe only because this gate has exactly one caller, `claude-subscription`, whose endpoint is
-/// always Anthropic's -- so an unrecognised name there is necessarily a real Claude. Do not reach
+/// always Anthropic's -- so an unrecognized name there is necessarily a real Claude. Do not reach
 /// for it from a backend a `base_url` can point anywhere.
 pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
@@ -296,40 +286,79 @@ pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
     }
 }
 
-pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<serde_json::Value> {
-    let message_count = messages.len();
+/// The name of an SSE frame: the `type` the data names, else the `event:` line.
+///
+/// Anthropic sends both and they agree. A gateway that forwards the data and drops the `event:`
+/// line leaves `eventsource-stream` reporting `message`, and dispatching on that alone discarded
+/// every frame of a good turn. The Responses driver keys the same way for the same reason.
+fn claude_frame_name<'a>(data: &'a serde_json::Value, event_name: &'a str) -> &'a str {
+    data.get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or(event_name)
+}
+
+/// The cache breakpoint a backend puts on the last block it sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheBreakpoint {
+    /// `{"type": "ephemeral"}`: the API's own TTL, which needs no beta and which every endpoint
+    /// speaking this protocol accepts.
+    Ephemeral,
+    /// `{"type": "ephemeral", "ttl": "1h"}`, admitted by the `extended-cache-ttl-2025-04-11` beta
+    /// the subscription backend sends, and pinned by its captured wire.
+    OneHour,
+}
+
+impl CacheBreakpoint {
+    fn value(self) -> serde_json::Value {
+        match self {
+            Self::Ephemeral => serde_json::json!({"type": "ephemeral"}),
+            Self::OneHour => serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+        }
+    }
+}
+
+/// An image block for this wire. A base64 source serializes to exactly Anthropic's `source` object;
+/// a blob reference the store did not resolve is not an image the API can take, so it goes out as
+/// the same placeholder text the OpenAI encoders send, rather than as a shape the API rejects
+/// whole.
+fn claude_image_block(source: &crate::image::ImageSource) -> serde_json::Value {
+    match source {
+        crate::image::ImageSource::Base64 { .. } => serde_json::json!({
+            "type": "image",
+            "source": source,
+        }),
+        crate::image::ImageSource::Blob { .. } => serde_json::json!({
+            "type": "text",
+            "text": crate::image::UNRESOLVED_IMAGE_PLACEHOLDER,
+        }),
+    }
+}
+
+pub(super) fn convert_messages_to_claude_content(
+    messages: &[Message],
+    breakpoint: CacheBreakpoint,
+) -> Vec<serde_json::Value> {
     let mut claude_messages: Vec<serde_json::Value> = messages
         .iter()
-        .enumerate()
-        .map(|(message_index, message)| {
+        .map(|message| {
             let role = match message.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
             };
 
-            let is_last_message = message_index + 1 == message_count;
-            let block_count = message.content.len();
-
             let content: Vec<serde_json::Value> = message
                 .content
                 .iter()
-                .enumerate()
-                .map(|(block_index, block)| {
-                    let mut value = match block {
-                        ContentBlock::Text { text } => {
+                .map(|block| {
+                    match block {
+                        // The turn's context block is text on this wire, ahead of the words.
+                        ContentBlock::Text { text } | ContentBlock::TurnContext { text } => {
                             serde_json::json!({
                                 "type": "text",
                                 "text": text,
                             })
                         }
-                        // `ImageSource` serializes to `{type:"base64", media_type, data}`, which is
-                        // exactly Anthropic's image `source` object.
-                        ContentBlock::Image { source } => {
-                            serde_json::json!({
-                                "type": "image",
-                                "source": source,
-                            })
-                        }
+                        ContentBlock::Image { source } => claude_image_block(source),
                         ContentBlock::ToolUse { id, name, input } => {
                             serde_json::json!({
                                 "type": "tool_use",
@@ -343,6 +372,17 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
                             content,
                             is_error,
                         } => {
+                            let content: Vec<serde_json::Value> = content
+                                .iter()
+                                .map(|item| match item {
+                                    ToolResultContent::Text { text } => {
+                                        serde_json::json!({"type": "text", "text": text})
+                                    }
+                                    ToolResultContent::Image { source } => {
+                                        claude_image_block(source)
+                                    }
+                                })
+                                .collect();
                             serde_json::json!({
                                 "type": "tool_result",
                                 "tool_use_id": tool_use_id,
@@ -372,19 +412,7 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
                                 "data": data,
                             })
                         }
-                    };
-
-                    if is_last_message
-                        && block_index + 1 == block_count
-                        && let Some(obj) = value.as_object_mut()
-                    {
-                        obj.insert(
-                            "cache_control".to_string(),
-                            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
-                        );
                     }
-
-                    value
                 })
                 .collect();
 
@@ -399,7 +427,7 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
     if let Some(last_assistant) = claude_messages
         .iter_mut()
         .rev()
-        .find(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .find(|message| message.get("role").and_then(|r| r.as_str()) == Some("assistant"))
         && let Some(content) = last_assistant
             .get_mut("content")
             .and_then(|c| c.as_array_mut())
@@ -418,6 +446,16 @@ pub(super) fn convert_messages_to_claude_content(messages: &[Message]) -> Vec<se
                 "text": "[No message content]"
             }));
         }
+    }
+
+    // After the strip, not before it: attached to the last block first, the breakpoint went out
+    // on a trailing thinking block and left with it, so a conversation ending on one carried no
+    // breakpoint at all and re-billed its whole prefix at the write tier.
+    if let Some(last) = claude_messages.last_mut()
+        && let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut())
+        && let Some(block) = content.last_mut().and_then(|b| b.as_object_mut())
+    {
+        block.insert("cache_control".to_string(), breakpoint.value());
     }
 
     claude_messages
@@ -539,7 +577,7 @@ pub(super) fn parse_non_streaming_response(
                 }
             }
             _ => {
-                tracing::warn!("unknown Claude content block type: {}", block_type);
+                tracing::warn!("unknown Claude content block type: {block_type}");
             }
         }
     }
@@ -554,31 +592,113 @@ pub(super) fn parse_non_streaming_response(
     ))
 }
 
-/// Whether a mid-stream Anthropic `event: error`'s `error.type` indicates a transient condition
-/// safe to retry. `overloaded_error` (529 capacity), `rate_limit_error`, and `api_error` are
-/// documented as retryable; everything else (invalid_request_error, authentication_error,
-/// permission_error, not_found_error, and any unrecognized type) defaults to *not* retryable —
-/// conservative on purpose, since retrying a permanent failure would just burn the retry budget
-/// before surfacing the real problem.
-fn is_retryable_claude_error_type(error_type: &str) -> bool {
-    matches!(
-        error_type,
-        "overloaded_error" | "rate_limit_error" | "api_error"
+/// What the two Claude providers differ in, so one driver serves both. The API-key backend has
+/// nothing to refresh and no decoration; the subscription backend rotates a rejected credential
+/// once, patches the attestation into the serialized body, and remembers the response's request id.
+#[async_trait::async_trait]
+pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync {
+    fn client(&self) -> &reqwest::Client;
+    fn endpoint(&self) -> String;
+    /// Largest request body this backend sends before redacting old images: the profile's
+    /// `max_request_bytes`, else [`MAX_REQUEST_BYTES`].
+    fn max_request_bytes(&self) -> usize;
+    fn request_body(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        stream: bool,
+        thinking: ThinkingOverride,
+        attribution: &crate::provider::Attribution,
+    ) -> serde_json::Value;
+    /// The serialized body after any decoration that needs the whole of it.
+    fn finish_body(&self, _system_prompt: &str, body_json: String) -> Result<String> {
+        Ok(body_json)
+    }
+    /// One attempt's authenticated request. Called again after a rejected credential, so a backend
+    /// that can refresh one does it here.
+    async fn authenticated_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        has_tools: bool,
+        stream: bool,
+        thinking: ThinkingOverride,
+    ) -> Result<reqwest::RequestBuilder>;
+    fn remember_request_id(
+        &self,
+        _attribution: &crate::provider::Attribution,
+        _headers: &reqwest::header::HeaderMap,
+    ) {
+    }
+}
+
+/// Called from inside the `map_err` closure rather than beside the length it reads, so the size
+/// `String` is allocated on the failure path only: every provider request pays for what happens
+/// here, and the value is read by none of the ones that succeed.
+fn transport_error(body_length: usize, error: &reqwest::Error) -> MekaError {
+    crate::error::provider_transport_error(
+        &format!(
+            "HTTP request failed (body {})",
+            crate::text::format_size(body_length)
+        ),
+        error,
+        None,
     )
 }
 
-pub(super) async fn drive_claude_sse_stream(
-    response: reqwest::Response,
-    event_sender: mpsc::Sender<StreamEvent>,
-    cancellation: CancellationToken,
-) -> Result<()> {
+/// One non-streaming Claude call: the body within budget, one send, one retry on a credential the
+/// backend could refresh, and the login remedy on a second rejection.
+pub(super) async fn complete<B: ClaudeBackend>(
+    backend: &B,
+    request: CompletionRequest<'_>,
+) -> Result<crate::provider::Completion> {
+    let CompletionRequest {
+        system_prompt,
+        messages,
+        tools,
+        thinking,
+        attribution,
+        ..
+    } = request;
+    let (body_json, redaction_notice) =
+        build_body_within_budget(messages, backend.max_request_bytes(), |messages| {
+            serialize_body(&backend.request_body(
+                system_prompt,
+                messages,
+                tools,
+                false,
+                thinking,
+                &attribution,
+            ))
+        })?;
+    let body_json = backend.finish_body(system_prompt, body_json)?;
+    let body_length = body_json.len();
+
+    let response = crate::oauth::send_with_one_refresh(
+        backend,
+        crate::error::ProviderRequest::Completion,
+        |error| transport_error(body_length, error),
+        || async {
+            Ok(backend
+                .authenticated_request(
+                    backend.client().post(backend.endpoint()),
+                    !tools.is_empty(),
+                    false,
+                    thinking,
+                )
+                .await?
+                .body(body_json.clone()))
+        },
+    )
+    .await?;
+
     let status = response.status();
+    let retry_after = crate::error::parse_retry_after(response.headers());
+    backend.remember_request_id(&attribution, response.headers());
+    let response_text = response.text().await.map_err(|error| {
+        crate::error::provider_transport_error("failed to read response", &error, retry_after)
+    })?;
     if !status.is_success() {
-        let retry_after = crate::error::parse_retry_after(response.headers());
-        let response_text = response.text().await.unwrap_or_else(|error| {
-            tracing::warn!("failed to read Claude error response body: {}", error);
-            String::new()
-        });
         return Err(crate::error::provider_http_error(
             status,
             &response_text,
@@ -587,514 +707,399 @@ pub(super) async fn drive_claude_sse_stream(
         ));
     }
 
-    let mut event_stream = response.bytes_stream().eventsource();
-
-    let mut current_tool_input = String::new();
-    let mut in_tool_use = false;
-    // Retained past `ToolUseStart` so a call whose arguments never parse can be *rejected* by id
-    // rather than silently run with `{}`.
-    let mut current_tool_id = String::new();
-    let mut current_tool_name = String::new();
-    // Whether the message reached its end rather than the byte stream simply stopping.
-    let mut saw_terminal_event = false;
-    // Whether the loop exited because nobody is listening any more. Distinct from a truncated
-    // message: the receiver going away is the *caller* leaving, and reporting it as a stream error
-    // sent the turn back through the retry path to re-issue a provider call whose result already
-    // has nowhere to go.
-    let mut receiver_gone = false;
-    let mut in_thinking = false;
-    let mut current_thinking_signature: Option<String> = None;
-
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                return Err(MekaError::Interrupted);
-            }
-            event = tokio::time::timeout(
-                crate::provider::STREAM_IDLE_TIMEOUT,
-                event_stream.next(),
-            ) => {
-                // Bounds silence, not the turn: a model still emitting deltas resets this on every
-                // one. Without it a connection that died without an RST left the turn parked on a
-                // socket that would never speak again, for as long as the process ran.
-                let event = match event {
-                    Ok(event) => event,
-                    Err(_elapsed) => {
-                        let message = format!(
-                            "idle timeout waiting for Claude SSE event after {}s",
-                            crate::provider::STREAM_IDLE_TIMEOUT.as_secs()
-                        );
-                        if event_sender
-                            .send(StreamEvent::Error(message.clone()))
-                            .await
-                            .is_err()
-                        {
-                                        tracing::trace!("stream event receiver dropped");
-                        }
-                        return Err(MekaError::StreamError(message));
-                    }
-                };
-                let Some(event) = event else {
-                    break;
-                };
-
-                match event {
-                    Ok(event) => {
-                        let data: serde_json::Value = match serde_json::from_str(&event.data) {
-                            Ok(data) => data,
-                            Err(error) => {
-                                tracing::warn!("failed to parse Claude SSE data: {}", error);
-                                continue;
-                            }
-                        };
-
-                        match event.event.as_str() {
-                            "content_block_start" => {
-                                let Some(content_block) = data.get("content_block") else {
-                                    continue;
-                                };
-                                let block_type = content_block
-                                    .get("type")
-                                    .and_then(|block_type| block_type.as_str())
-                                    .unwrap_or("");
-
-                                if block_type == "thinking" {
-                                    in_thinking = true;
-                                    // Both schemas make `signature` required on a thinking block
-                                    // sent back, and require it verbatim, but it does not always
-                                    // arrive as a `signature_delta`. Anthropic opens the block with
-                                    // an empty one and fills it by delta; OpenRouter sends no delta
-                                    // at all for a non-Anthropic model, leaving that empty string
-                                    // as the value. Losing it there costs every later request in
-                                    // the session, rejected for the missing field.
-                                    //
-                                    // Assigned rather than merged, so a block that opens without
-                                    // the field cannot inherit the signature of an earlier one.
-                                    current_thinking_signature = content_block
-                                        .get("signature")
-                                        .and_then(|signature| signature.as_str())
-                                        .map(str::to_string);
-                                    // Announce the block itself, before any estimate: this is the
-                                    // earliest point the pause becomes explainable, and on a
-                                    // redacted block it is otherwise the only thing that happens
-                                    // for seconds at a time.
-                                    if event_sender
-                                        .send(StreamEvent::ThinkingProgress {
-                                            estimated_tokens: None,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                } else if block_type == "redacted_thinking" {
-                                    // The opaque `data` arrives whole in the start event; forward it
-                                    // so the agent can replay it verbatim on later turns.
-                                    if let Some(data) =
-                                        content_block.get("data").and_then(|d| d.as_str())
-                                        && event_sender
-                                            .send(StreamEvent::RedactedThinking {
-                                                data: data.to_string(),
-                                            })
-                                            .await
-                                            .is_err()
-                                    {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                } else if block_type == "tool_use" {
-                                    let id = content_block
-                                        .get("id")
-                                        .and_then(|id| id.as_str())
-                                        .ok_or_else(|| {
-                                            MekaError::Provider(
-                                                "tool_use block missing 'id' field".to_string(),
-                                            )
-                                        })?
-                                        .to_string();
-                                    let name = content_block
-                                        .get("name")
-                                        .and_then(|name| name.as_str())
-                                        .ok_or_else(|| {
-                                            MekaError::Provider(
-                                                "tool_use block missing 'name' field"
-                                                    .to_string(),
-                                            )
-                                        })?
-                                        .to_string();
-
-                                    current_tool_input.clear();
-                                    in_tool_use = true;
-                                    current_tool_id = id.clone();
-                                    current_tool_name = name.clone();
-                                    if event_sender
-                                        .send(StreamEvent::ToolUseStart { id, name })
-                                        .await
-                                        .is_err()
-                                    {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                }
-                            }
-                            "content_block_delta" => {
-                                let Some(delta) = data.get("delta") else {
-                                    continue;
-                                };
-                                let delta_type = delta
-                                    .get("type")
-                                    .and_then(|delta_type| delta_type.as_str())
-                                    .unwrap_or("");
-
-                                match delta_type {
-                                    "thinking_delta" => {
-                                        // `estimated_tokens` is the server's running count of
-                                        // thinking spent so far (the `thinking-token-count` beta).
-                                        // It is the only progress signal on a redacted block,
-                                        // where `thinking` is `""` on every delta. The final delta
-                                        // of a block carries `null`; skipping it leaves the last
-                                        // real figure on screen rather than blanking the display
-                                        // just before the block ends.
-                                        if let Some(estimated) =
-                                            delta.get("estimated_tokens").and_then(|t| t.as_u64())
-                                            && event_sender.send(
-                                                StreamEvent::ThinkingProgress {
-                                                    estimated_tokens: Some(estimated),
-                                                },
-                                            ).await.is_err() {
-                                                receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                                break;
-                                            }
-                                        if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str())
-                                            && !thinking.is_empty()
-                                                && event_sender.send(
-                                                    StreamEvent::ThinkingDelta(thinking.to_string()),
-                                                ).await.is_err() {
-                                                    receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                                    break;
-                                                }
-                                    }
-                                    "text_delta" => {
-                                        if let Some(text) = delta.get("text").and_then(|text| text.as_str())
-                                            && !text.is_empty()
-                                                && event_sender.send(
-                                                    StreamEvent::TextDelta(text.to_string()),
-                                                ).await.is_err() {
-                                                    receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                                    break;
-                                                }
-                                    }
-                                    "signature_delta" => {
-                                        if let Some(sig) = delta.get("signature").and_then(|s| s.as_str()) {
-                                            current_thinking_signature = Some(
-                                                current_thinking_signature
-                                                    .map_or_else(|| sig.to_string(), |existing| existing + sig),
-                                            );
-                                        }
-                                    }
-                                    "input_json_delta" => {
-                                        if let Some(partial_json) =
-                                            delta.get("partial_json").and_then(|partial_json| partial_json.as_str())
-                                        {
-                                            current_tool_input.push_str(partial_json);
-                                            if event_sender.send(
-                                                StreamEvent::ToolInputDelta(
-                                                    partial_json.to_string(),
-                                                ),
-                                            ).await.is_err() {
-                                                receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "content_block_stop" => {
-                                if in_thinking {
-                                    in_thinking = false;
-                                    let signature = current_thinking_signature.take();
-                                    if event_sender
-                                        .send(StreamEvent::ThinkingComplete {
-                                            opaque: signature
-                                                .map(|signature| OpaqueReasoning::Signed { signature }),
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                } else if in_tool_use {
-                                    // An empty accumulator is a legitimate zero-argument call and
-                                    // becomes `{}`. Arguments that arrived but do not parse are a
-                                    // different thing entirely, and are rejected rather than
-                                    // replaced.
-                                    //
-                                    // Running the tool with `{}` discards what the model asked for
-                                    // and substitutes something else: for a tool whose parameters
-                                    // are all optional -- `context_compact`, `task_list`, most MCP
-                                    // tools -- `{}` is a *valid* call, so it performs a default
-                                    // action nobody requested and neither the user nor the model is
-                                    // told the arguments were dropped. Truncated argument JSON is
-                                    // the ordinary shape of a `max_tokens` cutoff mid-call, so this
-                                    // is not an exotic path. `finalize_tool_call_accumulators` has
-                                    // rejected it since the same bug was fixed on the Chat
-                                    // Completions side; this brings Claude in line.
-                                    let parsed = if current_tool_input.is_empty() {
-                                        Ok(serde_json::json!({}))
-                                    } else {
-                                        serde_json::from_str(&current_tool_input)
-                                    };
-                                    let event = match parsed {
-                                        Ok(input) => StreamEvent::ToolUseEnd { input },
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                tool = %current_tool_name,
-                                                "rejecting tool call with unparseable JSON \
-                                                 arguments: {}",
-                                                error
-                                            );
-                                            StreamEvent::ToolCallRejected {
-                                                id: current_tool_id.clone(),
-                                                name: current_tool_name.clone(),
-                                                reason: format!("invalid JSON arguments: {}", error),
-                                            }
-                                        }
-                                    };
-                                    if event_sender.send(event).await.is_err() {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                    current_tool_input.clear();
-                                    in_tool_use = false;
-                                }
-                            }
-                            "message_delta" => {
-                                let Some(delta) = data.get("delta") else {
-                                    continue;
-                                };
-                                if let Some(usage) = data.get("usage") {
-                                    let token_usage = parse_usage_object(usage);
-                                    if event_sender
-                                        .send(StreamEvent::Usage(token_usage))
-                                        .await
-                                        .is_err()
-                                    {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                }
-                                if let Some(stop_reason_str) =
-                                    delta.get("stop_reason").and_then(|reason| reason.as_str())
-                                {
-                                    // The stop reason is what ends a message; `message_stop` is
-                                    // the framing around it. Requiring the frame made meka
-                                    // strictly less tolerant than the wire format needs: a gateway
-                                    // named by `base_url` that forwards the deltas and closes
-                                    // without the final event delivered a complete answer, and
-                                    // every turn through it failed. What the check is actually for
-                                    // -- a cut mid-`content_block_delta` -- never gets this far.
-                                    saw_terminal_event = true;
-                                    let stop_reason = parse_claude_stop_reason(stop_reason_str);
-                                    if event_sender
-                                        .send(StreamEvent::MessageEnd { stop_reason })
-                                        .await
-                                        .is_err()
-                                    {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                }
-                            }
-                            "message_stop" => {
-                                saw_terminal_event = true;
-                                break;
-                            }
-                            "message_start" => {
-                                if let Some(usage) =
-                                    data.get("message").and_then(|m| m.get("usage"))
-                                {
-                                    let token_usage = parse_usage_object(usage);
-                                    if event_sender
-                                        .send(StreamEvent::Usage(token_usage))
-                                        .await
-                                        .is_err()
-                                    {
-                                        receiver_gone = true;
-                                        tracing::trace!("stream event receiver dropped");
-                                        break;
-                                    }
-                                }
-                            }
-                            "ping" => {}
-                            // Anthropic can send this *after* the 200 response has already started
-                            // streaming (typically right after `message_start`, before any visible
-                            // content) — e.g. `overloaded_error` during a capacity spike. Previously
-                            // fell into the `other` catch-all below and was silently dropped,
-                            // making an overloaded turn look like it succeeded with truncated/empty
-                            // content. Forward it on the channel for visibility, then return the
-                            // classified error directly so the caller can decide whether to retry.
-                            "error" => {
-                                let error_type = data
-                                    .get("error")
-                                    .and_then(|error| error.get("type"))
-                                    .and_then(|kind| kind.as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string();
-                                let message = data
-                                    .get("error")
-                                    .and_then(|error| error.get("message"))
-                                    .and_then(|message| message.as_str())
-                                    .unwrap_or("stream error event")
-                                    .to_string();
-                                if event_sender
-                                    .send(StreamEvent::Error(message.clone()))
-                                    .await
-                                    .is_err()
-                                {
-                                        tracing::trace!("stream event receiver dropped");
-                                }
-                                return Err(if is_retryable_claude_error_type(&error_type) {
-                                    MekaError::RetryableProvider {
-                                        message,
-                                        retry_after: None,
-                                        // False even though a completion was in flight: this
-                                        // arrives as an SSE event and the stream layer cannot tell
-                                        // an overload from a failure to handle the body, so it
-                                        // does not license deleting content.
-                                        server_error_on_completion: false,
-                                    }
-                                } else {
-                                    MekaError::Provider(message)
-                                });
-                            }
-                            other => {
-                                tracing::debug!("unknown Claude SSE event: {}", other);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        if event_sender
-                            .send(StreamEvent::Error(error.to_string()))
-                            .await
-                            .is_err()
-                        {
-                                        tracing::trace!("stream event receiver dropped");
-                        }
-                        return Err(MekaError::StreamError(error.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    // The byte stream ending is not the same as the message ending.
-    //
-    // An intermediary -- a gateway named by `base_url`, a CDN edge, a load balancer closing an idle
-    // connection -- can terminate a chunked response cleanly mid-message. Treating that as success
-    // handed the agent a half-written answer with `stop_reason` left at its `EndTurn` default: no
-    // error, so no retry, and nothing to distinguish a truncated reply from a complete one. Worse
-    // mid-tool-call, where the accumulated call is dropped entirely because `ToolUseEnd` never
-    // arrives. Reporting it as a `StreamError` routes it to the same retry path a dropped
-    // connection already takes.
-    //
-    // Skipped when the receiver has gone: the loop then exited because the caller left, not because
-    // the message was cut, and there is no half-written answer for anyone to act on. Sending it
-    // back through the retry path re-issued the provider call for a turn that had been abandoned.
-    if !saw_terminal_event && !receiver_gone {
-        let error = "stream ended before a stop reason".to_string();
-        if event_sender
-            .send(StreamEvent::Error(error.clone()))
-            .await
-            .is_err()
-        {
-            tracing::trace!("stream event receiver dropped");
-        }
-        return Err(MekaError::StreamError(error));
-    }
-
-    Ok(())
+    let response_json: serde_json::Value = serde_json::from_str(&response_text)
+        .map_err(|error| MekaError::Provider(format!("invalid JSON response: {error}")))?;
+    let (message, stop_reason, usage) = parse_non_streaming_response(&response_json)?;
+    Ok(crate::provider::Completion {
+        message,
+        stop_reason,
+        usage,
+        notices: redaction_notice.into_iter().collect(),
+    })
 }
 
-/// Stats from a single [`redact_oldest_images`] invocation. Returned to callers so they can surface
-/// a user-visible advisory and increment a per-session redaction counter.
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct RedactionStats {
-    pub images_redacted: usize,
-    pub bytes_freed: usize,
+/// One streaming Claude call, with the same retry-once policy as [`complete`]. A redaction notice
+/// goes out as the first stream event so the frontend renders it before any provider text; the
+/// agent's `run_streaming` turns it into a `FrontendEvent::Notice`.
+pub(super) async fn stream<B: ClaudeBackend>(
+    backend: &B,
+    request: CompletionRequest<'_>,
+    event_sender: mpsc::Sender<StreamEvent>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let CompletionRequest {
+        system_prompt,
+        messages,
+        tools,
+        thinking,
+        attribution,
+        ..
+    } = request;
+    let (body_json, redaction_notice) =
+        build_body_within_budget(messages, backend.max_request_bytes(), |messages| {
+            serialize_body(&backend.request_body(
+                system_prompt,
+                messages,
+                tools,
+                true,
+                thinking,
+                &attribution,
+            ))
+        })?;
+    // A send error here means the consumer hung up already, which the SSE driver reports itself.
+    if let Some(notice) = redaction_notice
+        && let Err(error) = event_sender.send(StreamEvent::Notice(notice)).await
+    {
+        tracing::debug!("failed to forward redaction notice into stream: {error}");
+    }
+    let body_json = backend.finish_body(system_prompt, body_json)?;
+    let body_length = body_json.len();
+
+    let response = crate::oauth::send_with_one_refresh(
+        backend,
+        crate::error::ProviderRequest::Completion,
+        |error| transport_error(body_length, error),
+        || async {
+            Ok(backend
+                .authenticated_request(
+                    backend.client().post(backend.endpoint()),
+                    !tools.is_empty(),
+                    true,
+                    thinking,
+                )
+                .await?
+                .body(body_json.clone()))
+        },
+    )
+    .await?;
+    backend.remember_request_id(&attribution, response.headers());
+    drive_claude_sse_stream(response, event_sender, cancellation).await
 }
 
-/// Walk `messages` oldest-first and replace `ToolResultContent::Image` payloads with
-/// [`IMAGE_REDACTION_PLACEHOLDER`] until at least `bytes_to_drop` base64 bytes have been removed.
-/// The LAST message is never touched; it carries the moving `cache_control` breakpoint set in
-/// [`convert_messages_to_claude_content`] and disturbing it would invalidate the cache for the new
-/// turn unnecessarily.
-///
-/// Returns `Cow::Borrowed` if no work was needed (`bytes_to_drop == 0`). Otherwise returns
-/// `Cow::Owned` with whatever redaction was possible. Even when the budget couldn't be met, the
-/// cloned messages are still returned so the caller can re-serialize and decide whether the body
-/// fits.
-pub(super) fn redact_oldest_images(
-    messages: &[Message],
-    bytes_to_drop: usize,
-) -> (Cow<'_, [Message]>, RedactionStats) {
-    if bytes_to_drop == 0 || messages.len() <= 1 {
-        return (Cow::Borrowed(messages), RedactionStats::default());
+pub(super) async fn drive_claude_sse_stream(
+    response: reqwest::Response,
+    event_sender: mpsc::Sender<StreamEvent>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let mut protocol = ClaudeStream::default();
+    match crate::provider::sse::drive(
+        response,
+        "Claude",
+        &event_sender,
+        &cancellation,
+        &mut protocol,
+    )
+    .await?
+    {
+        End::Finished | End::ReceiverGone => Ok(()),
+        // The byte stream ending is not the same as the message ending.
+        //
+        // An intermediary -- a gateway named by `base_url`, a CDN edge, a load balancer closing an
+        // idle connection -- can terminate a chunked response cleanly mid-message. Treating that as
+        // success handed the agent a half-written answer with `stop_reason` left at its `EndTurn`
+        // default: no error, so no retry, and nothing to distinguish a truncated reply from a
+        // complete one. Worse mid-tool-call, where the accumulated call is dropped entirely because
+        // `ToolUseEnd` never arrives. Reporting it as a `StreamError` routes it to the same retry
+        // path a dropped connection already takes.
+        //
+        // A stop reason already seen makes the message complete without `message_stop`: a gateway
+        // that forwards the deltas and closes without the final frame delivers a whole answer.
+        End::Ended if protocol.saw_terminal_event => Ok(()),
+        End::Ended => Err(crate::provider::sse::stream_error(
+            &event_sender,
+            "stream ended before a stop reason".to_string(),
+        )
+        .await),
     }
+}
 
-    let mut redacted: Vec<Message> = messages.to_vec();
-    let last = redacted.len() - 1;
-    let mut stats = RedactionStats::default();
+/// The Claude driver's state between frames.
+#[derive(Default)]
+struct ClaudeStream {
+    current_tool_input: String,
+    in_tool_use: bool,
+    /// Retained past `ToolUseStart` so a call whose arguments never parse can be *rejected* by id
+    /// rather than silently run with `{}`.
+    current_tool_id: String,
+    current_tool_name: String,
+    /// Whether the message reached its end rather than the byte stream simply stopping.
+    saw_terminal_event: bool,
+    in_thinking: bool,
+    current_thinking_signature: Option<String>,
+}
 
-    'outer: for message in &mut redacted[..last] {
-        for block in &mut message.content {
-            match block {
-                ContentBlock::ToolResult { content, .. } => {
-                    for item in content.iter_mut() {
-                        if let ToolResultContent::Image { source } = item {
-                            stats.bytes_freed = stats.bytes_freed.saturating_add(source.data.len());
-                            stats.images_redacted = stats.images_redacted.saturating_add(1);
-                            *item = ToolResultContent::Text {
-                                text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
-                            };
-                            if stats.bytes_freed >= bytes_to_drop {
-                                break 'outer;
-                            }
+#[async_trait::async_trait]
+impl crate::provider::sse::Protocol for ClaudeStream {
+    async fn frame(
+        &mut self,
+        event: eventsource_stream::Event,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> Result<Step> {
+        let Some(data) = crate::provider::sse::frame_json("Claude", &event.data) else {
+            return Ok(Step::Continue);
+        };
+        match claude_frame_name(&data, &event.event) {
+            "content_block_start" => {
+                let Some(content_block) = data.get("content_block") else {
+                    return Ok(Step::Continue);
+                };
+                let block_type = content_block
+                    .get("type")
+                    .and_then(|block_type| block_type.as_str())
+                    .unwrap_or("");
+
+                if block_type == "thinking" {
+                    self.in_thinking = true;
+                    // Both schemas make `signature` required on a thinking block
+                    // sent back, and require it verbatim, but it does not always
+                    // arrive as a `signature_delta`. Anthropic opens the block with
+                    // an empty one and fills it by delta; OpenRouter sends no delta
+                    // at all for a non-Anthropic model, leaving that empty string
+                    // as the value. Losing it there costs every later request in
+                    // the session, rejected for the missing field.
+                    //
+                    // Assigned rather than merged, so a block that opens without
+                    // the field cannot inherit the signature of an earlier one.
+                    self.current_thinking_signature = content_block
+                        .get("signature")
+                        .and_then(|signature| signature.as_str())
+                        .map(str::to_string);
+                    // Announce the block itself, before any estimate: this is the
+                    // earliest point the pause becomes explainable, and on a
+                    // redacted block it is otherwise the only thing that happens
+                    // for seconds at a time.
+                    if event_sender
+                        .send(StreamEvent::ThinkingProgress {
+                            estimated_tokens: None,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                } else if block_type == "redacted_thinking" {
+                    // The opaque `data` arrives whole in the start event; forward
+                    // it so the agent can replay it verbatim on later turns.
+                    if let Some(data) = content_block.get("data").and_then(|d| d.as_str())
+                        && event_sender
+                            .send(StreamEvent::RedactedThinking {
+                                data: data.to_string(),
+                            })
+                            .await
+                            .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                } else if block_type == "tool_use" {
+                    let id = content_block
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .ok_or_else(|| {
+                            MekaError::Provider("tool_use block missing 'id' field".to_string())
+                        })?
+                        .to_string();
+                    let name = content_block
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .ok_or_else(|| {
+                            MekaError::Provider("tool_use block missing 'name' field".to_string())
+                        })?
+                        .to_string();
+
+                    self.current_tool_input.clear();
+                    self.in_tool_use = true;
+                    self.current_tool_id = id.clone();
+                    self.current_tool_name = name.clone();
+                    if event_sender
+                        .send(StreamEvent::ToolUseStart { id, name })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                }
+            }
+            "content_block_delta" => {
+                let Some(delta) = data.get("delta") else {
+                    return Ok(Step::Continue);
+                };
+                let delta_type = delta
+                    .get("type")
+                    .and_then(|delta_type| delta_type.as_str())
+                    .unwrap_or("");
+
+                match delta_type {
+                    "thinking_delta" => {
+                        // `estimated_tokens` is the server's running count of
+                        // thinking spent so far (the `thinking-token-count` beta).
+                        // It is the only progress signal on a redacted block,
+                        // where `thinking` is `""` on every delta. The final delta
+                        // of a block carries `null`; skipping it leaves the last
+                        // real figure on screen rather than blanking the display
+                        // just before the block ends.
+                        if let Some(estimated) =
+                            delta.get("estimated_tokens").and_then(|t| t.as_u64())
+                            && event_sender
+                                .send(StreamEvent::ThinkingProgress {
+                                    estimated_tokens: Some(estimated),
+                                })
+                                .await
+                                .is_err()
+                        {
+                            return Ok(Step::ReceiverGone);
+                        }
+                        if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str())
+                            && !thinking.is_empty()
+                            && event_sender
+                                .send(StreamEvent::ThinkingDelta(thinking.to_string()))
+                                .await
+                                .is_err()
+                        {
+                            return Ok(Step::ReceiverGone);
                         }
                     }
+                    "text_delta" => {
+                        if let Some(text) = delta.get("text").and_then(|text| text.as_str())
+                            && !text.is_empty()
+                            && event_sender
+                                .send(StreamEvent::TextDelta(text.to_string()))
+                                .await
+                                .is_err()
+                        {
+                            return Ok(Step::ReceiverGone);
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(sig) = delta.get("signature").and_then(|s| s.as_str()) {
+                            self.current_thinking_signature = Some(
+                                self.current_thinking_signature
+                                    .take()
+                                    .map_or_else(|| sig.to_string(), |existing| existing + sig),
+                            );
+                        }
+                    }
+                    "input_json_delta" => {
+                        if let Some(partial_json) = delta
+                            .get("partial_json")
+                            .and_then(|partial_json| partial_json.as_str())
+                        {
+                            self.current_tool_input.push_str(partial_json);
+                        }
+                    }
+                    _ => {}
                 }
-                // Input images (ACP @-mentions) count toward the same 32 MiB cap; collapse them to
-                // the placeholder text just like tool-result images.
-                ContentBlock::Image { source } => {
-                    let freed = source.data.len();
-                    stats.bytes_freed = stats.bytes_freed.saturating_add(freed);
-                    stats.images_redacted = stats.images_redacted.saturating_add(1);
-                    *block = ContentBlock::Text {
-                        text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
-                    };
-                    if stats.bytes_freed >= bytes_to_drop {
-                        break 'outer;
+            }
+            "content_block_stop" => {
+                if self.in_thinking {
+                    self.in_thinking = false;
+                    let signature = self.current_thinking_signature.take();
+                    if event_sender
+                        .send(StreamEvent::ThinkingComplete {
+                            opaque: signature
+                                .map(|signature| OpaqueReasoning::Signed { signature }),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                } else if self.in_tool_use {
+                    // An empty accumulator is a legitimate zero-argument call and
+                    // becomes `{}`. Arguments that arrived but do not parse are a
+                    // different thing entirely, and are rejected rather than
+                    // replaced.
+                    //
+                    let event = crate::provider::tool_use_event(
+                        self.current_tool_id.clone(),
+                        self.current_tool_name.clone(),
+                        &self.current_tool_input,
+                    );
+                    if event_sender.send(event).await.is_err() {
+                        return Ok(Step::ReceiverGone);
+                    }
+                    self.current_tool_input.clear();
+                    self.in_tool_use = false;
+                }
+            }
+            "message_delta" => {
+                let Some(delta) = data.get("delta") else {
+                    return Ok(Step::Continue);
+                };
+                if let Some(usage) = data.get("usage") {
+                    let token_usage = parse_usage_object(usage);
+                    if event_sender
+                        .send(StreamEvent::Usage(token_usage))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
                     }
                 }
-                _ => {}
+                if let Some(stop_reason_str) =
+                    delta.get("stop_reason").and_then(|reason| reason.as_str())
+                {
+                    // The stop reason is what ends a message; `message_stop` is
+                    // the framing around it. Requiring the frame made meka
+                    // strictly less tolerant than the wire format needs: a gateway
+                    // named by `base_url` that forwards the deltas and closes
+                    // without the final event delivered a complete answer, and
+                    // every turn through it failed. What the check is actually for
+                    // -- a cut mid-`content_block_delta` -- never gets this far.
+                    self.saw_terminal_event = true;
+                    let stop_reason = parse_claude_stop_reason(stop_reason_str);
+                    if event_sender
+                        .send(StreamEvent::MessageEnd { stop_reason })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                }
+            }
+            "message_stop" => {
+                self.saw_terminal_event = true;
+                return Ok(Step::Finished);
+            }
+            "message_start" => {
+                if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
+                    let token_usage = parse_usage_object(usage);
+                    if event_sender
+                        .send(StreamEvent::Usage(token_usage))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Step::ReceiverGone);
+                    }
+                }
+            }
+            "ping" => {}
+            // Anthropic can send this *after* the 200 response has already started streaming
+            // (typically right after `message_start`, before any visible content), e.g.
+            // `overloaded_error` during a capacity spike. Letting it fall into the `other`
+            // catch-all below would make an overloaded turn look like it succeeded with truncated
+            // or empty content, so it is forwarded on the channel for visibility and then returned
+            // as the classified error for the caller to retry or not.
+            "error" => {
+                let error_type = data
+                    .get("error")
+                    .and_then(|error| error.get("type"))
+                    .and_then(|kind| kind.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let message = data
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(|message| message.as_str())
+                    .unwrap_or("stream error event")
+                    .to_string();
+                return Err(crate::error::provider_stream_error(&error_type, message));
+            }
+            other => {
+                tracing::debug!("unknown Claude SSE event: {other}");
             }
         }
+        Ok(Step::Continue)
     }
-
-    (Cow::Owned(redacted), stats)
 }
 
 /// Walk `messages` and downscale any `ToolResultContent::Image` whose pixel dimensions exceed
@@ -1151,16 +1156,12 @@ fn downscale_cache_key(source_base64: &str) -> DownscaleCacheKey {
 }
 
 fn downscale_cache_get(source_base64: &str) -> Option<String> {
-    let cache = DOWNSCALE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = crate::sync::lock(&DOWNSCALE_CACHE);
     cache.get(&downscale_cache_key(source_base64)).cloned()
 }
 
 fn downscale_cache_put(source_base64: &str, downscaled_base64: &str) {
-    let mut cache = DOWNSCALE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = crate::sync::lock(&DOWNSCALE_CACHE);
     if cache.len() >= DOWNSCALE_CACHE_ENTRIES {
         cache.clear();
     }
@@ -1179,11 +1180,14 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
     }
 
     // True when this image decodes and exceeds the per-axis pixel cap.
-    fn oversized(source: &crate::provider::ImageSource) -> bool {
-        let Some(format) = parse_format(&source.media_type) else {
+    fn oversized(source: &crate::image::ImageSource) -> bool {
+        let Some(format) = parse_format(source.media_type()) else {
             return false;
         };
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&source.data) else {
+        let Some(data) = source.base64_data() else {
+            return false;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
             return false;
         };
         crate::image::read_image_dimensions(&bytes, format)
@@ -1193,17 +1197,21 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
 
     // Re-encode `source` to a within-cap PNG in place; no-op if it can't be decoded or already
     // fits. Served from the cache when this exact payload has been downscaled before.
-    fn downscale_in_place(source: &mut crate::provider::ImageSource) {
-        let Some(format) = parse_format(&source.media_type) else {
+    fn downscale_in_place(source: &mut crate::image::ImageSource) {
+        // A reference has no bytes to downscale; hydration resolves every one before a request.
+        let crate::image::ImageSource::Base64 { media_type, data } = source else {
             return;
         };
-        if let Some(cached) = downscale_cache_get(&source.data) {
-            source.media_type = "image/png".to_string();
-            source.data = cached;
+        let Some(format) = parse_format(media_type) else {
+            return;
+        };
+        if let Some(cached) = downscale_cache_get(data) {
+            *media_type = "image/png".to_string();
+            *data = cached;
             return;
         }
-        let original = source.data.clone();
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&source.data) else {
+        let original = data.clone();
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&*data) else {
             return;
         };
         let Ok((w, h)) = crate::image::read_image_dimensions(&bytes, format) else {
@@ -1216,17 +1224,11 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
             Ok(png) => {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
                 downscale_cache_put(&original, &encoded);
-                source.media_type = "image/png".to_string();
-                source.data = encoded;
+                *media_type = "image/png".to_string();
+                *data = encoded;
             }
             Err(error) => {
-                tracing::warn!(
-                    "failed to downscale {}x{} {} image: {}",
-                    w,
-                    h,
-                    source.media_type,
-                    error,
-                );
+                tracing::warn!("failed to downscale {w}x{h} {media_type} image: {error}",);
             }
         }
     }
@@ -1266,70 +1268,27 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
     Cow::Owned(owned)
 }
 
-/// Serialize a Claude request body, downscaling oversized images first and reactively redacting old
-/// tool-result image blocks if the serialized JSON still exceeds [`MAX_REQUEST_BYTES`]. Both Claude
-/// providers run this same redact-and-retry loop; the caller supplies the body builder via `build`
-/// so each provider's thinking / metadata wiring stays in its own file.
-///
-/// `build` takes a `messages` slice (the downscaled-then-maybe-redacted view) and returns the
-/// serialized JSON. It's called once on the original messages and, if oversized, a second time on
-/// the redacted set.
-///
-/// Returns the serialized body plus an optional [`crate::provider::Notice`]: on a successful
-/// redaction pass, the notice describes what was dropped so the caller can forward it to the active
-/// frontend (REPL renders via `render_hint`; ACP surfaces in the session/update stream). On the
-/// happy path (no redaction needed), the notice is `None`. The function also records
-/// [`RedactionStats`] on `session_stats` when one is provided.
+/// Serialize a Claude request body: downscale oversized images first, then the budget every
+/// backend applies, [`crate::provider::budget::fit_body_to_budget`]. Both Claude providers run
+/// this; the caller supplies the body builder via `build` so each provider's thinking / metadata
+/// wiring stays in its own file. The downscale is the Anthropic-specific half, for the 2000 px
+/// multi-image cap; the redaction and the refusal are the shared half.
 pub(super) fn build_body_within_budget<F>(
     messages: &[Message],
-    session_stats: Option<&std::sync::Arc<crate::stats::SessionStats>>,
-    mut build: F,
-) -> Result<(String, Option<crate::provider::Notice>)>
+    max_request_bytes: usize,
+    build: F,
+) -> Result<(String, Option<crate::frontend::Notice>)>
 where
     F: FnMut(&[Message]) -> Result<String>,
 {
     let prepared = downscale_oversized_images(messages);
-    let body_json = build(prepared.as_ref())?;
-
-    if body_json.len() <= MAX_REQUEST_BYTES {
-        return Ok((body_json, None));
-    }
-
-    let bytes_to_drop = body_json.len() - REDACTION_TARGET_BYTES;
-    let (redacted, stats) = redact_oldest_images(prepared.as_ref(), bytes_to_drop);
-    let body_json = build(redacted.as_ref())?;
-
-    if body_json.len() > MAX_REQUEST_BYTES {
-        return Err(MekaError::Provider(format!(
-            "request body is {} MiB after redacting old tool-result images; meka's ceiling is \
-             {} MiB (Anthropic caps at 32 MiB). Run /compact, remove large attachments from the \
-             most recent turn, or split the work across smaller turns.",
-            body_json.len() / 1_048_576,
-            MAX_REQUEST_BYTES / 1_048_576,
-        )));
-    }
-
-    if let Some(session_stats) = session_stats {
-        session_stats.record_redaction(stats.images_redacted as u64, stats.bytes_freed as u64);
-    }
-    let notice_text = format!(
-        "Redacted {} old image{} (~{} MiB freed). Cache prefix invalidated for those messages.",
-        stats.images_redacted,
-        if stats.images_redacted == 1 { "" } else { "s" },
-        stats.bytes_freed / 1_048_576,
-    );
-    tracing::warn!(
-        "redacted {} old tool-result image(s); body now {} MiB",
-        stats.images_redacted,
-        body_json.len() / 1_048_576,
-    );
-    Ok((body_json, Some(crate::provider::Notice::info(notice_text))))
+    crate::provider::budget::fit_body_to_budget(prepared.as_ref(), max_request_bytes, build)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ImageSource;
+    use crate::image::ImageSource;
 
     /// Drive the SSE decoder over a canned body, returning what it emitted and how it ended.
     ///
@@ -1337,7 +1296,7 @@ mod tests {
     /// audit's standing complaint about this module was that every test sat above the
     /// `StreamEvent` boundary and so could not see them at all.
     async fn decode_sse(body: &str) -> (Vec<StreamEvent>, Result<()>) {
-        let response: reqwest::Response = axum::http::Response::builder()
+        let response: reqwest::Response = http::Response::builder()
             .status(200)
             .header("content-type", "text/event-stream")
             .body(body.to_string())
@@ -1350,6 +1309,143 @@ mod tests {
             events.push(event);
         }
         (events, outcome)
+    }
+
+    /// A gateway that forwards the data and drops the `event:` lines still delivers the turn: the
+    /// frame is named by its `type`. Dispatching on the `event:` line alone discarded every frame.
+    #[tokio::test]
+    async fn a_stream_without_event_lines_is_read_by_its_data_types() {
+        let (events, outcome) = decode_sse(concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+
+        assert!(outcome.is_ok(), "expected success, got {:?}", outcome.err());
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "hi")),
+            "the text must arrive: {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::MessageEnd { .. })),
+            "and so must the stop reason: {events:?}",
+        );
+    }
+
+    /// The breakpoint lands on the last block that is actually sent. Attached before the trailing
+    /// thinking strip, it left with the block it was on.
+    #[test]
+    fn the_breakpoint_survives_the_trailing_thinking_strip() {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+                ContentBlock::Thinking {
+                    thinking: "trailing".to_string(),
+                    opaque: None,
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let content = converted[0]["content"].as_array().expect("content");
+        assert_eq!(
+            content.len(),
+            1,
+            "the trailing thinking block is stripped: {content:?}"
+        );
+        assert_eq!(
+            content[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+    }
+
+    /// A turn's two blocks reach this wire as two text blocks in order, the context ahead of the
+    /// words, so the model reads what meka injected before what the user typed.
+    #[test]
+    fn the_context_block_precedes_the_words() {
+        let message = Message::user_turn("[Permission context]", "hello", Vec::new());
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let content = converted[0]["content"].as_array().expect("content");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "[Permission context]");
+        assert_eq!(content[1]["text"], "hello");
+    }
+
+    /// A blob reference the store did not resolve goes out as the placeholder, not as a `source`
+    /// object the API would reject along with the whole request.
+    #[test]
+    fn an_unresolved_blob_is_sent_as_the_placeholder() {
+        let source = crate::image::ImageSource::Blob {
+            hash: "abc".to_string(),
+            media_type: "image/png".to_string(),
+            size: 3,
+        };
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Image {
+                    source: source.clone(),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: vec![ToolResultContent::Image { source }],
+                    is_error: false,
+                },
+            ],
+        };
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::Ephemeral);
+        let content = converted[0]["content"].as_array().expect("content");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[0]["text"],
+            crate::image::UNRESOLVED_IMAGE_PLACEHOLDER
+        );
+        assert_eq!(content[1]["content"][0]["type"], "text");
+        assert_eq!(
+            content[1]["content"][0]["text"],
+            crate::image::UNRESOLVED_IMAGE_PLACEHOLDER
+        );
+    }
+
+    /// The ceiling is the profile's, not Anthropic's: a body well under 30 MiB is still redacted
+    /// when the profile says so, and refused when redaction cannot bring it under.
+    #[test]
+    fn the_request_ceiling_is_the_profiles() {
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "x".repeat(2_000),
+            }],
+        };
+        let build = |messages: &[Message]| {
+            serde_json::to_string(messages).map_err(|error| MekaError::Provider(error.to_string()))
+        };
+        let (body, notice) = build_body_within_budget(std::slice::from_ref(&message), 4_000, build)
+            .expect("under the ceiling");
+        assert!(body.len() <= 4_000 && notice.is_none());
+        let refused = build_body_within_budget(&[message], 1_000, build)
+            .expect_err("text cannot be redacted, so the profile's ceiling refuses it");
+        assert!(
+            refused.to_string().contains("max_request_bytes"),
+            "{refused}"
+        );
+        // The variant the turn's `refusal_may_blame_content` keys on: as `Provider` the refusal
+        // ended the turn with nothing degraded, and the next turn carried the same body.
+        //
+        // `RequestTooLarge` rather than `InvalidRequest`, which means the *provider* refused a
+        // body: nothing was sent here, so a host publishing this as a provider failure sent its
+        // caller looking for an upstream response that does not exist. It arms the same retry.
+        assert!(
+            matches!(refused, MekaError::RequestTooLarge(_)),
+            "the refusal must arm the degrade-and-retry: {refused:?}"
+        );
     }
 
     /// A gateway that forwards every delta and closes without Anthropic's final framing event has
@@ -1557,13 +1653,13 @@ mod tests {
     }
 
     #[test]
-    fn test_a_claude_base_url_drops_a_trailing_version_segment() {
+    fn a_claude_base_url_drops_a_trailing_version_segment() {
         // The shape a gateway publishes for its Anthropic endpoint when it mirrors the OpenAI one.
         assert_eq!(
             normalize_claude_base_url("https://api.synthetic.new/anthropic/v1"),
             "https://api.synthetic.new/anthropic"
         );
-        // Trailing slashes go first, so the version segment is still recognised behind them.
+        // Trailing slashes go first, so the version segment is still recognized behind them.
         assert_eq!(
             normalize_claude_base_url("https://api.synthetic.new/anthropic/v1/"),
             "https://api.synthetic.new/anthropic"
@@ -1575,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_claude_base_url_already_in_the_canonical_shape_is_untouched() {
+    fn a_claude_base_url_already_in_the_canonical_shape_is_untouched() {
         assert_eq!(
             normalize_claude_base_url("https://api.anthropic.com"),
             "https://api.anthropic.com"
@@ -1587,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_only_a_trailing_version_segment_is_dropped_from_a_claude_base_url() {
+    fn only_a_trailing_version_segment_is_dropped_from_a_claude_base_url() {
         // Cloudflare's AI Gateway puts the version early and the vendor last. Stripping a `/v1`
         // anywhere but the end would silently route to the wrong account.
         assert_eq!(
@@ -1610,37 +1706,14 @@ mod tests {
     }
 
     #[test]
-    fn test_is_retryable_claude_error_type() {
-        for retryable in ["overloaded_error", "rate_limit_error", "api_error"] {
-            assert!(
-                is_retryable_claude_error_type(retryable),
-                "{retryable} should be retryable"
-            );
-        }
-        for permanent in [
-            "invalid_request_error",
-            "authentication_error",
-            "permission_error",
-            "not_found_error",
-            "unknown",
-            "",
-        ] {
-            assert!(
-                !is_retryable_claude_error_type(permanent),
-                "{permanent} should not be retryable"
-            );
-        }
-    }
-
-    #[test]
-    fn test_convert_messages_serializes_input_image() {
-        let message =
-            crate::provider::Message::user_with_images("look at this", vec![ImageSource {
-                source_type: "base64".to_string(),
+    fn convert_messages_serializes_input_image() {
+        let message = crate::conversation::Message::user_with_images("look at this", vec![
+            ImageSource::Base64 {
                 media_type: "image/png".to_string(),
                 data: "QUJD".to_string(),
-            }]);
-        let converted = convert_messages_to_claude_content(&[message]);
+            },
+        ]);
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
         let blocks = converted[0]["content"].as_array().expect("content array");
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[1]["type"], "image");
@@ -1650,7 +1723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_redacted_thinking_block() {
+    fn parse_redacted_thinking_block() {
         let response = serde_json::json!({
             "content": [
                 { "type": "redacted_thinking", "data": "ENCRYPTED_OPAQUE_BLOB" },
@@ -1667,9 +1740,9 @@ mod tests {
     }
 
     #[test]
-    fn test_redacted_thinking_round_trips_verbatim() {
-        let message = crate::provider::Message {
-            role: crate::provider::Role::Assistant,
+    fn redacted_thinking_round_trips_verbatim() {
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
             content: vec![
                 ContentBlock::RedactedThinking {
                     data: "ENCRYPTED_OPAQUE_BLOB".to_string(),
@@ -1679,7 +1752,7 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message]);
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
         let block = &converted[0]["content"].as_array().unwrap()[0];
         assert_eq!(block["type"], "redacted_thinking");
         assert_eq!(block["data"], "ENCRYPTED_OPAQUE_BLOB");
@@ -1693,8 +1766,8 @@ mod tests {
     /// serialized as one; the block goes out with its summary text and unsigned.
     #[test]
     fn sealed_reasoning_is_never_sent_to_claude_as_a_signature() {
-        let message = crate::provider::Message {
-            role: crate::provider::Role::Assistant,
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
                     thinking: "a summary".to_string(),
@@ -1710,7 +1783,7 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message]);
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
         let block = &converted[0]["content"].as_array().expect("content")[0];
 
         assert_eq!(block["type"], "thinking");
@@ -1724,9 +1797,9 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_thinking_block_with_signature_serializes_signature() {
-        let message = crate::provider::Message {
-            role: crate::provider::Role::Assistant,
+    fn empty_thinking_block_with_signature_serializes_signature() {
+        let message = crate::conversation::Message {
+            role: crate::conversation::Role::Assistant,
             content: vec![
                 ContentBlock::Thinking {
                     thinking: String::new(),
@@ -1739,7 +1812,7 @@ mod tests {
                 },
             ],
         };
-        let converted = convert_messages_to_claude_content(&[message]);
+        let converted = convert_messages_to_claude_content(&[message], CacheBreakpoint::OneHour);
         let block = &converted[0]["content"].as_array().unwrap()[0];
         assert_eq!(block["type"], "thinking");
         assert_eq!(block["thinking"], "");
@@ -1747,16 +1820,15 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_oldest_images_redacts_input_image() {
+    fn redact_oldest_images_redacts_input_image() {
         let big = "x".repeat(2_000);
         let messages = vec![
-            crate::provider::Message::user_with_images("first", vec![ImageSource {
-                source_type: "base64".to_string(),
+            crate::conversation::Message::user_with_images("first", vec![ImageSource::Base64 {
                 media_type: "image/png".to_string(),
-                data: big.clone(),
+                data: big,
             }]),
             // A trailing message: the last message is never redacted.
-            crate::provider::Message::assistant_text("ok"),
+            crate::conversation::Message::assistant_text("ok"),
         ];
         let (redacted, stats) = redact_oldest_images(&messages, 1_000);
         assert_eq!(stats.images_redacted, 1);
@@ -1810,36 +1882,30 @@ mod tests {
     }
 
     #[test]
-    fn suppressing_thinking_turns_it_off_and_never_on() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let flag = AtomicBool::new(false);
+    fn an_override_turns_thinking_off_and_never_on() {
         assert_eq!(
-            effective_thinking(&flag, ThinkingMode::Adaptive),
+            effective_thinking(ThinkingOverride::Inherit, ThinkingMode::Adaptive),
             ThinkingMode::Adaptive
         );
-
-        // Compaction sets this so its summary doesn't pay for reasoning.
-        flag.store(true, Ordering::Relaxed);
+        // The compaction summary sends `Off` so it doesn't pay for reasoning.
         assert_eq!(
-            effective_thinking(&flag, ThinkingMode::Adaptive),
+            effective_thinking(ThinkingOverride::Off, ThinkingMode::Adaptive),
             ThinkingMode::Off
         );
         assert_eq!(
-            effective_thinking(&flag, ThinkingMode::Budgeted),
+            effective_thinking(ThinkingOverride::Off, ThinkingMode::Budgeted),
             ThinkingMode::Off
         );
         // It cannot resurrect thinking for a profile that asked for none, so the two settings can
         // never disagree about whether a request asks for thinking.
-        flag.store(false, Ordering::Relaxed);
         assert_eq!(
-            effective_thinking(&flag, ThinkingMode::Off),
+            effective_thinking(ThinkingOverride::Inherit, ThinkingMode::Off),
             ThinkingMode::Off
         );
     }
 
     #[test]
-    fn test_model_supports_modern_features() {
+    fn only_the_4_x_line_supports_modern_features() {
         assert!(model_supports_modern_features("claude-opus-4-6-20250514"));
         assert!(model_supports_modern_features("claude-sonnet-4-20250514"));
         assert!(model_supports_modern_features("claude-haiku-4-5-20251001"));
@@ -1851,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_model_version() {
+    fn a_model_version_parses_from_the_name_and_ignores_the_date_stamp() {
         assert_eq!(parse_model_version("claude-opus-4-8"), Some((4, 8)));
         // Trailing date stamp is ignored (too many digits).
         assert_eq!(
@@ -1875,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_is_haiku() {
+    fn a_haiku_model_is_recognized_by_its_family_segment() {
         assert!(model_is_haiku("claude-haiku-4-5-20251001"));
         assert!(model_is_haiku("claude-haiku-4-5"));
         assert!(!model_is_haiku("claude-opus-4-6-20250514"));
@@ -1883,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_supports_temperature() {
+    fn temperature_is_sent_only_to_the_allowlisted_models() {
         // The allowlist: the 3.x line, Opus 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6, Haiku 4.5. Dated
         // and canonical spellings both resolve (`claude-sonnet-4-20250514` parses as 4.0).
         for model in [
@@ -1912,7 +1978,7 @@ mod tests {
         ] {
             assert!(!model_supports_temperature(model), "{model}");
         }
-        // The allowlist fails safe: anything it doesn't recognise (a model newer than this list)
+        // The allowlist fails safe: anything it doesn't recognize (a model newer than this list)
         // omits `temperature` rather than earning a 400. This is what a denylist got wrong.
         for model in [
             "claude-opus-6",
@@ -1925,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn test_model_supports_mid_conversation_system() {
+    fn mid_conversation_system_is_sent_to_every_model_outside_the_denylist() {
         // Everything outside Claude Code's denylist sends the beta, which is every current model
         // and every future one.
         for model in [
@@ -1955,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_claude_stop_reason_all_variants() {
+    fn parse_claude_stop_reason_all_variants() {
         assert_eq!(parse_claude_stop_reason("end_turn"), StopReason::EndTurn);
         assert_eq!(parse_claude_stop_reason("tool_use"), StopReason::ToolUse);
         assert_eq!(
@@ -1982,8 +2048,7 @@ mod tests {
         ContentBlock::ToolResult {
             tool_use_id: tool_use_id.to_string(),
             content: vec![ToolResultContent::Image {
-                source: ImageSource {
-                    source_type: "base64".to_string(),
+                source: ImageSource::Base64 {
                     media_type: "image/png".to_string(),
                     data: payload.to_string(),
                 },
@@ -2009,7 +2074,7 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_no_op_when_under_threshold() {
+    fn redact_no_op_when_under_threshold() {
         let messages = vec![
             user_with_block(image_block("call_a", "AAAA")),
             assistant_text("ack"),
@@ -2021,9 +2086,9 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_drops_oldest_image_first() {
-        // Two images: one in msg[0] (older), one in msg[1] (last). The helper must only touch the
-        // older one; the last message carries the moving cache_control marker.
+    fn redact_drops_oldest_image_first() {
+        // Two images: one in message[0] (older), one in message[1] (last). The helper must only
+        // touch the older one; the last message carries the moving cache_control marker.
         let payload_a = "A".repeat(1024);
         let payload_b = "B".repeat(1024);
         let messages = vec![
@@ -2033,34 +2098,41 @@ mod tests {
         let (result, stats) = redact_oldest_images(&messages, 1);
         assert_eq!(stats.images_redacted, 1);
         assert_eq!(stats.bytes_freed, 1024);
+        // Named tail-relative for the conversation to record: the older of two messages is two
+        // from the end, and the image is the first item of its first block.
+        assert_eq!(stats.positions, vec![crate::image::RedactedImage {
+            from_end: 2,
+            block: 0,
+            item: Some(0),
+        }]);
         let owned = match result {
             Cow::Owned(v) => v,
             Cow::Borrowed(_) => panic!("expected owned redacted vec"),
         };
-        // msg[0] image redacted to placeholder text.
+        // message[0] image redacted to placeholder text.
         match &owned[0].content[0] {
             ContentBlock::ToolResult { content, .. } => match &content[0] {
                 ToolResultContent::Text { text } => {
                     assert_eq!(text, IMAGE_REDACTION_PLACEHOLDER);
                 }
-                other => panic!("expected text placeholder, got {:?}", other),
+                other => panic!("expected text placeholder, got {other:?}"),
             },
-            other => panic!("expected ToolResult, got {:?}", other),
+            other => panic!("expected ToolResult, got {other:?}"),
         }
-        // msg[1] (last) image untouched.
+        // message[1] (last) image untouched.
         match &owned[1].content[0] {
             ContentBlock::ToolResult { content, .. } => match &content[0] {
                 ToolResultContent::Image { source } => {
-                    assert_eq!(source.data, payload_b);
+                    assert_eq!(source.base64_data(), Some(&*payload_b));
                 }
-                other => panic!("expected untouched image, got {:?}", other),
+                other => panic!("expected untouched image, got {other:?}"),
             },
-            other => panic!("expected ToolResult, got {:?}", other),
+            other => panic!("expected ToolResult, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_redact_stops_when_target_reached() {
+    fn redact_stops_when_target_reached() {
         // Three images each 1 KiB. Target = 1500 bytes. Only the FIRST image should be redacted;
         // the second remains because we hit the budget after one (1024 >= 1500 is false, but
         // saturating_add gets us past after the first redaction since we then loop-check before the
@@ -2100,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_preserves_last_message() {
+    fn redact_preserves_last_message() {
         // Single image, in the LAST message. Helper must not touch it even when the budget is huge.
         let payload = "P".repeat(8 * 1024);
         let messages = vec![
@@ -2117,7 +2189,9 @@ mod tests {
         };
         match &owned[1].content[0] {
             ContentBlock::ToolResult { content, .. } => match &content[0] {
-                ToolResultContent::Image { source } => assert_eq!(source.data, payload),
+                ToolResultContent::Image { source } => {
+                    assert_eq!(source.base64_data(), Some(&*payload))
+                }
                 _ => panic!("last-message image must survive"),
             },
             _ => unreachable!(),
@@ -2125,7 +2199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_handles_no_images() {
+    fn redact_handles_no_images() {
         let messages = vec![
             assistant_text("hello"),
             assistant_text("world"),
@@ -2162,8 +2236,7 @@ mod tests {
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.to_string(),
                 content: vec![ToolResultContent::Image {
-                    source: crate::provider::ImageSource {
-                        source_type: "base64".to_string(),
+                    source: crate::image::ImageSource::Base64 {
                         media_type: "image/png".to_string(),
                         data: base64_payload.to_string(),
                     },
@@ -2174,7 +2247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_downscale_no_op_when_all_within_cap() {
+    fn downscale_no_op_when_all_within_cap() {
         let small = synthesize_png_base64(800, 600);
         let messages = vec![
             user_with_image_block("call_a", &small),
@@ -2197,13 +2270,13 @@ mod tests {
     fn a_repeated_image_is_downscaled_once_and_then_served_from_the_cache() {
         let big = synthesize_png_base64(2400, 1200);
         let message = |data: &str| {
-            vec![crate::provider::Message::user_with_images("look", vec![
-                crate::provider::ImageSource {
-                    source_type: "base64".to_string(),
+            vec![crate::conversation::Message::user_with_images(
+                "look",
+                vec![crate::image::ImageSource::Base64 {
                     media_type: "image/png".to_string(),
                     data: data.to_string(),
-                },
-            ])]
+                }],
+            )]
         };
 
         let first = downscale_oversized_images(&message(&big)).into_owned();
@@ -2214,7 +2287,7 @@ mod tests {
 
         let second = downscale_oversized_images(&message(&big)).into_owned();
         let bytes_of = |messages: &[Message]| match &messages[0].content[1] {
-            ContentBlock::Image { source } => source.data.clone(),
+            ContentBlock::Image { source } => source.base64_data().unwrap_or_default().to_string(),
             other => panic!("expected a downscaled image; got {other:?}"),
         };
         assert_eq!(
@@ -2234,19 +2307,19 @@ mod tests {
     }
 
     #[test]
-    fn test_downscale_resizes_oversized_input_image() {
+    fn downscale_resizes_oversized_input_image() {
         use base64::Engine;
         use image::ImageFormat;
         // A user message with a top-level input image (ACP @-mention / pasted screenshot) must be
         // downscaled the same as a tool-result image, or Anthropic rejects the multi-image request.
         let big = synthesize_png_base64(2400, 1200);
-        let messages = vec![crate::provider::Message::user_with_images("look", vec![
-            crate::provider::ImageSource {
-                source_type: "base64".to_string(),
+        let messages = vec![crate::conversation::Message::user_with_images(
+            "look",
+            vec![crate::image::ImageSource::Base64 {
                 media_type: "image/png".to_string(),
                 data: big,
-            },
-        ])];
+            }],
+        )];
         let owned = match downscale_oversized_images(&messages) {
             Cow::Owned(v) => v,
             Cow::Borrowed(_) => panic!("expected owned (input-image resize triggered)"),
@@ -2255,19 +2328,19 @@ mod tests {
         match &owned[0].content[1] {
             ContentBlock::Image { source } => {
                 let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&source.data)
+                    .decode(source.base64_data().expect("inline bytes"))
                     .expect("decode");
                 let decoded =
                     image::load_from_memory_with_format(&bytes, ImageFormat::Png).expect("png");
                 assert!(decoded.width() <= MAX_IMAGE_DIMENSION_PX);
                 assert!(decoded.height() <= MAX_IMAGE_DIMENSION_PX);
             }
-            other => panic!("expected downscaled input image; got {:?}", other),
+            other => panic!("expected downscaled input image; got {other:?}"),
         }
     }
 
     #[test]
-    fn test_downscale_resizes_oversized_image() {
+    fn downscale_resizes_oversized_image() {
         use base64::Engine;
         use image::ImageFormat;
         let big = synthesize_png_base64(2400, 1200);
@@ -2286,7 +2359,7 @@ mod tests {
             ContentBlock::ToolResult { content, .. } => match &content[0] {
                 ToolResultContent::Image { source } => {
                     let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(&source.data)
+                        .decode(source.base64_data().expect("inline bytes"))
                         .expect("decode");
                     let decoded =
                         image::load_from_memory_with_format(&bytes, ImageFormat::Png).expect("png");
@@ -2302,7 +2375,9 @@ mod tests {
         // Second image was within cap → unchanged.
         match &owned[1].content[0] {
             ContentBlock::ToolResult { content, .. } => match &content[0] {
-                ToolResultContent::Image { source } => assert_eq!(source.data, small),
+                ToolResultContent::Image { source } => {
+                    assert_eq!(source.base64_data(), Some(&*small))
+                }
                 _ => panic!("small image should be untouched"),
             },
             _ => unreachable!(),
@@ -2310,11 +2385,11 @@ mod tests {
     }
 
     /// Locks in the contract that `build_body_within_budget` returns a user-visible
-    /// [`crate::provider::Notice`] (rather than printing to stderr directly) when redaction kicks
+    /// [`crate::frontend::Notice`] (rather than printing to stderr directly) when redaction kicks
     /// in. The agent loop then forwards it through `Frontend::emit`, which is how ACP clients see
     /// the redaction signal at all.
     #[test]
-    fn test_build_body_within_budget_returns_notice_on_redaction() {
+    fn build_body_within_budget_returns_notice_on_redaction() {
         use std::cell::Cell;
 
         // Two messages, the first containing an oversized image and the second a small one. The
@@ -2340,11 +2415,18 @@ mod tests {
             }
         };
 
-        let (body, notice) =
-            build_body_within_budget(&messages, None, build).expect("redaction should succeed");
+        let (body, notice) = build_body_within_budget(&messages, MAX_REQUEST_BYTES, build)
+            .expect("redaction should succeed");
         assert_eq!(body, "{}");
         let notice = notice.expect("redaction must surface a Notice");
-        assert_eq!(notice.level, crate::provider::NoticeLevel::Info);
+        assert_eq!(notice.level, crate::frontend::NoticeLevel::Info);
+        let redaction = notice
+            .redaction
+            .expect("the notice carries what was removed, for the session to count");
+        assert!(
+            redaction.images >= 1 && redaction.bytes > 0,
+            "{redaction:?}"
+        );
         assert!(
             notice.text.starts_with("Redacted "),
             "notice text should describe the redaction: {:?}",
@@ -2356,10 +2438,11 @@ mod tests {
     /// On the happy path (no redaction needed), the function returns `None` for the notice. Locks
     /// the contract: frontends never see a no-op advisory.
     #[test]
-    fn test_build_body_within_budget_no_notice_when_within_budget() {
+    fn build_body_within_budget_no_notice_when_within_budget() {
         let messages = vec![assistant_text("hi")];
         let build = |_msgs: &[Message]| -> Result<String> { Ok("{}".to_string()) };
-        let (body, notice) = build_body_within_budget(&messages, None, build).expect("happy path");
+        let (body, notice) =
+            build_body_within_budget(&messages, MAX_REQUEST_BYTES, build).expect("happy path");
         assert_eq!(body, "{}");
         assert!(notice.is_none());
     }

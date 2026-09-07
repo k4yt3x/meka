@@ -27,11 +27,15 @@
 
 use std::io::Write;
 
-use crate::render::{self, OutputSpacing, RenderMode, StreamingRenderer, ToolParams};
+use crate::{
+    config::{RenderMode, ToolParams},
+    render,
+    render::{OutputSpacing, StreamingRenderer},
+};
 
 /// What occupies the row the cursor is sitting on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowState {
+pub(crate) enum RowState {
     /// Column zero of a row nothing has written to. Anything may print immediately.
     Empty,
     /// An in-place status line the writer expects to overwrite or erase: the thinking indicator, or
@@ -56,7 +60,7 @@ pub enum RowState {
 /// arm the opening blank looks equivalent and is not: `printed` is set when that blank is spent,
 /// and it is what the closing bracket answers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Neighbour {
+pub(crate) enum Neighbor {
     Prompt,
     Shell,
 }
@@ -68,14 +72,14 @@ pub enum Neighbour {
 /// advancing"; the latter leaks the previous turn's last block into the next one and prints the
 /// blank the setting just disabled.
 #[derive(Debug, Clone, Copy)]
-pub struct Spacing {
-    pub newline_before_prompt: bool,
-    pub newline_after_prompt: bool,
+pub(crate) struct Spacing {
+    pub(crate) newline_before_prompt: bool,
+    pub(crate) newline_after_prompt: bool,
 }
 
 /// A kind of block, in the sense that matters to spacing: what separates it from what came before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockKind {
+pub(crate) enum BlockKind {
     /// meka speaking for itself: an error, a hint, a session id, a status table. Deliberately does
     /// not advance the block machine, because these are punctuation between the model's blocks
     /// rather than blocks of their own.
@@ -91,9 +95,9 @@ pub enum BlockKind {
 /// Something that happens to the console, as a value, so the decision it forces can be tested
 /// without a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    OpenEpisode(RowState, Neighbour),
-    CloseEpisode(Neighbour),
+pub(crate) enum Action {
+    OpenEpisode(RowState, Neighbor),
+    CloseEpisode(Neighbor),
     /// Output that `Console` cannot see is about to print: a slash command answering through one of
     /// the `cli` modules, or a child process meka handed the terminal to.
     AnnounceForeign,
@@ -108,7 +112,7 @@ pub enum Action {
 
 /// What has to happen to the current row before anything else prints on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Settle {
+pub(crate) enum Settle {
     Nothing,
     /// End the row, keeping what is on it.
     Terminate,
@@ -118,15 +122,15 @@ pub enum Settle {
 
 /// Everything an action writes before its own content, and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Emit {
-    pub settle: Settle,
+pub(crate) struct Emit {
+    pub(crate) settle: Settle,
     /// The `newline_after_prompt` blank, fired late so it can never land below the first thing the
     /// episode prints.
-    pub after_prompt_blank: bool,
+    pub(crate) after_prompt_blank: bool,
     /// The separator between two blocks of different kinds, from [`OutputSpacing`].
-    pub separator_blank: bool,
+    pub(crate) separator_blank: bool,
     /// The `newline_before_prompt` blank.
-    pub before_prompt_blank: bool,
+    pub(crate) before_prompt_blank: bool,
 }
 
 impl Emit {
@@ -140,15 +144,15 @@ impl Emit {
 
 /// The console's state, separated from the console so [`step`] can be a pure function of it.
 #[derive(Clone, Copy)]
-pub struct State {
-    pub row: RowState,
+pub(crate) struct State {
+    pub(crate) row: RowState,
     spacing: OutputSpacing,
     /// Whether the `newline_after_prompt` blank is still owed. Armed by `OpenEpisode`, spent by
     /// the first thing that prints.
     pending_after_blank: bool,
     /// Which prompt this episode opened against, carried because the blank above it is armed at
     /// the open and spent later, by whatever turns out to print first.
-    opened_against: Neighbour,
+    opened_against: Neighbor,
     /// Whether this episode has printed anything. Set when the opening blank is spent, *whether or
     /// not the flag let it print*, so it means "something happened" rather than "a blank was
     /// written".
@@ -162,7 +166,7 @@ impl State {
             spacing: OutputSpacing::new(),
             pending_after_blank: false,
             // Never read before an `OpenEpisode` sets it: nothing is owed until an episode arms it.
-            opened_against: Neighbour::Shell,
+            opened_against: Neighbor::Shell,
             printed: false,
         }
     }
@@ -179,7 +183,7 @@ impl State {
 /// the only place any of them is decided. Split out from the printing for the same reason
 /// `repl::indicator_action` is: in a dispatch that mixes the two, the only way to see a wrong
 /// answer is to run a terminal and look at it.
-pub fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
+pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
     let mut next = state;
     match action {
         Action::OpenEpisode(row, follows) => {
@@ -217,7 +221,7 @@ pub fn step(state: State, spacing: Spacing, action: Action) -> (Emit, State) {
                 Emit {
                     settle,
                     before_prompt_blank: state.printed
-                        && precedes == Neighbour::Prompt
+                        && precedes == Neighbor::Prompt
                         && spacing.newline_before_prompt,
                     ..Emit::NOTHING
                 },
@@ -324,7 +328,7 @@ fn spend_pending(next: &mut State, spacing: Spacing) -> bool {
     }
     next.pending_after_blank = false;
     next.printed = true;
-    next.opened_against == Neighbour::Prompt && spacing.newline_after_prompt
+    next.opened_against == Neighbor::Prompt && spacing.newline_after_prompt
 }
 
 /// A streamed block in progress, and which kind it is.
@@ -375,7 +379,7 @@ fn indicator_may_draw(open: Option<StreamKind>) -> bool {
 ///
 /// Shared by the blocking REPL thread and the agent's frontend task, which also gives the two
 /// threads that write to the terminal one lock to contend on rather than none.
-pub struct Console {
+pub(crate) struct Console {
     state: State,
     spacing: Spacing,
     render_mode: RenderMode,
@@ -398,7 +402,7 @@ pub struct Console {
 }
 
 impl Console {
-    pub fn new(spacing: Spacing, render_mode: RenderMode) -> Self {
+    pub(crate) fn new(spacing: Spacing, render_mode: RenderMode) -> Self {
         Self {
             state: State::new(),
             spacing,
@@ -420,7 +424,7 @@ impl Console {
     }
 
     /// Take the failure that cost this run its output, if one did.
-    pub fn take_lost_output(&mut self) -> Option<std::io::Error> {
+    pub(crate) fn take_lost_output(&mut self) -> Option<std::io::Error> {
         self.lost_output.take()
     }
 
@@ -429,22 +433,22 @@ impl Console {
         self.state = next;
         match emit.settle {
             Settle::Nothing => {}
-            Settle::Terminate => render::write_stderr_line(""),
+            Settle::Terminate => crate::streams::write_stderr_line(""),
             Settle::Erase => render::begin_own_line(),
         }
         if emit.after_prompt_blank {
-            render::write_stderr_line("");
+            crate::streams::write_stderr_line("");
         }
         if emit.separator_blank {
-            render::write_stderr_line("");
+            crate::streams::write_stderr_line("");
         }
         if emit.before_prompt_blank {
-            render::write_stderr_line("");
+            crate::streams::write_stderr_line("");
         }
     }
 
     /// Begin an episode, given what reedline left on the row and which prompt is above it.
-    pub fn open_episode(&mut self, row: RowState, follows: Neighbour) {
+    pub(crate) fn open_episode(&mut self, row: RowState, follows: Neighbor) {
         // A new episode is a new chance to say that output is not arriving. Once per process is
         // right for a one-shot run and wrong for a shell someone leaves open all day, where the
         // first lost answer would otherwise be the only one mentioned.
@@ -453,7 +457,7 @@ impl Console {
     }
 
     /// End the episode, immediately before the prompt below it is drawn.
-    pub fn close_episode(&mut self, precedes: Neighbour) {
+    pub(crate) fn close_episode(&mut self, precedes: Neighbor) {
         self.close_stream();
         self.act(Action::CloseEpisode(precedes));
     }
@@ -468,57 +472,68 @@ impl Console {
     /// empty region. Every REPL command says something, even if only that a list is empty; the
     /// exceptions are a successful `/cd` and `/clear`, where the prompt and the cleared screen are
     /// the confirmation.
-    pub fn announce_foreign_output(&mut self) {
+    pub(crate) fn announce_foreign_output(&mut self) {
         self.act(Action::AnnounceForeign);
     }
 
-    pub fn error(&mut self, error: &dyn std::fmt::Display) {
+    pub(crate) fn error(&mut self, error: &dyn std::fmt::Display) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_error(error);
     }
 
-    pub fn hint(&mut self, message: &str) {
+    pub(crate) fn hint(&mut self, message: &str) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_hint(message);
     }
 
-    pub fn session_id(&mut self, label: &str, id: &str) {
+    /// A [`crate::frontend::Notice`], in the color its level asks for: dim for `Info`, the warning
+    /// color for `Warn`.
+    pub(crate) fn notice(&mut self, notice: &crate::frontend::Notice) {
+        self.close_stream();
+        self.act(Action::Block(BlockKind::Chrome));
+        match notice.level {
+            crate::frontend::NoticeLevel::Info => render::render_hint(&notice.text),
+            crate::frontend::NoticeLevel::Warn => render::render_warning(&notice.text),
+        }
+    }
+
+    pub(crate) fn session_id(&mut self, label: &str, id: &str) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_session_id(label, id);
     }
 
     /// The heading above a block of command output. See [`render::render_heading`].
-    pub fn heading(&mut self, heading: &str) {
+    pub(crate) fn heading(&mut self, heading: &str) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_heading(heading);
     }
 
     /// A stage direction about the output: `(interrupted)`. See [`render::render_annotation`].
-    pub fn annotation(&mut self, note: &str) {
+    pub(crate) fn annotation(&mut self, note: &str) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_annotation(note);
     }
 
-    pub fn line(&mut self, line: &str) {
+    pub(crate) fn line(&mut self, line: &str) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
-        render::write_stderr_line(line);
+        crate::streams::write_stderr_line(line);
     }
 
     /// Print through a closure, for the callers whose painter takes arguments this module has no
     /// reason to model (`render_session_status`, `render_account_usage`, the help text).
-    pub fn chrome(&mut self, paint: impl FnOnce()) {
+    pub(crate) fn chrome(&mut self, paint: impl FnOnce()) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         paint();
     }
 
-    pub fn tool_indicator(
+    pub(crate) fn tool_indicator(
         &mut self,
         name: &str,
         input: &serde_json::Value,
@@ -531,7 +546,7 @@ impl Console {
     }
 
     /// The one dimmed line shown for a thinking block under `show_content = false`.
-    pub fn thinking_preview(&mut self, content: &str) {
+    pub(crate) fn thinking_preview(&mut self, content: &str) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Thinking));
         render::render_thinking_preview(content);
@@ -540,7 +555,7 @@ impl Console {
     /// An empty list prints nothing and must not claim the trailing blank line that
     /// [`render::render_todo_list`] would otherwise have left, so the block is opened only once the
     /// list is known to have content.
-    pub fn todo_list(&mut self, title: Option<&str>, items: &[crate::tools::todo::TodoItem]) {
+    pub(crate) fn todo_list(&mut self, title: Option<&str>, items: &[crate::todo::TodoItem]) {
         if items.is_empty() {
             return;
         }
@@ -549,7 +564,7 @@ impl Console {
         render::render_todo_list(title, items);
     }
 
-    pub fn token_usage(&mut self, usage: &crate::provider::TokenUsage) {
+    pub(crate) fn token_usage(&mut self, usage: &crate::stats::TokenUsage) {
         self.close_stream();
         self.act(Action::Block(BlockKind::Chrome));
         render::render_token_usage(usage);
@@ -566,7 +581,7 @@ impl Console {
     /// episode owed, so only the row is restored: the line may be partly on screen. No caller does
     /// today -- both write through helpers that accept a failed write -- but the contract is the
     /// one a fallible drawer would need.
-    pub fn transient(&mut self, draw: impl FnOnce() -> bool) -> bool {
+    pub(crate) fn transient(&mut self, draw: impl FnOnce() -> bool) -> bool {
         if !render::live_indicator_supported() {
             return false;
         }
@@ -583,7 +598,7 @@ impl Console {
     /// `opening` separates the first draw of a block like the thinking block it stands in for, so
     /// the line it eventually commits to sits apart from what preceded it. Redraws overwrite their
     /// own row and ask for nothing.
-    pub fn thinking_indicator(&mut self, opening: bool, estimate: Option<u64>) -> bool {
+    pub(crate) fn thinking_indicator(&mut self, opening: bool, estimate: Option<u64>) -> bool {
         if !indicator_may_draw(self.open_stream_kind()) {
             return false;
         }
@@ -606,13 +621,13 @@ impl Console {
     }
 
     /// Keep the transient line by writing the newline its writer withheld.
-    pub fn commit_transient(&mut self) {
+    pub(crate) fn commit_transient(&mut self) {
         self.act(Action::CommitTransient);
     }
 
     /// Discard the transient line, for the one case where something is about to render in its
     /// place.
-    pub fn erase_transient(&mut self) {
+    pub(crate) fn erase_transient(&mut self) {
         self.act(Action::EraseTransient);
     }
 
@@ -624,14 +639,14 @@ impl Console {
     /// Whether a text block is still open, for the frontend's tests: a run left open past the end
     /// of its episode is what flushes a failed turn's tail under the next prompt.
     #[cfg(test)]
-    pub fn has_open_text(&self) -> bool {
+    pub(crate) fn has_open_text(&self) -> bool {
         self.open_stream_kind() == Some(StreamKind::Text)
     }
 
     /// The same question for reasoning. Separate rather than one predicate over both, because the
     /// property under test is that the two never overlap.
     #[cfg(test)]
-    pub fn has_open_thinking(&self) -> bool {
+    pub(crate) fn has_open_thinking(&self) -> bool {
         self.open_stream_kind() == Some(StreamKind::Thinking)
     }
 
@@ -641,7 +656,7 @@ impl Console {
     /// and enough to answer the question the relay's test asks: did a log line reach the console at
     /// all, or go round it to stderr.
     #[cfg(test)]
-    pub fn has_printed(&self) -> bool {
+    pub(crate) fn has_printed(&self) -> bool {
         self.state.printed()
     }
 
@@ -651,22 +666,22 @@ impl Console {
     /// `render::live_indicator_supported()`, which is false without a terminal, so the row a
     /// mid-turn log line actually collides with is otherwise unreachable under `cargo test`.
     #[cfg(test)]
-    pub fn force_row(&mut self, row: RowState) {
+    pub(crate) fn force_row(&mut self, row: RowState) {
         self.state.row = row;
     }
 
     /// What the cursor is sitting on, for the same tests.
     #[cfg(test)]
-    pub fn row(&self) -> RowState {
+    pub(crate) fn row(&self) -> RowState {
         self.state.row
     }
 
-    pub fn text_delta(&mut self, text: &str) {
+    pub(crate) fn text_delta(&mut self, text: &str) {
         self.stream_delta(StreamKind::Text, text);
     }
 
     /// A chunk of reasoning, shown as it arrives under `show_content = true`.
-    pub fn thinking_delta(&mut self, text: &str) {
+    pub(crate) fn thinking_delta(&mut self, text: &str) {
         self.stream_delta(StreamKind::Thinking, text);
     }
 
@@ -705,14 +720,14 @@ impl Console {
     /// and under Claude's `redact-thinking`. Closing indiscriminately there ends the *answer's*
     /// run mid-paragraph, and the next delta opens a second one -- splitting one paragraph across
     /// two on the stream a caller pipes.
-    pub fn close_thinking(&mut self) {
+    pub(crate) fn close_thinking(&mut self) {
         if self.open_stream_kind() == Some(StreamKind::Thinking) {
             self.close_stream();
         }
     }
 
     /// Flush and drop any open streamed block, so block types don't interleave.
-    pub fn close_stream(&mut self) {
+    pub(crate) fn close_stream(&mut self) {
         let Some(mut open) = self.stream.take() else {
             return;
         };
@@ -783,9 +798,9 @@ mod tests {
     /// variation on.
     fn plain_turn() -> Vec<Action> {
         vec![
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]
     }
 
@@ -824,9 +839,9 @@ mod tests {
     #[test]
     fn the_shell_s_prompt_gets_neither_bracket() {
         let first = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Shell),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Shell),
             Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert!(
             !first[1].after_prompt_blank,
@@ -839,9 +854,9 @@ mod tests {
         );
 
         let last = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode(Neighbour::Shell),
+            Action::CloseEpisode(Neighbor::Shell),
         ]);
         assert!(
             last[1].after_prompt_blank,
@@ -857,12 +872,12 @@ mod tests {
     fn a_disabled_opening_blank_still_resets_the_block_machine() {
         for spacing in [NEITHER, BEFORE_ONLY] {
             let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
                 Action::Block(BlockKind::Text),
-                Action::CloseEpisode(Neighbour::Prompt),
-                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+                Action::CloseEpisode(Neighbor::Prompt),
+                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::CloseEpisode(Neighbour::Prompt),
+                Action::CloseEpisode(Neighbor::Prompt),
             ]);
             assert!(
                 !emits[4].separator_blank,
@@ -878,26 +893,26 @@ mod tests {
     #[test]
     fn every_episode_is_bracketed_the_same_however_it_answered() {
         let error_only = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert_eq!(total_blanks(&error_only), 2);
 
         let foreign = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::AnnounceForeign,
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert_eq!(total_blanks(&foreign), 2);
 
         // Two turns fired by one wake. The gap between them is the blocks' own separator, not a
         // second pair of prompt brackets.
         let two_turns = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
             Action::Block(BlockKind::Text),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert!(two_turns[1].after_prompt_blank);
         assert!(two_turns[3].before_prompt_blank);
@@ -911,8 +926,8 @@ mod tests {
     fn an_episode_that_prints_nothing_leaves_no_trace() {
         for spacing in [BOTH, NEITHER] {
             let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
-                Action::CloseEpisode(Neighbour::Prompt),
+                Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
+                Action::CloseEpisode(Neighbor::Prompt),
             ]);
             assert_eq!(total_blanks(&emits), 0);
             assert_eq!(
@@ -928,9 +943,9 @@ mod tests {
     #[test]
     fn a_wake_that_runs_something_keeps_the_prompt_it_broke_out_of() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert_eq!(emits[1].settle, Settle::Terminate);
         assert_eq!(emits[2].settle, Settle::Nothing);
@@ -942,10 +957,10 @@ mod tests {
     #[test]
     fn a_transient_row_is_erased_by_whatever_prints_next() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::OpenTransient,
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert_eq!(emits[2].settle, Settle::Erase);
         assert!(
@@ -956,10 +971,10 @@ mod tests {
         // Left drawn at the end of an episode it is still not content, so it must not survive into
         // the prompt.
         let leftover = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::Text),
             Action::OpenTransient,
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert_eq!(leftover[3].settle, Settle::Erase);
     }
@@ -969,10 +984,10 @@ mod tests {
     #[test]
     fn closing_an_episode_twice_closes_it_once() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbour::Prompt),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert!(emits[2].before_prompt_blank);
         assert!(!emits[3].before_prompt_blank);
@@ -986,10 +1001,10 @@ mod tests {
         // armed. With a block in there the blank is already spent and the first assertion holds
         // whatever `CloseEpisode` does with it.
         let parting_word = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
             Action::Block(BlockKind::Chrome),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert!(
             !parting_word[2].after_prompt_blank,
@@ -1008,7 +1023,7 @@ mod tests {
     #[test]
     fn foreign_output_settles_the_row_it_lands_on() {
         let after_wake = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
             Action::AnnounceForeign,
         ]);
         assert_eq!(
@@ -1018,7 +1033,7 @@ mod tests {
         );
 
         let after_status_line = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::OpenTransient,
             Action::AnnounceForeign,
         ]);
@@ -1034,9 +1049,9 @@ mod tests {
     #[test]
     fn a_transient_line_moves_past_a_parked_prompt_rather_than_over_it() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::PromptParked, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::PromptParked, Neighbor::Prompt),
             Action::OpenTransient,
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert_eq!(emits[1].settle, Settle::Terminate);
         assert!(
@@ -1053,14 +1068,14 @@ mod tests {
     #[test]
     fn committing_a_transient_line_keeps_it_and_erasing_it_does_not() {
         let committed = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::OpenTransient,
             Action::CommitTransient,
         ]);
         assert_eq!(committed[2].settle, Settle::Terminate);
 
         let erased = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::OpenTransient,
             Action::EraseTransient,
         ]);
@@ -1069,7 +1084,7 @@ mod tests {
         // Neither writes anything when no indicator is drawn, which is what lets the frontend call
         // them from a dispatch that cannot know.
         let absent = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::CommitTransient,
             Action::EraseTransient,
         ]);
@@ -1082,10 +1097,10 @@ mod tests {
     #[test]
     fn the_opening_blank_precedes_whatever_prints_first() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::Chrome),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert!(emits[1].after_prompt_blank);
         assert!(!emits[2].after_prompt_blank);
@@ -1097,20 +1112,20 @@ mod tests {
     fn block_separators_do_not_follow_the_prompt_flags() {
         for spacing in [BOTH, NEITHER, BEFORE_ONLY, AFTER_ONLY] {
             let emits = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
                 Action::Block(BlockKind::Text),
-                Action::CloseEpisode(Neighbour::Prompt),
+                Action::CloseEpisode(Neighbor::Prompt),
             ]);
             assert!(
                 emits[2].separator_blank,
                 "text after a tool indicator is always separated from it",
             );
             let adjacent = run(spacing, &[
-                Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+                Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
                 Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
-                Action::CloseEpisode(Neighbour::Prompt),
+                Action::CloseEpisode(Neighbor::Prompt),
             ]);
             assert!(
                 !adjacent[2].separator_blank,
@@ -1124,11 +1139,11 @@ mod tests {
     #[test]
     fn a_todo_list_brings_its_own_separation() {
         let emits = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::ToolIndicator(ToolParams::Summary)),
             Action::Block(BlockKind::TodoList),
             Action::Block(BlockKind::Text),
-            Action::CloseEpisode(Neighbour::Prompt),
+            Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert!(!emits[2].separator_blank);
         assert!(!emits[3].separator_blank);
@@ -1138,7 +1153,7 @@ mod tests {
     /// meets visible thinking, so the two arrive alternately for the whole block. Redrawing the
     /// counter over streamed reasoning closes the block to make room, and the next delta opens a
     /// fresh one behind a second `Thinking... ` label -- once per delta, which shreds the block
-    /// into one labelled fragment per chunk.
+    /// into one labeled fragment per chunk.
     #[test]
     fn a_progress_estimate_never_draws_over_reasoning_already_on_screen() {
         assert!(
@@ -1161,7 +1176,7 @@ mod tests {
     fn output_is_recorded_even_when_no_blank_is_printed() {
         let mut state = State::new();
         for action in [
-            Action::OpenEpisode(RowState::Empty, Neighbour::Prompt),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
             Action::Block(BlockKind::Text),
         ] {
             let (_, next) = step(state, NEITHER, action);

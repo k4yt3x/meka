@@ -7,15 +7,19 @@ speaks, so the two differ only in how they authenticate and where they post.
 ## Setup
 
 ```console
-$ meka provider add work --type openai-responses --model gpt-5.6-sol
+$ meka account add openai --backend openai-responses
+$ meka profile add work --account openai --model gpt-5.6-sol
 ```
 
 ```toml
-default_provider = "work"
+default_profile = "work"
 
-[providers.work]
-type  = "openai-responses"
-model = "gpt-5.6-sol"
+[accounts.openai]
+backend = "openai-responses"
+
+[profiles.work]
+account = "openai"
+model   = "gpt-5.6-sol"
 ```
 
 ## Configuration
@@ -46,7 +50,7 @@ applies its own default. See the [`effort`](../configuration/config-file.md#effo
 | OpenRouter | `https://openrouter.ai/api/v1` | Beta |
 | Synthetic | not served | **Not supported**; use [`openai-chat-completions`](./openai-chat-completions.md) or [`anthropic-messages`](./anthropic-messages.md) |
 
-Only the non-stateful flavour is needed. meka replays the whole conversation every turn and sends
+Only the non-stateful flavor is needed. meka replays the whole conversation every turn and sends
 `store: false`, so it never uses `previous_response_id` or server-side conversation state, which is
 also all the local runtimes implement.
 
@@ -64,7 +68,7 @@ the server implements and which one you want:
 Neither is the legacy `/v1/completions` endpoint, which is a third protocol with no tool calling that
 meka does not implement.
 
-## API Details
+## API details
 
 **Endpoint:** `POST {base_url}/responses`
 **Auth:** `Authorization: Bearer <api key>`
@@ -80,7 +84,7 @@ What it deliberately does **not** send is `include: ["reasoning.encrypted_conten
 `reasoning.summary`. Both are OpenAI extensions: the first round-trips reasoning across stateless
 turns, the second asks for the human-readable digest meka renders as a thinking block.
 `chatgpt-subscription` sends both because its endpoint is always ChatGPT; here the endpoint is
-whatever `base_url` names, meka has no way to know whether either is understood, and an unrecognised
+whatever `base_url` names, meka has no way to know whether either is understood, and an unrecognized
 field is a rejected request rather than a degraded one.
 
 The trade-off, stated plainly: against OpenAI itself this backend shows no thinking and carries no

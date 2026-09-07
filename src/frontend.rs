@@ -3,51 +3,64 @@
 //! `Agent::run_turn` emits its user-facing output (streamed assistant text, thinking blocks,
 //! tool-call indicators, todo lists, token usage) and its tool-approval requests through `Arc<dyn
 //! Frontend>` instead of calling `render::*` and `std::sync::mpsc` directly. The REPL today is one
-//! impl ([`crate::repl::ReplFrontend`]); ACP, a Telegram bridge, or a web UI become additional
-//! impls without touching the agent core.
+//! impl ([`crate::host::repl::frontend::ReplFrontend`]); ACP, a Telegram bridge, or a web UI become
+//! additional impls without touching the agent core.
 //!
 //! This module owns the trait, the event/permission types, and the two UI-agnostic impls
 //! ([`SilentFrontend`], [`PermissionForwardingFrontend`]). Concrete UI impls live with their UI
-//! (`ReplFrontend` in `crate::repl`, `AcpFrontend` in `crate::acp`) so the abstraction layer never
-//! depends on a specific frontend by name.
+//! (`ReplFrontend` in `crate::host::repl::editor`, `AcpFrontend` in `crate::host::acp`) so the
+//! abstraction layer never depends on a specific frontend by name.
 //!
 //! The event-based shape mirrors ACP's `session/update` notification: one channel for every kind
 //! of agent-emitted output, discriminated by the [`FrontendEvent`] variant.
 
-// `Mutex` and `PathBuf` are consumed only by the `#[cfg(test)] mod testing` block below; gating
-// their imports keeps non-test builds warning-clean now that `ReplFrontend` (the production user of
-// `std::sync::Mutex`) has moved into `crate::repl`.
-use std::{collections::VecDeque, path::Path, sync::Arc};
+// `PathBuf` is consumed only by the `#[cfg(test)] mod testing` block below; gating its import
+// keeps non-test builds warning-clean.
 #[cfg(test)]
-use std::{path::PathBuf, sync::Mutex};
+use std::path::PathBuf;
+use std::{
+    collections::{HashSet, VecDeque},
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{provider::TokenUsage, tools::todo::TodoItem};
+use crate::{stats::TokenUsage, todo::TodoItem};
+
+/// How long a host with a client on the far side waits for an approval answer before denying.
+///
+/// One figure for ACP and HTTP, because the thing being waited on is the same on both: a human
+/// reading a prompt and deciding. It is a backstop against a client that will never answer at all
+/// (an editor whose UI thread has wedged, a headless harness that speaks the protocol but shows no
+/// prompt), not a deadline on the user, so it is generous. A prompt still open after this long has
+/// been abandoned, and the turn holding the session's runtime open for it blocks everything queued
+/// behind it. The REPL has no such backstop: a human is at the keyboard, and Ctrl+D or `n` is how
+/// they leave a prompt.
+pub(crate) const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Trait the agent loop talks through to surface output and ask the user to approve tool calls.
 /// Implementations are responsible for rendering mode, newline spacing, and any inter-event
 /// formatting.
 #[async_trait]
-pub trait Frontend: Send + Sync {
+pub(crate) trait Frontend: Send + Sync {
     /// Emit a one-way UI event. Implementations must tolerate any order of events but may assume
     /// `TurnStarted` precedes any per-turn activity and `TurnFinished` closes it.
     async fn emit(&self, event: FrontendEvent);
 
-    /// Round-trip request for user approval of a tool call. Used only when
-    /// [`crate::permission::Permission::Ask`] is active. [`PermissionOutcome::Cancelled`] is
-    /// distinct from [`PermissionOutcome::Deny`]; it indicates the user cancelled the enclosing
+    /// Round-trip request for user approval of a tool call, sent when the session's approvals
+    /// switch submits a call above its level. [`PermissionOutcome::Cancelled`] is
+    /// distinct from [`PermissionOutcome::Deny`]; it indicates the user canceled the enclosing
     /// turn (Ctrl+C, `session/cancel`), which ACP will surface later. Today's REPL collapses it to
     /// deny semantics.
     async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome;
 
     /// Delegate a file read to whatever filesystem the frontend owns (typically the ACP client's
-    /// in-buffer view of the file). `Some(Ok(content))` means the frontend handled it;
-    /// `Some(Err(_))` means delegation was attempted and failed; `None` means "no delegate
-    /// available, do it locally".
+    /// in-buffer view of the file).
     ///
-    /// The file tools route on the [`DelegateFailure`] carried by `Some(Err(_))`, under one rule:
+    /// The file tools route on the [`DelegateFailure`] carried by [`Delegation::Failed`], under
+    /// one rule:
     /// **[`DelegateFailure::UnservablePath`] means the local filesystem is the only route and is
     /// used; anything else means the frontend may own the file, and the operation fails rather
     /// than routing around it.** Which paths a frontend will serve is its own business and differs
@@ -59,18 +72,13 @@ pub trait Frontend: Send + Sync {
         _path: &Path,
         _line: Option<u32>,
         _limit: Option<u32>,
-    ) -> Option<Result<String, FrontendError>> {
-        None
+    ) -> Delegation<String> {
+        Delegation::Local
     }
 
-    /// Delegate a file write. Same `None` / `Some(Err)` / `Some(Ok)` semantics as
-    /// [`Self::delegate_fs_read`].
-    async fn delegate_fs_write(
-        &self,
-        _path: &Path,
-        _content: &str,
-    ) -> Option<Result<(), FrontendError>> {
-        None
+    /// Delegate a file write. Same [`Delegation`] semantics as [`Self::delegate_fs_read`].
+    async fn delegate_fs_write(&self, _path: &Path, _content: &str) -> Delegation<()> {
+        Delegation::Local
     }
 
     /// Returns `true` if the frontend has observed that its client is no longer reachable (e.g. an
@@ -111,20 +119,77 @@ pub trait Frontend: Send + Sync {
 
     /// Handle an MCP `elicitation/create` request: the server asked the user for input (either a
     /// structured form or a URL-consent flow). The frontend is responsible for prompting the user
-    /// and returning their response. The default impl declines: the safe behavior when no human
-    /// is reachable (non-interactive subcommands, `SilentFrontend`, the test-only
-    /// `RecordingFrontend`).
+    /// and returning their response. The default impl declines and says so through a
+    /// [`Notice`]: the safe behavior when no human is reachable (non-interactive subcommands,
+    /// `SilentFrontend`, the test-only `RecordingFrontend`), and the same shape every concrete
+    /// impl gives a decline it makes on the user's behalf, so a tool call that then fails is
+    /// explained on whatever surface the frontend has.
     ///
-    /// Called via the task-local installed in `Agent::run_tool`; see
-    /// [`crate::mcp::current_session_frontend`]. Concrete impls today:
-    /// [`crate::repl::ReplFrontend`] (routes through the REPL thread), `crate::acp::AcpFrontend`
-    /// (issues ACP `elicitation/create`, declining when the client doesn't advertise the mode),
-    /// and [`PermissionForwardingFrontend`] (hands a sub-agent's elicitation to the parent).
+    /// Called through the frontend on the tool call's [`crate::tools::ToolContext`]. Concrete
+    /// impls today:
+    /// [`crate::host::repl::frontend::ReplFrontend`] (routes through the REPL thread),
+    /// `crate::host::acp::AcpFrontend` (issues ACP `elicitation/create`, declining when the client
+    /// doesn't advertise the mode), and [`PermissionForwardingFrontend`] (hands a sub-agent's
+    /// elicitation to the parent).
     async fn handle_elicitation(
         &self,
-        _prompt: crate::mcp::elicitation::ElicitationPrompt,
-    ) -> crate::mcp::elicitation::ElicitationResponse {
-        crate::mcp::elicitation::ElicitationResponse::Decline
+        prompt: crate::frontend::ElicitationPrompt,
+    ) -> crate::frontend::ElicitationResponse {
+        self.emit(FrontendEvent::Notice(Notice::elicitation_declined(
+            &prompt.server_name,
+            "nothing here can show a prompt",
+        )))
+        .await;
+        crate::frontend::ElicitationResponse::Decline
+    }
+}
+
+/// The allow and deny answers a user gave for the rest of the session, keyed on the tool name
+/// alone.
+///
+/// One definition for every frontend that offers a sticky answer (`always` and `never` at the
+/// REPL, `allow_always` and `reject_always` on ACP, `allow_always` and `deny_always` over HTTP), so
+/// what such an answer covers cannot drift between hosts: every later call to that tool, whatever
+/// its arguments, until the session ends. Held in memory with the frontend and never persisted.
+#[derive(Debug, Default)]
+pub(crate) struct StickyApprovals {
+    remembered: Mutex<StickySets>,
+}
+
+#[derive(Debug, Default)]
+struct StickySets {
+    always_allowed: HashSet<String>,
+    never_allowed: HashSet<String>,
+}
+
+impl StickyApprovals {
+    /// The answer already given for `tool_name`, if any, so the user is not asked again.
+    pub(crate) fn remembered(&self, tool_name: &str) -> Option<PermissionOutcome> {
+        let sets = crate::sync::lock(&self.remembered);
+        if sets.always_allowed.contains(tool_name) {
+            Some(PermissionOutcome::Allow)
+        } else if sets.never_allowed.contains(tool_name) {
+            Some(PermissionOutcome::Deny)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn remember_allow(&self, tool_name: &str) {
+        crate::sync::lock(&self.remembered)
+            .always_allowed
+            .insert(tool_name.to_string());
+    }
+
+    pub(crate) fn remember_deny(&self, tool_name: &str) {
+        crate::sync::lock(&self.remembered)
+            .never_allowed
+            .insert(tool_name.to_string());
+    }
+
+    /// Forget every answer, for a frontend that outlives the session its answers were given in.
+    pub(crate) fn clear(&self) {
+        *crate::sync::lock(&self.remembered) = StickySets::default();
     }
 }
 
@@ -133,7 +198,7 @@ pub trait Frontend: Send + Sync {
 /// Editors differ in which paths they will serve -- some only the project they have open, some
 /// anything absolute -- so meka does not model any editor's rule. It asks, and this is the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DelegateFailure {
+pub(crate) enum DelegateFailure {
     /// The frontend will not serve this path at all (ACP `ResourceNotFound`). It holds no buffer
     /// for the file and never will, so the local filesystem is not a degraded substitute for the
     /// delegate here -- it is the same bytes, and the only route.
@@ -164,14 +229,15 @@ tokio::task_local! {
     ///
     /// A task-local rather than a parameter because the frontend is a shared `Arc` behind a trait
     /// whose delegation methods take no token, and threading one through would touch every impl and
-    /// call site to serve one caller. Mirrors [`crate::provider::scope_subagent`], which solves the
-    /// same "which unit of work is this task" problem the same way.
+    /// call site to serve one caller. Mirrors the sub-agent flag on
+    /// [`crate::provider::Attribution`], which solves the same "which unit of work is this task"
+    /// problem the same way.
     static CALL_CANCELLATION: tokio_util::sync::CancellationToken;
 }
 
 /// Run `future` with `token` as the cancellation any frontend delegation on this task should
-/// honour.
-pub async fn scope_call_cancellation<F: std::future::Future>(
+/// honor.
+pub(crate) async fn scope_call_cancellation<F: std::future::Future>(
     token: tokio_util::sync::CancellationToken,
     future: F,
 ) -> F::Output {
@@ -179,8 +245,32 @@ pub async fn scope_call_cancellation<F: std::future::Future>(
 }
 
 /// The detached call's token, if this task is running one.
-pub fn current_call_cancellation() -> Option<tokio_util::sync::CancellationToken> {
+pub(crate) fn current_call_cancellation() -> Option<tokio_util::sync::CancellationToken> {
     CALL_CANCELLATION.try_with(Clone::clone).ok()
+}
+
+/// What a frontend answered when asked to serve a file operation. The three answers route
+/// differently in the file tools, so they are three variants rather than an `Option<Result>` whose
+/// `None` reads as "nothing happened".
+#[derive(Debug, Clone)]
+pub(crate) enum Delegation<T> {
+    /// The frontend served it.
+    Served(T),
+    /// The frontend was asked and failed; the [`DelegateFailure`] says whether the local
+    /// filesystem may stand in.
+    Failed(FrontendError),
+    /// The frontend has no file delegate, so the local filesystem is the only route.
+    Local,
+}
+
+impl<T> Delegation<T> {
+    #[cfg(test)]
+    pub(crate) fn served(self) -> Option<T> {
+        match self {
+            Self::Served(value) => Some(value),
+            Self::Failed(_) | Self::Local => None,
+        }
+    }
 }
 
 /// Error from a frontend-delegated operation ([`Frontend::delegate_fs_read`],
@@ -188,7 +278,7 @@ pub fn current_call_cancellation() -> Option<tokio_util::sync::CancellationToken
 /// so tools can splice it into their `ToolOutput` text without depending on the transport crate,
 /// plus the [`DelegateFailure`] the routing rule needs.
 #[derive(Debug, Clone)]
-pub struct FrontendError {
+pub(crate) struct FrontendError {
     message: String,
     failure: DelegateFailure,
 }
@@ -196,7 +286,7 @@ pub struct FrontendError {
 impl FrontendError {
     /// Construct a [`DelegateFailure::Transient`] error -- the conservative default, since it is
     /// the classification that never routes around the frontend.
-    pub fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             failure: DelegateFailure::Transient,
@@ -205,7 +295,7 @@ impl FrontendError {
 
     /// Construct a [`DelegateFailure::UnservablePath`] error. Only a transport that can tell the
     /// two apart on the wire may call this.
-    pub fn unservable_path(message: impl Into<String>) -> Self {
+    pub(crate) fn unservable_path(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             failure: DelegateFailure::UnservablePath,
@@ -214,23 +304,23 @@ impl FrontendError {
 
     /// Construct a [`DelegateFailure::Cancelled`] error. `what` names the round-trip that was
     /// abandoned, e.g. `"fs/read_text_file"`.
-    pub fn cancelled(what: &str) -> Self {
+    pub(crate) fn cancelled(what: &str) -> Self {
         Self {
-            message: format!("{} was abandoned: the turn was cancelled", what),
+            message: format!("{what} was abandoned: the turn was canceled"),
             failure: DelegateFailure::Cancelled,
         }
     }
 
     /// Whether the local filesystem is a safe route for this path: true only when the frontend
     /// said it cannot serve the path at all.
-    pub fn is_unservable_path(&self) -> bool {
+    pub(crate) fn is_unservable_path(&self) -> bool {
         self.failure == DelegateFailure::UnservablePath
     }
 
     /// Whether this is the turn being stopped rather than a delegation failing. Callers turn it
     /// into [`crate::error::MekaError::Interrupted`] instead of a tool error, so stopping a turn
     /// mid-`fs/*` reads as a stop and not as a broken client.
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.failure == DelegateFailure::Cancelled
     }
 }
@@ -245,7 +335,7 @@ impl std::error::Error for FrontendError {}
 
 /// One-way UI event emitted by the agent loop.
 #[derive(Debug, Clone)]
-pub enum FrontendEvent {
+pub(crate) enum FrontendEvent {
     /// A new session was created. Carries the session UUID.
     SessionStarted { id: Uuid },
     /// The agent is about to start a turn. Carries no spacing duty: the `[display]` blanks bracket
@@ -261,8 +351,8 @@ pub enum FrontendEvent {
     /// The model is thinking, with the server's running token estimate when it offers one.
     ///
     /// A transient indicator, not content: it is expected to be drawn in place and erased when
-    /// anything else prints. Exists because thinking is frequently *silent* — under Claude's
-    /// `redact-thinking` beta no thinking text is ever streamed — so without this the reasoning
+    /// anything else prints. Exists because thinking is frequently *silent* (under Claude's
+    /// `redact-thinking` beta no thinking text is ever streamed), so without this the reasoning
     /// phase is an unexplained pause, and a long one on a hard prompt.
     ThinkingProgress { estimated_tokens: Option<u64> },
     /// A thinking block closed without any text to show for it.
@@ -291,9 +381,9 @@ pub enum FrontendEvent {
     ///
     /// Deliberately carries no opaque half. No `signature` against a future replay: replay reads
     /// the conversation log, where the block keeps its provider-tagged
-    /// [`crate::provider::OpaqueReasoning`]. A bare blob here would be an undiscriminated Claude
-    /// MAC or OpenAI sealed reasoning, which is the conflation that shape exists to prevent, and it
-    /// cloned kilobytes per block for a reader that never came.
+    /// [`crate::conversation::OpaqueReasoning`]. A bare blob here would be an undiscriminated
+    /// Claude MAC or OpenAI sealed reasoning, which is the conflation that shape exists to
+    /// prevent, and it cloned kilobytes per block for a reader that never came.
     ThinkingBlock { content: String },
     /// The model has started composing a tool call: the name has arrived, the arguments have not.
     ///
@@ -307,14 +397,14 @@ pub enum FrontendEvent {
     ///
     /// Streamed turns only, and unpaired if the turn dies. Under `--no-stream` the provider hands
     /// back each call whole, so there is no composition to report and this never fires; and a turn
-    /// that fails or is cancelled mid-block emits this with no `ToolCallStarted` after it, so a
+    /// that fails or is canceled mid-block emits this with no `ToolCallStarted` after it, so a
     /// consumer holding state per `id` has to close it on the turn's terminal event as well.
     ToolCallComposing { id: String, name: String },
     /// A tool call is about to be dispatched. `id` is the `tool_use_id` assigned by the provider;
     /// frontends use it to correlate this announcement with the matching
     /// [`Self::ToolCallCompleted`]. `display_summary` is the agent-resolved primary argument for
     /// display (e.g. the path for `read_file`, the command for `execute_command`), pre-computed via
-    /// [`crate::render::resolve_primary_param`] so frontends don't need the tool's JSON Schema to
+    /// [`crate::tools::resolve_primary_param`] so frontends don't need the tool's JSON Schema to
     /// render the indicator. `None` means "no obvious primary arg". Render the bare tool name.
     ToolCallStarted {
         id: String,
@@ -332,7 +422,7 @@ pub enum FrontendEvent {
         /// output per tool, e.g. wrapping `execute_command` output in a console code block.
         name: String,
         is_error: bool,
-        content: Vec<crate::provider::ToolResultContent>,
+        content: Vec<crate::conversation::ToolResultContent>,
         /// Tool-specific structured side-channel. `edit_file` / `write_file` populate
         /// [`ToolOutputMetadata::Diff`] so ACP can emit a proper `diff` content block (and Zed can
         /// render its apply-diff UI). `None` for tools that have nothing extra.
@@ -371,18 +461,20 @@ pub enum FrontendEvent {
     },
     /// End-of-turn token-usage summary.
     TokenUsage(TokenUsage),
-    /// User-visible advisory surfaced by the provider layer (e.g. image redaction when the request
-    /// body would exceed the API limit). `ReplFrontend` renders via [`crate::render::render_hint`];
-    /// `AcpFrontend` forwards as an `AgentMessageChunk` with a `[meka] ` prefix so the editor's
-    /// transcript records the side-effect. `SilentFrontend` drops them.
-    Notice(crate::provider::Notice),
+    /// User-visible advisory raised by meka itself or by the provider layer (e.g. image redaction
+    /// when the request body would exceed the API limit). `ReplFrontend` renders it in the color
+    /// its [`NoticeLevel`] asks for; `AcpFrontend` forwards it as an `AgentMessageChunk` with a
+    /// `[meka] ` or `[meka warn] ` prefix so the editor's transcript records the side-effect; the
+    /// HTTP and one-shot JSON surfaces carry it as a [`NoticeView`]. `SilentFrontend` drops it.
+    Notice(crate::frontend::Notice),
     /// Incremental progress from an in-flight MCP tool (`notifications/progress`). Routed
-    /// per-session via the task-local frontend installed in `Agent::run_tool`. See
-    /// [`crate::mcp::current_session_frontend`]. `ReplFrontend` renders an inline status line
-    /// (carriage-return overwrite); `AcpFrontend` logs at `info!` today (no protocol primitive
-    /// yet). `SilentFrontend` drops them.
-    McpProgress(crate::mcp::progress::ProgressUpdate),
-    /// The conversation was just summarised and the window replaced.
+    /// per-session via the frontend the MCP call registered with its progress token. See
+    /// [`crate::mcp::progress::ProgressRegistry`]. `ReplFrontend` renders an inline status line
+    /// (carriage-return overwrite); `HttpFrontend` streams it as a `progress` SSE event;
+    /// `AcpFrontend` logs at `info!` today (no protocol primitive yet). `SilentFrontend` drops
+    /// them.
+    McpProgress(crate::frontend::ProgressUpdate),
+    /// The conversation was just summarized and the window replaced.
     ///
     /// Emitted for every compaction whatever triggered it, including the automatic ones that fire
     /// mid-turn without anyone asking. A frontend holding its own view of the transcript needs this
@@ -409,7 +501,7 @@ pub enum FrontendEvent {
 /// know how to render it. Frontends that don't understand a variant ignore it (the regular
 /// `content` text is still the source of truth for the model and the REPL).
 #[derive(Debug, Clone)]
-pub enum ToolOutputMetadata {
+pub(crate) enum ToolOutputMetadata {
     /// Pre/post file content produced by `edit_file` / `write_file`. `old_text == None` means the
     /// file did not exist before the call (the write created it).
     Diff {
@@ -429,36 +521,36 @@ pub enum ToolOutputMetadata {
 
 /// Round-trip request for tool-call approval.
 #[derive(Debug, Clone)]
-pub struct PermissionRequest {
-    pub tool_name: String,
+pub(crate) struct PermissionRequest {
+    pub(crate) tool_name: String,
     /// The most user-meaningful argument for display in the prompt (e.g. the file path for
     /// `read_file`, the command for `execute_command`). Resolved via
-    /// [`crate::render::resolve_primary_param`]. Still the right shape for a client that wants one
+    /// [`crate::tools::resolve_primary_param`]. Still the right shape for a client that wants one
     /// line: the ACP frontend builds its permission title from it.
-    pub primary_param: Option<String>,
+    pub(crate) primary_param: Option<String>,
     /// Every argument the tool was called with, plus `background` when the call would detach.
     ///
     /// `background` is meka's own parameter and is taken out before any tool sees it, but it
     /// decides whether the call outlives the turn, so it is put back for the asking.
     ///
-    /// `primary_param` alone is not enough to authorise a call. It resolves to the *destination*
+    /// `primary_param` alone is not enough to authorize a call. It resolves to the *destination*
     /// for every write-shaped tool -- `path` for `write_file` and `edit_file`, `url` for
     /// `fetch_url`, `name` for `scratchpad_write` -- so a prompt built from it asks the user
     /// to approve a write without showing them what is being written. A frontend that gates on
-    /// human judgement should render this instead.
-    pub input: serde_json::Value,
+    /// human judgment should render this instead.
+    pub(crate) input: serde_json::Value,
     /// Per-turn cancellation token. ACP frontends race their `session/request_permission`
-    /// round-trip against this so a `session/cancel` during an `Ask`-mode prompt resolves promptly
+    /// round-trip against this so a `session/cancel` during an approval prompt resolves promptly
     /// instead of hanging until the client replies.
-    pub cancellation: tokio_util::sync::CancellationToken,
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
 /// Outcome of a [`Frontend::request_permission`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PermissionOutcome {
+pub(crate) enum PermissionOutcome {
     Allow,
     Deny,
-    /// The enclosing turn was cancelled while the request was in flight. The ACP frontend surfaces
+    /// The enclosing turn was canceled while the request was in flight. The ACP frontend surfaces
     /// this as `{outcome: cancelled}`; the REPL collapses it to a deny-shaped tool error.
     Cancelled,
 }
@@ -468,18 +560,18 @@ pub enum PermissionOutcome {
 /// reports flow back through the parent's `agent_spawn` tool result, not through this frontend.
 /// The exceptions are:
 ///
-/// - `Notice` — provider-side advisories the user should still see, e.g. a redaction during a
+/// - `Notice`: provider-side advisories the user should still see, e.g. a redaction during a
 ///   sub-agent's turn.
-/// - `request_permission` and `handle_elicitation` — round-trips forwarded so the user is asked in
+/// - `request_permission` and `handle_elicitation`: round-trips forwarded so the user is asked in
 ///   their original UI (REPL approval line, ACP `session/request_permission` /
 ///   `elicitation/create`).
-/// - `ToolCallStarted` — not forwarded as-is, but rolled up into
-///   [`FrontendEvent::SubAgentActivity`] against the parent's `agent_spawn` call so a long
-///   delegated task shows its progress instead of an opaque spinner.
+/// - `ToolCallStarted`: not forwarded as-is, but rolled up into [`FrontendEvent::SubAgentActivity`]
+///   against the parent's `agent_spawn` call so a long delegated task shows its progress instead of
+///   an opaque spinner.
 ///
 /// Constructed in [`crate::tools::subagent::AgentSpawnTool`] with the parent agent's frontend as
 /// the delegate.
-pub struct PermissionForwardingFrontend {
+pub(crate) struct PermissionForwardingFrontend {
     delegate: Arc<dyn Frontend>,
     /// The parent's `tool_use_id` for the `agent_spawn` call this sub-agent is running under, when
     /// one is in scope. `None` outside a tool call (tests, direct construction), which disables
@@ -495,7 +587,7 @@ impl PermissionForwardingFrontend {
     /// update (ACP replaces content), so this bounds per-update payload as well as height.
     const MAX_ACTIVITY_LINES: usize = 20;
 
-    pub fn new(delegate: Arc<dyn Frontend>, tool_call_id: Option<String>) -> Self {
+    pub(crate) fn new(delegate: Arc<dyn Frontend>, tool_call_id: Option<String>) -> Self {
         Self {
             delegate,
             tool_call_id,
@@ -504,19 +596,17 @@ impl PermissionForwardingFrontend {
     }
 
     /// Append `line` and return the whole block to send.
-    fn record_activity(&self, line: String) -> Option<String> {
-        let mut activity = self.activity.lock().ok()?;
+    fn record_activity(&self, line: String) -> String {
+        let mut activity = crate::sync::lock(&self.activity);
         if activity.len() == Self::MAX_ACTIVITY_LINES {
             activity.pop_front();
         }
         activity.push_back(line);
-        Some(
-            activity
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        activity
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -541,19 +631,18 @@ impl Frontend for PermissionForwardingFrontend {
                     return;
                 };
                 let line = match display_summary {
-                    Some(summary) => format!("{}: {}", name, summary),
+                    Some(summary) => format!("{name}: {summary}"),
                     None => name,
                 };
-                if let Some(summary) = self.record_activity(line) {
-                    self.delegate
-                        .emit(FrontendEvent::SubAgentActivity {
-                            tool_call_id,
-                            summary,
-                        })
-                        .await;
-                }
+                let summary = self.record_activity(line);
+                self.delegate
+                    .emit(FrontendEvent::SubAgentActivity {
+                        tool_call_id,
+                        summary,
+                    })
+                    .await;
             }
-            // A nested sub-agent's activity is already summarised as a `agent_spawn` line in this
+            // A nested sub-agent's activity is already summarized as a `agent_spawn` line in this
             // sub-agent's own record; forwarding it too would have two writers fighting over one
             // tool call's content.
             FrontendEvent::SubAgentActivity { .. } => {}
@@ -587,15 +676,11 @@ impl Frontend for PermissionForwardingFrontend {
         path: &Path,
         line: Option<u32>,
         limit: Option<u32>,
-    ) -> Option<Result<String, FrontendError>> {
+    ) -> Delegation<String> {
         self.delegate.delegate_fs_read(path, line, limit).await
     }
 
-    async fn delegate_fs_write(
-        &self,
-        path: &Path,
-        content: &str,
-    ) -> Option<Result<(), FrontendError>> {
+    async fn delegate_fs_write(&self, path: &Path, content: &str) -> Delegation<()> {
         self.delegate.delegate_fs_write(path, content).await
     }
 
@@ -604,8 +689,8 @@ impl Frontend for PermissionForwardingFrontend {
     /// behalf without ever asking.
     async fn handle_elicitation(
         &self,
-        prompt: crate::mcp::elicitation::ElicitationPrompt,
-    ) -> crate::mcp::elicitation::ElicitationResponse {
+        prompt: crate::frontend::ElicitationPrompt,
+    ) -> crate::frontend::ElicitationResponse {
         self.delegate.handle_elicitation(prompt).await
     }
 }
@@ -614,25 +699,151 @@ impl Frontend for PermissionForwardingFrontend {
 /// `meka tools list`'s reference registry. Both want a frontend that never reaches out to a user.
 /// Sub-agents use [`PermissionForwardingFrontend`] instead so their permission prompts surface in
 /// the parent's UI.
-pub struct SilentFrontend;
+pub(crate) struct SilentFrontend;
 
 #[async_trait]
 impl Frontend for SilentFrontend {
     async fn emit(&self, _event: FrontendEvent) {}
 
-    async fn request_permission(&self, _request: PermissionRequest) -> PermissionOutcome {
-        // No human to ask: safest default.
+    async fn request_permission(&self, request: PermissionRequest) -> PermissionOutcome {
+        // Said through `emit` even though this frontend drops it: the decision reads the same at
+        // every door, and the silence is this sink's doing rather than the refusal's.
+        self.emit(FrontendEvent::Notice(
+            Notice::approval_refused_without_asking(&request.tool_name),
+        ))
+        .await;
         PermissionOutcome::Deny
     }
 }
 
-/// Test-only frontend that records every event it receives. Available to the rest of the crate's
-/// test suite via `crate::frontend::testing::RecordingFrontend`.
+/// Severity hint for a provider-emitted [`Notice`]. Frontends can map these to per-level styling
+/// (a dim hint for `Info`, a warn-colored line for `Warn`). `Info` carries the image-redaction
+/// notice; `Warn` carries recoverable conditions the user should see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoticeLevel {
+    Info,
+    Warn,
+}
+impl NoticeLevel {
+    /// The level's spelling on every JSON surface (HTTP responses, SSE events, one-shot reports).
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+        }
+    }
+}
+/// A [`Notice`] as every JSON surface serializes it: `level` is [`NoticeLevel::name`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
+pub(crate) struct NoticeView {
+    pub(crate) level: String,
+    pub(crate) text: String,
+}
+impl From<Notice> for NoticeView {
+    fn from(notice: Notice) -> Self {
+        Self {
+            level: notice.level.name().to_string(),
+            text: notice.text,
+        }
+    }
+}
+/// User-visible advisory surfaced by a provider during a request. Frontends format the message
+/// themselves; the one structured payload is for the agent, not for display.
+#[derive(Debug, Clone)]
+pub(crate) struct Notice {
+    pub(crate) level: NoticeLevel,
+    pub(crate) text: String,
+    /// Set when the advisory reports an image-redaction pass, so the agent can count it against
+    /// the session the request belonged to.
+    pub(crate) redaction: Option<crate::stats::Redaction>,
+}
+impl Notice {
+    pub(crate) fn info(text: impl Into<String>) -> Self {
+        Self {
+            level: NoticeLevel::Info,
+            text: text.into(),
+            redaction: None,
+        }
+    }
+
+    pub(crate) fn warn(text: impl Into<String>) -> Self {
+        Self {
+            level: NoticeLevel::Warn,
+            text: text.into(),
+            redaction: None,
+        }
+    }
+
+    pub(crate) fn reporting(mut self, redaction: crate::stats::Redaction) -> Self {
+        self.redaction = Some(redaction);
+        self
+    }
+
+    /// What every frontend says when a call needs approval and nothing can put the question to a
+    /// human: the one-shot run, the silent frontend, a REPL whose prompt thread is gone.
+    ///
+    /// A `warn`, and a notice rather than a log line, because the run is otherwise
+    /// indistinguishable from a model that chose not to use its tools, and that has sent people
+    /// debugging the prompt instead of the flag.
+    pub(crate) fn approval_refused_without_asking(tool_name: &str) -> Self {
+        Self::warn(format!(
+            "approvals are on but nobody can answer here, so '{tool_name}' was refused without \
+             asking"
+        ))
+    }
+
+    /// What every frontend says when it declines an MCP elicitation on the user's behalf. `reason`
+    /// is the host's: no prompt to show, a mode the client did not advertise, a schema the
+    /// protocol cannot express.
+    pub(crate) fn elicitation_declined(server_name: &str, reason: &str) -> Self {
+        Self::warn(format!(
+            "MCP elicitation from '{server_name}' declined: {reason}"
+        ))
+    }
+}
+
+/// User-facing payload the frontend renders.
+#[derive(Debug)]
+pub(crate) struct ElicitationPrompt {
+    pub(crate) server_name: String,
+    pub(crate) kind: ElicitationKind,
+    pub(crate) message: String,
+}
+#[derive(Debug)]
+pub(crate) enum ElicitationKind {
+    /// Structured form: the server sent a JSON schema of fields to fill.
+    Form { schema: serde_json::Value },
+    /// URL consent: the server wants the user to visit a URL (e.g. to log in to a third-party
+    /// service).
+    Url { url: String },
+}
+/// Frontend's response back to the MCP handler.
+#[derive(Debug, Clone)]
+pub(crate) enum ElicitationResponse {
+    Accept { content: Option<serde_json::Value> },
+    Decline,
+    Cancel,
+}
+
+/// Single progress update forwarded to the frontend.
+#[derive(Clone, Debug)]
+pub(crate) struct ProgressUpdate {
+    pub(crate) server_name: String,
+    pub(crate) tool_name: String,
+    /// The provider's `tool_use_id` for the in-flight call, when one was supplied, so a client
+    /// holding state per call (the SSE `progress` event's readers) can attach the update to the
+    /// `tool_call.executing` it belongs to.
+    pub(crate) tool_use_id: Option<String>,
+    pub(crate) progress: f64,
+    pub(crate) total: Option<f64>,
+    pub(crate) message: Option<String>,
+}
 #[cfg(test)]
-pub mod testing {
+pub(crate) mod testing {
     use super::*;
 
-    pub struct RecordingFrontend {
+    pub(crate) struct RecordingFrontend {
         events: Mutex<Vec<FrontendEvent>>,
         permission_response: Mutex<PermissionOutcome>,
         /// Tool names this frontend was asked to approve, in order. Lets a test assert that a gate
@@ -641,7 +852,7 @@ pub mod testing {
     }
 
     impl RecordingFrontend {
-        pub fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 events: Mutex::new(Vec::new()),
                 permission_response: Mutex::new(PermissionOutcome::Allow),
@@ -649,7 +860,7 @@ pub mod testing {
             }
         }
 
-        pub fn with_permission(response: PermissionOutcome) -> Self {
+        pub(crate) fn with_permission(response: PermissionOutcome) -> Self {
             Self {
                 events: Mutex::new(Vec::new()),
                 permission_response: Mutex::new(response),
@@ -657,11 +868,11 @@ pub mod testing {
             }
         }
 
-        pub fn events(&self) -> Vec<FrontendEvent> {
+        pub(crate) fn events(&self) -> Vec<FrontendEvent> {
             self.events.lock().unwrap().clone()
         }
 
-        pub fn permission_requests(&self) -> Vec<String> {
+        pub(crate) fn permission_requests(&self) -> Vec<String> {
             self.permission_requests.lock().unwrap().clone()
         }
     }
@@ -693,7 +904,7 @@ mod tests {
     use super::{testing::RecordingFrontend, *};
 
     #[tokio::test]
-    async fn test_silent_frontend_emit_is_no_op_and_does_not_panic() {
+    async fn silent_frontend_emit_is_no_op_and_does_not_panic() {
         let frontend = SilentFrontend;
         frontend.emit(FrontendEvent::TurnStarted).await;
         frontend
@@ -703,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_frontend_request_permission_denies() {
+    async fn silent_frontend_request_permission_denies() {
         let frontend = SilentFrontend;
         let outcome = frontend
             .request_permission(PermissionRequest {
@@ -716,8 +927,77 @@ mod tests {
         assert_eq!(outcome, PermissionOutcome::Deny);
     }
 
+    /// The trait default is what every frontend without a prompt of its own answers with, so the
+    /// decline it makes on the user's behalf has to be said where that frontend says things. The
+    /// recorder does not override the method, so what it records is the default's doing.
     #[tokio::test]
-    async fn test_recording_frontend_records_events_in_order() {
+    async fn the_default_elicitation_decline_is_announced_as_a_warn_notice() {
+        let frontend = RecordingFrontend::new();
+        let response = frontend
+            .handle_elicitation(ElicitationPrompt {
+                server_name: "notion".to_string(),
+                message: "authorize?".to_string(),
+                kind: ElicitationKind::Url {
+                    url: "https://example.com/".to_string(),
+                },
+            })
+            .await;
+        assert!(matches!(response, ElicitationResponse::Decline));
+        let events = frontend.events();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [FrontendEvent::Notice(notice)]
+                    if notice.level == NoticeLevel::Warn && notice.text.contains("'notion'")
+            ),
+            "the decline must be said once, at warn, naming the server: {events:?}"
+        );
+    }
+
+    /// A sticky answer covers the tool, not the call, and a session starting over forgets it.
+    #[test]
+    fn a_sticky_answer_covers_every_later_call_to_the_tool_until_cleared() {
+        let sticky = StickyApprovals::default();
+        assert_eq!(sticky.remembered("write_file"), None);
+        sticky.remember_allow("write_file");
+        sticky.remember_deny("execute_command");
+        assert_eq!(
+            sticky.remembered("write_file"),
+            Some(PermissionOutcome::Allow)
+        );
+        assert_eq!(
+            sticky.remembered("execute_command"),
+            Some(PermissionOutcome::Deny)
+        );
+        assert_eq!(sticky.remembered("read_file"), None);
+        sticky.clear();
+        assert_eq!(sticky.remembered("write_file"), None);
+        assert_eq!(sticky.remembered("execute_command"), None);
+    }
+
+    /// The activity record is a display aid; a panic that poisoned its lock elsewhere must not
+    /// blank the parent's view of the sub-agent for the rest of the run.
+    #[test]
+    fn activity_is_still_recorded_after_the_lock_was_poisoned() {
+        let frontend =
+            PermissionForwardingFrontend::new(Arc::new(SilentFrontend), Some("call-1".to_string()));
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| {
+                let _held = frontend.activity.lock().expect("not yet poisoned");
+                panic!("poison the activity lock");
+            });
+            assert!(poisoner.join().is_err(), "the panic is the point");
+        });
+        assert!(frontend.activity.is_poisoned());
+
+        assert_eq!(
+            frontend.record_activity("read_file: a.txt".to_string()),
+            "read_file: a.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_frontend_records_events_in_order() {
         let frontend = RecordingFrontend::new();
         frontend.emit(FrontendEvent::TurnStarted).await;
         frontend
@@ -733,7 +1013,7 @@ mod tests {
 
     /// Locks in the contract for the `display_summary` field on
     /// [`FrontendEvent::ToolCallStarted`]: the agent loop is expected to pre-resolve the primary
-    /// argument via [`crate::render::resolve_primary_param`] and ship the resulting `String` (or
+    /// argument via [`crate::tools::resolve_primary_param`] and ship the resulting `String` (or
     /// `None`) on the event. Frontends rely on this so they never need the tool's JSON Schema
     /// themselves.
     ///
@@ -741,10 +1021,10 @@ mod tests {
     /// the result, so a future refactor that changes either side is caught here. End-to-end
     /// emission from `Agent::run_turn` is covered by `tests/acp.rs`.
     #[tokio::test]
-    async fn test_tool_call_started_carries_resolved_display_summary() {
+    async fn tool_call_started_carries_resolved_display_summary() {
         let recorder = RecordingFrontend::new();
         let input = serde_json::json!({"path": "/etc/hosts"});
-        let display_summary = crate::render::resolve_primary_param("read_file", &input, None);
+        let display_summary = crate::tools::resolve_primary_param("read_file", &input, None);
         assert_eq!(display_summary.as_deref(), Some("/etc/hosts"));
         recorder
             .emit(FrontendEvent::ToolCallStarted {
@@ -762,12 +1042,12 @@ mod tests {
             } => {
                 assert_eq!(display_summary.as_deref(), Some("/etc/hosts"));
             }
-            other => panic!("expected ToolCallStarted; got {:?}", other),
+            other => panic!("expected ToolCallStarted; got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn test_recording_frontend_returns_configured_permission_outcome() {
+    async fn recording_frontend_returns_configured_permission_outcome() {
         let frontend = RecordingFrontend::with_permission(PermissionOutcome::Deny);
         let outcome = frontend
             .request_permission(PermissionRequest {
@@ -781,7 +1061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_drops_sub_agent_chrome() {
+    async fn permission_forwarding_frontend_drops_sub_agent_chrome() {
         // Sub-agent chrome (text, lifecycle, tool indicators) must NOT bubble up to the parent's
         // UI; the sub-agent's report flows back via the agent_spawn tool result instead.
         let recorder = Arc::new(RecordingFrontend::new());
@@ -800,7 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_rolls_up_sub_agent_tool_calls() {
+    async fn permission_forwarding_frontend_rolls_up_sub_agent_tool_calls() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
@@ -812,7 +1092,7 @@ mod tests {
         ] {
             forwarder
                 .emit(FrontendEvent::ToolCallStarted {
-                    id: format!("toolu_{}", name),
+                    id: format!("toolu_{name}"),
                     name: name.to_string(),
                     input: serde_json::json!({}),
                     display_summary: summary,
@@ -831,12 +1111,12 @@ mod tests {
                 assert_eq!(tool_call_id, "toolu_parent");
                 assert_eq!(summary, "read_file: /etc/hosts\nfind_files: **/*.rs\ntodo");
             }
-            other => panic!("expected SubAgentActivity; got {:?}", other),
+            other => panic!("expected SubAgentActivity; got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_caps_activity_lines() {
+    async fn permission_forwarding_frontend_caps_activity_lines() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
@@ -845,10 +1125,10 @@ mod tests {
         for i in 0..total {
             forwarder
                 .emit(FrontendEvent::ToolCallStarted {
-                    id: format!("toolu_{}", i),
+                    id: format!("toolu_{i}"),
                     name: "read_file".to_string(),
                     input: serde_json::json!({}),
-                    display_summary: Some(format!("/file{}", i)),
+                    display_summary: Some(format!("/file{i}")),
                 })
                 .await;
         }
@@ -874,7 +1154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_without_tool_call_id_stays_silent() {
+    async fn permission_forwarding_frontend_without_tool_call_id_stays_silent() {
         // Outside a tool call there is nothing to correlate the activity with, so it is dropped
         // rather than sent against a guessed id.
         let recorder = Arc::new(RecordingFrontend::new());
@@ -894,7 +1174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_drops_nested_sub_agent_activity() {
+    async fn permission_forwarding_frontend_drops_nested_sub_agent_activity() {
         // A nested sub-agent's roll-up must not reach the parent: it already appears as a
         // `agent_spawn` line in this level's own record, and two writers on one tool call's
         // content would overwrite each other.
@@ -918,7 +1198,7 @@ mod tests {
     /// parent's call, so a client pairing the two would hold an indicator open on an id it never
     /// hears about again.
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_drops_events_keyed_by_sub_agent_call_id() {
+    async fn permission_forwarding_frontend_drops_events_keyed_by_sub_agent_call_id() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate, Some("toolu_parent".into()));
@@ -939,7 +1219,7 @@ mod tests {
         assert!(recorder.events().is_empty());
     }
 
-    /// A detached call's token is what frontend delegation must honour on that task.
+    /// A detached call's token is what frontend delegation must honor on that task.
     ///
     /// `AcpFrontend::until_cancelled` reads this before falling back to the session's cell. Without
     /// it, a `session/cancel` on any later turn abandoned a background task's `fs/*` request
@@ -976,12 +1256,12 @@ mod tests {
     /// sub-agent's report has no place to surface it, and silent redaction without operator
     /// awareness is exactly the bypass this whole refactor is meant to close.
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_forwards_notice() {
+    async fn permission_forwarding_frontend_forwards_notice() {
         let recorder = Arc::new(RecordingFrontend::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate, None);
         forwarder
-            .emit(FrontendEvent::Notice(crate::provider::Notice::info(
+            .emit(FrontendEvent::Notice(crate::frontend::Notice::info(
                 "redacted 2 images",
             )))
             .await;
@@ -990,14 +1270,14 @@ mod tests {
         match &events[0] {
             FrontendEvent::Notice(notice) => {
                 assert_eq!(notice.text, "redacted 2 images");
-                assert_eq!(notice.level, crate::provider::NoticeLevel::Info);
+                assert_eq!(notice.level, crate::frontend::NoticeLevel::Info);
             }
-            other => panic!("expected Notice, got {:?}", other),
+            other => panic!("expected Notice, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_delegates_request_permission() {
+    async fn permission_forwarding_frontend_delegates_request_permission() {
         let delegate: Arc<dyn Frontend> =
             Arc::new(RecordingFrontend::with_permission(PermissionOutcome::Allow));
         let forwarder = PermissionForwardingFrontend::new(delegate, None);
@@ -1013,30 +1293,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_frontend_default_delegate_methods_return_none() {
+    async fn silent_frontend_default_delegate_methods_answer_local() {
         // Default impls signal "no delegate available, do it locally".
         let frontend = SilentFrontend;
-        assert!(
+        assert!(matches!(
             frontend
                 .delegate_fs_read(Path::new("/tmp/x"), None, None)
-                .await
-                .is_none()
-        );
-        assert!(
-            frontend
-                .delegate_fs_write(Path::new("/tmp/x"), "hi")
-                .await
-                .is_none()
-        );
+                .await,
+            Delegation::Local
+        ));
+        assert!(matches!(
+            frontend.delegate_fs_write(Path::new("/tmp/x"), "hi").await,
+            Delegation::Local
+        ));
     }
 
     /// Test fixture that records what arguments each delegate method was called with, and lets the
     /// test pick the response.
     pub(super) struct DelegatingRecorder {
-        pub fs_reads: Mutex<Vec<PathBuf>>,
-        pub fs_writes: Mutex<Vec<(PathBuf, String)>>,
-        pub fs_read_response: Mutex<Option<Result<String, FrontendError>>>,
-        pub fs_write_response: Mutex<Option<Result<(), FrontendError>>>,
+        pub(crate) fs_reads: Mutex<Vec<PathBuf>>,
+        pub(crate) fs_writes: Mutex<Vec<(PathBuf, String)>>,
+        pub(crate) fs_read_response: Mutex<Option<Delegation<String>>>,
+        pub(crate) fs_write_response: Mutex<Option<Delegation<()>>>,
     }
 
     impl DelegatingRecorder {
@@ -1044,8 +1322,8 @@ mod tests {
             Self {
                 fs_reads: Mutex::new(Vec::new()),
                 fs_writes: Mutex::new(Vec::new()),
-                fs_read_response: Mutex::new(Some(Ok("from-delegate".to_string()))),
-                fs_write_response: Mutex::new(Some(Ok(()))),
+                fs_read_response: Mutex::new(Some(Delegation::Served("from-delegate".to_string()))),
+                fs_write_response: Mutex::new(Some(Delegation::Served(()))),
             }
         }
     }
@@ -1063,49 +1341,54 @@ mod tests {
             path: &Path,
             _line: Option<u32>,
             _limit: Option<u32>,
-        ) -> Option<Result<String, FrontendError>> {
+        ) -> Delegation<String> {
             self.fs_reads.lock().unwrap().push(path.to_path_buf());
-            self.fs_read_response.lock().unwrap().take()
+            self.fs_read_response
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Delegation::Local)
         }
 
-        async fn delegate_fs_write(
-            &self,
-            path: &Path,
-            content: &str,
-        ) -> Option<Result<(), FrontendError>> {
+        async fn delegate_fs_write(&self, path: &Path, content: &str) -> Delegation<()> {
             self.fs_writes
                 .lock()
                 .unwrap()
                 .push((path.to_path_buf(), content.to_string()));
-            self.fs_write_response.lock().unwrap().take()
+            self.fs_write_response
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Delegation::Local)
         }
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_forwards_fs_read() {
+    async fn permission_forwarding_frontend_forwards_fs_read() {
         let recorder = Arc::new(DelegatingRecorder::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate, None);
         let outcome = forwarder
             .delegate_fs_read(Path::new("/tmp/sub.txt"), None, None)
             .await
+            .served()
             .expect("delegate result");
-        assert_eq!(outcome.expect("ok"), "from-delegate");
+        assert_eq!(outcome, "from-delegate");
         assert_eq!(recorder.fs_reads.lock().unwrap().as_slice(), &[
             PathBuf::from("/tmp/sub.txt")
         ],);
     }
 
     #[tokio::test]
-    async fn test_permission_forwarding_frontend_forwards_fs_write() {
+    async fn permission_forwarding_frontend_forwards_fs_write() {
         let recorder = Arc::new(DelegatingRecorder::new());
         let delegate: Arc<dyn Frontend> = recorder.clone();
         let forwarder = PermissionForwardingFrontend::new(delegate, None);
         forwarder
             .delegate_fs_write(Path::new("/tmp/sub.txt"), "hi from sub-agent")
             .await
-            .expect("delegate result")
-            .expect("ok");
+            .served()
+            .expect("delegate result");
         let recorded = recorder.fs_writes.lock().unwrap().clone();
         assert_eq!(recorded, vec![(
             PathBuf::from("/tmp/sub.txt"),

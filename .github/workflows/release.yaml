@@ -127,7 +127,9 @@ jobs:
           draft: true
           name: ${{ github.ref_name }}
           body_path: release-notes.md
-          files: artifacts/*
+          files: |
+            artifacts/*
+            scripts/migrate-0.45-to-0.46.py
 
   container:
     name: Build and push container

@@ -10,9 +10,9 @@
 //!   subscription's OAuth tokens and shaped to match the Claude Code CLI exactly -- beta headers,
 //!   attestation, injected system block. Deviating from that shape gets the request rejected.
 
-pub mod messages;
+pub(crate) mod messages;
 mod shared;
-pub mod subscription;
+pub(crate) mod subscription;
 
-pub use messages::AnthropicMessagesProvider;
-pub use subscription::ClaudeSubscriptionProvider;
+pub(crate) use messages::AnthropicMessagesProvider;
+pub(crate) use subscription::ClaudeSubscriptionProvider;

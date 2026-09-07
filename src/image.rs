@@ -6,11 +6,7 @@ use std::io::Cursor;
 
 use base64::Engine;
 use image::ImageFormat;
-
-use crate::{
-    provider::{ImageSource, ToolResultContent},
-    tools::ToolOutput,
-};
+use serde::{Deserialize, Serialize};
 
 /// Maximum raw image bytes before base64 encoding. Keeps the resulting base64 payload under ~5
 /// MB, a safe ceiling across providers.
@@ -95,7 +91,7 @@ pub(crate) fn classify_bytes(bytes: &[u8]) -> ImageHandling {
 /// optimistically unless told otherwise, so this is the only thing standing between a crafted image
 /// in a tool result and the process. 128 MiB is a 5792x5792 RGBA image, far past any real
 /// screenshot or diagram.
-const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DECODE_ALLOC_BYTES: usize = 128 * crate::text::MIB;
 
 /// Decode image bytes under [`MAX_DECODE_ALLOC_BYTES`].
 ///
@@ -107,18 +103,18 @@ const MAX_DECODE_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 /// claim.
 fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<image::DynamicImage, String> {
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES as u64);
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
     reader.decode().map_err(|error| match error {
         image::ImageError::Limits(_) => format!(
-            "{:?} image is too large to convert: decoding it would need more than {} MiB, which is \
+            "{:?} image is too large to convert: decoding it would need more than {}, which is \
              meka's per-image ceiling. Convert or downscale it first, or supply it in a format \
              that needs no conversion (png, jpeg, gif, webp, bmp).",
             format,
-            MAX_DECODE_ALLOC_BYTES / (1024 * 1024)
+            crate::text::format_size(MAX_DECODE_ALLOC_BYTES)
         ),
-        error => format!("failed to decode {:?} image: {}", format, error),
+        error => format!("failed to decode {format:?} image: {error}"),
     })
 }
 
@@ -141,7 +137,7 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
         return refuse_undecodable_jpeg(bytes);
     }
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES as u64);
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
     match reader.decode() {
@@ -149,7 +145,7 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
         // Checked against the declared dimensions before any buffer is reserved, so this costs
         // nothing beyond parsing the header.
         Err(image::ImageError::Limits(_)) => Ok(()),
-        Err(error) => Err(format!("failed to decode {:?} image: {}", format, error)),
+        Err(error) => Err(format!("failed to decode {format:?} image: {error}")),
     }
 }
 
@@ -161,14 +157,14 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
 /// with what it has and returns a picture. A guard that passes that is not a guard, and JPEG is the
 /// format most likely to arrive truncated, so meka drives the same decoder itself with strict mode
 /// on. Measured: strict refuses truncation at every fraction from 10% to 99% and refuses a
-/// corrupted scan, while accepting baseline, progressive, optimised, 4:4:4 and grayscale JPEGs
+/// corrupted scan, while accepting baseline, progressive, optimized, 4:4:4 and grayscale JPEGs
 /// unchanged.
 ///
 /// The alternative considered and rejected was checking for a trailing `FF D9` end-of-image marker.
 /// It is worse in both directions: it misses corruption that leaves the marker intact, and it
 /// refuses the valid files that carry bytes after it.
 ///
-/// The header is read first so this can honour [`MAX_DECODE_ALLOC_BYTES`] the way every other
+/// The header is read first so this can honor [`MAX_DECODE_ALLOC_BYTES`] the way every other
 /// format does. Two things forced it, and taking the defaults got both wrong:
 ///
 /// `DecoderOptions::default()` caps each axis at 16384 and enforces that in frame-header parsing,
@@ -189,7 +185,7 @@ fn refuse_undecodable_jpeg(bytes: &[u8]) -> Result<(), String> {
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(bytes), options);
     decoder
         .decode_headers()
-        .map_err(|error| format!("failed to decode Jpeg image: {}", error))?;
+        .map_err(|error| format!("failed to decode Jpeg image: {error}"))?;
     // Unknown rather than large: nothing to weigh against the ceiling, so fall through and let the
     // decode speak.
     //
@@ -207,14 +203,14 @@ fn refuse_undecodable_jpeg(bytes: &[u8]) -> Result<(), String> {
     let within_ceiling = decoder
         .output_buffer_size()
         .and_then(|size| u64::try_from(size).ok())
-        .is_some_and(|size| size <= MAX_DECODE_ALLOC_BYTES);
+        .is_some_and(|size| size <= MAX_DECODE_ALLOC_BYTES as u64);
     if !within_ceiling {
         return Ok(());
     }
     decoder
         .decode()
         .map(|_| ())
-        .map_err(|error| format!("failed to decode Jpeg image: {}", error))
+        .map_err(|error| format!("failed to decode Jpeg image: {error}"))
 }
 
 /// Decode arbitrary supported image bytes and re-encode as PNG.
@@ -224,7 +220,7 @@ pub(crate) fn convert_to_png(bytes: &[u8], source: ImageFormat) -> Result<Vec<u8
     let mut out = Vec::new();
     decoded
         .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
-        .map_err(|error| format!("failed to re-encode image as PNG: {}", error))?;
+        .map_err(|error| format!("failed to re-encode image as PNG: {error}"))?;
     Ok(out)
 }
 
@@ -238,7 +234,7 @@ pub(crate) fn read_image_dimensions(
     let reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader
         .into_dimensions()
-        .map_err(|error| format!("failed to read {:?} image dimensions: {}", format, error))
+        .map_err(|error| format!("failed to read {format:?} image dimensions: {error}"))
 }
 
 /// Decode `bytes`, downscale (preserving aspect ratio) if either dimension exceeds `max_dim`, and
@@ -269,7 +265,7 @@ pub(crate) fn downscale_to_dim_cap(
     let mut out = Vec::new();
     scaled
         .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
-        .map_err(|error| format!("failed to re-encode image as PNG: {}", error))?;
+        .map_err(|error| format!("failed to re-encode image as PNG: {error}"))?;
     Ok(out)
 }
 
@@ -283,13 +279,13 @@ pub(crate) fn downscale_to_dim_cap(
 /// `hint` is what the *source* claimed the format was (a filename extension, an HTTP
 /// `Content-Type`, an MCP server's `mime_type`, a client's declared MIME). It is only consulted
 /// when the bytes can't be identified, because every one of those labels is guessable-wrong and the
-/// providers sniff: Anthropic rejects a JPEG labelled `image/png` with a 400, and that rejection
+/// providers sniff: Anthropic rejects a JPEG labeled `image/png` with a 400, and that rejection
 /// lands in a `tool_result` already committed to the session, where it fails every subsequent
 /// request. Deciding the media type from the bytes is what keeps a mislabel from becoming
 /// unrecoverable history.
 ///
-/// The decode check answers that same question one step further in. A correctly labelled image
-/// whose payload is truncated or corrupt is refused for the same reason a mislabelled one is: it
+/// The decode check answers that same question one step further in. A correctly labeled image
+/// whose payload is truncated or corrupt is refused for the same reason a mislabeled one is: it
 /// lands in a committed `tool_result` and fails every later request. Worse, the refusal need not
 /// arrive as a 400 -- a gateway that reports its decoder's exception as a 500 reads to
 /// [`crate::error::provider_http_error`] as transient, so the request is retried unchanged rather
@@ -337,15 +333,14 @@ pub(crate) fn prepare_image_payload(
 
 /// Normalize raw image bytes into a base64 [`ImageSource`] (byte cap + format conversion via
 /// [`prepare_image_payload`]). Used for *input* images (e.g. an ACP client's @-mention or pasted
-/// screenshot), parallel to [`build_image_tool_output`] for tool results.
+/// screenshot), parallel to [`crate::tools::util::build_image_tool_output`] for tool results.
 pub(crate) fn prepare_image_source(
     hint: ImageHandling,
     bytes: &[u8],
 ) -> Result<ImageSource, String> {
     let (media_type, payload) = prepare_image_payload(hint, bytes)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
-    Ok(ImageSource {
-        source_type: "base64".to_string(),
+    Ok(ImageSource::Base64 {
         media_type: media_type.to_string(),
         data: encoded,
     })
@@ -364,12 +359,12 @@ pub(crate) fn prepare_image_source(
 pub(crate) fn decode_base64_image(data: &str, declared_mime: &str) -> Result<ImageSource, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
-        .map_err(|error| format!("base64 decode failed: {}", error))?;
+        .map_err(|error| format!("base64 decode failed: {error}"))?;
     prepare_image_source(classify_content_type(declared_mime), &bytes)
 }
 
 /// Number of leading base64 characters that decode to enough bytes for [`image::guess_format`] to
-/// identify every format it recognises: 32 chars decode to 24, and the longest signature it matches
+/// identify every format it recognizes: 32 chars decode to 24, and the longest signature it matches
 /// is WebP's 12-byte `RIFF....WEBP`. Used where only a base64 string is on hand and decoding a
 /// multi-megabyte payload purely to sniff it would be wasteful.
 const SNIFF_PREFIX_CHARS: usize = 32;
@@ -394,40 +389,65 @@ pub(crate) fn classify_base64_prefix(data: &str) -> ImageHandling {
     }
 }
 
-/// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
-/// pre-computed classification. Wraps `prepare_image_payload` so error paths become a text
-/// `ToolOutput` with `is_error: true`. Shared by `fetch_url`, `read_file`, and `render_image`.
-pub(crate) fn build_image_tool_output(
-    marker: &str,
-    handling: ImageHandling,
-    bytes: &[u8],
-) -> ToolOutput {
-    let source = match prepare_image_source(handling, bytes) {
-        Ok(source) => source,
-        Err(message) => {
-            return ToolOutput::text(format!("Error: {}: {}", marker, message), true);
-        }
-    };
+/// Where an image's bytes are.
+///
+/// `Base64` is how an image travels on every wire and how it enters meka; `Blob` is how it rests in
+/// the store and travels in an export, a reference into the `blobs` table by content hash. A
+/// conversation is hydrated with every reference resolved back to `Base64`, so everything that
+/// builds a request sees bytes, and the store turns bytes back into references as it writes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ImageSource {
+    Base64 {
+        media_type: String,
+        data: String,
+    },
+    Blob {
+        hash: String,
+        media_type: String,
+        size: u64,
+    },
+}
 
-    ToolOutput {
-        content: vec![
-            ToolResultContent::Text {
-                text: format!("[{}]", marker),
-            },
-            ToolResultContent::Image { source },
-        ],
-        is_error: false,
-        scratchpad_hint: None,
-        frontend_metadata: None,
-        structured: None,
+impl ImageSource {
+    pub(crate) fn media_type(&self) -> &str {
+        match self {
+            Self::Base64 { media_type, .. } | Self::Blob { media_type, .. } => media_type,
+        }
+    }
+
+    /// The base64 payload, when the bytes are here rather than in the store.
+    pub(crate) fn base64_data(&self) -> Option<&str> {
+        match self {
+            Self::Base64 { data, .. } => Some(data),
+            Self::Blob { .. } => None,
+        }
     }
 }
 
+/// One image a request budget removed, addressed from the tail of the conversation as the request
+/// saw it: `from_end` is how many messages back it sits (1 is the last), `block` the index in that
+/// message's content, and `item` the index inside a tool result's content when the image is one,
+/// or `None` for an input image block. Lives here rather than beside the event that carries it
+/// because the statistics module reports it too, and the two are siblings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RedactedImage {
+    pub(crate) from_end: usize,
+    pub(crate) block: usize,
+    pub(crate) item: Option<usize>,
+}
+
+/// What a provider is sent in place of an image whose bytes were not loaded: a reference that was
+/// never resolved is a bug in the hydration path, and a sentence beats a request the provider
+/// rejects for a shape it does not know.
+pub(crate) const UNRESOLVED_IMAGE_PLACEHOLDER: &str =
+    "[image unavailable: its bytes were not loaded from the store]";
 #[cfg(test)]
 mod tests {
     use image::RgbaImage;
 
     use super::*;
+    use crate::{conversation::ToolResultContent, tools::util::build_image_tool_output};
 
     fn synthesize_image_bytes(format: ImageFormat) -> Vec<u8> {
         let img = RgbaImage::from_pixel(4, 4, image::Rgba([128, 64, 200, 255]));
@@ -486,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_pass_through_png() {
+    fn classify_content_type_pass_through_png() {
         assert_eq!(
             classify_content_type("image/png"),
             ImageHandling::PassThrough(ImageFormat::Png)
@@ -494,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_jpg_alias_passes_through_as_jpeg() {
+    fn classify_content_type_jpg_alias_passes_through_as_jpeg() {
         assert_eq!(
             classify_content_type("image/jpg"),
             ImageHandling::PassThrough(ImageFormat::Jpeg)
@@ -502,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_strips_params_and_case() {
+    fn classify_content_type_strips_params_and_case() {
         assert_eq!(
             classify_content_type("Image/PNG; charset=utf-8"),
             ImageHandling::PassThrough(ImageFormat::Png)
@@ -510,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_bmp_alias_passes_through() {
+    fn classify_content_type_bmp_alias_passes_through() {
         assert_eq!(
             classify_content_type("image/x-ms-bmp"),
             ImageHandling::PassThrough(ImageFormat::Bmp)
@@ -518,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_convertible_tiff() {
+    fn classify_content_type_convertible_tiff() {
         assert_eq!(
             classify_content_type("image/tiff"),
             ImageHandling::Convert(ImageFormat::Tiff)
@@ -530,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_convertible_ico() {
+    fn classify_content_type_convertible_ico() {
         assert_eq!(
             classify_content_type("image/vnd.microsoft.icon"),
             ImageHandling::Convert(ImageFormat::Ico)
@@ -542,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_unsupported() {
+    fn classify_content_type_unsupported() {
         assert_eq!(
             classify_content_type("image/svg+xml"),
             ImageHandling::Unsupported
@@ -559,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_content_type_disabled_decoder() {
+    fn classify_content_type_disabled_decoder() {
         // AVIF decoder is not enabled in our Cargo features, so even though the image crate knows
         // the MIME type, we should report it as Unsupported rather than trying to decode.
         assert_eq!(
@@ -569,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_extension_native() {
+    fn classify_extension_native() {
         assert_eq!(
             classify_extension("png"),
             ImageHandling::PassThrough(ImageFormat::Png)
@@ -589,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_extension_convertible() {
+    fn classify_extension_convertible() {
         assert_eq!(
             classify_extension("tiff"),
             ImageHandling::Convert(ImageFormat::Tiff)
@@ -609,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_extension_unsupported() {
+    fn classify_extension_unsupported() {
         assert_eq!(classify_extension("pdf"), ImageHandling::Unsupported);
         assert_eq!(classify_extension("jxl"), ImageHandling::Unsupported);
         assert_eq!(classify_extension("svg"), ImageHandling::Unsupported);
@@ -617,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_bmp_to_png_roundtrip() {
+    fn convert_bmp_to_png_roundtrip() {
         let bmp = synthesize_image_bytes(ImageFormat::Bmp);
         let png = convert_to_png(&bmp, ImageFormat::Bmp).expect("convert");
         let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png).expect("decode");
@@ -626,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_tiff_to_png_roundtrip() {
+    fn convert_tiff_to_png_roundtrip() {
         let tiff = synthesize_image_bytes(ImageFormat::Tiff);
         let png = convert_to_png(&tiff, ImageFormat::Tiff).expect("convert");
         let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png).expect("decode");
@@ -635,13 +655,13 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_corrupt_bytes_returns_error() {
+    fn convert_corrupt_bytes_returns_error() {
         let result = convert_to_png(b"not a real image", ImageFormat::Png);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_prepare_pass_through_within_limit() {
+    fn prepare_pass_through_within_limit() {
         let bytes = synthesize_image_bytes(ImageFormat::Png);
         let (media_type, payload) =
             prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Png), &bytes)
@@ -656,7 +676,7 @@ mod tests {
     /// and was forwarded verbatim as `image/png`. It then failed in the provider's decoder, inside
     /// a `tool_result` already committed to the session, where it failed every later request too.
     #[test]
-    fn test_prepare_refuses_a_truncated_payload_that_sniffs_clean() {
+    fn prepare_refuses_a_truncated_payload_that_sniffs_clean() {
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 64, 64);
         let truncated = &png[..png.len() / 2];
         assert_eq!(
@@ -676,7 +696,7 @@ mod tests {
     /// the interesting ones are the *late* truncations: a 99% JPEG is what an interrupted download
     /// or a full disk produces, and a header-only check calls it perfect.
     #[test]
-    fn test_prepare_refuses_a_truncated_jpeg_at_every_depth() {
+    fn prepare_refuses_a_truncated_jpeg_at_every_depth() {
         let jpeg = synthesize_detailed_jpeg(400, 400);
         for percent in [10usize, 25, 50, 75, 90, 99] {
             let truncated = &jpeg[..jpeg.len() * percent / 100];
@@ -694,7 +714,7 @@ mod tests {
     /// And a scan corrupted in place, which keeps the length and the trailing `FF D9` marker. This
     /// is the case that rules out checking for that marker instead of decoding.
     #[test]
-    fn test_prepare_refuses_a_jpeg_whose_scan_is_corrupt() {
+    fn prepare_refuses_a_jpeg_whose_scan_is_corrupt() {
         let mut jpeg = synthesize_detailed_jpeg(400, 400);
         let middle = jpeg.len() / 2;
         for byte in &mut jpeg[middle..middle + 256] {
@@ -722,7 +742,7 @@ mod tests {
     /// ceiling is passed through *unverified*, exactly as the non-JPEG path treats
     /// `ImageError::Limits`, rather than being decoded.
     #[test]
-    fn test_prepare_forwards_a_jpeg_past_the_axis_and_alloc_ceilings() {
+    fn prepare_forwards_a_jpeg_past_the_axis_and_alloc_ceilings() {
         let tall = synthesize_flat_jpeg(1_080, 20_000);
         assert!(
             tall.len() < MAX_IMAGE_RAW_BYTES,
@@ -739,7 +759,7 @@ mod tests {
 
         // Over the alloc ceiling (8000 x 6000 x 3 = 144 MB), so meka must decline to decode it at
         // all. Truncated on purpose: a *valid* oversized JPEG passes whether or not the ceiling is
-        // honoured, so it cannot tell "declined" from "decoded anyway". This one is refused the
+        // honored, so it cannot tell "declined" from "decoded anyway". This one is refused the
         // moment anything actually decodes it, which makes the pass evidence that nothing did.
         let huge = synthesize_flat_jpeg(8_000, 6_000);
         assert!(
@@ -760,7 +780,7 @@ mod tests {
     /// carrying bytes after its end-of-image marker is ordinary and must not be refused; so must a
     /// tiny one, whose entire scan is shorter than the headers around it.
     #[test]
-    fn test_prepare_accepts_ordinary_jpegs() {
+    fn prepare_accepts_ordinary_jpegs() {
         let plain = synthesize_jpeg_bytes();
         prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Jpeg), &plain)
             .expect("a 4x4 JPEG is a JPEG");
@@ -778,7 +798,7 @@ mod tests {
     /// and decodes to more than [`MAX_DECODE_ALLOC_BYTES`]; refusing it would break a working case
     /// to defend meka's memory, which declining to decode already does.
     #[test]
-    fn test_prepare_forwards_an_image_too_large_to_decode_under_the_ceiling() {
+    fn prepare_forwards_an_image_too_large_to_decode_under_the_ceiling() {
         let huge = synthesize_image_bytes_sized(ImageFormat::Png, 6000, 6000);
         assert!(
             huge.len() < MAX_IMAGE_RAW_BYTES,
@@ -806,7 +826,7 @@ mod tests {
     /// The sibling shape: the signature is intact and the header behind it is not, so the failure
     /// surfaces from the decoder rather than from a short read.
     #[test]
-    fn test_prepare_refuses_a_corrupt_header_behind_a_valid_signature() {
+    fn prepare_refuses_a_corrupt_header_behind_a_valid_signature() {
         let mut png = synthesize_image_bytes_sized(ImageFormat::Png, 64, 64);
         png[8..16].fill(0);
         assert_eq!(
@@ -822,7 +842,7 @@ mod tests {
     /// refused for its size rather than paying for a decode it was never going to survive. These
     /// bytes are not a PNG, so a decode-first arm would report the wrong reason.
     #[test]
-    fn test_prepare_pass_through_oversized_errors() {
+    fn prepare_pass_through_oversized_errors() {
         let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES + 1];
         let error = prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Png), &bytes)
             .expect_err("should error");
@@ -830,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_convert_returns_png() {
+    fn prepare_convert_returns_png() {
         let tiff = synthesize_image_bytes(ImageFormat::Tiff);
         let (media_type, payload) =
             prepare_image_payload(ImageHandling::Convert(ImageFormat::Tiff), &tiff).expect("ok");
@@ -839,16 +859,16 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_unsupported_errors() {
+    fn an_unsupported_image_is_refused_as_unsupported() {
         let error =
             prepare_image_payload(ImageHandling::Unsupported, b"anything").expect_err("should err");
         assert!(error.contains("unsupported"));
     }
 
     /// The regression this file exists to prevent: a JPEG behind a `.png` name (or a `Content-Type:
-    /// image/png`) must be labelled `image/jpeg`, because Anthropic sniffs and answers 400.
+    /// image/png`) must be labeled `image/jpeg`, because Anthropic sniffs and answers 400.
     #[test]
-    fn test_prepare_media_type_comes_from_bytes_not_hint() {
+    fn prepare_media_type_comes_from_bytes_not_hint() {
         let jpeg = synthesize_jpeg_bytes();
         let (media_type, payload) =
             prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Png), &jpeg).expect("ok");
@@ -858,7 +878,7 @@ mod tests {
 
     /// A hint claiming a native format doesn't skip the transcode when the bytes need one.
     #[test]
-    fn test_prepare_converts_when_bytes_need_it_despite_native_hint() {
+    fn prepare_converts_when_bytes_need_it_despite_native_hint() {
         let tiff = synthesize_image_bytes(ImageFormat::Tiff);
         let (media_type, payload) =
             prepare_image_payload(ImageHandling::PassThrough(ImageFormat::Png), &tiff).expect("ok");
@@ -867,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_base64_prefix_identifies_format() {
+    fn classify_base64_prefix_identifies_format() {
         let png = base64::engine::general_purpose::STANDARD.encode(synthesize_image_bytes_sized(
             ImageFormat::Png,
             200,
@@ -884,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_base64_prefix_tolerates_whitespace() {
+    fn classify_base64_prefix_tolerates_whitespace() {
         let raw = base64::engine::general_purpose::STANDARD.encode(synthesize_jpeg_bytes());
         let wrapped = raw
             .as_bytes()
@@ -903,7 +923,7 @@ mod tests {
     /// the same answer as sniffing the whole payload for every format we forward; WebP is the one
     /// that matters, since its `RIFF....WEBP` check reaches furthest into the file.
     #[test]
-    fn test_classify_base64_prefix_matches_full_sniff_for_every_native_format() {
+    fn classify_base64_prefix_matches_full_sniff_for_every_native_format() {
         // Hand-built headers: `image` can't encode all of these, and only the magic bytes are
         // under test.
         let mut webp = b"RIFF".to_vec();
@@ -929,7 +949,7 @@ mod tests {
             assert_ne!(
                 full,
                 ImageHandling::Unsupported,
-                "{name} fixture must be recognisable at all"
+                "{name} fixture must be recognizable at all"
             );
             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
             assert!(
@@ -946,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_base64_prefix_rejects_non_image_and_non_base64() {
+    fn classify_base64_prefix_rejects_non_image_and_non_base64() {
         assert_eq!(
             classify_base64_prefix("BASE64DATA"),
             ImageHandling::Unsupported
@@ -956,21 +976,21 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_base64_image_prefers_bytes_over_declared_mime() {
+    fn decode_base64_image_prefers_bytes_over_declared_mime() {
         let data = base64::engine::general_purpose::STANDARD.encode(synthesize_jpeg_bytes());
         let source = decode_base64_image(&data, "image/png").expect("ok");
-        assert_eq!(source.media_type, "image/jpeg");
+        assert_eq!(source.media_type(), "image/jpeg");
     }
 
     #[test]
-    fn test_read_image_dimensions_png() {
+    fn read_image_dimensions_png() {
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 1234, 567);
         let (width, height) = read_image_dimensions(&png, ImageFormat::Png).expect("ok");
         assert_eq!((width, height), (1234, 567));
     }
 
     #[test]
-    fn test_downscale_to_dim_cap_resizes_oversized() {
+    fn downscale_to_dim_cap_resizes_oversized() {
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 2400, 1200);
         let out = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
         let decoded = image::load_from_memory_with_format(&out, ImageFormat::Png).expect("decode");
@@ -980,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn test_downscale_to_dim_cap_passes_through_dimensions_when_within_cap() {
+    fn downscale_to_dim_cap_passes_through_dimensions_when_within_cap() {
         // Always re-encodes as PNG, but dimensions match the input when already within cap.
         let png = synthesize_image_bytes_sized(ImageFormat::Png, 800, 400);
         let out = downscale_to_dim_cap(&png, ImageFormat::Png, 2000).expect("ok");
@@ -989,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn test_downscale_to_dim_cap_handles_non_native_format() {
+    fn downscale_to_dim_cap_handles_non_native_format() {
         let bmp = synthesize_image_bytes_sized(ImageFormat::Bmp, 2400, 600);
         let png = downscale_to_dim_cap(&bmp, ImageFormat::Bmp, 2000).expect("ok");
         let decoded = image::load_from_memory_with_format(&png, ImageFormat::Png).expect("decode");
@@ -997,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_bytes_png() {
+    fn classify_bytes_png() {
         let png = synthesize_image_bytes(ImageFormat::Png);
         assert_eq!(
             classify_bytes(&png),
@@ -1006,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_bytes_tiff() {
+    fn classify_bytes_tiff() {
         let tiff = synthesize_image_bytes(ImageFormat::Tiff);
         assert_eq!(
             classify_bytes(&tiff),
@@ -1015,13 +1035,13 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_bytes_garbage_is_unsupported() {
+    fn classify_bytes_garbage_is_unsupported() {
         assert_eq!(classify_bytes(b"not an image"), ImageHandling::Unsupported);
         assert_eq!(classify_bytes(&[]), ImageHandling::Unsupported);
     }
 
     #[test]
-    fn test_build_image_tool_output_pass_through_png() {
+    fn build_image_tool_output_pass_through_png() {
         let png = synthesize_image_bytes(ImageFormat::Png);
         let output = build_image_tool_output(
             "Image fetched from https://example.com/a.png",
@@ -1038,10 +1058,9 @@ mod tests {
         }
         match &output.content[1] {
             ToolResultContent::Image { source } => {
-                assert_eq!(source.source_type, "base64");
-                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.media_type(), "image/png");
                 let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(&source.data)
+                    .decode(source.base64_data().expect("inline bytes"))
                     .expect("valid base64");
                 assert_eq!(decoded, png);
             }
@@ -1050,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_image_tool_output_oversized_returns_error() {
+    fn build_image_tool_output_oversized_returns_error() {
         let bytes = vec![0u8; MAX_IMAGE_RAW_BYTES + 1];
         let output = build_image_tool_output(
             "Image fetched from https://example.com/big.png",
@@ -1067,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_image_tool_output_converts_tiff_to_png() {
+    fn build_image_tool_output_converts_tiff_to_png() {
         let tiff = synthesize_image_bytes(ImageFormat::Tiff);
         let output = build_image_tool_output(
             "rendered image",
@@ -1077,7 +1096,7 @@ mod tests {
         assert!(!output.is_error);
         match &output.content[1] {
             ToolResultContent::Image { source } => {
-                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.media_type(), "image/png");
             }
             _ => panic!("expected Image block"),
         }

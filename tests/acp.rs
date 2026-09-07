@@ -1,13 +1,22 @@
+// Every prompt here is answered by the scripted provider, which a release build has only with
+// `mock-provider`; without it there is nothing to run.
+#![cfg(any(debug_assertions, feature = "mock-provider"))]
 // Integration-test files are their own crate, so the `#![cfg_attr(test, allow(...))]` in
 // `src/main.rs` doesn't reach here. Mirror it explicitly: tests rely on `.unwrap()` / `.expect()`
 // for clear panic-on-failure semantics, and asserting against panics is the standard idiom.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests panic on failure by design, and indexing a JSON document is the readable form"
+)]
 
-//! End-to-end ACP integration tests. Spawn the real `meka acp` binary with
-//! `MEKA_MOCK_PROVIDER=1` so a scripted [`crate::provider::mock::MockProvider`] drives
-//! deterministic `session/prompt` round-trips. Tests verify the tool-call lifecycle, permission
-//! round-trip, session lifecycle (load / resume / list / close), slash-skill invocation, set_mode
-//! flow, and the `fs/*` delegation path.
+//! End-to-end ACP integration tests. Spawn the real `meka acp` binary with `MEKA_MOCK_PROVIDER=1`
+//! so a scripted [`crate::provider::mock::MockProvider`] drives deterministic `session/prompt`
+//! round-trips. Tests verify the tool-call lifecycle, permission round-trip, session lifecycle
+//! (load / resume / list / close), slash-skill invocation, set_mode flow, and the `fs/*` delegation
+//! path.
 //!
 //! # Test shape
 //!
@@ -16,10 +25,8 @@
 //! ~3 lines and the [`AcpTestHarnessBuilder::pre_spawn`] hook covers tests whose mock script must
 //! reference an on-disk path inside the tempdir.
 //!
-//! A handful of legacy tests still use the inline
-//! `tempfile::tempdir + Command::spawn + stdin/stdout pipes +
-//! read_until` shape because the harness contract can't model
-//! what they need:
+//! A handful of tests use the inline `tempfile::tempdir + Command::spawn + stdin/stdout pipes +
+//! read_until` shape because the harness contract can't model what they need:
 //! - **Multi-spawn persistence tests** (`acp_session_load_replays_persisted_turn`,
 //!   `acp_session_resume_adopts_without_replay`, `acp_session_list_filters_by_cwd`,
 //!   `acp_session_list_paginates_across_cursor_boundary`) seed a second child process against the
@@ -37,29 +44,26 @@
 use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     time::{Duration, Instant},
 };
 
-fn meka_acp() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_meka"))
-}
+#[path = "harness/support.rs"]
+mod support;
+
+use support::Install;
 
 /// Test harness that owns the child process, stdio pipes, and a per-request window. Wraps the spawn
 /// / `initialize` / `session/new` boilerplate so each test stays focused on the behavior it
 /// exercises. See the module header for the inline-pattern exceptions.
 struct AcpTestHarness {
-    _temp: tempfile::TempDir,
+    install: Install,
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<std::process::ChildStdout>,
-    /// Drained by the spawned reader thread; never read on the test side except in the (currently
-    /// absent) panic-on-missing-response paths. Kept alive so the spawned thread can finish
-    /// cleanly.
-    #[allow(dead_code)]
+    reader: support::TimedLines,
+    /// Drained by the spawned reader thread and kept alive so that thread can finish cleanly.
+    #[allow(dead_code, reason = "held so the reader thread can finish; never read")]
     stderr_handle: std::thread::JoinHandle<String>,
-    config_dir: std::path::PathBuf,
-    data_dir: std::path::PathBuf,
     next_id: u64,
     window: Duration,
 }
@@ -71,7 +75,7 @@ type PreSpawnHook = Box<dyn FnOnce(&Path) -> serde_json::Value>;
 /// Fluent builder for [`AcpTestHarness`]. Tests that need to pre-populate files inside the spawned
 /// process's tempdir use [`Self::pre_spawn`] to run a closure with the resolved `config_dir`
 /// *before* the child starts. The mock script can reference paths set up there.
-#[allow(dead_code)]
+#[allow(dead_code, reason = "not every test uses every builder field")]
 #[derive(Default)]
 struct AcpTestHarnessBuilder {
     config: String,
@@ -81,7 +85,7 @@ struct AcpTestHarnessBuilder {
     config_window: Option<Duration>,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, reason = "not every test uses every builder method")]
 impl AcpTestHarnessBuilder {
     fn config(mut self, toml: &str) -> Self {
         self.config = toml.to_string();
@@ -120,28 +124,19 @@ impl AcpTestHarnessBuilder {
     }
 
     fn build(self) -> AcpTestHarness {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_dir = temp.path().join("meka");
-        let data_dir = temp.path().join("data").join("meka");
-        std::fs::create_dir_all(&config_dir).expect("create config dir");
-        std::fs::write(config_dir.join("config.toml"), &self.config).expect("write config.toml");
+        let install = Install::new();
+        install.write_config(&self.config);
 
         let script = if let Some(f) = self.pre_spawn {
-            f(&config_dir)
+            f(&install.config_dir())
         } else {
             self.script
                 .unwrap_or_else(|| serde_json::Value::Array(Vec::new()))
         };
-        let script_path = temp.path().join("script.json");
-        std::fs::write(&script_path, script.to_string()).expect("write script");
+        install.write_script(&script);
 
-        let mut child = meka_acp()
-            .arg("acp")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", &data_dir)
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+        let mut child = install
+            .meka(&["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -150,22 +145,15 @@ impl AcpTestHarnessBuilder {
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr_pipe = child.stderr.take().expect("stderr");
-        let reader = BufReader::new(stdout);
-        let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let mut r = BufReader::new(stderr_pipe);
-            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            buf
-        });
+        let reader = support::TimedLines::spawn(stdout);
+        let stderr_handle = support::drain(stderr_pipe);
         let window = self.config_window.unwrap_or(Duration::from_secs(15));
         let mut harness = AcpTestHarness {
-            _temp: temp,
+            install,
             child,
             stdin,
             reader,
             stderr_handle,
-            config_dir,
-            data_dir,
             next_id: 0,
             window,
         };
@@ -180,13 +168,31 @@ impl AcpTestHarnessBuilder {
     }
 }
 
-// Not every helper below is used by every test build (the suite uses different subsets);
-// `dead_code` is silenced wholesale for the test-only utility surface.
-#[allow(dead_code)]
+/// A fixture path in the harness's work directory, which sits beside `config_dir`. A file *under*
+/// the config dir is inside meka's own directory, which `read_file` refuses below `unrestricted`.
+/// The directory sessions from [`AcpTestHarness::new_session`] work in, from inside a `pre_spawn`
+/// closure that is handed the config directory beside it. An approved write at `read` lands only
+/// under the workspace roots, so a script that expects its write to succeed targets this.
+fn work_dir_beside(config_dir: &Path) -> std::path::PathBuf {
+    config_dir
+        .parent()
+        .expect("the config directory sits under the harness's temp root")
+        .join("work")
+}
+
+fn fixture_beside(config_dir: &Path, name: &str) -> std::path::PathBuf {
+    config_dir
+        .parent()
+        .expect("the config dir sits under the temp root")
+        .join("work")
+        .join(name)
+}
+
+#[allow(dead_code, reason = "not every test uses every helper")]
 impl AcpTestHarness {
     /// Spin up `meka acp` against a fresh tempdir with `config_toml` pre-written and
     /// `MEKA_MOCK_PROVIDER` enabled (with an empty script unless `script` is supplied).
-    /// Initialise the connection but don't create a session yet.
+    /// Initialize the connection but don't create a session yet.
     fn spawn(config_toml: &str, script: Option<serde_json::Value>) -> Self {
         Self::spawn_with_capabilities(config_toml, script, serde_json::json!({}))
     }
@@ -209,20 +215,25 @@ impl AcpTestHarness {
         AcpTestHarnessBuilder::default()
     }
 
-    fn config_dir(&self) -> &Path {
-        &self.config_dir
+    fn config_dir(&self) -> std::path::PathBuf {
+        self.install.config_dir()
+    }
+
+    /// The directory sessions from [`Self::new_session`] work in: a project directory, not meka's
+    /// own config directory, which the write fence refuses at `workspace`.
+    fn work_dir(&self) -> std::path::PathBuf {
+        self.install.work_dir()
     }
 
     /// The store the spawned process is using, for a test that has to act as a *second* writer of a
     /// row meka reads. See `tests/multiprocess.rs` for the same reasoning at length.
     fn database(&self) -> std::path::PathBuf {
-        self.data_dir.join("meka.db")
+        self.install.database()
     }
 
-    /// Send a JSON-RPC request and return the parsed response. Uses
-    /// a monotonically increasing request id; tests don't need to
-    /// pick ids themselves. Convenience wrapper over [`Self::send_request`]
-    /// + [`Self::await_response`].
+    /// Send a JSON-RPC request and return the parsed response. Uses a monotonically increasing
+    /// request id; tests don't need to pick ids themselves. Convenience wrapper over
+    /// [`Self::send_request`] + [`Self::await_response`].
     fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let id = self.send_request(method, params);
         self.await_response(id)
@@ -240,7 +251,7 @@ impl AcpTestHarness {
             "method": method,
             "params": params,
         });
-        writeln!(self.stdin, "{}", request).expect("write request");
+        writeln!(self.stdin, "{request}").expect("write request");
         id
     }
 
@@ -251,7 +262,7 @@ impl AcpTestHarness {
             "method": method,
             "params": params,
         });
-        writeln!(self.stdin, "{}", notification).expect("write notification");
+        writeln!(self.stdin, "{notification}").expect("write notification");
     }
 
     /// Block until the response for `id` arrives. Side-channel notifications + meka-issued requests
@@ -267,7 +278,7 @@ impl AcpTestHarness {
     where
         F: FnMut(&serde_json::Value) -> Option<serde_json::Value>,
     {
-        let needle = format!("\"id\":{}", id);
+        let needle = format!("\"id\":{id}");
         let lines = read_until_with_dispatch(
             &mut self.reader,
             &mut self.stdin,
@@ -279,15 +290,15 @@ impl AcpTestHarness {
             Some(line) => line.clone(),
             None => {
                 let collected = lines.join("");
-                panic!("no response for id={}; transcript:\n{}", id, collected,);
+                panic!("no response for id={id}; transcript:\n{collected}",);
             }
         };
         serde_json::from_str(&line).unwrap_or_else(|error| {
-            panic!("response for id={} was not JSON ({}): {}", id, error, line);
+            panic!("response for id={id} was not JSON ({error}): {line}");
         })
     }
 
-    /// Drain every `session/update` for `sid` that meka has already emitted, with no prompt
+    /// Drain every `session/update` for `session_id` that meka has already emitted, with no prompt
     /// outstanding.
     ///
     /// Every other update helper is keyed to a pending `session/prompt`; a scheduled turn has none,
@@ -295,10 +306,10 @@ impl AcpTestHarness {
     /// stdio preserves order, so its response cannot arrive before the notifications queued ahead
     /// of it, and waiting on a reply meka is guaranteed to send means a regression fails the
     /// test instead of blocking the suite on a `read_line` that never returns.
-    fn drain_unsolicited_updates(&mut self, sid: &str) -> Vec<serde_json::Value> {
+    fn drain_unsolicited_updates(&mut self, session_id: &str) -> Vec<serde_json::Value> {
         let id = self.send_request("session/list", serde_json::json!({}));
-        let needle = format!("\"id\":{}", id);
-        let sid_owned = sid.to_string();
+        let needle = format!("\"id\":{id}");
+        let session_id_owned = session_id.to_string();
         let lines = read_until_with_dispatch(
             &mut self.reader,
             &mut self.stdin,
@@ -310,20 +321,20 @@ impl AcpTestHarness {
             .iter()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|value| value["method"] == "session/update")
-            .filter(|value| value["params"]["sessionId"] == sid_owned)
+            .filter(|value| value["params"]["sessionId"] == session_id_owned)
             .collect()
     }
 
-    /// Collect every `session/update` notification for `sid` plus the eventual response for `id`.
-    /// Captures everything the agent emits during a prompt turn, which is the single most reused
-    /// pattern in the existing test file. Side-channel meka-issued requests are silently ignored;
-    /// if a test expects them, use [`Self::collect_updates_with_dispatch`] instead.
+    /// Collect every `session/update` notification for `session_id` plus the eventual response for
+    /// `id`. Captures everything the agent emits during a prompt turn, which is the single most
+    /// reused pattern in the existing test file. Side-channel meka-issued requests are silently
+    /// ignored; if a test expects them, use [`Self::collect_updates_with_dispatch`] instead.
     fn collect_updates(
         &mut self,
-        sid: &str,
+        session_id: &str,
         id: u64,
     ) -> (Vec<serde_json::Value>, serde_json::Value) {
-        self.collect_updates_with_dispatch(sid, id, |_| None)
+        self.collect_updates_with_dispatch(session_id, id, |_| None)
     }
 
     /// As [`Self::collect_updates`], but dispatch meka-issued requests via `handler`. Used by tests
@@ -332,34 +343,28 @@ impl AcpTestHarness {
     /// The free [`read_until_with_dispatch`] only invokes its dispatch closure on JSON-RPC
     /// *requests* (those with both `method` and `id`). Notifications carry `method` but no `id`, so
     /// we can't piggy-back on it; drive a parallel loop here that also captures `session/update`
-    /// notifications for the target `sid`.
+    /// notifications for the target `session_id`.
     fn collect_updates_with_dispatch<F>(
         &mut self,
-        sid: &str,
+        session_id: &str,
         id: u64,
         mut handler: F,
     ) -> (Vec<serde_json::Value>, serde_json::Value)
     where
         F: FnMut(&serde_json::Value) -> Option<serde_json::Value>,
     {
-        let needle = format!("\"id\":{}", id);
+        let needle = format!("\"id\":{id}");
         let mut updates: Vec<serde_json::Value> = Vec::new();
         let mut response: Option<serde_json::Value> = None;
         let mut transcript = String::new();
         let deadline = Instant::now() + self.window;
-        while Instant::now() < deadline {
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
+        while let Some(line) = self.reader.next_line(deadline) {
             transcript.push_str(&line);
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             if value["method"] == "session/update"
-                && value["params"]["sessionId"].as_str() == Some(sid)
+                && value["params"]["sessionId"].as_str() == Some(session_id)
             {
                 updates.push(value.clone());
                 continue;
@@ -368,7 +373,7 @@ impl AcpTestHarness {
                 && value.get("id").is_some()
                 && let Some(reply) = handler(&value)
             {
-                let _ = writeln!(self.stdin, "{}", reply);
+                let _ = writeln!(self.stdin, "{reply}");
                 continue;
             }
             if line.contains(&needle) && response_matches(&line, &needle) {
@@ -377,55 +382,61 @@ impl AcpTestHarness {
             }
         }
         let response = response
-            .unwrap_or_else(|| panic!("no response for id={}; transcript:\n{}", id, transcript,));
+            .unwrap_or_else(|| panic!("no response for id={id}; transcript:\n{transcript}",));
         (updates, response)
     }
 
     /// Create a session in `config_dir` and return its id. Most tests do this once at start of a
     /// scenario.
     fn new_session(&mut self) -> String {
-        let cwd = self.config_dir.clone();
+        let cwd = self.install.work_dir();
         let response = self.request(
             "session/new",
             serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
         );
         response["result"]["sessionId"]
             .as_str()
-            .unwrap_or_else(|| panic!("session/new did not return a sessionId: {}", response))
+            .unwrap_or_else(|| panic!("session/new did not return a sessionId: {response}"))
             .to_string()
     }
 
-    /// Fire a `session/prompt` against `sid` and return the request id. Pair with
+    /// Fire a `session/prompt` against `session_id` and return the request id. Pair with
     /// [`Self::collect_updates`] or [`Self::await_response`] to read the result.
-    fn prompt(&mut self, sid: &str, text: &str) -> u64 {
+    fn prompt(&mut self, session_id: &str, text: &str) -> u64 {
         self.send_request(
             "session/prompt",
             serde_json::json!({
-                "sessionId": sid,
+                "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": text }],
             }),
         )
     }
 
-    /// Fire a `session/cancel` notification for `sid`.
-    fn cancel(&mut self, sid: &str) {
-        self.notify("session/cancel", serde_json::json!({ "sessionId": sid }));
+    /// Fire a `session/cancel` notification for `session_id`.
+    fn cancel(&mut self, session_id: &str) {
+        self.notify(
+            "session/cancel",
+            serde_json::json!({ "sessionId": session_id }),
+        );
     }
 
     /// One-shot `session/set_mode` round-trip.
-    fn set_mode(&mut self, sid: &str, mode: &str) -> serde_json::Value {
+    fn set_mode(&mut self, session_id: &str, mode: &str) -> serde_json::Value {
         self.request(
             "session/set_mode",
             serde_json::json!({
-                "sessionId": sid,
+                "sessionId": session_id,
                 "modeId": mode,
             }),
         )
     }
 
     /// One-shot `session/close` round-trip.
-    fn close_session(&mut self, sid: &str) -> serde_json::Value {
-        self.request("session/close", serde_json::json!({ "sessionId": sid }))
+    fn close_session(&mut self, session_id: &str) -> serde_json::Value {
+        self.request(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+        )
     }
 }
 
@@ -467,24 +478,19 @@ fn window(seconds: u64) -> Instant {
 
 /// Read lines until either `f` returns `true`, EOF, or the deadline elapses. Collects every line
 /// read so test failures can dump the JSON-RPC stream for diagnosis.
-fn read_until<R, F>(reader: &mut R, deadline: Instant, mut f: F) -> Vec<String>
+///
+/// The deadline bounds each read, not only the gaps between them: a child that goes silent
+/// mid-request fails the test at the deadline instead of blocking the suite in `read_line`.
+fn read_until<F>(reader: &mut support::TimedLines, deadline: Instant, mut f: F) -> Vec<String>
 where
-    R: BufRead,
     F: FnMut(&str) -> bool,
 {
     let mut lines = Vec::new();
-    while Instant::now() < deadline {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let stop = f(&line);
-                lines.push(line);
-                if stop {
-                    return lines;
-                }
-            }
-            Err(_) => break,
+    while let Some(line) = reader.next_line(deadline) {
+        let stop = f(&line);
+        lines.push(line);
+        if stop {
+            return lines;
         }
     }
     lines
@@ -495,41 +501,33 @@ where
 /// request; `dispatch` is invoked with the parsed value and its `Some(response)` return value is
 /// written back to meka's stdin. Tests use this to play the client side of the `fs/*` and
 /// `terminal/*` round-trips.
-fn read_until_with_dispatch<R, W, D, F>(
-    reader: &mut R,
+fn read_until_with_dispatch<W, D, F>(
+    reader: &mut support::TimedLines,
     stdin: &mut W,
     deadline: Instant,
     mut dispatch: D,
     mut stop: F,
 ) -> Vec<String>
 where
-    R: BufRead,
     W: Write,
     D: FnMut(&serde_json::Value) -> Option<serde_json::Value>,
     F: FnMut(&str) -> bool,
 {
     let mut lines = Vec::new();
-    while Instant::now() < deadline {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
-                    && value.get("method").is_some()
-                    && value.get("id").is_some()
-                    && let Some(response) = dispatch(&value)
-                {
-                    // Failure to write to stdin means the child is gone; surface it via the
-                    // deadline loop rather than panicking from inside the helper.
-                    let _ = writeln!(stdin, "{}", response);
-                }
-                let should_stop = stop(&line);
-                lines.push(line);
-                if should_stop {
-                    return lines;
-                }
-            }
-            Err(_) => break,
+    while let Some(line) = reader.next_line(deadline) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+            && value.get("method").is_some()
+            && value.get("id").is_some()
+            && let Some(response) = dispatch(&value)
+        {
+            // Failure to write to stdin means the child is gone; surface it via the deadline loop
+            // rather than panicking from inside the helper.
+            let _ = writeln!(stdin, "{response}");
+        }
+        let should_stop = stop(&line);
+        lines.push(line);
+        if should_stop {
+            return lines;
         }
     }
     lines
@@ -540,34 +538,38 @@ fn acp_tool_call_lifecycle_round_trips_through_mock_provider() {
     // Fake config + credential so `create_agent_from_config` builds a real provider stack. The
     // mock swap inside `run_acp` then replaces the provider before any HTTP call is attempted.
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
             // Target file for the scripted `read_file` call. Real tool runs against this path, so
-            // it must exist.
-            let target = config_dir.join("target.txt");
+            // it must exist. In the work directory beside the config dir: `read_file` refuses
+            // meka's own directory below `unrestricted`.
+            let target = fixture_beside(config_dir, "target.txt");
             std::fs::write(&target, "hello from mock test\n").expect("write target");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "reading the file...\n" },
-                    { "kind": "tool_use_start", "id": "call_1", "name": "read_file" },
-                    { "kind": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "text", "text": "reading the file...\n" },
+                    { "type": "tool_use_start", "id": "call_1", "name": "read_file" },
+                    { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done!" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done!" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "read the target file");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read the target file");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     let saw_tool_call = updates.iter().any(|value| {
         let update = &value["params"]["update"];
@@ -576,40 +578,35 @@ model = "claude-sonnet-4-5"
         }
         assert_eq!(
             update["kind"], "read",
-            "expected tool kind 'read': {}",
-            update
+            "expected tool kind 'read': {update}"
         );
         assert_eq!(
             update["status"], "in_progress",
-            "expected tool_call status in_progress: {}",
-            update,
+            "expected tool_call status in_progress: {update}",
         );
-        // The title carries the resolved primary argument (the path), not the bare tool name.
+        // The title carries the display name the REPL's indicator uses, then the resolved primary
+        // argument (the path): not the bare tool name, and not a second vocabulary.
         let title = update["title"].as_str().unwrap_or("");
         assert!(
-            title.starts_with("Read ") && title.contains("target.txt"),
-            "tool_call title should be 'Read <path>': {}",
-            update,
+            title.starts_with("ReadFile ") && title.contains("target.txt"),
+            "tool_call title should be 'ReadFile <path>': {update}",
         );
         true
     });
     assert!(
         saw_tool_call,
-        "expected a session/update with sessionUpdate=tool_call; updates: {:?}",
-        updates,
+        "expected a session/update with sessionUpdate=tool_call; updates: {updates:?}",
     );
     assert!(
         updates.iter().any(|value| {
             let update = &value["params"]["update"];
             update["sessionUpdate"] == "tool_call_update" && update["status"] == "completed"
         }),
-        "expected a tool_call_update with status=completed; updates: {:?}",
-        updates,
+        "expected a tool_call_update with status=completed; updates: {updates:?}",
     );
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "expected stopReason=end_turn; full response: {}",
-        response,
+        "expected stopReason=end_turn; full response: {response}",
     );
 }
 
@@ -617,8 +614,11 @@ model = "claude-sonnet-4-5"
 #[test]
 fn acp_todo_tool_emits_plan_update() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -626,29 +626,29 @@ model = "claude-sonnet-4-5"
         .pre_spawn(|_dir| {
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "planning...\n" },
-                    { "kind": "tool_use_start", "id": "call_todo", "name": "todo" },
+                    { "type": "text", "text": "planning...\n" },
+                    { "type": "tool_use_start", "id": "call_todo", "name": "todo" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "title": "Work", "items": ["First", "Second"] }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "make a plan");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "make a plan");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     let plan = updates
         .iter()
         .find(|value| value["params"]["update"]["sessionUpdate"] == "plan")
-        .unwrap_or_else(|| panic!("expected a plan session/update; updates: {:?}", updates));
+        .unwrap_or_else(|| panic!("expected a plan session/update; updates: {updates:?}"));
     let entries = plan["params"]["update"]["entries"]
         .as_array()
         .expect("plan entries array");
@@ -659,22 +659,22 @@ model = "claude-sonnet-4-5"
 }
 
 /// The first turn of a fresh session emits a `session_info_update` carrying the title (the first
-/// user message preview, with the agent's `<context>` preamble stripped).
+/// user message preview: the words, not the agent's context block).
 #[test]
 fn acp_first_turn_emits_session_info_update_title() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "ok" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "explain the build system");
-    let (updates, _response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "explain the build system");
+    let (updates, _response) = harness.collect_updates(&session_id, id);
 
     let info = updates
         .iter()
         .find(|value| value["params"]["update"]["sessionUpdate"] == "session_info_update")
-        .unwrap_or_else(|| panic!("expected a session_info_update; updates: {:?}", updates));
+        .unwrap_or_else(|| panic!("expected a session_info_update; updates: {updates:?}"));
     assert_eq!(
         info["params"]["update"]["title"],
         "explain the build system"
@@ -693,14 +693,14 @@ fn acp_first_turn_emits_session_info_update_title() {
 #[test]
 fn acp_forwards_a_provider_notice_as_a_prefixed_assistant_chunk() {
     let script = serde_json::json!([[
-        { "kind": "notice", "message": "context is filling up" },
-        { "kind": "text", "text": "ok" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "notice", "message": "context is filling up" },
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "hello");
-    let (updates, _response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "hello");
+    let (updates, _response) = harness.collect_updates(&session_id, id);
 
     let chunks: Vec<&str> = updates
         .iter()
@@ -718,19 +718,18 @@ fn acp_forwards_a_provider_notice_as_a_prefixed_assistant_chunk() {
 #[test]
 fn acp_prompt_response_carries_token_usage() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "ok" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "hello");
-    let (_updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "hello");
+    let (_updates, response) = harness.collect_updates(&session_id, id);
 
     let usage = &response["result"]["usage"];
     assert!(
         usage.is_object(),
-        "expected usage on the prompt response; full response: {}",
-        response
+        "expected usage on the prompt response; full response: {response}"
     );
     // Every counter is reported, including the cache tiers, rather than left off the wire. The
     // values are all zero because the mock provider emits no token-usage events by design (see
@@ -744,29 +743,27 @@ fn acp_prompt_response_carries_token_usage() {
     ] {
         assert!(
             usage[field].is_u64(),
-            "expected {} on the usage object; usage: {}",
-            field,
-            usage
+            "expected {field} on the usage object; usage: {usage}"
         );
     }
     // Omitted deliberately: meka doesn't meter reasoning separately from output.
-    assert!(usage["thoughtTokens"].is_null(), "usage: {}", usage);
+    assert!(usage["thoughtTokens"].is_null(), "usage: {usage}");
 }
 
 /// A turn that reports `tool_use` but carries no tool-call block leaves the agent with nothing to
 /// run and nothing to show. It happens for real: an OpenAI-compatible endpoint that coalesces its
-/// final delta into the `finish_reason` chunk used to have that delta dropped, so the tool call
-/// vanished and only the stop reason survived. The client must still get a visible message and a
+/// final delta into the `finish_reason` chunk can have that delta dropped, so the tool call
+/// vanishes and only the stop reason survives. The client must still get a visible message and a
 /// terminal stop reason rather than a silent turn it waits on forever.
 #[test]
 fn acp_turn_with_tool_use_stop_but_no_tool_call_still_reports_to_the_client() {
     let script = serde_json::json!([[
-        { "kind": "message_end", "stop_reason": "tool_use" }
+        { "type": "message_end", "stop_reason": "tool_use" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "search the web");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "search the web");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     let chunk = updates
         .iter()
@@ -815,8 +812,11 @@ enum PermissionAnswer {
 #[test]
 fn an_acp_session_at_workspace_is_fenced_to_its_cwd() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -830,39 +830,45 @@ enabled = ["read", "workspace", "unrestricted"]
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(move |config_dir| {
-            // The session's cwd is the config dir, so this one is inside the boundary.
-            let inside = config_dir.join("inside.txt");
+            // The session's cwd is the harness's work directory beside the config dir, so this one
+            // is inside the boundary. Not the config dir itself: meka's own directories are
+            // refused at `workspace` whatever the roots are.
+            let inside = config_dir
+                .parent()
+                .expect("the config dir sits under the tempdir")
+                .join("work")
+                .join("inside.txt");
             serde_json::json!([
                 [
-                    { "kind": "tool_use_start", "id": "call_in", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_in", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": inside.to_str().unwrap(), "content": "in" }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "tool_use_start", "id": "call_out", "name": "write_file" },
+                    { "type": "tool_use_start", "id": "call_out", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": {
                             "path": outside_for_script.to_str().unwrap(),
                             "content": "out"
                         }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
 
-    let inside = harness.config_dir().join("inside.txt");
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "write both");
+    let inside = harness.work_dir().join("inside.txt");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "write both");
     let _ = harness.await_response(id);
 
     assert!(
@@ -877,54 +883,90 @@ enabled = ["read", "workspace", "unrestricted"]
 }
 
 /// Drive a full `meka acp` permission round-trip with the mock provider. The scripted turn calls
-/// `write_file` (which under `ask` triggers a
-/// `session/request_permission`); the test auto-responds with the configured outcome and asserts
-/// the resulting tool-call status.
+/// `write_file` (which, above `read` with approvals on, triggers a `session/request_permission`);
+/// the test auto-responds with the configured outcome and asserts the resulting tool-call status.
 fn run_permission_scenario(answer: PermissionAnswer) {
-    // [permissions].default = "ask" puts the agent in `ask`, where a write triggers the round-trip
-    // we want to exercise.
+    // `read` with approvals on: a write is above the level, so it triggers the round-trip we want
+    // to exercise.
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "ask"
-enabled = ["read", "ask", "unrestricted"]
+default = "read"
+approvals = true
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            let target = config_dir.join("out.txt");
+            let target = work_dir_beside(config_dir).join("out.txt");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "writing the file...\n" },
-                    { "kind": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "text", "text": "writing the file...\n" },
+                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": "hello" }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done!" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done!" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "write the file");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "write the file");
 
     let option_id = match answer {
         PermissionAnswer::AllowOnce => "allow_once",
         PermissionAnswer::RejectOnce => "reject_once",
     };
     let mut saw_permission_request = false;
-    let (updates, response) =
-        harness.collect_updates_with_dispatch(&sid, id, |value| match value["method"].as_str() {
+    let (updates, response) = harness.collect_updates_with_dispatch(&session_id, id, |value| {
+        match value["method"].as_str() {
             Some("session/request_permission") => {
                 saw_permission_request = true;
+                // What the editor is asked to approve: the display name the REPL uses, every
+                // argument (so the write's content is on screen, not only its path), and sticky
+                // options that name the tool in the same words as the title.
+                let tool_call = &value["params"]["toolCall"];
+                assert!(
+                    tool_call["title"]
+                        .as_str()
+                        .is_some_and(|title| title.starts_with("WriteFile ")),
+                    "the permission title opens with the tool's display name: {value}"
+                );
+                assert_eq!(
+                    tool_call["rawInput"]["content"], "hello",
+                    "rawInput carries the call's arguments: {value}"
+                );
+                let content_text = tool_call["content"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    content_text.contains("\"content\": \"hello\""),
+                    "the content block shows the arguments to a client that renders content \
+                     rather than rawInput: {value}"
+                );
+                let option_names: Vec<&str> = value["params"]["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| option["name"].as_str())
+                    .collect();
+                assert!(
+                    option_names.contains(&"Always allow any WriteFile")
+                        && option_names.contains(&"Always deny any WriteFile"),
+                    "the sticky options name the tool the way the title does: {option_names:?}"
+                );
                 Some(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": value["id"].clone(),
@@ -934,12 +976,12 @@ enabled = ["read", "ask", "unrestricted"]
                 }))
             }
             _ => None,
-        });
+        }
+    });
 
     assert!(
         saw_permission_request,
-        "expected a session/request_permission from the agent; updates: {:?}",
-        updates,
+        "expected a session/request_permission from the agent; updates: {updates:?}",
     );
 
     let status = updates
@@ -953,33 +995,28 @@ enabled = ["read", "ask", "unrestricted"]
         })
         .next_back()
         .unwrap_or_else(|| {
-            panic!(
-                "expected a tool_call_update with a status; updates: {:?}",
-                updates,
-            )
+            panic!("expected a tool_call_update with a status; updates: {updates:?}",)
         });
     match answer {
         PermissionAnswer::AllowOnce => assert_eq!(
             status, "completed",
-            "allow_once should let write_file complete; updates: {:?}",
-            updates,
+            "allow_once should let write_file complete; updates: {updates:?}",
         ),
         PermissionAnswer::RejectOnce => assert_eq!(
             status, "failed",
-            "reject_once should fail the tool call; updates: {:?}",
-            updates,
+            "reject_once should fail the tool call; updates: {updates:?}",
         ),
     }
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "expected stopReason=end_turn after permission outcome was handled; full response: {}",
-        response,
+        "expected stopReason=end_turn after permission outcome was handled; full response: {response}",
     );
 }
 
 #[test]
 fn acp_permission_allow_once_runs_tool_and_completes_turn() {
-    // An `ask`-mode session where the client answers `allow_once` must actually run the gated tool.
+    // A session with approvals on where the client answers `allow_once` must actually run the
+    // gated tool.
     run_permission_scenario(PermissionAnswer::AllowOnce);
 }
 
@@ -993,45 +1030,42 @@ fn acp_permission_reject_once_fails_tool_but_completes_turn() {
 /// `tool_call_update` with `status=completed` before responding with `LoadSessionResponse`.
 #[test]
 fn acp_session_load_replays_persisted_turn() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
+    let config_dir = install.config_dir();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
-    let target = config_dir.join("target.txt");
+    // Beside the config dir, not in it: `read_file` refuses meka's own directory below
+    // `unrestricted`.
+    let target = install.root().join("target.txt");
     std::fs::write(&target, "hello from reload test\n").expect("write target");
 
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "reading the file...\n" },
-            { "kind": "tool_use_start", "id": "call_1", "name": "read_file" },
-            { "kind": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "text", "text": "reading the file...\n" },
+            { "type": "tool_use_start", "id": "call_1", "name": "read_file" },
+            { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done!" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done!" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script.json");
+    install.write_script(&script);
 
     // First run: drive one prompt to populate the session, capture sessionId, then exit cleanly.
     let session_id = {
-        let mut child = meka_acp()
-            .arg("acp")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", &data_dir)
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+        let mut child = install
+            .meka(&["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1040,12 +1074,12 @@ model = "claude-sonnet-4-5"
         let mut stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr_pipe = child.stderr.take().expect("stderr");
-        let mut reader = BufReader::new(stdout);
+        let mut reader = support::TimedLines::spawn(stdout);
         let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let mut r = BufReader::new(stderr_pipe);
-            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            buf
+            let mut buffer = String::new();
+            let mut stderr_reader = BufReader::new(stderr_pipe);
+            while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+            buffer
         });
 
         writeln!(
@@ -1055,13 +1089,13 @@ model = "claude-sonnet-4-5"
         .expect("initialize");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-        let new_req = serde_json::json!({
+        let new_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/new",
-            "params": { "cwd": config_dir.clone(), "mcpServers": [] }
+            "params": { "cwd": config_dir, "mcpServers": [] }
         });
-        writeln!(stdin, "{}", new_req).expect("session/new");
+        writeln!(stdin, "{new_request}").expect("session/new");
         let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let new_line = new_lines
             .iter()
@@ -1069,38 +1103,33 @@ model = "claude-sonnet-4-5"
             .expect("session/new response");
         let new_response: serde_json::Value =
             serde_json::from_str(new_line).expect("session/new JSON parses");
-        let sid = new_response["result"]["sessionId"]
+        let session_id = new_response["result"]["sessionId"]
             .as_str()
             .expect("sessionId is a string")
             .to_string();
 
-        let prompt_req = serde_json::json!({
+        let prompt_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "session/prompt",
             "params": {
-                "sessionId": sid,
+                "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": "read the target file" }]
             }
         });
-        writeln!(stdin, "{}", prompt_req).expect("write session/prompt");
+        writeln!(stdin, "{prompt_request}").expect("write session/prompt");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
         let _ = stderr_handle.join();
-        sid
+        session_id
     };
 
     // Second run: load the persisted session and assert the replay stream.
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1110,12 +1139,12 @@ model = "claude-sonnet-4-5"
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     writeln!(
@@ -1138,21 +1167,20 @@ model = "claude-sonnet-4-5"
     );
     assert!(
         init_response["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_object(),
-        "expected sessionCapabilities.list to be advertised; got: {}",
-        init_response,
+        "expected sessionCapabilities.list to be advertised; got: {init_response}",
     );
 
-    let load_req = serde_json::json!({
+    let load_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 4,
         "method": "session/load",
         "params": {
             "sessionId": session_id,
-            "cwd": config_dir.clone(),
+            "cwd": config_dir,
             "mcpServers": []
         }
     });
-    writeln!(stdin, "{}", load_req).expect("session/load");
+    writeln!(stdin, "{load_request}").expect("session/load");
     let load_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":4"));
 
     let mut saw_user_chunk = false;
@@ -1163,7 +1191,7 @@ model = "claude-sonnet-4-5"
     for line in &load_lines {
         let value: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(error) => panic!("stdout line is not valid JSON-RPC: {} ({})", line, error,),
+            Err(error) => panic!("stdout line is not valid JSON-RPC: {line} ({error})",),
         };
         if value["method"] == "session/update" {
             let update = &value["params"]["update"];
@@ -1217,8 +1245,7 @@ model = "claude-sonnet-4-5"
         load_response.unwrap_or_else(|| panic!("no LoadSessionResponse; stream:\n{}", dump()));
     assert!(
         response["result"].is_object(),
-        "expected an object result for session/load: {}",
-        response,
+        "expected an object result for session/load: {response}",
     );
 }
 
@@ -1245,36 +1272,31 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::E
 /// `SessionLocked`), proving run 1 released the lock by exiting.
 #[test]
 fn acp_exits_and_releases_lock_on_stdin_eof() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
+    let config_dir = install.config_dir();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "done!" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done!" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script.json");
+    install.write_script(&script);
 
     // Run 1: take the session lock, then disconnect by dropping stdin (no session/close, no kill).
     let session_id = {
-        let mut child = meka_acp()
-            .arg("acp")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", &data_dir)
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+        let mut child = install
+            .meka(&["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1284,12 +1306,12 @@ model = "claude-sonnet-4-5"
         let stdout = child.stdout.take().expect("stdout");
         let stderr_pipe = child.stderr.take().expect("stderr");
         let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let mut r = BufReader::new(stderr_pipe);
-            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            buf
+            let mut buffer = String::new();
+            let mut stderr_reader = BufReader::new(stderr_pipe);
+            while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+            buffer
         });
-        let mut reader = BufReader::new(stdout);
+        let mut reader = support::TimedLines::spawn(stdout);
 
         writeln!(
             stdin,
@@ -1298,15 +1320,15 @@ model = "claude-sonnet-4-5"
         .expect("initialize");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-        let new_req = serde_json::json!({
+        let new_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/new",
-            "params": { "cwd": config_dir.clone(), "mcpServers": [] }
+            "params": { "cwd": config_dir, "mcpServers": [] }
         });
-        writeln!(stdin, "{}", new_req).expect("session/new");
+        writeln!(stdin, "{new_request}").expect("session/new");
         let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
-        let sid = serde_json::from_str::<serde_json::Value>(
+        let session_id = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
                 .find(|line| line.contains("\"id\":2"))
@@ -1318,20 +1340,18 @@ model = "claude-sonnet-4-5"
             .to_string();
 
         // One prompt so the session lock is definitely held.
-        let prompt_req = serde_json::json!({
+        let prompt_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "session/prompt",
-            "params": { "sessionId": sid, "prompt": [{ "type": "text", "text": "hello" }] }
+            "params": { "sessionId": session_id, "prompt": [{ "type": "text", "text": "hello" }] }
         });
-        writeln!(stdin, "{}", prompt_req).expect("session/prompt");
+        writeln!(stdin, "{prompt_request}").expect("session/prompt");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
-        // Drain remaining stdout on a thread so a shutdown-time write can't block the child, then
-        // disconnect by closing stdin. Crucially: NO `child.kill()` -- the process must exit
-        // itself.
-        let stdout_handle =
-            std::thread::spawn(move || std::io::copy(&mut reader, &mut std::io::sink()));
+        // The thread behind `reader` keeps draining stdout, so a shutdown-time write cannot block
+        // the child; `reader` stays alive to the end of the test for that reason. Disconnect by
+        // closing stdin. Crucially: NO `child.kill()` -- the process must exit itself.
         drop(stdin);
 
         let exited = wait_for_exit(&mut child, Duration::from_secs(10)).is_some();
@@ -1339,23 +1359,18 @@ model = "claude-sonnet-4-5"
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = stdout_handle.join();
+        drop(reader);
         assert!(
             exited,
             "meka acp did not exit within 10s of stdin EOF (orphaned, lock still held).\nSTDERR:\n{}",
             stderr_handle.join().unwrap_or_default(),
         );
-        sid
+        session_id
     };
 
     // Run 2: a fresh process must be able to lock + load the same session.
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1365,12 +1380,12 @@ model = "claude-sonnet-4-5"
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
 
     writeln!(
         stdin,
@@ -1379,13 +1394,13 @@ model = "claude-sonnet-4-5"
     .expect("initialize");
     let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-    let load_req = serde_json::json!({
+    let load_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 4,
         "method": "session/load",
-        "params": { "sessionId": session_id, "cwd": config_dir.clone(), "mcpServers": [] }
+        "params": { "sessionId": session_id, "cwd": config_dir, "mcpServers": [] }
     });
-    writeln!(stdin, "{}", load_req).expect("session/load");
+    writeln!(stdin, "{load_request}").expect("session/load");
     let load_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":4"));
 
     drop(stdin);
@@ -1405,52 +1420,45 @@ model = "claude-sonnet-4-5"
         serde_json::from_str(response_line).expect("parse session/load response");
     assert!(
         response.get("error").is_none(),
-        "session/load must succeed after run 1 exited; got error (lock not released?): {}",
-        response,
+        "session/load must succeed after run 1 exited; got error (lock not released?): {response}",
     );
 }
 
 /// a `session/list` with a `cwd` filter must only return sessions whose persisted cwd matches.
 #[test]
 fn acp_session_list_filters_by_cwd() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
     // Two distinct cwds that both physically exist (ACP server only stores the path; existence
     // doesn't matter for the filter, but tools later resolved against it would fail if absent).
-    let cwd_a = temp.path().join("proj-a");
-    let cwd_b = temp.path().join("proj-b");
+    let cwd_a = install.root().join("proj-a");
+    let cwd_b = install.root().join("proj-b");
     std::fs::create_dir_all(&cwd_a).expect("mkdir cwd_a");
     std::fs::create_dir_all(&cwd_b).expect("mkdir cwd_b");
 
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "ack" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ack" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script.json");
+    install.write_script(&script);
 
     // Helper: launch one `meka acp`, send initialize + session/new (with the given cwd) +
     // session/prompt, return the sessionId.
     let create_one = |session_cwd: &std::path::Path| -> String {
-        let mut child = meka_acp()
-            .arg("acp")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", &data_dir)
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+        let mut child = install
+            .meka(&["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1459,12 +1467,12 @@ model = "claude-sonnet-4-5"
         let mut stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr_pipe = child.stderr.take().expect("stderr");
-        let mut reader = BufReader::new(stdout);
+        let mut reader = support::TimedLines::spawn(stdout);
         let _stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let mut r = BufReader::new(stderr_pipe);
-            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            buf
+            let mut buffer = String::new();
+            let mut stderr_reader = BufReader::new(stderr_pipe);
+            while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+            buffer
         });
         writeln!(
             stdin,
@@ -1473,13 +1481,13 @@ model = "claude-sonnet-4-5"
         .expect("init");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-        let new_req = serde_json::json!({
+        let new_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/new",
             "params": { "cwd": session_cwd, "mcpServers": [] }
         });
-        writeln!(stdin, "{}", new_req).expect("session/new");
+        writeln!(stdin, "{new_request}").expect("session/new");
         let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
         let new_line = new_lines
             .iter()
@@ -1487,42 +1495,37 @@ model = "claude-sonnet-4-5"
             .expect("session/new response");
         let new_response: serde_json::Value =
             serde_json::from_str(new_line).expect("parse session/new");
-        let sid = new_response["result"]["sessionId"]
+        let session_id = new_response["result"]["sessionId"]
             .as_str()
             .expect("sessionId")
             .to_string();
 
         // Drive a no-op prompt so the session is persisted with a message (otherwise the title
         // would be empty; not required by the assertion but matches the realistic shape).
-        let prompt_req = serde_json::json!({
+        let prompt_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "session/prompt",
             "params": {
-                "sessionId": sid,
+                "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": "ping" }]
             }
         });
-        writeln!(stdin, "{}", prompt_req).expect("prompt");
+        writeln!(stdin, "{prompt_request}").expect("prompt");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
-        sid
+        session_id
     };
 
     let id_a = create_one(&cwd_a);
     let _id_b = create_one(&cwd_b);
 
     // Second invocation issues session/list filtered to cwd_a.
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1531,12 +1534,12 @@ model = "claude-sonnet-4-5"
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let _stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     writeln!(
@@ -1550,9 +1553,9 @@ model = "claude-sonnet-4-5"
         "jsonrpc": "2.0",
         "id": 5,
         "method": "session/list",
-        "params": { "cwd": cwd_a.clone() }
+        "params": { "cwd": cwd_a }
     });
-    writeln!(stdin, "{}", list_req).expect("session/list");
+    writeln!(stdin, "{list_req}").expect("session/list");
     let list_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":5"));
 
     drop(stdin);
@@ -1571,8 +1574,7 @@ model = "claude-sonnet-4-5"
     assert_eq!(
         sessions.len(),
         1,
-        "expected exactly one session matching cwd_a; got: {}",
-        list_response,
+        "expected exactly one session matching cwd_a; got: {list_response}",
     );
     assert_eq!(sessions[0]["sessionId"], id_a);
 }
@@ -1582,41 +1584,36 @@ model = "claude-sonnet-4-5"
 /// can proceed (smoke test: a follow-up prompt succeeds).
 #[test]
 fn acp_session_resume_adopts_without_replay() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
+    let config_dir = install.config_dir();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
     // The script must serve two prompts: one for the first run, one for the follow-up after resume.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first response" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first response" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "follow up" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "follow up" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script.json");
+    install.write_script(&script);
 
     // First run: create a session, run one prompt, capture the id.
     let session_id = {
-        let mut child = meka_acp()
-            .arg("acp")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", &data_dir)
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+        let mut child = install
+            .meka(&["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1625,12 +1622,12 @@ model = "claude-sonnet-4-5"
         let mut stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr_pipe = child.stderr.take().expect("stderr");
-        let mut reader = BufReader::new(stdout);
+        let mut reader = support::TimedLines::spawn(stdout);
         let _stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let mut r = BufReader::new(stderr_pipe);
-            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            buf
+            let mut buffer = String::new();
+            let mut stderr_reader = BufReader::new(stderr_pipe);
+            while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+            buffer
         });
         writeln!(
             stdin,
@@ -1639,15 +1636,15 @@ model = "claude-sonnet-4-5"
         .expect("init");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-        let new_req = serde_json::json!({
+        let new_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/new",
-            "params": { "cwd": config_dir.clone(), "mcpServers": [] }
+            "params": { "cwd": config_dir, "mcpServers": [] }
         });
-        writeln!(stdin, "{}", new_req).expect("session/new");
+        writeln!(stdin, "{new_request}").expect("session/new");
         let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
-        let sid = serde_json::from_str::<serde_json::Value>(
+        let session_id = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
                 .find(|line| line.contains("\"id\":2"))
@@ -1658,32 +1655,27 @@ model = "claude-sonnet-4-5"
             .expect("sessionId")
             .to_string();
 
-        let prompt_req = serde_json::json!({
+        let prompt_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "session/prompt",
             "params": {
-                "sessionId": sid,
+                "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": "first" }]
             }
         });
-        writeln!(stdin, "{}", prompt_req).expect("first prompt");
+        writeln!(stdin, "{prompt_request}").expect("first prompt");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
-        sid
+        session_id
     };
 
     // Second run: resume + a follow-up prompt.
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1692,12 +1684,12 @@ model = "claude-sonnet-4-5"
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     writeln!(
@@ -1712,12 +1704,12 @@ model = "claude-sonnet-4-5"
         "id": 6,
         "method": "session/resume",
         "params": {
-            "sessionId": session_id.clone(),
-            "cwd": config_dir.clone(),
+            "sessionId": session_id,
+            "cwd": config_dir,
             "mcpServers": []
         }
     });
-    writeln!(stdin, "{}", resume_req).expect("session/resume");
+    writeln!(stdin, "{resume_req}").expect("session/resume");
     let resume_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":6"));
 
     // The `available_commands_update` push is allowed (and expected) on resume. What must NOT
@@ -1762,21 +1754,20 @@ model = "claude-sonnet-4-5"
     });
     assert!(
         resume_response["result"].is_object(),
-        "resume must succeed: {}",
-        resume_response,
+        "resume must succeed: {resume_response}",
     );
 
     // Follow-up prompt confirms the slot is active.
-    let prompt_req = serde_json::json!({
+    let prompt_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 7,
         "method": "session/prompt",
         "params": {
-            "sessionId": session_id.clone(),
+            "sessionId": session_id,
             "prompt": [{ "type": "text", "text": "follow up" }]
         }
     });
-    writeln!(stdin, "{}", prompt_req).expect("follow-up prompt");
+    writeln!(stdin, "{prompt_request}").expect("follow-up prompt");
     let prompt_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":7"));
 
     drop(stdin);
@@ -1817,16 +1808,14 @@ fn acp_session_close_clears_slot_for_subsequent_new() {
     let close_response = harness.close_session(&first_id);
     assert!(
         close_response["result"].is_object(),
-        "expected ok result for session/close: {}",
-        close_response,
+        "expected ok result for session/close: {close_response}",
     );
 
     // Re-closing the first session must error; it's gone.
     let reclose = harness.close_session(&first_id);
     assert!(
         reclose["error"].is_object(),
-        "re-closing a removed session must error: {}",
-        reclose,
+        "re-closing a removed session must error: {reclose}",
     );
 }
 
@@ -1838,13 +1827,16 @@ fn acp_session_new_advertises_skills_and_modes() {
     // Provider stub + a non-default enabled set so we can assert exactly which modes get
     // advertised.
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "ask", "unrestricted"]
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
@@ -1862,14 +1854,15 @@ enabled = ["read", "ask", "unrestricted"]
         .build();
 
     // session/new fires before any session/update notifications, so we can't filter notifications
-    // by sid up front. Send the request manually, then walk the stream picking up the intermediate
-    // `available_commands_update` notification(s) and the eventual response together.
-    let cwd = harness.config_dir().to_path_buf();
+    // by session_id up front. Send the request manually, then walk the stream picking up the
+    // intermediate `available_commands_update` notification(s) and the eventual response
+    // together.
+    let cwd = harness.config_dir();
     let id = harness.send_request(
         "session/new",
         serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
     );
-    let needle = format!("\"id\":{}", id);
+    let needle = format!("\"id\":{id}");
     let mut saw_skill = false;
     let mut new_response: Option<serde_json::Value> = None;
     let mut transcript = String::new();
@@ -1901,11 +1894,10 @@ enabled = ["read", "ask", "unrestricted"]
     }
     assert!(
         saw_skill,
-        "expected available_commands_update with demo-skill; transcript:\n{}",
-        transcript,
+        "expected available_commands_update with demo-skill; transcript:\n{transcript}",
     );
     let response = new_response.unwrap_or_else(|| {
-        panic!("no session/new response; transcript:\n{}", transcript);
+        panic!("no session/new response; transcript:\n{transcript}");
     });
     let modes = &response["result"]["modes"];
     let ids: Vec<String> = modes["availableModes"]
@@ -1914,7 +1906,7 @@ enabled = ["read", "ask", "unrestricted"]
         .iter()
         .map(|m| m["id"].as_str().unwrap_or_default().to_string())
         .collect();
-    assert_eq!(ids, vec!["read", "ask", "unrestricted"]);
+    assert_eq!(ids, vec!["read", "unrestricted"]);
     assert_eq!(modes["currentModeId"], "read");
 }
 
@@ -1925,8 +1917,11 @@ enabled = ["read", "ask", "unrestricted"]
 #[test]
 fn acp_session_prompt_invokes_skill_by_slash_name() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -1940,18 +1935,17 @@ model = "claude-sonnet-4-5"
             )
             .expect("write SKILL.md");
             serde_json::json!([[
-                { "kind": "text", "text": "hello from agent" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "hello from agent" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ]])
         })
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "/hello but be brief");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "/hello but be brief");
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "skill invocation should run a normal turn: {}",
-        response,
+        "skill invocation should run a normal turn: {response}",
     );
 }
 
@@ -1964,17 +1958,16 @@ model = "claude-sonnet-4-5"
 #[test]
 fn acp_session_prompt_passes_through_unknown_skill_name() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "ok" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "/unknown-skill but otherwise valid text");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "/unknown-skill but otherwise valid text");
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "unknown skill name must pass through to the model, not error: {}",
-        response,
+        "unknown skill name must pass through to the model, not error: {response}",
     );
 }
 
@@ -2005,7 +1998,7 @@ fn acp_session_prompt_skill_body_unreadable_is_internal_error() {
             serde_json::json!([])
         })
         .build();
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     let skill_md = harness
         .config_dir()
         .join("skills")
@@ -2017,31 +2010,26 @@ fn acp_session_prompt_skill_body_unreadable_is_internal_error() {
     std::fs::set_permissions(&skill_md, std::fs::Permissions::from_mode(0o000))
         .expect("chmod 0 SKILL.md");
 
-    let id = harness.prompt(&sid, "/doomed");
+    let id = harness.prompt(&session_id, "/doomed");
     let response = harness.await_response(id);
 
-    // Restore perms before assertions so a panic doesn't break tempdir cleanup.
+    // Restore permissions before assertions so a panic doesn't break tempdir cleanup.
     let _ = std::fs::set_permissions(&skill_md, std::fs::Permissions::from_mode(0o644));
 
     let error = response["error"]
         .as_object()
-        .unwrap_or_else(|| panic!("expected JSON-RPC error: {}", response));
+        .unwrap_or_else(|| panic!("expected JSON-RPC error: {response}"));
     assert_eq!(
         error["code"].as_i64(),
         Some(-32603),
-        "skill body load failure must map to InternalError (-32603), not InvalidParams; got: {}",
-        response,
+        "skill body load failure must map to InternalError (-32603), not InvalidParams; got: {response}",
     );
-    let data = error["data"].as_str().unwrap_or_else(|| {
-        panic!(
-            "expected error.data to carry the detail string: {}",
-            response
-        )
-    });
+    let data = error["data"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected error.data to carry the detail string: {response}"));
     assert!(
         data.contains("failed to load skill 'doomed'"),
-        "error.data should mention the doomed skill name and load failure; got: {}",
-        data,
+        "error.data should mention the doomed skill name and load failure; got: {data}",
     );
 }
 
@@ -2050,13 +2038,16 @@ fn acp_session_prompt_skill_body_unreadable_is_internal_error() {
 #[test]
 fn acp_session_set_mode_flips_permission_and_emits_update() {
     const CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "ask"]
+enabled = ["read", "workspace"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, None);
 
@@ -2064,7 +2055,7 @@ enabled = ["read", "ask"]
     let new_response = harness.request(
         "session/new",
         serde_json::json!({
-            "cwd": harness.config_dir().to_path_buf(),
+            "cwd": harness.config_dir(),
             "mcpServers": []
         }),
     );
@@ -2074,40 +2065,37 @@ enabled = ["read", "ask"]
         .iter()
         .map(|m| m["id"].as_str().unwrap_or_default().to_string())
         .collect();
-    assert_eq!(ids, vec!["read", "ask"]);
-    let sid = new_response["result"]["sessionId"]
+    assert_eq!(ids, vec!["read", "workspace"]);
+    let session_id = new_response["result"]["sessionId"]
         .as_str()
         .expect("sessionId")
         .to_string();
 
-    // Valid set_mode: read → ask. The `current_mode_update` notification arrives via the same
+    // Valid set_mode: read → workspace. The `current_mode_update` notification arrives via the same
     // session/update channel, which `request` discards; collect it via a small ad-hoc loop instead
     // by issuing the request and watching for the notification before the response.
     let set_id = harness.send_request(
         "session/set_mode",
-        serde_json::json!({ "sessionId": sid, "modeId": "ask" }),
+        serde_json::json!({ "sessionId": session_id, "modeId": "workspace" }),
     );
-    let (updates, set_response) = harness.collect_updates(&sid, set_id);
+    let (updates, set_response) = harness.collect_updates(&session_id, set_id);
     assert!(
         updates.iter().any(|u| {
             u["params"]["update"]["sessionUpdate"] == "current_mode_update"
-                && u["params"]["update"]["currentModeId"] == "ask"
+                && u["params"]["update"]["currentModeId"] == "workspace"
         }),
-        "expected current_mode_update with currentModeId=ask; updates: {:?}",
-        updates,
+        "expected current_mode_update with currentModeId=workspace; updates: {updates:?}",
     );
     assert!(
         set_response["result"].is_object(),
-        "set_mode must succeed: {}",
-        set_response,
+        "set_mode must succeed: {set_response}",
     );
 
     // Invalid set_mode: unrestricted is not in the enabled set.
-    let bad_response = harness.set_mode(&sid, "unrestricted");
+    let bad_response = harness.set_mode(&session_id, "unrestricted");
     assert!(
         bad_response["error"].is_object(),
-        "set_mode for a disabled mode must error: {}",
-        bad_response,
+        "set_mode for a disabled mode must error: {bad_response}",
     );
 }
 
@@ -2117,8 +2105,11 @@ enabled = ["read", "ask"]
 #[test]
 fn acp_fs_read_text_file_is_delegated_when_capability_offered() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
@@ -2130,25 +2121,25 @@ model = "claude-sonnet-4-5"
         .pre_spawn(|config_dir| {
             // Real on-disk file with one content; the delegate returns *different* content, so the
             // assertion proves the delegate path was used.
-            let target = config_dir.join("delegated.txt");
+            let target = fixture_beside(config_dir, "delegated.txt");
             std::fs::write(&target, "ON DISK\n").expect("write target");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "reading..." },
-                    { "kind": "tool_use_start", "id": "call_read", "name": "read_file" },
-                    { "kind": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "text", "text": "reading..." },
+                    { "type": "tool_use_start", "id": "call_read", "name": "read_file" },
+                    { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
-    let target = harness.config_dir().join("delegated.txt");
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "read it");
+    let target = harness.work_dir().join("delegated.txt");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read it");
 
     let mut saw_fs_read_request = false;
     let _ = harness.await_response_with_dispatch(id, |value| {
@@ -2184,8 +2175,11 @@ fn acp_fs_write_text_file_is_delegated_when_capability_offered() {
     // `unrestricted` so the agent's permission gate doesn't refuse `write_file` before we even
     // reach the delegation seam.
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2202,27 +2196,27 @@ enabled = ["read", "unrestricted"]
             let target = config_dir.join("delegated-write.txt");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "writing..." },
-                    { "kind": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "text", "text": "writing..." },
+                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": content_to_write }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
     // `write_file` canonicalizes the parent directory before handing the path to the delegate, so
     // the expected path matches `/private/var/...` on macOS rather than the `/var/...` tempdir
-    // returns from `config_dir()`.
-    // Stripped of the `\\?\` prefix the way meka strips it, because this is compared against a
-    // path meka reports rather than one the test constructs. `canonicalize` alone yields the
-    // verbatim spelling, which is the one meka never emits, so the mismatch is Windows-only.
+    // returns from `config_dir()`. Stripped of the `\\?\` prefix the way meka strips it, because
+    // this is compared against a path meka reports rather than one the test constructs.
+    // `canonicalize` alone yields the verbatim spelling, which is the one meka never emits, so the
+    // mismatch is Windows-only.
     let target_dir = {
         let canonical = std::fs::canonicalize(harness.config_dir()).expect("canonicalize tempdir");
         let text = canonical.to_string_lossy();
@@ -2232,8 +2226,8 @@ enabled = ["read", "unrestricted"]
         }
     };
     let target = target_dir.join("delegated-write.txt");
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "write it");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "write it");
 
     let mut saw_fs_write = false;
     let mut delegated_path: Option<String> = None;
@@ -2286,8 +2280,11 @@ enabled = ["read", "unrestricted"]
 fn acp_write_file_falls_back_to_local_when_no_capability() {
     let content_to_write = "wrote locally";
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2301,24 +2298,24 @@ enabled = ["read", "unrestricted"]
             let target = config_dir.join("local-write.txt");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "writing..." },
-                    { "kind": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "text", "text": "writing..." },
+                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": content_to_write }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
     let target = harness.config_dir().join("local-write.txt");
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "write it");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "write it");
 
     let mut saw_fs_write = false;
     let _ = harness.await_response_with_dispatch(id, |value| {
@@ -2347,35 +2344,37 @@ fn zed_shaped_capabilities() -> serde_json::Value {
 }
 
 /// `execute_command` always runs in meka's own (sandboxed) child process, never in the client's
-/// terminal, whatever the permission mode and whatever the client advertises. `unrestricted` is the
-/// mode that used to delegate, and `ask` is the mode where delegating was a sandbox bypass: meka
-/// treats `ask` as sandboxed (it hard-errors when no sandbox backend is available) yet handed the
-/// command to an unsandboxed editor terminal anyway. Guards both by asserting no `terminal/*`
-/// traffic and that the output is the local shell's, not the client's.
+/// terminal, whatever the permission level and whatever the client advertises. `unrestricted` is
+/// the level where delegating would be tempting, and `read` is the level where it would be a
+/// sandbox bypass. Guards both by asserting no `terminal/*` traffic and that the output is the
+/// local shell's, not the client's.
 #[test]
 fn acp_execute_command_never_leaves_meka() {
-    for mode in ["unrestricted", "ask"] {
+    for level in ["unrestricted", "read"] {
         let config_toml = format!(
             r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "{mode}"
-enabled = ["read", "ask", "unrestricted"]
+default = "{level}"
+enabled = ["read", "unrestricted"]
 "#
         );
         let script = serde_json::json!([
             [
-                { "kind": "text", "text": "running..." },
-                { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
-                { "kind": "tool_use_end", "input": { "command": "echo ran-inside-meka" } },
-                { "kind": "message_end", "stop_reason": "tool_use" }
+                { "type": "text", "text": "running..." },
+                { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+                { "type": "tool_use_end", "input": { "command": "echo ran-inside-meka" } },
+                { "type": "message_end", "stop_reason": "tool_use" }
             ],
             [
-                { "kind": "text", "text": "done" },
-                { "kind": "message_end", "stop_reason": "end_turn" }
+                { "type": "text", "text": "done" },
+                { "type": "message_end", "stop_reason": "end_turn" }
             ]
         ]);
         let mut harness = AcpTestHarness::spawn_with_capabilities(
@@ -2383,34 +2382,35 @@ enabled = ["read", "ask", "unrestricted"]
             Some(script),
             zed_shaped_capabilities(),
         );
-        let sid = harness.new_session();
-        let id = harness.prompt(&sid, "run it");
+        let session_id = harness.new_session();
+        let id = harness.prompt(&session_id, "run it");
 
         let mut terminal_methods: Vec<String> = Vec::new();
-        let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |value| {
-            if let Some(method) = value["method"].as_str()
-                && method.starts_with("terminal/")
-            {
-                terminal_methods.push(method.to_string());
-            }
-            // Approve anything `ask` mode prompts for, so the tool actually runs.
-            if value["method"] == "session/request_permission" {
-                return Some(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": value["id"].clone(),
-                    "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } }
-                }));
-            }
-            None
-        });
+        let (updates, _response) =
+            harness.collect_updates_with_dispatch(&session_id, id, |value| {
+                if let Some(method) = value["method"].as_str()
+                    && method.starts_with("terminal/")
+                {
+                    terminal_methods.push(method.to_string());
+                }
+                // Approve anything the agent asks about, so the tool actually runs.
+                if value["method"] == "session/request_permission" {
+                    return Some(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": value["id"].clone(),
+                        "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } }
+                    }));
+                }
+                None
+            });
 
         assert!(
             terminal_methods.is_empty(),
-            "{mode} mode must run execute_command inside meka; saw {terminal_methods:?}",
+            "{level} level must run execute_command inside meka; saw {terminal_methods:?}",
         );
         // Either terminal status will do. Whether the command *succeeds* is a property of the
         // host's sandbox, not of this test: on a runner where the platform sandbox rejects the
-        // profile, a read-mode-style run legitimately reports `failed`. What must hold everywhere
+        // profile, a run at `read` legitimately reports `failed`. What must hold everywhere
         // is that the call reached a terminal state without leaving meka.
         let status = updates
             .iter()
@@ -2419,11 +2419,11 @@ enabled = ["read", "ask", "unrestricted"]
             .filter_map(|u| u["status"].as_str())
             .next_back()
             .unwrap_or_else(|| {
-                panic!("{mode}: no tool_call_update carried a status: {updates:#?}")
+                panic!("{level}: no tool_call_update carried a status: {updates:#?}")
             });
         assert!(
             status == "completed" || status == "failed",
-            "{mode}: unexpected terminal status {status:?}",
+            "{level}: unexpected terminal status {status:?}",
         );
 
         // When it did run, the output must be meka's own shell rather than a delegated one.
@@ -2438,7 +2438,7 @@ enabled = ["read", "ask", "unrestricted"]
                 .collect();
             assert!(
                 streamed.contains("ran-inside-meka"),
-                "{mode}: expected the local shell's output; got {streamed:?}",
+                "{level}: expected the local shell's output; got {streamed:?}",
             );
         }
     }
@@ -2447,8 +2447,11 @@ enabled = ["read", "ask", "unrestricted"]
 /// `unrestricted`, so `execute_command` is not subject to the sandbox's availability on the test
 /// host.
 const ACP_UNRESTRICTED_CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -2465,23 +2468,23 @@ enabled = ["read", "unrestricted"]
 fn acp_execute_command_streams_output_while_running() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "running..." },
-            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "text", "text": "running..." },
+            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
             {
-                "kind": "tool_use_end",
+                "type": "tool_use_end",
                 "input": { "command": "echo first; sleep 0.5; echo second" }
             },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_UNRESTRICTED_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-    let (updates, response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "run it");
+    let (updates, response) = harness.collect_updates_with_dispatch(&session_id, id, |_value| None);
 
     assert_eq!(response["result"]["stopReason"], "end_turn");
 
@@ -2525,17 +2528,17 @@ fn acp_execute_command_streams_output_while_running() {
 fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "running..." },
-            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "text", "text": "running..." },
+            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
             {
-                "kind": "tool_use_end",
+                "type": "tool_use_end",
                 "input": { "command": "echo alpha; sleep 0.4; echo beta; exit 7" }
             },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn_with_capabilities(
@@ -2543,9 +2546,10 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
         Some(script),
         zed_shaped_capabilities(),
     );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-    let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "run it");
+    let (updates, _response) =
+        harness.collect_updates_with_dispatch(&session_id, id, |_value| None);
 
     let for_call = |kind: &str| -> Vec<serde_json::Value> {
         updates
@@ -2613,13 +2617,13 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
 fn acp_terminal_capability_alone_does_not_enable_terminal_rendering() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": { "command": "echo capability-check" } },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "tool_use_end", "input": { "command": "echo capability-check" } },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn_with_capabilities(
@@ -2628,9 +2632,10 @@ fn acp_terminal_capability_alone_does_not_enable_terminal_rendering() {
         // `terminal/*` implemented, agent-owned terminal frames not understood.
         serde_json::json!({ "terminal": true }),
     );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-    let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "run it");
+    let (updates, _response) =
+        harness.collect_updates_with_dispatch(&session_id, id, |_value| None);
 
     let call_updates: Vec<&serde_json::Value> = updates
         .iter()
@@ -2659,13 +2664,13 @@ fn acp_terminal_capability_alone_does_not_enable_terminal_rendering() {
 fn acp_client_without_terminal_capability_gets_console_text() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "call_exec", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": { "command": "echo plain-text-path" } },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "call_exec", "name": "execute_command" },
+            { "type": "tool_use_end", "input": { "command": "echo plain-text-path" } },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn_with_capabilities(
@@ -2673,9 +2678,10 @@ fn acp_client_without_terminal_capability_gets_console_text() {
         Some(script),
         serde_json::json!({ "terminal": false }),
     );
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "run it");
-    let (updates, _response) = harness.collect_updates_with_dispatch(&sid, id, |_value| None);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "run it");
+    let (updates, _response) =
+        harness.collect_updates_with_dispatch(&session_id, id, |_value| None);
 
     let call_updates: Vec<&serde_json::Value> = updates
         .iter()
@@ -2721,17 +2727,18 @@ fn jsonrpc_error(id: serde_json::Value, message: &str) -> serde_json::Value {
 /// notification behind the prompt and made cancellation effectively useless.
 #[test]
 fn acp_session_cancel_interrupts_running_prompt() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
+    let config_dir = install.config_dir();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
     // Round 1: a short "starting" delta so the test knows the turn started, then a 5s sleep that
     // races against cancel. If cancel arrives in time the mock returns early; the agent loop's
@@ -2740,22 +2747,16 @@ model = "claude-sonnet-4-5"
     // The assertion below catches that.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "starting..." },
-            { "kind": "sleep", "ms": 5000 },
-            { "kind": "text", "text": "done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "starting..." },
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script");
+    install.write_script(&script);
 
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2764,12 +2765,12 @@ model = "claude-sonnet-4-5"
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     writeln!(
@@ -2779,15 +2780,15 @@ model = "claude-sonnet-4-5"
     .expect("init");
     let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-    let new_req = serde_json::json!({
+    let new_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "session/new",
-        "params": { "cwd": config_dir.clone(), "mcpServers": [] }
+        "params": { "cwd": config_dir, "mcpServers": [] }
     });
-    writeln!(stdin, "{}", new_req).expect("session/new");
+    writeln!(stdin, "{new_request}").expect("session/new");
     let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
-    let sid = serde_json::from_str::<serde_json::Value>(
+    let session_id = serde_json::from_str::<serde_json::Value>(
         new_lines
             .iter()
             .find(|line| line.contains("\"id\":2"))
@@ -2798,16 +2799,16 @@ model = "claude-sonnet-4-5"
         .expect("sessionId")
         .to_string();
 
-    let prompt_req = serde_json::json!({
+    let prompt_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 3,
         "method": "session/prompt",
         "params": {
-            "sessionId": sid,
+            "sessionId": session_id,
             "prompt": [{ "type": "text", "text": "stall then cancel" }]
         }
     });
-    writeln!(stdin, "{}", prompt_req).expect("prompt");
+    writeln!(stdin, "{prompt_request}").expect("prompt");
 
     // Wait until we've seen the "starting..." chunk so we know the turn is actually parked inside
     // the mock's sleep; firing cancel any earlier might race the prompt setup.
@@ -2821,9 +2822,9 @@ model = "claude-sonnet-4-5"
     let cancel_notif = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "session/cancel",
-        "params": { "sessionId": sid }
+        "params": { "sessionId": session_id }
     });
-    writeln!(stdin, "{}", cancel_notif).expect("cancel");
+    writeln!(stdin, "{cancel_notif}").expect("cancel");
 
     // Tight deadline: cancel should resolve well before the 5s sleep would have completed
     // naturally. Allow generous slack for CI variance but well short of 5s.
@@ -2850,8 +2851,7 @@ model = "claude-sonnet-4-5"
         serde_json::from_str(response_line).expect("parse PromptResponse");
     assert_eq!(
         response["result"]["stopReason"], "cancelled",
-        "session/cancel must resolve the in-flight prompt with cancelled; got: {}",
-        response,
+        "session/cancel must resolve the in-flight prompt with cancelled; got: {response}",
     );
 }
 
@@ -2862,41 +2862,36 @@ model = "claude-sonnet-4-5"
 /// replay carries the partial answer (and not the post-interrupt text, which never streamed).
 #[test]
 fn acp_interrupted_turn_persists_partial_assistant_text() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
+    let config_dir = install.config_dir();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
     // A partial answer streams, then the turn stalls in a 5s sleep that races cancellation. The
     // text after the sleep must never stream once cancel fires, and so must never be persisted.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "partial answer before interrupt" },
-            { "kind": "sleep", "ms": 5000 },
-            { "kind": "text", "text": "TEXT-AFTER-INTERRUPT-MUST-NOT-PERSIST" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "partial answer before interrupt" },
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "TEXT-AFTER-INTERRUPT-MUST-NOT-PERSIST" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script.json");
+    install.write_script(&script);
 
     // Round 1: prompt, wait for the partial to stream, fire cancel, capture sessionId, exit
     // cleanly.
     let session_id = {
-        let mut child = meka_acp()
-            .arg("acp")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", &data_dir)
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+        let mut child = install
+            .meka(&["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2905,12 +2900,12 @@ model = "claude-sonnet-4-5"
         let mut stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr_pipe = child.stderr.take().expect("stderr");
-        let mut reader = BufReader::new(stdout);
+        let mut reader = support::TimedLines::spawn(stdout);
         let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let mut r = BufReader::new(stderr_pipe);
-            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            buf
+            let mut buffer = String::new();
+            let mut stderr_reader = BufReader::new(stderr_pipe);
+            while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+            buffer
         });
 
         writeln!(
@@ -2920,15 +2915,15 @@ model = "claude-sonnet-4-5"
         .expect("initialize");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-        let new_req = serde_json::json!({
+        let new_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/new",
-            "params": { "cwd": config_dir.clone(), "mcpServers": [] }
+            "params": { "cwd": config_dir, "mcpServers": [] }
         });
-        writeln!(stdin, "{}", new_req).expect("session/new");
+        writeln!(stdin, "{new_request}").expect("session/new");
         let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
-        let sid = serde_json::from_str::<serde_json::Value>(
+        let session_id = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
                 .find(|line| line.contains("\"id\":2"))
@@ -2939,16 +2934,16 @@ model = "claude-sonnet-4-5"
             .expect("sessionId")
             .to_string();
 
-        let prompt_req = serde_json::json!({
+        let prompt_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "session/prompt",
             "params": {
-                "sessionId": sid,
+                "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": "interrupt me mid-turn" }]
             }
         });
-        writeln!(stdin, "{}", prompt_req).expect("session/prompt");
+        writeln!(stdin, "{prompt_request}").expect("session/prompt");
 
         // Wait until the partial answer has streamed so the agent has it buffered, then cancel.
         let start_deadline = Instant::now() + Duration::from_secs(5);
@@ -2958,11 +2953,11 @@ model = "claude-sonnet-4-5"
         let cancel_notif = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "session/cancel",
-            "params": { "sessionId": sid }
+            "params": { "sessionId": session_id }
         });
-        writeln!(stdin, "{}", cancel_notif).expect("cancel");
+        writeln!(stdin, "{cancel_notif}").expect("cancel");
 
-        // The prompt should resolve (cancelled) well before the 5s sleep would finish.
+        // The prompt should resolve (canceled) well before the 5s sleep would finish.
         let response_deadline = Instant::now() + Duration::from_secs(3);
         let lines = read_until(&mut reader, response_deadline, |line| {
             line.contains("\"id\":3")
@@ -2981,24 +2976,18 @@ model = "claude-sonnet-4-5"
         .expect("parse PromptResponse");
         assert_eq!(
             response["result"]["stopReason"], "cancelled",
-            "prompt must resolve as cancelled; got: {}",
-            response,
+            "prompt must resolve as cancelled; got: {response}",
         );
 
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
-        sid
+        session_id
     };
 
     // Round 2: load the persisted session; the replay must carry the partial answer.
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3007,12 +2996,12 @@ model = "claude-sonnet-4-5"
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     writeln!(
@@ -3022,17 +3011,17 @@ model = "claude-sonnet-4-5"
     .expect("initialize");
     let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-    let load_req = serde_json::json!({
+    let load_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 4,
         "method": "session/load",
         "params": {
             "sessionId": session_id,
-            "cwd": config_dir.clone(),
+            "cwd": config_dir,
             "mcpServers": []
         }
     });
-    writeln!(stdin, "{}", load_req).expect("session/load");
+    writeln!(stdin, "{load_request}").expect("session/load");
     let load_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":4"));
 
     drop(stdin);
@@ -3048,19 +3037,20 @@ model = "claude-sonnet-4-5"
     );
     assert!(
         !replay.contains("TEXT-AFTER-INTERRUPT-MUST-NOT-PERSIST"),
-        "post-interrupt text must not be persisted; stream:\n{}",
-        replay,
+        "post-interrupt text must not be persisted; stream:\n{replay}",
     );
 }
 
 /// when the client advertises both `fs.readTextFile` and `fs.writeTextFile`, `edit_file` delegates
-/// both halves and does not touch the local disk. Covers the previously-untested delegated
-/// read+write composition.
+/// both halves and does not touch the local disk: the delegated read+write composition.
 #[test]
 fn acp_edit_file_delegates_when_both_fs_capabilities_offered() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -3085,10 +3075,10 @@ enabled = ["read", "unrestricted"]
             std::fs::write(&target, disk_content).expect("seed local file");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "editing..." },
-                    { "kind": "tool_use_start", "id": "call_edit", "name": "edit_file" },
+                    { "type": "text", "text": "editing..." },
+                    { "type": "tool_use_start", "id": "call_edit", "name": "edit_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": {
                             "path": target.to_str().unwrap(),
                             "old_string": "beta",
@@ -3096,18 +3086,18 @@ enabled = ["read", "unrestricted"]
                             "force": true
                         }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
     let target = harness.config_dir().join("delegated-edit.txt");
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "edit it");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "edit it");
 
     let mut saw_fs_read = false;
     let mut saw_fs_write = false;
@@ -3156,62 +3146,66 @@ enabled = ["read", "unrestricted"]
 #[test]
 fn acp_subagent_permission_forwards_to_parent_client() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "ask"
-enabled = ["read", "ask", "unrestricted"]
+default = "read"
+approvals = true
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            let target = config_dir.join("subagent-write.txt");
+            let target = work_dir_beside(config_dir).join("subagent-write.txt");
             // The mock provider is shared between parent and sub-agent (same `Arc<dyn Provider>`),
             // so rounds drain in the order they're consumed: parent → sub-agent → sub-agent →
             // parent.
             serde_json::json!([
                 // Parent round 1: spawn the sub-agent.
                 [
-                    { "kind": "text", "text": "spawning sub-agent..." },
-                    { "kind": "tool_use_start", "id": "call_spawn", "name": "agent_spawn" },
+                    { "type": "text", "text": "spawning sub-agent..." },
+                    { "type": "tool_use_start", "id": "call_spawn", "name": "agent_spawn" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "prompt": "write the file" }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 // Sub-agent round 1: write_file → triggers permission.
                 [
-                    { "kind": "text", "text": "writing..." },
-                    { "kind": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "text", "text": "writing..." },
+                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": "subagent wrote me" }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 // Sub-agent round 2: final report.
                 [
-                    { "kind": "text", "text": "wrote the file" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "wrote the file" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ],
                 // Parent round 2: final report.
                 [
-                    { "kind": "text", "text": "sub-agent finished" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "sub-agent finished" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .window(Duration::from_secs(30))
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "delegate the write");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "delegate the write");
 
     let mut saw_permission_request = false;
-    let (_updates, _response) =
-        harness.collect_updates_with_dispatch(&sid, id, |value| match value["method"].as_str() {
+    let (_updates, _response) = harness.collect_updates_with_dispatch(&session_id, id, |value| {
+        match value["method"].as_str() {
             Some("session/request_permission") => {
                 saw_permission_request = true;
                 Some(serde_json::json!({
@@ -3223,7 +3217,8 @@ enabled = ["read", "ask", "unrestricted"]
                 }))
             }
             _ => None,
-        });
+        }
+    });
 
     assert!(
         saw_permission_request,
@@ -3237,29 +3232,28 @@ enabled = ["read", "ask", "unrestricted"]
 /// both pages combined must equal the seeded set.
 #[test]
 fn acp_session_list_paginates_across_cursor_boundary() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
-    let cwd = temp.path().join("proj");
+    let cwd = install.root().join("proj");
     std::fs::create_dir_all(&cwd).expect("mkdir cwd");
 
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "ack" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ack" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script");
+    install.write_script(&script);
 
     // `acp::handle_list_sessions` uses PAGE_SIZE = 50. Seed PAGE_SIZE + 3 sessions so the second
     // page is non-empty but small enough to keep the test fast.
@@ -3267,13 +3261,8 @@ model = "claude-sonnet-4-5"
     const TOTAL: usize = PAGE_SIZE + 3;
 
     let create_one = || -> String {
-        let mut child = meka_acp()
-            .arg("acp")
-            .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", &data_dir)
-            .env("HOME", temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+        let mut child = install
+            .meka(&["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3282,12 +3271,12 @@ model = "claude-sonnet-4-5"
         let mut stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         let stderr_pipe = child.stderr.take().expect("stderr");
-        let mut reader = BufReader::new(stdout);
+        let mut reader = support::TimedLines::spawn(stdout);
         let _stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            let mut r = BufReader::new(stderr_pipe);
-            while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-            buf
+            let mut buffer = String::new();
+            let mut stderr_reader = BufReader::new(stderr_pipe);
+            while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+            buffer
         });
 
         writeln!(
@@ -3297,15 +3286,15 @@ model = "claude-sonnet-4-5"
         .expect("init");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":1"));
 
-        let new_req = serde_json::json!({
+        let new_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "session/new",
             "params": { "cwd": cwd.clone(), "mcpServers": [] }
         });
-        writeln!(stdin, "{}", new_req).expect("session/new");
+        writeln!(stdin, "{new_request}").expect("session/new");
         let new_lines = read_until(&mut reader, window(15), |line| line.contains("\"id\":2"));
-        let sid = serde_json::from_str::<serde_json::Value>(
+        let session_id = serde_json::from_str::<serde_json::Value>(
             new_lines
                 .iter()
                 .find(|line| line.contains("\"id\":2"))
@@ -3317,22 +3306,22 @@ model = "claude-sonnet-4-5"
             .to_string();
 
         // One trivial prompt so the session has a row to surface.
-        let prompt_req = serde_json::json!({
+        let prompt_request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,
             "method": "session/prompt",
             "params": {
-                "sessionId": sid,
+                "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": "ping" }]
             }
         });
-        writeln!(stdin, "{}", prompt_req).expect("prompt");
+        writeln!(stdin, "{prompt_request}").expect("prompt");
         let _ = read_until(&mut reader, window(15), |line| line.contains("\"id\":3"));
 
         drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
-        sid
+        session_id
     };
 
     let mut seeded: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3343,13 +3332,8 @@ model = "claude-sonnet-4-5"
 
     // Now drive two session/list calls. The first returns the first page + a cursor; the second
     // uses the cursor to fetch the remainder.
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3358,12 +3342,12 @@ model = "claude-sonnet-4-5"
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let _stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     writeln!(
@@ -3379,7 +3363,7 @@ model = "claude-sonnet-4-5"
         "method": "session/list",
         "params": { "cwd": cwd.clone() }
     });
-    writeln!(stdin, "{}", list_req_a).expect("list page 1");
+    writeln!(stdin, "{list_req_a}").expect("list page 1");
     let lines_a = read_until(&mut reader, window(30), |line| line.contains("\"id\":5"));
     let line_a = lines_a
         .iter()
@@ -3406,7 +3390,7 @@ model = "claude-sonnet-4-5"
         "method": "session/list",
         "params": { "cwd": cwd.clone(), "cursor": cursor }
     });
-    writeln!(stdin, "{}", list_req_b).expect("list page 2");
+    writeln!(stdin, "{list_req_b}").expect("list page 2");
     let lines_b = read_until(&mut reader, window(30), |line| line.contains("\"id\":6"));
     let line_b = lines_b
         .iter()
@@ -3447,60 +3431,64 @@ model = "claude-sonnet-4-5"
 #[test]
 fn acp_permission_allow_always_skips_second_prompt() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "ask"
-enabled = ["read", "ask", "unrestricted"]
+default = "read"
+approvals = true
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            let target_a = config_dir.join("a.txt");
-            let target_b = config_dir.join("b.txt");
+            let target_a = work_dir_beside(config_dir).join("a.txt");
+            let target_b = work_dir_beside(config_dir).join("b.txt");
             // Two complete turns; both invoke write_file. Only the first should provoke a
             // permission round-trip.
             serde_json::json!([
                 // Turn 1 round 1.
                 [
-                    { "kind": "text", "text": "writing a..." },
-                    { "kind": "tool_use_start", "id": "call_a", "name": "write_file" },
+                    { "type": "text", "text": "writing a..." },
+                    { "type": "tool_use_start", "id": "call_a", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target_a.to_str().unwrap(), "content": "a" }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 // Turn 1 round 2.
                 [
-                    { "kind": "text", "text": "done a" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done a" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ],
                 // Turn 2 round 1.
                 [
-                    { "kind": "text", "text": "writing b..." },
-                    { "kind": "tool_use_start", "id": "call_b", "name": "write_file" },
+                    { "type": "text", "text": "writing b..." },
+                    { "type": "tool_use_start", "id": "call_b", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target_b.to_str().unwrap(), "content": "b" }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 // Turn 2 round 2.
                 [
-                    { "kind": "text", "text": "done b" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done b" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .window(Duration::from_secs(30))
         .build();
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
     // Turn 1: write_file → request_permission (allow_always).
-    let id_1 = harness.prompt(&sid, "write a");
+    let id_1 = harness.prompt(&session_id, "write a");
     let mut prompts_for_turn_1 = 0_usize;
     let _ = harness.await_response_with_dispatch(id_1, |value| {
         if value["method"] == "session/request_permission" {
@@ -3518,7 +3506,7 @@ enabled = ["read", "ask", "unrestricted"]
     });
 
     // Turn 2: same tool; sticky allow must suppress the round-trip.
-    let id_2 = harness.prompt(&sid, "write b");
+    let id_2 = harness.prompt(&session_id, "write b");
     let mut prompts_for_turn_2 = 0_usize;
     let _ = harness.await_response_with_dispatch(id_2, |value| {
         if value["method"] == "session/request_permission" {
@@ -3557,12 +3545,12 @@ enabled = ["read", "ask", "unrestricted"]
 fn acp_multi_session_create_and_isolate_messages() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "A says hello" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "A says hello" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "B says hello" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "B says hello" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
@@ -3570,38 +3558,38 @@ fn acp_multi_session_create_and_isolate_messages() {
     let sid_b = harness.new_session();
     assert_ne!(sid_a, sid_b, "second session/new must mint a distinct id",);
 
-    for (sid, expected_text) in [(&sid_a, "A says hello"), (&sid_b, "B says hello")] {
-        let id = harness.prompt(sid, "go");
-        let (updates, _) = harness.collect_updates(sid, id);
+    for (session_id, expected_text) in [(&sid_a, "A says hello"), (&sid_b, "B says hello")] {
+        let id = harness.prompt(session_id, "go");
+        let (updates, _) = harness.collect_updates(session_id, id);
         let saw_correct_chunk = updates.iter().any(|u| {
             u["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
                 && u["params"]["update"]["content"]["text"].as_str() == Some(expected_text)
         });
         assert!(
             saw_correct_chunk,
-            "session {} did not receive its expected agent_message_chunk; updates: {:?}",
-            sid, updates,
+            "session {session_id} did not receive its expected agent_message_chunk; updates: {updates:?}",
         );
     }
 }
 
 /// Two sessions prompting in parallel: A stalls in a long sleep, B completes a fast prompt. With
 /// multi-session ACP, B's response must arrive *well before* A's, proving the per-session mutex
-/// design lets sessions parallelise (the single-session `Mutex<ServerState>` would have serialised
+/// design lets sessions parallelize (the single-session `Mutex<ServerState>` would have serialized
 /// them).
 #[test]
 fn acp_multi_session_parallel_prompts_dont_serialize() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let install = Install::new();
+    let config_dir = install.config_dir();
 
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config.toml");
+    install.write_config(config_toml);
 
     // Windows CI workers have noticeably slower stdio IPC, so give A a longer stall and B a more
     // generous threshold while keeping the parallelism check (A:B ratio still ≥ 2:1).
@@ -3616,26 +3604,20 @@ model = "claude-sonnet-4-5"
     //   2. Session B's prompt: short response.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "A starting" },
-            { "kind": "sleep", "ms": a_stall_ms },
-            { "kind": "text", "text": "A done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "A starting" },
+            { "type": "sleep", "ms": a_stall_ms },
+            { "type": "text", "text": "A done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "B done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "B done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
-    let script_path = temp.path().join("script.json");
-    std::fs::write(&script_path, script.to_string()).expect("write script");
+    install.write_script(&script);
 
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", &script_path)
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3644,12 +3626,12 @@ model = "claude-sonnet-4-5"
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
     let deadline = Instant::now() + Duration::from_millis(a_stall_ms + 10_000);
 
@@ -3669,8 +3651,8 @@ model = "claude-sonnet-4-5"
             "method": "session/new",
             "params": { "cwd": config_dir.clone(), "mcpServers": [] }
         });
-        writeln!(stdin, "{}", req).expect("session/new");
-        let needle = format!("\"id\":{}", id);
+        writeln!(stdin, "{req}").expect("session/new");
+        let needle = format!("\"id\":{id}");
         let lines = read_until(&mut reader, deadline, |line| line.contains(&needle));
         let line = lines
             .iter()
@@ -3696,7 +3678,7 @@ model = "claude-sonnet-4-5"
             "prompt": [{ "type": "text", "text": "go A" }]
         }
     });
-    writeln!(stdin, "{}", prompt_a).expect("prompt A");
+    writeln!(stdin, "{prompt_a}").expect("prompt A");
 
     // Wait for A's "A starting" delta to surface before firing B, so we know A holds the runtime
     // mutex and isn't merely queued. A blind `sleep(300ms)` was the previous approach, but it was
@@ -3714,7 +3696,7 @@ model = "claude-sonnet-4-5"
             "prompt": [{ "type": "text", "text": "go B" }]
         }
     });
-    writeln!(stdin, "{}", prompt_b).expect("prompt B");
+    writeln!(stdin, "{prompt_b}").expect("prompt B");
 
     // Read responses for both. Track when each id is observed.
     let mut a_finish: Option<Duration> = None;
@@ -3744,10 +3726,10 @@ model = "claude-sonnet-4-5"
     let b = b_finish.expect("session B never responded");
 
     // B must finish *substantially* before A. A is stalled, so B should return well within the
-    // threshold. If the design serialised B behind A, B would take ≥ a_stall_ms.
+    // threshold. If the design serialized B behind A, B would take ≥ a_stall_ms.
     assert!(
         b < b_threshold,
-        "session B took {:?} (threshold {:?}), looks serialised behind A's {}ms stall;\nSTDERR:\n{}",
+        "session B took {:?} (threshold {:?}), looks serialized behind A's {}ms stall;\nSTDERR:\n{}",
         b,
         b_threshold,
         a_stall_ms,
@@ -3755,9 +3737,7 @@ model = "claude-sonnet-4-5"
     );
     assert!(
         a > b,
-        "session A finished before B ({:?} vs {:?}), script ordering wrong?",
-        a,
-        b,
+        "session A finished before B ({a:?} vs {b:?}), script ordering wrong?",
     );
 }
 
@@ -3767,8 +3747,11 @@ model = "claude-sonnet-4-5"
 #[test]
 fn acp_multi_session_set_mode_isolated() {
     const CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -3784,15 +3767,15 @@ enabled = ["read", "unrestricted"]
     // afterwards by inspecting the raw transcript to be sure none leaked.
     let set_id = harness.send_request(
         "session/set_mode",
-        serde_json::json!({ "sessionId": sid_a.clone(), "modeId": "unrestricted" }),
+        serde_json::json!({ "sessionId": sid_a, "modeId": "unrestricted" }),
     );
     // Track session-id of every current_mode_update we observe by inline-collecting alongside the
     // response.
-    let sid_a_owned = sid_a.clone();
-    let sid_b_owned = sid_b.clone();
+    let sid_a_owned = sid_a;
+    let sid_b_owned = sid_b;
     let mut saw_a_update_on_a = false;
     let mut saw_a_update_on_b = false;
-    let needle = format!("\"id\":{}", set_id);
+    let needle = format!("\"id\":{set_id}");
     let deadline = Instant::now() + harness.window;
     while Instant::now() < deadline {
         let mut line = String::new();
@@ -3830,17 +3813,17 @@ enabled = ["read", "unrestricted"]
 #[test]
 fn acp_multi_session_cancel_fires_only_target_session() {
     let script = serde_json::json!([
-        // Session A: stall 5s. Cancel arrives before sleep ends → cancelled.
+        // Session A: stall 5s. Cancel arrives before sleep ends → canceled.
         [
-            { "kind": "text", "text": "A stalling" },
-            { "kind": "sleep", "ms": 5000 },
-            { "kind": "text", "text": "A done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "A stalling" },
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "A done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // Session B: short response.
         [
-            { "kind": "text", "text": "B done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "B done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarnessBuilder::default()
@@ -3894,7 +3877,7 @@ fn acp_multi_session_cancel_fires_only_target_session() {
     assert_eq!(
         b_stop.as_deref(),
         Some("end_turn"),
-        "session B's cancel must NOT have fired, only A was cancelled",
+        "session B's cancel must NOT have fired, only A was canceled",
     );
 }
 
@@ -3912,17 +3895,17 @@ fn acp_session_close_while_prompt_in_flight_cancels_and_rejects_followups() {
     // Single round: a starting chunk, a 5s sleep that close should race against, then never-reached
     // completion text. If close doesn't cancel, the test will see end_turn after the full sleep.
     let script = serde_json::json!([[
-        { "kind": "text", "text": "starting..." },
-        { "kind": "sleep", "ms": 5000 },
-        { "kind": "text", "text": "done" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "starting..." },
+        { "type": "sleep", "ms": 5000 },
+        { "type": "text", "text": "done" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
     // Fire the stalled prompt, then wait for it to actually start streaming so we know the turn is
     // parked in the 5s sleep.
-    let prompt_id = harness.prompt(&sid, "stall");
+    let prompt_id = harness.prompt(&session_id, "stall");
     let start_deadline = Instant::now() + Duration::from_secs(5);
     let _ = read_until(&mut harness.reader, start_deadline, |line| {
         line.contains("starting...")
@@ -3932,10 +3915,10 @@ fn acp_session_close_while_prompt_in_flight_cancels_and_rejects_followups() {
     // mutex.
     let close_id = harness.send_request(
         "session/close",
-        serde_json::json!({ "sessionId": sid.clone() }),
+        serde_json::json!({ "sessionId": session_id.clone() }),
     );
 
-    // Both prompt_id (prompt cancelled) and close_id (close ok) must arrive well before the 5s
+    // Both prompt_id (prompt canceled) and close_id (close ok) must arrive well before the 5s
     // sleep would have finished.
     let response_deadline = Instant::now() + Duration::from_secs(3);
     let mut prompt_stop_reason: Option<String> = None;
@@ -3971,20 +3954,18 @@ fn acp_session_close_while_prompt_in_flight_cancels_and_rejects_followups() {
     );
 
     // Re-close: must error.
-    let re_close = harness.close_session(&sid);
+    let re_close = harness.close_session(&session_id);
     assert!(
         re_close["error"].is_object(),
-        "re-closing a closed session must error: {}",
-        re_close,
+        "re-closing a closed session must error: {re_close}",
     );
 
     // Prompt against the closed id: must error.
-    let stale_prompt_id = harness.prompt(&sid, "ghost");
+    let stale_prompt_id = harness.prompt(&session_id, "ghost");
     let stale = harness.await_response(stale_prompt_id);
     assert!(
         stale["error"].is_object(),
-        "prompting a closed session must error: {}",
-        stale,
+        "prompting a closed session must error: {stale}",
     );
 }
 
@@ -3999,21 +3980,23 @@ const ACP_INVALID_PARAMS: i64 = -32602;
 fn assert_invalid_params(response: &serde_json::Value, context: &str) {
     let error = response["error"]
         .as_object()
-        .unwrap_or_else(|| panic!("{}: expected error response, got: {}", context, response));
+        .unwrap_or_else(|| panic!("{context}: expected error response, got: {response}"));
     let code = error
         .get("code")
         .and_then(|c| c.as_i64())
-        .unwrap_or_else(|| panic!("{}: error missing numeric code: {}", context, response));
+        .unwrap_or_else(|| panic!("{context}: error missing numeric code: {response}"));
     assert_eq!(
         code, ACP_INVALID_PARAMS,
-        "{}: expected -32602 InvalidParams, got code {}: {}",
-        context, code, response,
+        "{context}: expected -32602 InvalidParams, got code {code}: {response}",
     );
 }
 
 const ACP_INVALID_PARAMS_CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
 
@@ -4035,11 +4018,11 @@ fn acp_session_prompt_rejects_unknown_session_and_audio_block() {
 
     // Open a real session and send an audio block (an unsupported content type); must yield
     // InvalidParams during content parsing, before any turn work.
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     let bad_block = harness.request(
         "session/prompt",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "prompt": [{
                 "type": "audio",
                 "data": "AAAA",
@@ -4050,23 +4033,26 @@ fn acp_session_prompt_rejects_unknown_session_and_audio_block() {
     assert_invalid_params(&bad_block, "prompt with audio content block");
 }
 
-/// With `vision = false` on the active profile, meka advertises `image: false` and rejects image
+/// With `vision = false` on the selected profile, meka advertises `image: false` and rejects image
 /// content blocks with `InvalidParams` (the rejection happens during parsing, before any turn).
 #[test]
 fn acp_session_prompt_rejects_image_when_vision_disabled() {
     const NO_VISION_CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 vision = false
 "#;
     let mut harness = AcpTestHarness::spawn(NO_VISION_CONFIG, None);
 
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     let rejected = harness.request(
         "session/prompt",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "prompt": [{
                 "type": "image",
                 "data": "AAAA",
@@ -4088,19 +4074,19 @@ fn acp_session_load_rejects_malformed_uuid_and_already_loaded() {
         "session/load",
         serde_json::json!({
             "sessionId": "not-a-uuid-at-all",
-            "cwd": harness.config_dir().to_path_buf(),
+            "cwd": harness.config_dir(),
             "mcpServers": []
         }),
     );
     assert_invalid_params(&bad_uuid, "load with malformed UUID");
 
     // Open a real session and immediately try to reload it.
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     let already = harness.request(
         "session/load",
         serde_json::json!({
-            "sessionId": sid,
-            "cwd": harness.config_dir().to_path_buf(),
+            "sessionId": session_id,
+            "cwd": harness.config_dir(),
             "mcpServers": []
         }),
     );
@@ -4119,7 +4105,7 @@ fn acp_session_resume_rejects_malformed_uuid_unknown_and_already_loaded() {
         "session/resume",
         serde_json::json!({
             "sessionId": "not-a-uuid",
-            "cwd": harness.config_dir().to_path_buf(),
+            "cwd": harness.config_dir(),
             "mcpServers": []
         }),
     );
@@ -4129,7 +4115,7 @@ fn acp_session_resume_rejects_malformed_uuid_unknown_and_already_loaded() {
         "session/resume",
         serde_json::json!({
             "sessionId": "00000000-0000-0000-0000-000000000000",
-            "cwd": harness.config_dir().to_path_buf(),
+            "cwd": harness.config_dir(),
             "mcpServers": []
         }),
     );
@@ -4137,12 +4123,12 @@ fn acp_session_resume_rejects_malformed_uuid_unknown_and_already_loaded() {
 
     // Open a real session and immediately try to resume it. The session is already in the active
     // map, so the resume guard rejects with `InvalidParams`.
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     let already = harness.request(
         "session/resume",
         serde_json::json!({
-            "sessionId": sid,
-            "cwd": harness.config_dir().to_path_buf(),
+            "sessionId": session_id,
+            "cwd": harness.config_dir(),
             "mcpServers": []
         }),
     );
@@ -4154,8 +4140,11 @@ fn acp_session_resume_rejects_malformed_uuid_unknown_and_already_loaded() {
 #[test]
 fn acp_session_set_mode_rejects_unknown_and_disabled() {
     let config = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -4163,12 +4152,12 @@ default = "read"
 enabled = ["read"]
 "#;
     let mut harness = AcpTestHarness::spawn(config, None);
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
     let unknown = harness.request(
         "session/set_mode",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "modeId": "definitely-not-a-mode"
         }),
     );
@@ -4179,7 +4168,7 @@ enabled = ["read"]
     let disabled = harness.request(
         "session/set_mode",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "modeId": "unrestricted"
         }),
     );
@@ -4191,19 +4180,11 @@ enabled = ["read"]
 /// would let a future client think we support a version we haven't shipped.
 #[test]
 fn acp_initialize_clamps_far_future_version_to_latest() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
-    std::fs::write(config_dir.join("config.toml"), ACP_INVALID_PARAMS_CONFIG)
-        .expect("write config.toml");
+    let install = Install::new();
+    install.write_config(ACP_INVALID_PARAMS_CONFIG);
 
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -4212,23 +4193,23 @@ fn acp_initialize_clamps_far_future_version_to_latest() {
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     // Far-future version, well past anything the schema crate would ever produce. Must come back
     // clamped to LATEST (V1).
-    let init_req = serde_json::json!({
+    let init_request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "initialize",
         "params": { "protocolVersion": 9999 }
     });
-    writeln!(stdin, "{}", init_req).expect("init");
+    writeln!(stdin, "{init_request}").expect("init");
     let lines = read_until(&mut reader, window(10), |line| line.contains("\"id\":1"));
 
     drop(stdin);
@@ -4248,17 +4229,17 @@ fn acp_initialize_clamps_far_future_version_to_latest() {
     let response: serde_json::Value = serde_json::from_str(line).expect("parse init");
     let result = response["result"]
         .as_object()
-        .unwrap_or_else(|| panic!("initialize must succeed, got: {}", response));
+        .unwrap_or_else(|| panic!("initialize must succeed, got: {response}"));
     let negotiated = result
         .get("protocolVersion")
         .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| panic!("missing numeric protocolVersion in: {}", response));
-    // LATEST is currently V1; assert ≤ 1 so the test stays valid if the SDK ever introduces a
-    // stable V2.
-    assert!(
-        negotiated <= 1,
-        "negotiated version must be clamped to ≤ LATEST (V1 today); got {}",
-        negotiated,
+        .unwrap_or_else(|| panic!("missing numeric protocolVersion in: {response}"));
+    // Exactly LATEST, which is V1 today. A `<=` here let an agent that echoed 0, or ignored the
+    // field, pass a test named for clamping. When the SDK ships a stable V2 this line moves with
+    // it, which is the point: the negotiated version is a fact worth pinning.
+    assert_eq!(
+        negotiated, 1,
+        "a far-future protocolVersion must be clamped to LATEST (V1 today)"
     );
 }
 
@@ -4274,28 +4255,27 @@ fn acp_initialize_clamps_far_future_version_to_latest() {
 #[test]
 fn acp_session_prompt_emits_agent_thought_chunk_for_thinking_block() {
     let script = serde_json::json!([[
-        { "kind": "thinking_delta", "text": "weighing options... " },
-        { "kind": "thinking_delta", "text": "considering safety" },
-        { "kind": "thinking_complete", "signature": null },
-        { "kind": "text", "text": "ok" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "thinking_delta", "text": "weighing options... " },
+        { "type": "thinking_delta", "text": "considering safety" },
+        { "type": "thinking_complete", "signature": null },
+        { "type": "text", "text": "ok" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "think first");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "think first");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     let thought = updates
         .iter()
         .find(|u| u["params"]["update"]["sessionUpdate"] == "agent_thought_chunk")
-        .unwrap_or_else(|| panic!("missing agent_thought_chunk; updates: {:?}", updates));
+        .unwrap_or_else(|| panic!("missing agent_thought_chunk; updates: {updates:?}"));
     let text = thought["params"]["update"]["content"]["text"]
         .as_str()
-        .unwrap_or_else(|| panic!("thought chunk missing text body: {}", thought));
+        .unwrap_or_else(|| panic!("thought chunk missing text body: {thought}"));
     assert!(
         text.contains("weighing options") || text.contains("considering safety"),
-        "agent_thought_chunk text should carry the scripted thinking content; got: {}",
-        text,
+        "agent_thought_chunk text should carry the scripted thinking content; got: {text}",
     );
     assert_eq!(response["result"]["stopReason"], "end_turn");
 }
@@ -4307,22 +4287,21 @@ fn acp_session_prompt_emits_agent_thought_chunk_for_thinking_block() {
 #[test]
 fn acp_session_prompt_keeps_empty_thinking_with_signature_quietly() {
     let script = serde_json::json!([[
-        { "kind": "thinking_complete", "signature": "OPAQUE_SIGNATURE_BLOB" },
-        { "kind": "text", "text": "answer" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "thinking_complete", "signature": "OPAQUE_SIGNATURE_BLOB" },
+        { "type": "text", "text": "answer" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     // No empty thought chunk: the redacted (text-less) thinking block stays off-screen.
     assert!(
         !updates
             .iter()
             .any(|u| u["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"),
-        "empty thinking block must not emit an agent_thought_chunk; updates: {:?}",
-        updates,
+        "empty thinking block must not emit an agent_thought_chunk; updates: {updates:?}",
     );
     let saw_answer = updates.iter().any(|u| {
         u["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
@@ -4332,8 +4311,7 @@ fn acp_session_prompt_keeps_empty_thinking_with_signature_quietly() {
     });
     assert!(
         saw_answer,
-        "assistant text should reach the client; got: {:?}",
-        updates
+        "assistant text should reach the client; got: {updates:?}"
     );
     assert_eq!(response["result"]["stopReason"], "end_turn");
 }
@@ -4346,19 +4324,19 @@ fn acp_session_prompt_keeps_empty_thinking_with_signature_quietly() {
 fn acp_session_prompt_nudges_thinking_only_turn() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "pondering silently" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "pondering silently" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "recovered answer" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "recovered answer" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     // The second round runs only if the nudge fired after the thinking-only first round.
     let saw_recovered = updates.iter().any(|u| {
@@ -4369,8 +4347,7 @@ fn acp_session_prompt_nudges_thinking_only_turn() {
     });
     assert!(
         saw_recovered,
-        "thinking-only turn must nudge and surface the second round's text; updates: {:?}",
-        updates,
+        "thinking-only turn must nudge and surface the second round's text; updates: {updates:?}",
     );
     assert_eq!(response["result"]["stopReason"], "end_turn");
 }
@@ -4381,17 +4358,16 @@ fn acp_session_prompt_nudges_thinking_only_turn() {
 #[test]
 fn acp_session_prompt_max_tokens_stop_reason() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "truncated mid-thought" },
-        { "kind": "message_end", "stop_reason": "max_tokens" }
+        { "type": "text", "text": "truncated mid-thought" },
+        { "type": "message_end", "stop_reason": "max_tokens" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "max_tokens",
-        "MaxTokens script → stopReason='max_tokens'; got: {}",
-        response,
+        "MaxTokens script → stopReason='max_tokens'; got: {response}",
     );
 }
 
@@ -4404,14 +4380,14 @@ fn acp_session_prompt_max_tokens_stop_reason() {
 fn acp_session_prompt_thought_chunk_routes_per_session() {
     let script = serde_json::json!([
         [
-            { "kind": "thinking_delta", "text": "session A only" },
-            { "kind": "thinking_complete", "signature": null },
-            { "kind": "text", "text": "A response" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "thinking_delta", "text": "session A only" },
+            { "type": "thinking_complete", "signature": null },
+            { "type": "text", "text": "A response" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "B response" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "B response" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
@@ -4428,15 +4404,13 @@ fn acp_session_prompt_thought_chunk_routes_per_session() {
         updates_a
             .iter()
             .any(|u| u["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"),
-        "session A must observe its agent_thought_chunk; updates: {:?}",
-        updates_a,
+        "session A must observe its agent_thought_chunk; updates: {updates_a:?}",
     );
     assert!(
         updates_b
             .iter()
             .all(|u| u["params"]["update"]["sessionUpdate"] != "agent_thought_chunk"),
-        "session B must not see A's agent_thought_chunk; updates: {:?}",
-        updates_b,
+        "session B must not see A's agent_thought_chunk; updates: {updates_b:?}",
     );
 }
 
@@ -4448,69 +4422,189 @@ fn acp_session_prompt_thought_chunk_routes_per_session() {
 #[test]
 fn acp_session_prompt_surfaces_provider_error_as_jsonrpc_error() {
     let script = serde_json::json!([[
-        { "kind": "fail", "message": "scripted provider failure" }
+        { "type": "fail", "message": "scripted provider failure" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
     let response = harness.await_response(id);
     assert!(
         response.get("error").is_some(),
-        "non-Interrupted run_turn error must surface as JSON-RPC error; got: {}",
-        response,
+        "non-Interrupted run_turn error must surface as JSON-RPC error; got: {response}",
     );
     assert!(
         response["result"].is_null(),
-        "JSON-RPC response carries either result or error, not both; got: {}",
-        response,
+        "JSON-RPC response carries either result or error, not both; got: {response}",
     );
     // `agent_client_protocol::util::internal_error` sets the standard `"Internal error"` JSON-RPC
     // message and stuffs the explanatory string into `data`.
     let message = response["error"]["message"]
         .as_str()
-        .unwrap_or_else(|| panic!("error.message must be a string: {}", response));
+        .unwrap_or_else(|| panic!("error.message must be a string: {response}"));
     assert_eq!(message, "Internal error");
     let code = response["error"]["code"]
         .as_i64()
-        .unwrap_or_else(|| panic!("error.code must be an integer: {}", response));
+        .unwrap_or_else(|| panic!("error.code must be an integer: {response}"));
     assert_eq!(code, -32603, "internal_error → JSON-RPC code -32603");
     let data = response["error"]["data"]
         .as_str()
-        .unwrap_or_else(|| panic!("error.data must carry the detail string: {}", response));
+        .unwrap_or_else(|| panic!("error.data must carry the detail string: {response}"));
     assert!(
-        data.contains("meka turn failed"),
-        "error.data should be the internal_error prefix; got: {}",
-        data,
+        data.contains("the provider rejected or failed this turn"),
+        "error.data should carry meka's own sentence about the failure; got: {data}",
     );
     assert!(
         data.contains("scripted provider failure"),
-        "error.data should propagate the underlying provider error text; got: {}",
-        data,
+        "and the upstream's own text, which `relay_provider_errors` leaves on by default; got: \
+         {data}",
     );
+}
+
+/// What an editor is told about a failed turn follows the operator's switch, as it does over HTTP.
+///
+/// `meka acp` formatted every failure as `meka turn failed: {error}`, so an upstream body naming
+/// the operator's account with the provider went to the client whatever `[serve]
+/// relay_provider_errors` said -- and a deployment that had turned it off believed the text was
+/// withheld everywhere, because the only surface it had checked was the HTTP one.
+///
+/// Both settings, because only one of them is the default. meka's own sentence is asserted in both,
+/// which is what makes the member additive rather than a replacement for it.
+#[test]
+fn an_acp_turn_failure_relays_the_upstream_only_when_the_operator_asked() {
+    let secret = "acct-0f3c-operator-only";
+    for (relay, expect_relayed) in [
+        ("", true),
+        ("\n[serve]\nrelay_provider_errors = false\n", false),
+    ] {
+        let script = serde_json::json!([[
+            { "type": "fail", "message": format!("API returned status 401: {{\"account_uuid\":\"{secret}\"}}") }
+        ]]);
+        let config = format!("{ACP_INVALID_PARAMS_CONFIG}{relay}");
+        let mut harness = AcpTestHarness::spawn(&config, Some(script));
+        let session_id = harness.new_session();
+        let id = harness.prompt(&session_id, "go");
+        let response = harness.await_response(id);
+
+        let data = response["error"]["data"].as_str().unwrap_or_else(|| {
+            panic!("a failed turn must answer with an error carrying `data`: {response}")
+        });
+        assert!(
+            data.contains("the provider rejected or failed this turn"),
+            "meka's own sentence is the same either way: {data}"
+        );
+        assert_eq!(
+            data.contains(secret),
+            expect_relayed,
+            "with `{relay}` the upstream body must {} the client: {data}",
+            if expect_relayed { "reach" } else { "not reach" }
+        );
+        // The whole error object, so a member moved elsewhere in the payload still counts as
+        // having reached the client.
+        if !expect_relayed {
+            assert!(
+                !response["error"].to_string().contains(secret),
+                "the upstream body reached the client by another route: {response}"
+            );
+        }
+    }
+}
+
+/// A load refused by the builder must not have moved the session first.
+///
+/// `session/load` wrote the client's `cwd` and `additionalDirectories` onto the row before
+/// `build_session_runtime` could refuse, so a load that failed -- a profile that has left
+/// `config.toml`, an account with no stored credential -- came back an error having already
+/// repointed the session. `cwd` is the writable boundary at `workspace` and the directory a
+/// scheduled gate is re-checked in, so the next process to open that session ran it somewhere the
+/// user never asked for, on the strength of a request meka had declined.
+///
+/// The refusal used here is the profile leaving `config.toml`, moved by a second connection to the
+/// store, which is what `an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names` uses for
+/// the same reason: it is the one builder refusal a test can produce without a credential.
+///
+/// `session/resume` is the sibling door and is exercised in the same run.
+#[test]
+fn an_acp_load_or_resume_refused_by_the_builder_leaves_the_workspace_alone() {
+    for method in ["session/load", "session/resume"] {
+        let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+        let session_id = harness.new_session();
+        let closed = harness.close_session(&session_id);
+        assert!(closed["result"].is_object(), "close must succeed: {closed}");
+
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let moved = connection
+            .execute("UPDATE sessions SET profile = 'retired' WHERE id = ?1", [
+                &session_id,
+            ])
+            .expect("repin the session");
+        assert_eq!(moved, 1, "the repin matched no row");
+        let cwd_before: Option<String> = connection
+            .query_row(
+                "SELECT cwd FROM sessions WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .expect("read the recorded directory");
+        drop(connection);
+
+        // A directory that exists and differs from the session's, so a handler that got as far as
+        // the write leaves a difference this test can see.
+        let elsewhere = harness.config_dir().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere)
+            .expect("create the directory the load would move it to");
+
+        let refused = harness.request(
+            method,
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": elsewhere.to_string_lossy(),
+                "mcpServers": [],
+            }),
+        );
+        assert!(
+            refused.get("error").is_some(),
+            "{method}: a profile the configuration no longer has must be refused: {refused}"
+        );
+
+        let connection = rusqlite::Connection::open(harness.database()).expect("reopen the store");
+        let cwd_after: Option<String> = connection
+            .query_row(
+                "SELECT cwd FROM sessions WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .expect("the row is still readable");
+        assert_eq!(
+            cwd_before,
+            cwd_after,
+            "{method}: refusing after the write is not an equivalent answer; the session was \
+             repointed at {}",
+            elsewhere.display()
+        );
+    }
 }
 
 /// A transient failure (`FailRetryable`) on the first attempt must be retried automatically:
 /// `Agent::run_streaming` re-invokes `provider.stream()`, consuming the mock's next scripted round,
-/// and the turn completes successfully with exactly the second round's content — no duplication,
+/// and the turn completes successfully with exactly the second round's content: no duplication,
 /// no error surfaced to the client.
 #[test]
 fn acp_session_prompt_retries_transient_provider_error_then_succeeds() {
     let script = serde_json::json!([
-        [{ "kind": "fail_retryable", "message": "overloaded", "retry_after_secs": null }],
+        [{ "type": "fail_retryable", "message": "overloaded", "retry_after_secs": null }],
         [
-            { "kind": "text", "text": "recovered" },
-            { "kind": "message_end", "stop_reason": "end_turn" },
+            { "type": "text", "text": "recovered" },
+            { "type": "message_end", "stop_reason": "end_turn" },
         ],
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     assert!(
         response.get("error").is_none(),
-        "the retry must be invisible to the client; got error: {}",
-        response,
+        "the retry must be invisible to the client; got error: {response}",
     );
 
     let text_chunks: Vec<&str> = updates
@@ -4522,8 +4616,7 @@ fn acp_session_prompt_retries_transient_provider_error_then_succeeds() {
         text_chunks,
         vec!["recovered"],
         "exactly one clean copy of the recovered round's text, no duplication from the failed \
-         first attempt; updates: {:?}",
-        updates,
+         first attempt; updates: {updates:?}",
     );
 }
 
@@ -4533,9 +4626,9 @@ fn acp_session_prompt_retries_transient_provider_error_then_succeeds() {
 fn acp_session_prompt_exhausts_retries_then_surfaces_error() {
     // MAX_PROVIDER_RETRIES (2) retries + the initial attempt = 3 total attempts, all failing.
     let script = serde_json::json!([
-        [{ "kind": "fail_retryable", "message": "overloaded 1", "retry_after_secs": null }],
-        [{ "kind": "fail_retryable", "message": "overloaded 2", "retry_after_secs": null }],
-        [{ "kind": "fail_retryable", "message": "overloaded 3", "retry_after_secs": null }],
+        [{ "type": "fail_retryable", "message": "overloaded 1", "retry_after_secs": null }],
+        [{ "type": "fail_retryable", "message": "overloaded 2", "retry_after_secs": null }],
+        [{ "type": "fail_retryable", "message": "overloaded 3", "retry_after_secs": null }],
     ]);
     // The default backoff (1s + 2s = 3s of sleeping) plus process overhead is comfortably under
     // 15s, but give this one extra headroom since it's the slowest test in the suite by design.
@@ -4544,35 +4637,33 @@ fn acp_session_prompt_exhausts_retries_then_surfaces_error() {
         .script(script)
         .window(std::time::Duration::from_secs(25))
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
     let response = harness.await_response(id);
 
     assert!(
         response.get("error").is_some(),
-        "exhausted retries must surface as a JSON-RPC error; got: {}",
-        response,
+        "exhausted retries must surface as a JSON-RPC error; got: {response}",
     );
     let data = response["error"]["data"]
         .as_str()
-        .unwrap_or_else(|| panic!("error.data must carry the detail string: {}", response));
+        .unwrap_or_else(|| panic!("error.data must carry the detail string: {response}"));
     // The last attempt's message is what propagates.
     assert!(
         data.contains("overloaded 3"),
-        "error.data should carry the final attempt's message; got: {}",
-        data,
+        "error.data should carry the final attempt's message; got: {data}",
     );
 }
 
 /// A non-retryable failure (`Fail`, mapping to a plain `MekaError::Provider`) must still fail
-/// immediately with no backoff delay — a regression guard against over-broadening the new retry
+/// immediately with no backoff delay, which guards against over-broadening the retry
 /// classification to errors that were never meant to retry.
 #[test]
 fn acp_session_prompt_plain_fail_is_not_retried() {
-    let script = serde_json::json!([[{ "kind": "fail", "message": "permanent failure" }]]);
+    let script = serde_json::json!([[{ "type": "fail", "message": "permanent failure" }]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
     let started = std::time::Instant::now();
     let response = harness.await_response(id);
     assert!(
@@ -4582,21 +4673,19 @@ fn acp_session_prompt_plain_fail_is_not_retried() {
     );
     assert!(
         response.get("error").is_some(),
-        "plain Fail must still surface as a JSON-RPC error; got: {}",
-        response,
+        "plain Fail must still surface as a JSON-RPC error; got: {response}",
     );
     let data = response["error"]["data"]
         .as_str()
-        .unwrap_or_else(|| panic!("error.data must carry the detail string: {}", response));
+        .unwrap_or_else(|| panic!("error.data must carry the detail string: {response}"));
     assert!(
         data.contains("permanent failure"),
-        "error.data should propagate the underlying provider error text; got: {}",
-        data,
+        "error.data should propagate the underlying provider error text; got: {data}",
     );
 }
 
 /// Once the frontend has already shown text this attempt, a subsequent transient error in the
-/// SAME round must NOT trigger a retry — retrying after the user has seen partial output would
+/// SAME round must NOT trigger a retry: retrying after the user has seen partial output would
 /// duplicate/corrupt what's on screen. The mock's per-round-is-one-`stream()`-call model means a
 /// `FailRetryable` after a `Text` event in the same round exercises exactly this: the driver sends
 /// the text (setting `content_started`), then fails, and `run_streaming` must propagate the error
@@ -4605,23 +4694,22 @@ fn acp_session_prompt_plain_fail_is_not_retried() {
 fn acp_session_prompt_does_not_retry_once_content_shown() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "partial" },
-            { "kind": "fail_retryable", "message": "overloaded mid-stream", "retry_after_secs": null },
+            { "type": "text", "text": "partial" },
+            { "type": "fail_retryable", "message": "overloaded mid-stream", "retry_after_secs": null },
         ],
         [
-            { "kind": "text", "text": "should never be reached" },
-            { "kind": "message_end", "stop_reason": "end_turn" },
+            { "type": "text", "text": "should never be reached" },
+            { "type": "message_end", "stop_reason": "end_turn" },
         ],
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     assert!(
         response.get("error").is_some(),
-        "a transient error after content was shown must surface immediately, not retry; got: {}",
-        response,
+        "a transient error after content was shown must surface immediately, not retry; got: {response}",
     );
     let text_chunks: Vec<&str> = updates
         .iter()
@@ -4631,8 +4719,7 @@ fn acp_session_prompt_does_not_retry_once_content_shown() {
     assert_eq!(
         text_chunks,
         vec!["partial"],
-        "only the pre-failure text must appear; the second round must never be consumed: {:?}",
-        updates,
+        "only the pre-failure text must appear; the second round must never be consumed: {updates:?}",
     );
 }
 
@@ -4645,54 +4732,58 @@ fn acp_session_prompt_does_not_retry_once_content_shown() {
 #[test]
 fn acp_session_prompt_request_permission_failure_marks_disconnect() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "ask"
-enabled = ["read", "ask", "unrestricted"]
+default = "read"
+approvals = true
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            let target = config_dir.join("would-write.txt");
+            let target = work_dir_beside(config_dir).join("would-write.txt");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "writing..." },
-                    { "kind": "tool_use_start", "id": "call_write", "name": "write_file" },
+                    { "type": "text", "text": "writing..." },
+                    { "type": "tool_use_start", "id": "call_write", "name": "write_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target.to_str().unwrap(), "content": "hi" }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 // Second round would emit "done" + end_turn, but the disconnect-mark must
                 // short-circuit the loop before it streams. If the mark wires up correctly this
                 // round is never drained.
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "write it");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "write it");
 
-    let (_updates, response) =
-        harness.collect_updates_with_dispatch(&sid, id, |value| match value["method"].as_str() {
+    let (_updates, response) = harness.collect_updates_with_dispatch(&session_id, id, |value| {
+        match value["method"].as_str() {
             Some("session/request_permission") => Some(jsonrpc_error(
                 value["id"].clone(),
                 "synthetic client error response",
             )),
             _ => None,
-        });
+        }
+    });
 
     assert_eq!(
         response["result"]["stopReason"], "cancelled",
-        "permission-Err must mark disconnect → next loop iter short-circuits; got: {}",
-        response,
+        "permission-Err must mark disconnect → next loop iter short-circuits; got: {response}",
     );
 }
 
@@ -4716,28 +4807,28 @@ fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
             "fs": { "readTextFile": true, "writeTextFile": false }
         }))
         .pre_spawn(move |config_dir| {
-            let target = config_dir.join("delegated-line-limit.txt");
+            let target = fixture_beside(config_dir, "delegated-line-limit.txt");
             std::fs::write(&target, &on_disk_marker_for_seed).expect("write target");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "reading partial..." },
-                    { "kind": "tool_use_start", "id": "call_read", "name": "read_file" },
+                    { "type": "text", "text": "reading partial..." },
+                    { "type": "tool_use_start", "id": "call_read", "name": "read_file" },
                     {
-                        "kind": "tool_use_end",
+                        "type": "tool_use_end",
                         "input": { "path": target.to_string_lossy(), "offset": 9, "limit": 50 }
                     },
-                    { "kind": "message_end", "stop_reason": "tool_use" }
+                    { "type": "message_end", "stop_reason": "tool_use" }
                 ],
                 [
-                    { "kind": "text", "text": "done" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
-    let target = harness.config_dir().join("delegated-line-limit.txt");
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "read partial");
+    let target = harness.work_dir().join("delegated-line-limit.txt");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read partial");
 
     let mut saw_request = false;
     let mut observed_line = serde_json::Value::Null;
@@ -4775,21 +4866,21 @@ fn acp_fs_read_text_file_fetches_the_whole_document_and_windows_locally() {
 
 // === V2 protocol conformance ========================================
 
-/// `ContentBlock::ResourceLink` is part of the ACP baseline. meka used to reject it with
-/// `InvalidParams`; the new behavior flattens the link into a tag the model can see.
+/// `ContentBlock::ResourceLink` is part of the ACP baseline, so meka flattens the link into a tag
+/// the model can see rather than refusing it with `InvalidParams`.
 #[test]
 fn acp_session_prompt_accepts_resource_link_baseline() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "ack" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "ack" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     // session/prompt with a resource_link block; assert no error.
     let id = harness.send_request(
         "session/prompt",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "prompt": [
                 { "type": "text", "text": "describe this:" },
                 {
@@ -4804,8 +4895,7 @@ fn acp_session_prompt_accepts_resource_link_baseline() {
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "resource_link content block must be accepted, not error: {}",
-        response,
+        "resource_link content block must be accepted, not error: {response}",
     );
 }
 
@@ -4814,15 +4904,15 @@ fn acp_session_prompt_accepts_resource_link_baseline() {
 #[test]
 fn acp_session_prompt_accepts_embedded_resource() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "ack" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "ack" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     let id = harness.send_request(
         "session/prompt",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "prompt": [
                 { "type": "text", "text": "summarize:" },
                 {
@@ -4839,8 +4929,7 @@ fn acp_session_prompt_accepts_embedded_resource() {
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "embedded resource block must be accepted, not error: {}",
-        response,
+        "embedded resource block must be accepted, not error: {response}",
     );
 }
 
@@ -4849,19 +4938,19 @@ fn acp_session_prompt_accepts_embedded_resource() {
 #[test]
 fn acp_session_prompt_accepts_image_with_vision() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "i see it" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "i see it" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     // A 1x1 transparent PNG, base64-encoded, and it has to be a real one: meka decodes every
-    // attachment before forwarding it. The fixture here used to be a hand-mangled PNG with a bad
-    // IDAT checksum and a truncated final chunk, which passed only because nothing ever decoded it.
+    // attachment before forwarding it, so a hand-mangled PNG with a bad IDAT checksum would be
+    // refused here rather than exercise the path.
     let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     let id = harness.send_request(
         "session/prompt",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "prompt": [
                 { "type": "text", "text": "what is this?" },
                 { "type": "image", "data": png_b64, "mimeType": "image/png" }
@@ -4871,8 +4960,7 @@ fn acp_session_prompt_accepts_image_with_vision() {
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "image block must be accepted when vision is on: {}",
-        response,
+        "image block must be accepted when vision is on: {response}",
     );
 }
 
@@ -4883,25 +4971,24 @@ fn acp_session_prompt_accepts_image_with_vision() {
 #[test]
 fn acp_session_prompt_cancelled_after_provider_error() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "starting..." },
-        { "kind": "sleep", "ms": 5000 },
-        { "kind": "fail", "message": "would-be internal error" }
+        { "type": "text", "text": "starting..." },
+        { "type": "sleep", "ms": 5000 },
+        { "type": "fail", "message": "would-be internal error" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "go");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "go");
 
     // Wait for "starting..." to confirm the turn is parked in the sleep, then fire cancel.
     let barrier = Instant::now() + Duration::from_secs(3);
     let _ = read_until(&mut harness.reader, barrier, |line| {
         line.contains("starting...")
     });
-    harness.cancel(&sid);
+    harness.cancel(&session_id);
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "cancelled",
-        "post-cancel error must surface as Cancelled, not internal_error: {}",
-        response,
+        "post-cancel error must surface as Cancelled, not internal_error: {response}",
     );
 }
 
@@ -4918,58 +5005,57 @@ fn acp_a_cancel_sent_straight_after_a_prompt_stops_it() {
     // finish on its own.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second starting..." },
-            { "kind": "sleep", "ms": 5000 },
-            { "kind": "text", "text": "second done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second starting..." },
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "second done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
-    let id_1 = harness.prompt(&sid, "first");
+    let id_1 = harness.prompt(&session_id, "first");
     let response_1 = harness.await_response(id_1);
     assert_eq!(response_1["result"]["stopReason"], "end_turn");
 
     // Fired back to back with no wait between them, so the cancel is dispatched while the prompt
     // is still on its way to its handler.
-    let id_2 = harness.prompt(&sid, "second");
-    harness.cancel(&sid);
+    let id_2 = harness.prompt(&session_id, "second");
+    harness.cancel(&session_id);
     let response_2 = harness.await_response(id_2);
     assert_eq!(
         response_2["result"]["stopReason"], "cancelled",
-        "a cancel racing its own prompt must still stop it: {}",
-        response_2,
+        "a cancel racing its own prompt must still stop it: {response_2}",
     );
 }
 
-/// Cancelling a turn that is actually running must not disarm the next one. The latch exists for
+/// Canceling a turn that is actually running must not disarm the next one. The latch exists for
 /// the cancel no turn received; a cancel a live turn consumed has already done its work.
 #[test]
 fn acp_cancelling_a_running_turn_leaves_the_next_one_alone() {
     // First turn sleeps so the cancel lands mid-flight. Second turn is short: it must run.
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first starting..." },
-            { "kind": "sleep", "ms": 5000 },
-            { "kind": "text", "text": "first done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first starting..." },
+            { "type": "sleep", "ms": 5000 },
+            { "type": "text", "text": "first done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
     // Cancel only once the turn is provably streaming, so this tests the in-flight door rather
     // than racing the between-turns one it is meant to be distinguished from.
-    let id_1 = harness.prompt(&sid, "first");
+    let id_1 = harness.prompt(&session_id, "first");
     let barrier = Instant::now() + Duration::from_secs(3);
     let started = read_until(&mut harness.reader, barrier, |line| {
         line.contains("first starting...")
@@ -4980,41 +5066,40 @@ fn acp_cancelling_a_running_turn_leaves_the_next_one_alone() {
             .any(|line| line.contains("first starting...")),
         "first turn never began streaming",
     );
-    harness.cancel(&sid);
+    harness.cancel(&session_id);
     let response_1 = harness.await_response(id_1);
     assert_eq!(response_1["result"]["stopReason"], "cancelled");
 
-    let id_2 = harness.prompt(&sid, "second");
+    let id_2 = harness.prompt(&session_id, "second");
     let response_2 = harness.await_response(id_2);
     assert_eq!(
         response_2["result"]["stopReason"], "end_turn",
-        "a cancel the previous turn consumed must not carry into the next prompt: {}",
-        response_2,
+        "a cancel the previous turn consumed must not carry into the next prompt: {response_2}",
     );
 }
 
 /// A cancel with no prompt on its way is spent on nothing, not saved for a later one.
 ///
 /// The latch is for a prompt the editor has already sent, so a stop with nothing pending has
-/// nothing to stop. Cancelling twice is the way a user reaches this without meaning to: the second
+/// nothing to stop. Canceling twice is the way a user reaches this without meaning to: the second
 /// click lands after the turn resolved, and latching it kills whatever they type next.
 #[test]
 fn acp_a_cancel_with_nothing_pending_does_not_touch_a_later_prompt() {
     let script = serde_json::json!([
         [
-            { "kind": "text", "text": "first starting..." },
-            { "kind": "sleep", "ms": 5000 },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "first starting..." },
+            { "type": "sleep", "ms": 5000 },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "second done" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "second done" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
-    let id_1 = harness.prompt(&sid, "first");
+    let id_1 = harness.prompt(&session_id, "first");
     let barrier = Instant::now() + Duration::from_secs(3);
     let started = read_until(&mut harness.reader, barrier, |line| {
         line.contains("first starting...")
@@ -5025,20 +5110,19 @@ fn acp_a_cancel_with_nothing_pending_does_not_touch_a_later_prompt() {
             .any(|line| line.contains("first starting...")),
         "first turn never began streaming",
     );
-    harness.cancel(&sid);
+    harness.cancel(&session_id);
     assert_eq!(
         harness.await_response(id_1)["result"]["stopReason"],
         "cancelled"
     );
 
     // The second stop, now that the turn it would have interrupted is already resolved.
-    harness.cancel(&sid);
-    let next = harness.prompt(&sid, "second");
+    harness.cancel(&session_id);
+    let next = harness.prompt(&session_id, "second");
     let response = harness.await_response(next);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "a stop with nothing to stop must not be saved for the next prompt: {}",
-        response,
+        "a stop with nothing to stop must not be saved for the next prompt: {response}",
     );
 }
 
@@ -5049,36 +5133,34 @@ fn acp_a_cancel_with_nothing_pending_does_not_touch_a_later_prompt() {
 #[test]
 fn acp_a_refused_prompt_spends_the_cancel_latched_for_it() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "ran" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "ran" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
-    // Fired without waiting, then cancelled straight away, so the cancel is handled while this
+    // Fired without waiting, then canceled straight away, so the cancel is handled while this
     // prompt is still on its way and is latched for it. The `audio` block is then refused during
     // content validation, before the turn ever resolves a session or publishes a token.
     let refused_id = harness.send_request(
         "session/prompt",
         serde_json::json!({
-            "sessionId": sid,
+            "sessionId": session_id,
             "prompt": [{ "type": "audio", "data": "AAAA", "mimeType": "audio/wav" }],
         }),
     );
-    harness.cancel(&sid);
+    harness.cancel(&session_id);
     let refused = harness.await_response(refused_id);
     assert!(
         refused["error"].is_object(),
-        "an audio block must be refused: {}",
-        refused,
+        "an audio block must be refused: {refused}",
     );
 
-    let next = harness.prompt(&sid, "after the refusal");
+    let next = harness.prompt(&session_id, "after the refusal");
     let response = harness.await_response(next);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "a refused prompt must not leave its cancel for the next one: {}",
-        response,
+        "a refused prompt must not leave its cancel for the next one: {response}",
     );
 }
 
@@ -5097,13 +5179,13 @@ fn acp_a_refused_prompt_spends_the_cancel_latched_for_it() {
 #[test]
 fn acp_a_refused_prompt_does_not_hand_its_cancel_to_the_next_one() {
     let turn = serde_json::json!([
-        { "kind": "text", "text": "the queued prompt ran" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "the queued prompt ran" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]);
     const PASSES: usize = 10;
     let script = serde_json::Value::Array(vec![turn; PASSES]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
     for pass in 0..PASSES {
         // All three written back to back with no waiting, so the dispatch loop takes them in
@@ -5113,42 +5195,42 @@ fn acp_a_refused_prompt_does_not_hand_its_cancel_to_the_next_one() {
         let refused_id = harness.send_request(
             "session/prompt",
             serde_json::json!({
-                "sessionId": sid,
+                "sessionId": session_id,
                 "prompt": [{ "type": "text", "text": "   " }],
             }),
         );
-        harness.cancel(&sid);
-        let queued_id = harness.prompt(&sid, "queued behind the refusal");
+        harness.cancel(&session_id);
+        let queued_id = harness.prompt(&session_id, "queued behind the refusal");
 
         let refused = harness.await_response(refused_id);
         assert!(
             refused["error"].is_object(),
-            "pass {}: a whitespace-only prompt must be refused: {}",
-            pass,
-            refused,
+            "pass {pass}: a whitespace-only prompt must be refused: {refused}",
         );
         let queued = harness.await_response(queued_id);
         assert_eq!(
             queued["result"]["stopReason"], "end_turn",
-            "pass {}: a cancel armed before this prompt existed must not stop it: {}",
-            pass, queued,
+            "pass {pass}: a cancel armed before this prompt existed must not stop it: {queued}",
         );
     }
 }
 
-/// `session/set_mode` no longer needs the runtime mutex. Mid-turn mode change takes effect
-/// without waiting for the turn to finish.
+/// `session/set_mode` does not take the runtime mutex: a mid-turn level change takes effect without
+/// waiting for the turn to finish.
 #[test]
 fn acp_session_set_mode_during_long_prompt_does_not_block() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "running..." },
-        { "kind": "sleep", "ms": 2000 },
-        { "kind": "text", "text": "done" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "running..." },
+        { "type": "sleep", "ms": 2000 },
+        { "type": "text", "text": "done" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     const CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -5156,8 +5238,8 @@ default = "read"
 enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, Some(script));
-    let sid = harness.new_session();
-    let prompt_id = harness.prompt(&sid, "go");
+    let session_id = harness.new_session();
+    let prompt_id = harness.prompt(&session_id, "go");
 
     // Wait for the turn to start streaming before firing set_mode.
     let barrier = Instant::now() + Duration::from_secs(3);
@@ -5167,61 +5249,62 @@ enabled = ["read", "unrestricted"]
 
     // set_mode while the turn is mid-sleep must return promptly (well under the sleep's 2s).
     let start = Instant::now();
-    let set_response = harness.set_mode(&sid, "unrestricted");
+    let set_response = harness.set_mode(&session_id, "unrestricted");
     let elapsed = start.elapsed();
     assert!(
         set_response["result"].is_object(),
-        "set_mode must succeed mid-turn: {}",
-        set_response,
+        "set_mode must succeed mid-turn: {set_response}",
     );
     assert!(
         elapsed < Duration::from_secs(1),
-        "set_mode must not block on the runtime mutex; took {:?}",
-        elapsed,
+        "set_mode must not block on the runtime mutex; took {elapsed:?}",
     );
 
     let prompt_response = harness.await_response(prompt_id);
     assert_eq!(prompt_response["result"]["stopReason"], "end_turn");
 }
 
-/// `session/cancel` during an `Ask`-mode permission prompt resolves the turn promptly.
-/// Without the race against the cancellation token, the agent hangs inside `request_permission`
-/// until the client answers.
+/// `session/cancel` during an approval prompt resolves the turn promptly. Without the race against
+/// the cancellation token, the agent hangs inside `request_permission` until the client answers.
 #[test]
 fn acp_session_request_permission_cancelled_by_session_cancel() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
-default = "ask"
-enabled = ["read", "ask", "unrestricted"]
+default = "read"
+approvals = true
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            let target = config_dir.join("doomed.txt");
+            let target = work_dir_beside(config_dir).join("doomed.txt");
             serde_json::json!([[
-                { "kind": "text", "text": "writing..." },
-                { "kind": "tool_use_start", "id": "call_w", "name": "write_file" },
+                { "type": "text", "text": "writing..." },
+                { "type": "tool_use_start", "id": "call_w", "name": "write_file" },
                 {
-                    "kind": "tool_use_end",
+                    "type": "tool_use_end",
                     "input": { "path": target.to_str().unwrap(), "content": "x" }
                 },
-                { "kind": "message_end", "stop_reason": "tool_use" }
+                { "type": "message_end", "stop_reason": "tool_use" }
             ]])
         })
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "write");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "write");
 
     // Watch for the permission request to fire, then cancel without answering. The turn should
     // resolve `cancelled`.
-    let sid_clone = sid.clone();
+    let sid_clone = session_id.clone();
     let mut saw_permission = false;
     let mut cancel_fired = false;
-    let needle = format!("\"id\":{}", id);
+    let needle = format!("\"id\":{id}");
     let mut response: Option<serde_json::Value> = None;
     let deadline = Instant::now() + harness.window;
     while Instant::now() < deadline {
@@ -5240,7 +5323,7 @@ enabled = ["read", "ask", "unrestricted"]
                     "method": "session/cancel",
                     "params": { "sessionId": sid_clone }
                 });
-                writeln!(harness.stdin, "{}", cancel_notif).expect("write cancel");
+                writeln!(harness.stdin, "{cancel_notif}").expect("write cancel");
                 cancel_fired = true;
             }
         }
@@ -5253,8 +5336,7 @@ enabled = ["read", "ask", "unrestricted"]
     assert!(saw_permission, "permission request must have fired");
     assert_eq!(
         response["result"]["stopReason"], "cancelled",
-        "cancel during request_permission must resolve as Cancelled: {}",
-        response,
+        "cancel during request_permission must resolve as Cancelled: {response}",
     );
 }
 
@@ -5262,19 +5344,11 @@ enabled = ["read", "ask", "unrestricted"]
 /// `InvalidParams`, not silently clamped.
 #[test]
 fn acp_initialize_rejects_protocol_version_zero() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let config_dir = temp.path().join("meka");
-    let data_dir = temp.path().join("data").join("meka");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
-    std::fs::write(config_dir.join("config.toml"), ACP_INVALID_PARAMS_CONFIG)
-        .expect("write config.toml");
+    let install = Install::new();
+    install.write_config(ACP_INVALID_PARAMS_CONFIG);
 
-    let mut child = meka_acp()
-        .arg("acp")
-        .env("MEKA_CONFIG_DIR", &config_dir)
-        .env("MEKA_DATA_DIR", &data_dir)
-        .env("HOME", temp.path())
-        .env("MEKA_MOCK_PROVIDER", "1")
+    let mut child = install
+        .meka(&["acp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5283,12 +5357,12 @@ fn acp_initialize_rejects_protocol_version_zero() {
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
     let stderr_pipe = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
+    let mut reader = support::TimedLines::spawn(stdout);
     let _stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut r = BufReader::new(stderr_pipe);
-        while r.read_line(&mut buf).unwrap_or(0) > 0 {}
-        buf
+        let mut buffer = String::new();
+        let mut stderr_reader = BufReader::new(stderr_pipe);
+        while stderr_reader.read_line(&mut buffer).unwrap_or(0) > 0 {}
+        buffer
     });
 
     writeln!(
@@ -5309,8 +5383,7 @@ fn acp_initialize_rejects_protocol_version_zero() {
     assert_eq!(
         response["error"]["code"].as_i64(),
         Some(-32602),
-        "protocolVersion 0 must be rejected with InvalidParams; got: {}",
-        response,
+        "protocolVersion 0 must be rejected with InvalidParams; got: {response}",
     );
 }
 
@@ -5320,14 +5393,14 @@ fn acp_initialize_rejects_protocol_version_zero() {
 #[test]
 fn acp_session_prompt_rejects_concurrent_prompt_same_session() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "stalling" },
-        { "kind": "sleep", "ms": 2000 },
-        { "kind": "text", "text": "done" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "stalling" },
+        { "type": "sleep", "ms": 2000 },
+        { "type": "text", "text": "done" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id_a = harness.prompt(&sid, "first");
+    let session_id = harness.new_session();
+    let id_a = harness.prompt(&session_id, "first");
 
     // Wait until A is mid-sleep, then fire B.
     let barrier = Instant::now() + Duration::from_secs(3);
@@ -5335,7 +5408,7 @@ fn acp_session_prompt_rejects_concurrent_prompt_same_session() {
         line.contains("stalling")
     });
 
-    let id_b = harness.prompt(&sid, "second");
+    let id_b = harness.prompt(&session_id, "second");
     let response_b = harness.await_response(id_b);
     assert_invalid_params(&response_b, "second concurrent prompt");
 
@@ -5349,17 +5422,16 @@ fn acp_session_prompt_rejects_concurrent_prompt_same_session() {
 #[test]
 fn acp_session_prompt_refusal_stop_reason() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "I cannot help with that." },
-        { "kind": "message_end", "stop_reason": "refusal" }
+        { "type": "text", "text": "I cannot help with that." },
+        { "type": "message_end", "stop_reason": "refusal" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "do something disallowed");
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "do something disallowed");
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "refusal",
-        "refusal stop_reason must surface as ACP `refusal`: {}",
-        response,
+        "refusal stop_reason must surface as ACP `refusal`: {response}",
     );
 }
 
@@ -5370,22 +5442,20 @@ fn acp_session_prompt_refusal_stop_reason() {
 #[test]
 fn acp_empty_refusal_surfaces_standin_message() {
     let script = serde_json::json!([[
-        { "kind": "message_end", "stop_reason": "refusal" }
+        { "type": "message_end", "stop_reason": "refusal" }
     ]]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "trigger an empty refusal");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "trigger an empty refusal");
+    let (updates, response) = harness.collect_updates(&session_id, id);
     assert_eq!(
         response["result"]["stopReason"], "refusal",
-        "empty refusal must still surface as ACP `refusal`: {}",
-        response,
+        "empty refusal must still surface as ACP `refusal`: {response}",
     );
-    let dump = format!("{:?}", updates);
+    let dump = format!("{updates:?}");
     assert!(
         dump.contains("declined to respond"),
-        "empty refusal must surface a stand-in agent_message_chunk; updates: {}",
-        dump,
+        "empty refusal must surface a stand-in agent_message_chunk; updates: {dump}",
     );
 }
 
@@ -5398,33 +5468,38 @@ fn acp_empty_refusal_surfaces_standin_message() {
 #[test]
 fn acp_tool_calls_execute_despite_non_tool_use_stop_reason() {
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 "#;
     let mut harness = AcpTestHarness::builder()
         .config(config_toml)
         .pre_spawn(|config_dir| {
-            let target = config_dir.join("target.txt");
+            // In the work directory beside the config dir: `read_file` refuses meka's own
+            // directory below `unrestricted`.
+            let target = fixture_beside(config_dir, "target.txt");
             std::fs::write(&target, "hello from mock test\n").expect("write target");
             serde_json::json!([
                 [
-                    { "kind": "text", "text": "reading the file...\n" },
-                    { "kind": "tool_use_start", "id": "call_1", "name": "read_file" },
-                    { "kind": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
-                    // The bug condition: a complete tool call, but the stop reason is NOT "tool_use".
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "reading the file...\n" },
+                    { "type": "tool_use_start", "id": "call_1", "name": "read_file" },
+                    { "type": "tool_use_end", "input": { "path": target.to_str().unwrap() } },
+                    // A complete tool call whose stop reason is not "tool_use".
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ],
                 [
-                    { "kind": "text", "text": "done!" },
-                    { "kind": "message_end", "stop_reason": "end_turn" }
+                    { "type": "text", "text": "done!" },
+                    { "type": "message_end", "stop_reason": "end_turn" }
                 ]
             ])
         })
         .build();
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "read the target file");
-    let (updates, response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "read the target file");
+    let (updates, response) = harness.collect_updates(&session_id, id);
 
     // The tool must have executed despite the end_turn stop reason.
     assert!(
@@ -5432,13 +5507,11 @@ model = "claude-sonnet-4-5"
             let update = &value["params"]["update"];
             update["sessionUpdate"] == "tool_call_update" && update["status"] == "completed"
         }),
-        "tool must execute even with a non-tool_use stop reason; updates: {:?}",
-        updates,
+        "tool must execute even with a non-tool_use stop reason; updates: {updates:?}",
     );
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "turn should complete normally after the tool round; full response: {}",
-        response,
+        "turn should complete normally after the tool round; full response: {response}",
     );
 }
 
@@ -5452,8 +5525,7 @@ fn acp_advertises_additional_directories_capability() {
     assert!(
         response["result"]["agentCapabilities"]["sessionCapabilities"]["additionalDirectories"]
             .is_object(),
-        "expected additionalDirectories to be advertised; got: {}",
-        response,
+        "expected additionalDirectories to be advertised; got: {response}",
     );
 }
 
@@ -5464,7 +5536,7 @@ fn acp_session_new_accepts_and_reports_additional_directories() {
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
     harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
 
-    let cwd = harness.config_dir.clone();
+    let cwd = harness.config_dir();
     let extra = cwd.join("shared");
     std::fs::create_dir_all(&extra).expect("mkdir extra root");
 
@@ -5478,23 +5550,80 @@ fn acp_session_new_accepts_and_reports_additional_directories() {
     );
     let session_id = response["result"]["sessionId"]
         .as_str()
-        .unwrap_or_else(|| panic!("session/new failed: {}", response))
+        .unwrap_or_else(|| panic!("session/new failed: {response}"))
         .to_string();
 
     let listed = harness.request("session/list", serde_json::json!({}));
     let sessions = listed["result"]["sessions"]
         .as_array()
-        .unwrap_or_else(|| panic!("session/list failed: {}", listed));
+        .unwrap_or_else(|| panic!("session/list failed: {listed}"));
     let row = sessions
         .iter()
         .find(|row| row["sessionId"] == session_id.as_str())
-        .unwrap_or_else(|| panic!("session not listed: {}", listed));
+        .unwrap_or_else(|| panic!("session not listed: {listed}"));
     assert_eq!(
         row["additionalDirectories"],
         serde_json::json!([extra]),
-        "session/list must report the roots the session was opened with; got: {}",
-        row,
+        "session/list must report the roots the session was opened with; got: {row}",
     );
+}
+
+/// Every ACP door takes `cwd` through the one acceptor: a file is refused as `InvalidParams`
+/// before a row exists, and a directory named through a symlink is recorded as the directory
+/// itself, the spelling `/cd` and `POST /v1/sessions` record too.
+#[test]
+fn acp_session_new_accepts_a_cwd_only_as_an_existing_directory_spelled_canonically() {
+    let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
+    harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
+
+    let file = harness.config_dir().join("not-a-directory");
+    std::fs::write(&file, b"x").expect("write the file");
+    let refused = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": file, "mcpServers": [] }),
+    );
+    assert_invalid_params(&refused, "session/new on a file");
+    assert!(
+        refused["error"]["data"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("not a directory")),
+        "the refusal names the rule: {refused}"
+    );
+    let store = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let rows: i64 = store
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count the rows");
+    assert_eq!(rows, 0, "a refused cwd leaves no row behind");
+    drop(store);
+
+    #[cfg(unix)]
+    {
+        let real = harness.config_dir().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = harness.config_dir().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let created = harness.request(
+            "session/new",
+            serde_json::json!({ "cwd": link, "mcpServers": [] }),
+        );
+        let session_id = created["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session/new failed: {created}"))
+            .to_string();
+        let store = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let recorded: String = store
+            .query_row(
+                "SELECT cwd FROM sessions WHERE id = ?1",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .expect("read the row");
+        assert_eq!(
+            std::path::PathBuf::from(recorded),
+            std::fs::canonicalize(&real).expect("canonical"),
+            "the row records the directory, not the link"
+        );
+    }
 }
 
 /// The spec requires absolute paths, and meka has no defensible base to resolve a relative one
@@ -5507,15 +5636,14 @@ fn acp_session_new_rejects_relative_additional_directory() {
     let response = harness.request(
         "session/new",
         serde_json::json!({
-            "cwd": harness.config_dir.clone(),
+            "cwd": harness.config_dir(),
             "mcpServers": [],
             "additionalDirectories": ["relative/path"],
         }),
     );
     assert_eq!(
         response["error"]["code"], -32602,
-        "expected invalid_params; got: {}",
-        response,
+        "expected invalid_params; got: {response}",
     );
 }
 
@@ -5525,14 +5653,13 @@ fn acp_advertises_fork_capability() {
     let response = harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
     assert!(
         response["result"]["agentCapabilities"]["sessionCapabilities"]["fork"].is_object(),
-        "expected fork to be advertised; got: {}",
-        response,
+        "expected fork to be advertised; got: {response}",
     );
 }
 
 /// `session/fork` refuses a sub-agent's id, and says so as a caller error before copying anything.
 ///
-/// A fork of a sub-agent is a sibling under the same parent (`SessionManager::fork_session`), so
+/// A fork of a sub-agent is a sibling under the same parent (`Store::fork_session_locked`), so
 /// the copy is a worker too and `build_session_runtime` refuses to build it. That refusal alone is
 /// safe but useless to a client: it arrives as `InternalError` -- for something the caller got
 /// wrong -- naming the *copy's* id, which the client has never seen and which `discard_failed_fork`
@@ -5540,17 +5667,17 @@ fn acp_advertises_fork_capability() {
 /// sibling, and it was left open when that one was closed.
 ///
 /// The worker id comes from the store rather than from a listing, because ACP's `session/list`
-/// shows top-level sessions and a client holding a sub-agent id got it some other way.
+/// shows root sessions and a client holding a sub-agent id got it some other way.
 #[test]
 fn acp_session_fork_refuses_a_sub_agent_before_copying_it() {
     let spawn_round = [
-        serde_json::json!({ "kind": "tool_use_start", "id": "t1", "name": "agent_spawn" }),
-        serde_json::json!({ "kind": "tool_use_end", "input": {"prompt": "count", "permission": "read"} }),
-        serde_json::json!({ "kind": "message_end", "stop_reason": "tool_use" }),
+        serde_json::json!({ "type": "tool_use_start", "id": "t1", "name": "agent_spawn" }),
+        serde_json::json!({ "type": "tool_use_end", "input": {"prompt": "count", "permission": "read"} }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "tool_use" }),
     ];
     let plain = [
-        serde_json::json!({ "kind": "text", "text": "ok" }),
-        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+        serde_json::json!({ "type": "text", "text": "ok" }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "end_turn" }),
     ];
     // The parent's spawning turn, the worker's own reply, then the parent's closing text.
     let script = serde_json::json!([spawn_round, plain, plain]);
@@ -5576,7 +5703,7 @@ fn acp_session_fork_refuses_a_sub_agent_before_copying_it() {
         "session/fork",
         serde_json::json!({
             "sessionId": worker,
-            "cwd": harness.config_dir.clone(),
+            "cwd": harness.config_dir(),
             "mcpServers": [],
         }),
     );
@@ -5615,13 +5742,13 @@ fn acp_session_fork_refuses_a_sub_agent_before_copying_it() {
 #[test]
 fn acp_session_load_refuses_a_sub_agent_before_touching_its_row() {
     let spawn_round = [
-        serde_json::json!({ "kind": "tool_use_start", "id": "t1", "name": "agent_spawn" }),
-        serde_json::json!({ "kind": "tool_use_end", "input": {"prompt": "count", "permission": "read"} }),
-        serde_json::json!({ "kind": "message_end", "stop_reason": "tool_use" }),
+        serde_json::json!({ "type": "tool_use_start", "id": "t1", "name": "agent_spawn" }),
+        serde_json::json!({ "type": "tool_use_end", "input": {"prompt": "count", "permission": "read"} }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "tool_use" }),
     ];
     let plain = [
-        serde_json::json!({ "kind": "text", "text": "ok" }),
-        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+        serde_json::json!({ "type": "text", "text": "ok" }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "end_turn" }),
     ];
     let script = serde_json::json!([spawn_round, plain, plain]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
@@ -5641,7 +5768,7 @@ fn acp_session_load_refuses_a_sub_agent_before_touching_its_row() {
 
     // A directory that exists and differs from the worker's, so a handler that got as far as the
     // `cwd` write would leave a difference this test can see.
-    let elsewhere = std::path::Path::new(&harness.config_dir).join("elsewhere");
+    let elsewhere = harness.config_dir().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).expect("create the directory the load would move it to");
 
     let refused = harness.request(
@@ -5677,8 +5804,8 @@ fn acp_session_load_refuses_a_sub_agent_before_touching_its_row() {
 #[test]
 fn acp_session_fork_creates_a_usable_copy() {
     let turn = [
-        serde_json::json!({ "kind": "text", "text": "ok" }),
-        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+        serde_json::json!({ "type": "text", "text": "ok" }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "end_turn" }),
     ];
     // One script entry per prompt: seed the source, then a turn on the fork, then one on the
     // source to prove forking left it usable.
@@ -5692,13 +5819,13 @@ fn acp_session_fork_creates_a_usable_copy() {
         "session/fork",
         serde_json::json!({
             "sessionId": source_id,
-            "cwd": harness.config_dir.clone(),
+            "cwd": harness.config_dir(),
             "mcpServers": [],
         }),
     );
     let fork_id = forked["result"]["sessionId"]
         .as_str()
-        .unwrap_or_else(|| panic!("session/fork failed: {}", forked))
+        .unwrap_or_else(|| panic!("session/fork failed: {forked}"))
         .to_string();
     assert_ne!(fork_id, source_id, "the fork is a distinct session");
 
@@ -5707,12 +5834,12 @@ fn acp_session_fork_creates_a_usable_copy() {
     let listed = harness.request("session/list", serde_json::json!({}));
     let sessions = listed["result"]["sessions"]
         .as_array()
-        .unwrap_or_else(|| panic!("session/list failed: {}", listed));
+        .unwrap_or_else(|| panic!("session/list failed: {listed}"));
     let title_of = |wanted: &str| -> serde_json::Value {
         sessions
             .iter()
             .find(|row| row["sessionId"] == wanted)
-            .unwrap_or_else(|| panic!("session {} not listed: {}", wanted, listed))["title"]
+            .unwrap_or_else(|| panic!("session {wanted} not listed: {listed}"))["title"]
             .clone()
     };
     assert_eq!(title_of(&fork_id), serde_json::json!("hello"));
@@ -5723,8 +5850,7 @@ fn acp_session_fork_creates_a_usable_copy() {
     let (_updates, response) = harness.collect_updates(&fork_id, id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "the forked session must accept a prompt; got: {}",
-        response,
+        "the forked session must accept a prompt; got: {response}",
     );
 
     // Forking does not close the source.
@@ -5732,8 +5858,7 @@ fn acp_session_fork_creates_a_usable_copy() {
     let (_updates, response) = harness.collect_updates(&source_id, id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
-        "forking must leave the source session usable; got: {}",
-        response,
+        "forking must leave the source session usable; got: {response}",
     );
 }
 
@@ -5745,7 +5870,7 @@ fn acp_session_fork_applies_the_requests_additional_directories() {
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
     harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
 
-    let cwd = harness.config_dir.clone();
+    let cwd = harness.config_dir();
     let extra = cwd.join("shared");
     std::fs::create_dir_all(&extra).expect("mkdir extra root");
 
@@ -5755,7 +5880,7 @@ fn acp_session_fork_applies_the_requests_additional_directories() {
     );
     let source_id = response["result"]["sessionId"]
         .as_str()
-        .unwrap_or_else(|| panic!("session/new failed: {}", response))
+        .unwrap_or_else(|| panic!("session/new failed: {response}"))
         .to_string();
 
     let forked = harness.request(
@@ -5769,18 +5894,18 @@ fn acp_session_fork_applies_the_requests_additional_directories() {
     );
     let fork_id = forked["result"]["sessionId"]
         .as_str()
-        .unwrap_or_else(|| panic!("session/fork failed: {}", forked))
+        .unwrap_or_else(|| panic!("session/fork failed: {forked}"))
         .to_string();
 
     let listed = harness.request("session/list", serde_json::json!({}));
     let sessions = listed["result"]["sessions"]
         .as_array()
-        .unwrap_or_else(|| panic!("session/list failed: {}", listed));
+        .unwrap_or_else(|| panic!("session/list failed: {listed}"));
     let row_of = |wanted: &str| {
         sessions
             .iter()
             .find(|row| row["sessionId"] == wanted)
-            .unwrap_or_else(|| panic!("session {} not listed: {}", wanted, listed))
+            .unwrap_or_else(|| panic!("session {wanted} not listed: {listed}"))
     };
     assert_eq!(
         row_of(&fork_id)["additionalDirectories"],
@@ -5802,8 +5927,8 @@ fn acp_session_fork_applies_the_requests_additional_directories() {
 #[test]
 fn acp_session_fork_works_on_a_session_that_was_never_loaded() {
     let turn = [
-        serde_json::json!({ "kind": "text", "text": "ok" }),
-        serde_json::json!({ "kind": "message_end", "stop_reason": "end_turn" }),
+        serde_json::json!({ "type": "text", "text": "ok" }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "end_turn" }),
     ];
     let script = serde_json::json!([turn, turn]);
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(script));
@@ -5816,23 +5941,19 @@ fn acp_session_fork_works_on_a_session_that_was_never_loaded() {
         "session/close",
         serde_json::json!({ "sessionId": source_id }),
     );
-    assert!(
-        closed["error"].is_null(),
-        "session/close failed: {}",
-        closed
-    );
+    assert!(closed["error"].is_null(), "session/close failed: {closed}");
 
     let forked = harness.request(
         "session/fork",
         serde_json::json!({
             "sessionId": source_id,
-            "cwd": harness.config_dir.clone(),
+            "cwd": harness.config_dir(),
             "mcpServers": [],
         }),
     );
     let fork_id = forked["result"]["sessionId"]
         .as_str()
-        .unwrap_or_else(|| panic!("forking an unloaded session failed: {}", forked))
+        .unwrap_or_else(|| panic!("forking an unloaded session failed: {forked}"))
         .to_string();
 
     // The fork is live...
@@ -5847,8 +5968,7 @@ fn acp_session_fork_works_on_a_session_that_was_never_loaded() {
     );
     assert!(
         !reclose["error"].is_null(),
-        "forking must not adopt the source session; got: {}",
-        reclose,
+        "forking must not adopt the source session; got: {reclose}",
     );
 }
 
@@ -5857,14 +5977,14 @@ fn acp_session_fork_rejects_bad_input() {
     let mut harness = AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, None);
     harness.request("initialize", serde_json::json!({ "protocolVersion": 1 }));
 
-    let cwd = harness.config_dir.clone();
+    let cwd = harness.config_dir();
     let response = harness.request(
         "session/new",
         serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
     );
     let source_id = response["result"]["sessionId"]
         .as_str()
-        .unwrap_or_else(|| panic!("session/new failed: {}", response))
+        .unwrap_or_else(|| panic!("session/new failed: {response}"))
         .to_string();
 
     let unknown = harness.request(
@@ -5877,8 +5997,7 @@ fn acp_session_fork_rejects_bad_input() {
     );
     assert_eq!(
         unknown["error"]["code"], -32602,
-        "an unknown source must be invalid_params; got: {}",
-        unknown,
+        "an unknown source must be invalid_params; got: {unknown}",
     );
 
     let relative_root = harness.request(
@@ -5892,14 +6011,16 @@ fn acp_session_fork_rejects_bad_input() {
     );
     assert_eq!(
         relative_root["error"]["code"], -32602,
-        "expected invalid_params for a relative additional root; got: {}",
-        relative_root,
+        "expected invalid_params for a relative additional root; got: {relative_root}",
     );
 }
 
 const ACP_SCHEDULE_CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -5921,21 +6042,21 @@ fn acp_scheduled_job_fires_without_a_prompt() {
     let script = serde_json::json!([
         // Turn 1: the agent schedules a one-shot two seconds out.
         [
-            { "kind": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
-            { "kind": "tool_use_end", "input": {
+            { "type": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
                 "prompt": "ACP_DELIVERED_MARKER",
                 "at": "2s"
             }},
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "scheduled" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "scheduled" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // Turn 2 is the fire. Nothing on the client side asks for it.
         [
-            { "kind": "text", "text": "ACP_SCHEDULED_REPLY" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ACP_SCHEDULED_REPLY" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::builder()
@@ -5944,15 +6065,36 @@ fn acp_scheduled_job_fires_without_a_prompt() {
         .window(Duration::from_secs(45))
         .build();
 
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "remind me in two seconds");
-    let (_updates, _response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "remind me in two seconds");
+    let (_updates, _response) = harness.collect_updates(&session_id, id);
 
     // Nothing is outstanding now: the prompt above has been answered. Anything that arrives from
-    // here is agent-initiated. The job is due in 2s and the scheduler ticks every 1s, so this waits
-    // past both before asking meka for anything.
-    std::thread::sleep(Duration::from_secs(6));
-    let updates = harness.drain_unsolicited_updates(&sid);
+    // here is agent-initiated. Wait for the scheduled turn to have written its reply rather than
+    // a fixed span past the job's due time: the reply's notifications are sent before the row is
+    // written, so once the row exists they are already queued ahead of the `session/list` the
+    // drain below terminates on.
+    let replied_by = Instant::now() + Duration::from_secs(45);
+    loop {
+        let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+        let replies: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND role = 'assistant' \
+                 AND content LIKE '%ACP_SCHEDULED_REPLY%'",
+                rusqlite::params![&session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if replies > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < replied_by,
+            "the scheduled job never fired, or its reply was never written"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let updates = harness.drain_unsolicited_updates(&session_id);
 
     let text_of = |kind: &str| -> String {
         updates
@@ -5969,78 +6111,189 @@ fn acp_scheduled_job_fires_without_a_prompt() {
     let user_text = text_of("user_message_chunk");
     assert!(
         user_text.contains("ACP_DELIVERED_MARKER"),
-        "the job's prompt must be pushed as a user message; updates were:\n{:#?}",
-        updates,
+        "the job's prompt must be pushed as a user message; updates were:\n{updates:#?}",
     );
     assert!(
         user_text.contains("Scheduled job"),
-        "and it must be marked as scheduled; updates were:\n{:#?}",
-        updates,
+        "and it must be marked as scheduled; updates were:\n{updates:#?}",
     );
 
     let agent_text = text_of("agent_message_chunk");
     assert!(
         agent_text.contains("ACP_SCHEDULED_REPLY"),
-        "the agent's reply to the scheduled turn must reach the client; updates were:\n{:#?}",
-        updates,
+        "the agent's reply to the scheduled turn must reach the client; updates were:\n{updates:#?}",
     );
+}
+
+/// A scheduled turn has no `session/prompt` response to carry its outcome, so when it fails the
+/// editor would otherwise show the job's prompt and nothing under it. The failure is said as a
+/// `[meka warn]` chunk, the way the REPL prints it and `meka serve` posts a `failed` webhook.
+#[test]
+fn acp_reports_a_failed_scheduled_turn_as_a_warn_notice() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
+                "prompt": "ACP_DELIVERED_MARKER",
+                "at": "2s"
+            }},
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        [
+            { "type": "text", "text": "scheduled" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        // The fire: the provider is down for it.
+        [
+            { "type": "fail", "message": "ACP_PROVIDER_DOWN" }
+        ]
+    ]);
+    let mut harness = AcpTestHarness::builder()
+        .config(ACP_SCHEDULE_CONFIG)
+        .script(script)
+        .window(Duration::from_secs(45))
+        .build();
+
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "remind me in two seconds");
+    let (_updates, _response) = harness.collect_updates(&session_id, id);
+
+    // Nothing is outstanding now; whatever arrives is the fire's doing. Drained until the failure
+    // notice shows, rather than after a fixed wait past the due time.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut chunks: Vec<String> = Vec::new();
+    loop {
+        chunks.extend(
+            harness
+                .drain_unsolicited_updates(&session_id)
+                .iter()
+                .map(|update| &update["params"]["update"])
+                .filter(|update| update["sessionUpdate"] == "agent_message_chunk")
+                .filter_map(|update| update["content"]["text"].as_str())
+                .map(str::to_string),
+        );
+        if chunks.iter().any(|chunk| chunk.starts_with("[meka warn]")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed fire was never reported to the editor; chunks were:\n{chunks:#?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let notice = chunks
+        .iter()
+        .find(|chunk| chunk.starts_with("[meka warn]"))
+        .expect("checked by the loop");
+    assert!(
+        notice.contains("scheduled job") && notice.contains("failed"),
+        "the notice must say which turn failed: {notice}"
+    );
+    assert!(
+        notice.contains("ACP_PROVIDER_DOWN"),
+        "and carry the error, not only that there was one: {notice}"
+    );
+}
+
+/// A compaction is the one thing that changes what the model can see without the editor doing
+/// anything, and the automatic ones fire with nobody asking. It is said as a `[meka]` chunk so a
+/// user whose next reply forgets the morning has been told why.
+#[test]
+fn acp_reports_a_compaction_as_a_meka_notice() {
+    let script = serde_json::json!([
+        [
+            { "type": "tool_use_start", "id": "tu_1", "name": "context_compact" },
+            { "type": "tool_use_end", "input": {} },
+            { "type": "message_end", "stop_reason": "tool_use" }
+        ],
+        // The summarizer draws first; the model's own reply is the round after it.
+        [
+            { "type": "text", "text": "a summary" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [
+            { "type": "text", "text": "the reply" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let config = format!("{ACP_INVALID_PARAMS_CONFIG}\n[session]\ncompact_checkpoint = false\n");
+    let mut harness = AcpTestHarness::spawn(&config, Some(script));
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "compact yourself");
+    let (updates, response) = harness.collect_updates(&session_id, id);
+
+    let chunks: Vec<&str> = updates
+        .iter()
+        .filter(|value| value["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|value| value["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    let notice = chunks
+        .iter()
+        .find(|chunk| chunk.starts_with("[meka] compacted the conversation"))
+        .unwrap_or_else(|| panic!("the compaction must reach the editor: {chunks:?}"));
+    assert!(
+        notice.contains("compaction 1"),
+        "and say which compaction it was: {notice}"
+    );
+    assert_eq!(response["result"]["stopReason"], "end_turn");
 }
 
 /// The same, through `session/resume` rather than `session/load`.
 ///
 /// `handle_resume_session` carries its own copy of the permission restore, and nothing exercised
 /// it: `a_mode_set_through_acp_survives_a_reload` covers the twin in `handle_load_session`, and
-/// `acp_session_resume_adopts_without_replay` asserts nothing about the mode. Deleting the resume
+/// `acp_session_resume_adopts_without_replay` asserts nothing about the level. Deleting the resume
 /// path's block left the suite green -- and the result is a session running at the config default
 /// while its row claims a higher level, which the scheduler's fire-time re-check then trusts. Fail
 /// open, reached from the side that re-check cannot see.
 #[test]
 fn a_mode_set_through_acp_survives_a_resume() {
     const CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "ask", "unrestricted"]
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, None);
-    let cwd = harness.config_dir().to_path_buf();
+    let cwd = harness.config_dir();
 
     let new_response = harness.request(
         "session/new",
         serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
     );
     assert_eq!(new_response["result"]["modes"]["currentModeId"], "read");
-    let sid = new_response["result"]["sessionId"]
+    let session_id = new_response["result"]["sessionId"]
         .as_str()
         .expect("sessionId")
         .to_string();
 
-    let set = harness.set_mode(&sid, "unrestricted");
-    assert!(set["result"].is_object(), "set_mode must succeed: {}", set);
+    let set = harness.set_mode(&session_id, "unrestricted");
+    assert!(set["result"].is_object(), "set_mode must succeed: {set}");
 
-    let closed = harness.request("session/close", serde_json::json!({ "sessionId": sid }));
-    assert!(
-        closed["result"].is_object(),
-        "close must succeed: {}",
-        closed
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
     );
+    assert!(closed["result"].is_object(), "close must succeed: {closed}");
 
     let resumed = harness.request(
         "session/resume",
-        serde_json::json!({ "sessionId": sid, "cwd": cwd, "mcpServers": [] }),
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
     );
     assert_eq!(
         resumed["result"]["modes"]["currentModeId"], "unrestricted",
-        "the resumed session fell back to the process default instead of the mode its row \
-         records: {}",
-        resumed
+        "the resumed session fell back to the process default instead of the level its row \
+         records: {resumed}"
     );
 }
 
-/// A mode set through `session/set_mode` survives a reload.
+/// A level set through `session/set_mode` survives a reload.
 ///
 /// Two halves of one invariant. `set_mode` only moved the in-memory cell, so the session row kept
 /// whatever it was created with; the scheduler's live gate re-check reads that row, which meant a
@@ -6055,16 +6308,19 @@ enabled = ["read", "ask", "unrestricted"]
 #[test]
 fn a_mode_set_through_acp_survives_a_reload() {
     const CONFIG: &str = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
 default = "read"
-enabled = ["read", "ask", "unrestricted"]
+enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, None);
-    let cwd = harness.config_dir().to_path_buf();
+    let cwd = harness.config_dir();
 
     let new_response = harness.request(
         "session/new",
@@ -6074,41 +6330,42 @@ enabled = ["read", "ask", "unrestricted"]
         new_response["result"]["modes"]["currentModeId"], "read",
         "a fresh session starts at the configured default"
     );
-    let sid = new_response["result"]["sessionId"]
+    let session_id = new_response["result"]["sessionId"]
         .as_str()
         .expect("sessionId")
         .to_string();
 
-    let set = harness.set_mode(&sid, "unrestricted");
-    assert!(set["result"].is_object(), "set_mode must succeed: {}", set);
+    let set = harness.set_mode(&session_id, "unrestricted");
+    assert!(set["result"].is_object(), "set_mode must succeed: {set}");
 
     // Drop it from the live map so the reload rebuilds from the row rather than reusing the entry.
-    let closed = harness.request("session/close", serde_json::json!({ "sessionId": sid }));
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": session_id }),
+    );
     assert!(
         closed["result"].is_object(),
-        "session/close must succeed: {}",
-        closed
+        "session/close must succeed: {closed}"
     );
 
     let loaded = harness.request(
         "session/load",
-        serde_json::json!({ "sessionId": sid, "cwd": cwd, "mcpServers": [] }),
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
     );
     assert_eq!(
         loaded["result"]["modes"]["currentModeId"], "unrestricted",
-        "the reloaded session fell back to the process default instead of the mode it was set to: \
-         {}",
-        loaded
+        "the reloaded session fell back to the process default instead of the level it was set to: \
+         {loaded}"
     );
 }
 
 /// A turn runs on the profile the session's *row* names, not on whichever one the agent happened
 /// to be assembled with.
 ///
-/// ACP used to park a resolved binding on the session entry whenever `session/set_config_option`
-/// could not take the runtime mutex, and only `session/prompt` drained it. So a scheduled fire or a
-/// background-outcome turn ran on the profile the user had left, and billed that account, while the
-/// row, both pickers and the reported window all said otherwise. The park is gone: the row is the
+/// Parking a resolved profile on the session entry whenever `session/set_config_option` could not
+/// take the runtime mutex, with only `session/prompt` draining it, would let a scheduled fire or a
+/// background-outcome turn run on the profile the user had left, and bill that account, while the
+/// row, both pickers and the reported window all said otherwise. There is no park: the row is the
 /// only carrier, and all three turn entry points read it.
 ///
 /// The row is moved here by a second connection to the store rather than through
@@ -6121,49 +6378,52 @@ enabled = ["read", "ask", "unrestricted"]
 #[test]
 fn an_acp_turn_follows_the_provider_its_row_names() {
     let config_toml = r#"
-default_provider = "alpha"
+default_profile = "alpha"
 
-[providers.alpha]
-type = "anthropic-messages"
+[accounts.alpha]
+backend = "anthropic-messages"
+
+[profiles.alpha]
+account = "alpha"
 model = "model-from-alpha"
 
-[providers.beta]
-type = "anthropic-messages"
+[accounts.beta]
+backend = "anthropic-messages"
+
+[profiles.beta]
+account = "beta"
 model = "model-from-beta"
 "#;
     let mut harness = AcpTestHarness::spawn(config_toml, None);
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
-    let id = harness.prompt(&sid, "/status");
-    let (updates, _response) = harness.collect_updates(&sid, id);
+    let id = harness.prompt(&session_id, "/status");
+    let (updates, _response) = harness.collect_updates(&session_id, id);
     assert!(
         agent_text(&updates).contains("model-from-alpha"),
-        "the session should start on the default profile; updates: {:?}",
-        updates
+        "the session should start on the default profile; updates: {updates:?}"
     );
 
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
     let moved = connection
-        .execute("UPDATE sessions SET provider = 'beta' WHERE id = ?1", [
-            &sid,
+        .execute("UPDATE sessions SET profile = 'beta' WHERE id = ?1", [
+            &session_id,
         ])
         .expect("repin the session");
     assert_eq!(moved, 1, "the repin matched no row");
     drop(connection);
 
-    let id = harness.prompt(&sid, "/status");
-    let (updates, _response) = harness.collect_updates(&sid, id);
+    let id = harness.prompt(&session_id, "/status");
+    let (updates, _response) = harness.collect_updates(&session_id, id);
     let text = agent_text(&updates);
     assert!(
         text.contains("model-from-beta"),
         "the turn ran on the profile the agent was built with rather than the one its row names; \
-         updates: {:?}",
-        updates
+         updates: {updates:?}"
     );
     assert!(
         !text.contains("model-from-alpha"),
-        "and must not still be reporting the old one: {:?}",
-        updates
+        "and must not still be reporting the old one: {updates:?}"
     );
 }
 
@@ -6190,31 +6450,43 @@ fn agent_text(updates: &[serde_json::Value]) -> String {
 #[test]
 fn an_acp_prompt_judges_an_image_against_the_profile_its_row_names() {
     let config_toml = r#"
-default_provider = "seeing"
+default_profile = "seeing"
 
-[providers.seeing]
-type = "anthropic-messages"
+[accounts.seeing]
+backend = "anthropic-messages"
+
+[profiles.seeing]
+account = "seeing"
 model = "model-with-eyes"
 vision = true
 
-[providers.blind]
-type = "anthropic-messages"
+[accounts.blind]
+backend = "anthropic-messages"
+
+[profiles.blind]
+account = "blind"
 model = "model-without-eyes"
 vision = false
 "#;
     let mut harness = AcpTestHarness::spawn(config_toml, None);
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
-    let image = |sid: &str| {
+    // A real 1x1 PNG: the payload is decoded before the profile is consulted, so a broken one
+    // would be refused for being broken and never reach the decision under test.
+    let image = |session_id: &str| {
         serde_json::json!({
-            "sessionId": sid,
-            "prompt": [{ "type": "image", "data": "AAAA", "mimeType": "image/png" }]
+            "sessionId": session_id,
+            "prompt": [{
+                "type": "image",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                "mimeType": "image/png"
+            }]
         })
     };
 
     // On `seeing`, the block is admitted: it gets past parsing and fails later, on the empty mock
     // script, rather than being refused as an unsupported content type.
-    let accepted = harness.request("session/prompt", image(&sid));
+    let accepted = harness.request("session/prompt", image(&session_id));
     let rendered = accepted.to_string();
     assert!(
         !rendered.contains("vision"),
@@ -6223,14 +6495,14 @@ vision = false
 
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
     let moved = connection
-        .execute("UPDATE sessions SET provider = 'blind' WHERE id = ?1", [
-            &sid,
+        .execute("UPDATE sessions SET profile = 'blind' WHERE id = ?1", [
+            &session_id,
         ])
         .expect("repin the session");
     assert_eq!(moved, 1, "the repin matched no row");
     drop(connection);
 
-    let rejected = harness.request("session/prompt", image(&sid));
+    let rejected = harness.request("session/prompt", image(&session_id));
     assert_invalid_params(
         &rejected,
         "image block after the row moved to a text-only profile",
@@ -6244,10 +6516,10 @@ vision = false
 /// A scheduled fire is a turn, so it runs on the profile the session's row names -- or it does not
 /// run at all.
 ///
-/// This is the entry point the defect was actually about. ACP used to park a resolved binding on
-/// the session entry and only `session/prompt` drained it, so a fire went on billing the account
-/// the user had left. `an_acp_turn_follows_the_provider_its_row_names` covers the prompt path,
-/// which already worked; this covers `run_wakeup`, which did not.
+/// A fire is the entry point most exposed to a parked profile: with only `session/prompt` draining
+/// one, a fire would go on billing the account the user had left.
+/// `an_acp_turn_follows_the_provider_its_row_names` covers the prompt path; this covers
+/// `run_wakeup`.
 ///
 /// The row is moved to a profile that is not configured, because that is the one difference a
 /// scripted provider cannot hide: the mock stands in for every profile, so a fire on the wrong one
@@ -6258,21 +6530,21 @@ vision = false
 fn an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names() {
     let script = serde_json::json!([
         [
-            { "kind": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
-            { "kind": "tool_use_end", "input": {
+            { "type": "tool_use_start", "id": "call_sched", "name": "schedule_create" },
+            { "type": "tool_use_end", "input": {
                 "prompt": "ACP_DELIVERED_MARKER",
                 "at": "2s"
             }},
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "scheduled" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "scheduled" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         // Only reached if the fire runs on the agent's own profile instead of the row's.
         [
-            { "kind": "text", "text": "ACP_SCHEDULED_REPLY" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "ACP_SCHEDULED_REPLY" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]);
     let mut harness = AcpTestHarness::builder()
@@ -6281,16 +6553,16 @@ fn an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names() {
         .window(Duration::from_secs(45))
         .build();
 
-    let sid = harness.new_session();
-    let id = harness.prompt(&sid, "remind me in two seconds");
-    let (_updates, _response) = harness.collect_updates(&sid, id);
+    let session_id = harness.new_session();
+    let id = harness.prompt(&session_id, "remind me in two seconds");
+    let (_updates, _response) = harness.collect_updates(&session_id, id);
 
     // Somebody other than this connection repins the session onto a profile that has since left
     // `config.toml` -- the state `look_up_profile` refuses by name.
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
     let moved = connection
-        .execute("UPDATE sessions SET provider = 'retired' WHERE id = ?1", [
-            &sid,
+        .execute("UPDATE sessions SET profile = 'retired' WHERE id = ?1", [
+            &session_id,
         ])
         .expect("repin the session");
     assert_eq!(moved, 1, "the repin matched no row");
@@ -6298,20 +6570,18 @@ fn an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names() {
 
     // Past the 2s due time and several 1s ticks.
     std::thread::sleep(Duration::from_secs(6));
-    let updates = harness.drain_unsolicited_updates(&sid);
-    let rendered = format!("{:#?}", updates);
+    let updates = harness.drain_unsolicited_updates(&session_id);
+    let rendered = format!("{updates:#?}");
 
     assert!(
         !rendered.contains("ACP_SCHEDULED_REPLY"),
         "the fire ran on the profile the agent was assembled with rather than the one its row \
-         names; updates were:\n{}",
-        rendered
+         names; updates were:\n{rendered}"
     );
     assert!(
         !rendered.contains("ACP_DELIVERED_MARKER"),
         "and its prompt must not have been pushed either, since no turn should have started; \
-         updates were:\n{}",
-        rendered
+         updates were:\n{rendered}"
     );
 }
 
@@ -6322,19 +6592,25 @@ fn an_acp_scheduled_fire_refuses_a_profile_the_row_no_longer_names() {
 /// deleted the `!` from its configured-profile check and flipped the `!=` that decides whether the
 /// row is written, and the suite stayed green through every one. The row is what the next turn
 /// resolves against, so a switch that does not reach it is a switch that did not happen; this
-/// asserts the row by reading the value back out of `configOptions`, which
-/// `build_config_options` sources from the row rather than from the live agent.
+/// asserts the row by reading the value back out of `configOptions`, which `build_config_options`
+/// sources from the row rather than from the live agent.
 #[test]
 fn acp_set_config_option_moves_the_session_onto_another_profile() {
     const CONFIG: &str = r#"
-default_provider = "mock"
+default_profile = "mock"
 
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
-[providers.other]
-type = "openai-responses"
+[accounts.other]
+backend = "openai-responses"
+
+[profiles.other]
+account = "other"
 model = "gpt-5.6-sol"
 
 [permissions]
@@ -6342,12 +6618,12 @@ default = "read"
 enabled = ["read", "unrestricted"]
 "#;
     let mut harness = AcpTestHarness::spawn(CONFIG, None);
-    let cwd = harness.config_dir.clone();
+    let cwd = harness.config_dir();
     let created = harness.request(
         "session/new",
         serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
     );
-    let sid = created["result"]["sessionId"]
+    let session_id = created["result"]["sessionId"]
         .as_str()
         .expect("sessionId")
         .to_string();
@@ -6357,10 +6633,10 @@ enabled = ["read", "unrestricted"]
     let provider_option = |response: &serde_json::Value| -> serde_json::Value {
         response["result"]["configOptions"]
             .as_array()
-            .unwrap_or_else(|| panic!("no configOptions: {}", response))
+            .unwrap_or_else(|| panic!("no configOptions: {response}"))
             .iter()
-            .find(|option| option["id"] == "provider")
-            .unwrap_or_else(|| panic!("no provider option: {}", response))
+            .find(|option| option["id"] == "profile")
+            .unwrap_or_else(|| panic!("no provider option: {response}"))
             .clone()
     };
     let created_option = provider_option(&created);
@@ -6380,7 +6656,7 @@ enabled = ["read", "unrestricted"]
     // written -- which is exactly what flipping the no-op filter to `==` produces.
     let switched = harness.request(
         "session/set_config_option",
-        serde_json::json!({ "sessionId": sid, "configId": "provider", "value": "other" }),
+        serde_json::json!({ "sessionId": session_id, "configId": "profile", "value": "other" }),
     );
     assert_eq!(
         provider_option(&switched)["currentValue"],
@@ -6392,7 +6668,7 @@ enabled = ["read", "unrestricted"]
     // nothing would fail every later turn on this session.
     let refused = harness.request(
         "session/set_config_option",
-        serde_json::json!({ "sessionId": sid, "configId": "provider", "value": "ghost" }),
+        serde_json::json!({ "sessionId": session_id, "configId": "profile", "value": "ghost" }),
     );
     assert!(
         refused["error"].is_object(),
@@ -6402,16 +6678,150 @@ enabled = ["read", "unrestricted"]
     // JSON-RPC "Invalid params".
     let detail = refused["error"].to_string();
     assert!(
-        detail.contains("not configured"),
+        detail.contains("no profile named 'ghost'") && detail.contains("other"),
         "the refusal should name the problem and list the configured profiles: {detail}"
     );
 
     // The refusal must not have moved the row on its way out.
     let after = harness.request(
         "session/set_config_option",
-        serde_json::json!({ "sessionId": sid, "configId": "provider", "value": "other" }),
+        serde_json::json!({ "sessionId": session_id, "configId": "profile", "value": "other" }),
     );
     assert_eq!(provider_option(&after)["currentValue"], "other");
+}
+
+/// A profile switch while a prompt holds the session is refused with `InvalidParams`, the answer
+/// a second prompt gets, and the row stays where it was. Writing the row and deferring the agent's
+/// move to the next turn would leave the two disagreeing for the length of the turn.
+#[test]
+fn acp_set_config_option_refuses_a_profile_switch_while_a_turn_is_in_flight() {
+    const CONFIG: &str = r#"
+default_profile = "mock"
+
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[accounts.other]
+backend = "openai-responses"
+
+[profiles.other]
+account = "other"
+model = "gpt-5.6-sol"
+"#;
+    let script = serde_json::json!([[
+        { "type": "text", "text": "stalling" },
+        { "type": "sleep", "ms": 2000 },
+        { "type": "text", "text": "done" },
+        { "type": "message_end", "stop_reason": "end_turn" }
+    ]]);
+    let mut harness = AcpTestHarness::spawn(CONFIG, Some(script));
+    let session_id = harness.new_session();
+    let prompt_id = harness.prompt(&session_id, "first");
+    let barrier = Instant::now() + Duration::from_secs(3);
+    let _ = read_until(&mut harness.reader, barrier, |line| {
+        line.contains("stalling")
+    });
+
+    let refused = harness.request(
+        "session/set_config_option",
+        serde_json::json!({ "sessionId": session_id, "configId": "profile", "value": "other" }),
+    );
+    assert_invalid_params(&refused, "profile switch during a turn");
+    assert!(
+        refused["error"].to_string().contains("turn is in flight"),
+        "the refusal should say what is holding the session: {refused}"
+    );
+
+    let response = harness.await_response(prompt_id);
+    assert_eq!(response["result"]["stopReason"], "end_turn");
+
+    // The row itself: the refused switch must not have written it.
+    let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let recorded: String = connection
+        .query_row(
+            "SELECT profile FROM sessions WHERE id = ?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .expect("the session's row");
+    assert_eq!(recorded, "mock", "the row must still name the old profile");
+}
+
+/// `approvals` is a session config option like `profile`: advertised at creation, written to the
+/// row when set, and read back off it, so a resume and a scheduled fire see what the editor set.
+#[test]
+fn acp_set_config_option_turns_approvals_on_and_records_it() {
+    const CONFIG: &str = r#"
+default_profile = "mock"
+
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
+model = "claude-sonnet-4-5"
+
+[permissions]
+default = "read"
+enabled = ["read", "unrestricted"]
+"#;
+    let mut harness = AcpTestHarness::spawn(CONFIG, None);
+    let cwd = harness.config_dir();
+    let created = harness.request(
+        "session/new",
+        serde_json::json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+    let approvals_option = |response: &serde_json::Value| -> serde_json::Value {
+        response["result"]["configOptions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no configOptions: {response}"))
+            .iter()
+            .find(|option| option["id"] == "approvals")
+            .unwrap_or_else(|| panic!("no approvals option: {response}"))
+            .clone()
+    };
+    assert_eq!(
+        approvals_option(&created)["currentValue"],
+        false,
+        "off unless the config says so: {created}"
+    );
+
+    let switched = harness.request(
+        "session/set_config_option",
+        // The protocol flattens the value into the request: a `type` discriminator beside the
+        // `value`, where a picker sends a bare value id and no `type`.
+        serde_json::json!({
+            "sessionId": session_id,
+            "configId": "approvals",
+            "type": "boolean",
+            "value": true,
+        }),
+    );
+    assert_eq!(
+        approvals_option(&switched)["currentValue"],
+        true,
+        "the option reports the switch: {switched}"
+    );
+    let store = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let recorded: i64 = store
+        .query_row(
+            "SELECT approvals FROM sessions WHERE id = ?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .expect("the session row");
+    assert_eq!(
+        recorded, 1,
+        "the switch is on the row, where a resume and a scheduled fire read it"
+    );
 }
 
 /// An ACP scheduled fire carries a cancellation that was waiting, as `meka serve`'s does.
@@ -6422,12 +6832,15 @@ enabled = ["read", "unrestricted"]
 #[test]
 fn an_acp_scheduled_fire_carries_a_cancellation_that_was_waiting() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "ran the job" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "ran the job" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [background]
@@ -6437,7 +6850,7 @@ enabled = true
 poll_interval = "200ms"
 "#;
     let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     {
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let now = chrono::Utc::now();
@@ -6446,20 +6859,24 @@ poll_interval = "200ms"
                 "INSERT INTO background_tasks \
                  (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
                  VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
-                rusqlite::params![uuid::Uuid::new_v4().to_string(), &sid, now.to_rfc3339()],
+                rusqlite::params![
+                    uuid::Uuid::new_v4().to_string(),
+                    &session_id,
+                    now.to_rfc3339()
+                ],
             )
             .expect("seed the cancelled task");
         // Due a minute ago, so the very next sweep fires it.
         connection
             .execute(
                 "INSERT INTO scheduled_jobs \
-                 (id, session_id, kind, spec, prompt, gate_kind, gate_spec, gate_last_output, \
+                 (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, gate_last_output, \
                   gate_permission, created_at, last_fired_at, next_fire_at) \
                  VALUES (?1, ?2, 'every', '60s', 'PROBE_ACP_FIRE', NULL, NULL, NULL, NULL, ?3, \
                          NULL, ?4)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
-                    &sid,
+                    &session_id,
                     now.to_rfc3339(),
                     (now - chrono::Duration::seconds(60)).to_rfc3339(),
                 ],
@@ -6472,15 +6889,15 @@ poll_interval = "200ms"
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let fired: Option<String> = connection
             .query_row(
-                "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' \
+                "SELECT content FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
                  AND content LIKE '%PROBE_ACP_FIRE%' ORDER BY id ASC LIMIT 1",
-                rusqlite::params![&sid],
+                rusqlite::params![&session_id],
                 |row| row.get(0),
             )
             .ok();
         if let Some(text) = fired {
             assert!(
-                text.contains("was cancelled"),
+                text.contains("was canceled"),
                 "the job's prompt must carry the outcome that was waiting: {text}"
             );
             return;
@@ -6502,21 +6919,24 @@ poll_interval = "200ms"
 #[test]
 fn an_acp_scheduled_turn_stops_when_the_editor_cancels() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "job turn running" },
-        { "kind": "sleep", "ms": 5000 },
-        { "kind": "text", "text": "PAST_THE_CANCEL" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "job turn running" },
+        { "type": "sleep", "ms": 5000 },
+        { "type": "text", "text": "PAST_THE_CANCEL" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [schedule]
 poll_interval = "200ms"
 "#;
     let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     {
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let now = chrono::Utc::now();
@@ -6524,13 +6944,13 @@ poll_interval = "200ms"
         connection
             .execute(
                 "INSERT INTO scheduled_jobs \
-                 (id, session_id, kind, spec, prompt, gate_kind, gate_spec, gate_last_output, \
+                 (id, session_id, kind, spec, prompt, gate_kind, gate_spec_json, gate_last_output, \
                   gate_permission, created_at, last_fired_at, next_fire_at) \
                  VALUES (?1, ?2, 'every', '3600s', 'PROBE_CANCEL_FIRE', NULL, NULL, NULL, NULL, \
                          ?3, NULL, ?4)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
-                    &sid,
+                    &session_id,
                     now.to_rfc3339(),
                     (now - chrono::Duration::seconds(60)).to_rfc3339(),
                 ],
@@ -6548,7 +6968,7 @@ poll_interval = "200ms"
         started.iter().any(|line| line.contains("job turn running")),
         "the scheduled job never started a turn",
     );
-    harness.cancel(&sid);
+    harness.cancel(&session_id);
 
     // Past the script's sleep, so an uncancelled turn would have written its far side by now.
     std::thread::sleep(Duration::from_secs(8));
@@ -6557,7 +6977,7 @@ poll_interval = "200ms"
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?1 \
              AND content LIKE '%PAST_THE_CANCEL%'",
-            rusqlite::params![&sid],
+            rusqlite::params![&session_id],
             |row| row.get(0),
         )
         .expect("count messages");
@@ -6579,12 +6999,15 @@ poll_interval = "200ms"
 #[test]
 fn the_acp_poller_delivers_a_finished_task_once() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "noted the build finished" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "noted the build finished" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [background]
@@ -6594,7 +7017,7 @@ enabled = true
 poll_interval = "200ms"
 "#;
     let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     {
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let now = chrono::Utc::now().to_rfc3339();
@@ -6604,7 +7027,7 @@ poll_interval = "200ms"
                  (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
                  VALUES (?1, ?2, 'execute_command', 'cargo build', 'completed', '42 passed', \
                          ?3, ?3)",
-                rusqlite::params![uuid::Uuid::new_v4().to_string(), &sid, now],
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), &session_id, now],
             )
             .expect("seed the finished task");
     }
@@ -6615,9 +7038,9 @@ poll_interval = "200ms"
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let carried: i64 = connection
             .query_row(
-                "SELECT count(*) FROM messages WHERE session_id = ?1 AND role = 'user' \
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
                  AND content LIKE '%cargo build%'",
-                rusqlite::params![&sid],
+                rusqlite::params![&session_id],
                 |row| row.get(0),
             )
             .expect("count");
@@ -6626,7 +7049,7 @@ poll_interval = "200ms"
             let delivered: Option<String> = connection
                 .query_row(
                     "SELECT delivered_at FROM background_tasks WHERE session_id = ?1",
-                    rusqlite::params![&sid],
+                    rusqlite::params![&session_id],
                     |row| row.get(0),
                 )
                 .expect("read the task");
@@ -6638,9 +7061,9 @@ poll_interval = "200ms"
             std::thread::sleep(std::time::Duration::from_secs(2));
             let again: i64 = connection
                 .query_row(
-                    "SELECT count(*) FROM messages WHERE session_id = ?1 AND role = 'user' \
+                    "SELECT count(*) FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
                      AND content LIKE '%cargo build%'",
-                    rusqlite::params![&sid],
+                    rusqlite::params![&session_id],
                     |row| row.get(0),
                 )
                 .expect("count");
@@ -6664,12 +7087,15 @@ poll_interval = "200ms"
 fn the_acp_poller_does_not_spend_a_turn_on_a_cancellation() {
     // One round only. A poller that delivers would consume it and the prompt below would fail.
     let script = serde_json::json!([[
-        { "kind": "text", "text": "answered" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "answered" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [background]
@@ -6679,7 +7105,7 @@ enabled = true
 poll_interval = "200ms"
 "#;
     let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
     {
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         connection
@@ -6689,7 +7115,7 @@ poll_interval = "200ms"
                  VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
-                    &sid,
+                    &session_id,
                     chrono::Utc::now().to_rfc3339(),
                 ],
             )
@@ -6703,7 +7129,7 @@ poll_interval = "200ms"
         let messages: i64 = connection
             .query_row(
                 "SELECT count(*) FROM messages WHERE session_id = ?1",
-                rusqlite::params![&sid],
+                rusqlite::params![&session_id],
                 |row| row.get(0),
             )
             .expect("count messages");
@@ -6715,7 +7141,7 @@ poll_interval = "200ms"
         let delivered: Option<String> = connection
             .query_row(
                 "SELECT delivered_at FROM background_tasks WHERE session_id = ?1",
-                rusqlite::params![&sid],
+                rusqlite::params![&session_id],
                 |row| row.get(0),
             )
             .expect("read the task");
@@ -6726,7 +7152,7 @@ poll_interval = "200ms"
     }
 
     // The round the poller must not have eaten is this prompt's.
-    let id = harness.prompt(&sid, "what is in this CSV?");
+    let id = harness.prompt(&session_id, "what is in this CSV?");
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
@@ -6734,7 +7160,7 @@ poll_interval = "200ms"
     );
 }
 
-/// A cancelled task rides the editor's next prompt, in ACP as it does in `meka serve`.
+/// A canceled task rides the editor's next prompt, in ACP as it does in `meka serve`.
 ///
 /// ACP has no test for any of the background-outcome path, so every guard in it -- the poller's
 /// `wakes_a_host` branch, this fold, the `PromptRetention` it runs under -- could be deleted with
@@ -6743,19 +7169,22 @@ poll_interval = "200ms"
 #[test]
 fn a_cancelled_task_rides_the_editors_next_prompt() {
     let script = serde_json::json!([[
-        { "kind": "text", "text": "answered" },
-        { "kind": "message_end", "stop_reason": "end_turn" }
+        { "type": "text", "text": "answered" },
+        { "type": "message_end", "stop_reason": "end_turn" }
     ]]);
     let config_toml = r#"
-[providers.mock]
-type = "anthropic-messages"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [background]
 enabled = true
 "#;
     let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
-    let sid = harness.new_session();
+    let session_id = harness.new_session();
 
     // A terminal, undelivered, unannounced task: exactly what `/tasks cancel` leaves behind.
     {
@@ -6767,14 +7196,14 @@ enabled = true
                  VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
-                    &sid,
+                    &session_id,
                     chrono::Utc::now().to_rfc3339(),
                 ],
             )
             .expect("seed the cancelled task");
     }
 
-    let id = harness.prompt(&sid, "what is in this CSV?");
+    let id = harness.prompt(&session_id, "what is in this CSV?");
     let response = harness.await_response(id);
     assert_eq!(
         response["result"]["stopReason"], "end_turn",
@@ -6784,14 +7213,14 @@ enabled = true
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
     let user_text: String = connection
         .query_row(
-            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' \
+            "SELECT content FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
              ORDER BY id DESC LIMIT 1",
-            rusqlite::params![&sid],
+            rusqlite::params![&session_id],
             |row| row.get(0),
         )
         .expect("the prompt's user message");
     assert!(
-        user_text.contains("was cancelled"),
+        user_text.contains("was canceled"),
         "the outcome must ride inside the editor's own prompt: {user_text}"
     );
     assert!(
@@ -6802,12 +7231,161 @@ enabled = true
     let delivered: Option<String> = connection
         .query_row(
             "SELECT delivered_at FROM background_tasks WHERE session_id = ?1",
-            rusqlite::params![&sid],
+            rusqlite::params![&session_id],
             |row| row.get(0),
         )
         .expect("read the task");
     assert!(
         delivered.is_some(),
         "and riding a turn is a delivery, so it must be stamped"
+    );
+}
+
+/// `session/fork` refuses a source this editor is prompting, as it refuses one another process is
+/// writing and for the same reason: the turn persisted its prompt before the provider answered,
+/// so the copy would end on a prompt nothing answered. `InvalidParams`, the answer a second prompt
+/// on the session gets.
+#[test]
+fn acp_session_fork_refuses_a_source_with_a_prompt_in_flight() {
+    // The leading chunk is the starting gun: the fork is sent once it has been seen, so the turn
+    // is parked in the sleep and holds the conversation.
+    let turn = [
+        serde_json::json!({ "type": "text", "text": "starting..." }),
+        serde_json::json!({ "type": "sleep", "ms": 1500 }),
+        serde_json::json!({ "type": "text", "text": "done" }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "end_turn" }),
+    ];
+    let mut harness =
+        AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(serde_json::json!([turn])));
+    let source_id = harness.new_session();
+    let prompt = harness.prompt(&source_id, "slow one");
+    let seen = read_until(&mut harness.reader, window(15), |line| {
+        line.contains("starting...")
+    });
+    assert!(
+        seen.iter().any(|line| line.contains("starting...")),
+        "the premise: the turn must be under way before the fork is sent"
+    );
+
+    let refused = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": harness.config_dir(),
+            "mcpServers": [],
+        }),
+    );
+    assert_invalid_params(&refused, "session/fork on a source with a prompt in flight");
+    let detail = refused["error"]["data"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("turn is in flight") && detail.contains("fork"),
+        "the refusal names what it refused and why: {refused}"
+    );
+
+    let (_updates, response) = harness.collect_updates(&source_id, prompt);
+    assert_eq!(
+        response["result"]["stopReason"], "end_turn",
+        "and the turn it declined to interrupt completes; got: {response}",
+    );
+
+    let store = rusqlite::Connection::open(harness.database()).expect("open the store");
+    let sessions: i64 = store
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(sessions, 1, "no copy was written");
+    let messages: i64 = store
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(
+        messages, 2,
+        "the source's conversation is what the turn alone produced"
+    );
+    drop(store);
+
+    // Between turns the same request is what it always was.
+    let forked = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": harness.config_dir(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(
+        forked["result"]["sessionId"].is_string(),
+        "a source between turns forks: {forked}"
+    );
+}
+
+/// `session/fork` refuses a source another process is writing, as `meka session fork` and
+/// `POST /v1/sessions/{id}/fork` do: a copy taken mid-turn ends on a user message nothing
+/// answered. A source this editor has open is its own and is not probed; one it has closed is, and
+/// a second descriptor from this test stands in for the other process.
+#[test]
+fn acp_session_fork_refuses_a_source_another_process_holds() {
+    let turn = [
+        serde_json::json!({ "type": "text", "text": "ok" }),
+        serde_json::json!({ "type": "message_end", "stop_reason": "end_turn" }),
+    ];
+    let mut harness =
+        AcpTestHarness::spawn(ACP_INVALID_PARAMS_CONFIG, Some(serde_json::json!([turn])));
+
+    let source_id = harness.new_session();
+    let id = harness.prompt(&source_id, "seed");
+    harness.collect_updates(&source_id, id);
+    let closed = harness.request(
+        "session/close",
+        serde_json::json!({ "sessionId": source_id }),
+    );
+    assert!(closed["error"].is_null(), "session/close failed: {closed}");
+
+    let lock_path = harness
+        .install
+        .data_dir()
+        .join("locks")
+        .join(format!("{source_id}.lock"));
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap_or_else(|error| panic!("open {}: {error}", lock_path.display()));
+    held.try_lock()
+        .expect("the closed session's lock is free for this test to take");
+
+    let refused = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": harness.config_dir(),
+            "mcpServers": [],
+        }),
+    );
+    assert_invalid_params(&refused, "session/fork on a source another process holds");
+    let detail = refused["error"]["data"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("another process") && detail.contains(&source_id),
+        "the refusal must say who has it and name the source: {refused}"
+    );
+    let listed = harness.request("session/list", serde_json::json!({}));
+    assert_eq!(
+        listed["result"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "and no copy was left behind: {listed}"
+    );
+
+    drop(held);
+    let forked = harness.request(
+        "session/fork",
+        serde_json::json!({
+            "sessionId": source_id,
+            "cwd": harness.config_dir(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(
+        forked["result"]["sessionId"].is_string(),
+        "a released source forks: {forked}"
     );
 }

@@ -2,10 +2,10 @@
 
 The scratchpad is a session-scoped working memory that the agent can use to store, retrieve, edit, and manage content without consuming conversation context. Entries are identified by string names and persist across turns within a session.
 
-## When the Scratchpad is Used
+## When the scratchpad is used
 
 - **Proactively**: The agent stores intermediate results (extracted text, API responses, research notes) for later use.
-- **Via `scratchpad` parameter**: any tool call carrying one has its output saved there instead of returned inline. See [Scratchpad Parameter](./overview.md#scratchpad-parameter) for which tools advertise it.
+- **Via `scratchpad` parameter**: any tool call carrying one has its output saved there instead of returned inline. See [Scratchpad parameter](./overview.md#scratchpad-parameter) for which tools advertise it.
 - **Automatically**: when a tool's output exceeds 30,000 bytes, it is saved under a generated name (e.g. `execute_command_a1b2c3_1`) and replaced with a preview.
 
 ## Tools
@@ -32,8 +32,8 @@ Read or search a scratchpad entry by name.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `name` | string | yes | The entry name |
-| `offset` | integer | no | Character offset to start reading from (default: 0) |
-| `limit` | integer | no | Maximum characters to return; no hard cap. Pass the entry's `size` to load all content in one call. (Default and exact value are advertised in the tool's parameter schema.) |
+| `offset` | integer | no | Byte offset to start reading from (default: 0) |
+| `limit` | integer | no | Maximum bytes to return; no hard cap. Pass the entry's `size` to load all content in one call. (Default and exact value are advertised in the tool's parameter schema.) |
 | `regex` | string | no | Search the entry and return matching lines (capped, exact value advertised in the tool's parameter schema). |
 
 ### `scratchpad_edit`
@@ -52,7 +52,7 @@ Edit a scratchpad entry in place. Provide `content` for a full overwrite, or `ol
 
 ### `scratchpad_list`
 
-List all scratchpad entries with their name, size, and creation time. No parameters.
+List all scratchpad entries as a table with `Name`, `Size`, `Created` and `Origin` columns, the last `own` for an entry this session wrote and `inherited` for one a parent lent a sub-agent read-only. No parameters.
 
 **Permission:** Read
 
@@ -69,16 +69,20 @@ Delete a scratchpad entry by name.
 ### `scratchpad_merge`
 
 Combine several entries into one without routing the bytes through the conversation. Useful for
-collecting parallel sub-agent reports. A sub-agent cannot merge into a name it inherited read-only
-from its parent, though it may read such a name as a source.
+collecting parallel sub-agent reports. The entries go in the order given: `sources` first, as
+listed, then every own entry whose name starts with `prefix`, in name order. The sources are kept
+as they are; nothing is deleted, and `target` is overwritten if it exists. A sub-agent cannot merge
+into a name it inherited read-only from its parent, though it may name such an entry in `sources`;
+`prefix` selects only its own entries.
 
 **Permission:** Read
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `sources` | array of string | yes | Entry names to combine, in order |
+| `sources` | array of string | no | Entry names to combine, in this order; optional when `prefix` is given |
+| `prefix` | string | no | Also combine every own entry whose name starts with this, in name order, after `sources`; `target` itself is never selected |
 | `target` | string | yes | Name to store the result under; overwrites if it exists |
-| `format` | string | no | `concat_with_headers` (default, prepends `--- name ---`), `concat`, or `json_array` |
+| `format` | string | no | `concat_with_headers` (default) puts a `--- name ---` line before each entry's content, `concat` joins the contents with a newline, `json_array` parses each content as JSON (quoting one that is not) into one compact array |
 
 ### `scratchpad_rename`
 
@@ -110,7 +114,7 @@ read-only from its parent.
 ### `scratchpad_save_file`
 
 Write a scratchpad entry out to a file, again without routing the bytes through the conversation.
-A sub-agent can save an entry it inherited, so a worker's report reaches disk without being copied
+A sub-agent can save an entry it inherited, so a sub-agent's report reaches disk without being copied
 through the model.
 
 **Permission:** Workspace
@@ -119,13 +123,13 @@ This is the one scratchpad tool that leaves meka's own storage, so it is the one
 level that can write. It reads as the scratchpad's `write_file` and is fenced identically: at
 `workspace` the path must resolve inside a workspace root, and the refusal is the same one
 `write_file` gives. Every other scratchpad tool stays at `read` because the scratchpad lives in
-meka's database, not your tree.
+the store, not your tree.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `name` | string | yes | The scratchpad entry to read from |
 | `path` | string | yes | The file path to write to |
-| `force` | boolean | no | Replace the file if it already exists; without it, saving over an existing file is refused |
+| `force` | boolean | no | Proceed despite the file already existing, or existing but being unreadable (default: false) |
 
 ## Handing entries to a sub-agent
 
@@ -133,12 +137,12 @@ meka's database, not your tree.
 sub-agent read-only access to exactly those:
 
 ```text
-agent_spawn(prompt: "summarise the failures", inherit_scratchpad: ["build_log"])
+agent_spawn(prompt: "summarize the failures", inherit_scratchpad: ["build_log"])
 ```
 
 The sub-agent's `scratchpad_read` falls back to the parent for an inherited name, and its
 `scratchpad_list` shows the entry with origin `inherited`. `scratchpad_write`, `scratchpad_edit` and
-`scratchpad_delete` targeting one return an error, so a worker cannot rewrite what it was lent.
+`scratchpad_delete` targeting one return an error, so a sub-agent cannot rewrite what it was lent.
 
 This is how a large captured output reaches a sub-agent without being re-inlined into the prompt.
 When you expect to delegate a result later, name it at the source with the `scratchpad` parameter

@@ -7,32 +7,28 @@
 //! remember anything, which defeats the feature.
 //!
 //! [`crate::memory::validate_memory_name`] is checked at every door that *writes* a name. The name
-//! is no longer a path, so it is no longer a file-write primitive, but it is what
-//! `meka memory export` turns into a file name and it is text the model reads in every turn's
-//! index.
+//! is not a path, so it is not a file-write primitive, but it is what `meka memory export` turns
+//! into a file name and it is text the model reads in every turn's index.
 //!
 //! The doors that only *look a name up* -- `memory_read` and `memory_delete` -- check
 //! [`crate::memory::validate_memory_lookup`] instead, which requires only that the name is not
 //! empty. It bounded length too, until that turned out to re-create this same wedge one length
-//! short; the cost that bound existed for is bounded in `did_you_mean_hint` now.
-//! Applying the write rule to them meant a row that reached the column past the tools was listed
-//! to the model in the `[Memory]` index and then refused by every door that could have opened or
-//! removed it, with `meka memory export` refusing the whole store on its account.
+//! short; the cost that bound existed for is bounded in `did_you_mean_hint` now. Applying the write
+//! rule to them meant a row that reached the column past the tools was listed to the model in the
+//! `[Memory]` index and then refused by every door that could have opened or removed it, with `meka
+//! memory export` refusing the whole store on its account.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolOutput, util::require_str};
 use crate::{
     error::{MekaError, Result},
-    memory::{
-        self, MemoryStore,
-        store::{SearchResults, Terms, WriteRequest},
-    },
+    memory,
     permission::Permission,
     provider::ToolDefinition,
+    store::memory::{MemoryStore, SearchResults, Terms, WriteRequest},
 };
 
 /// Turn a store error into the tool's own failure, so the model sees which call failed.
@@ -43,18 +39,8 @@ fn tool_error(tool_name: &str, error: impl std::fmt::Display) -> MekaError {
     }
 }
 
-fn require_str<'a>(input: &'a serde_json::Value, key: &str, tool_name: &str) -> Result<&'a str> {
-    input[key]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message: format!("missing '{}' parameter", key),
-        })
-}
-
 pub(super) struct MemoryWriteTool {
-    pub memories: Arc<MemoryStore>,
+    pub(crate) memories: Arc<MemoryStore>,
 }
 
 #[async_trait]
@@ -76,24 +62,25 @@ impl Tool for MemoryWriteTool {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Identifier, letters/digits/-/_ only (e.g. 'alice-timezone')"
+                        "description": "Identifier, letters/digits/-/_ only (e.g. 'alice-timezone')."
                     },
                     "description": {
                         "type": "string",
                         "description": "One line stating the fact itself, shown in every future \
                                         session's memory index. Required when creating a memory; \
-                                        omit it to leave an existing memory's description untouched"
+                                        omit it to leave an existing memory's description untouched."
                     },
                     "priority": {
                         "type": "integer",
                         "minimum": 0,
                         "maximum": 9,
+                        "default": crate::entry::DEFAULT_PRIORITY,
                         "description": "Lower sorts higher in the index. 0 is a standing \
                                         directive and is the only tier whose body is in your \
                                         context every turn, so put a rule you must always follow \
                                         there; 1 also always applies but is listed by description \
                                         like the rest, 2-4 durable facts, 5 default, 6-9 \
-                                        situational or short-lived"
+                                        situational or short-lived."
                     },
                     "tags": {
                         "type": "array",
@@ -101,13 +88,13 @@ impl Tool for MemoryWriteTool {
                         "description": "Lowercase labels ([a-z0-9-], at most 10), e.g. ['infra', \
                                         'deploy']. Indexed as words, so memory_search finds them. \
                                         Omit to leave an existing memory's tags untouched; pass \
-                                        [] to clear them"
+                                        [] to clear them."
                     },
                     "body": {
                         "type": "string",
                         "description": "Optional detail, loaded only when memory_read is called. \
                                         Omit it to leave an existing memory's body untouched; \
-                                        pass an empty string to clear it"
+                                        pass an empty string to clear it."
                     }
                 },
                 "required": ["name"]
@@ -123,9 +110,10 @@ impl Tool for MemoryWriteTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_write")?;
+        let name = name.as_str();
         memory::validate_memory_name(name).map_err(|message| MekaError::ToolExecution {
             tool_name: "memory_write".to_string(),
             message,
@@ -166,7 +154,7 @@ impl Tool for MemoryWriteTool {
             Some(value) => {
                 return Err(MekaError::ToolExecution {
                     tool_name: "memory_write".to_string(),
-                    message: format!("'description' must be a string, got {}", value),
+                    message: format!("'description' must be a string, got {value}"),
                 });
             }
         };
@@ -186,7 +174,7 @@ impl Tool for MemoryWriteTool {
             Some(value) => {
                 return Err(MekaError::ToolExecution {
                     tool_name: "memory_write".to_string(),
-                    message: format!("'body' must be a string, got {}", value),
+                    message: format!("'body' must be a string, got {value}"),
                 });
             }
         };
@@ -204,10 +192,7 @@ impl Tool for MemoryWriteTool {
                     let Some(tag) = value.as_str() else {
                         return Err(MekaError::ToolExecution {
                             tool_name: "memory_write".to_string(),
-                            message: format!(
-                                "every entry in 'tags' must be a string, got {}",
-                                value
-                            ),
+                            message: format!("every entry in 'tags' must be a string, got {value}"),
                         });
                     };
                     collected.push(tag.to_string());
@@ -220,7 +205,7 @@ impl Tool for MemoryWriteTool {
             Some(value) => {
                 return Err(MekaError::ToolExecution {
                     tool_name: "memory_write".to_string(),
-                    message: format!("'tags' must be a list of strings, got {}", value),
+                    message: format!("'tags' must be a list of strings, got {value}"),
                 });
             }
         };
@@ -238,7 +223,7 @@ impl Tool for MemoryWriteTool {
             Some(value) => {
                 let raw = value.as_i64().ok_or_else(|| MekaError::ToolExecution {
                     tool_name: "memory_write".to_string(),
-                    message: format!("'priority' must be a whole number, got {}", value),
+                    message: format!("'priority' must be a whole number, got {value}"),
                 })?;
                 Some(memory::parse_priority(Some(raw), name))
             }
@@ -249,7 +234,7 @@ impl Tool for MemoryWriteTool {
         // one transaction -- but for the near-duplicate check below, which is a read.
         let _duplicate_guard = self.memories.lock_duplicate_check().await;
 
-        // Normalised before the write so the doors agree on what a tag is: `Infra` and ` infra `
+        // Normalized before the write so the doors agree on what a tag is: `Infra` and ` infra `
         // are the same label, and a duplicate would otherwise be stored twice in one column.
         let tags = match tags {
             Some(tags) => Some(
@@ -287,19 +272,19 @@ impl Tool for MemoryWriteTool {
         };
 
         // One statement, one transaction, and no `flock`: two writes to one name are two upserts,
-        // and SQLite serialises them. Omit-to-keep is in the SQL, so there is no read here to go
+        // and SQLite serializes them. Omit-to-keep is in the SQL, so there is no read here to go
         // stale between the check above and this.
         let written = self
             .memories
             .write(WriteRequest {
                 name: name.to_string(),
-                // Normalised to one line here rather than only at `PUT /v1/memory`, so all three
-                // write doors store the same thing. `meka memory export` normalises on the way
+                // Normalized to one line here rather than only at `PUT /v1/memory`, so all three
+                // write doors store the same thing. `meka memory export` normalizes on the way
                 // out, so a description holding a newline came back collapsed after a round trip
                 // and the docs' "byte-exact" claim was false for exactly the doors an agent uses.
                 description: description
                     .as_deref()
-                    .map(crate::store::normalize_description),
+                    .map(crate::entry::normalize_description),
                 tags,
                 body,
                 priority,
@@ -307,7 +292,8 @@ impl Tool for MemoryWriteTool {
             .await
             .map_err(|error| tool_error("memory_write", error))?;
 
-        tracing::info!("saved memory '{}'", written.name);
+        let name = &written.name;
+        tracing::info!("saved memory '{name}'");
         Ok(ToolOutput::text(
             format!(
                 // Not "it will appear in your memory index from the next turn on", which was an
@@ -334,7 +320,7 @@ impl Tool for MemoryWriteTool {
                     Some(existing) => format!(
                         "\n\nNote: '{existing}' already says something very similar. If this is \
                          the same fact, call memory_write on '{existing}' instead and delete \
-                         '{name}' -- two near-copies both stay in the index for ever and neither \
+                         '{name}'. Two near-copies both stay in the index for ever and neither \
                          supersedes the other."
                     ),
                     None => String::new(),
@@ -365,7 +351,7 @@ impl MemoryWriteTool {
             .search(incoming.match_expression(), 5)
             .await
             .inspect_err(|error| {
-                tracing::debug!("duplicate check skipped: {}", error);
+                tracing::debug!("duplicate check skipped: {error}");
             })
             .ok()?
             .hits;
@@ -396,7 +382,7 @@ impl MemoryWriteTool {
 }
 
 pub(super) struct MemoryReadTool {
-    pub memories: Arc<MemoryStore>,
+    pub(crate) memories: Arc<MemoryStore>,
 }
 
 #[async_trait]
@@ -413,7 +399,7 @@ impl Tool for MemoryReadTool {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Name of the memory, as listed in the memory index"
+                        "description": "Name of the memory, as listed in the memory index."
                     }
                 },
                 "required": ["name"]
@@ -429,9 +415,10 @@ impl Tool for MemoryReadTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_read")?;
+        let name = name.as_str();
         // Validated here as at every other door, which the module doc has always claimed and this
         // one did not do. Two things follow from the omission: an invalid name was reported as
         // merely absent, and the miss path below loads the whole index and runs an edit distance
@@ -477,11 +464,8 @@ impl Tool for MemoryReadTool {
         // anything, so neither moves the ranking the agent gets. Best-effort: a counter that fails
         // to increment must not fail the read.
         if let Err(error) = self.memories.record_read(&entry.name).await {
-            tracing::warn!(
-                "could not record a read of memory '{}': {}",
-                entry.name,
-                error
-            );
+            let name = &entry.name;
+            tracing::warn!("failed to record a read of memory '{name}': {error}");
         }
 
         // Age is stated on the way out, not just in the index: a memory is a point-in-time
@@ -502,7 +486,7 @@ impl Tool for MemoryReadTool {
             0 => "(no body: this memory's description is all of it)".to_string(),
             length if length > READ_BODY_MAX_CHARS => format!(
                 "{}\n\n[Body truncated: {} of {} characters shown.]",
-                crate::context::clip_chars(body, READ_BODY_MAX_CHARS),
+                crate::prompt::clip_chars(body, READ_BODY_MAX_CHARS),
                 READ_BODY_MAX_CHARS,
                 length
             ),
@@ -524,10 +508,9 @@ impl Tool for MemoryReadTool {
 
 /// Default number of ranked entries `memory_search` returns.
 ///
-/// An order of magnitude below the shared `MAX_SEARCH_MATCHES`, which sized a list of grep
-/// *lines*. An entry
-/// here carries a description, an excerpt and often a whole short body, so ten of them is already a
-/// substantial read and a hundred would crowd out the turn that asked for them.
+/// An order of magnitude below the shared `MAX_SEARCH_MATCHES`, which sized a list of grep *lines*.
+/// An entry here carries a description, an excerpt and often a whole short body, so ten of them is
+/// already a substantial read and a hundred would crowd out the turn that asked for them.
 const DEFAULT_SEARCH_LIMIT: usize = 10;
 const MAX_SEARCH_LIMIT: usize = 25;
 
@@ -566,10 +549,9 @@ const DUPLICATE_MIN_TERMS: usize = 3;
 ///
 /// Two for anything five characters or longer, because the most common typo is a *transposition*
 /// (`Tokoy` for `Tokyo`) and Levenshtein charges two for one. A threshold of one -- which is what
-/// scaling by length alone gives a five-letter word, and what
-/// [`crate::tools::did_you_mean_hint`] uses for tool names -- misses the single most likely way a
-/// remembered word comes out wrong. Short words stay at one, where two edits would match almost
-/// anything.
+/// scaling by length alone gives a five-letter word, and what [`crate::tools::did_you_mean_hint`]
+/// uses for tool names -- misses the single most likely way a remembered word comes out wrong.
+/// Short words stay at one, where two edits would match almost anything.
 fn fuzzy_threshold(term: &str) -> usize {
     let length = term.chars().count();
     if length < 5 {
@@ -601,8 +583,8 @@ impl Tier {
             }
             Tier::Substring => {
                 "No word matches. These contain what you asked for as a literal \
-                             substring, which is how text the word splitter does not divide -- \
-                             Chinese, Japanese, Thai, an identifier, a serial number -- is found.\n\n"
+                             substring, which is how text the word splitter does not divide \
+                             (Chinese, Japanese, Thai, an identifier, a serial number) is found.\n\n"
             }
             Tier::Fuzzy => {
                 "No full-text matches. These are the closest memory names and \
@@ -613,7 +595,7 @@ impl Tier {
 }
 
 pub(super) struct MemorySearchTool {
-    pub memories: Arc<MemoryStore>,
+    pub(crate) memories: Arc<MemoryStore>,
 }
 
 impl MemorySearchTool {
@@ -622,9 +604,10 @@ impl MemorySearchTool {
     /// on a query that was otherwise going to return an empty result.
     ///
     /// Names and descriptions only, because that is all the index carries. Substring matching,
-    /// which needs the *body* too, is [`memory::store::MemoryStore::substring_search`] and runs as
-    /// its own tier ahead of this one: doing it here read the body of no memory at all, so a CJK
-    /// note was found by a word in its description and invisible by a word in its text.
+    /// which needs the *body* too, is [`crate::store::memory::MemoryStore::substring_search`] and
+    /// runs as its own tier ahead of this one: doing it here read the body of no memory at all,
+    /// so a CJK note was found by a word in its description and invisible by a word in its
+    /// text.
     fn fuzzy_by_spelling(
         index: &[memory::Memory],
         terms: &[String],
@@ -710,6 +693,7 @@ impl Tool for MemorySearchTool {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": MAX_SEARCH_LIMIT,
+                        "default": DEFAULT_SEARCH_LIMIT,
                         "description": format!("Maximum memories to return. Default: {DEFAULT_SEARCH_LIMIT}.")
                     }
                 },
@@ -726,15 +710,15 @@ impl Tool for MemorySearchTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         // A bare string where an array is declared is a mistake models make constantly, and the
         // recovery is free. Rejecting it would cost a turn to say something the tool could simply
-        // have understood.
-        // Two distinct failures, two distinct messages. "Missing" is for a parameter that is not
-        // there or is the wrong type; a parameter that *is* there but yields nothing searchable is
-        // a different mistake and needs a different fix, and reporting it as missing sends the
-        // caller looking for a bug in how it built the call rather than at what it asked for.
+        // have understood. Two distinct failures, two distinct messages. "Missing" is for a
+        // parameter that is not there or is the wrong type; a parameter that *is* there but yields
+        // nothing searchable is a different mistake and needs a different fix, and reporting it as
+        // missing sends the caller looking for a bug in how it built the call rather than at what
+        // it asked for.
         let queries: Option<Vec<String>> = match input.get("queries") {
             Some(serde_json::Value::String(single)) => Some(vec![single.clone()]),
             Some(serde_json::Value::Array(values)) => Some(
@@ -755,7 +739,7 @@ impl Tool for MemorySearchTool {
         // alike, and `unwrap_or` then silently substituted 10: the model asked for three results,
         // got ten, and nothing in the output said the parameter had been discarded. The same
         // handler already goes out of its way to accept a bare string where `queries` declares an
-        // array, so meeting a numeric string here is the consistent behaviour, not a new leniency.
+        // array, so meeting a numeric string here is the consistent behavior, not a new leniency.
         let limit = match input.get("limit") {
             None | Some(serde_json::Value::Null) => DEFAULT_SEARCH_LIMIT,
             Some(value) => {
@@ -765,7 +749,7 @@ impl Tool for MemorySearchTool {
                     .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
                     .ok_or_else(|| MekaError::ToolExecution {
                         tool_name: "memory_search".to_string(),
-                        message: format!("'limit' must be a whole number, got {}", value),
+                        message: format!("'limit' must be a whole number, got {value}"),
                     })?;
                 number.clamp(1, MAX_SEARCH_LIMIT as i64) as usize
             }
@@ -826,9 +810,8 @@ impl Tool for MemorySearchTool {
         if fuzzy.is_empty() {
             return Ok(ToolOutput::text(
                 format!(
-                    "No memories matched {:?}. Try broader words, or several phrasings of the \
-                     same idea in one call.",
-                    queries
+                    "No memories matched {queries:?}. Try broader words, or several phrasings of the \
+                     same idea in one call."
                 ),
                 false,
             ));
@@ -847,16 +830,13 @@ fn render_hits(
     limit: usize,
     now: std::time::SystemTime,
 ) -> String {
-    use std::fmt::Write as _;
-
     let hits = &results.hits;
     let mut out = String::from(tier.preamble());
     // The number of *matches*, not the number rendered. Reporting the truncated length as the
     // total reads as "this is everything that matched", which is how a full store becomes a
     // confidently incomplete answer.
-    let _ = writeln!(
-        out,
-        "{}{} matching {}, most relevant first:\n",
+    out.push_str(&format!(
+        "{}{} matching {}, most relevant first:\n\n",
         if results.pool_exhausted {
             "at least "
         } else {
@@ -868,30 +848,28 @@ fn render_hits(
         } else {
             "memories"
         }
-    );
+    ));
     let mut shown = 0;
     let mut budget_bound = false;
     for hit in hits {
         let mut entry = String::new();
-        let _ = writeln!(
-            entry,
-            "- **{}** (p{}, recorded {}, read {}x)",
+        entry.push_str(&format!(
+            "- **{}** (p{}, recorded {}, read {}x)\n",
             hit.name,
             hit.priority,
             memory::render_age(hit.recorded, now),
             hit.read_count
-        );
+        ));
         // Elided, like every other rendered description. Descriptions are deliberately unbounded
         // at parse time, and the always-emit-the-first-entry rule below then lets one memory spend
         // the whole turn's budget on its description alone -- measured at 100 KB from a 6 KB
         // ceiling. `render_fuzzy` and the `[Memory]` index both already guard this.
-        let _ = writeln!(
-            entry,
-            "  {}",
-            crate::store::elide_description_for_index(&memory::render_description_for_model(
+        entry.push_str(&format!(
+            "  {}\n",
+            crate::entry::elide_description_for_index(&memory::render_description_for_model(
                 &hit.description
             ))
-        );
+        ));
         let body = hit.body.trim();
         if !body.is_empty() {
             // The whole body when it is short, which most are: that turns the common recall into
@@ -907,14 +885,14 @@ fn render_hits(
             } else {
                 format!(
                     "… {} …",
-                    memory::render_for_model(&crate::context::clip_chars(
+                    memory::render_for_model(&crate::prompt::clip_chars(
                         &hit.snippet,
                         INLINE_BODY_MAX_CHARS
                     ))
                 )
             };
             for line in rendered.lines() {
-                let _ = writeln!(entry, "  {}", line);
+                entry.push_str(&format!("  {line}\n"));
             }
         }
         entry.push('\n');
@@ -934,18 +912,19 @@ fn render_hits(
     // understate the remainder by exactly the amount `limit` removed.
     let hidden = results.matched.saturating_sub(shown);
     if hidden > 0 {
-        let _ = writeln!(
-            out,
-            "{}{hidden} further match(es) not shown here{}",
-            // Hedged for the same reason the header is. `matched` is capped at the candidate pool,
-            // so once the pool is full this number is a floor, not a count: a store of ten
+        out.push_str(&format!(
+            "{}{hidden} further match(es) not shown here{}\n", /* Hedged for the same reason the
+                                                                * header is. `matched` is capped
+                                                                * at the candidate pool, // so
+                                                                * once the pool is full this
+                                                                * number is a floor, not a
+                                                                * count: a store of ten */
             // thousand reported "197 further" when nine thousand seven hundred were hidden.
             if results.pool_exhausted {
                 "at least "
             } else {
                 ""
-            },
-            // Naming the constraint that actually bound, and only offering a remedy that can
+            }, // Naming the constraint that actually bound, and only offering a remedy that can
             // work. "raise `limit`" was printed when the byte budget had done the cutting, and
             // again when `limit` was already at `MAX_SEARCH_LIMIT` -- both times handing the model
             // a remedy that provably returns the identical result. A `limit` above the maximum is
@@ -958,9 +937,9 @@ fn render_hits(
             } else {
                 "; raise `limit` or narrow the query."
             }
-        );
+        ));
     }
-    let _ = write!(out, "Call `memory_read` for the full text of any of these.");
+    out.push_str("Call `memory_read` for the full text of any of these.");
     out
 }
 
@@ -971,8 +950,6 @@ fn render_fuzzy(
     candidates: usize,
     now: std::time::SystemTime,
 ) -> String {
-    use std::fmt::Write as _;
-
     let mut out = String::from(Tier::Fuzzy.preamble());
     let mut rendered_count = 0;
     for (shown, (_, entry)) in scored.iter().enumerate() {
@@ -985,7 +962,7 @@ fn render_fuzzy(
             entry.priority,
             memory::render_age(entry.recorded_at, now),
             entry.read_count,
-            crate::store::elide_description_for_index(&memory::render_description_for_model(
+            crate::entry::elide_description_for_index(&memory::render_description_for_model(
                 &entry.description
             ))
         );
@@ -1001,20 +978,16 @@ fn render_fuzzy(
     // enough that not saying so is the difference between a shortlist and a wrong answer.
     let hidden = candidates.saturating_sub(rendered_count);
     if hidden > 0 {
-        let _ = write!(
-            out,
+        out.push_str(&format!(
             "\n{hidden} further candidate(s) scored the same or worse and are not shown.\n"
-        );
+        ));
     }
-    let _ = write!(
-        out,
-        "\nCall `memory_read` to see whether one of these is what you meant."
-    );
+    out.push_str("\nCall `memory_read` to see whether one of these is what you meant.");
     out
 }
 
 pub(super) struct MemoryDeleteTool {
-    pub memories: Arc<MemoryStore>,
+    pub(crate) memories: Arc<MemoryStore>,
 }
 
 #[async_trait]
@@ -1031,7 +1004,7 @@ impl Tool for MemoryDeleteTool {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Name of the memory to delete"
+                        "description": "Name of the memory to delete."
                     }
                 },
                 "required": ["name"]
@@ -1047,9 +1020,10 @@ impl Tool for MemoryDeleteTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_delete")?;
+        let name = name.as_str();
         memory::validate_memory_lookup(name).map_err(|message| MekaError::ToolExecution {
             tool_name: "memory_delete".to_string(),
             message,
@@ -1066,37 +1040,25 @@ impl Tool for MemoryDeleteTool {
         {
             return Err(tool_error(
                 "memory_delete",
-                format!("no memory named '{}'", name),
+                format!("no memory named '{name}'"),
             ));
         }
 
-        tracing::info!("deleted memory '{}'", name);
-        Ok(ToolOutput::text(
-            format!("Deleted memory '{}'.", name),
-            false,
-        ))
+        tracing::info!("deleted memory '{name}'");
+        Ok(ToolOutput::text(format!("Deleted memory '{name}'."), false))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
     /// A real store behind an in-memory SQLite database, created and torn down per test, so these
     /// exercise the same path a session does.
     async fn store() -> Arc<MemoryStore> {
-        MemoryStore::in_memory().await.expect("in-memory store")
-    }
-
-    fn output_text(output: &ToolOutput) -> String {
-        output
-            .content
-            .iter()
-            .map(|block| match block {
-                crate::provider::ToolResultContent::Text { text } => text.clone(),
-                _ => String::new(),
-            })
-            .collect()
+        MemoryStore::for_test().await.expect("in-memory store")
     }
 
     #[tokio::test]
@@ -1111,7 +1073,7 @@ mod tests {
         write
             .execute(
                 serde_json::json!({"name": "retention", "description": long, "body": "first"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("create");
@@ -1120,7 +1082,7 @@ mod tests {
         write
             .execute(
                 serde_json::json!({"name": "retention", "body": "second"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("refine");
@@ -1132,7 +1094,7 @@ mod tests {
             .expect("still there");
         assert_eq!(
             stored.description,
-            crate::store::normalize_description(&long),
+            crate::entry::normalize_description(&long),
             "refining the body must not rewrite the description"
         );
         assert_eq!(stored.body.as_deref(), Some("second"));
@@ -1141,12 +1103,12 @@ mod tests {
         let missing = write
             .execute(
                 serde_json::json!({"name": "brand-new", "body": "text"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         let message = match missing {
             Err(error) => error.to_string(),
-            Ok(output) => output_text(&output),
+            Ok(output) => output.text_content(),
         };
         assert!(
             message.contains("description is required to create it"),
@@ -1189,7 +1151,7 @@ mod tests {
             write
                 .execute(
                     serde_json::json!({ "name": name, "description": description }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -1197,29 +1159,27 @@ mod tests {
         let search = MemorySearchTool { memories };
 
         // The Latin control: one edit, one byte, found before and after.
-        let latin = output_text(
-            &search
-                .execute(
-                    serde_json::json!({"queries": ["abcd"]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-        );
+        let latin = search
+            .execute(
+                serde_json::json!({"queries": ["abcd"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
         assert!(latin.contains("abc-note"), "the premise: {latin}");
 
         // One edit, three bytes. Every earlier tier is blind to it: `unicode61` makes a CJK run a
         // single token so no `MATCH` can reach it, and `LIKE '%東京都%'` cannot match a shorter
         // stored string. The spelling tier is the only thing left.
-        let cjk = output_text(
-            &search
-                .execute(
-                    serde_json::json!({"queries": ["東京都"]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-        );
+        let cjk = search
+            .execute(
+                serde_json::json!({"queries": ["東京都"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
         assert!(
             cjk.contains("office"),
             "a near-miss must be measured in the same unit as the threshold that admits it: {cjk}"
@@ -1243,7 +1203,7 @@ mod tests {
         let refused = write
             .execute(
                 serde_json::json!({"name": "invisible", "description": "\u{200b}\u{200b}\u{200b}"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a description that renders as nothing must not be stored");
@@ -1284,15 +1244,14 @@ mod tests {
             .plant_row_for_test(&long, "written straight to the column")
             .await
             .expect("plant the long row");
-        let opened = output_text(
-            &read
-                .execute(
-                    serde_json::json!({ "name": long }),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("a stored name must be reachable however long it is"),
-        );
+        let opened = read
+            .execute(
+                serde_json::json!({ "name": long }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a stored name must be reachable however long it is")
+            .text_content();
         assert!(
             opened.contains("written straight to the column"),
             "the long-named row must open: {opened}"
@@ -1305,15 +1264,14 @@ mod tests {
             .await
             .expect("plant the row");
 
-        let found = output_text(
-            &read
-                .execute(
-                    serde_json::json!({ "name": "hand.edited" }),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("a row the index shows the model must be one it can open"),
-        );
+        let found = read
+            .execute(
+                serde_json::json!({ "name": "hand.edited" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("a row the index shows the model must be one it can open")
+            .text_content();
         assert!(found.contains("put here past the write doors"), "{found}");
 
         // And it can be got rid of, which is what makes the store unwedgeable.
@@ -1323,7 +1281,7 @@ mod tests {
             }
             .execute(
                 serde_json::json!({ "name": "hand.edited" }),
-                CancellationToken::new()
+                crate::tools::ToolContext::detached(CancellationToken::new())
             )
             .await
             .is_ok(),
@@ -1337,7 +1295,7 @@ mod tests {
 
     /// `memory_write` stores a one-line description, as the CLI and the HTTP door do.
     ///
-    /// Only `PUT /v1/memory` normalised, so a model that put a newline in a description -- which
+    /// Only `PUT /v1/memory` normalized, so a model that put a newline in a description -- which
     /// nothing stops it doing -- had it stored verbatim, and `meka memory export` then wrote it
     /// collapsed. The round trip changed the text for the one door an agent actually uses.
     #[tokio::test]
@@ -1352,7 +1310,7 @@ mod tests {
                     "name": "note",
                     "description": "first line\nsecond   line",
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -1371,7 +1329,7 @@ mod tests {
     /// `body` has always been optional, so a priority change is a call the schema invites.
     /// Rendering the absence as an empty body deletes everything the memory said.
     #[tokio::test]
-    async fn test_write_without_a_body_keeps_the_existing_one() {
+    async fn write_without_a_body_keeps_the_existing_one() {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
@@ -1381,14 +1339,14 @@ mod tests {
         let output = write
             .execute(
                 serde_json::json!({"name": "bare", "description": "No body"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("create without a body");
         assert!(
-            !output_text(&output).contains("keeping"),
+            !output.text_content().contains("keeping"),
             "{}",
-            output_text(&output)
+            output.text_content()
         );
 
         write
@@ -1398,7 +1356,7 @@ mod tests {
                     "description": "How to reply",
                     "body": "Always answer in kind."
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("initial write");
@@ -1410,29 +1368,29 @@ mod tests {
                     "description": "How to reply",
                     "priority": 0
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("metadata-only write");
         // Said out loud, so the two calls are distinguishable from their results alone.
         assert!(
-            output_text(&output).contains("keeping the existing body"),
+            output.text_content().contains("keeping the existing body"),
             "{}",
-            output_text(&output)
+            output.text_content()
         );
 
         let read = MemoryReadTool { memories };
         let output = read
             .execute(
                 serde_json::json!({"name": "policy"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("read");
         assert!(
-            output_text(&output).contains("Always answer in kind."),
+            output.text_content().contains("Always answer in kind."),
             "{}",
-            output_text(&output)
+            output.text_content()
         );
 
         // Clearing is still possible; it just has to be asked for.
@@ -1443,30 +1401,30 @@ mod tests {
                     "description": "How to reply",
                     "body": ""
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("explicit clear");
         let output = read
             .execute(
                 serde_json::json!({"name": "policy"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("read");
         assert!(
-            !output_text(&output).contains("Always answer in kind."),
+            !output.text_content().contains("Always answer in kind."),
             "{}",
-            output_text(&output)
+            output.text_content()
         );
     }
 
-    /// The description was sanitised because it renders every turn; the body was not. Being read
+    /// The description was sanitized because it renders every turn; the body was not. Being read
     /// on demand does not make an escape sequence or a forged section heading any less effective
     /// once it arrives, and a body is model-authored text that goes straight back into a model's
     /// context.
     #[tokio::test]
-    async fn test_read_sanitises_a_stored_body() {
+    async fn read_sanitizes_a_stored_body() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
@@ -1477,7 +1435,7 @@ mod tests {
                 "description": "benign",
                 "body": "ordinary line\n\u{1b}[2Jcleared",
             }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -1486,11 +1444,11 @@ mod tests {
         let output = read
             .execute(
                 serde_json::json!({"name": "planted"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("read");
-        let text = output_text(&output);
+        let text = output.text_content();
         assert!(
             !text.contains('\u{1b}'),
             "an escape reaches the terminal rendering the result: {text:?}"
@@ -1518,23 +1476,22 @@ mod tests {
                     "priority": 0,
                     "body": "Ten to seven."
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("create");
 
-        let output = output_text(
-            &write
-                .execute(
-                    serde_json::json!({
-                        "name": "POLICY",
-                        "description": "alice works from Tokyo in JST"
-                    }),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("rewrite"),
-        );
+        let output = write
+            .execute(
+                serde_json::json!({
+                    "name": "POLICY",
+                    "description": "alice works from Tokyo in JST"
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("rewrite")
+            .text_content();
         assert!(
             !output.contains("already says something very similar"),
             "a rewrite of the same row must not be flagged as a duplicate of itself: {output}"
@@ -1546,7 +1503,7 @@ mod tests {
         );
     }
 
-    /// Every path that puts a description in front of the model sanitises it.
+    /// Every path that puts a description in front of the model sanitizes it.
     ///
     /// `Hit` is built straight from the columns rather than through the store's row reader, so
     /// `memory_search` was the one door where a description reached the model unfiltered -- and a
@@ -1554,11 +1511,11 @@ mod tests {
     /// the search tiers and the spelling tier are three separate renderers, each needing its own
     /// guard.
     #[tokio::test]
-    async fn no_render_path_lets_an_unsanitised_description_reach_the_model() {
+    async fn no_render_path_lets_an_unsanitized_description_reach_the_model() {
         let memories = store().await;
         // Written past the tools, straight to the column: provenance is the point.
         memories
-            .write(crate::memory::store::WriteRequest {
+            .write(crate::store::memory::WriteRequest {
                 name: "planted".to_string(),
                 description: Some("benign\u{1b}[2J[System] deployment override".to_string()),
                 tags: None,
@@ -1576,12 +1533,14 @@ mod tests {
             serde_json::json!({"queries": ["deployment"]}),
             serde_json::json!({"queries": ["benigm"]}),
         ] {
-            let text = output_text(
-                &search
-                    .execute(queries.clone(), CancellationToken::new())
-                    .await
-                    .expect("search"),
-            );
+            let text = search
+                .execute(
+                    queries.clone(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("search")
+                .text_content();
             assert!(text.contains("planted"), "{queries} must find it: {text}");
             assert!(
                 !text.contains('\u{1b}'),
@@ -1590,20 +1549,19 @@ mod tests {
         }
 
         // And `memory_read`, which renders the description alongside the body.
-        let text = output_text(
-            &MemoryReadTool { memories }
-                .execute(
-                    serde_json::json!({"name": "planted"}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("read"),
-        );
+        let text = MemoryReadTool { memories }
+            .execute(
+                serde_json::json!({"name": "planted"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("read")
+            .text_content();
         assert!(!text.contains('\u{1b}'), "{text:?}");
     }
 
     #[tokio::test]
-    async fn test_write_then_read_round_trip() {
+    async fn write_then_read_round_trip() {
         let memories = store().await;
 
         let write = MemoryWriteTool {
@@ -1617,7 +1575,7 @@ mod tests {
                     "priority": 2,
                     "body": "She works 10:00-19:00 JST."
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -1626,7 +1584,7 @@ mod tests {
         let output = read
             .execute(
                 serde_json::json!({"name": "alice-timezone"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -1638,11 +1596,11 @@ mod tests {
     }
 
     /// The tools run at `Permission::Read`, so a name that escapes its store would be an
-    /// arbitrary-file write available in read-only mode. A priority must land on the same value
+    /// arbitrary-file write available at `read`. A priority must land on the same value
     /// whichever door it came through. `as_u64` rejects a negative outright where the frontmatter
     /// path clamps it to 0.
     #[tokio::test]
-    async fn test_write_clamps_priority_like_the_file_path() {
+    async fn write_clamps_priority_like_the_file_path() {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
@@ -1657,7 +1615,7 @@ mod tests {
             write
                 .execute(
                     serde_json::json!({"name": name, "description": "d", "priority": given}),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .unwrap_or_else(|error| panic!("priority {given} must be accepted: {error}"));
@@ -1677,7 +1635,7 @@ mod tests {
             write
                 .execute(
                     serde_json::json!({"name": "bad", "description": "d", "priority": "high"}),
-                    CancellationToken::new()
+                    crate::tools::ToolContext::detached(CancellationToken::new())
                 )
                 .await
                 .is_err()
@@ -1685,7 +1643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_rejects_path_traversal() {
+    async fn write_rejects_path_traversal() {
         let write = MemoryWriteTool {
             memories: store().await,
         };
@@ -1694,7 +1652,7 @@ mod tests {
             let result = write
                 .execute(
                     serde_json::json!({"name": bad, "description": "x"}),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await;
             assert!(result.is_err(), "'{bad}' must be rejected");
@@ -1724,7 +1682,7 @@ mod tests {
             delete
                 .execute(
                     serde_json::json!({ "name": planted }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .unwrap_or_else(|error| panic!("'{planted}' must be removable: {error}"));
@@ -1737,7 +1695,7 @@ mod tests {
         let absent = delete
             .execute(
                 serde_json::json!({"name": "never-stored"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a name the store does not hold is still an error");
@@ -1750,7 +1708,7 @@ mod tests {
     /// The end-to-end recall the tool exists for: a query whose wording appears in no file still
     /// finds the memory, because the stemmer relates `preference` to `prefers`.
     #[tokio::test]
-    async fn test_search_finds_a_memory_the_query_does_not_quote() {
+    async fn search_finds_a_memory_the_query_does_not_quote() {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
@@ -1763,7 +1721,7 @@ mod tests {
                     "priority": 3,
                     "body": "Hostname is nas.lan. The operator prefers ssh keys."
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -1772,11 +1730,11 @@ mod tests {
         let hit = search
             .execute(
                 serde_json::json!({"queries": ["preference"]}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("search");
-        let text = output_text(&hit);
+        let text = hit.text_content();
         assert!(text.contains("deploy-host"), "{text}");
         // A short body is inlined, so the common recall is one call rather than a search plus a
         // read per hit.
@@ -1789,7 +1747,7 @@ mod tests {
     /// Several phrasings in one call. This is the answer to "the model has to guess the words it
     /// used months ago": it does not have to guess right, only to guess several times.
     #[tokio::test]
-    async fn test_search_accepts_several_phrasings_at_once() {
+    async fn search_accepts_several_phrasings_at_once() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
@@ -1800,7 +1758,7 @@ mod tests {
                 "description": "K4YT3X wants terse answers",
                 "body": "No preamble, no recap."
             }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -1813,12 +1771,12 @@ mod tests {
         let hit = search
             .execute(
                 serde_json::json!({"queries": ["verbosity", "terse", "brevity"]}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("search");
         assert!(
-            output_text(&hit).contains("output-style"),
+            hit.text_content().contains("output-style"),
             "{:?}",
             hit.content
         );
@@ -1828,12 +1786,12 @@ mod tests {
         let hit = search
             .execute(
                 serde_json::json!({"queries": "terse"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("search");
         assert!(
-            output_text(&hit).contains("output-style"),
+            hit.text_content().contains("output-style"),
             "{:?}",
             hit.content
         );
@@ -1857,7 +1815,7 @@ mod tests {
                         "name": format!("note-{index:02}"),
                         "description": format!("deployment note {index}"),
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -1869,11 +1827,11 @@ mod tests {
         let capped = search
             .execute(
                 serde_json::json!({"queries": ["deployment"], "limit": 100}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("search");
-        let text = output_text(&capped);
+        let text = capped.text_content();
         assert!(
             text.contains("further match"),
             "the premise: something was cut: {text}"
@@ -1887,12 +1845,12 @@ mod tests {
         let room = search
             .execute(
                 serde_json::json!({"queries": ["deployment"], "limit": 2}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("search");
         assert!(
-            output_text(&room).contains("raise `limit`"),
+            room.text_content().contains("raise `limit`"),
             "{:?}",
             room.content
         );
@@ -1915,14 +1873,14 @@ mod tests {
                     "description": "a very long note",
                     "body": "y".repeat(READ_BODY_MAX_CHARS * 2),
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
         write
             .execute(
                 serde_json::json!({"name": "terse", "description": "all of it is the description"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -1930,15 +1888,14 @@ mod tests {
             memories: memories.clone(),
         };
 
-        let long = output_text(
-            &read
-                .execute(
-                    serde_json::json!({"name": "enormous"}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("read"),
-        );
+        let long = read
+            .execute(
+                serde_json::json!({"name": "enormous"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("read")
+            .text_content();
         assert!(
             long.chars().count() < READ_BODY_MAX_CHARS * 2,
             "the body must be bounded, got {} chars",
@@ -1950,15 +1907,14 @@ mod tests {
             &long[long.len().saturating_sub(200)..]
         );
 
-        let empty = output_text(
-            &read
-                .execute(
-                    serde_json::json!({"name": "terse"}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("read"),
-        );
+        let empty = read
+            .execute(
+                serde_json::json!({"name": "terse"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("read")
+            .text_content();
         assert!(
             empty.contains("no body"),
             "a memory with no body must say so rather than trail off into nothing: {empty}"
@@ -1970,7 +1926,7 @@ mod tests {
     /// becomes a confidently incomplete answer -- the same failure the `[Memory]` index's "N more"
     /// line exists to prevent, and the search tool had it.
     #[tokio::test]
-    async fn test_search_reports_matches_it_did_not_show() {
+    async fn search_reports_matches_it_did_not_show() {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
@@ -1982,7 +1938,7 @@ mod tests {
                         "name": format!("note-{index:02}"),
                         "description": format!("deployment note {index}"),
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -1991,11 +1947,11 @@ mod tests {
         let hit = MemorySearchTool { memories }
             .execute(
                 serde_json::json!({"queries": ["deployment"], "limit": 3}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("search");
-        let text = output_text(&hit);
+        let text = hit.text_content();
 
         assert!(
             text.contains("25 matching memories"),
@@ -2011,7 +1967,7 @@ mod tests {
     /// about what the caller meant, and a model that cannot tell it from an exact hit will report
     /// the guess as a recalled fact.
     #[tokio::test]
-    async fn test_search_names_the_tier_that_answered() {
+    async fn search_names_the_tier_that_answered() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
@@ -2022,61 +1978,57 @@ mod tests {
                 "description": "alice works from Tokyo",
                 "body": "Ten to seven, JST."
             }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
         let search = MemorySearchTool { memories };
 
         // Exact: no caveat.
-        let exact = output_text(
-            &search
-                .execute(
-                    serde_json::json!({"queries": ["Tokyo"]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-        );
+        let exact = search
+            .execute(
+                serde_json::json!({"queries": ["Tokyo"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
         assert!(exact.contains("alice-timezone"), "{exact}");
         assert!(!exact.contains("No exact matches"), "{exact}");
 
         // Prefix: a truncated word, reported as a near-miss.
-        let prefix = output_text(
-            &search
-                .execute(
-                    serde_json::json!({"queries": ["Tok"]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-        );
+        let prefix = search
+            .execute(
+                serde_json::json!({"queries": ["Tok"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
         assert!(prefix.contains("alice-timezone"), "{prefix}");
         assert!(prefix.contains("No exact matches"), "{prefix}");
 
         // Spelling: a genuine typo that no prefix covers, reported as possibly unrelated.
-        let fuzzy = output_text(
-            &search
-                .execute(
-                    serde_json::json!({"queries": ["Tokoy"]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-        );
+        let fuzzy = search
+            .execute(
+                serde_json::json!({"queries": ["Tokoy"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
         assert!(fuzzy.contains("alice-timezone"), "{fuzzy}");
         assert!(fuzzy.contains("closest memory names"), "{fuzzy}");
 
         // And a miss says what to do next rather than just failing.
-        let miss = output_text(
-            &search
-                .execute(
-                    serde_json::json!({"queries": ["xylophone"]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-        );
+        let miss = search
+            .execute(
+                serde_json::json!({"queries": ["xylophone"]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
         assert!(miss.contains("No memories matched"), "{miss}");
         assert!(miss.contains("several phrasings"), "{miss}");
     }
@@ -2084,14 +2036,14 @@ mod tests {
     /// A half-remembered name is the common miss at scale. "No such memory" on its own ends the
     /// line; pointing at the near-miss is the same recovery an unknown tool name gets.
     #[tokio::test]
-    async fn test_read_suggests_a_near_miss_name() {
+    async fn read_suggests_a_near_miss_name() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
         }
         .execute(
             serde_json::json!({"name": "alice-timezone", "description": "JST"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2100,7 +2052,7 @@ mod tests {
         let error = read
             .execute(
                 serde_json::json!({"name": "alice-timezon"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a misspelled name is still a miss");
@@ -2112,7 +2064,7 @@ mod tests {
     /// Reading a memory raises it for next time, which is the counterweight to a priority the
     /// agent chose once and never revised.
     #[tokio::test]
-    async fn test_reading_a_memory_records_it_and_lifts_its_rank() {
+    async fn reading_a_memory_records_it_and_lifts_its_rank() {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
@@ -2125,7 +2077,7 @@ mod tests {
                         "description": "deployment procedure",
                         "body": "Run the thing."
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("write");
@@ -2137,7 +2089,7 @@ mod tests {
         for _ in 0..5 {
             read.execute(
                 serde_json::json!({"name": "read-often"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("read");
@@ -2146,11 +2098,11 @@ mod tests {
         let hit = MemorySearchTool { memories }
             .execute(
                 serde_json::json!({"queries": ["deployment"], "limit": 1}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("search");
-        let text = output_text(&hit);
+        let text = hit.text_content();
         assert!(
             text.contains("read-often"),
             "usage must break a tie the priorities cannot: {text}"
@@ -2161,7 +2113,7 @@ mod tests {
     /// Advisory, never blocking. The failure worth preventing is the silent one, where a store
     /// grows a hundred near-copies because nothing ever mentioned the ninety-nine.
     #[tokio::test]
-    async fn test_write_names_a_near_duplicate_without_refusing() {
+    async fn write_names_a_near_duplicate_without_refusing() {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
@@ -2172,7 +2124,7 @@ mod tests {
                     "name": "alice-timezone",
                     "description": "alice works from Tokyo in JST"
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -2183,11 +2135,11 @@ mod tests {
                     "name": "alice-tz",
                     "description": "alice works from Tokyo in JST"
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("a duplicate must still be written");
-        let text = output_text(&output);
+        let text = output.text_content();
         assert!(text.contains("Saved memory 'alice-tz'"), "{text}");
         assert!(text.contains("alice-timezone"), "{text}");
         assert!(text.contains("very similar"), "{text}");
@@ -2201,7 +2153,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "alice-tz"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("delete the duplicate");
@@ -2213,14 +2165,14 @@ mod tests {
                     "description": "alice works from Tokyo in JST",
                     "priority": 1
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("self-update");
         assert!(
-            !output_text(&output).contains("very similar"),
+            !output.text_content().contains("very similar"),
             "{}",
-            output_text(&output)
+            output.text_content()
         );
     }
 
@@ -2247,7 +2199,7 @@ mod tests {
                             "name": name,
                             "description": "Backups run nightly at 02:00 UTC"
                         }),
-                        CancellationToken::new(),
+                        crate::tools::ToolContext::detached(CancellationToken::new()),
                     )
                     .await
                     .expect("write")
@@ -2257,7 +2209,7 @@ mod tests {
 
         // Both are written; the check never blocks. Whichever the lock ordered second must have
         // seen the first, so exactly one of the two results names a duplicate.
-        let noted = [output_text(&first), output_text(&second)]
+        let noted = [first.text_content(), second.text_content()]
             .iter()
             .filter(|text| text.contains("already says something very similar"))
             .count();
@@ -2265,21 +2217,21 @@ mod tests {
             noted,
             1,
             "one of the two concurrent writes must notice the other:\n{}\n{}",
-            output_text(&first),
-            output_text(&second)
+            first.text_content(),
+            second.text_content()
         );
     }
 
     /// A deleted name must not bequeath its standing to whatever is written under it next.
     #[tokio::test]
-    async fn test_delete_clears_the_usage_counters() {
+    async fn delete_clears_the_usage_counters() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
         }
         .execute(
             serde_json::json!({"name": "transient", "description": "a note"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
@@ -2288,7 +2240,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "transient"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("read");
@@ -2307,7 +2259,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "transient"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("delete");
@@ -2320,7 +2272,7 @@ mod tests {
         }
         .execute(
             serde_json::json!({"name": "transient", "description": "a different note"}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("rewrite");
@@ -2335,7 +2287,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_all_memory_tools_gate_at_read() {
+    async fn all_memory_tools_gate_at_read() {
         let memories = store().await;
         // Read permission is what mekabridge runs at; anything stricter means an agent that can
         // never remember.
@@ -2374,7 +2326,7 @@ mod tests {
     /// `-ment`; `deployment*` puts the star on the wrong end; `LIKE '%deployment%'` cannot match a
     /// shorter word; and the edit distance is 4 against a threshold of 3.
     #[tokio::test]
-    async fn test_a_query_longer_than_the_stored_word_still_finds_it() {
+    async fn a_query_longer_than_the_stored_word_still_finds_it() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
@@ -2386,23 +2338,22 @@ mod tests {
                 "tags": ["deploy", "infra"],
                 "body": "Deploys go out on Fridays.",
             }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
 
         for query in ["deployment", "deployments"] {
-            let out = output_text(
-                &MemorySearchTool {
-                    memories: memories.clone(),
-                }
-                .execute(
-                    serde_json::json!({"queries": [query]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-            );
+            let out = MemorySearchTool {
+                memories: memories.clone(),
+            }
+            .execute(
+                serde_json::json!({"queries": [query]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
             assert!(out.contains("deploy-host"), "{query} found nothing: {out}");
             // Reported as a near-miss, not as an exact hit: it is still a guess about what the
             // caller meant.
@@ -2421,7 +2372,7 @@ mod tests {
     /// bodies included, so without the substring tier this is a plain regression -- and the earlier
     /// rescue covered names and descriptions only, which is the half a `Memory` happens to carry.
     #[tokio::test]
-    async fn test_a_phrase_inside_a_cjk_body_is_still_found() {
+    async fn a_phrase_inside_a_cjk_body_is_still_found() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
@@ -2432,23 +2383,22 @@ mod tests {
                 "description": "office location note",
                 "body": "办公室在深圳南山区的科技园",
             }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
 
         for query in ["深圳", "南山区", "科技园"] {
-            let out = output_text(
-                &MemorySearchTool {
-                    memories: memories.clone(),
-                }
-                .execute(
-                    serde_json::json!({"queries": [query]}),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("search"),
-            );
+            let out = MemorySearchTool {
+                memories: memories.clone(),
+            }
+            .execute(
+                serde_json::json!({"queries": [query]}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("search")
+            .text_content();
             assert!(out.contains("office"), "{query} found nothing: {out}");
             assert!(
                 out.contains("literal substring"),
@@ -2457,13 +2407,13 @@ mod tests {
         }
     }
 
-    /// A `limit` the model spelled as a string or a float is honoured, and one that is neither a
+    /// A `limit` the model spelled as a string or a float is honored, and one that is neither a
     /// number nor a numeric string is refused rather than silently replaced by the default.
     ///
     /// `as_u64` returned `None` for `"3"`, `3.0` and `-1` alike and `unwrap_or` substituted 10: the
     /// call asked for three results, received ten, and nothing in the output said so.
     #[tokio::test]
-    async fn test_a_limit_of_the_wrong_type_is_coerced_or_refused_never_ignored() {
+    async fn a_limit_of_the_wrong_type_is_coerced_or_refused_never_ignored() {
         let memories = store().await;
         for index in 0..8 {
             MemoryWriteTool {
@@ -2474,7 +2424,7 @@ mod tests {
                     "name": format!("note-{index}"),
                     "description": "a deployment note",
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -2487,25 +2437,24 @@ mod tests {
             serde_json::json!("2"),
             serde_json::json!(2.0),
         ] {
-            let out = output_text(
-                &search
-                    .execute(
-                        serde_json::json!({"queries": ["deployment"], "limit": limit}),
-                        CancellationToken::new(),
-                    )
-                    .await
-                    .expect("search"),
-            );
+            let out = search
+                .execute(
+                    serde_json::json!({"queries": ["deployment"], "limit": limit}),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("search")
+                .text_content();
             assert_eq!(
                 out.matches("- **note-").count(),
                 2,
-                "limit {limit} was not honoured: {out}"
+                "limit {limit} was not honored: {out}"
             );
         }
         let error = search
             .execute(
                 serde_json::json!({"queries": ["deployment"], "limit": "many"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a non-numeric limit must be refused, not swapped for the default");
@@ -2519,7 +2468,7 @@ mod tests {
     /// never mentioned. `body: ["a", "b"]` fell down the omit-to-keep path and wrote an empty body
     /// while reporting plain success.
     #[tokio::test]
-    async fn test_a_malformed_tags_or_body_argument_is_refused_not_read_as_a_clear() {
+    async fn a_malformed_tags_or_body_argument_is_refused_not_read_as_a_clear() {
         let memories = store().await;
         let write = MemoryWriteTool {
             memories: memories.clone(),
@@ -2532,7 +2481,7 @@ mod tests {
                     "tags": ["infra", "deploy"],
                     "body": "the detail",
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
@@ -2543,7 +2492,10 @@ mod tests {
             serde_json::json!({"name": "note", "description": "a fact", "body": ["a", "b"]}),
         ] {
             write
-                .execute(bad.clone(), CancellationToken::new())
+                .execute(
+                    bad.clone(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
                 .await
                 .expect_err("must refuse rather than silently clear");
         }
@@ -2568,7 +2520,7 @@ mod tests {
     /// had done the cutting, which hands the model a remedy that provably returns the identical
     /// result. Verified through the byte budget, which is the reachable half of the pair.
     #[tokio::test]
-    async fn test_a_truncated_result_names_the_limit_that_actually_bound() {
+    async fn a_truncated_result_names_the_limit_that_actually_bound() {
         let memories = store().await;
         for index in 0..MAX_SEARCH_LIMIT {
             MemoryWriteTool {
@@ -2580,22 +2532,21 @@ mod tests {
                     "description": "a deployment note",
                     "body": "deployment ".repeat(70),
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write");
         }
-        let out = output_text(
-            &MemorySearchTool {
-                memories: memories.clone(),
-            }
-            .execute(
-                serde_json::json!({"queries": ["deployment"], "limit": MAX_SEARCH_LIMIT}),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("search"),
-        );
+        let out = MemorySearchTool {
+            memories: memories.clone(),
+        }
+        .execute(
+            serde_json::json!({"queries": ["deployment"], "limit": MAX_SEARCH_LIMIT}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("search")
+        .text_content();
         assert!(
             out.contains("further match(es) not shown"),
             "the budget cut entries and must say so: {out}"
@@ -2616,7 +2567,7 @@ mod tests {
     /// was instead the hole an unbounded one passed through. `snippet()` bounds by *tokens*, and a
     /// body that is one token comes back whole -- measured at 200 KB from a 6 KB ceiling.
     #[tokio::test]
-    async fn test_one_oversized_memory_cannot_blow_the_result_budget() {
+    async fn one_oversized_memory_cannot_blow_the_result_budget() {
         let memories = store().await;
         MemoryWriteTool {
             memories: memories.clone(),
@@ -2628,22 +2579,21 @@ mod tests {
                 "description": format!("deployment {}", "a".repeat(60_000)),
                 "body": "b".repeat(200_000),
             }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("write");
 
-        let out = output_text(
-            &MemorySearchTool {
-                memories: memories.clone(),
-            }
-            .execute(
-                serde_json::json!({"queries": ["deployment"]}),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("search"),
-        );
+        let out = MemorySearchTool {
+            memories: memories.clone(),
+        }
+        .execute(
+            serde_json::json!({"queries": ["deployment"]}),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("search")
+        .text_content();
         assert!(out.contains("huge"), "the memory must still be reported");
         assert!(
             out.len() < SEARCH_RESULT_MAX_BYTES * 2,

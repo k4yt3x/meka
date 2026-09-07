@@ -1,18 +1,27 @@
 [package]
 name = "meka"
-version = "0.45.1"
+version = "0.46.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 description = "A general-purpose AI agent harness"
 repository = "https://github.com/k4yt3x/meka"
 
+[features]
+default = ["serve"]
+# The scripted provider the test suites drive every host with. Compiled into debug builds
+# regardless, so `cargo test` needs nothing; enabled explicitly to make a release-profile build
+# testable. Never on in a shipped artifact: it lets `MEKA_MOCK_PROVIDER=1` stand in for every profile.
+mock-provider = []
+# `meka serve`: the HTTP API and everything only it pulls in.
+serve = ["dep:axum", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui"]
+
 [dependencies]
 agent-client-protocol = { version = "2.0", features = ["unstable_elicitation", "unstable_end_turn_token_usage", "unstable_session_fork"] }
 anyhow = "1"
 async-stream = "0.3"
 async-trait = "0.1"
-axum = "0.8"
+axum = { version = "0.8", optional = true }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }
@@ -54,13 +63,13 @@ tokio-rusqlite = "0.7"
 tokio-util = { version = "0.7", features = ["compat"] }
 toml = "1.1"
 toml_edit = "0.25"
-tower-http = { version = "0.7", features = ["limit", "trace"] }
+tower-http = { version = "0.7", features = ["limit", "trace"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 url = "2"
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"], optional = true }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"], optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 zune-core = "0.5"
 zune-jpeg = "0.5"
@@ -76,6 +85,7 @@ winres = "0.1"
 
 [dev-dependencies]
 filetime = "0.2.29"
+http = "1"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
@@ -89,8 +99,16 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] 
 [lints.clippy]
 await_holding_lock = "deny"
 expect_used = "warn"
+# 125 production and 411 integration-test sites at 0.46; kept explicit so the next pass sees it.
+indexing_slicing = "allow"
+match_wildcard_for_single_variants = "warn"
 panic = "warn"
+redundant_clone = "warn"
 result_large_err = "allow"
+significant_drop_tightening = "warn"
+uninlined_format_args = "warn"
+unreachable = "warn"
+unused_async = "warn"
 unwrap_used = "warn"
 
 [profile.release]

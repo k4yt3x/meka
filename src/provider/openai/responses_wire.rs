@@ -19,23 +19,17 @@
 //! - input items:   `codex-rs/protocol/src/models.rs`
 //! - SSE events:    `codex-rs/codex-api/src/sse/responses.rs`
 
-use eventsource_stream::Eventsource;
-use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Abort the SSE read if no event arrives within this window. A Responses endpoint can
-/// silently stall a stream; without a ceiling the turn would hang forever. Shared with the
-/// Anthropic and `openai-chat-completions` drivers, and matches the first-party Codex client's
-/// `stream_idle_timeout` default (`stream_idle_timeout_ms = 300000`). A timeout surfaces as a
-/// [`MekaError::StreamError`], which the agent retries when no output has been forwarded yet.
-use crate::provider::STREAM_IDLE_TIMEOUT as RESPONSES_STREAM_IDLE_TIMEOUT;
 use crate::{
+    conversation::{ContentBlock, Message, OpaqueReasoning, Role, ToolResultContent},
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, Notice, OpaqueReasoning, Role, StopReason, StreamEvent, TokenUsage,
-        ToolDefinition, ToolResultContent,
+        CompletionRequest, StopReason, StreamEvent, ToolDefinition,
+        sse::{End, Step},
     },
+    stats::TokenUsage,
 };
 
 /// Build the JSON body POSTed to `/responses`. Translates the meka internal `Message` /
@@ -100,82 +94,15 @@ pub(super) fn build_request_body(
 /// concurrently-awaited `stream` future in each backend's `complete`.
 pub(super) async fn aggregate_stream(
     mut receiver: mpsc::Receiver<StreamEvent>,
-) -> (Message, StopReason, TokenUsage, Vec<Notice>) {
-    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-    let mut current_text = String::new();
-    let mut current_thinking = String::new();
-    let mut current_tool_id = String::new();
-    let mut current_tool_name = String::new();
-    let mut stop_reason = StopReason::EndTurn;
-    let mut token_usage = TokenUsage::default();
-    let mut notices: Vec<Notice> = Vec::new();
-
+) -> crate::provider::Completion {
+    let mut accumulator = crate::provider::MessageAccumulator::new();
     while let Some(event) = receiver.recv().await {
-        match event {
-            StreamEvent::TextDelta(text) => current_text.push_str(&text),
-            StreamEvent::ThinkingDelta(text) => current_thinking.push_str(&text),
-            StreamEvent::ThinkingComplete { opaque } => {
-                let thinking = std::mem::take(&mut current_thinking);
-                if !thinking.is_empty() || opaque.is_some() {
-                    content_blocks.push(ContentBlock::Thinking { thinking, opaque });
-                }
-            }
-            StreamEvent::RedactedThinking { data } => {
-                content_blocks.push(ContentBlock::RedactedThinking { data });
-            }
-            // A display-only liveness signal with nothing to accumulate. Only the Claude providers
-            // emit it today; the arm exists so adding it there cannot silently change what this
-            // provider persists.
-            StreamEvent::ThinkingProgress { .. } => {}
-            StreamEvent::ToolUseStart { id, name } => {
-                if !current_text.is_empty() {
-                    content_blocks.push(ContentBlock::Text {
-                        text: std::mem::take(&mut current_text),
-                    });
-                }
-                current_tool_id = id;
-                current_tool_name = name;
-            }
-            // The full arguments object arrives whole in `ToolUseEnd`; the incremental JSON only
-            // feeds the live renderer, which this silent path has none of.
-            StreamEvent::ToolInputDelta(_) => {}
-            StreamEvent::ToolUseEnd { input } => {
-                content_blocks.push(ContentBlock::ToolUse {
-                    id: std::mem::take(&mut current_tool_id),
-                    name: std::mem::take(&mut current_tool_name),
-                    input,
-                });
-            }
-            StreamEvent::ToolCallRejected { id, name, reason } => {
-                let input = serde_json::json!({
-                    crate::provider::INVALID_TOOL_ARGS_MARKER: reason,
-                });
-                content_blocks.push(ContentBlock::ToolUse { id, name, input });
-            }
-            StreamEvent::MessageEnd {
-                stop_reason: reason,
-            } => stop_reason = reason,
-            StreamEvent::Usage(usage) => token_usage.merge_stream(&usage),
-            StreamEvent::Notice(notice) => notices.push(notice),
-            StreamEvent::Error(error) => {
-                tracing::error!("responses: stream error: {}", error);
-            }
+        if let StreamEvent::Error(error) = &event {
+            tracing::error!("responses: stream error: {error}");
         }
+        accumulator.push(event);
     }
-
-    if !current_text.is_empty() {
-        content_blocks.push(ContentBlock::Text { text: current_text });
-    }
-
-    (
-        Message {
-            role: Role::Assistant,
-            content: content_blocks,
-        },
-        stop_reason,
-        token_usage,
-        notices,
-    )
+    accumulator.finish()
 }
 
 /// Ask the server to round-trip its reasoning as `reasoning.encrypted_content`.
@@ -268,12 +195,18 @@ fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value 
 
 /// Build a Responses API `input_image` content part from an image source. Shared by the tool-result
 /// and user-message encoders.
-fn input_image_part(source: &crate::provider::ImageSource) -> serde_json::Value {
-    serde_json::json!({
-        "type": "input_image",
-        "image_url": super::data_url(source),
-        "detail": "auto",
-    })
+fn input_image_part(source: &crate::image::ImageSource) -> serde_json::Value {
+    match super::data_url(source) {
+        Some(url) => serde_json::json!({
+            "type": "input_image",
+            "image_url": url,
+            "detail": "auto",
+        }),
+        None => serde_json::json!({
+            "type": "input_text",
+            "text": crate::image::UNRESOLVED_IMAGE_PLACEHOLDER,
+        }),
+    }
 }
 
 fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
@@ -282,7 +215,10 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
 
     for block in &message.content {
         match block {
-            ContentBlock::Text { text } => text_parts.push(text),
+            // The context block is text on this wire too, ahead of the words.
+            ContentBlock::Text { text } | ContentBlock::TurnContext { text } => {
+                text_parts.push(text)
+            }
             // Responses takes `input_image` content parts on the user message. No model gate;
             // non-vision models return a clear error.
             ContentBlock::Image { source } => image_parts.push(input_image_part(source)),
@@ -298,18 +234,17 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
                 }));
             }
             // ToolUse / Thinking on a user message would be malformed; ignore defensively to match
-            // the Chat Completions encoder's behaviour.
+            // the Chat Completions encoder's behavior.
             _ => {}
         }
     }
 
-    let mut content_parts: Vec<serde_json::Value> = Vec::new();
-    if !text_parts.is_empty() {
-        content_parts.push(serde_json::json!({
-            "type": "input_text",
-            "text": text_parts.join("\n"),
-        }));
-    }
+    // One part per block, in order: the context block ahead of the words, as the other wires send
+    // them, rather than the two joined into one part.
+    let mut content_parts: Vec<serde_json::Value> = text_parts
+        .iter()
+        .map(|text| serde_json::json!({"type": "input_text", "text": text}))
+        .collect();
     content_parts.extend(image_parts);
     if !content_parts.is_empty() {
         input.push(serde_json::json!({
@@ -470,15 +405,6 @@ struct ActiveToolCall {
 /// Pure SSE-event handler. Inspects the named event + parsed JSON payload, updates `state`, and
 /// returns the meka-level [`StreamEvent`]s to forward to the agent. Returns `Err` when the server
 /// reports a fatal stream error; the driver propagates this back to the caller.
-/// Whether a `response.failed` event's error `code`/`type` indicates a transient, retryable
-/// condition. Conservative on purpose (matches the Claude driver's equivalent): only the codes
-/// OpenAI documents as transient server-side conditions are retryable; anything else (including
-/// unrecognized codes) is treated as permanent so a real problem surfaces immediately instead of
-/// being masked by retries.
-fn is_retryable_responses_error_code(code: &str) -> bool {
-    matches!(code, "server_error" | "rate_limit_exceeded" | "overloaded")
-}
-
 /// Which Responses frame this is: the payload's `type`, falling back to the SSE `event:` line.
 ///
 /// The payload field is the spec's discriminator and is always present; the `event:` line is an
@@ -556,11 +482,9 @@ pub(super) fn process_event(
         "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
             if let Some(delta) = data.get("delta").and_then(|v| v.as_str())
                 && !delta.is_empty()
+                && let Some(tool) = state.active_tool_call.as_mut()
             {
-                if let Some(tool) = state.active_tool_call.as_mut() {
-                    tool.arguments_buffer.push_str(delta);
-                }
-                out.push(StreamEvent::ToolInputDelta(delta.to_string()));
+                tool.arguments_buffer.push_str(delta);
             }
         }
 
@@ -585,38 +509,18 @@ pub(super) fn process_event(
                     .unwrap_or_default()
                     .to_string();
                 // Prefer the final `arguments` string from the item over our accumulated buffer;
-                // the server may normalise it.
+                // the server may normalize it.
                 let arguments_str = item
                     .get("arguments")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .or_else(|| buffered.map(|tool| tool.arguments_buffer))
                     .unwrap_or_default();
-                // Empty arguments are a legitimate zero-parameter call; arguments that arrived and
-                // do not parse are rejected rather than replaced with `{}`. Substituting an empty
-                // object runs the tool on whatever defaults it tolerates -- a valid call the model
-                // never made -- with nothing told to anyone. Matches the Chat Completions path,
-                // which has a regression test named for this exact bug.
-                let parsed = if arguments_str.is_empty() {
-                    Ok(serde_json::json!({}))
-                } else {
-                    serde_json::from_str(&arguments_str)
-                };
-                match parsed {
-                    Ok(input) => out.push(StreamEvent::ToolUseEnd { input }),
-                    Err(error) => {
-                        tracing::warn!(
-                            tool = %call_name,
-                            "rejecting tool call with unparseable JSON arguments: {}",
-                            error
-                        );
-                        out.push(StreamEvent::ToolCallRejected {
-                            id: call_id,
-                            name: call_name,
-                            reason: format!("invalid JSON arguments: {}", error),
-                        });
-                    }
-                }
+                out.push(crate::provider::tool_use_event(
+                    call_id,
+                    call_name,
+                    &arguments_str,
+                ));
             } else if item_type == "reasoning" {
                 // True when this item streamed anything readable, by either spelling: a requested
                 // summary, or the raw reasoning text a local server emits unprompted.
@@ -652,17 +556,7 @@ pub(super) fn process_event(
             state.finished = true;
             if let Some(response) = data.get("response") {
                 if let Some(usage) = response.get("usage") {
-                    out.push(StreamEvent::Usage(TokenUsage {
-                        input_tokens: usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        output_tokens: usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        ..TokenUsage::default()
-                    }));
+                    out.push(StreamEvent::Usage(usage_from(usage)));
                 }
                 // The Responses API reports `status: "completed"` even when the output is function
                 // calls, so a tool-call turn must be surfaced as `ToolUse` regardless of status;
@@ -690,53 +584,76 @@ pub(super) fn process_event(
 
         "response.failed" => {
             state.finished = true;
+            // Sending `StreamEvent::Error` is handled by the caller (`drive_responses_sse_stream`),
+            // which has channel access.
             let error_object = data
                 .get("response")
-                .and_then(|response| response.get("error"));
-            let message = error_object
-                .and_then(|error| error.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("response.failed event")
-                .to_string();
-            // OpenAI's error objects carry `code` (occasionally `type`); either indicates a
-            // transient server-side condition worth retrying. Sending `StreamEvent::Error` is
-            // handled by the caller (`drive_responses_sse_stream`), which has channel access.
-            let error_code = error_object
-                .and_then(|error| error.get("code").or_else(|| error.get("type")))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            return Err(if is_retryable_responses_error_code(error_code) {
-                MekaError::RetryableProvider {
-                    message,
-                    retry_after: None,
-                    // As in the Claude backend: a mid-stream error event cannot be told apart from
-                    // an overload, so it does not license deleting content.
-                    server_error_on_completion: false,
-                }
-            } else {
-                MekaError::Provider(message)
-            });
+                .and_then(|response| response.get("error"))
+                .unwrap_or(&serde_json::Value::Null);
+            return Err(crate::error::provider_stream_error_object(
+                error_object,
+                "response.failed event",
+            ));
+        }
+
+        // The stream's own top-level error frame, distinct from `response.failed`: the request
+        // died rather than the response. Unhandled, it fell into the catch-all and the turn was
+        // reported as a stream that ended early, retried twice against an error that repeats.
+        "error" => {
+            state.finished = true;
+            return Err(crate::error::provider_stream_error_object(
+                data,
+                "error event",
+            ));
         }
 
         "response.incomplete" => {
             state.finished = true;
-            // `incomplete_details.reason` (e.g. "max_output_tokens", "content_filter") is a
-            // deterministic outcome, not a transient failure — never retryable.
-            let reason = data
-                .get("response")
+            let response = data.get("response");
+            let reason = response
                 .and_then(|response| response.get("incomplete_details"))
                 .and_then(|details| details.get("reason"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let message = format!("response.incomplete: {}", reason);
+            // The output cap is a stop reason, not a failure: the two sibling protocols report it
+            // as `MaxTokens` and commit the message, and the agent labels the turn so the user
+            // sees a truncated answer rather than an error. Reported as an error, a
+            // `max_output_tokens` profile lost every answer that reached it, whole on the blocking
+            // path. Anything else (a content filter, an unknown reason) is deterministic on the
+            // request and ends the turn; never retryable.
+            if reason == "max_output_tokens" {
+                if let Some(usage) = response.and_then(|response| response.get("usage")) {
+                    out.push(StreamEvent::Usage(usage_from(usage)));
+                }
+                out.push(StreamEvent::MessageEnd {
+                    stop_reason: StopReason::MaxTokens,
+                });
+                return Ok(out);
+            }
+            let message = format!("response.incomplete: {reason}");
             return Err(MekaError::Provider(message));
         }
 
         other => {
-            tracing::debug!("unhandled Responses SSE event: {}", other);
+            tracing::debug!("unhandled Responses SSE event: {other}");
         }
     }
     Ok(out)
+}
+
+/// The `usage` object of a terminal response event, as the agent counts it.
+fn usage_from(usage: &serde_json::Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        ..TokenUsage::default()
+    }
 }
 
 fn parse_response_status(status: &str) -> StopReason {
@@ -752,6 +669,116 @@ fn parse_response_status(status: &str) -> StopReason {
     }
 }
 
+/// What the two Responses providers differ in, so one driver serves both: the endpoint, how a
+/// request is authenticated, and whether a rejected credential can be refreshed for one more try.
+#[async_trait::async_trait]
+pub(super) trait ResponsesBackend: crate::oauth::RefreshesCredential + Send + Sync {
+    fn client(&self) -> &reqwest::Client;
+    fn endpoint(&self) -> String;
+    fn request_body(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> serde_json::Value;
+    /// The profile's request ceiling, when it states one; see [`crate::provider::budget`]. `None`
+    /// sends the body as built.
+    fn max_request_bytes(&self) -> Option<usize>;
+    /// One attempt's authenticated request. Called again after a rejected credential, so a backend
+    /// that can refresh one does it here.
+    async fn authenticated_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder>;
+}
+
+/// A non-streaming Responses call is the streaming one aggregated: the API is stream-first and the
+/// two providers never needed a second wire shape.
+pub(super) async fn complete<B: ResponsesBackend>(
+    backend: &B,
+    request: CompletionRequest<'_>,
+) -> Result<crate::provider::Completion> {
+    let (event_sender, event_receiver) = mpsc::channel::<StreamEvent>(1024);
+    let (stream_result, aggregated) = tokio::join!(
+        stream(backend, request, event_sender, CancellationToken::new()),
+        aggregate_stream(event_receiver),
+    );
+    stream_result?;
+    Ok(aggregated)
+}
+
+/// One streaming Responses call: one send, one retry on a credential the backend could refresh,
+/// and the login remedy on a second rejection.
+pub(super) async fn stream<B: ResponsesBackend>(
+    backend: &B,
+    request: CompletionRequest<'_>,
+    event_sender: mpsc::Sender<StreamEvent>,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let CompletionRequest {
+        system_prompt,
+        messages,
+        tools,
+        ..
+    } = request;
+    let (body_json, redaction_notice) =
+        body_within_budget(backend, system_prompt, messages, tools)?;
+    // A send error here means the consumer hung up already, which the SSE driver reports itself.
+    if let Some(notice) = redaction_notice
+        && event_sender
+            .send(StreamEvent::Notice(notice))
+            .await
+            .is_err()
+    {
+        tracing::trace!("stream event receiver dropped");
+    }
+
+    let response = crate::oauth::send_with_one_refresh(
+        backend,
+        crate::error::ProviderRequest::Completion,
+        |error| {
+            crate::error::provider_transport_error("Responses HTTP request failed", error, None)
+        },
+        || async {
+            Ok(backend
+                .authenticated_request(backend.client().post(backend.endpoint()))
+                .await?
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body_json.clone()))
+        },
+    )
+    .await?;
+    drive_responses_sse_stream(response, event_sender, cancellation).await
+}
+
+/// The serialized request, within the profile's ceiling when it states one.
+pub(super) fn body_within_budget<B: ResponsesBackend + ?Sized>(
+    backend: &B,
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> Result<(String, Option<crate::frontend::Notice>)> {
+    match backend.max_request_bytes() {
+        Some(max_request_bytes) => {
+            crate::provider::budget::fit_body_to_budget(messages, max_request_bytes, |messages| {
+                crate::provider::budget::serialize_body(&backend.request_body(
+                    system_prompt,
+                    messages,
+                    tools,
+                ))
+            })
+        }
+        None => Ok((
+            crate::provider::budget::serialize_body(&backend.request_body(
+                system_prompt,
+                messages,
+                tools,
+            ))?,
+            None,
+        )),
+    }
+}
+
 /// Drive the SSE stream for a Responses API call. Pulls events off the transport, runs them through
 /// [`process_event`], and forwards the resulting [`StreamEvent`]s to the agent.
 pub(super) async fn drive_responses_sse_stream(
@@ -759,127 +786,69 @@ pub(super) async fn drive_responses_sse_stream(
     event_sender: mpsc::Sender<StreamEvent>,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let status = response.status();
-    if !status.is_success() {
-        let retry_after = crate::error::parse_retry_after(response.headers());
-        let response_text = response.text().await.unwrap_or_else(|error| {
-            tracing::warn!("failed to read the Responses error body: {}", error);
-            String::new()
-        });
-        return Err(crate::error::provider_http_error(
-            status,
-            &response_text,
-            retry_after,
-            crate::error::ProviderRequest::Completion,
-        ));
+    let mut protocol = ResponsesStream {
+        state: SseState::default(),
+    };
+    match crate::provider::sse::drive(
+        response,
+        "Responses",
+        &event_sender,
+        &cancellation,
+        &mut protocol,
+    )
+    .await?
+    {
+        End::Finished | End::ReceiverGone => Ok(()),
+        // The stream ended without `response.completed`, `response.failed` or
+        // `response.incomplete`. Falling through here committed a truncated turn as a complete one:
+        // the agent saw whatever text had arrived, wrote it to the conversation, and moved on, with
+        // the retry path never consulted. A connection cut mid-response is exactly what that path
+        // exists for.
+        End::Ended => Err(crate::provider::sse::stream_error(
+            &event_sender,
+            "the Responses stream ended before a terminal response event".to_string(),
+        )
+        .await),
     }
+}
 
-    let mut event_stream = response.bytes_stream().eventsource();
-    let mut state = SseState::default();
+/// The Responses driver's state between frames: [`process_event`]'s accumulator.
+struct ResponsesStream {
+    state: SseState,
+}
 
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                return Err(MekaError::Interrupted);
-            }
-            event = tokio::time::timeout(RESPONSES_STREAM_IDLE_TIMEOUT, event_stream.next()) => {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(_elapsed) => {
-                        // No event for the idle window: treat a stalled stream as a transport
-                        // error so the agent can retry rather than hang forever.
-                        let message = format!(
-                            "idle timeout waiting for a Responses SSE event after {}s",
-                            RESPONSES_STREAM_IDLE_TIMEOUT.as_secs()
-                        );
-                        if event_sender
-                            .send(StreamEvent::Error(message.clone()))
-                            .await
-                            .is_err()
-                        {
-                            tracing::trace!("stream event receiver dropped");
-                        }
-                        return Err(MekaError::StreamError(message));
-                    }
-                };
-                let Some(event) = event else { break };
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error) => {
-                        if event_sender
-                            .send(StreamEvent::Error(error.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            tracing::trace!("stream event receiver dropped");
-                        }
-                        return Err(MekaError::StreamError(error.to_string()));
-                    }
-                };
-
-                let data: serde_json::Value = match serde_json::from_str(&event.data) {
-                    Ok(data) => data,
-                    Err(error) => {
-                        tracing::warn!("failed to parse Responses SSE data: {}", error);
-                        continue;
-                    }
-                };
-
-                let outcomes = process_event(frame_name(&data, &event.event), &data, &mut state);
-                let events = match outcomes {
-                    Ok(events) => events,
-                    Err(error) => {
-                        // `process_event` doesn't have channel access, so forward the error here
-                        // (mirrors the Claude driver's pattern) rather than relying on the caller
-                        // to notice — best-effort: a dropped receiver just means no one's
-                        // listening anymore, not a reason to fail differently.
-                        if event_sender
-                            .send(StreamEvent::Error(error.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            tracing::trace!("stream event receiver dropped");
-                        }
-                        return Err(error);
-                    }
-                };
-
-                for emit in events {
-                    if event_sender.send(emit).await.is_err() {
-                        tracing::trace!("stream event receiver dropped");
-                        return Ok(());
-                    }
-                }
-
-                if state.finished {
-                    return Ok(());
-                }
+#[async_trait::async_trait]
+impl crate::provider::sse::Protocol for ResponsesStream {
+    async fn frame(
+        &mut self,
+        event: eventsource_stream::Event,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> Result<Step> {
+        let Some(data) = crate::provider::sse::frame_json("Responses", &event.data) else {
+            return Ok(Step::Continue);
+        };
+        let events = process_event(frame_name(&data, &event.event), &data, &mut self.state)?;
+        for emit in events {
+            if event_sender.send(emit).await.is_err() {
+                tracing::trace!("stream event receiver dropped");
+                return Ok(Step::ReceiverGone);
             }
         }
+        Ok(if self.state.finished {
+            Step::Finished
+        } else {
+            Step::Continue
+        })
     }
-
-    // The stream ended without `response.completed`, `response.failed` or `response.incomplete`.
-    // Falling through here committed a truncated turn as a complete one: the agent saw whatever
-    // text had arrived, wrote it to the conversation, and moved on, with the retry path never
-    // consulted. A connection cut mid-response is exactly what that path exists for.
-    let message = "the Responses stream ended before a terminal response event".to_string();
-    if event_sender
-        .send(StreamEvent::Error(message.clone()))
-        .await
-        .is_err()
-    {
-        tracing::trace!("stream event receiver dropped");
-    }
-    Err(MekaError::StreamError(message))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ToolResultContent;
+    use crate::conversation::ToolResultContent;
 
     #[test]
-    fn test_request_body_minimal() {
+    fn a_minimal_request_body_states_only_the_defaults() {
         let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["stream"], true);
@@ -891,8 +860,34 @@ mod tests {
         assert!(body.get("reasoning").is_none());
     }
 
+    /// The context block and the words are two `input_text` parts in order, the context first.
     #[test]
-    fn test_request_body_includes_instructions_when_system_prompt_set() {
+    fn the_context_block_precedes_the_words() {
+        let body = build_request_body(
+            "gpt-5",
+            "",
+            &[Message::user_turn("ctx", "hello", Vec::new())],
+            &[],
+            None,
+            None,
+            true,
+        );
+        let parts = body["input"][0]["content"]
+            .as_array()
+            .expect("content parts");
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!(
+            parts[0],
+            serde_json::json!({"type": "input_text", "text": "ctx"})
+        );
+        assert_eq!(
+            parts[1],
+            serde_json::json!({"type": "input_text", "text": "hello"})
+        );
+    }
+
+    #[test]
+    fn request_body_includes_instructions_when_system_prompt_set() {
         let body = build_request_body(
             "gpt-5",
             "be helpful",
@@ -906,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_body_user_message_uses_input_text() {
+    fn request_body_user_message_uses_input_text() {
         let body = build_request_body(
             "gpt-5",
             "",
@@ -925,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_body_assistant_text_uses_output_text() {
+    fn request_body_assistant_text_uses_output_text() {
         let messages = vec![
             Message::user("a"),
             Message::assistant_text("b"),
@@ -940,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_body_tool_use_emits_function_call_item() {
+    fn request_body_tool_use_emits_function_call_item() {
         let messages = vec![
             Message::user("read /tmp/x"),
             Message {
@@ -979,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_body_tools_use_responses_api_flat_shape() {
+    fn request_body_tools_use_responses_api_flat_shape() {
         let tools = vec![ToolDefinition::new(
             "demo",
             "A demo tool",
@@ -1000,7 +995,7 @@ mod tests {
     ///
     /// `include` is an OpenAI extension, so it is not the protocol's to add: it was moved out of
     /// here when `openai-responses` arrived, because that backend reaches servers where an
-    /// unrecognised field is a rejected request. The subscription backend opts in explicitly, and
+    /// unrecognized field is a rejected request. The subscription backend opts in explicitly, and
     /// its half of this split is asserted alongside.
     #[test]
     fn the_shared_body_asks_for_reasoning_but_never_for_an_openai_extension() {
@@ -1037,12 +1032,12 @@ mod tests {
     }
 
     #[test]
-    fn test_request_body_user_image_emits_input_image() {
-        let message = Message::user_with_images("describe", vec![crate::provider::ImageSource {
-            source_type: "base64".to_string(),
-            media_type: "image/png".to_string(),
-            data: "QUJD".to_string(),
-        }]);
+    fn request_body_user_image_emits_input_image() {
+        let message =
+            Message::user_with_images("describe", vec![crate::image::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: "QUJD".to_string(),
+            }]);
         let body = build_request_body("gpt-5", "", &[message], &[], None, None, true);
         let input = body["input"].as_array().expect("input array");
         let content = input[0]["content"].as_array().expect("content array");
@@ -1053,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_body_sets_max_output_tokens_when_overridden() {
+    fn request_body_sets_max_output_tokens_when_overridden() {
         let body = build_request_body(
             "gpt-5",
             "",
@@ -1067,20 +1062,20 @@ mod tests {
     }
 
     #[test]
-    fn test_request_body_omits_max_output_tokens_when_unset() {
+    fn request_body_omits_max_output_tokens_when_unset() {
         let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
         assert!(body.get("max_output_tokens").is_none());
     }
 
     #[test]
-    fn test_request_body_omits_reasoning_when_effort_unset() {
+    fn request_body_omits_reasoning_when_effort_unset() {
         let body = build_request_body("gpt-5", "", &[Message::user("hi")], &[], None, None, true);
         assert!(body.get("reasoning").is_none());
         assert!(body.get("include").is_none());
     }
 
     #[test]
-    fn test_request_body_user_message_with_tool_result_only_no_text_block() {
+    fn request_body_user_message_with_tool_result_only_no_text_block() {
         // A user turn that's *only* a tool_result must produce only a function_call_output input
         // item, no empty user message.
         let messages = vec![Message {
@@ -1172,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_text_delta() {
+    fn process_event_text_delta() {
         let mut state = SseState::default();
         let events = process_event(
             "response.output_text.delta",
@@ -1185,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_text_delta_empty_emits_nothing() {
+    fn process_event_text_delta_empty_emits_nothing() {
         let mut state = SseState::default();
         let events = process_event(
             "response.output_text.delta",
@@ -1197,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_reasoning_delta_emits_thinking() {
+    fn process_event_reasoning_delta_emits_thinking() {
         let mut state = SseState::default();
         let events = process_event(
             "response.reasoning_text.delta",
@@ -1211,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_tool_call_full_lifecycle() {
+    fn process_event_tool_call_full_lifecycle() {
         let (events, outcome) = run_events(&[
             (
                 "response.output_item.added",
@@ -1254,15 +1249,13 @@ mod tests {
             events[0],
             StreamEvent::ToolUseStart { ref id, ref name } if id == "c1" && name == "read_file"
         ));
-        assert!(matches!(events[1], StreamEvent::ToolInputDelta(_)));
-        assert!(matches!(events[2], StreamEvent::ToolInputDelta(_)));
-        match &events[3] {
+        match &events[1] {
             StreamEvent::ToolUseEnd { input } => assert_eq!(input["path"], "/tmp/x"),
-            other => panic!("expected ToolUseEnd, got {:?}", other),
+            other => panic!("expected ToolUseEnd, got {other:?}"),
         }
         // The Responses API reports `status: "completed"` even for tool-call turns; the presence of
         // the function call must still surface as `ToolUse`, not `EndTurn`.
-        assert!(matches!(events[4], StreamEvent::MessageEnd {
+        assert!(matches!(events[2], StreamEvent::MessageEnd {
             stop_reason: StopReason::ToolUse
         }));
     }
@@ -1272,7 +1265,7 @@ mod tests {
     /// no terminal event means. Drive the real loop instead, the way the Claude decoder's
     /// counterpart test does.
     async fn decode_sse(body: &str) -> (Vec<StreamEvent>, Result<()>) {
-        let response: reqwest::Response = axum::http::Response::builder()
+        let response: reqwest::Response = http::Response::builder()
             .status(200)
             .header("content-type", "text/event-stream")
             .body(body.to_string())
@@ -1317,7 +1310,7 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, StreamEvent::MessageEnd { .. })),
-            "the terminal frame must be recognised too: {events:?}"
+            "the terminal frame must be recognized too: {events:?}"
         );
     }
 
@@ -1405,7 +1398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_completed_without_tool_call_is_end_turn() {
+    fn process_event_completed_without_tool_call_is_end_turn() {
         let (events, outcome) = run_events(&[
             (
                 "response.output_text.delta",
@@ -1426,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_tool_call_recovers_arguments_from_done_only() {
+    fn process_event_tool_call_recovers_arguments_from_done_only() {
         // Server elides per-delta events and sends arguments only on `done`.
         let (events, outcome) = run_events(&[
             (
@@ -1463,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_completed_emits_token_usage() {
+    fn process_event_completed_emits_token_usage() {
         let mut state = SseState::default();
         let events = process_event(
             "response.completed",
@@ -1490,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_failed_yields_error_and_propagates() {
+    fn process_event_failed_yields_error_and_propagates() {
         let mut state = SseState::default();
         let result = process_event(
             "response.failed",
@@ -1506,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_failed_with_server_error_code_is_retryable() {
+    fn process_event_failed_with_server_error_code_is_retryable() {
         let mut state = SseState::default();
         let result = process_event(
             "response.failed",
@@ -1519,8 +1512,8 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_failed_without_code_stays_permanent() {
-        // No `code`/`type` field at all — default is not-retryable, matching today's behavior.
+    fn process_event_failed_without_code_stays_permanent() {
+        // No `code`/`type` field at all: the default is not-retryable.
         let mut state = SseState::default();
         let result = process_event(
             "response.failed",
@@ -1532,35 +1525,125 @@ mod tests {
         assert!(matches!(result, Err(MekaError::Provider(_))));
     }
 
+    /// The stream's top-level `error` frame is a failure with a reason, not an early end.
     #[test]
-    fn test_is_retryable_responses_error_code() {
-        for retryable in ["server_error", "rate_limit_exceeded", "overloaded"] {
-            assert!(is_retryable_responses_error_code(retryable));
-        }
-        for permanent in ["invalid_request_error", "unknown", ""] {
-            assert!(!is_retryable_responses_error_code(permanent));
-        }
+    fn the_streams_own_error_frame_ends_the_turn_with_its_reason() {
+        let mut state = SseState::default();
+        let result = process_event(
+            "error",
+            &serde_json::json!({"type": "error", "code": "server_error", "message": "try later"}),
+            &mut state,
+        );
+        assert!(state.finished);
+        assert!(
+            matches!(result, Err(MekaError::RetryableProvider { ref message, .. }) if message.contains("try later")),
+            "{result:?}"
+        );
+    }
+
+    /// The output cap ends the message as `MaxTokens`, with its usage, the way the Claude and Chat
+    /// Completions drivers report `max_tokens` and `length`; reported as an error, the whole
+    /// answer was lost on the blocking path.
+    /// The Responses driver applies the profile's ceiling the same way, for both of its backends.
+    #[test]
+    fn a_stated_ceiling_redacts_old_images_on_responses() {
+        let with_ceiling = |max_request_bytes: Option<usize>| {
+            let api_key: String = "test-key".to_string();
+            crate::provider::openai::responses::OpenAiResponsesProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiResponses,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-5".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None)
+                .max_request_bytes(max_request_bytes),
+            )
+            .expect("build test provider")
+        };
+        let image = "A".repeat(8_000);
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: vec![ToolResultContent::Image {
+                        source: crate::image::ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: image.clone(),
+                        },
+                    }],
+                    is_error: false,
+                }],
+            },
+            Message::user("and now this"),
+        ];
+
+        let (body, notice) = body_within_budget(&with_ceiling(Some(4_000)), "", &messages, &[])
+            .expect("fits after redaction");
+        assert!(
+            body.contains(crate::provider::budget::IMAGE_REDACTION_PLACEHOLDER),
+            "the old image is redacted: {body}"
+        );
+        assert!(notice.is_some(), "the redaction is announced");
+
+        let (body, notice) = body_within_budget(&with_ceiling(None), "", &messages, &[])
+            .expect("no ceiling, no refusal");
+        assert!(body.contains(&image), "sent as built without a ceiling");
+        assert!(notice.is_none());
     }
 
     #[test]
-    fn test_process_event_incomplete_yields_error() {
+    fn process_event_incomplete_for_the_output_cap_ends_as_max_tokens() {
+        let mut state = SseState::default();
+        let events = process_event(
+            "response.incomplete",
+            &serde_json::json!({
+                "response": {
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "usage": {"input_tokens": 12, "output_tokens": 512}
+                }
+            }),
+            &mut state,
+        )
+        .expect("a stop reason, not a failure");
+        assert!(state.finished);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    StreamEvent::Usage(usage),
+                    StreamEvent::MessageEnd {
+                        stop_reason: StopReason::MaxTokens
+                    }
+                ] if usage.output_tokens == 512
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// Any other reason is deterministic on the request and fails the turn.
+    #[test]
+    fn process_event_incomplete_for_a_content_filter_yields_error() {
         let mut state = SseState::default();
         let result = process_event(
             "response.incomplete",
             &serde_json::json!({
-                "response": {"incomplete_details": {"reason": "max_output_tokens"}}
+                "response": {"incomplete_details": {"reason": "content_filter"}}
             }),
             &mut state,
         );
         assert!(state.finished);
         assert!(matches!(
             result,
-            Err(MekaError::Provider(ref message)) if message.contains("max_output_tokens")
+            Err(MekaError::Provider(ref message)) if message.contains("content_filter")
         ));
     }
 
     #[test]
-    fn test_process_event_status_incomplete_maps_to_max_tokens() {
+    fn process_event_status_incomplete_maps_to_max_tokens() {
         let mut state = SseState::default();
         let events = process_event(
             "response.completed",
@@ -1580,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_unknown_event_silently_skipped() {
+    fn process_event_unknown_event_silently_skipped() {
         let mut state = SseState::default();
         let events = process_event(
             "response.output_audio_transcript.delta",
@@ -1593,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_event_reasoning_done_emits_thinking_complete_with_signature() {
+    fn process_event_reasoning_done_emits_thinking_complete_with_signature() {
         let mut state = SseState {
             in_reasoning: true,
             ..SseState::default()
@@ -1623,7 +1706,7 @@ mod tests {
                 assert_eq!(encrypted_content, "OPAQUE");
                 assert_eq!(id.as_deref(), Some("rs_123"));
             }
-            other => panic!("expected ThinkingComplete, got {:?}", other),
+            other => panic!("expected ThinkingComplete, got {other:?}"),
         }
         assert!(!state.in_reasoning);
     }
@@ -1657,8 +1740,7 @@ mod tests {
                     }),
                 }] if id.as_deref() == Some("rs_silent") && encrypted_content == "OPAQUE"
             ),
-            "silent reasoning must still be captured, got {:?}",
-            events
+            "silent reasoning must still be captured, got {events:?}"
         );
     }
 
@@ -1673,7 +1755,7 @@ mod tests {
             &mut state,
         )
         .expect("ok");
-        assert!(events.is_empty(), "got {:?}", events);
+        assert!(events.is_empty(), "got {events:?}");
     }
 
     /// Each summary part is its own section. Without a break between them the parts run together
@@ -1687,7 +1769,7 @@ mod tests {
             &mut state,
         )
         .expect("ok");
-        assert!(opening.is_empty(), "got {:?}", opening);
+        assert!(opening.is_empty(), "got {opening:?}");
 
         process_event(
             "response.reasoning_summary_text.delta",
@@ -1704,15 +1786,13 @@ mod tests {
         .expect("ok");
         assert!(
             matches!(between.as_slice(), [StreamEvent::ThinkingDelta(text)] if text == "\n\n"),
-            "got {:?}",
-            between
+            "got {between:?}"
         );
     }
 
     fn image_content(media_type: &str, data: &str) -> ToolResultContent {
         ToolResultContent::Image {
-            source: crate::provider::ImageSource {
-                source_type: "base64".to_string(),
+            source: crate::image::ImageSource::Base64 {
                 media_type: media_type.to_string(),
                 data: data.to_string(),
             },
@@ -1720,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tool_result_output_text_only_returns_string() {
+    fn build_tool_result_output_text_only_returns_string() {
         let content = vec![ToolResultContent::Text {
             text: "result".to_string(),
         }];
@@ -1729,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tool_result_output_with_image_returns_array() {
+    fn build_tool_result_output_with_image_returns_array() {
         let content = vec![
             ToolResultContent::Text {
                 text: "before".to_string(),
@@ -1752,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tool_result_output_image_only_returns_array() {
+    fn build_tool_result_output_image_only_returns_array() {
         let content = vec![image_content("image/jpeg", "DEAD")];
         let out = build_tool_result_output(&content);
         let array = out.as_array().expect("should be array");
@@ -1762,7 +1842,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_call_output_carries_image_array_in_request_body() {
+    fn function_call_output_carries_image_array_in_request_body() {
         // End-to-end: build_request_body wires build_tool_result_output via encode_user_message;
         // confirm the function_call_output's `output` field is the array form when an image is
         // present.
@@ -1864,8 +1944,7 @@ mod tests {
 
         assert!(
             !input.iter().any(|item| item["type"] == "reasoning"),
-            "a dangling reasoning item would be rejected: {:?}",
-            input
+            "a dangling reasoning item would be rejected: {input:?}"
         );
     }
 
@@ -1884,14 +1963,13 @@ mod tests {
 
         assert!(
             !input.iter().any(|item| item["type"] == "reasoning"),
-            "got {:?}",
-            input
+            "got {input:?}"
         );
     }
 
-    /// Reasoning has to precede the output it produced, which the old encoder could not express:
-    /// it emitted every text block first and every call after, so a turn that thought twice came
-    /// back in an order the API rejects.
+    /// Reasoning has to precede the output it produced, so the encoder cannot emit every text block
+    /// first and every call after: a turn that thought twice would come back in an order the API
+    /// rejects.
     #[test]
     fn reasoning_precedes_the_output_it_produced_across_two_thinking_rounds() {
         let input = input_of(&[
@@ -1968,8 +2046,7 @@ mod tests {
 
         assert!(
             !input.iter().any(|item| item["type"] == "reasoning"),
-            "got {:?}",
-            input
+            "got {input:?}"
         );
     }
 
@@ -1986,7 +2063,7 @@ mod tests {
             .iter()
             .find(|item| item["type"] == "reasoning")
             .expect("present");
-        assert!(reasoning.get("id").is_none(), "got {:?}", reasoning);
+        assert!(reasoning.get("id").is_none(), "got {reasoning:?}");
         assert_eq!(reasoning["summary"], serde_json::json!([]));
     }
 
@@ -2000,8 +2077,8 @@ mod tests {
         request_reasoning_summary(&mut body);
         assert_eq!(body["reasoning"]["summary"], "auto");
 
-        // And settling `reasoning` is what lets the `include` apply to a default profile, which is
-        // the configuration that previously asked for no encrypted reasoning at all.
+        // And settling `reasoning` is what lets the `include` apply to a default profile, which
+        // states no reasoning of its own.
         include_encrypted_reasoning(&mut body);
         assert_eq!(
             body["include"],
@@ -2036,7 +2113,7 @@ mod tests {
             sender.send(event).await.expect("buffered");
         }
         drop(sender);
-        let (message, _stop, _usage, _notices) = aggregate_stream(receiver).await;
+        let message = aggregate_stream(receiver).await.message;
 
         let input = input_of(&[Message::user("hi"), message]);
         let reasoning = input

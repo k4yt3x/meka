@@ -1,6 +1,16 @@
+// Every turn here runs against the scripted provider, which a release build has only with
+// `mock-provider`, and the contention tests need `meka serve`; without both there is nothing to
+// run.
+#![cfg(all(feature = "serve", any(debug_assertions, feature = "mock-provider")))]
 // See the matching allow in `tests/acp.rs` for the rationale: integration tests panic on failure
 // by design.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests panic on failure by design, and indexing a JSON document is the readable form"
+)]
 
 //! What two `meka` processes do to each other.
 //!
@@ -8,8 +18,8 @@
 //! at one server, `tests/acp.rs` two prompts at one session. Those cannot see the properties that
 //! only exist between processes -- who holds a session's file lock, which host claims a scheduled
 //! occurrence, whose credential write lands last -- and an audit found several of those properties
-//! were not held at all. Six tests elsewhere are *named* for cross-process behaviour they
-//! structurally cannot observe, and two of them enshrined the defect as intended behaviour.
+//! were not held at all. Six tests elsewhere are *named* for cross-process behavior they
+//! structurally cannot observe, and two of them enshrined the defect as intended behavior.
 //!
 //! So these tests spawn real `meka` binaries against one shared `MEKA_DATA_DIR`. That is slow and
 //! it is the point: nothing cheaper can fail when these guarantees break.
@@ -26,15 +36,19 @@
 //! the network or needs a credential.
 
 use std::{
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[path = "harness/support.rs"]
+mod support;
+
+use support::{Install, drain, wait_until};
 
 /// A set of `meka` processes sharing one config and data directory.
 struct Cluster {
-    temp: tempfile::TempDir,
+    install: Install,
 }
 
 impl Cluster {
@@ -44,15 +58,16 @@ impl Cluster {
     /// `extra_config` is appended verbatim, which is how a test adds `[schedule]` or `[background]`
     /// settings without every other test carrying them.
     fn new(extra_config: &str) -> Self {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let cluster = Self { temp };
-        std::fs::create_dir_all(cluster.config_dir()).expect("create config dir");
-        std::fs::write(
-            cluster.config_dir().join("config.toml"),
-            format!(
-                r#"
-[providers.mock]
-type = "anthropic-messages"
+        let cluster = Self {
+            install: Install::new(),
+        };
+        cluster.install.write_config(&format!(
+            r#"
+[accounts.mock]
+backend = "anthropic-messages"
+
+[profiles.mock]
+account = "mock"
 model = "claude-sonnet-4-5"
 
 [permissions]
@@ -60,14 +75,12 @@ default = "unrestricted"
 enabled = ["read", "unrestricted"]
 {extra_config}
 "#
-            ),
-        )
-        .expect("write config.toml");
+        ));
 
         // Opening the store is a side effect of any subcommand that reads it, and this is the
         // cheapest one. Without it the first `rusqlite` connection a test opens would create an
         // empty file with no schema, and every later assertion would fail on a missing table
-        // rather than on the behaviour under test.
+        // rather than on the behavior under test.
         let opened = cluster
             .meka(&["session", "list"])
             .output()
@@ -80,52 +93,33 @@ enabled = ["read", "unrestricted"]
         cluster
     }
 
-    fn config_dir(&self) -> PathBuf {
-        self.temp.path().join("meka")
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.temp.path().join("data").join("meka")
-    }
-
     fn database(&self) -> PathBuf {
-        self.data_dir().join("meka.db")
+        self.install.database()
     }
 
     /// A path inside the cluster's tempdir, for gate commands and probe files.
     fn path(&self, name: &str) -> PathBuf {
-        self.temp.path().join(name)
+        self.install.root().join(name)
     }
 
-    /// A `meka` command pointed at this cluster, with the host's own config and data directories
-    /// kept well clear.
+    /// A `meka` command pointed at this cluster, logging at debug so a failure has its history.
     fn meka(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_meka"));
-        command
-            .args(args)
-            .env("MEKA_CONFIG_DIR", self.config_dir())
-            .env("MEKA_DATA_DIR", self.data_dir())
-            .env("HOME", self.temp.path())
-            .env("XDG_CONFIG_HOME", self.temp.path())
-            .env("XDG_DATA_HOME", self.temp.path().join("data"))
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("RUST_LOG", "meka=debug");
+        let mut command = self.install.meka(args);
+        command.env("RUST_LOG", "meka=debug");
         command
     }
 
-    /// Point the cluster's processes at a scripted set of provider rounds. One script serves every
-    /// process; each gets its own queue, since each loads the file at startup.
+    /// Point the cluster's processes at a scripted set of provider rounds.
     fn script(&self, rounds: serde_json::Value) -> &Self {
-        std::fs::write(self.path("script.json"), rounds.to_string()).expect("write script");
+        self.install.write_script(&rounds);
         self
     }
 
     /// Run one `meka` process to completion.
     fn run(&self, args: &[&str]) -> std::process::Output {
         self.meka(args)
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", self.path("script.json"))
             .output()
-            .unwrap_or_else(|error| panic!("spawn meka {:?}: {}", args, error))
+            .unwrap_or_else(|error| panic!("spawn meka {args:?}: {error}"))
     }
 
     /// Start one `meka` process and leave it running, for a test that needs to act while a turn is
@@ -140,12 +134,11 @@ enabled = ["read", "unrestricted"]
     fn start(&self, args: &[&str]) -> Child {
         let mut child = self
             .meka(args)
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", self.path("script.json"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|error| panic!("spawn meka {:?}: {}", args, error));
+            .unwrap_or_else(|error| panic!("spawn meka {args:?}: {error}"));
         if let Some(stdout) = child.stdout.take() {
             drain(stdout);
         }
@@ -161,16 +154,11 @@ enabled = ["read", "unrestricted"]
     /// surface; `serve` is used because it is the only host that runs the scheduler for every
     /// session rather than one, which is what makes two of them contend.
     fn serve(&self, name: &str) -> ServeProcess {
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-            let port = listener.local_addr().expect("local_addr").port();
-            drop(listener);
-            port
-        };
+        let port = support::ephemeral_port();
         // Written per server rather than shared, because the bind address differs and because a
         // test that fails wants to know which server did what.
-        let config = self.config_dir().join(format!("{}.toml", name));
-        let base = std::fs::read_to_string(self.config_dir().join("config.toml"))
+        let config = self.install.config_dir().join(format!("{name}.toml"));
+        let base = std::fs::read_to_string(self.install.config_dir().join("config.toml"))
             .expect("read base config");
         std::fs::write(
             &config,
@@ -182,67 +170,44 @@ enabled = ["read", "unrestricted"]
         .expect("write server config");
         // `MEKA_CONFIG_DIR` names a directory, not a file, so each server needs its own -- sharing
         // one would mean sharing a bind address.
-        let config_dir = self.temp.path().join(format!("meka-{}", name));
+        let config_dir = self.path(&format!("meka-{name}"));
         std::fs::create_dir_all(&config_dir).expect("create server config dir");
         std::fs::copy(&config, config_dir.join("config.toml")).expect("install server config");
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_meka"))
-            .arg("serve")
+        let mut child = self
+            .meka(&["serve"])
             .env("MEKA_CONFIG_DIR", &config_dir)
-            .env("MEKA_DATA_DIR", self.data_dir())
-            .env("HOME", self.temp.path())
-            .env("MEKA_MOCK_PROVIDER", "1")
-            .env("MEKA_MOCK_PROVIDER_SCRIPT", self.path("script.json"))
-            .env("RUST_LOG", "meka=debug")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn meka serve");
 
-        let stdout = child.stdout.take().expect("stdout");
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut sink = String::new();
-            while reader.read_line(&mut sink).unwrap_or(0) > 0 {}
-        });
-
+        drain(child.stdout.take().expect("stdout"));
         let stderr = child.stderr.take().expect("stderr");
-        let (ready_sender, ready_receiver) = std::sync::mpsc::channel::<()>();
-        let logs = std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            let mut accumulated = String::new();
-            let mut announced = false;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                accumulated.push_str(&line);
-                if !announced && line.contains("listening on") {
-                    let _ = ready_sender.send(());
-                    announced = true;
-                }
+        let bind = format!("127.0.0.1:{port}");
+        match support::wait_for_serve(&bind, &mut child, stderr, Duration::from_secs(30)) {
+            support::Started::Ready(logs) => ServeProcess {
+                child,
+                logs: Some(logs),
+                port,
+            },
+            support::Started::Exited(status, stderr) => panic!(
+                "meka serve '{name}' exited with {status} before announcing its address:\n{stderr}"
+            ),
+            support::Started::TimedOut(logs) => {
+                let mut process = ServeProcess {
+                    child,
+                    logs: Some(logs),
+                    port,
+                };
+                panic!(
+                    "meka serve '{}' never announced its address:\n{}",
+                    name,
+                    process.stop()
+                );
             }
-            accumulated
-        });
-
-        let mut process = ServeProcess {
-            child,
-            logs: Some(logs),
-        };
-        if ready_receiver
-            .recv_timeout(Duration::from_secs(30))
-            .is_err()
-        {
-            panic!(
-                "meka serve '{}' never logged its bind address:\n{}",
-                name,
-                process.stop()
-            );
         }
-        process
     }
 
     /// Read the database the cluster's processes share.
@@ -293,7 +258,7 @@ enabled = ["read", "unrestricted"]
     /// Whether any lock file exists, which is the observable the audit measured directly: during a
     /// first turn the `locks/` directory held nothing at all.
     fn holds_a_session_lock(&self) -> bool {
-        std::fs::read_dir(self.data_dir().join("locks"))
+        std::fs::read_dir(self.install.data_dir().join("locks"))
             .map(|entries| {
                 entries.filter_map(Result::ok).any(|entry| {
                     entry
@@ -338,7 +303,7 @@ enabled = ["read", "unrestricted"]
             transaction
                 .execute(
                     "INSERT INTO scheduled_jobs (id, session_id, kind, spec, prompt, \
-                     gate_kind, gate_spec, gate_permission, created_at, next_fire_at) \
+                     gate_kind, gate_spec_json, gate_permission, created_at, next_fire_at) \
                      VALUES (?1, ?2, 'every', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         format!("job-{}", job.name),
@@ -382,6 +347,8 @@ struct PlantedJob<'a> {
 struct ServeProcess {
     child: Child,
     logs: Option<std::thread::JoinHandle<String>>,
+    /// Where the server listens, for the one test that talks to it over HTTP.
+    port: u16,
 }
 
 impl ServeProcess {
@@ -403,47 +370,21 @@ impl Drop for ServeProcess {
     }
 }
 
-/// Read one of a child's pipes to EOF on its own thread and throw it away, so it cannot fill and
-/// block the process writing to it. See [`Cluster::start`].
-fn drain(pipe: impl std::io::Read + Send + 'static) {
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(pipe);
-        let mut line = String::new();
-        while reader.read_line(&mut line).unwrap_or(0) > 0 {
-            line.clear();
-        }
-    });
-}
-
 /// A minimal script: one round that answers with a line of text and stops.
 fn one_reply(text: &str) -> serde_json::Value {
     serde_json::json!([[
-        {"kind": "text", "text": text},
-        {"kind": "message_end", "stop_reason": "end_turn"},
+        {"type": "text", "text": text},
+        {"type": "message_end", "stop_reason": "end_turn"},
     ]])
 }
 
 /// The same, but the provider takes its time, so another process can act mid-turn.
 fn one_slow_reply(text: &str, thinking_for: Duration) -> serde_json::Value {
     serde_json::json!([[
-        {"kind": "sleep", "ms": thinking_for.as_millis() as u64},
-        {"kind": "text", "text": text},
-        {"kind": "message_end", "stop_reason": "end_turn"},
+        {"type": "sleep", "ms": thinking_for.as_millis() as u64},
+        {"type": "text", "text": text},
+        {"type": "message_end", "stop_reason": "end_turn"},
     ]])
-}
-
-/// Wait until `check` holds, or give up. Polling rather than sleeping a fixed span: these tests
-/// wait on another process reaching a state, and the only constant that is reliably long enough on
-/// a loaded machine is one that makes the suite slow for everybody.
-fn wait_until(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if check() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("timed out after {:?} waiting for {}", timeout, what);
 }
 
 /// A gate command that records one run and then declines, spelled for the host's own shell.
@@ -505,7 +446,7 @@ fn a_session_is_locked_while_its_first_turn_runs() {
     let cluster = Cluster::new("");
     cluster.script(one_slow_reply("first", Duration::from_secs(5)));
 
-    let mut first = cluster.start(&["--oneshot", "the first prompt"]);
+    let mut first = cluster.start(&["--oneshot", "-p", "the first prompt"]);
     wait_until("the session row to exist", Duration::from_secs(20), || {
         cluster.session_count() >= 1
     });
@@ -515,7 +456,7 @@ fn a_session_is_locked_while_its_first_turn_runs() {
     );
 
     // Exactly what the audit ran: a second invocation, mid-turn, continuing the same session.
-    let second = cluster.run(&["-c", "--oneshot", "the second prompt"]);
+    let second = cluster.run(&["-c", "--oneshot", "-p", "the second prompt"]);
     let refusal = String::from_utf8_lossy(&second.stderr).to_string();
 
     let status = first.wait().expect("the first process exits");
@@ -523,24 +464,22 @@ fn a_session_is_locked_while_its_first_turn_runs() {
 
     assert!(
         !second.status.success(),
-        "a second process must be refused, not admitted: {}",
-        refusal
+        "a second process must be refused, not admitted: {refusal}"
     );
     assert!(
         refusal.contains("already attached by another process"),
-        "and refused for the right reason: {}",
-        refusal
+        "and refused for the right reason: {refusal}"
     );
     assert_eq!(
         cluster.message_roles(),
-        vec!["user".to_string(), "assistant".to_string()],
+        vec!["user_blocks".to_string(), "assistant".to_string()],
         "one process's turn, not two interleaved"
     );
 }
 
 /// `meka session delete` against a conversation another process is having.
 ///
-/// The measured behaviour: rc=0 with no output whatsoever -- the count goes through
+/// The measured behavior: rc=0 with no output whatsoever -- the count goes through
 /// `tracing::info!`, invisible at the default level -- while the row and its messages cascaded away
 /// and the live REPL carried on as though nothing had happened, until its next turn ran against the
 /// provider and *then* failed on a foreign-key violation. Tokens spent, answer lost, and every
@@ -550,7 +489,7 @@ fn a_second_process_cannot_delete_a_session_in_use() {
     let cluster = Cluster::new("");
     cluster.script(one_slow_reply("thinking", Duration::from_secs(5)));
 
-    let mut first = cluster.start(&["--oneshot", "a question"]);
+    let mut first = cluster.start(&["--oneshot", "-p", "a question"]);
     wait_until("the session row to exist", Duration::from_secs(20), || {
         cluster.session_count() >= 1
     });
@@ -561,13 +500,11 @@ fn a_second_process_cannot_delete_a_session_in_use() {
 
     assert!(
         !deleted.status.success(),
-        "deleting a session another process is mid-turn on must fail, not exit 0 in silence: {}",
-        refusal
+        "deleting a session another process is mid-turn on must fail, not exit 0 in silence: {refusal}"
     );
     assert!(
         refusal.contains("already attached by another process"),
-        "and say why: {}",
-        refusal
+        "and say why: {refusal}"
     );
     assert_eq!(
         cluster.session_count(),
@@ -581,43 +518,43 @@ fn a_second_process_cannot_delete_a_session_in_use() {
         "and finish its turn without a foreign-key violation"
     );
     assert_eq!(cluster.message_roles(), vec![
-        "user".to_string(),
+        "user_blocks".to_string(),
         "assistant".to_string()
     ]);
 }
 
 /// The consequence the first-turn hole had that costs work rather than coherence.
 ///
-/// A `--oneshot` run that detaches a command stays alive waiting for it, and used to hold no lock
-/// at any point. A second `meka -c --oneshot` therefore opened the same session, swept the
-/// genuinely-running task to `interrupted`, and told its own model the work had died -- and when
-/// the command really finished, `finish_background_task`'s `AND status = 'running'` guard threw
-/// the real outcome away. Both halves were silent: two rc=0 processes, no warning either side.
+/// A `--oneshot` run that detaches a command stays alive waiting for it, and must hold the lock the
+/// whole time. Without it a second `meka -c --oneshot` opens the same session, sweeps the
+/// genuinely-running task to `interrupted`, and tells its own model the work had died; and when the
+/// command really finishes, `finish_background_task`'s `AND status = 'running'` guard throws the
+/// real outcome away. Both halves would be silent: two rc=0 processes, no warning either side.
 #[test]
 fn a_second_process_cannot_sweep_a_running_background_task() {
     let cluster = Cluster::new("[background]\nenabled = true\n");
     let proof = cluster.path("finished");
     cluster.script(serde_json::json!([
         [
-            {"kind": "tool_use_start", "id": "tu_1", "name": "execute_command"},
-            {"kind": "tool_use_end", "input": {
+            {"type": "tool_use_start", "id": "tu_1", "name": "execute_command"},
+            {"type": "tool_use_end", "input": {
                 "command": sleep_then_leave_proof(4, &proof),
                 "background": true,
             }},
-            {"kind": "message_end", "stop_reason": "tool_use"},
+            {"type": "message_end", "stop_reason": "tool_use"},
         ],
         [
-            {"kind": "text", "text": "started it"},
-            {"kind": "message_end", "stop_reason": "end_turn"},
+            {"type": "text", "text": "started it"},
+            {"type": "message_end", "stop_reason": "end_turn"},
         ],
     ]));
 
-    let mut first = cluster.start(&["--oneshot", "kick off the build"]);
+    let mut first = cluster.start(&["--oneshot", "-p", "kick off the build"]);
     wait_until("the task to be running", Duration::from_secs(30), || {
         cluster.task_statuses() == vec!["running".to_string()]
     });
 
-    let second = cluster.run(&["-c", "--oneshot", "anything"]);
+    let second = cluster.run(&["-c", "--oneshot", "-p", "anything"]);
     assert!(
         !second.status.success(),
         "the second process must be refused while the first still owns the session"
@@ -649,7 +586,7 @@ fn a_conversation_being_written_cannot_be_forked_out_from_under_itself() {
     let cluster = Cluster::new("");
     cluster.script(one_slow_reply("answer", Duration::from_secs(5)));
 
-    let mut first = cluster.start(&["--oneshot", "a question"]);
+    let mut first = cluster.start(&["--oneshot", "-p", "a question"]);
     wait_until("the session row to exist", Duration::from_secs(20), || {
         cluster.session_count() >= 1
     });
@@ -659,13 +596,11 @@ fn a_conversation_being_written_cannot_be_forked_out_from_under_itself() {
     let refusal = String::from_utf8_lossy(&forked.stderr).to_string();
     assert!(
         !forked.status.success(),
-        "forking a session mid-turn copies a half-written conversation: {}",
-        refusal
+        "forking a session mid-turn copies a half-written conversation: {refusal}"
     );
     assert!(
         refusal.contains("cannot be copied while it is being written"),
-        "and the refusal has to say why: {}",
-        refusal
+        "and the refusal has to say why: {refusal}"
     );
 
     // The same rule for the other door that copies a conversation.
@@ -739,7 +674,7 @@ fn plant_a_decoy_and_the_job(cluster: &Cluster, session: &str, job: PlantedJob<'
 fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
     let cluster = Cluster::new("[schedule]\npoll_interval = \"200ms\"\n");
     cluster.script(one_reply("done"));
-    let started = cluster.run(&["--oneshot", "make a session"]);
+    let started = cluster.run(&["--oneshot", "-p", "make a session"]);
     assert!(
         started.status.success(),
         "the first turn failed: {}",
@@ -778,8 +713,7 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
     assert_eq!(
         gate_runs(&log),
         1,
-        "one occurrence must produce one gate execution, not one per host\n{}",
-        logs
+        "one occurrence must produce one gate execution, not one per host\n{logs}"
     );
 }
 
@@ -800,9 +734,9 @@ fn two_processes_migrating_one_store_apply_it_once() {
         connection
             .execute_batch(
                 "ALTER TABLE scheduled_jobs DROP COLUMN gate_kind;
-                 ALTER TABLE scheduled_jobs DROP COLUMN gate_spec;
+                 ALTER TABLE scheduled_jobs DROP COLUMN gate_spec_json;
                  ALTER TABLE scheduled_jobs DROP COLUMN claimed_by;
-                 ALTER TABLE scheduled_jobs DROP COLUMN claimed_until;
+                 ALTER TABLE scheduled_jobs DROP COLUMN claim_expires_at;
                  ALTER TABLE scheduled_jobs DROP COLUMN attempts;
                  ALTER TABLE scheduled_jobs ADD COLUMN gate_command TEXT;
                  ALTER TABLE scheduled_jobs ADD COLUMN gate_fire TEXT;
@@ -844,7 +778,7 @@ fn two_processes_migrating_one_store_apply_it_once() {
     for (table, column) in [
         ("scheduled_jobs", "claimed_by"),
         ("scheduled_jobs", "gate_kind"),
-        ("sessions", "provider"),
+        ("sessions", "profile"),
     ] {
         let occurrences: i64 = connection
             .query_row(
@@ -861,7 +795,7 @@ fn two_processes_migrating_one_store_apply_it_once() {
         );
     }
 
-    let backups = std::fs::read_dir(cluster.data_dir())
+    let backups = std::fs::read_dir(cluster.install.data_dir())
         .expect("read the data dir")
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
@@ -883,23 +817,29 @@ fn two_processes_migrating_one_store_apply_it_once() {
 /// point at port 9, which discards.
 fn cluster_with_two_unreachable_profiles() -> Cluster {
     let cluster = Cluster::new("");
-    // Rewritten whole rather than appended: `default_provider` is a top-level key and
+    // Rewritten whole rather than appended: `default_profile` is a top-level key and
     // `Cluster::new` ends its template inside `[permissions]`, so anything appended lands in that
     // table. The store already exists by here, which is all the constructor was needed for.
     std::fs::write(
-        cluster.config_dir().join("config.toml"),
+        cluster.install.config_dir().join("config.toml"),
         r#"
-default_provider = "alpha"
+default_profile = "alpha"
 
-[providers.alpha]
-type = "openai-chat-completions"
-model = "alpha-model"
+[accounts.alpha]
+backend = "openai-chat-completions"
 base_url = "http://127.0.0.1:9/alpha"
 
-[providers.beta]
-type = "openai-chat-completions"
-model = "beta-model"
+[profiles.alpha]
+account = "alpha"
+model = "alpha-model"
+
+[accounts.beta]
+backend = "openai-chat-completions"
 base_url = "http://127.0.0.1:9/beta"
+
+[profiles.beta]
+account = "beta"
+model = "beta-model"
 
 [permissions]
 default = "read"
@@ -912,7 +852,7 @@ enabled = ["read", "unrestricted"]
     for profile in ["alpha", "beta"] {
         connection
             .execute(
-                "INSERT OR REPLACE INTO provider_credentials (profile, credentials_json, \
+                "INSERT OR REPLACE INTO account_credentials (account, credentials_json, \
                  updated_at) VALUES (?1, ?2, ?3)",
                 rusqlite::params![
                     profile,
@@ -935,7 +875,7 @@ fn turn_reaches(cluster: &Cluster, args: &[&str]) -> String {
         .meka(args)
         .env("MEKA_MOCK_PROVIDER", "0")
         .output()
-        .unwrap_or_else(|error| panic!("spawn meka {:?}: {}", args, error));
+        .unwrap_or_else(|error| panic!("spawn meka {args:?}: {error}"));
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
@@ -945,15 +885,16 @@ fn turn_reaches(cluster: &Cluster, args: &[&str]) -> String {
 /// provider from config rather than from the row, and a test that never leaves the process has no
 /// second invocation to be wrong.
 #[test]
-fn a_second_process_resumes_on_the_provider_the_first_one_used() {
+fn a_second_process_resumes_on_the_profile_the_first_one_used() {
     let cluster = cluster_with_two_unreachable_profiles();
 
     let first = turn_reaches(&cluster, &[
         "--oneshot",
-        "-p",
+        "--profile",
         "beta",
         "--permission",
         "read",
+        "-p",
         "hello",
     ]);
     assert!(
@@ -961,12 +902,13 @@ fn a_second_process_resumes_on_the_provider_the_first_one_used() {
         "the first turn should go to the profile it named, got: {first}"
     );
 
-    // No `--provider`: everything this process knows about the session comes off its row.
+    // No `--profile`: everything this process knows about the session comes off its row.
     let resumed = turn_reaches(&cluster, &[
         "--oneshot",
         "-c",
         "--permission",
         "read",
+        "-p",
         "again",
     ]);
     assert!(
@@ -984,16 +926,17 @@ fn a_second_process_refuses_a_profile_that_is_no_longer_configured() {
     let cluster = cluster_with_two_unreachable_profiles();
     turn_reaches(&cluster, &[
         "--oneshot",
-        "-p",
+        "--profile",
         "beta",
         "--permission",
         "read",
+        "-p",
         "hello",
     ]);
 
     let connection = rusqlite::Connection::open(cluster.database()).expect("open the store");
     connection
-        .execute("UPDATE sessions SET provider = 'retired'", [])
+        .execute("UPDATE sessions SET profile = 'retired'", [])
         .expect("the profile leaves config.toml");
     drop(connection);
 
@@ -1002,6 +945,7 @@ fn a_second_process_refuses_a_profile_that_is_no_longer_configured() {
         "-c",
         "--permission",
         "read",
+        "-p",
         "again",
     ]);
     assert!(
@@ -1016,7 +960,7 @@ fn a_second_process_refuses_a_profile_that_is_no_longer_configured() {
 
 /// A resume must not be blocked by a *default* it does not use.
 ///
-/// `meka provider remove <the default>` drops `default_provider` with two profiles still
+/// `meka profile remove <the default>` drops `default_profile` with two profiles still
 /// configured, and every later `meka -c` stopped there -- on a session whose row named a profile
 /// that was still perfectly configured, and which `meka session list` printed correctly.
 #[test]
@@ -1024,22 +968,23 @@ fn a_resume_is_not_blocked_by_an_ambiguous_default_it_does_not_use() {
     let cluster = cluster_with_two_unreachable_profiles();
     turn_reaches(&cluster, &[
         "--oneshot",
-        "-p",
+        "--profile",
         "beta",
         "--permission",
         "read",
+        "-p",
         "hello",
     ]);
 
     // Retire the default, leaving `alpha` and `beta` and no way to pick between them. Stripping
-    // the key is the whole of it: `provider remove alpha` used to stand here, which *deleted*
-    // `alpha` and left `beta` as the sole profile -- unambiguous, and coincidentally the very
-    // profile the assertion looks for, so the test passed with the fix reverted.
+    // the key is the whole of it: `profile remove alpha` would *delete* `alpha` and leave `beta` as
+    // the sole profile, unambiguous and coincidentally the very profile the assertion looks for, so
+    // the test would pass with the fix reverted.
     std::fs::write(
-        cluster.config_dir().join("config.toml"),
-        std::fs::read_to_string(cluster.config_dir().join("config.toml"))
+        cluster.install.config_dir().join("config.toml"),
+        std::fs::read_to_string(cluster.install.config_dir().join("config.toml"))
             .expect("read config")
-            .replace("default_provider = \"alpha\"\n", ""),
+            .replace("default_profile = \"alpha\"\n", ""),
     )
     .expect("drop the default");
 
@@ -1048,6 +993,7 @@ fn a_resume_is_not_blocked_by_an_ambiguous_default_it_does_not_use() {
         "-c",
         "--permission",
         "read",
+        "-p",
         "again",
     ]);
     assert!(
@@ -1064,24 +1010,77 @@ fn a_resume_is_not_blocked_by_an_ambiguous_default_it_does_not_use() {
 fn a_fresh_run_still_stops_when_no_default_can_be_picked() {
     let cluster = cluster_with_two_unreachable_profiles();
     std::fs::write(
-        cluster.config_dir().join("config.toml"),
-        std::fs::read_to_string(cluster.config_dir().join("config.toml"))
+        cluster.install.config_dir().join("config.toml"),
+        std::fs::read_to_string(cluster.install.config_dir().join("config.toml"))
             .expect("read config")
-            .replace("default_provider = \"alpha\"\n", ""),
+            .replace("default_profile = \"alpha\"\n", ""),
     )
     .expect("drop the default");
 
-    let refused = turn_reaches(&cluster, &["--oneshot", "--permission", "read", "hello"]);
+    let refused = turn_reaches(&cluster, &[
+        "--oneshot",
+        "--permission",
+        "read",
+        "-p",
+        "hello",
+    ]);
     assert!(
-        refused.contains("multiple provider profiles configured"),
+        refused.contains("multiple profiles configured"),
         "a fresh run needs a default and must say so: {refused}"
     );
     assert!(
-        refused.contains("meka provider use"),
+        refused.contains("meka profile use"),
         "the message should name the command that sets one: {refused}"
     );
     assert!(
         !refused.contains("127.0.0.1:9/"),
         "nothing should have been sent anywhere: {refused}"
     );
+}
+
+/// `DELETE /v1/sessions/{id}` goes through the same locked door `meka session delete` does: a
+/// session another process is mid-turn on is refused with 409 rather than cascaded away under it.
+#[test]
+fn an_http_delete_cannot_take_a_session_another_process_holds() {
+    let cluster = Cluster::new("");
+    cluster.script(one_slow_reply("thinking", Duration::from_secs(5)));
+    let server = cluster.serve("alpha");
+
+    let mut first = cluster.start(&["--oneshot", "-p", "a question"]);
+    wait_until("the session row to exist", Duration::from_secs(20), || {
+        cluster.session_count() >= 1
+    });
+    let session = cluster.only_session();
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("client");
+    let response = client
+        .delete(format!(
+            "http://127.0.0.1:{}/v1/sessions/{}",
+            server.port, session
+        ))
+        .header("Authorization", "Bearer sk_test_alpha")
+        .send()
+        .expect("delete");
+    assert_eq!(
+        response.status(),
+        409,
+        "a session another process holds must be refused, not deleted"
+    );
+    let problem: serde_json::Value = response.json().expect("problem body");
+    assert_eq!(problem["type"], "https://meka.so/errors/session-locked");
+    assert_eq!(
+        cluster.session_count(),
+        1,
+        "the conversation must survive the attempt"
+    );
+
+    let status = first.wait().expect("the first process exits");
+    assert!(
+        status.success(),
+        "and finish its turn without a foreign-key violation"
+    );
+    drop(server);
 }

@@ -9,7 +9,7 @@
 //!
 //! This module owns the vocabulary -- what a [`Memory`] is, what names and tags are legal, how an
 //! age is rendered, and how a memory is written out for `meka memory export`. Storage and retrieval
-//! are [`store`], which is the source of truth.
+//! are [`crate::store::memory`], which is the source of truth.
 //!
 //! One row is the whole of a memory: there is no second copy to keep in step, and a transaction is
 //! what makes a write atomic rather than a lock. `meka memory export` is the answer for anyone who
@@ -19,63 +19,61 @@
 //! clients read, and a skill directory carries bundled scripts and assets, so files are right
 //! there.
 //!
-//! Why this survives compaction: the index rides [`crate::context::WorldSnapshot`], which
+//! Why this survives compaction: the index rides [`crate::prompt::WorldSnapshot`], which
 //! `Agent::last_rendered_world` re-states in full at session start, after every compaction, and
 //! whenever the previous render scrolls out of the context window.
-
-pub mod cli;
-pub mod store;
 
 use std::{
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
-pub use self::store::MemoryStore;
-// Re-exported rather than referenced through `crate::store` at each use site: priority is part
+// Re-exported rather than referenced through `crate::entry` at each use site: priority is part
 // of the memory store's public vocabulary (`meka memory add --priority`, the `memory_write`
 // schema), and the constants moved there only so `skills` could share the same scale.
-pub use crate::store::{DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY, normalize_description};
-use crate::store::{validate_entry_name, yaml_scalar};
+pub(crate) use crate::entry::{
+    DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY, normalize_description,
+};
+use crate::entry::{validate_entry_name, yaml_scalar};
 
 /// A single durable note, as one row of the `memories` table.
 ///
 /// `description` is what the agent sees every turn; `body` is fetched on demand through the
 /// `memory_read` tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Memory {
-    pub name: String,
-    pub description: String,
-    pub priority: u8,
+pub(crate) struct Memory {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) priority: u8,
     /// Free-form labels, validated to [`validate_tag`]'s character class.
     ///
     /// What makes a store of thousands navigable rather than merely searchable: the index can only
     /// show a couple of hundred entries, and "4,910 more memories not shown" is not a usable
     /// signal, where "most common tags infra, people, decisions" is a query the model can act on.
-    pub tags: Vec<String>,
+    pub(crate) tags: Vec<String>,
     /// When the memory was *recorded*: stamped once, at create, and carried across every later
-    /// write by the upsert itself (see [`store::MemoryStore::write`]).
+    /// write by the upsert itself (see [`crate::store::memory::MemoryStore::write`]).
     ///
     /// Distinct from [`Self::updated_at`] because the two answer different questions and only one
     /// of them is the one being asked. With one timestamp, a `memory_write` that merely rewords a
     /// description makes a years-old note render as "today", sort to the top of its priority band,
     /// and arrive through `memory_read` under the caption "Saved today. This is what you recorded
     /// then".
-    pub recorded_at: SystemTime,
+    pub(crate) recorded_at: SystemTime,
     /// When the row was last written. Reported by `meka memory get` and the HTTP API; it takes no
     /// part in ordering, ranking or the rendered age.
-    pub updated_at: SystemTime,
+    pub(crate) updated_at: SystemTime,
     /// How many times `memory_read` has opened this memory. Feeds the usage weight in
-    /// [`store::Ranking`], which is the counterweight to a priority the agent guessed once and
-    /// never revised.
-    pub read_count: u32,
+    /// [`crate::store::memory::Ranking`], which is the counterweight to a priority the agent
+    /// guessed once and never revised.
+    pub(crate) read_count: u32,
     /// The body text, present when the query that produced this loaded it.
     ///
-    /// [`store::MemoryStore::get`] always loads it; [`store::MemoryStore::index`] loads it only
-    /// for the band the `[Memory]` section renders in full (see [`INLINE_BODY_PRIORITY_MAX`]),
-    /// because carrying every body would put the whole store in resident memory for the sake
-    /// of a handful of entries.
-    pub body: Option<String>,
+    /// [`crate::store::memory::MemoryStore::get`] always loads it;
+    /// [`crate::store::memory::MemoryStore::index`] loads it only for the band the `[Memory]`
+    /// section renders in full (see [`INLINE_BODY_PRIORITY_MAX`]), because carrying every body
+    /// would put the whole store in resident memory for the sake of a handful of entries.
+    pub(crate) body: Option<String>,
 }
 
 /// Priority at or below which a memory's body is rendered into the per-turn context in full,
@@ -85,41 +83,41 @@ pub struct Memory {
 /// *is* the rule, and leaving it behind a tool call the model may never make is the gap this
 /// closes -- but inlining two whole bands doubles the chance of blowing the budget and pushing the
 /// index itself out, so the always-in-context tier is deliberately the narrower one.
-pub const INLINE_BODY_PRIORITY_MAX: u8 = 0;
+pub(crate) const INLINE_BODY_PRIORITY_MAX: u8 = 0;
 
 /// Most tags one memory may carry. A tag set is a handful of labels; past this it is a body.
-pub const MAX_TAGS: usize = 10;
+pub(crate) const MAX_TAGS: usize = 10;
 /// Longest a single tag may be. Bounded so the histogram in the `[Memory]` index stays readable.
-pub const MAX_TAG_LEN: usize = 32;
+pub(crate) const MAX_TAG_LEN: usize = 32;
 
 /// Validate one tag: lowercase alphanumerics and hyphens, starting with an alphanumeric.
 ///
 /// Strict deliberately, and load-bearing rather than cosmetic in two places. Tags are stored
 /// space-joined in one column, so a tag containing a space would come back as two; and
 /// [`render_memory`] emits the list as a YAML flow sequence through [`yaml_scalar`], which is safe
-/// only for values already normalised to one line.
-pub fn validate_tag(tag: &str) -> Result<(), String> {
+/// only for values already normalized to one line.
+pub(crate) fn validate_tag(tag: &str) -> Result<(), String> {
     if tag.is_empty() {
         return Err("a tag cannot be empty".to_string());
     }
     if tag.chars().count() > MAX_TAG_LEN {
-        return Err(format!("tag '{}' exceeds {} characters", tag, MAX_TAG_LEN));
+        return Err(format!("tag '{tag}' exceeds {MAX_TAG_LEN} characters"));
     }
     let mut chars = tag.chars();
-    // Non-empty was checked above, so this always yields `Some`.
-    #[allow(clippy::expect_used)]
+    #[allow(
+        clippy::expect_used,
+        reason = "the empty tag was refused above, so the first char is always `Some`"
+    )]
     let first = chars.next().expect("non-empty checked above");
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return Err(format!(
-            "tag '{}' must start with a lowercase letter or digit",
-            tag
+            "tag '{tag}' must start with a lowercase letter or digit"
         ));
     }
     for character in chars {
         if !(character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-') {
             return Err(format!(
-                "tag '{}' contains invalid character '{}'; only [a-z0-9-] are allowed",
-                tag, character
+                "tag '{tag}' contains invalid character '{character}'; only [a-z0-9-] are allowed"
             ));
         }
     }
@@ -127,7 +125,7 @@ pub fn validate_tag(tag: &str) -> Result<(), String> {
 }
 
 /// Validate a whole tag list for a write, rejecting the set rather than silently dropping members.
-pub fn validate_tags(tags: &[String]) -> Result<(), String> {
+pub(crate) fn validate_tags(tags: &[String]) -> Result<(), String> {
     if tags.len() > MAX_TAGS {
         return Err(format!(
             "{} tags given; at most {} are allowed",
@@ -143,11 +141,11 @@ pub fn validate_tags(tags: &[String]) -> Result<(), String> {
 
 /// Lowercase, sort, deduplicate and validate a tag list on its way to the store.
 ///
-/// Lowercased *before* validating, so the doors agree: search normalises case anyway, and refusing
+/// Lowercased *before* validating, so the doors agree: search normalizes case anyway, and refusing
 /// `Infra` here would mean a label meka itself renders is one meka itself will not take back.
 /// Sorted before the dedup because `dedup` only removes *consecutive* duplicates, so the other
 /// order leaves `[a, b, a]` intact and the row ends up declaring `a` twice.
-pub fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
+pub(crate) fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
     let mut tags: Vec<String> = tags.iter().map(|tag| tag.trim().to_lowercase()).collect();
     tags.sort();
     tags.dedup();
@@ -170,12 +168,12 @@ pub(crate) fn render_recorded(time: SystemTime) -> String {
 /// The file name one exported memory lands under. The sole owner of the `<name>.md` layout
 /// convention, so changing it is a one-line edit rather than a grep.
 fn memory_file_name(name: &str) -> String {
-    format!("{}.md", name)
+    format!("{name}.md")
 }
 
 /// Resolve one exported memory's path inside `root`. Performs no I/O and does not validate the
 /// name; callers pair it with [`validate_memory_name`].
-pub fn memory_file_in(root: &Path, name: &str) -> PathBuf {
+pub(crate) fn memory_file_in(root: &Path, name: &str) -> PathBuf {
     root.join(memory_file_name(name))
 }
 
@@ -185,24 +183,24 @@ pub fn memory_file_in(root: &Path, name: &str) -> PathBuf {
 /// Still load-bearing after the move off the filesystem, for two reasons that outlived it: a name
 /// is what `meka memory export` turns into a file name, and it is text the model reads in every
 /// turn's index.
-pub fn validate_memory_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_memory_name(name: &str) -> Result<(), String> {
     validate_entry_name(name, "memory")
 }
 
 /// Bound a name being *looked up*, without demanding it be one this store would write.
 ///
-/// The lookup half of [`validate_memory_name`]; see [`crate::store::validate_lookup_name`] for why
+/// The lookup half of [`validate_memory_name`]; see [`crate::entry::validate_lookup_name`] for why
 /// a store that applies its write rule to reads and deletes cannot get rid of a row it should never
 /// have accepted.
-pub fn validate_memory_lookup(name: &str) -> Result<(), String> {
-    crate::store::validate_lookup_name(name, "memory")
+pub(crate) fn validate_memory_lookup(name: &str) -> Result<(), String> {
+    crate::entry::validate_lookup_name(name, "memory")
 }
 
 /// Clamp a caller-supplied `priority` for a memory. Thin wrapper over
-/// [`crate::store::parse_priority`] that supplies this store's noun, mirroring
+/// [`crate::entry::parse_priority`] that supplies this store's noun, mirroring
 /// [`validate_memory_name`].
-pub fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
-    crate::store::parse_priority(raw, "memory", name)
+pub(crate) fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
+    crate::entry::parse_priority(raw, "memory", name)
 }
 
 /// The header an exported memory file carries.
@@ -211,12 +209,12 @@ pub fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
 /// `render_skill_file` received: `render_memory("x", 5, None, &[], body)` is unreadable at the call
 /// site and silently accepts a swapped pair.
 #[derive(Debug, Clone)]
-pub struct MemoryFrontmatter {
-    pub description: String,
-    pub priority: u8,
+pub(crate) struct MemoryFrontmatter {
+    pub(crate) description: String,
+    pub(crate) priority: u8,
     /// The `recorded:` value as it will appear in the file, RFC 3339.
-    pub recorded: Option<String>,
-    pub tags: Vec<String>,
+    pub(crate) recorded: Option<String>,
+    pub(crate) tags: Vec<String>,
     /// How many times the memory has been read, emitted only when non-zero.
     ///
     /// Not content but usage: what the agent has *done* with the note. It rides along in an export
@@ -224,7 +222,7 @@ pub struct MemoryFrontmatter {
     /// and dates are all there, but a store restored with every counter at zero has silently lost
     /// each memory's accumulated ranking weight. A reader that does not model the key ignores it,
     /// as it ignores any other it does not model.
-    pub read_count: u32,
+    pub(crate) read_count: u32,
 }
 
 /// Render one memory as a Markdown file: frontmatter followed by the body.
@@ -235,34 +233,31 @@ pub struct MemoryFrontmatter {
 ///
 /// `priority` is emitted only when it differs from [`DEFAULT_PRIORITY`], `recorded` only when
 /// known, and `tags` only when non-empty, so the common case stays a two-line header.
-pub fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
-    use std::fmt::Write as _;
-
+pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
     let mut out = String::new();
     out.push_str("---\n");
     // Only the characters YAML genuinely cannot carry are dropped. A C0 or C1 control inside a
     // double-quoted scalar is outside YAML's `c-printable` production, so an export holding one is
     // a file no parser will read. `sanitize_stored_description` was used here at first and went
     // further than that argument: it also strips the whole `Cf` category, so a Persian description
-    // came back a different word after a backup -- a read that sanitises, written to a persistent
+    // came back a different word after a backup -- a read that sanitizes, written to a persistent
     // store, which is the class this whole change closed for bodies.
-    let _ = writeln!(
-        out,
-        "description: {}",
+    out.push_str(&format!(
+        "description: {}\n",
         yaml_scalar(&normalize_description(&yaml_printable(
             &frontmatter.description
         )))
-    );
+    ));
     if frontmatter.priority != DEFAULT_PRIORITY {
-        let _ = writeln!(out, "priority: {}", frontmatter.priority);
+        out.push_str(&format!("priority: {}\n", frontmatter.priority));
     }
     if let Some(recorded) = &frontmatter.recorded {
         // Quoted by `yaml_scalar` on the strength of the colons in the time, which is what keeps
         // the offset from parsing as a nested mapping.
-        let _ = writeln!(out, "recorded: {}", yaml_scalar(recorded));
+        out.push_str(&format!("recorded: {}\n", yaml_scalar(recorded)));
     }
     if frontmatter.read_count > 0 {
-        let _ = writeln!(out, "read_count: {}", frontmatter.read_count);
+        out.push_str(&format!("read_count: {}\n", frontmatter.read_count));
     }
     if !frontmatter.tags.is_empty() {
         // Each element through `yaml_scalar` rather than a bare flow sequence. Every tag reaching
@@ -274,7 +269,7 @@ pub fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
             .iter()
             .map(|tag| yaml_scalar(tag))
             .collect();
-        let _ = writeln!(out, "tags: [{}]", quoted.join(", "));
+        out.push_str(&format!("tags: [{}]\n", quoted.join(", ")));
     }
     // The body verbatim between one separator newline and one terminator newline, both added
     // unconditionally. Trimming leading newlines and appending a terminator only when one was
@@ -314,7 +309,7 @@ fn yaml_printable(text: &str) -> String {
 ///
 /// Distinct from [`description_survives_export`], which asks whether YAML can carry the text. A
 /// description can fail either check independently.
-pub fn description_says_something(description: &str) -> bool {
+pub(crate) fn description_says_something(description: &str) -> bool {
     !render_description_for_model(description).trim().is_empty()
 }
 
@@ -329,14 +324,14 @@ pub fn description_says_something(description: &str) -> bool {
 /// Distinct from [`description_says_something`], which asks whether the *model* would see anything.
 /// A description can fail either check independently: YAML carries a zero-width space fine, and the
 /// render boundary strips it.
-pub fn description_survives_export(description: &str) -> bool {
+pub(crate) fn description_survives_export(description: &str) -> bool {
     !normalize_description(&yaml_printable(description))
         .trim()
         .is_empty()
 }
 
 /// Render one [`Memory`] as an export file, body included.
-pub fn export_memory(memory: &Memory) -> String {
+pub(crate) fn export_memory(memory: &Memory) -> String {
     render_memory(
         &MemoryFrontmatter {
             description: memory.description.clone(),
@@ -351,24 +346,24 @@ pub fn export_memory(memory: &Memory) -> String {
 
 /// Make stored memory text safe to render into a model's context or a terminal.
 ///
-/// The store returns bytes (see `store::row_to_memory`), because `meka memory edit` round-trips a
-/// body through `$EDITOR` and a read that stripped characters would destroy them permanently.
-/// Neutralising therefore happens here, at each boundary where the text is *displayed* rather than
-/// carried: the `[Memory]` index and its standing band, `memory_read`, both search renderers, a
-/// sub-agent's index, and the `meka memory` listing.
+/// The store returns bytes (see `crate::store::memory::row_to_memory`), because `meka memory edit`
+/// round-trips a body through `$EDITOR` and a read that stripped characters would destroy them
+/// permanently. Neutralising therefore happens here, at each boundary where the text is *displayed*
+/// rather than carried: the `[Memory]` index and its standing band, `memory_read`, both search
+/// renderers, a sub-agent's index, and the `meka memory` listing.
 ///
 /// The two doors that deliberately do **not** call this are `meka memory export` and
 /// `meka memory edit`, which exist to hand back exactly what is stored.
-pub fn render_for_model(text: &str) -> String {
-    crate::mcp::sanitize::sanitize_text(text)
+pub(crate) fn render_for_model(text: &str) -> String {
+    crate::text::sanitize_text(text)
 }
 
 /// The same for a description, which is additionally contracted to be one line.
 ///
 /// A memory whose description carries a newline would otherwise open what looks like a new section
 /// in the per-turn index the model reads every turn.
-pub fn render_description_for_model(description: &str) -> String {
-    crate::store::sanitize_stored_description(description)
+pub(crate) fn render_description_for_model(description: &str) -> String {
+    crate::entry::sanitize_stored_description(description)
 }
 
 /// Human-readable age, e.g. "today", "yesterday", "47 days ago".
@@ -380,7 +375,7 @@ pub fn render_description_for_model(description: &str) -> String {
 /// Callers pass [`Memory::recorded_at`], never [`Memory::updated_at`]. The number is only worth
 /// rendering if it answers "how old is what this says"; an edit date dressed up as an observation
 /// date is worse than no date, because it reads as a fact the model can rely on.
-pub fn render_age(recorded: SystemTime, now: SystemTime) -> String {
+pub(crate) fn render_age(recorded: SystemTime, now: SystemTime) -> String {
     // A stamp in the future is its own answer, not "today". `duration_since` fails for one, and
     // folding that to zero tells the model a note dated next year was written this morning, while
     // the same row sorts to the top of its priority band, so the memory most likely to be wrong is
@@ -392,7 +387,7 @@ pub fn render_age(recorded: SystemTime, now: SystemTime) -> String {
     match elapsed.as_secs() / 86_400 {
         0 => "today".to_string(),
         1 => "yesterday".to_string(),
-        n => format!("{} days ago", n),
+        n => format!("{n} days ago"),
     }
 }
 
@@ -401,7 +396,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_memory_name_rejects_traversal_and_separators() {
+    fn validate_memory_name_rejects_traversal_and_separators() {
         for bad in [
             "../escape",
             "a/b",
@@ -413,21 +408,19 @@ mod tests {
         ] {
             assert!(
                 validate_memory_name(bad).is_err(),
-                "'{}' must be rejected",
-                bad
+                "'{bad}' must be rejected"
             );
         }
         for good in ["alice-timezone", "deploy_host", "note42", "A-B_c9"] {
             assert!(
                 validate_memory_name(good).is_ok(),
-                "'{}' must be accepted",
-                good
+                "'{good}' must be accepted"
             );
         }
     }
 
     #[test]
-    fn test_priority_defaults_and_clamps() {
+    fn priority_defaults_and_clamps() {
         assert_eq!(parse_priority(None, "n"), DEFAULT_PRIORITY);
         assert_eq!(parse_priority(Some(0), "n"), 0);
         assert_eq!(parse_priority(Some(9), "n"), 9);
@@ -438,7 +431,7 @@ mod tests {
     /// A tag is stored space-joined in one column and rendered into a YAML flow sequence, so
     /// anything either of those would read as structure has to be refused at the door.
     #[test]
-    fn test_tag_validation_refuses_anything_yaml_would_interpret() {
+    fn tag_validation_refuses_anything_yaml_would_interpret() {
         for bad in [
             "",
             "Infra",
@@ -451,20 +444,20 @@ mod tests {
             "bracket]",
             &"x".repeat(MAX_TAG_LEN + 1),
         ] {
-            assert!(validate_tag(bad).is_err(), "'{}' must be rejected", bad);
+            assert!(validate_tag(bad).is_err(), "'{bad}' must be rejected");
         }
         for good in ["infra", "deploy-host", "k8s", "0day"] {
-            assert!(validate_tag(good).is_ok(), "'{}' must be accepted", good);
+            assert!(validate_tag(good).is_ok(), "'{good}' must be accepted");
         }
         assert!(validate_tags(&vec!["a".to_string(); MAX_TAGS]).is_ok());
         assert!(validate_tags(&vec!["a".to_string(); MAX_TAGS + 1]).is_err());
     }
 
-    /// The normalisation the write door applies. Sorting before the dedup is the load-bearing part:
+    /// The normalization the write door applies. Sorting before the dedup is the load-bearing part:
     /// `dedup` only removes *consecutive* duplicates, so `[a, b, a]` would otherwise survive whole
     /// and the row would declare `a` twice.
     #[test]
-    fn test_normalize_tags_lowercases_sorts_and_deduplicates() {
+    fn normalize_tags_lowercases_sorts_and_deduplicates() {
         assert_eq!(
             normalize_tags(&[
                 "Infra".to_string(),
@@ -480,7 +473,7 @@ mod tests {
     /// An export has to parse back as YAML frontmatter, or `meka memory export` produces files
     /// that only look like the format they claim.
     #[test]
-    fn test_export_round_trips_through_frontmatter() {
+    fn export_round_trips_through_frontmatter() {
         let memory = Memory {
             name: "note".to_string(),
             description: "a description: with a colon".to_string(),
@@ -493,7 +486,7 @@ mod tests {
         };
         let rendered = export_memory(&memory);
         let (frontmatter, body) =
-            crate::store::split_frontmatter(&rendered).expect("must have frontmatter");
+            crate::entry::split_frontmatter(&rendered).expect("must have frontmatter");
         let parsed: serde_norway::Value =
             serde_norway::from_str(frontmatter).expect("frontmatter must parse");
         assert_eq!(
@@ -519,7 +512,7 @@ mod tests {
 
     /// A default priority and an empty tag set are omitted, so an export stays readable.
     #[test]
-    fn test_export_omits_default_priority_and_empty_tags() {
+    fn export_omits_default_priority_and_empty_tags() {
         let memory = Memory {
             name: "note".to_string(),
             description: "plain".to_string(),
@@ -538,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_age() {
+    fn an_age_renders_as_today_yesterday_days_ago_or_a_future_date() {
         let now = SystemTime::now();
         assert_eq!(render_age(now, now), "today");
         assert_eq!(

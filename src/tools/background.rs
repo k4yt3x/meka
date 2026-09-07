@@ -2,7 +2,7 @@
 //! ([`crate::background`]).
 //!
 //! Both gate at [`Permission::Read`]. Neither runs anything: listing reads meka's own store, and
-//! cancelling only signals a token belonging to work whose permission was already checked when it
+//! canceling only signals a token belonging to work whose permission was already checked when it
 //! was dispatched. Requiring `unrestricted` to stop something the agent itself started would leave
 //! it unable to clean up after a call it had every right to make.
 //!
@@ -13,27 +13,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::{
     Tool, ToolOutput,
     util::{require_str, resolve_session_id},
 };
 use crate::{
-    background::{BackgroundTasks, TaskStatus},
+    background::{BackgroundTasks, TASK_INDEX_TOOL},
     error::Result,
     permission::Permission,
     provider::ToolDefinition,
-    session::SessionManager,
+    store::{Store, background::TaskStatus},
 };
 
-/// Name of the tool the `[Background]` index exists to drive. Without it the index would be a menu
-/// with nothing to order from.
-pub const TASK_INDEX_TOOL: &str = "task_list";
-
-/// How much of a finished task's output `task_list` shows. Enough to recognise what happened, not
+/// How much of a finished task's output `task_list` shows. Enough to recognize what happened, not
 /// enough to make listing tasks a way to re-read every result.
 const OUTCOME_EXCERPT_CHARS: usize = 200;
 
@@ -42,8 +35,8 @@ const OUTCOME_EXCERPT_CHARS: usize = 200;
 const LABEL_EXCERPT_CHARS: usize = 48;
 
 struct TaskContext {
-    session_manager: SessionManager,
-    session_id: Arc<RwLock<Option<Uuid>>>,
+    store: Store,
+    site: crate::session::ToolSite,
     tasks: BackgroundTasks,
 }
 
@@ -75,12 +68,12 @@ impl Tool for TaskListTool {
     async fn execute(
         &self,
         _input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let session_id = resolve_session_id(&self.context.session_id, TASK_INDEX_TOOL).await?;
+        let session_id = resolve_session_id(&self.context.site.session_id, TASK_INDEX_TOOL)?;
         let tasks = self
             .context
-            .session_manager
+            .store
             .background_store()
             .list_background_tasks(session_id)
             .await?;
@@ -98,7 +91,7 @@ impl Tool for TaskListTool {
             .map(|task| {
                 vec![
                     task.short_id().to_string(),
-                    task.status.as_str().to_string(),
+                    task.status.name().to_string(),
                     task.tool_name.clone(),
                     crate::background::excerpt(&task.label, LABEL_EXCERPT_CHARS),
                     humantime_serde::re::humantime::format_duration(
@@ -106,13 +99,12 @@ impl Tool for TaskListTool {
                     )
                     .to_string(),
                     // An excerpt for anything already finished. Outcomes are delivered as their
-                    // own turn, but that delivery is stamped before the turn
-                    // runs, so a turn that fails (a provider error, an
-                    // interrupt) consumes the report. Without this the result
-                    // would be reachable only by reading the database by hand, which for the agent
-                    // means not at all.
+                    // own turn, but that delivery is stamped before the turn runs, so a turn that
+                    // fails (a provider error, an interrupt) consumes the report. Without this the
+                    // result would be reachable only by reading the database by hand, which for
+                    // the agent means not at all.
                     match (&task.outcome, &task.scratchpad_name) {
-                        (_, Some(name)) => format!("in scratchpad '{}'", name),
+                        (_, Some(name)) => format!("in scratchpad '{name}'"),
                         (Some(outcome), None) if task.status.is_terminal() => {
                             crate::background::excerpt(outcome, OUTCOME_EXCERPT_CHARS)
                         }
@@ -122,7 +114,7 @@ impl Tool for TaskListTool {
             })
             .collect();
 
-        let mut rendered = crate::render::format_columns(
+        let mut rendered = crate::text::format_columns(
             &["ID", "Status", "Tool", "What", "Elapsed", "Result"],
             &rows,
         );
@@ -145,7 +137,7 @@ impl Tool for TaskCancelTool {
             name: "task_cancel".to_string(),
             description:
                 "Stop a running background task by id (the short form from `task_list` is \
-                enough), or every one of them with all=true. A cancelled task still reports back, \
+                enough), or every one of them with all=true. A canceled task still reports back, \
                 so you will be told when it has actually stopped."
                     .to_string(),
             parameters: serde_json::json!({
@@ -153,12 +145,12 @@ impl Tool for TaskCancelTool {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Task id, full or the short prefix task_list shows",
+                        "description": "Task id, in full or the short prefix `task_list` shows.",
                     },
                     "all": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Cancel every running task in this session instead",
+                        "description": "Cancel every running task in this session instead of one by id. Default: false.",
                     }
                 }
             }),
@@ -173,33 +165,32 @@ impl Tool for TaskCancelTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let session_id = resolve_session_id(&self.context.session_id, "task_cancel").await?;
+        let session_id = resolve_session_id(&self.context.site.session_id, "task_cancel")?;
 
         if input
             .get("all")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
         {
-            // Recorded before signalling, exactly as the single-id path below does and for the same
+            // Recorded before signaling, exactly as the single-id path below does and for the same
             // reason: the work reacting to its token reports an interruption, which would otherwise
             // land as `failed` and tell the agent its build broke rather than that it was stopped.
             let ids = self.context.tasks.session_task_ids(session_id).await;
-            let store = self.context.session_manager.background_store();
+            let store = self.context.store.background_store();
             for id in &ids {
                 store
                     .finish_background_task(id, TaskStatus::Cancelled, None, None)
                     .await?;
             }
-            let signalled = self.context.tasks.cancel_session(session_id).await;
+            let signaled = self.context.tasks.cancel_session(session_id).await;
             return Ok(ToolOutput::text(
-                if signalled == 0 {
+                if signaled == 0 {
                     "No running background tasks to cancel.".to_string()
                 } else {
                     format!(
-                        "Asked {} background task(s) to stop. Each will report back once it has.",
-                        signalled
+                        "Asked {signaled} background task(s) to stop. Each will report back once it has."
                     )
                 },
                 false,
@@ -209,16 +200,15 @@ impl Tool for TaskCancelTool {
         let id_prefix = require_str(&input, "id", "task_cancel")?;
         let Some(task) = self
             .context
-            .session_manager
+            .store
             .background_store()
             .resolve_background_task(session_id, &id_prefix)
             .await?
         else {
             return Ok(ToolOutput::text(
                 format!(
-                    "Error: no background task in this session matches '{}'. Call `task_list` for \
-                     the current ids.",
-                    id_prefix
+                    "Error: no background task in this session matches '{id_prefix}'. Call `task_list` for \
+                     the current ids."
                 ),
                 true,
             ));
@@ -229,29 +219,29 @@ impl Tool for TaskCancelTool {
                 format!(
                     "Task {} already {} and is not running.",
                     task.short_id(),
-                    task.status.as_str()
+                    task.status.name()
                 ),
                 false,
             ));
         }
 
-        // Record the cancellation before signalling. `finish_background_task` only writes over a
+        // Record the cancellation before signaling. `finish_background_task` only writes over a
         // `running` row, so whichever of the two lands first wins, and doing it in this order means
         // a task that happens to finish in the same instant cannot report success after the agent
         // was told it was stopped.
         self.context
-            .session_manager
+            .store
             .background_store()
             .finish_background_task(&task.id, TaskStatus::Cancelled, None, None)
             .await?;
-        let signalled = self.context.tasks.cancel(&task.id).await;
-        if !signalled {
+        let signaled = self.context.tasks.cancel(&task.id).await;
+        if !signaled {
             // The row was ours to retire but the handle was not: the task belonged to a process
             // that is gone. Recording it is still the right move, and is what stops the agent
             // waiting forever.
+            let short_id = task.short_id();
             tracing::debug!(
-                "task {} had no live handle in this process; recorded as cancelled",
-                task.short_id()
+                "task {short_id} had no live handle in this process; recorded as canceled"
             );
         }
         Ok(ToolOutput::text(
@@ -266,47 +256,44 @@ impl Tool for TaskCancelTool {
 }
 
 pub(super) fn build(
-    session_manager: SessionManager,
-    session_id: Arc<RwLock<Option<Uuid>>>,
+    store: Store,
+    site: crate::session::ToolSite,
     tasks: BackgroundTasks,
 ) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(TaskListTool {
             context: TaskContext {
-                session_manager: session_manager.clone(),
-                session_id: session_id.clone(),
+                store: store.clone(),
                 tasks: tasks.clone(),
+                site: site.clone(),
             },
         }),
         Arc::new(TaskCancelTool {
-            context: TaskContext {
-                session_manager,
-                session_id,
-                tasks,
-            },
+            context: TaskContext { store, tasks, site },
         }),
     ]
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
     use super::*;
-    use crate::{background::BackgroundTask, provider::ContentBlock};
+    use crate::store::background::BackgroundTask;
 
     async fn context() -> (TaskContext, Uuid) {
-        let session_manager =
-            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory db");
-        let session_id = session_manager
+        let store = Store::for_test().await;
+        let session_id = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create session");
         (
             TaskContext {
-                session_manager,
-                session_id: Arc::new(RwLock::new(Some(session_id))),
+                store,
                 tasks: BackgroundTasks::default(),
+                site: crate::session::ToolSite::for_test()
+                    .with_session_id(crate::session::SharedSessionId::new(Some(session_id))),
             },
             session_id,
         )
@@ -327,7 +314,7 @@ mod tests {
             delivered_at: None,
         };
         context
-            .session_manager
+            .store
             .background_store()
             .start_background_task(&task)
             .await
@@ -336,29 +323,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_list_reports_nothing_when_there_is_nothing() {
+    async fn task_list_reports_nothing_when_there_is_nothing() {
         let (context, _) = context().await;
         let tool = TaskListTool { context };
         let result = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("ok");
         assert!(!result.is_error);
-        assert!(
-            ContentBlock::tool_result_text_content(&result.content).contains("No background tasks")
-        );
+        assert!(result.text_content().contains("No background tasks"));
     }
 
     #[tokio::test]
-    async fn test_task_list_names_each_task_and_its_state() {
+    async fn task_list_names_each_task_and_its_state() {
         let (context, session_id) = context().await;
         seed(&context, session_id, "cargo test --all").await;
         let tool = TaskListTool { context };
         let result = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("ok");
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("ID"), "column headers: {text}");
         assert!(text.contains("cargo test --all"), "{text}");
         assert!(text.contains("running"), "{text}");
@@ -367,11 +358,11 @@ mod tests {
     /// `[failed] … running for 30s` reads as a contradiction and invites the agent to keep waiting
     /// on work that already stopped.
     #[tokio::test]
-    async fn test_task_list_does_not_say_a_finished_task_is_running() {
+    async fn task_list_does_not_say_a_finished_task_is_running() {
         let (context, session_id) = context().await;
         let task = seed(&context, session_id, "make").await;
         context
-            .session_manager
+            .store
             .background_store()
             .finish_background_task(&task.id, TaskStatus::Failed, Some("boom".to_string()), None)
             .await
@@ -379,10 +370,13 @@ mod tests {
 
         let tool = TaskListTool { context };
         let result = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("ok");
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         // Scoped to the task's own row: the trailing note legitimately mentions what is still
         // running, and asserting over the whole output would be testing the footer.
         let row = text
@@ -391,7 +385,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no row for the task: {text}"));
         assert!(row.contains("failed"), "{row}");
         // The `Status` column is the single place a task's state is stated. An elapsed time
-        // labelled "running for" beside a `failed` badge read as a contradiction and invited the
+        // labeled "running for" beside a `failed` badge read as a contradiction and invited the
         // agent to keep waiting on work that had already stopped.
         assert!(!row.contains("running"), "{row}");
     }
@@ -399,22 +393,22 @@ mod tests {
     /// The cancellation has to be recorded even when the handle is gone, or the agent waits forever
     /// on a task it was told it had stopped.
     #[tokio::test]
-    async fn test_task_cancel_records_a_terminal_outcome() {
+    async fn task_cancel_records_a_terminal_outcome() {
         let (context, session_id) = context().await;
         let task = seed(&context, session_id, "sleep 600").await;
-        let session_manager = context.session_manager.clone();
+        let store = context.store.clone();
         let tool = TaskCancelTool { context };
 
         let result = tool
             .execute(
                 serde_json::json!({"id": &task.id[..8]}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("ok");
         assert!(!result.is_error, "{:?}", result.content);
 
-        let undelivered = session_manager
+        let undelivered = store
             .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
@@ -424,33 +418,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_cancel_rejects_an_unknown_id() {
+    async fn task_cancel_rejects_an_unknown_id() {
         let (context, _) = context().await;
         let tool = TaskCancelTool { context };
         let result = tool
             .execute(
                 serde_json::json!({"id": "deadbeef"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("ok");
         assert!(result.is_error);
-        assert!(
-            ContentBlock::tool_result_text_content(&result.content).contains("no background task")
-        );
+        assert!(result.text_content().contains("no background task"));
     }
 
-    /// Cancelling in bulk must record `cancelled`, not leave the task's own interruption to land as
+    /// Canceling in bulk must record `canceled`, not leave the task's own interruption to land as
     /// `failed`. "Your build failed" and "you stopped your build" call for different next moves.
     /// Outcome delivery is stamped before its turn runs, so a turn that fails consumes the report.
     /// Listing has to be able to recover it, or the result is reachable only by reading the
     /// database by hand.
     #[tokio::test]
-    async fn test_task_list_shows_a_finished_task_s_result() {
+    async fn task_list_shows_a_finished_task_s_result() {
         let (context, session_id) = context().await;
         let task = seed(&context, session_id, "cargo test").await;
         context
-            .session_manager
+            .store
             .background_store()
             .finish_background_task(
                 &task.id,
@@ -463,29 +455,42 @@ mod tests {
 
         let tool = TaskListTool { context };
         let result = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("ok");
-        let text = ContentBlock::tool_result_text_content(&result.content);
+        let text = result.text_content();
         assert!(text.contains("42 passed"), "{text}");
     }
 
     /// A running task has no result yet, so listing must not invent one.
     #[tokio::test]
-    async fn test_task_list_shows_no_result_for_a_running_task() {
+    async fn task_list_shows_no_result_for_a_running_task() {
         let (context, session_id) = context().await;
         seed(&context, session_id, "sleep 600").await;
         let tool = TaskListTool { context };
         let result = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("ok");
-        let text = ContentBlock::tool_result_text_content(&result.content);
-        assert!(!text.contains("result:"), "{text}");
+        let text = result.text_content();
+        let row = text
+            .lines()
+            .find(|line| line.contains("sleep 600"))
+            .unwrap_or_else(|| panic!("the running task's row is missing from:\n{text}"));
+        assert!(
+            row.trim_end().ends_with('-'),
+            "a running task's Result cell must be the `-` placeholder: {row}"
+        );
     }
 
     #[tokio::test]
-    async fn test_task_cancel_all_records_cancelled_not_failed() {
+    async fn task_cancel_all_records_canceled_not_failed() {
         let (context, session_id) = context().await;
         let task = seed(&context, session_id, "sleep 600").await;
         // A live handle, so the bulk path has something to enumerate.
@@ -493,16 +498,19 @@ mod tests {
             .tasks
             .try_reserve(task.id.clone(), session_id, CancellationToken::new(), 10)
             .await;
-        let session_manager = context.session_manager.clone();
+        let store = context.store.clone();
         let tool = TaskCancelTool { context };
 
         let result = tool
-            .execute(serde_json::json!({"all": true}), CancellationToken::new())
+            .execute(
+                serde_json::json!({"all": true}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("ok");
         assert!(!result.is_error);
 
-        let undelivered = session_manager
+        let undelivered = store
             .background_store()
             .list_undelivered_background_tasks(session_id)
             .await
@@ -512,17 +520,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_cancel_all_is_a_no_op_when_nothing_runs() {
+    async fn task_cancel_all_is_a_no_op_when_nothing_runs() {
         let (context, _) = context().await;
         let tool = TaskCancelTool { context };
         let result = tool
-            .execute(serde_json::json!({"all": true}), CancellationToken::new())
+            .execute(
+                serde_json::json!({"all": true}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("ok");
         assert!(!result.is_error);
-        assert!(
-            ContentBlock::tool_result_text_content(&result.content)
-                .contains("No running background")
-        );
+        assert!(result.text_content().contains("No running background"));
     }
 }

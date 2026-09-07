@@ -14,28 +14,35 @@ use std::{
 /// the REPL prompt, the `/cd` slash command, and the per-turn environment-context block.
 /// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) so the synchronous REPL prompt can read
 /// it without entering an async context; reads/writes are microseconds (a `PathBuf` clone or
-/// replace), never held across `.await`.
-pub type SharedCwd = Arc<RwLock<PathBuf>>;
+/// replace), never held across `.await`. Poisoning is recovered through [`crate::sync`]: meka never
+/// panics with this lock held, so a poisoned lock is a separate bug that already fired, and serving
+/// the stored path beats failing every later tool call.
+#[derive(Clone)]
+pub(crate) struct SharedCwd(Arc<RwLock<PathBuf>>);
 
-/// Read the current value of [`SharedCwd`]. Recovers from a poisoned lock by extracting the inner
-/// value; meka never panics with the cwd lock held, so the only way to see a poisoned lock is a
-/// separate bug that already triggered, and falling back to the stored value beats crashing the
-/// agent on every subsequent tool call.
-pub fn cwd_snapshot(cwd: &SharedCwd) -> PathBuf {
-    cwd.read()
-        .map(|guard| guard.clone())
-        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+impl SharedCwd {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self(Arc::new(RwLock::new(path)))
+    }
+
+    pub(crate) fn get(&self) -> PathBuf {
+        crate::sync::read(&self.0).clone()
+    }
+
+    pub(crate) fn set(&self, path: PathBuf) {
+        *crate::sync::write(&self.0) = path;
+    }
 }
 
 /// Resolve a tool-input path against the per-session [`SharedCwd`]. Absolute paths pass through
 /// unchanged; relative paths are joined to the current cwd value. Tools use this at the top of
 /// their `execute` methods to decouple from process `cwd`.
-pub fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) -> PathBuf {
+pub(crate) fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) -> PathBuf {
     let input = input.as_ref();
     if input.is_absolute() {
         input.to_path_buf()
     } else {
-        cwd_snapshot(cwd).join(input)
+        cwd.get().join(input)
     }
 }
 
@@ -49,20 +56,22 @@ pub fn resolve_against_cwd(cwd: &SharedCwd, input: impl AsRef<std::path::Path>) 
 ///
 /// These expand discovery scope **and**, at [`crate::permission::Permission::Workspace`], the set
 /// of roots a write may land under ([`writable_roots`]). A client that hands meka a folder is
-/// naming part of the workspace rather than somewhere to search, and a mode that could read those
+/// naming part of the workspace rather than somewhere to search, and a level that could read those
 /// folders but never write them would impose a boundary the client never asked for.
 ///
 /// Empty unless one of those named a root, which is the common case for the HTTP API and for an ACP
-/// client that sends none.
-pub type SharedRoots = Arc<RwLock<Vec<PathBuf>>>;
+/// client that sends none. Locked and recovered like [`SharedCwd`], for the same reasons.
+#[derive(Clone, Default)]
+pub(crate) struct SharedRoots(Arc<RwLock<Vec<PathBuf>>>);
 
-/// Read the current value of [`SharedRoots`], with the same poisoned-lock recovery as
-/// [`cwd_snapshot`] and for the same reason.
-pub fn roots_snapshot(roots: &SharedRoots) -> Vec<PathBuf> {
-    roots
-        .read()
-        .map(|guard| guard.clone())
-        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+impl SharedRoots {
+    pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
+        Self(Arc::new(RwLock::new(roots)))
+    }
+
+    pub(crate) fn get(&self) -> Vec<PathBuf> {
+        crate::sync::read(&self.0).clone()
+    }
 }
 
 /// The ordered set of roots a **recursive** search should sweep when the caller named no explicit
@@ -87,8 +96,8 @@ pub fn roots_snapshot(roots: &SharedRoots) -> Vec<PathBuf> {
 /// Paths are compared as given. A symlink pointing at another root, or a path containing `..`, is
 /// not detected; canonicalising to catch those would resolve symlinked roots to targets the client
 /// never named, which is a worse trade than an occasional duplicate.
-pub fn search_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
-    retain_broadest(std::iter::once(cwd_snapshot(cwd)).chain(roots_snapshot(roots)))
+pub(crate) fn search_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
+    retain_broadest(std::iter::once(cwd.get()).chain(roots.get()))
 }
 
 /// Keep only the broadest roots, in first-seen order: a path contained by one already kept is
@@ -140,8 +149,8 @@ fn retain_broadest(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 ///
 /// Synchronous because both kinds of caller need it: the async fence and the `pre_exec` sandbox
 /// setup, where an `.await` is not available. The cost is a handful of `stat` calls per write.
-pub fn writable_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
-    usable_roots(std::iter::once(cwd_snapshot(cwd)).chain(roots_snapshot(roots)))
+pub(crate) fn writable_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
+    usable_roots(std::iter::once(cwd.get()).chain(roots.get()))
 }
 
 /// The boundary [`writable_roots`] would compute from an already-taken snapshot of the same paths.
@@ -151,7 +160,7 @@ pub fn writable_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
 /// that is a file, one that is a masked system directory, and one already contained by another are
 /// each dropped here. Listing the request told the model it could write to paths where the very
 /// next write would be refused, and hid the merge when two roots collapsed into one.
-pub fn usable_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+pub(crate) fn usable_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     retain_broadest(
         paths
             .into_iter()
@@ -179,18 +188,15 @@ pub fn usable_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 /// un-masks `/proc` and `/dev`, defeating the PID namespace. None of these are workspaces, and
 /// every backend is degraded by them, so they are refused rather than special-cased per backend.
 fn is_usable_root(path: &Path) -> bool {
+    let displayed = path.display();
     if !path.is_dir() {
-        tracing::warn!(
-            "workspace root {} is not a directory; ignoring it",
-            path.display()
-        );
+        tracing::warn!("workspace root {displayed} is not a directory; ignoring it");
         return false;
     }
     if is_system_root(path) {
         tracing::warn!(
-            "refusing {} as a workspace root: the sandbox masks system directories, so binding \
-             one back would undo that. Name a project directory instead",
-            path.display()
+            "refusing {displayed} as a workspace root: the sandbox masks system directories, so \
+             binding one back would undo that. Name a project directory instead"
         );
         return false;
     }
@@ -214,6 +220,113 @@ fn is_usable_root(path: &Path) -> bool {
 /// The list below is the authority. `/tmp` and `/var/tmp` are in it: "they hold no IPC socket
 /// meka's masks care about" is false on any ordinary desktop.
 pub(crate) fn is_system_root(path: &Path) -> bool {
+    is_masked_root(path, &private_directories())
+}
+
+/// meka's own directories: the config directory, the data directory holding the credential store,
+/// and the command-output captures.
+///
+/// Every sandbox dialect that can hides these from a confined shell, and the write fence refuses a
+/// target under them whatever roots the session holds. The shell's environment is already scrubbed
+/// because a leaked secret plus the open network is a live exfiltration vector under prompt
+/// injection; the same secrets sit in `meka.db` at a path any shell can guess, so leaving the disk
+/// door open while guarding the environment one guarded nothing. Canonicalised where they exist,
+/// so a symlinked home matches the path the kernel reports; deduplicated because the capture
+/// directory usually sits under the data directory.
+pub(crate) fn private_directories() -> Vec<PathBuf> {
+    let candidates = [
+        crate::paths::meka_config_dir(),
+        crate::paths::meka_data_dir(),
+        Some(crate::paths::command_output_dir()),
+    ];
+    let mut directories: Vec<PathBuf> = Vec::new();
+    for directory in candidates.into_iter().flatten() {
+        // Only a directory that exists: bubblewrap mounts its mask over a path in the bound root,
+        // and there is nothing to hide where nothing is. And never one the system masks already
+        // cover, which happens when captures fall back to the temp directory: taking `/tmp` as
+        // private would make every working directory under it read as masked, and a `read`-level
+        // session there would lose sight of its own files.
+        let Ok(directory) = std::fs::canonicalize(&directory).map(strip_verbatim) else {
+            continue;
+        };
+        if !directory.is_dir() || is_masked_root(&directory, &[]) {
+            continue;
+        }
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    directories
+}
+
+/// The refusal for reading `target` at `permission`, when it lies inside meka's own directories.
+///
+/// The sandbox hides these from a confined shell and the write fence refuses them at every level
+/// below `unrestricted`; the in-process read tools had no such door, so `read_file` and
+/// `search_contents` at `read` returned `config.toml` and byte runs out of `meka.db`, and
+/// `fetch_url` at the same level could carry them out. Same rule and the same exception:
+/// `unrestricted` reads them as it writes them. `target` must be canonical, or a symlink into the
+/// store walks past it.
+pub(crate) fn private_read_refusal(
+    permission: crate::permission::Permission,
+    target: &Path,
+) -> Option<String> {
+    private_read_refusal_with(permission, target, &private_directories())
+}
+
+/// [`private_read_refusal`] with the private directories taken as a parameter, for the tests.
+fn private_read_refusal_with(
+    permission: crate::permission::Permission,
+    target: &Path,
+    private: &[PathBuf],
+) -> Option<String> {
+    if permission == crate::permission::Permission::Unrestricted {
+        return None;
+    }
+    let directory = private
+        .iter()
+        .find(|directory| target.starts_with(directory))?;
+    Some(format!(
+        "'{}' is inside meka's own directory {}, which only `unrestricted` reads.",
+        target.display(),
+        directory.display()
+    ))
+}
+
+/// The private directories a walk at `permission` has to step around: none at `unrestricted`, so
+/// the walk resolves nothing.
+pub(crate) fn private_directories_hidden_at(
+    permission: crate::permission::Permission,
+) -> Vec<PathBuf> {
+    if permission == crate::permission::Permission::Unrestricted {
+        Vec::new()
+    } else {
+        private_directories()
+    }
+}
+
+/// Whether `path`, resolved through any symlinks, lies inside one of `private`. A path that cannot
+/// be resolved is not inside anything meka owns, and an empty list costs no resolution at all.
+pub(crate) fn resolves_into_private(path: &Path, private: &[PathBuf]) -> bool {
+    if private.is_empty() {
+        return false;
+    }
+    std::fs::canonicalize(path)
+        .map(strip_verbatim)
+        .is_ok_and(|real| private.iter().any(|directory| real.starts_with(directory)))
+}
+
+/// [`is_system_root`] with meka's private directories taken as a parameter, so it can be tested
+/// without the environment deciding where those are.
+///
+/// A private directory refuses a root **at or under** it, not an ancestor of it. The system masks
+/// refuse ancestors because a bind over one un-masks it; the private masks are applied after every
+/// bind, so a workspace root at `$HOME` still cannot reach `~/.config/meka` and need not be refused
+/// for containing it.
+fn is_masked_root(path: &Path, private: &[PathBuf]) -> bool {
+    if private.iter().any(|directory| path.starts_with(directory)) {
+        return true;
+    }
     if path.parent().is_none() {
         // The filesystem root itself, and on Windows a bare drive prefix.
         return true;
@@ -281,7 +394,7 @@ pub(crate) fn is_system_root(path: &Path) -> bool {
     false
 }
 
-/// Serialises the tests that point `XDG_RUNTIME_DIR` at a directory of their own.
+/// Serializes the tests that point `XDG_RUNTIME_DIR` at a directory of their own.
 ///
 /// Same shape and same reason as [`crate::config::CONFIG_DIR_ENV_LOCK`]: the variable is
 /// process-global, `cargo test` runs these in parallel, and [`is_system_root`] reads it.
@@ -299,10 +412,9 @@ pub(crate) static RUNTIME_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 /// Verbatim UNC paths are deliberately left alone: a network share cannot be a workspace root
 /// anyway, because meka has to own the directory to grant on it.
 ///
-/// `pub(crate)` because `/cd` needs it too: it canonicalises what the user typed and stores the
-/// result as the session working directory, from which the prompt, the model's environment block,
-/// every relative tool path and the sessions table's `cwd` column are all derived. This is the
-/// tree's one answer to what shape a path is in, so everything that produces one goes through it.
+/// `pub(crate)` because the tools canonicalize too, for the file they are about to open. This is
+/// the tree's one answer to what shape a path is in, so everything that produces one goes through
+/// it; [`accept_cwd`] is where a working directory does.
 pub(crate) fn strip_verbatim(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
@@ -325,23 +437,64 @@ pub(crate) fn strip_verbatim(path: PathBuf) -> PathBuf {
     path
 }
 
+/// Admit a working directory named from outside the process: an HTTP `cwd`, an ACP `cwd`, a `/cd`
+/// argument. Returns the canonical spelling, which is what the session row records and what the
+/// write fence, the prompt and every relative tool path are then derived from.
+///
+/// One definition because the working directory is the writable boundary at `workspace` and the
+/// directory a scheduled gate is re-checked in, and each door once judged it with its own subset of
+/// these checks and recorded its own spelling.
+pub(crate) fn accept_cwd(path: &Path) -> crate::error::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(refuse_cwd(path, "is not an absolute path"));
+    }
+    // The kernel reads a path up to its first NUL, so the directory the OS would open is not the
+    // one the caller spelled.
+    if path.as_os_str().to_string_lossy().contains('\0') {
+        return Err(refuse_cwd(path, "contains a NUL byte"));
+    }
+    let canonical = match std::fs::canonicalize(path) {
+        Ok(canonical) => strip_verbatim(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(refuse_cwd(path, "does not exist"));
+        }
+        Err(error) => return Err(refuse_cwd(path, &format!("cannot be resolved: {error}"))),
+    };
+    if !canonical.is_dir() {
+        return Err(refuse_cwd(path, "is not a directory"));
+    }
+    Ok(canonical)
+}
+
+fn refuse_cwd(path: &Path, reason: &str) -> crate::error::MekaError {
+    crate::error::MekaError::Usage(format!("working directory '{}' {reason}", path.display()))
+}
+
+/// The spelling to match a recorded working directory against when a listing is filtered by one:
+/// the canonical spelling while the directory resolves, since that is what every door recorded, and
+/// the given one otherwise, since a session whose directory has since been deleted still has a row
+/// to find.
+pub(crate) fn cwd_filter(path: &Path) -> PathBuf {
+    accept_cwd(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Whether `path` lies within one of `roots`.
 ///
 /// Split out so the fence and its tests agree on what containment means, and so a root that equals
 /// the path is a hit: writing *to* a workspace root's own path is a write inside it.
 ///
 /// Both sides are put in the same normal form here rather than at each call site. Callers arrive
-/// from two directions, `canonicalize` (verbatim on Windows) and lexical normalisation of a path
+/// from two directions, `canonicalize` (verbatim on Windows) and lexical normalization of a path
 /// that does not exist yet (never verbatim), and a comparison that assumed either one would be
 /// wrong half the time.
-pub fn is_within_roots(path: &std::path::Path, roots: &[PathBuf]) -> bool {
+pub(crate) fn is_within_roots(path: &std::path::Path, roots: &[PathBuf]) -> bool {
     let path = strip_verbatim(path.to_path_buf());
     roots
         .iter()
         .any(|root| path.starts_with(strip_verbatim(root.clone())))
 }
 
-/// Normalise `.` and `..` textually, without consulting the filesystem.
+/// Normalize `.` and `..` textually, without consulting the filesystem.
 ///
 /// The filesystem cannot help for the case this exists for: a `write_file` naming a path that does
 /// not exist yet, which is most of them. `canonicalize` fails on a missing path, so the only way to
@@ -362,14 +515,51 @@ fn normalize_lexically(path: &std::path::Path) -> PathBuf {
     out
 }
 
+/// Per-path write locks, so two tool calls that mutate the same file cannot interleave.
+///
+/// One per host rather than one per registry, because the hazard belongs to the file, not to a
+/// registry: a sub-agent and its parent hold different `ToolRegistry` instances but write the
+/// same disk, and a per-registry lock would let exactly the pair that shares a workspace race.
+/// The session materials carry the host's handle to every registry built for it. Keyed on the
+/// canonicalised path so two spellings of one file take the same lock.
+///
+/// The map is a `std::sync::Mutex` holding only `Arc` clones -- no `.await` happens inside it, so
+/// it never blocks the runtime -- while the per-path lock is a `tokio::sync::Mutex`, since it is
+/// held across the read/modify/write awaits.
+#[derive(Clone, Default)]
+pub(crate) struct WriteLocks {
+    by_path: Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl WriteLocks {
+    /// Acquire the write lock for `canonical`, creating it on first use.
+    ///
+    /// Entries whose only remaining owner is the map are dropped on the way past, which keeps it
+    /// bounded by the number of files being written *concurrently* rather than by every file the
+    /// session has ever touched.
+    pub(crate) async fn lock_path(&self, canonical: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut by_path = crate::sync::lock(&self.by_path);
+            by_path.retain(|_, held| Arc::strong_count(held) > 1);
+            Arc::clone(
+                by_path
+                    .entry(canonical.to_path_buf())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
+}
+
 /// The write boundary as a tool sees it: whether one applies right now, and what it admits.
 ///
 /// Carries the *live* permission handle rather than a snapshot, so a `/permission` change mid-turn
 /// reaches the next write rather than the next session. Cheap to clone; every field is shared.
 #[derive(Clone)]
-pub struct WriteScope {
+pub(crate) struct WriteScope {
     permission: crate::permission::SharedPermission,
     roots: SharedRoots,
+    locks: WriteLocks,
     /// Set only by [`WriteScope::deny_all`]. A separate flag rather than an empty root list,
     /// because an empty list does not mean "nothing": [`writable_roots`] always folds in the cwd,
     /// so the closed fallback was in fact a cwd-wide grant. There has to be a state that means
@@ -378,26 +568,35 @@ pub struct WriteScope {
 }
 
 impl WriteScope {
-    pub fn new(permission: crate::permission::SharedPermission, roots: SharedRoots) -> Self {
+    pub(crate) fn new(
+        permission: crate::permission::SharedPermission,
+        roots: SharedRoots,
+        locks: WriteLocks,
+    ) -> Self {
         Self {
             permission,
             roots,
             denied: false,
+            locks,
         }
     }
 
     /// The roots a write must land under right now, or `None` when this level imposes no boundary.
     ///
-    /// Only `ask` and `unrestricted` disclaim a boundary. `ask` does so deliberately: its safety
-    /// is the approval prompt, and an approved call is meant to reach anywhere. `unrestricted` does
-    /// so by definition. Every other level, `none` and `read` included, is confined here: a level
-    /// that should never reach a write door must fail closed if one is ever wired to it.
-    pub fn confined_to(&self, cwd: &SharedCwd) -> Option<Vec<PathBuf>> {
+    /// Only `unrestricted` disclaims a boundary, by definition; an approved call runs at its own
+    /// level and reaches no further. Every other level, `none` and `read` included, is confined
+    /// here: a level that should never reach a write door must fail closed if one is ever wired to
+    /// it. The write lock for `canonical`, from the map every scope built for this host shares.
+    pub(crate) async fn lock_path(&self, canonical: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        self.locks.lock_path(canonical).await
+    }
+
+    pub(crate) fn confined_to(&self, cwd: &SharedCwd) -> Option<Vec<PathBuf>> {
         if self.denied {
             return Some(Vec::new());
         }
         match self.permission.get() {
-            // Only the two levels that *disclaim* a boundary are exempt. Written as an allow-list
+            // Only the level that *disclaims* a boundary is exempt. Written as an allow-list
             // rather than `Workspace => Some(..), _ => None`, because that catch-all failed open:
             // it exempted `none` and `read` too, on the reasoning that they never reach a write
             // door. They normally do not -- but `[tools.tool_permissions]` overrides a tool's
@@ -414,27 +613,51 @@ impl WriteScope {
             //   `write_file = "read"` override is a statement that the tool should be usable at
             //   that level. Refusing it outright would make the override a no-op with no
             //   diagnostic; confining it to the workspace roots is the narrowest reading that still
-            //   honours what was configured.
+            //   honors what was configured.
             //
             // So the override can only ever narrow *reach*: it never escapes the roots, and it
             // cannot touch `execute_command`, which stays closed at `read` regardless.
-            crate::permission::Permission::Ask | crate::permission::Permission::Unrestricted => {
-                None
-            }
+            crate::permission::Permission::Unrestricted => None,
             _ => Some(writable_roots(cwd, &self.roots)),
         }
     }
 
     /// Judge one write target, returning the refusal sentence when it falls outside the boundary.
     ///
-    /// `target` should be canonical where the caller can manage it and lexically normalised where
+    /// `target` should be canonical where the caller can manage it and lexically normalized where
     /// it cannot (a path being created). Both are checked the same way; the difference is only in
     /// how much the caller has been able to resolve.
-    pub fn admit(&self, cwd: &SharedCwd, target: &std::path::Path) -> Result<(), String> {
+    pub(crate) fn admit(&self, cwd: &SharedCwd, target: &std::path::Path) -> Result<(), String> {
+        self.admit_with_private(cwd, target, &private_directories())
+    }
+
+    /// [`Self::admit`] with meka's private directories taken as a parameter, so the refusal can be
+    /// tested without the environment deciding where those are.
+    fn admit_with_private(
+        &self,
+        cwd: &SharedCwd,
+        target: &std::path::Path,
+        private: &[PathBuf],
+    ) -> Result<(), String> {
         let Some(roots) = self.confined_to(cwd) else {
             return Ok(());
         };
         let candidate = normalize_lexically(target);
+        // meka's own store is never a workspace, whatever roots the session holds: a root at
+        // `$HOME` contains `~/.config/meka`, and a confined agent that can rewrite `config.toml` or
+        // `meka.db` has left every boundary that file describes. The sandbox masks the same
+        // directories from the shell; this is the same rule at the in-process door.
+        if let Some(directory) = private
+            .iter()
+            .find(|directory| candidate.starts_with(directory))
+        {
+            return Err(format!(
+                "'{}' is inside meka's own directory {}, which no workspace root reaches. Only \
+                 `unrestricted` writes there.",
+                target.display(),
+                directory.display()
+            ));
+        }
         if is_within_roots(&candidate, &roots) {
             return Ok(());
         }
@@ -468,38 +691,41 @@ impl WriteScope {
     /// `register_core_tools` before the session-scoped pass. It exists so the fallback is
     /// *closed*. A registry that cannot tell whether a boundary applies must refuse rather than
     /// assume there is none, which is the direction a missing scope would otherwise fail in.
-    pub fn deny_all() -> Self {
+    pub(crate) fn deny_all() -> Self {
         Self {
             permission: crate::permission::SharedPermission::new(
                 crate::permission::Permission::None,
                 crate::permission::EnabledPermissions::DEFAULT,
             ),
-            roots: Arc::new(RwLock::new(Vec::new())),
+            roots: SharedRoots::default(),
+            locks: WriteLocks::default(),
             denied: true,
         }
     }
 
     /// A scope that confines nothing, for tools under test that are not exercising the boundary.
     #[cfg(test)]
-    pub fn unconfined() -> Self {
+    pub(crate) fn unconfined() -> Self {
         Self::new(
             crate::permission::SharedPermission::new(
                 crate::permission::Permission::Unrestricted,
                 crate::permission::EnabledPermissions::ALL,
             ),
-            test_roots(),
+            roots_for_test(),
+            WriteLocks::default(),
         )
     }
 
     /// A scope confined to `roots`, for tests that *are* exercising the boundary.
     #[cfg(test)]
-    pub fn confined(roots: Vec<PathBuf>) -> Self {
+    pub(crate) fn confined(roots: Vec<PathBuf>) -> Self {
         Self::new(
             crate::permission::SharedPermission::new(
                 crate::permission::Permission::Workspace,
                 crate::permission::EnabledPermissions::ALL,
             ),
-            Arc::new(RwLock::new(roots)),
+            SharedRoots::new(roots),
+            WriteLocks::default(),
         )
     }
 }
@@ -510,13 +736,13 @@ impl WriteScope {
 /// The counterpart to [`search_roots`] for a tool that builds one rooted pattern per root rather
 /// than descending from it. Containment must not drop anything here: `find_files` turns each root
 /// into `<root>/<pattern>`, and a glob's `*` does not cross `/`, so a workspace of `/work` plus
-/// `cwd = /work/main` would answer `*.md` from `/work/*.md` alone and miss
-/// `/work/main/README.md` entirely. That is the exact "the agent says a file you can see doesn't
-/// exist" failure multi-root support was added to prevent, so nested roots are all kept and the
-/// caller deduplicates the matches instead.
-pub fn glob_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
+/// `cwd = /work/main` would answer `*.md` from `/work/*.md` alone and miss `/work/main/README.md`
+/// entirely. That is the exact "the agent says a file you can see doesn't exist" failure multi-root
+/// support was added to prevent, so nested roots are all kept and the caller deduplicates the
+/// matches instead.
+pub(crate) fn glob_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
     let mut kept: Vec<PathBuf> = Vec::new();
-    for path in std::iter::once(cwd_snapshot(cwd)).chain(roots_snapshot(roots)) {
+    for path in std::iter::once(cwd.get()).chain(roots.get()) {
         if !kept.contains(&path) {
             kept.push(path);
         }
@@ -533,7 +759,7 @@ pub fn glob_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
 /// reached the tree with that shape at once, which is why this is a named helper rather than a
 /// `.map(strip_verbatim)` a future test can forget.
 #[cfg(test)]
-pub fn canonical_for_test(path: impl AsRef<std::path::Path>) -> PathBuf {
+pub(crate) fn canonical_for_test(path: impl AsRef<std::path::Path>) -> PathBuf {
     std::fs::canonicalize(path.as_ref())
         .map(strip_verbatim)
         .unwrap_or_else(|error| panic!("canonicalize {}: {error}", path.as_ref().display()))
@@ -543,24 +769,182 @@ pub fn canonical_for_test(path: impl AsRef<std::path::Path>) -> PathBuf {
 /// instantiate a tool but don't exercise the per-session cwd resolution path. Tests using absolute
 /// paths or `tempdir()` are unaffected by the value here.
 #[cfg(test)]
-pub fn test_cwd() -> SharedCwd {
-    Arc::new(RwLock::new(
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    ))
+pub(crate) fn cwd_for_test() -> SharedCwd {
+    SharedCwd::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Construct an empty [`SharedRoots`], for tools under test that don't exercise multi-root search.
 #[cfg(test)]
-pub fn test_roots() -> SharedRoots {
-    Arc::new(RwLock::new(Vec::new()))
+pub(crate) fn roots_for_test() -> SharedRoots {
+    SharedRoots::default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A holder that panics poisons the lock; the next reader still gets the value, because the
+    /// alternative is every later tool call failing for a bug that already reported itself.
+    #[test]
+    fn a_poisoned_cwd_or_roots_handle_still_serves_its_value() {
+        let cwd = SharedCwd::new(PathBuf::from("/before"));
+        let roots = SharedRoots::new(vec![PathBuf::from("/root")]);
+        let poisoned = std::panic::catch_unwind({
+            let cwd = cwd.clone();
+            let roots = roots.clone();
+            move || {
+                let _cwd_guard = cwd.0.write().expect("not poisoned yet");
+                let _roots_guard = roots.0.write().expect("not poisoned yet");
+                panic!("poison both locks");
+            }
+        });
+        assert!(poisoned.is_err(), "the holder must have panicked");
+
+        assert_eq!(cwd.get(), PathBuf::from("/before"));
+        assert_eq!(roots.get(), vec![PathBuf::from("/root")]);
+        cwd.set(PathBuf::from("/after"));
+        assert_eq!(cwd.get(), PathBuf::from("/after"));
+    }
+
+    /// One acceptor for every door a working directory comes through from outside: an existing
+    /// directory, in the one spelling the row records, or a refusal that says which rule it broke.
+    #[test]
+    fn a_working_directory_is_accepted_only_as_an_existing_directory_spelled_canonically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory = temp.path().join("project");
+        std::fs::create_dir(&directory).expect("mkdir");
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"x").expect("write");
+
+        assert_eq!(
+            accept_cwd(&directory).expect("a directory is accepted"),
+            canonical_for_test(&directory)
+        );
+        assert_eq!(
+            accept_cwd(&directory.join("..").join("project").join("."))
+                .expect("a directory reached through `..` is the same directory"),
+            canonical_for_test(&directory),
+            "the row must never record a spelling the fence would compare against another"
+        );
+
+        let refused = |path: &Path| accept_cwd(path).expect_err("refused").to_string();
+        assert!(refused(Path::new("relative/path")).contains("is not an absolute path"));
+        assert!(refused(&temp.path().join("missing")).contains("does not exist"));
+        assert!(refused(&file).contains("is not a directory"));
+        assert!(refused(&temp.path().join("with\0nul")).contains("contains a NUL byte"));
+    }
+
+    /// A directory named through a symlink is recorded as the directory itself, and a listing
+    /// filter spelled either way finds the rows; one for a directory that is gone is matched as
+    /// given, so the sessions it recorded stay findable.
+    #[cfg(unix)]
+    #[test]
+    fn a_working_directory_named_through_a_symlink_is_recorded_as_its_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("real");
+        std::fs::create_dir(&target).expect("mkdir");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        assert_eq!(
+            accept_cwd(&link).expect("a symlink to a directory is accepted"),
+            canonical_for_test(&target)
+        );
+        assert_eq!(cwd_filter(&link), canonical_for_test(&target));
+        let gone = temp.path().join("gone");
+        assert_eq!(cwd_filter(&gone), gone);
+    }
+
+    /// A private directory refuses a root at or under it and nothing above it: the masks are
+    /// applied after every bind, so a root that merely contains the store cannot reach it.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_refuses_roots_at_or_under_it_but_not_above() {
+        let private = vec![PathBuf::from("/home/someone/.config/meka")];
+        assert!(is_masked_root(
+            Path::new("/home/someone/.config/meka"),
+            &private
+        ));
+        assert!(is_masked_root(
+            Path::new("/home/someone/.config/meka/skills"),
+            &private
+        ));
+        assert!(!is_masked_root(Path::new("/home/someone"), &private));
+        assert!(!is_masked_root(
+            Path::new("/home/someone/.config"),
+            &private
+        ));
+        assert!(!is_masked_root(
+            Path::new("/home/someone/project"),
+            &private
+        ));
+    }
+
+    /// The read door is the write fence's twin: below `unrestricted` nothing under meka's own
+    /// directories is readable, whatever roots the session holds. Without it a session at `read`,
+    /// the level whose contract is "cannot change the machine", read the credential store.
+    #[test]
+    fn a_private_directory_is_not_readable_below_unrestricted() {
+        use crate::permission::Permission;
+        let private = vec![PathBuf::from("/home/someone/.local/share/meka")];
+        let store = Path::new("/home/someone/.local/share/meka/meka.db");
+        for permission in [Permission::Read, Permission::Workspace, Permission::None] {
+            let refusal = private_read_refusal_with(permission, store, &private)
+                .unwrap_or_else(|| panic!("{permission:?} must refuse the store"));
+            assert!(refusal.contains("meka's own directory"), "{refusal}");
+        }
+        assert!(
+            private_read_refusal_with(Permission::Unrestricted, store, &private).is_none(),
+            "unrestricted reads it, as it writes it"
+        );
+        assert!(
+            private_read_refusal_with(
+                Permission::Read,
+                Path::new("/home/someone/.local/share/other"),
+                &private
+            )
+            .is_none()
+        );
+    }
+
+    /// The in-process write door refuses meka's own directories even when a workspace root
+    /// contains them, the same rule the sandbox masks enforce for the shell.
+    #[test]
+    fn the_write_fence_refuses_meka_s_own_directories_under_a_containing_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = canonical_for_test(temp.path());
+        let store = root.join("meka-store");
+        std::fs::create_dir(&store).expect("store");
+        let cwd = SharedCwd::new(root.clone());
+        let scope = WriteScope::new(
+            crate::permission::SharedPermission::new(
+                crate::permission::Permission::Workspace,
+                crate::permission::EnabledPermissions::DEFAULT,
+            ),
+            SharedRoots::default(),
+            WriteLocks::default(),
+        );
+        let private = vec![store.clone()];
+        assert!(
+            scope
+                .admit_with_private(&cwd, &root.join("notes.txt"), &private)
+                .is_ok(),
+            "a path beside the store is still inside the workspace"
+        );
+        let refusal = scope
+            .admit_with_private(&cwd, &store.join("config.toml"), &private)
+            .expect_err("a path inside the store is refused although the root contains it");
+        assert!(refusal.contains("meka's own directory"), "{refusal}");
+        assert!(
+            scope
+                .admit_with_private(&cwd, &store.join("config.toml"), &[])
+                .is_ok(),
+            "the refusal is the private list's doing, not the root's"
+        );
+    }
+
     fn shared(path: &std::path::Path) -> SharedCwd {
-        Arc::new(RwLock::new(path.to_path_buf()))
+        SharedCwd::new(path.to_path_buf())
     }
 
     /// The three sources compose into one canonical, containment-deduplicated set.
@@ -574,7 +958,7 @@ mod tests {
 
         let roots = writable_roots(
             &shared(&base.join("work")),
-            &Arc::new(RwLock::new(vec![base.join("shared"), base.join("extra")])),
+            &SharedRoots::new(vec![base.join("shared"), base.join("extra")]),
         );
 
         assert_eq!(roots, vec![
@@ -606,7 +990,7 @@ mod tests {
         std::fs::create_dir(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, work.join("escape")).expect("symlink");
 
-        let roots = writable_roots(&shared(&work), &test_roots());
+        let roots = writable_roots(&shared(&work), &roots_for_test());
         let spelled = work.join("escape").join("passwd");
         let escaped = crate::workspace::canonical_for_test(work.join("escape")).join("passwd");
 
@@ -627,7 +1011,7 @@ mod tests {
 
     /// The boundary tracks the cwd rather than freezing at the value it was built with.
     ///
-    /// Documented behaviour, not an accident of the implementation: `/cd` is meant to move the
+    /// Documented behavior, not an accident of the implementation: `/cd` is meant to move the
     /// workspace, and a boundary that stayed put would refuse writes to the directory the user is
     /// plainly now working in. Named roots are unaffected by the move, which is what keeps a
     /// client-supplied folder the client's rather than the cwd's.
@@ -639,17 +1023,14 @@ mod tests {
             std::fs::create_dir(base.join(name)).expect("create dir");
         }
         let cwd = shared(&base.join("before"));
-        let named: SharedRoots = Arc::new(RwLock::new(vec![base.join("named")]));
+        let named = SharedRoots::new(vec![base.join("named")]);
 
         assert_eq!(writable_roots(&cwd, &named), vec![
             base.join("before"),
             base.join("named"),
         ]);
 
-        match cwd.write() {
-            Ok(mut current) => *current = base.join("after"),
-            Err(poisoned) => *poisoned.into_inner() = base.join("after"),
-        }
+        cwd.set(base.join("after"));
 
         assert_eq!(
             writable_roots(&cwd, &named),
@@ -663,7 +1044,7 @@ mod tests {
     /// The regression this guards shipped once and was invisible to every Linux test:
     /// `canonicalize` hands back `\\?\C:\ws`, the fence checks a target spelled `C:\ws\f.txt`
     /// against it, and `starts_with` says no. Writes *outside* were still refused, so the
-    /// boundary looked correct while refusing everything the mode exists to allow.
+    /// boundary looked correct while refusing everything the level exists to allow.
     #[test]
     #[cfg(windows)]
     fn a_verbatim_root_admits_an_as_spelled_path_inside_it() {
@@ -694,7 +1075,7 @@ mod tests {
             as_spelled.join("a").join("b")
         );
 
-        let roots = writable_roots(&shared(temp.path()), &test_roots());
+        let roots = writable_roots(&shared(temp.path()), &roots_for_test());
         assert!(
             is_within_roots(&as_spelled.join("f.txt"), &roots),
             "an as-spelled path inside the root must be admitted: roots {roots:?}"
@@ -726,21 +1107,18 @@ mod tests {
         let not_a_directory = base.join("notes.md");
         std::fs::write(&not_a_directory, b"x").expect("write");
 
-        let roots = writable_roots(
-            &shared(&work),
-            &Arc::new(RwLock::new(vec![not_a_directory.clone()])),
-        );
+        let roots = writable_roots(&shared(&work), &SharedRoots::new(vec![not_a_directory]));
         assert_eq!(roots, vec![work.clone()], "a file must not become a root");
 
         #[cfg(unix)]
         {
             let roots = writable_roots(
                 &shared(&work),
-                &Arc::new(RwLock::new(vec![
+                &SharedRoots::new(vec![
                     PathBuf::from("/run"),
                     PathBuf::from("/proc"),
                     PathBuf::from("/"),
-                ])),
+                ]),
             );
             assert_eq!(
                 roots,
@@ -772,11 +1150,9 @@ mod tests {
         let sibling = base.join("project");
         std::fs::create_dir(&sibling).expect("sibling");
 
-        let _guard = RUNTIME_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = crate::sync::lock(&RUNTIME_DIR_ENV_LOCK);
         let previous = std::env::var_os("XDG_RUNTIME_DIR");
-        // SAFETY: `XDG_RUNTIME_DIR` is process-global; `RUNTIME_DIR_ENV_LOCK` serialises every test
+        // SAFETY: `XDG_RUNTIME_DIR` is process-global; `RUNTIME_DIR_ENV_LOCK` serializes every test
         // that touches it and the guard is held across the whole set/read/restore cycle.
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime) };
 
@@ -880,9 +1256,9 @@ mod tests {
     ///
     /// It did not. `deny_all` was built at `Workspace` with an empty root list, and
     /// `writable_roots` unconditionally folds in the cwd -- so the scope a registry falls back to
-    /// when it cannot tell whether a boundary applies granted the entire working tree. The doc
-    /// said "admits nothing" and the accessor was renamed to say `deny_all`, and both were wrong
-    /// about the same object. Unreachable in production, which is exactly why nothing noticed.
+    /// when it cannot tell whether a boundary applies granted the entire working tree. A doc
+    /// saying "admits nothing" and an accessor named `deny_all` would both be wrong about the same
+    /// object. Unreachable in production, which is exactly why nothing would notice.
     #[test]
     fn deny_all_admits_nothing_not_even_the_cwd() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -902,14 +1278,13 @@ mod tests {
         assert!(scope.admit(&cwd, &base).is_err());
     }
 
-    /// Which levels confine, spelled out for all five.
+    /// Which levels confine, spelled out for all four.
     ///
-    /// `ask` returning `None` is a deliberate exemption and had no test, so nothing distinguished
-    /// "ask is unconfined on purpose" from "ask fell through a catch-all", which is the shape the
-    /// `_ => None` arm here actually had: it exempted `none` and `read` as well, and
-    /// `[tools.tool_permissions]` can dispatch a write tool at either of those.
+    /// Spelled out because a `_ => None` arm once stood here and exempted `none` and `read` along
+    /// with the level it meant, and `[tools.tool_permissions]` can dispatch a write tool at either
+    /// of those.
     #[test]
-    fn only_ask_and_unrestricted_disclaim_a_write_boundary() {
+    fn only_unrestricted_disclaims_a_write_boundary() {
         let temp = tempfile::tempdir().expect("tempdir");
         let base = crate::workspace::canonical_for_test(temp.path());
         let cwd = shared(&base);
@@ -918,7 +1293,6 @@ mod tests {
             crate::permission::Permission::None,
             crate::permission::Permission::Read,
             crate::permission::Permission::Workspace,
-            crate::permission::Permission::Ask,
             crate::permission::Permission::Unrestricted,
         ] {
             let scope = WriteScope::new(
@@ -926,17 +1300,16 @@ mod tests {
                     level,
                     crate::permission::EnabledPermissions::ALL,
                 ),
-                test_roots(),
+                roots_for_test(),
+                WriteLocks::default(),
             );
             let outside = std::env::temp_dir().join("meka-outside-every-root.txt");
             match level {
-                crate::permission::Permission::Ask
-                | crate::permission::Permission::Unrestricted => {
+                crate::permission::Permission::Unrestricted => {
                     assert_eq!(
                         scope.confined_to(&cwd),
                         None,
-                        "{level} disclaims a boundary: an approved or unrestricted write reaches \
-                         anywhere"
+                        "{level} disclaims a boundary: a write reaches anywhere"
                     );
                     scope
                         .admit(&cwd, &outside)
@@ -963,14 +1336,14 @@ mod tests {
     /// A `..` that climbs out of the workspace is refused even though the path is never created.
     ///
     /// `admit` is reached with a path that does not exist yet on every `write_file` to a new file,
-    /// so `canonicalize` cannot answer and the only defence is resolving the components as text
+    /// so `canonicalize` cannot answer and the only defense is resolving the components as text
     /// first. Without that, `starts_with` is component-wise and answers *yes* for
     /// `<root>/../../etc/passwd`, because the literal path really does begin with `<root>` -- so
     /// the escape is admitted by the check written to refuse it.
     ///
     /// Both halves are asserted. The refusal alone would still pass against an implementation that
     /// refused everything containing `..`, which would break `<root>/a/../b`: a legitimate write
-    /// that normalises back inside.
+    /// that normalizes back inside.
     #[test]
     fn a_parent_traversal_out_of_the_workspace_is_refused_before_the_file_exists() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -983,7 +1356,8 @@ mod tests {
                 crate::permission::Permission::Workspace,
                 crate::permission::EnabledPermissions::ALL,
             ),
-            test_roots(),
+            roots_for_test(),
+            WriteLocks::default(),
         );
 
         let escape = work.join("..").join("..").join("etc").join("passwd");
@@ -1001,7 +1375,7 @@ mod tests {
 
         scope
             .admit(&cwd, &work.join("a").join("..").join("b.txt"))
-            .expect("a `..` that normalises back inside the workspace is an ordinary write");
+            .expect("a `..` that normalizes back inside the workspace is an ordinary write");
     }
 
     /// A root that does not resolve permits nothing rather than permitting its name.
@@ -1014,7 +1388,7 @@ mod tests {
         let base = crate::workspace::canonical_for_test(temp.path());
         let missing = base.join("was-deleted");
 
-        assert!(writable_roots(&shared(&missing), &test_roots()).is_empty());
+        assert!(writable_roots(&shared(&missing), &roots_for_test()).is_empty());
 
         // Against a *populated* root set, which is what makes this an independent check.
         //
@@ -1024,7 +1398,7 @@ mod tests {
         // described a fix that had not been made.
         let real = base.join("real");
         std::fs::create_dir(&real).expect("real root");
-        let roots = writable_roots(&shared(&real), &test_roots());
+        let roots = writable_roots(&shared(&real), &roots_for_test());
         assert!(!roots.is_empty(), "the control root must resolve");
         assert!(
             is_within_roots(&real.join("f.txt"), &roots),
@@ -1045,7 +1419,7 @@ mod tests {
 
         let roots = writable_roots(
             &shared(&base.join("work")),
-            &Arc::new(RwLock::new(vec![base.join("work/nested")])),
+            &SharedRoots::new(vec![base.join("work/nested")]),
         );
         assert_eq!(roots, vec![base.join("work")]);
         assert!(is_within_roots(&base.join("work/nested/f.txt"), &roots));
@@ -1055,14 +1429,14 @@ mod tests {
     /// `additionalDirectories`, and a repeated root would double every search result and spend the
     /// shared walk budget twice on the same tree.
     #[test]
-    fn test_search_roots_puts_cwd_first_and_dedupes() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![
+    fn search_roots_puts_cwd_first_and_dedupes() {
+        let cwd = SharedCwd::new(PathBuf::from("/work/main"));
+        let roots = SharedRoots::new(vec![
             PathBuf::from("/work/shared"),
             PathBuf::from("/work/main"),
             PathBuf::from("/work/shared"),
             PathBuf::from("/work/docs"),
-        ]));
+        ]);
 
         assert_eq!(search_roots(&cwd, &roots), vec![
             PathBuf::from("/work/main"),
@@ -1074,12 +1448,12 @@ mod tests {
     /// A root nested inside another is covered by it, so keeping both walks that tree twice and
     /// reports every file in it twice.
     #[test]
-    fn test_search_roots_drops_roots_nested_in_another() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![
+    fn search_roots_drops_roots_nested_in_another() {
+        let cwd = SharedCwd::new(PathBuf::from("/work/main"));
+        let roots = SharedRoots::new(vec![
             PathBuf::from("/work/main/nested"),
             PathBuf::from("/work/other"),
-        ]));
+        ]);
 
         assert_eq!(search_roots(&cwd, &roots), vec![
             PathBuf::from("/work/main"),
@@ -1091,17 +1465,17 @@ mod tests {
     /// everything under `cwd`. Dropping `cwd` from the search set is safe; it stays the base for
     /// relative paths and the shell either way.
     #[test]
-    fn test_search_roots_lets_an_ancestor_root_subsume_cwd() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![PathBuf::from("/work")]));
+    fn search_roots_lets_an_ancestor_root_subsume_cwd() {
+        let cwd = SharedCwd::new(PathBuf::from("/work/main"));
+        let roots = SharedRoots::new(vec![PathBuf::from("/work")]);
         assert_eq!(search_roots(&cwd, &roots), vec![PathBuf::from("/work")]);
     }
 
     /// A shared prefix is not containment: `/work/main2` is not inside `/work/main`.
     #[test]
-    fn test_search_roots_keeps_sibling_with_shared_prefix() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(vec![PathBuf::from("/work/main2")]));
+    fn search_roots_keeps_sibling_with_shared_prefix() {
+        let cwd = SharedCwd::new(PathBuf::from("/work/main"));
+        let roots = SharedRoots::new(vec![PathBuf::from("/work/main2")]);
         assert_eq!(search_roots(&cwd, &roots), vec![
             PathBuf::from("/work/main"),
             PathBuf::from("/work/main2"),
@@ -1111,36 +1485,36 @@ mod tests {
     /// The single-root case has to stay exactly one path: that is every REPL and HTTP session, and
     /// every ACP client that sends no extra roots.
     #[test]
-    fn test_search_roots_without_extras_is_just_cwd() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/work/main")));
-        let roots: SharedRoots = Arc::new(RwLock::new(Vec::new()));
+    fn search_roots_without_extras_is_just_cwd() {
+        let cwd = SharedCwd::new(PathBuf::from("/work/main"));
+        let roots = SharedRoots::default();
         assert_eq!(search_roots(&cwd, &roots), vec![PathBuf::from(
             "/work/main"
         )]);
     }
 
     #[test]
-    fn test_resolve_against_cwd_passes_absolute_paths_through() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/home/agent")));
+    fn resolve_against_cwd_passes_absolute_paths_through() {
+        let cwd = SharedCwd::new(PathBuf::from("/home/agent"));
         let absolute = std::path::Path::new("/etc/hosts");
         let resolved = resolve_against_cwd(&cwd, absolute);
         assert_eq!(resolved, PathBuf::from("/etc/hosts"));
     }
 
     #[test]
-    fn test_resolve_against_cwd_joins_relative_paths_to_session_cwd() {
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/home/agent/project")));
+    fn resolve_against_cwd_joins_relative_paths_to_session_cwd() {
+        let cwd = SharedCwd::new(PathBuf::from("/home/agent/project"));
         let resolved = resolve_against_cwd(&cwd, "src/main.rs");
         assert_eq!(resolved, PathBuf::from("/home/agent/project/src/main.rs"));
     }
 
     #[test]
-    fn test_resolve_against_cwd_follows_subsequent_writes() {
+    fn resolve_against_cwd_follows_subsequent_writes() {
         // Confirms multiple sessions in one process would observe their own cwds: a write to the
         // shared lock is visible on the next resolve, without touching process cwd.
-        let cwd: SharedCwd = Arc::new(RwLock::new(PathBuf::from("/tmp/a")));
+        let cwd = SharedCwd::new(PathBuf::from("/tmp/a"));
         let first = resolve_against_cwd(&cwd, "foo.txt");
-        *cwd.write().expect("cwd lock") = PathBuf::from("/tmp/b");
+        cwd.set(PathBuf::from("/tmp/b"));
         let second = resolve_against_cwd(&cwd, "foo.txt");
         assert_eq!(first, PathBuf::from("/tmp/a/foo.txt"));
         assert_eq!(second, PathBuf::from("/tmp/b/foo.txt"));

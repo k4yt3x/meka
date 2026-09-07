@@ -1,4 +1,4 @@
-# File Operations
+# File operations
 
 ## `read_file`
 
@@ -21,7 +21,7 @@ Read the contents of a file at a given path. Supports text files and images.
 - `limit` defaults to 2000 lines. Whenever the read stops short of the end of the file, whether because of the default or an explicit `limit`, a notice naming the range shown and the total line count is appended. A definitive answer drawn from a silent truncation is worse than an error.
 - Use `offset`/`limit` to page through large files.
 - A single read holds at most 16 MiB in memory. Asking for the whole of a file larger than that is refused, because there is no bounded way to return it; asking for a *window* of one is not, and streams past everything outside the window. So a command-output capture larger than the ceiling stays readable a page at a time, which is what [`execute_command`](shell.md) promises when it spills one to a file.
-- A read that shows the whole file returns it byte for byte, so a CRLF file stays CRLF and an `old_string` copied out of it applies as written. A windowed read normalises line endings to `\n`; if a later `edit_file` misses for that reason it says so.
+- A read that shows the whole file returns it byte for byte, so a CRLF file stays CRLF and an `old_string` copied out of it applies as written. A windowed read normalizes line endings to `\n`; if a later `edit_file` misses for that reason it says so.
 - Under [ACP](../usage/acp.md) the editor is asked for the whole document and the window is applied here, so both the truncation notice and the freshness fingerprint describe the document rather than the slice.
 - `regex` runs the pattern against each line and returns `line:content` rows (like `grep -n`). It bypasses `offset`/`limit` and is meaningless on image content. Under [ACP](../usage/acp.md) it searches the editor's copy of the file, like any other text read, so a search and the edit that follows it see the same document.
 
@@ -33,7 +33,7 @@ Recognized image extensions are returned as base64-encoded multimodal content:
 - **Convertible** (decoded and re-encoded as PNG transparently): `.tif`/`.tiff`, `.ico`, `.hdr`, `.exr`, `.tga`, `.pbm`/`.pgm`/`.ppm`/`.pnm`, `.qoi`, `.dds`, `.ff`/`.farbfeld`
 - **Unsupported** (fall through to text read, which will fail on binary): `.svg`, `.jxl`, `.heic`, `.avif`
 
-Images are rejected if the final payload exceeds 3.75 MB (~5 MB base64). Conversion can enlarge an image, so a small TIFF may produce a too-large PNG.
+Images are refused if the final payload exceeds 3.75 MB (~5 MB base64). Conversion can enlarge an image, so a small TIFF may produce a too-large PNG.
 
 Every image `read_file` returns is decoded before it is sent, including the pass-through formats, and one that does not decode is a tool error naming the failure. The same door covers `fetch_url`, `render_image`, and an image a client attaches over ACP or the HTTP API. The decode is not about the extension: a truncated or corrupt PNG keeps a valid signature, so nothing short of decoding it tells the two apart. It matters because a broken image is not refused where it is read but inside the provider, by which time it sits in a tool result the session has already saved and every later turn re-sends.
 
@@ -54,13 +54,13 @@ Only read image files when the current model supports vision input; text-only mo
 Read an entire file:
 
 ```text
-meka [r] > show me the contents of src/main.rs
+meka ~/project [r] > show me the contents of src/main.rs
 ```
 
 Read lines 10-20:
 
 ```text
-meka [r] > show me lines 10 through 20 of src/main.rs
+meka ~/project [r] > show me lines 10 through 20 of src/main.rs
 ```
 
 ---
@@ -80,18 +80,19 @@ Modify a file. Supports two modes: **replace** (swap `old_string` for `new_strin
 | `new_string` | string | one of three | Replace mode: replacement for `old_string` (an empty string deletes it) |
 | `insert_before` | string | one of three | Insert mode: text inserted immediately before `old_string` (anchor preserved) |
 | `insert_after` | string | one of three | Insert mode: text inserted immediately after `old_string` (anchor preserved) |
-| `replace_all` | boolean | no | Apply to every occurrence (default: false). If false and `old_string` matches more than once, the edit is rejected as ambiguous |
-| `force` | boolean | no | Bypass read-before-edit requirement (default: false) |
+| `replace_all` | boolean | no | Apply to every occurrence (default: false). If false and `old_string` matches more than once, the edit is refused as ambiguous |
+| `force` | boolean | no | Proceed despite the file not having been read first, or having changed since it was read (default: false) |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
-Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided. Mixing modes is rejected.
+Exactly one of `new_string`, `insert_before`, or `insert_after` must be provided. Mixing modes is refused.
 
 ### Behavior
 
-- If `old_string` matches more than once and `replace_all` is not set, the edit is **rejected**. Add surrounding context to make the anchor unique, or set `replace_all` to change every occurrence.
+- A path outside the [workspace roots](../usage/permissions.md#the-workspace-boundary) is refused unless the level is `unrestricted`; the refusal names the roots a write may land under.
+- If `old_string` matches more than once and `replace_all` is not set, the edit is **refused**. Add surrounding context to make the anchor unique, or set `replace_all` to change every occurrence.
 - To delete text, use replace mode with an empty `new_string`.
 - The file must have been previously read with `read_file` on the same path. This prevents blind edits. Set `force` to bypass this requirement.
-- The read must still be **valid**. meka records the file's modification time and size when it is read, and rejects an edit if either has changed since:
+- The read must still be **valid**. meka records the file's modification time and size when it is read, and refuses an edit if either has changed since:
 
   ```text
   Error: file 'src/main.rs' changed on disk after you read it. Something else
@@ -127,11 +128,12 @@ Create or overwrite a file with the given content.
 |------|------|----------|-------------|
 | `path` | string | yes | The file path to write |
 | `content` | string | yes | The content to write to the file |
-| `force` | boolean | no | Overwrite a file that changed since it was read (default: false) |
+| `force` | boolean | no | Proceed despite the file having changed since it was read, or existing but being unreadable (default: false) |
 | `scratchpad` | string | no | Save output to the scratchpad under this name |
 
 ### Behavior
 
 - Creates parent directories if they do not exist.
+- A path outside the [workspace roots](../usage/permissions.md#the-workspace-boundary) is refused unless the level is `unrestricted`; the refusal names the roots a write may land under.
 - Overwrites the file if it already exists.
 - Overwriting an **existing** file is subject to the same staleness check as `edit_file`: if the file was read and has changed since, the write is refused with the message shown above and `force` is the way past it. A whole-file rewrite is the more destructive of the two, so it is not the more permissive one. Creating a new file needs no prior read.

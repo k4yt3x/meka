@@ -2,7 +2,7 @@
 
 meka is written in Rust and builds as a single binary.
 
-## Pre-Built Binaries
+## Pre-built binaries
 
 Download the latest release for your platform from the [GitHub Releases](https://github.com/k4yt3x/meka/releases/latest) page.
 
@@ -29,7 +29,7 @@ docker run --rm -it ghcr.io/k4yt3x/meka:latest --help
 ```
 
 The image carries the binary and nothing else, so a session inside it starts with no config and no
-database. Mount both to reach an existing setup:
+`meka.db`. Mount both to reach an existing setup:
 
 ```bash
 docker run --rm -it \
@@ -49,7 +49,7 @@ in, and starts the agent at `unrestricted` with instructions saying it may insta
 needs. It is the answer to "let it do anything, just not to my machine": the container is disposable
 and the host config is mounted read-only. It picks podman over docker when both are present.
 
-## Cargo Install
+## Cargo install
 
 If you have [Rust](https://www.rust-lang.org/tools/install) installed, you can install meka directly from the Git repository:
 
@@ -59,7 +59,7 @@ cargo install --locked --git https://github.com/k4yt3x/meka.git
 
 This builds the latest version from source and installs it to `~/.cargo/bin/`.
 
-## Building from Source
+## Building from source
 
 ### Prerequisites
 

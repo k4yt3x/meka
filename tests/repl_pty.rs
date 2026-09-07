@@ -12,96 +12,75 @@
 //! meka and reedline actually emit, because a raw comparison would be reading carriage returns and
 //! erase-to-end-of-line as though they were content.
 //!
-//! Unix only, and debug-only: the scripted provider (`MEKA_MOCK_PROVIDER`) is compiled out of a
-//! release build, the same thing `tests/multiprocess.rs` rests on.
+//! Unix only, and only where the scripted provider (`MEKA_MOCK_PROVIDER`) is compiled in, which a
+//! release build does without the `mock-provider` feature.
 
-#![cfg(unix)]
+#![cfg(all(unix, any(debug_assertions, feature = "mock-provider")))]
 // Same rationale as the other integration tests: a failed assumption here is a broken test, and
 // panicking says so at the point it broke.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests panic on failure by design, and indexing a JSON document is the readable form"
+)]
 
 use std::{
     os::unix::io::RawFd,
-    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-/// The debug binary under test.
-fn meka_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("meka")
+#[path = "harness/support.rs"]
+mod support;
+
+use support::Install;
+
+/// An install whose one profile points at port 9, which discards, so a run here cannot reach a
+/// provider even with the mock off.
+fn repl_install(
+    newline_before_prompt: bool,
+    newline_after_prompt: bool,
+    extra_display: &str,
+) -> Install {
+    repl_install_with_extra(
+        newline_before_prompt,
+        newline_after_prompt,
+        extra_display,
+        "",
+    )
 }
 
-/// An isolated install: both env dirs redirected, and every endpoint on port 9, which discards. A
-/// run here cannot read the developer's config or reach a provider.
-struct Install {
-    root: tempfile::TempDir,
-}
-
-impl Install {
-    fn new(newline_before_prompt: bool, newline_after_prompt: bool, extra_display: &str) -> Self {
-        Self::with_extra(
-            newline_before_prompt,
-            newline_after_prompt,
-            extra_display,
-            "",
-        )
-    }
-
-    /// [`Self::new`] plus whole config tables the `[display]` slot cannot hold.
-    fn with_extra(
-        newline_before_prompt: bool,
-        newline_after_prompt: bool,
-        extra_display: &str,
-        extra_tables: &str,
-    ) -> Self {
-        let root = tempfile::tempdir().expect("temp dir");
-        let path = root.path();
-        std::fs::create_dir_all(path.join("meka")).expect("config dir");
-        std::fs::create_dir_all(path.join("data").join("meka")).expect("data dir");
-        std::fs::create_dir_all(path.join("work")).expect("work dir");
-        std::fs::write(
-            path.join("meka").join("config.toml"),
-            format!(
-                "default_provider = \"default\"\n\n\
-                 [permissions]\ndefault = \"read\"\nenabled = [\"read\"]\n\n\
-                 [display]\nnewline_before_prompt = {newline_before_prompt}\n\
-                 newline_after_prompt = {newline_after_prompt}\n{extra_display}\n\
-                 [providers.default]\ntype = \"openai-chat-completions\"\n\
-                 model = \"mock-model\"\nbase_url = \"http://127.0.0.1:9/\"\n{extra_tables}"
-            ),
-        )
-        .expect("write config.toml");
-        Self { root }
-    }
-
-    /// The store the spawned REPL is using, for a test that has to read back what a turn recorded.
-    fn database(&self) -> PathBuf {
-        self.root.path().join("data").join("meka").join("meka.db")
-    }
-
-    fn script(&self, json: &str) -> PathBuf {
-        let path = self.root.path().join("script.json");
-        std::fs::write(&path, json).expect("write the provider script");
-        path
-    }
+/// [`repl_install`] plus whole config tables the `[display]` slot cannot hold.
+fn repl_install_with_extra(
+    newline_before_prompt: bool,
+    newline_after_prompt: bool,
+    extra_display: &str,
+    extra_tables: &str,
+) -> Install {
+    let install = Install::new();
+    install.write_config(&format!(
+        "default_profile = \"default\"\n\n\
+         [permissions]\ndefault = \"read\"\nenabled = [\"read\"]\n\n\
+         [display]\nnewline_before_prompt = {newline_before_prompt}\n\
+         newline_after_prompt = {newline_after_prompt}\n{extra_display}\n\
+         [accounts.default]\nbackend = \"openai-chat-completions\"\n\
+         base_url = \"http://127.0.0.1:9/\"\n\n\
+         [profiles.default]\naccount = \"default\"\nmodel = \"mock-model\"\n{extra_tables}"
+    ));
+    install
 }
 
 /// Run one REPL session, sending `inputs` line by line, and return the rows the terminal would
 /// show.
 fn run_repl(install: &Install, script: &str, inputs: &[&str]) -> Vec<String> {
-    let script = install.script(script);
-    let root = install.root.path().to_path_buf();
-    let captured = drive(&meka_binary(), &root, &script, inputs);
+    install.write_script(script);
+    let captured = drive(install, inputs);
     replay(&captured)
 }
 
 /// Fork a pty, exec meka on the child side, and drive the master side to completion.
-fn drive(binary: &Path, root: &Path, script: &Path, inputs: &[&str]) -> Vec<u8> {
+fn drive(install: &Install, inputs: &[&str]) -> Vec<u8> {
     let mut master: RawFd = -1;
     // SAFETY: `forkpty` with null pointers for the optional out-params is the documented way to get
     // a pty pair plus a child. The child branch below does nothing but set state and `exec`, which
@@ -127,8 +106,8 @@ fn drive(binary: &Path, root: &Path, script: &Path, inputs: &[&str]) -> Vec<u8> 
                 libc::tcsetattr(0, libc::TCSANOW, &attrs);
             }
         }
-        // Not `Command`: this process *is* the child, and `exec` replaces it.
-        let error = exec_meka(binary, root, script);
+        // Not spawned: this process *is* the child, and `exec` replaces it.
+        let error = exec_meka(install);
         // Only reachable if exec failed.
         eprintln!("exec failed: {error}");
         std::process::exit(127);
@@ -145,14 +124,14 @@ fn drive(binary: &Path, root: &Path, script: &Path, inputs: &[&str]) -> Vec<u8> 
     captured
 }
 
-fn exec_meka(binary: &Path, root: &Path, script: &Path) -> std::io::Error {
+fn exec_meka(install: &Install) -> std::io::Error {
     use std::os::unix::process::CommandExt;
-    std::process::Command::new(binary)
+    let mut command = support::meka();
+    command
         .arg("-c")
-        .current_dir(root.join("work"))
+        .current_dir(install.work_dir())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("HOME", root)
         .env("TERM", "xterm-256color")
         .env("COLUMNS", "100")
         .env("LINES", "40")
@@ -170,14 +149,8 @@ fn exec_meka(binary: &Path, root: &Path, script: &Path) -> std::io::Error {
             "RUST_LOG",
             "warn,meka::sandbox=error,rmcp::transport::common::client_side_sse=error,\
              rmcp::transport::worker=off",
-        )
-        .env("MEKA_CONFIG_DIR", root.join("meka"))
-        .env("MEKA_DATA_DIR", root.join("data").join("meka"))
-        .env("XDG_CONFIG_HOME", root)
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("MEKA_MOCK_PROVIDER", "1")
-        .env("MEKA_MOCK_PROVIDER_SCRIPT", script)
-        .exec()
+        );
+    install.env(&mut command).exec()
 }
 
 /// Read the master side, answering DSR and sending the next input whenever the child falls quiet.
@@ -264,7 +237,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Replay the capture onto a grid of rows, so a blank line means what it looks like.
 ///
-/// Only the sequences meka and reedline actually emit are modelled: SGR (dropped), erase-to-end-of-
+/// Only the sequences meka and reedline actually emit are modeled: SGR (dropped), erase-to-end-of-
 /// line, move-to-column, carriage return, backspace and newline. Anything else is skipped as a unit
 /// rather than printed, which is what keeps escape bytes out of the rows a test asserts on.
 fn replay(data: &[u8]) -> Vec<String> {
@@ -345,21 +318,21 @@ fn blanks(rows: &[String]) -> usize {
 }
 
 const TOOLS_THEN_TEXT: &str = r#"[
- [{"kind":"tool_use_start","id":"t1","name":"schedule_list"},
-  {"kind":"tool_use_end","input":{}},
-  {"kind":"message_end","stop_reason":"tool_use"}],
- [{"kind":"text","text":"All cleared."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"tool_use_start","id":"t1","name":"schedule_list"},
+  {"type":"tool_use_end","input":{}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"All cleared."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
 
 const TWO_TURNS: &str = r#"[
- [{"kind":"text","text":"First answer."},
-  {"kind":"message_end","stop_reason":"end_turn"}],
- [{"kind":"tool_use_start","id":"t1","name":"schedule_list"},
-  {"kind":"tool_use_end","input":{}},
-  {"kind":"message_end","stop_reason":"tool_use"}],
- [{"kind":"text","text":"Second answer."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"text","text":"First answer."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"tool_use_start","id":"t1","name":"schedule_list"},
+  {"type":"tool_use_end","input":{}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Second answer."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
 
 /// A thinking block, a transient failure, its retry, then a second turn.
@@ -373,26 +346,193 @@ const TWO_TURNS: &str = r#"[
 /// `MockEvent::FailRetryable` returns from the stream the moment it is reached, so anything after
 /// it in the same round is never emitted.
 const RETRIES_MID_TURN: &str = r#"[
- [{"kind":"thinking_delta","text":"weighing the options"},
-  {"kind":"fail_retryable","message":"529 overloaded","retry_after_secs":1}],
- [{"kind":"text","text":"recovered answer"},
-  {"kind":"message_end","stop_reason":"end_turn"}],
- [{"kind":"text","text":"second answer"},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"thinking_delta","text":"weighing the options"},
+  {"type":"fail_retryable","message":"529 overloaded","retry_after_secs":1}],
+ [{"type":"text","text":"recovered answer"},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"second answer"},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
 
 const FAILS_MID_ANSWER: &str = r#"[
- [{"kind":"text","text":"partial answer before the failure"},
-  {"kind":"fail","message":"provider exploded"}],
- [{"kind":"text","text":"recovered"},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"text","text":"partial answer before the failure"},
+  {"type":"fail","message":"provider exploded"}],
+ [{"type":"text","text":"recovered"},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
 
 /// The shape every other case is a variation on: one blank after the line you typed, one before the
-/// next prompt, and the tool indicator and the answer separated by the block machine.
+/// next prompt, and the tool indicator and the answer separated by the block machine. `/rewind all`
+/// is refused with a message rather than rewinding one turn and reporting a count the user had not
+/// asked for. Driven through the REPL rather than the parser alone, so the dispatch arm that prints
+/// the refusal is what is under test. `/approvals on` flips the switch for the session and writes
+/// it to the row, where a resume from any host and a scheduled fire read it.
+#[test]
+fn approvals_switched_on_in_the_repl_are_recorded_on_the_row() {
+    let install = repl_install(true, true, "");
+    let rows = run_repl(&install, TWO_TURNS, &["/approvals on", "hi", "/exit"]);
+    assert!(
+        rows.iter().any(|row| row.contains("Approvals set to: on")),
+        "the switch is confirmed on screen: {rows:#?}"
+    );
+    let connection = rusqlite::Connection::open(install.database()).expect("open the store");
+    let recorded: i64 = connection
+        .query_row("SELECT approvals FROM sessions", [], |row| row.get(0))
+        .expect("exactly one session row");
+    assert_eq!(recorded, 1, "the row carries the switch");
+}
+
+/// `always` at the approval prompt answers for the tool until the session ends: the second call to
+/// it is not put to the user, and both writes land. Driven through the terminal because the answer
+/// travels from the editor thread back to the frontend, and only the real channel proves it gets
+/// there as a sticky decision rather than a bare yes.
+#[test]
+fn an_always_answer_at_the_approval_prompt_covers_the_next_call_to_the_tool() {
+    const TWO_WRITES: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"write_file"},
+  {"type":"tool_use_end","input":{"path":"a.txt","content":"a"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"wrote a"},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"tool_use_start","id":"t2","name":"write_file"},
+  {"type":"tool_use_end","input":{"path":"b.txt","content":"b"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"wrote b"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = repl_install(true, true, "");
+    let rows = run_repl(&install, TWO_WRITES, &[
+        "/approvals on",
+        "write a",
+        "always",
+        "write b",
+        "/exit",
+    ]);
+    let prompts = rows
+        .iter()
+        .filter(|row| row.contains("[approval] WriteFile"))
+        .count();
+    assert_eq!(
+        prompts, 1,
+        "the first write is put to the user and the second is covered by `always`: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Allow? (Y/n/always/never)")),
+        "the question names the sticky answers: {rows:#?}"
+    );
+    let work = install.root().join("work");
+    assert!(work.join("a.txt").exists(), "the approved write ran");
+    assert!(
+        work.join("b.txt").exists(),
+        "the second write ran without a prompt: {rows:#?}"
+    );
+}
+
+/// `always` answers for the rest of the session it was given in, and `/fork` moves the REPL into
+/// another session: the same tool is put to the user again in the copy. Driven through the
+/// terminal because the handoff is the loop's, not the frontend's, and only the real loop proves
+/// the answer is forgotten when it moves.
+#[test]
+fn an_always_answer_does_not_survive_a_fork() {
+    const TWO_WRITES: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"write_file"},
+  {"type":"tool_use_end","input":{"path":"a.txt","content":"a"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"wrote a"},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"tool_use_start","id":"t2","name":"write_file"},
+  {"type":"tool_use_end","input":{"path":"b.txt","content":"b"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"wrote b"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = repl_install(true, true, "");
+    let rows = run_repl(&install, TWO_WRITES, &[
+        "/approvals on",
+        "write a",
+        "always",
+        "/fork",
+        "write b",
+        "y",
+        "/exit",
+    ]);
+    assert!(
+        rows.iter().any(|row| row.contains("Forked session")),
+        "the fork has to have happened for the rest to mean anything: {rows:#?}"
+    );
+    let prompts = rows
+        .iter()
+        .filter(|row| row.contains("[approval] WriteFile"))
+        .count();
+    assert_eq!(
+        prompts, 2,
+        "the write in the copy is put to the user again, since `always` was given in the \
+         original: {rows:#?}"
+    );
+    let work = install.root().join("work");
+    assert!(work.join("a.txt").exists(), "the approved write ran");
+    assert!(
+        work.join("b.txt").exists(),
+        "and so did the one approved in the copy: {rows:#?}"
+    );
+}
+
+/// A scheduled job's prompt is echoed before the reply it triggers, dimmed like a notice, so the
+/// answer that appears while the user is at the prompt is not the model speaking unprompted.
+#[test]
+fn a_scheduled_fire_echoes_its_prompt_before_the_reply() {
+    const SCHEDULE_THEN_FIRE: &str = r#"[
+ [{"type":"tool_use_start","id":"t1","name":"schedule_create"},
+  {"type":"tool_use_end","input":{"prompt":"REPL_DELIVERED_MARKER","at":"1s"}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"scheduled"},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"text","text":"REPL_SCHEDULED_REPLY"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install =
+        repl_install_with_extra(true, true, "", "\n[schedule]\npoll_interval = \"200ms\"\n");
+    let rows = run_repl(&install, SCHEDULE_THEN_FIRE, &["remind me", "/exit"]);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("REPL_SCHEDULED_REPLY"),
+        "the fire's reply must reach the screen: {rows:#?}"
+    );
+    let echoed = rows
+        .iter()
+        .position(|row| row.contains("[Scheduled job") && row.contains("fired"));
+    let replied = rows
+        .iter()
+        .position(|row| row.contains("REPL_SCHEDULED_REPLY"));
+    assert!(
+        matches!((echoed, replied), (Some(echo), Some(reply)) if echo < reply),
+        "the job's prompt is shown above the reply it triggered: {rows:#?}"
+    );
+    assert!(
+        screen.contains("REPL_DELIVERED_MARKER"),
+        "and the prompt's own words are what is shown: {rows:#?}"
+    );
+}
+
+#[test]
+fn a_rewind_with_a_bad_count_is_refused_on_screen() {
+    let install = repl_install(true, true, "");
+    let rows = run_repl(&install, TWO_TURNS, &["/rewind all", "/exit"]);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("/rewind takes a turn count")),
+        "the refusal must reach the screen: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Rewound")),
+        "nothing may be rewound on a refused count: {rows:#?}"
+    );
+}
+
 #[test]
 fn a_turn_is_bracketed_once_on_each_side() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, TOOLS_THEN_TEXT, &["do the thing", "/exit"]);
 
     let body = between(&rows, "do the thing", "> /exit");
@@ -405,12 +545,12 @@ fn a_turn_is_bracketed_once_on_each_side() {
     assert_eq!(body.last().map(String::as_str), Some(""));
 }
 
-/// The setting used to stop working after the first turn: the blank was suppressed but the block
-/// machine was suppressed with it, so the next turn's first block saw the previous turn's last one
-/// and asked for a separator that looked exactly like the blank the user had disabled.
+/// The setting must hold past the first turn: suppressing the block machine along with the blank
+/// makes the next turn's first block see the previous turn's last one and ask for a separator that
+/// looks exactly like the blank the user disabled.
 #[test]
 fn disabling_both_blanks_leaves_no_prompt_spacing_on_any_turn() {
-    let install = Install::new(false, false, "");
+    let install = repl_install(false, false, "");
     let rows = run_repl(&install, TWO_TURNS, &["first", "second", "/exit"]);
 
     let first = between(&rows, "> first", "> second");
@@ -424,27 +564,27 @@ fn disabling_both_blanks_leaves_no_prompt_spacing_on_any_turn() {
     );
 }
 
-/// A command that answers without running a turn used to be bracketed by neither the dispatcher nor
-/// the turn, printing its error flush against the line above *and* the prompt below.
+/// A command that answers without running a turn is bracketed by the dispatcher, since no turn will
+/// do it; otherwise its error prints flush against the line above *and* the prompt below.
 #[test]
 fn a_command_that_never_runs_a_turn_is_still_bracketed() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, TWO_TURNS, &["/skill nosuchskill", "/exit"]);
 
     let body = between(&rows, "/skill nosuchskill", "> /exit");
     assert_eq!(blanks(body), 2, "one blank on each side: {body:#?}");
     assert!(
-        body.iter().any(|row| row.contains("unknown skill")),
+        body.iter().any(|row| row.contains("no skill named")),
         "the error is what the brackets are around: {body:#?}"
     );
 }
 
 /// A turn that dies mid-answer holds whatever it streamed. Ending the *episode* flushes it, which
-/// puts it under the turn it belongs to; it used to be flushed by the next turn's `TurnStarted`,
-/// printing it beneath the following prompt as though it answered that.
+/// puts it under the turn it belongs to; flushed by the next turn's `TurnStarted` instead, it would
+/// print beneath the following prompt as though it answered that.
 #[test]
 fn a_failed_turn_shows_its_partial_answer_in_its_own_turn() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, FAILS_MID_ANSWER, &["boom", "again", "/exit"]);
 
     let failed = between(&rows, "> boom", "> again");
@@ -465,11 +605,11 @@ fn a_failed_turn_shows_its_partial_answer_in_its_own_turn() {
     );
 }
 
-/// The session-id notice is emitted before the turn starts, so it used to print above the blank
-/// that was supposed to separate it from the line the user typed.
+/// The session-id notice is emitted before the turn starts, so left alone it prints above the blank
+/// meant to separate it from the line the user typed.
 #[test]
 fn the_opening_blank_precedes_the_session_notice() {
-    let install = Install::new(true, true, "show_session_id_on_create = true\n");
+    let install = repl_install(true, true, "show_session_id_on_create = true\n");
     let rows = run_repl(&install, TWO_TURNS, &["first", "/exit"]);
 
     let body = between(&rows, "> first", "> /exit");
@@ -494,7 +634,7 @@ fn the_opening_blank_precedes_the_session_notice() {
 /// needs a session the first run left behind.
 #[test]
 fn the_shell_s_prompt_gets_neither_blank() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
 
     let leaving = run_repl(&install, TWO_TURNS, &["first", "/exit"]);
     let last_word = leaving
@@ -536,16 +676,16 @@ fn the_shell_s_prompt_gets_neither_blank() {
 /// would put a blank there that nobody chose.
 #[test]
 fn the_shutdown_notice_reads_as_one_block_with_the_exit_banner() {
-    let install = Install::with_extra(true, true, "", "\n[background]\nenabled = true\n");
+    let install = repl_install_with_extra(true, true, "", "\n[background]\nenabled = true\n");
     let script = r#"[
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started it" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]"#;
 
@@ -571,7 +711,7 @@ fn the_shutdown_notice_reads_as_one_block_with_the_exit_banner() {
 /// none of it.
 #[test]
 fn a_command_that_prints_for_itself_is_still_bracketed() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, TWO_TURNS, &["/status", "/exit"]);
 
     let body = between(&rows, "> /status", "> /exit");
@@ -595,7 +735,7 @@ fn a_command_that_prints_for_itself_is_still_bracketed() {
 /// cannot see. It is bracketed by the same rule as everything else.
 #[test]
 fn help_is_bracketed_by_the_repl_thread_too() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, TWO_TURNS, &["/help", "/exit"]);
 
     let body = between(&rows, "> /help", "> /exit");
@@ -612,13 +752,13 @@ fn help_is_bracketed_by_the_repl_thread_too() {
 #[test]
 fn a_todo_list_is_not_double_spaced() {
     const TODO: &str = r#"[
- [{"kind":"tool_use_start","id":"t1","name":"todo"},
-  {"kind":"tool_use_end","input":{"title":"Work","items":["First","Second"]}},
-  {"kind":"message_end","stop_reason":"tool_use"}],
- [{"kind":"text","text":"Done."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"tool_use_start","id":"t1","name":"todo"},
+  {"type":"tool_use_end","input":{"title":"Work","items":["First","Second"]}},
+  {"type":"message_end","stop_reason":"tool_use"}],
+ [{"type":"text","text":"Done."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, TODO, &["plan it", "/exit"]);
 
     let body = between(&rows, "> plan it", "> /exit");
@@ -638,12 +778,12 @@ fn a_todo_list_is_not_double_spaced() {
 #[test]
 fn a_thinking_block_sits_inside_the_brackets() {
     const THINKING: &str = r#"[
- [{"kind":"thinking_delta","text":"weighing the options"},
-  {"kind":"thinking_complete"},
-  {"kind":"text","text":"Here is the answer."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"thinking_delta","text":"weighing the options"},
+  {"type":"thinking_complete"},
+  {"type":"text","text":"Here is the answer."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(true, true, "\n[thinking]\nshow_content = true\n");
+    let install = repl_install(true, true, "\n[thinking]\nshow_content = true\n");
     let rows = run_repl(&install, THINKING, &["think about it", "/exit"]);
 
     let body = between(&rows, "> think about it", "> /exit");
@@ -659,7 +799,7 @@ fn a_thinking_block_sits_inside_the_brackets() {
     );
 }
 
-/// Reasoning arrives in chunks that stop wherever the provider's tokeniser did, so a block is one
+/// Reasoning arrives in chunks that stop wherever the provider's tokenizer did, so a block is one
 /// block however it was cut up: one `Thinking... ` label, and words split across a chunk boundary
 /// rejoined rather than shown broken.
 ///
@@ -669,13 +809,13 @@ fn a_thinking_block_sits_inside_the_brackets() {
 #[test]
 fn a_thinking_block_split_across_deltas_renders_as_one() {
     const SPLIT: &str = r#"[
- [{"kind":"thinking_delta","text":"**Weighing the op"},
-  {"kind":"thinking_delta","text":"tions**\n\nBoth are fine."},
-  {"kind":"thinking_complete"},
-  {"kind":"text","text":"Here is the answer."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"thinking_delta","text":"**Weighing the op"},
+  {"type":"thinking_delta","text":"tions**\n\nBoth are fine."},
+  {"type":"thinking_complete"},
+  {"type":"text","text":"Here is the answer."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(true, true, "\n[thinking]\nshow_content = true\n");
+    let install = repl_install(true, true, "\n[thinking]\nshow_content = true\n");
     let rows = run_repl(&install, SPLIT, &["think about it", "/exit"]);
 
     let body = between(&rows, "> think about it", "> /exit");
@@ -709,12 +849,12 @@ fn a_thinking_block_split_across_deltas_renders_as_one() {
 #[test]
 fn without_show_content_a_thinking_block_is_one_formatted_line() {
     const SPLIT: &str = r#"[
- [{"kind":"thinking_delta","text":"**Weighing the options.**\nThe second line."},
-  {"kind":"thinking_complete"},
-  {"kind":"text","text":"Here is the answer."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"thinking_delta","text":"**Weighing the options.**\nThe second line."},
+  {"type":"thinking_complete"},
+  {"type":"text","text":"Here is the answer."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, SPLIT, &["think about it", "/exit"]);
 
     let body = between(&rows, "> think about it", "> /exit");
@@ -734,11 +874,11 @@ fn without_show_content_a_thinking_block_is_one_formatted_line() {
 #[test]
 fn a_notice_renders_inside_the_brackets() {
     const NOTICE: &str = r#"[
- [{"kind":"notice","message":"the model dropped an unsupported parameter"},
-  {"kind":"text","text":"Answered anyway."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"notice","message":"the model dropped an unsupported parameter"},
+  {"type":"text","text":"Answered anyway."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, NOTICE, &["ask", "/exit"]);
 
     let body = between(&rows, "> ask", "> /exit");
@@ -750,52 +890,50 @@ fn a_notice_renders_inside_the_brackets() {
     );
 }
 
-/// `/provider <name>` is typed at the REPL thread but answered on the agent's side, so its
+/// `/profile <name>` is typed at the REPL thread but answered on the agent's side, so its
 /// confirmation is the one piece of command output that neither the dispatcher nor a turn prints.
 #[test]
-fn a_forwarded_provider_switch_is_bracketed() {
-    let install = Install::new(true, true, "");
+fn a_forwarded_profile_switch_is_bracketed() {
+    let install = repl_install(true, true, "");
     // A second profile to switch to; the first is what the session starts on.
-    let extra = "\n[providers.other]\ntype = \"openai-chat-completions\"\n\
-                 model = \"other-model\"\nbase_url = \"http://127.0.0.1:9/\"\n";
-    let config = install.root.path().join("meka").join("config.toml");
+    let extra = "\n[profiles.other]\naccount = \"default\"\nmodel = \"other-model\"\n";
+    let config = install.root().join("meka").join("config.toml");
     let mut text = std::fs::read_to_string(&config).expect("read config");
     text.push_str(extra);
     std::fs::write(&config, text).expect("write config");
 
-    let rows = run_repl(&install, TWO_TURNS, &["/provider other", "/exit"]);
+    let rows = run_repl(&install, TWO_TURNS, &["/profile other", "/exit"]);
 
-    let body = between(&rows, "> /provider other", "> /exit");
+    let body = between(&rows, "> /profile other", "> /exit");
     assert_eq!(body.first().map(String::as_str), Some(""), "{body:#?}");
     assert_eq!(body.last().map(String::as_str), Some(""), "{body:#?}");
     assert!(
-        body.iter()
-            .any(|row| row.contains("Provider profile set to")),
+        body.iter().any(|row| row.contains("Profile set to")),
         "the confirmation is what the brackets are around: {body:#?}"
     );
 }
 
-/// `/provider` with no argument names the profile this session runs on, then lists every configured
-/// one with the backend it speaks, under a heading styled like `/status`'s. It used to be a
-/// comma-joined run of names with no heading, which stops fitting long before a user stops adding
-/// accounts and never said what the list was for.
+/// `/profile` with no argument names the profile this session runs on, then lists every configured
+/// one with its account and the backend it speaks, under a heading styled like `/status`'s. It used
+/// to be a comma-joined run of names with no heading, which stops fitting long before a user stops
+/// adding accounts and never said what the list was for.
 #[test]
-fn provider_lists_one_profile_per_line_with_its_backend() {
-    let install = Install::new(true, true, "");
-    let config = install.root.path().join("meka").join("config.toml");
+fn profile_lists_one_profile_per_line_with_its_account_and_backend() {
+    let install = repl_install(true, true, "");
+    let config = install.root().join("meka").join("config.toml");
     let mut text = std::fs::read_to_string(&config).expect("read config");
     text.push_str(
-        "\n[providers.zzz-last]\ntype = \"anthropic-messages\"\n\
-         model = \"other-model\"\nbase_url = \"http://127.0.0.1:9/\"\n",
+        "\n[accounts.zzz-acct]\nbackend = \"anthropic-messages\"\n\n\
+         [profiles.zzz-last]\naccount = \"zzz-acct\"\nmodel = \"other-model\"\n",
     );
     std::fs::write(&config, text).expect("write config");
 
-    let rows = run_repl(&install, TWO_TURNS, &["/provider", "/exit"]);
-    let body = between(&rows, "> /provider", "> /exit");
+    let rows = run_repl(&install, TWO_TURNS, &["/profile", "/exit"]);
+    let body = between(&rows, "> /profile", "> /exit");
 
     let current = body
         .iter()
-        .position(|row| row == "Current provider profile: default")
+        .position(|row| row == "Current profile: default")
         .unwrap_or_else(|| panic!("the answer comes first: {body:#?}"));
     let heading = body
         .iter()
@@ -811,12 +949,12 @@ fn provider_lists_one_profile_per_line_with_its_backend() {
     );
     assert!(
         body.iter()
-            .any(|row| row == "- default (openai-chat-completions)"),
-        "each profile is its own line, with the backend: {body:#?}"
+            .any(|row| row == "- default (default, openai-chat-completions)"),
+        "each profile is its own line, with its account and backend: {body:#?}"
     );
     assert!(
         body.iter()
-            .any(|row| row == "- zzz-last (anthropic-messages)"),
+            .any(|row| row == "- zzz-last (zzz-acct, anthropic-messages)"),
         "including the ones that are not current: {body:#?}"
     );
     assert!(
@@ -828,7 +966,7 @@ fn provider_lists_one_profile_per_line_with_its_backend() {
 /// A successful `/cd` prints nothing, so it gets no blank lines; its failure prints, so it does.
 #[test]
 fn cd_is_spaced_only_when_it_has_something_to_say() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, TWO_TURNS, &[
         "/cd /nonexistent-xyz",
         "/cd /tmp",
@@ -846,19 +984,19 @@ fn cd_is_spaced_only_when_it_has_something_to_say() {
     );
 }
 
-/// Ctrl+C during a turn. The notice is the one piece of chrome that used to open with its own
-/// newline to terminate whatever row it landed on -- right when a row was open, a stray blank line
-/// when the cursor was already at column zero, and no brackets at all when the turn had not printed
-/// anything yet.
+/// Ctrl+C during a turn. The notice is the one piece of chrome tempted to open with its own newline
+/// to terminate whatever row it lands on: right when a row is open, a stray blank line when the
+/// cursor is already at column zero, and no brackets at all when the turn has not printed anything
+/// yet.
 #[test]
 fn an_interrupted_turn_is_annotated_and_bracketed() {
     const SLOW: &str = r#"[
- [{"kind":"text","text":"starting the long answer"},
-  {"kind":"sleep","ms":8000},
-  {"kind":"text","text":"never reached"},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"text","text":"starting the long answer"},
+  {"type":"sleep","ms":8000},
+  {"type":"text","text":"never reached"},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, SLOW, &["slow", "\u{3}", "/exit"]);
 
     let body = between(&rows, "> slow", "> /exit");
@@ -903,7 +1041,7 @@ fn an_interrupted_turn_is_annotated_and_bracketed() {
 /// would want to know.
 #[test]
 fn a_warning_raised_during_a_turn_is_not_erased_by_the_turn() {
-    let install = Install::new(true, true, "");
+    let install = repl_install(true, true, "");
     let rows = run_repl(&install, RETRIES_MID_TURN, &["boom", "again", "/exit"]);
 
     let turn = between(&rows, "> boom", "> again");
@@ -928,7 +1066,7 @@ fn a_warning_raised_during_a_turn_is_not_erased_by_the_turn() {
 /// script.
 #[test]
 fn showing_reasoning_trades_the_retry_for_not_repeating_it() {
-    let install = Install::new(true, true, "\n[thinking]\nshow_content = true\n");
+    let install = repl_install(true, true, "\n[thinking]\nshow_content = true\n");
     let rows = run_repl(&install, RETRIES_MID_TURN, &["boom", "again", "/exit"]);
 
     let turn = between(&rows, "> boom", "> again");
@@ -950,7 +1088,7 @@ fn showing_reasoning_trades_the_retry_for_not_repeating_it() {
 /// Claude's token-count beta reports an estimate from the *same* wire event that carries a visible
 /// delta, so the two alternate for the whole block. Drawing the counter closes the streamed block
 /// to free the row, and the next delta opens a fresh one behind a second `Thinking... ` label --
-/// once per delta, which shreds one block into a labelled fragment per chunk.
+/// once per delta, which shreds one block into a labeled fragment per chunk.
 ///
 /// Driven through a pty because the guard sits in front of terminal-only drawing:
 /// `live_indicator_supported` is false in every ordinary test process, so nothing there can reach
@@ -958,17 +1096,17 @@ fn showing_reasoning_trades_the_retry_for_not_repeating_it() {
 #[test]
 fn a_token_estimate_never_shreds_the_reasoning_it_counts() {
     const COUNTED: &str = r#"[
- [{"kind":"thinking_delta","text":"First I weigh it. "},
-  {"kind":"thinking_progress","estimated_tokens":16},
-  {"kind":"thinking_delta","text":"Then I settle it. "},
-  {"kind":"thinking_progress","estimated_tokens":32},
-  {"kind":"thinking_delta","text":"Then I say so."},
-  {"kind":"thinking_progress","estimated_tokens":48},
-  {"kind":"thinking_complete"},
-  {"kind":"text","text":"Here is the answer."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"thinking_delta","text":"First I weigh it. "},
+  {"type":"thinking_progress","estimated_tokens":16},
+  {"type":"thinking_delta","text":"Then I settle it. "},
+  {"type":"thinking_progress","estimated_tokens":32},
+  {"type":"thinking_delta","text":"Then I say so."},
+  {"type":"thinking_progress","estimated_tokens":48},
+  {"type":"thinking_complete"},
+  {"type":"text","text":"Here is the answer."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(true, true, "[thinking]\nshow_content = true\n");
+    let install = repl_install(true, true, "[thinking]\nshow_content = true\n");
     let rows = run_repl(&install, COUNTED, &["think about it", "/exit"]);
 
     let labels = rows
@@ -977,7 +1115,7 @@ fn a_token_estimate_never_shreds_the_reasoning_it_counts() {
         .count();
     assert_eq!(
         labels, 1,
-        "the block was relabelled once per estimate: {rows:#?}"
+        "the block was relabeled once per estimate: {rows:#?}"
     );
     let reasoning: String = rows.join(" ");
     assert!(
@@ -999,12 +1137,12 @@ fn a_token_estimate_never_shreds_the_reasoning_it_counts() {
 #[test]
 fn a_resumed_session_replays_the_reasoning_it_recorded() {
     const REASONED: &str = r#"[
- [{"kind":"thinking_delta","text":"**Weighing it** then deciding."},
-  {"kind":"thinking_complete"},
-  {"kind":"text","text":"Here is the answer."},
-  {"kind":"message_end","stop_reason":"end_turn"}]
+ [{"type":"thinking_delta","text":"**Weighing it** then deciding."},
+  {"type":"thinking_complete"},
+  {"type":"text","text":"Here is the answer."},
+  {"type":"message_end","stop_reason":"end_turn"}]
 ]"#;
-    let install = Install::new(
+    let install = repl_install(
         true,
         true,
         "resume_show_recent = 1\n\n[thinking]\nshow_content = true\n",
@@ -1030,7 +1168,7 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
     );
 }
 
-/// A cancelled background task rides the next thing the user types, without spending a turn.
+/// A canceled background task rides the next thing the user types, without spending a turn.
 ///
 /// The REPL is the most-used host and had no coverage for any of this: the fold, the watcher's
 /// refusal to wake, and the retention the carrier runs under were all deletable with the suite
@@ -1043,11 +1181,11 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
 ///
 /// Not pinned here: the watcher's own `wakes_a_host` gate. Removing it makes the watcher wake for a
 /// batch the wake arm then declines to claim, so the conversation and the script are untouched and
-/// only a prompt redraw is wasted. It is an optimisation sitting in front of the real guard, and
+/// only a prompt redraw is wasted. It is an optimization sitting in front of the real guard, and
 /// catching it needs an assertion about drawing rather than about the conversation.
 #[test]
 fn a_cancelled_task_rides_the_next_prompt_in_the_repl() {
-    let install = Install::with_extra(
+    let install = repl_install_with_extra(
         true,
         true,
         "",
@@ -1055,17 +1193,17 @@ fn a_cancelled_task_rides_the_next_prompt_in_the_repl() {
     );
     let script = r#"[
         [
-            { "kind": "tool_use_start", "id": "tu_1", "name": "execute_command" },
-            { "kind": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
-            { "kind": "message_end", "stop_reason": "tool_use" }
+            { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
+            { "type": "tool_use_end", "input": {"command": "sleep 120", "background": true} },
+            { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
-            { "kind": "text", "text": "started it" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "started it" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ],
         [
-            { "kind": "text", "text": "answered the question" },
-            { "kind": "message_end", "stop_reason": "end_turn" }
+            { "type": "text", "text": "answered the question" },
+            { "type": "message_end", "stop_reason": "end_turn" }
         ]
     ]"#;
 
@@ -1084,7 +1222,7 @@ fn a_cancelled_task_rides_the_next_prompt_in_the_repl() {
     let connection = rusqlite::Connection::open(install.database()).expect("open the store");
     let user_messages: Vec<String> = {
         let mut statement = connection
-            .prepare("SELECT content FROM messages WHERE role = 'user' ORDER BY id ASC")
+            .prepare("SELECT content FROM messages WHERE role IN ('user', 'user_blocks') ORDER BY id ASC")
             .expect("prepare");
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -1100,7 +1238,7 @@ fn a_cancelled_task_rides_the_next_prompt_in_the_repl() {
     );
     let carrier = user_messages.last().expect("the second turn");
     assert!(
-        carrier.contains("was cancelled") && carrier.contains("what is in this CSV?"),
+        carrier.contains("was canceled") && carrier.contains("what is in this CSV?"),
         "the outcome must ride inside the user's own message: {carrier}"
     );
 

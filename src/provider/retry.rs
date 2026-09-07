@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 /// Maximum number of retries after the initial attempt (so `MAX_PROVIDER_RETRIES + 1` total
-/// attempts). Hardcoded, not config-exposed — matches the project's convention for turn-level retry
-/// knobs (see `MAX_OVERFLOW_RETRIES` in `agent.rs`).
+/// attempts). Hardcoded rather than config-exposed, like every turn-level retry knob (see
+/// `MAX_OVERFLOW_RETRIES` in `agent.rs`).
 pub(crate) const MAX_PROVIDER_RETRIES: u32 = 2;
 
 /// How long a retry sequence may have been running before a further attempt is refused, measured
@@ -42,7 +42,7 @@ const BACKOFF_CAP: Duration = Duration::from_secs(8);
 
 /// Delay cap for a provider-supplied `Retry-After` value.
 ///
-/// Sized to honour the hint rather than to override it. Rate-limit windows in the wild are seconds
+/// Sized to honor the hint rather than to override it. Rate-limit windows in the wild are seconds
 /// to a minute, and a cap below them turns "the provider told us exactly when to come back" into
 /// "we came back too early and were refused again" -- which spends a retry to learn nothing. That
 /// matters more at [`MAX_PROVIDER_RETRIES`] = 2 than it did at 3: there are only two to spend.
@@ -90,7 +90,7 @@ const _: () = assert!(OUTAGE_REPRIEVE.as_nanos() <= RETRY_AFTER_CAP.as_nanos());
 /// How long the reprieve waits, given whatever the failing response asked for.
 ///
 /// The provider's own `Retry-After` decides, up to [`RETRY_AFTER_CAP`], with [`OUTAGE_REPRIEVE`] as
-/// the floor. Honouring it here rather than only in [`backoff_delay`] closes a gap that read badly
+/// the floor. Honoring it here rather than only in [`backoff_delay`] closes a gap that read badly
 /// once stated: a `503` carrying `Retry-After: 60` had both retries wait the full minute on the
 /// provider's instruction, and then the one wait that decides whether to *delete the user's
 /// content* was eight seconds. The hint is the only evidence anyone has about how long the outage
@@ -136,7 +136,7 @@ mod tests {
     /// relationship where the budget still does something.
     ///
     /// Worth asserting because the two constants live apart and neither reads the other's
-    /// intent: `MAX_PROVIDER_RETRIES` could be raised to 8 and every behavioural test would still
+    /// intent: `MAX_PROVIDER_RETRIES` could be raised to 8 and every behavioral test would still
     /// pass while the budget quietly became the only limit that ever fires.
     #[test]
     fn the_budget_can_still_be_the_limit_that_binds() {
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backoff_delay_exponential_without_retry_after() {
+    fn backoff_delay_exponential_without_retry_after() {
         assert_eq!(backoff_delay(1, None), Duration::from_secs(1));
         assert_eq!(backoff_delay(2, None), Duration::from_secs(2));
         assert_eq!(backoff_delay(3, None), Duration::from_secs(4));
@@ -164,13 +164,13 @@ mod tests {
     }
 
     #[test]
-    fn test_backoff_delay_zero_attempt_does_not_panic() {
+    fn backoff_delay_zero_attempt_does_not_panic() {
         // `attempt.saturating_sub(1)` guards against underflow if ever called with 0.
         assert_eq!(backoff_delay(0, None), Duration::from_secs(1));
     }
 
     #[test]
-    fn test_backoff_delay_uses_retry_after_when_present() {
+    fn backoff_delay_uses_retry_after_when_present() {
         assert_eq!(
             backoff_delay(1, Some(Duration::from_secs(3))),
             Duration::from_secs(3)
@@ -183,17 +183,12 @@ mod tests {
     }
 
     #[test]
-    fn test_backoff_delay_caps_large_retry_after() {
+    fn backoff_delay_caps_large_retry_after() {
         assert_eq!(
             backoff_delay(1, Some(Duration::from_secs(120))),
             RETRY_AFTER_CAP
         );
     }
-}
-
-#[cfg(test)]
-mod reprieve_tests {
-    use super::*;
 
     /// The reprieve waits as long as the provider asked, within the same bounds as a retry.
     ///
@@ -203,7 +198,7 @@ mod reprieve_tests {
     /// three bounds are asserted, because each exists for a different reason and a single-value
     /// test would pin none of them.
     #[test]
-    fn the_reprieve_honours_the_hint_between_its_floor_and_the_shared_cap() {
+    fn the_reprieve_honors_the_hint_between_its_floor_and_the_shared_cap() {
         assert_eq!(
             outage_reprieve(None),
             OUTAGE_REPRIEVE,

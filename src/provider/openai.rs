@@ -16,17 +16,22 @@
 //! The two Responses backends share the wire format through [`responses_wire`]; Chat Completions
 //! is a different protocol and shares nothing but [`data_url`].
 
-pub mod chat_completions;
-pub mod responses;
+pub(crate) mod chat_completions;
+pub(crate) mod responses;
 pub(crate) mod responses_wire;
-pub mod subscription;
+pub(crate) mod subscription;
 
-pub use chat_completions::OpenAiChatCompletionsProvider;
-pub use responses::OpenAiResponsesProvider;
-pub use subscription::ChatGptSubscriptionProvider;
+pub(crate) use chat_completions::OpenAiChatCompletionsProvider;
+pub(crate) use responses::OpenAiResponsesProvider;
+pub(crate) use subscription::ChatGptSubscriptionProvider;
 
 /// A `data:` URL for an image, the one piece of image wire-format both protocols share (Chat
-/// Completions `image_url.url` and the Responses API `input_image.image_url`).
-fn data_url(source: &crate::provider::ImageSource) -> String {
-    format!("data:{};base64,{}", source.media_type, source.data)
+/// Completions `image_url.url` and the Responses API `input_image.image_url`). `None` for a
+/// reference whose bytes were never loaded, which the caller sends as a sentence instead.
+fn data_url(source: &crate::image::ImageSource) -> Option<String> {
+    Some(format!(
+        "data:{};base64,{}",
+        source.media_type(),
+        source.base64_data()?
+    ))
 }

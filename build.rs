@@ -6,7 +6,7 @@ const CC_VERSION: &str = "2.1.241";
 /// too: the Windows lint job compiles this file, and the panicking call was a hard error there
 /// while every other platform cfg'd the block away and never saw it.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rustc-env=CC_VERSION={}", CC_VERSION);
+    println!("cargo:rustc-env=CC_VERSION={CC_VERSION}");
     println!("cargo:rerun-if-changed=build.rs");
 
     #[cfg(windows)]

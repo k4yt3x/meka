@@ -1,40 +1,30 @@
-//! Builtin tools exposing MCP resources and prompts to the agent:
-//! `mcp_resource_list`, `mcp_resource_read`, `mcp_prompt_list`, and
-//! `mcp_prompt_get`. Each tool routes through a shared [`McpClientManager`]
-//! so it can target any configured server by name.
+//! Builtin tools exposing MCP resources and prompts to the agent: `mcp_resource_list`,
+//! `mcp_resource_read`, `mcp_prompt_list`, and `mcp_prompt_get`. Each tool routes through a shared
+//! [`McpClientManager`] so it can target any configured server by name.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolDenials, ToolOutput, util::require_str};
 use crate::{
     error::{MekaError, Result},
-    mcp::{MAX_MCP_DESCRIPTION_LENGTH, McpClientManager, sanitize::sanitize_text, truncate},
+    mcp::{MAX_MCP_DESCRIPTION_CHARS, McpClientManager, truncate},
     permission::Permission,
     provider::ToolDefinition,
+    text::sanitize_text,
 };
 
-/// Cap on total bytes returned by `mcp_resource_read` across all content
-/// chunks from a single server response. Mirrors `MAX_MCP_IMAGE_BYTES`:
-/// servers can return large blob or text resources that would otherwise be
-/// cloned verbatim into the provider request and blown through the user's
+/// Cap on total bytes returned by `mcp_resource_read` across all content chunks from a single
+/// server response. Mirrors `MAX_MCP_IMAGE_BYTES`: servers can return large blob or text resources
+/// that would otherwise be cloned verbatim into the provider request and blown through the user's
 /// API quota (or OOM the agent).
-pub const MAX_MCP_RESOURCE_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_MCP_RESOURCE_BYTES: usize = 10 * crate::text::MIB;
 
 fn no_such_server(tool_name: &str, server: &str, available: &[String]) -> MekaError {
     MekaError::ToolExecution {
         tool_name: tool_name.to_string(),
-        message: format!(
-            "unknown MCP server '{}' (configured: {})",
-            server,
-            if available.is_empty() {
-                "<none>".to_string()
-            } else {
-                available.join(", ")
-            }
-        ),
+        message: crate::text::unknown_name("MCP server", server, available),
     }
 }
 
@@ -75,8 +65,8 @@ fn visible_server_entry(
 }
 
 pub(crate) struct ListMcpResourcesTool {
-    pub manager: Arc<McpClientManager>,
-    pub denials: Arc<ToolDenials>,
+    pub(crate) manager: Arc<McpClientManager>,
+    pub(crate) denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -108,8 +98,9 @@ impl Tool for ListMcpResourcesTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let server_filter = input
             .get("server")
             .and_then(|v| v.as_str())
@@ -145,7 +136,7 @@ impl Tool for ListMcpResourcesTool {
                         let mime = raw.mime_type.as_deref().unwrap_or("");
                         let description = raw.description.as_deref().unwrap_or("");
                         let description =
-                            truncate(&sanitize_text(description), MAX_MCP_DESCRIPTION_LENGTH);
+                            truncate(&sanitize_text(description), MAX_MCP_DESCRIPTION_CHARS);
                         lines.push(format!(
                             "{}\t{}\t{}\t{}\t{}",
                             name,
@@ -158,7 +149,7 @@ impl Tool for ListMcpResourcesTool {
                 }
                 Err(error) => {
                     any_error = true;
-                    lines.push(format!("{}\t<error>\t\t\t{}", name, error));
+                    lines.push(format!("{name}\t<error>\t\t\t{error}"));
                 }
             }
         }
@@ -175,8 +166,8 @@ impl Tool for ListMcpResourcesTool {
 }
 
 pub(crate) struct ReadMcpResourceTool {
-    pub manager: Arc<McpClientManager>,
-    pub denials: Arc<ToolDenials>,
+    pub(crate) manager: Arc<McpClientManager>,
+    pub(crate) denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -213,8 +204,9 @@ impl Tool for ReadMcpResourceTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let server = require_str(&input, "server", "mcp_resource_read")?;
         let uri = require_str(&input, "uri", "mcp_resource_read")?;
 
@@ -227,7 +219,7 @@ impl Tool for ReadMcpResourceTool {
 
         if chunks.is_empty() {
             return Ok(ToolOutput::text(
-                format!("resource '{}' returned no content", uri),
+                format!("resource '{uri}' returned no content"),
                 false,
             ));
         }
@@ -236,7 +228,7 @@ impl Tool for ReadMcpResourceTool {
     }
 }
 
-/// Render MCP `ResourceContents` into formatted chunks with Unicode sanitisation applied to all
+/// Render MCP `ResourceContents` into formatted chunks with Unicode sanitization applied to all
 /// server-supplied strings (URIs, MIME types, text bodies) and a hard byte budget across the whole
 /// response. Split from `ReadMcpResourceTool::execute` so it's exercisable from tests.
 fn format_resource_contents(
@@ -306,8 +298,8 @@ fn format_resource_contents(
 }
 
 pub(crate) struct ListMcpPromptsTool {
-    pub manager: Arc<McpClientManager>,
-    pub denials: Arc<ToolDenials>,
+    pub(crate) manager: Arc<McpClientManager>,
+    pub(crate) denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -339,8 +331,9 @@ impl Tool for ListMcpPromptsTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let server_filter = input
             .get("server")
             .and_then(|v| v.as_str())
@@ -372,17 +365,17 @@ impl Tool for ListMcpPromptsTool {
                     for prompt in prompts {
                         let description = prompt.description.unwrap_or_default();
                         let description =
-                            truncate(&sanitize_text(&description), MAX_MCP_DESCRIPTION_LENGTH);
+                            truncate(&sanitize_text(&description), MAX_MCP_DESCRIPTION_CHARS);
                         let args = prompt
                             .arguments
                             .unwrap_or_default()
                             .into_iter()
                             .map(|a| {
-                                let sanitised = sanitize_text(&a.name);
+                                let sanitized = sanitize_text(&a.name);
                                 if a.required == Some(true) {
-                                    format!("{}!", sanitised)
+                                    format!("{sanitized}!")
                                 } else {
-                                    sanitised
+                                    sanitized
                                 }
                             })
                             .collect::<Vec<_>>()
@@ -398,7 +391,7 @@ impl Tool for ListMcpPromptsTool {
                 }
                 Err(error) => {
                     any_error = true;
-                    lines.push(format!("{}\t<error>\t{}\t", name, error));
+                    lines.push(format!("{name}\t<error>\t{error}\t"));
                 }
             }
         }
@@ -415,8 +408,8 @@ impl Tool for ListMcpPromptsTool {
 }
 
 pub(crate) struct GetMcpPromptTool {
-    pub manager: Arc<McpClientManager>,
-    pub denials: Arc<ToolDenials>,
+    pub(crate) manager: Arc<McpClientManager>,
+    pub(crate) denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -425,7 +418,7 @@ impl Tool for GetMcpPromptTool {
         ToolDefinition {
             name: "mcp_prompt_get".to_string(),
             description: "Render an MCP prompt by name from a specific server. \
-                          Returns the prompt's messages serialised as `<role>: \
+                          Returns the prompt's messages serialized as `<role>: \
                           <text>` lines. `arguments` are passed verbatim to the \
                           server; see `mcp_prompt_list` for each prompt's \
                           declared arguments."
@@ -460,8 +453,9 @@ impl Tool for GetMcpPromptTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let server = require_str(&input, "server", "mcp_prompt_get")?;
         let name = require_str(&input, "name", "mcp_prompt_get")?;
 
@@ -471,28 +465,27 @@ impl Tool for GetMcpPromptTool {
 
         let result = crate::mcp::get_prompt(&entry, name.clone(), arguments, &cancellation).await?;
 
-        // Sanitised before truncation, like every other server-supplied string in this file. This
+        // Sanitized before truncation, like every other server-supplied string in this file. This
         // one was the omission: `prompts/get`'s description is server text that reaches the model
         // and the terminal, and it went through `truncate` alone.
         let description = result
             .description
             .map(|description| {
                 truncate(
-                    &crate::mcp::sanitize::sanitize_text(&description),
-                    MAX_MCP_DESCRIPTION_LENGTH,
+                    &crate::text::sanitize_text(&description),
+                    MAX_MCP_DESCRIPTION_CHARS,
                 )
             })
             .unwrap_or_default();
 
         let mut lines = Vec::new();
         if !description.is_empty() {
-            lines.push(format!("# {}", description));
+            lines.push(format!("# {description}"));
         }
 
         for message in &result.messages {
-            // rmcp 2.1: `PromptMessage` carries a plain `Role` and a `ContentBlock` (the same
-            // content enum used everywhere else), replacing the old `PromptMessageRole` /
-            // `PromptMessageContent` types.
+            // `PromptMessage` carries a plain `Role` and a `ContentBlock`, the same content enum
+            // used everywhere else.
             let role_label = match message.role {
                 rmcp::model::Role::User => "user",
                 rmcp::model::Role::Assistant => "assistant",
@@ -502,10 +495,10 @@ impl Tool for GetMcpPromptTool {
                     lines.push(format!("{}: {}", role_label, sanitize_text(&text.text)));
                 }
                 rmcp::model::ContentBlock::Image(_) => {
-                    lines.push(format!("{}: [image content]", role_label));
+                    lines.push(format!("{role_label}: [image content]"));
                 }
                 rmcp::model::ContentBlock::Audio(_) => {
-                    lines.push(format!("{}: [audio content]", role_label));
+                    lines.push(format!("{role_label}: [audio content]"));
                 }
                 rmcp::model::ContentBlock::Resource(embedded) => {
                     lines.push(format!(
@@ -520,13 +513,13 @@ impl Tool for GetMcpPromptTool {
                         sanitize_text(&link.uri)
                     ));
                 }
-                _ => lines.push(format!("{}: [unsupported content]", role_label)),
+                _ => lines.push(format!("{role_label}: [unsupported content]")),
             }
         }
 
         if lines.is_empty() {
             return Ok(ToolOutput::text(
-                format!("prompt '{}' returned no messages", name),
+                format!("prompt '{name}' returned no messages"),
                 false,
             ));
         }
@@ -535,11 +528,6 @@ impl Tool for GetMcpPromptTool {
     }
 }
 
-// `expect()` on each registration: a collision means two builtins share a name (a coding bug,
-// not a runtime condition). We want the first build to fail loudly rather than silently dropping
-// the second registration. Scoped to this function because the same justification applies to every
-// `.register(...).expect(...)` site below.
-#[allow(clippy::expect_used)]
 pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClientManager>) {
     // Skip registration if no servers are configured. These tools rely on the manager and there's
     // nothing useful to do without at least one. A sub-agent denied every configured server is in
@@ -550,19 +538,22 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
         return;
     }
     // These seven are registered directly rather than through `register_builtin`, so they only
-    // honour the `[tools]` block-list and the sub-agent deny list if this asks. Without it, naming
+    // honor the `[tools]` block-list and the sub-agent deny list if this asks. Without it, naming
     // one in `disabled_tools` did nothing at all. `admits_infrastructure` deliberately ignores
     // `allowed_tools`, which never reached these and would silently delete them from any install
     // that has one.
     //
     // All seven are discovery-style helpers, so each is marked deferred: they stay out of the tool
     // list until a prompt/resource-focused flow needs them, and the registry's auto-activate path
-    // promotes them when invoked.
-    // Marking deferred rides along in the same macro: a deferred marker for a tool that was never
-    // registered is a name `load_tool` would offer and then fail to find.
+    // promotes them when invoked. Marking deferred rides along in the same macro: a deferred marker
+    // for a tool that was never registered is a name `load_tool` would offer and then fail to find.
     macro_rules! register_meta {
         ($name:expr, $tool:expr) => {
             if registry.admits_infrastructure($name) {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "a collision means two builtins share a name, a bug the first build must surface rather than drop the second registration"
+                )]
                 registry.register(Arc::new($tool)).expect(concat!(
                     "builtin ",
                     $name,
@@ -597,14 +588,15 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
         denials: Arc::clone(&denials),
     });
     register_meta!("mcp_resource_updates_list", ListMcpResourceUpdatesTool {
+        manager: Arc::clone(&manager),
         denials
     });
     drop(manager);
 }
 
 pub(crate) struct SubscribeMcpResourceTool {
-    pub manager: Arc<McpClientManager>,
-    pub denials: Arc<ToolDenials>,
+    pub(crate) manager: Arc<McpClientManager>,
+    pub(crate) denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -619,8 +611,8 @@ impl Tool for SubscribeMcpResourceTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "server": {"type": "string", "description": "MCP server name"},
-                    "uri": {"type": "string", "description": "Resource URI to subscribe to"}
+                    "server": {"type": "string", "description": "MCP server name that advertises the resource."},
+                    "uri": {"type": "string", "description": "Resource URI to subscribe to."}
                 },
                 "required": ["server", "uri"]
             }),
@@ -635,8 +627,9 @@ impl Tool for SubscribeMcpResourceTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let server = require_str(&input, "server", "mcp_resource_subscribe")?;
         let uri = require_str(&input, "uri", "mcp_resource_subscribe")?;
         let entry = visible_server_entry(
@@ -649,18 +642,18 @@ impl Tool for SubscribeMcpResourceTool {
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "mcp_resource_subscribe".to_string(),
-                message: format!("subscribe failed: {}", error),
+                message: format!("subscribe failed: {error}"),
             })?;
         Ok(ToolOutput::text(
-            format!("subscribed to '{}' on server '{}'", uri, server),
+            format!("subscribed to '{uri}' on server '{server}'"),
             false,
         ))
     }
 }
 
 pub(crate) struct UnsubscribeMcpResourceTool {
-    pub manager: Arc<McpClientManager>,
-    pub denials: Arc<ToolDenials>,
+    pub(crate) manager: Arc<McpClientManager>,
+    pub(crate) denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -672,8 +665,8 @@ impl Tool for UnsubscribeMcpResourceTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "server": {"type": "string", "description": "MCP server name"},
-                    "uri": {"type": "string", "description": "Resource URI to unsubscribe from"}
+                    "server": {"type": "string", "description": "MCP server name that advertises the resource."},
+                    "uri": {"type": "string", "description": "Resource URI to unsubscribe from."}
                 },
                 "required": ["server", "uri"]
             }),
@@ -688,8 +681,9 @@ impl Tool for UnsubscribeMcpResourceTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let server = require_str(&input, "server", "mcp_resource_unsubscribe")?;
         let uri = require_str(&input, "uri", "mcp_resource_unsubscribe")?;
         let entry = visible_server_entry(
@@ -702,17 +696,18 @@ impl Tool for UnsubscribeMcpResourceTool {
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "mcp_resource_unsubscribe".to_string(),
-                message: format!("unsubscribe failed: {}", error),
+                message: format!("unsubscribe failed: {error}"),
             })?;
         Ok(ToolOutput::text(
-            format!("unsubscribed from '{}' on server '{}'", uri, server),
+            format!("unsubscribed from '{uri}' on server '{server}'"),
             false,
         ))
     }
 }
 
 pub(crate) struct ListMcpResourceUpdatesTool {
-    pub denials: Arc<ToolDenials>,
+    pub(crate) manager: Arc<McpClientManager>,
+    pub(crate) denials: Arc<ToolDenials>,
 }
 
 #[async_trait]
@@ -736,11 +731,16 @@ impl Tool for ListMcpResourceUpdatesTool {
         &self,
         _input: serde_json::Value,
         // Reads an in-process ledger; there is no round-trip to bound or interrupt.
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        // The update log is process-wide, so a parent's subscription to a denied server would show
-        // that server's resource URIs to a worker that cannot otherwise see it exists.
-        let updates: Vec<_> = crate::mcp::resource_updates::snapshot()
+        // The update log is shared by every session on this MCP context, so a parent's
+        // subscription to a denied server would show that server's resource URIs to a worker that
+        // cannot otherwise see it exists.
+        let updates: Vec<_> = self
+            .manager
+            .client_context
+            .resource_updates
+            .snapshot()
             .into_iter()
             .filter(|(server, _uri, _stamp)| !self.denials.denies_server(server))
             .collect();
@@ -752,7 +752,7 @@ impl Tool for ListMcpResourceUpdatesTool {
         }
         let body = updates
             .into_iter()
-            .map(|(server, uri, stamp)| format!("{}\t{}\t{}", server, uri, stamp))
+            .map(|(server, uri, stamp)| format!("{server}\t{uri}\t{stamp}"))
             .collect::<Vec<_>>()
             .join("\n");
         Ok(ToolOutput::text(body, false))
@@ -791,8 +791,8 @@ mod tests {
             "before\x1b[2Jafter\u{202E}rtl",
         )];
         let out = format_resource_contents(&contents, 1_000_000).join("\n");
-        assert!(!out.contains('\x1b'), "ANSI escape leaked: {:?}", out);
-        assert!(!out.contains('\u{202E}'), "RTL override leaked: {:?}", out);
+        assert!(!out.contains('\x1b'), "ANSI escape leaked: {out:?}");
+        assert!(!out.contains('\u{202E}'), "RTL override leaked: {out:?}");
         assert!(out.contains("before"));
         assert!(out.contains("after"));
         assert!(out.contains("rtl"));
@@ -878,7 +878,7 @@ mod tests {
     /// refactor accidentally drops `mark_deferred` calls here too, every MCP-using session would
     /// see seven extra tool schemas in its tools array on the first turn.
     #[tokio::test]
-    async fn test_mcp_resource_tools_remain_deferred() {
+    async fn mcp_resource_tools_remain_deferred() {
         use crate::{
             config::{McpServerConfig, McpTransport},
             mcp::{McpClientContext, McpClientManager},
@@ -901,7 +901,7 @@ mod tests {
             eager_load_tools: None,
             tool_permissions: None,
             trust_read_only_hint: None,
-            disabled: false,
+            disabled: None,
             required: None,
         };
         let context = McpClientContext::new();
@@ -912,7 +912,7 @@ mod tests {
         let registry = ToolRegistry::new();
         register_all(&registry, manager);
 
-        let entries = registry.tool_catalogue();
+        let entries = registry.tool_catalog();
         let by_name: std::collections::HashMap<_, _> =
             entries.iter().map(|(n, _, _, d)| (n.clone(), *d)).collect();
 
@@ -927,14 +927,12 @@ mod tests {
         ] {
             assert!(
                 by_name.contains_key(name),
-                "MCP resource tool {} not registered",
-                name
+                "MCP resource tool {name} not registered"
             );
             assert!(
                 by_name[name],
-                "MCP resource tool {} should still be deferred (would otherwise \
+                "MCP resource tool {name} should still be deferred (would otherwise \
                  bloat the tools array on every MCP-enabled session)",
-                name,
             );
         }
     }

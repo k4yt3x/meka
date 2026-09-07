@@ -2,23 +2,23 @@
 
 [Introduction](./introduction.md)
 
-# Getting Started
+# Getting started
 
 - [Installation](./getting-started/installation.md)
-- [Quick Start](./getting-started/quick-start.md)
+- [Quick start](./getting-started/quick-start.md)
 - [Upgrading](./getting-started/upgrading.md)
 
 # Configuration
 
 - [Overview](./configuration/overview.md)
-- [Config File](./configuration/config-file.md)
-- [Environment Variables](./configuration/environment-variables.md)
-- [CLI Options](./configuration/cli-options.md)
+- [Config file](./configuration/config-file.md)
+- [Environment variables](./configuration/environment-variables.md)
+- [CLI options](./configuration/cli-options.md)
 
 # Usage
 
-- [Interactive Mode](./usage/interactive-mode.md)
-- [One-Shot Mode](./usage/one-shot-mode.md)
+- [Interactive mode](./usage/interactive-mode.md)
+- [One-shot mode](./usage/one-shot-mode.md)
 - [ACP](./usage/acp.md)
 - [HTTP API](./usage/http-api.md)
 - [Permissions](./usage/permissions.md)
@@ -28,8 +28,8 @@
 - [Skills](./usage/skills.md)
 - [Memory](./usage/memory.md)
 - [Scheduling](./usage/scheduling.md)
-- [Background Tasks](./usage/background.md)
-- [Account Info](./usage/account.md)
+- [Background tasks](./usage/background.md)
+- [Account info](./usage/account.md)
 
 # Providers
 
@@ -43,9 +43,13 @@
 # Tools
 
 - [Overview](./tools/overview.md)
-- [File Operations](./tools/file-operations.md)
+- [File operations](./tools/file-operations.md)
 - [Search](./tools/search.md)
 - [Web](./tools/web.md)
 - [Shell](./tools/shell.md)
 - [Scratchpad](./tools/scratchpad.md)
+
+# Contributing
+
+- [Internals](./internals.md)
 

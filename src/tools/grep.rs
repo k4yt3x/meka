@@ -1,13 +1,12 @@
 //! `search_contents` tool: ripgrep-style content search powered by the `grep-*` crates, with glob
 //! filtering.
 //!
-//! It does **not** honour `.gitignore`, despite the name suggesting ripgrep's behaviour: the walk
+//! It does **not** honor `.gitignore`, despite the name suggesting ripgrep's behavior: the walk
 //! here is a hand-rolled `read_dir` traversal whose only exclusions are dotfiles, `target` and
 //! `node_modules`, and the `ignore` crate is not a dependency. Only the matcher comes from the
 //! `grep-*` family.
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 
 use super::{
     Tool, ToolOutput,
@@ -19,15 +18,12 @@ use crate::{
     provider::ToolDefinition,
 };
 
-/// Inline match cap when the agent isn't redirecting to the scratchpad. Single source of truth for
-/// the description and the runtime cap.
+/// Inline match cap when the agent isn't redirecting to the scratchpad, and the ceiling an explicit
+/// `limit` is clamped to. Single source of truth for the description and the runtime cap.
 const MAX_INLINE_MATCHES: usize = 100;
 
 pub(super) struct SearchContentsTool {
-    pub cwd: crate::workspace::SharedCwd,
-    /// Extra workspace roots swept when the caller names no explicit `path`. Empty outside a
-    /// multi-root ACP session.
-    pub roots: crate::workspace::SharedRoots,
+    pub(crate) site: crate::session::ToolSite,
 }
 
 #[async_trait]
@@ -44,17 +40,16 @@ impl Tool for SearchContentsTool {
                  if that returns nothing, widen the `path` by one level or \
                  loosen the `glob`, and repeat. Only fall back to a tree-wide \
                  scan if targeted attempts have all failed. Inline results are \
-                 capped at {} matches; use the `scratchpad` parameter to \
-                 collect an unbounded result set. Multiple independent \
+                 capped at {MAX_INLINE_MATCHES} matches; pass `limit` for fewer, or the \
+                 `scratchpad` parameter to collect an unbounded result set. Multiple independent \
                  search_contents calls in one assistant message run in parallel.",
-                MAX_INLINE_MATCHES,
             ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Regex pattern to search for"
+                        "description": "Regex pattern to search for."
                     },
                     "path": {
                         "type": "string",
@@ -63,6 +58,17 @@ impl Tool for SearchContentsTool {
                     "glob": {
                         "type": "string",
                         "description": "Glob pattern to filter files (e.g., '*.rs'). Strongly recommended when searching directories to avoid scanning unrelated files."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_INLINE_MATCHES,
+                        "default": MAX_INLINE_MATCHES,
+                        "description": format!(
+                            "Maximum matches to return, at most {MAX_INLINE_MATCHES}. Default: \
+                             {MAX_INLINE_MATCHES}, or unbounded when `scratchpad` is set and no \
+                             `limit` is passed."
+                        )
                     },
                     "scratchpad": {
                         "type": "string",
@@ -82,33 +88,37 @@ impl Tool for SearchContentsTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let pattern = require_str(&input, "pattern", "search_contents")?;
         // An explicit `path` searches exactly that tree, resolved against the per-session cwd. With
         // no `path`, sweep every workspace root: in a multi-root ACP workspace, searching only
-        // `cwd` silently misses whole folders the user can see in their editor.
-        // Carried as `PathBuf` end to end. Rendering each root through `to_string_lossy` and
-        // rebuilding it with `Path::new` replaced every non-UTF-8 byte with U+FFFD, so a working
-        // directory whose name is not valid UTF-8 -- `mkdir $'proj\xff'` -- named a directory that
-        // does not exist, and the tool reported the user's own cwd as missing under a spelling
-        // they never typed.
+        // `cwd` silently misses whole folders the user can see in their editor. Carried as
+        // `PathBuf` end to end. Rendering each root through `to_string_lossy` and rebuilding it
+        // with `Path::new` replaced every non-UTF-8 byte with U+FFFD, so a working directory whose
+        // name is not valid UTF-8 -- `mkdir $'proj\xff'` -- named a directory that does not exist,
+        // and the tool reported the user's own cwd as missing under a spelling they never typed.
         let search_paths: Vec<std::path::PathBuf> = match input["path"].as_str() {
-            Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.cwd, raw)],
-            None => crate::workspace::search_roots(&self.cwd, &self.roots),
+            Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
+            None => crate::workspace::search_roots(&self.site.cwd, &self.site.roots),
         };
         let file_glob = input["glob"].as_str().map(|s| s.to_string());
-        // Cap match count for inline use; lift it when redirecting output to the scratchpad so the
+        // Cap precedence, as `find_files` has it: an explicit `limit` wins, clamped to the inline
+        // cap the way `memory_search` clamps its own; with none, `scratchpad` lifts the cap so the
         // agent can collect an unbounded result set.
-        let max_results = if redirects_to_scratchpad(&input) {
-            usize::MAX
-        } else {
-            MAX_INLINE_MATCHES
+        let max_results = match input.get("limit").and_then(serde_json::Value::as_u64) {
+            Some(limit) => usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .clamp(1, MAX_INLINE_MATCHES),
+            None if redirects_to_scratchpad(&input) => usize::MAX,
+            None => MAX_INLINE_MATCHES,
         };
 
         // One budget for the whole call, not one per root: `WalkBudget::new` stamps its deadline at
         // construction, so a per-root budget would silently multiply the ceiling by the root count.
         let budget = WalkBudget::new(cancellation.clone());
+        let private = crate::workspace::private_directories_hidden_at(self.site.permission.get());
         let search = tokio::task::spawn_blocking(move || {
             search_with_grep(
                 &pattern,
@@ -116,6 +126,7 @@ impl Tool for SearchContentsTool {
                 file_glob.as_deref(),
                 max_results,
                 &budget,
+                &private,
             )
         });
 
@@ -125,7 +136,7 @@ impl Tool for SearchContentsTool {
         let result = tokio::select! {
             joined = search => joined.map_err(|error| MekaError::ToolExecution {
                 tool_name: "search_contents".to_string(),
-                message: format!("task join error: {}", error),
+                message: format!("task join error: {error}"),
             })??,
             _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
         };
@@ -144,33 +155,36 @@ fn search_with_grep(
     file_glob: Option<&str>,
     max_results: usize,
     budget: &WalkBudget,
+    // meka's own directories at this permission, which a named root may not be inside and the
+    // walk steps around; see `crate::workspace::private_read_refusal`.
+    private: &[std::path::PathBuf],
 ) -> Result<String> {
     use grep_regex::RegexMatcherBuilder;
 
     // Cap the compiled-regex automaton and DFA cache sizes so an LLM-supplied pattern like
     // `a{10_000_000}` can't exhaust host memory during compile.
-    const PATTERN_SIZE_LIMIT: usize = 1 << 20;
-    const DFA_SIZE_LIMIT: usize = 1 << 20;
+    const PATTERN_SIZE_BYTES: usize = crate::text::MIB;
+    const DFA_SIZE_BYTES: usize = crate::text::MIB;
 
     let matcher = RegexMatcherBuilder::new()
-        .size_limit(PATTERN_SIZE_LIMIT)
-        .dfa_size_limit(DFA_SIZE_LIMIT)
+        .size_limit(PATTERN_SIZE_BYTES)
+        .dfa_size_limit(DFA_SIZE_BYTES)
         .build(pattern)
         .map_err(|error| MekaError::ToolExecution {
             tool_name: "search_contents".to_string(),
-            message: format!("invalid or oversized regex '{}': {}", pattern, error),
+            message: format!("invalid or oversized regex '{pattern}': {error}"),
         })?;
 
     let mut results = Vec::new();
     let mut timed_out = false;
     // A root that doesn't exist is skipped rather than fatal, because one stale entry in a
     // multi-root workspace shouldn't sink a search the other roots can answer. With a single
-    // explicit `path` this reduces to today's behaviour exactly: nothing existed, so the error
+    // explicit `path` this reduces to today's behavior exactly: nothing existed, so the error
     // below fires with the same message.
     let mut searched_any = false;
     // Compiled lazily and at most once. Deliberately inside the directory branch rather than
     // hoisted above the loop: hoisting would report an invalid `glob` for a path that doesn't
-    // exist, or for a single file where the glob is irrelevant, changing single-root behaviour.
+    // exist, or for a single file where the glob is irrelevant, changing single-root behavior.
     let mut glob_pattern: Option<glob::Pattern> = None;
     // Roots left unsearched because the match cap filled up first. cwd is always root #1, so a
     // busy cwd would otherwise starve every other root and report only "truncated", which reads as
@@ -204,9 +218,21 @@ fn search_with_grep(
             continue;
         }
 
+        // A root the caller named is refused outright rather than stepped around: pointing `path`
+        // at the store is the question, and a silent empty answer would read as "nothing there".
+        if crate::workspace::resolves_into_private(path, private) {
+            return Err(MekaError::ToolExecution {
+                tool_name: "search_contents".to_string(),
+                message: format!(
+                    "'{}' is inside meka's own directories, which only `unrestricted` reads.",
+                    path.display()
+                ),
+            });
+        }
+
         if path.is_file() {
             searched_any = true;
-            search_file(&matcher, path, &mut results, max_results)?;
+            search_file(&matcher, path, &mut results, max_results, &mut unreadable)?;
         } else if path.is_dir() {
             searched_any = true;
             if glob_pattern.is_none()
@@ -216,19 +242,18 @@ fn search_with_grep(
                     Some(
                         glob::Pattern::new(g).map_err(|error| MekaError::ToolExecution {
                             tool_name: "search_contents".to_string(),
-                            message: format!("invalid glob pattern '{}': {}", g, error),
+                            message: format!("invalid glob pattern '{g}': {error}"),
                         })?,
                     );
             }
-            if walk_directory(
-                path,
-                &matcher,
-                &glob_pattern,
-                &mut results,
+            let scope = SearchScope {
+                matcher: &matcher,
+                glob_pattern: &glob_pattern,
                 max_results,
                 budget,
-                &mut unreadable,
-            )? {
+                private,
+            };
+            if walk_directory(path, &scope, &mut results, &mut unreadable)? {
                 timed_out = true;
                 break;
             }
@@ -265,13 +290,12 @@ fn search_with_grep(
     // found." on an unfinished search reads as a definitive answer.
     let mut notes: Vec<String> = Vec::new();
     if truncated {
-        notes.push(format!("truncated, showing first {} matches", max_results));
+        notes.push(format!("truncated, showing first {max_results} matches"));
     }
     if unsearched_roots > 0 {
         notes.push(format!(
-            "{} workspace root(s) were not searched because the match cap filled first: pass \
+            "{unsearched_roots} workspace root(s) were not searched because the match cap filled first: pass \
              `path` to search one of them directly, or `scratchpad` to lift the cap",
-            unsearched_roots,
         ));
     }
     if timed_out {
@@ -283,9 +307,8 @@ fn search_with_grep(
     }
     if unreadable > 0 {
         notes.push(format!(
-            "{} director(ies) could not be read and were skipped, so a match inside them would \
-             not appear here",
-            unreadable,
+            "{unreadable} file(s) or director(ies) could not be read and were skipped, so a match \
+             inside them would not appear here",
         ));
     }
 
@@ -309,6 +332,9 @@ fn search_file(
     path: &std::path::Path,
     results: &mut Vec<String>,
     max_results: usize,
+    // Counted like an unreadable directory: a file that cannot be opened or searched may hold the
+    // match, and dropping it at `debug!` let "No matches found." read as definitive.
+    unreadable: &mut usize,
 ) -> Result<()> {
     use grep_searcher::{Searcher, sinks::UTF8};
 
@@ -326,32 +352,58 @@ fn search_file(
             Ok(results.len() <= max_results)
         }),
     ) {
-        tracing::debug!("could not search {}: {}", path.display(), error);
+        let path = path.display();
+        tracing::debug!("failed to search {path}: {error}");
+        *unreadable += 1;
     }
 
     Ok(())
 }
 
-/// Walk `directory`, searching every file that passes `glob_pattern`. Returns whether the walk was
-/// stopped by the time budget; errors with [`MekaError::Interrupted`] when the turn was cancelled.
+/// What one search is judged against, the same for every root and every directory under it.
+struct SearchScope<'a> {
+    matcher: &'a grep_regex::RegexMatcher,
+    glob_pattern: &'a Option<glob::Pattern>,
+    max_results: usize,
+    budget: &'a WalkBudget,
+    /// meka's own directories at this permission, which the walk steps around; see
+    /// `crate::workspace::private_read_refusal`.
+    private: &'a [std::path::PathBuf],
+}
+
+/// Walk `directory`, searching every file that passes the scope's glob. Returns whether the walk
+/// was stopped by the time budget; errors with [`MekaError::Interrupted`] when the turn was
+/// canceled.
+///
+/// `unreadable` counts the directories the walk could not open and the files it could not search,
+/// so the caller can say so. A silent skip turns `search_contents` over a tree with an unreadable
+/// subdirectory into a confident "No matches found.", which is the definitive-sounding wrong answer
+/// the truncation and timeout notices already exist to prevent. `find_files` has reported this all
+/// along.
 fn walk_directory(
     directory: &std::path::Path,
-    matcher: &grep_regex::RegexMatcher,
-    glob_pattern: &Option<glob::Pattern>,
+    scope: &SearchScope<'_>,
     results: &mut Vec<String>,
-    max_results: usize,
-    budget: &WalkBudget,
-    // Directories the walk could not open, counted so the caller can say so. A silent skip turns
-    // `search_contents` over a tree with an unreadable subdirectory into a confident "No matches
-    // found.", which is the definitive-sounding wrong answer the truncation and timeout notices
-    // already exist to prevent. `find_files` has reported this all along.
     unreadable: &mut usize,
 ) -> Result<bool> {
+    let SearchScope {
+        matcher,
+        glob_pattern,
+        max_results,
+        budget,
+        private,
+    } = *scope;
     // Iterative traversal via an explicit work-stack: a recursive walk would overflow the call
     // stack on a pathologically deep directory tree.
     let mut pending: Vec<std::path::PathBuf> = vec![directory.to_path_buf()];
 
     while let Some(dir) = pending.pop() {
+        // Stepped around, like the dot-directories below: a root above meka's directories is a
+        // legitimate workspace, and what lies inside them is not this walk's to read. Resolved
+        // per directory, since the root itself need not be canonical.
+        if crate::workspace::resolves_into_private(&dir, private) {
+            continue;
+        }
         // Checked here as well as per entry: a run of directories that all fail `read_dir` (a tree
         // the user has no permission for) never reaches the inner loop, and would otherwise grind
         // through the whole work-stack without consulting the budget once.
@@ -364,11 +416,8 @@ fn walk_directory(
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
-                tracing::debug!(
-                    "search_contents: cannot read '{}': {}",
-                    dir.display(),
-                    error
-                );
+                let directory = dir.display();
+                tracing::debug!("search_contents: cannot read '{directory}': {error}");
                 *unreadable += 1;
                 continue;
             }
@@ -409,7 +458,14 @@ fn walk_directory(
                 {
                     continue;
                 }
-                search_file(matcher, &path, results, max_results)?;
+                // A symlink is the one way a file under a permitted directory resolves into
+                // meka's own; a regular file cannot, since the walk never descends a symlinked
+                // directory and every directory it does enter was judged above.
+                if file_type.is_symlink() && crate::workspace::resolves_into_private(&path, private)
+                {
+                    continue;
+                }
+                search_file(matcher, &path, results, max_results, unreadable)?;
                 // Stop walking once the cap is exceeded. Reading every remaining file on the
                 // machine to fill a result set that is already being truncated is pure waste.
                 if results.len() > max_results {
@@ -424,11 +480,117 @@ fn walk_directory(
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
-    use crate::tools::tests::text_content;
+
+    /// `search_contents` below `unrestricted` refuses a `path` inside meka's own directories, and a
+    /// walk from a root above them neither enters them nor follows a symlink into them. The
+    /// database is searched as bytes, so a pattern for a key prefix pulled runs out of `meka.db`.
+    #[tokio::test]
+    async fn search_contents_steps_around_meka_s_own_directories_below_unrestricted() {
+        use crate::permission::{EnabledPermissions, Permission, SharedPermission};
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let config_dir = home.path().join("meka-config");
+        std::fs::create_dir(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "token = \"sk-secret-value\"\n",
+        )
+        .expect("write config.toml");
+        std::fs::write(home.path().join("notes.txt"), "sk-public-value\n").expect("write notes");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            config_dir.join("config.toml"),
+            home.path().join("link.toml"),
+        )
+        .expect("symlink into the store");
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serializes every test
+        // that touches it, and the guard is held across the whole set -> search -> clear cycle.
+        let _env = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", &config_dir) };
+
+        let tool = SearchContentsTool {
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test())
+                .with_permission(SharedPermission::new(
+                    Permission::Read,
+                    EnabledPermissions::ALL,
+                )),
+        };
+        let named = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "sk-",
+                    "path": config_dir.to_str().expect("path")
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await;
+        let walked = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "sk-",
+                    "path": home.path().to_str().expect("path")
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = named.expect_err("a root inside the store is refused");
+        assert!(error.to_string().contains("meka's own"), "{error}");
+        let walked = walked.expect("a root above it is searched").text_content();
+        assert!(walked.contains("sk-public-value"), "{walked}");
+        assert!(
+            !walked.contains("sk-secret-value"),
+            "neither the directory nor the symlink into it is read: {walked}"
+        );
+    }
+
+    /// A file the search cannot open is counted with the directories it cannot read, so the
+    /// result says the answer may be incomplete instead of a definitive "No matches found.".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_file_is_reported_not_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let hidden = temp_dir.path().join("hidden.txt");
+        std::fs::write(&hidden, "needle\n").expect("write");
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read(&hidden).is_ok() {
+            // Running as root, where the mode is not a boundary; there is nothing to observe.
+            return;
+        }
+
+        let tool = SearchContentsTool {
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "needle",
+                    "path": temp_dir.path().to_str().expect("path")
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("the search completes");
+        let text = result.text_content();
+        assert!(text.contains("No matches found."), "{text}");
+        assert!(
+            text.contains("1 file(s) or director(ies) could not be read"),
+            "the unreadable file must be disclosed: {text}"
+        );
+    }
 
     #[tokio::test]
-    async fn test_search_contents() {
+    async fn search_contents_returns_every_matching_line() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         std::fs::write(
             temp_dir.path().join("test.txt"),
@@ -437,8 +599,9 @@ mod tests {
         .expect("failed");
 
         let tool = SearchContentsTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
@@ -446,55 +609,56 @@ mod tests {
                     "pattern": "hello",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
         assert!(!result.is_error);
-        assert!(text_content(&result).contains("hello world"));
-        assert!(text_content(&result).contains("hello again"));
+        assert!(result.text_content().contains("hello world"));
+        assert!(result.text_content().contains("hello again"));
     }
 
     /// The counterpart to `find_files`' nested-root test, pinning why the two tools use different
-    /// root sets. `search_contents` descends, so `search_roots` pruning `cwd` in favour of an
+    /// root sets. `search_contents` descends, so `search_roots` pruning `cwd` in favor of an
     /// ancestor genuinely loses nothing here. If that ever stops holding, this fails rather than
     /// the tool quietly reporting a file in `cwd` as absent.
     #[tokio::test]
-    async fn test_search_contents_reaches_cwd_through_an_ancestor_root() {
+    async fn search_contents_reaches_cwd_through_an_ancestor_root() {
         let top = tempfile::tempdir().expect("tempdir");
         let nested = top.path().join("main");
         std::fs::create_dir(&nested).expect("mkdir");
         std::fs::write(nested.join("README.md"), "needle here\n").expect("write");
 
         let tool = SearchContentsTool {
-            cwd: std::sync::Arc::new(std::sync::RwLock::new(nested.clone())),
-            roots: std::sync::Arc::new(std::sync::RwLock::new(vec![top.path().to_path_buf()])),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::SharedCwd::new(nested.clone()))
+                .with_roots(crate::workspace::SharedRoots::new(vec![
+                    top.path().to_path_buf(),
+                ])),
         };
         let result = tool
             .execute(
                 serde_json::json!({ "pattern": "needle" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             text.contains("needle here"),
-            "a descending walk from the ancestor must still reach cwd; got: {}",
-            text,
+            "a descending walk from the ancestor must still reach cwd; got: {text}",
         );
         assert_eq!(
             text.matches("README.md").count(),
             1,
-            "and must not report it twice; got: {}",
-            text,
+            "and must not report it twice; got: {text}",
         );
     }
 
     #[tokio::test]
-    async fn test_search_contents_deeply_nested_tree() {
+    async fn search_contents_deeply_nested_tree() {
         // Exercises the iterative work-stack traversal: a file buried many directory levels deep
         // must still be found. A recursive walk would recurse once per level; the iterative version
         // uses a heap stack.
@@ -507,8 +671,9 @@ mod tests {
         std::fs::write(deep.join("buried.txt"), "needle here\n").expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
@@ -516,25 +681,26 @@ mod tests {
                     "pattern": "needle",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
         assert!(!result.is_error);
-        assert!(text_content(&result).contains("needle here"));
+        assert!(result.text_content().contains("needle here"));
     }
 
     #[tokio::test]
-    async fn test_search_contents_inline_capped_at_100() {
+    async fn search_contents_inline_capped_at_100() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         // One file with 150 matching lines.
         let content = (0..150).map(|_| "match\n").collect::<String>();
         std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
@@ -542,51 +708,123 @@ mod tests {
                     "pattern": "match",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        assert!(text_content(&result).contains("truncated, showing first 100"));
+        assert!(
+            result
+                .text_content()
+                .contains("truncated, showing first 100")
+        );
+    }
+
+    /// `limit` lowers the inline cap and never raises it: the cap is the schema's declared
+    /// maximum, and a value past it is clamped rather than refused, as `memory_search` does.
+    #[tokio::test]
+    async fn a_limit_lowers_the_inline_cap_and_is_clamped_to_it() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let content = (0..150).map(|_| "match\n").collect::<String>();
+        std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
+
+        let tool = SearchContentsTool {
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
+        };
+        for (limit, shown) in [(10, 10), (1_000, MAX_INLINE_MATCHES)] {
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "pattern": "match",
+                        "path": temp_dir.path().to_str().expect("path"),
+                        "limit": limit,
+                    }),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("should succeed");
+            let text = result.text_content();
+            assert!(
+                text.contains(&format!("truncated, showing first {shown} matches")),
+                "limit {limit}: got {text}"
+            );
+            let match_lines = text.lines().filter(|line| line.contains(":match")).count();
+            assert_eq!(match_lines, shown, "limit {limit}: got {text}");
+        }
+    }
+
+    /// An explicit `limit` beats the unbounded default `scratchpad` would otherwise apply, the
+    /// precedence `find_files` documents for its own `limit`.
+    #[tokio::test]
+    async fn an_explicit_limit_beats_the_scratchpad_lift() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let content = (0..150).map(|_| "match\n").collect::<String>();
+        std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
+
+        let tool = SearchContentsTool {
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
+        };
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "pattern": "match",
+                    "path": temp_dir.path().to_str().expect("path"),
+                    "scratchpad": "matches",
+                    "limit": 10,
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("should succeed");
+        let text = result.text_content();
+        assert!(
+            text.contains("truncated, showing first 10 matches"),
+            "got: {text}"
+        );
     }
 
     #[tokio::test]
-    async fn test_search_contents_invalid_glob_errors() {
+    async fn search_contents_invalid_glob_errors() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp_dir.path().join("a.txt"), "match").expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
-        let err = tool
+        let error = tool
             .execute(
                 serde_json::json!({
                     "pattern": "match",
                     "path": temp_dir.path().to_str().expect("path"),
                     "glob": "[unclosed",
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("invalid glob must be rejected, not silently scan everything");
-        let message = format!("{}", err);
+        let message = format!("{error}");
         assert!(
             message.contains("invalid glob pattern"),
-            "unexpected error: {}",
-            message
+            "unexpected error: {message}"
         );
     }
 
     #[tokio::test]
-    async fn test_search_contents_scratchpad_lifts_cap() {
+    async fn search_contents_scratchpad_lifts_cap() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let content = (0..150).map(|_| "match\n").collect::<String>();
         std::fs::write(temp_dir.path().join("many.txt"), content).expect("write");
 
         let tool = SearchContentsTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
@@ -595,12 +833,12 @@ mod tests {
                     "path": temp_dir.path().to_str().expect("path"),
                     "scratchpad": "matches"
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             !text.contains("truncated"),
             "expected no truncation marker when scratchpad set"
@@ -608,23 +846,23 @@ mod tests {
         let match_lines = text.lines().filter(|l| l.contains("match")).count();
         assert!(
             match_lines >= 150,
-            "expected >= 150 match lines, got {}",
-            match_lines
+            "expected >= 150 match lines, got {match_lines}"
         );
     }
 
     #[tokio::test]
-    async fn test_search_contents_cancelled_search_is_interrupted() {
+    async fn search_contents_canceled_search_is_interrupted() {
         // An ignored cancellation token leaves a search rooted high in the tree running to
         // completion no matter what the user does.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..50 {
-            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "match\n").expect("write");
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "match\n").expect("write");
         }
 
         let tool = SearchContentsTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let cancellation = CancellationToken::new();
         cancellation.cancel();
@@ -634,11 +872,11 @@ mod tests {
                     "pattern": "match",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                cancellation,
+                crate::tools::ToolContext::detached(cancellation),
             )
             .await
-            .expect_err("a cancelled turn must not run the search to completion");
-        assert!(matches!(error, MekaError::Interrupted), "got: {}", error);
+            .expect_err("a canceled turn must not run the search to completion");
+        assert!(matches!(error, MekaError::Interrupted), "got: {error}");
     }
 
     /// A subdirectory the walk cannot open is not "no matches here", it is a part of the tree
@@ -661,8 +899,9 @@ mod tests {
         }
 
         let tool = SearchContentsTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
@@ -670,7 +909,7 @@ mod tests {
                     "pattern": "needle",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -678,11 +917,10 @@ mod tests {
         // Restore the mode so the temp dir can be torn down.
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).expect("unseal");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             text.contains("could not be read"),
-            "the unreadable directory must be named as unsearched, got: {}",
-            text
+            "the unreadable directory must be named as unsearched, got: {text}"
         );
     }
 
@@ -690,7 +928,7 @@ mod tests {
     /// root while the output said only "truncated" -- which reads as "the other folders had
     /// nothing", the exact failure multi-root support exists to prevent.
     #[test]
-    fn test_search_discloses_roots_left_unsearched_when_the_cap_fills() {
+    fn search_discloses_roots_left_unsearched_when_the_cap_fills() {
         let busy = tempfile::tempdir().expect("tempdir");
         let other = tempfile::tempdir().expect("tempdir");
         // More matches than the cap, all in the first root.
@@ -707,22 +945,21 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
+            &[],
         )
         .expect("search should return, not error");
 
-        assert!(output.contains("truncated"), "got: {}", output);
+        assert!(output.contains("truncated"), "got: {output}");
         assert!(
             output.contains("1 workspace root(s) were not searched"),
-            "an unsearched root must be disclosed, not implied by absence; got: {}",
-            output
+            "an unsearched root must be disclosed, not implied by absence; got: {output}"
         );
         // The note is prose the model reads and acts on, so pin it as prose: a `\`-continued string
         // literal that loses its leading-whitespace escape silently ships a run of spaces
         // mid-sentence, which no substring assertion would notice.
         assert!(
             !output.contains("  "),
-            "the disclosure must not contain runs of whitespace; got: {}",
-            output
+            "the disclosure must not contain runs of whitespace; got: {output}"
         );
     }
 
@@ -730,7 +967,7 @@ mod tests {
     /// skipped because the cap filled, and telling the model to `path`-search it directly buys a
     /// round trip that can only answer "does not exist".
     #[test]
-    fn test_search_does_not_blame_the_cap_for_a_stale_root() {
+    fn search_does_not_blame_the_cap_for_a_stale_root() {
         let busy = tempfile::tempdir().expect("tempdir");
         let body = (0..MAX_INLINE_MATCHES + 20)
             .map(|_| "needle\n")
@@ -747,21 +984,21 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
+            &[],
         )
         .expect("search should return, not error");
 
-        assert!(output.contains("truncated"), "got: {}", output);
+        assert!(output.contains("truncated"), "got: {output}");
         assert!(
             !output.contains("not searched"),
-            "a stale root is not a root the cap starved; got: {}",
-            output
+            "a stale root is not a root the cap starved; got: {output}"
         );
     }
 
     /// A budget that expired before any root was examined says nothing about whether the path
     /// exists, so it must not report "does not exist" -- a definitive answer the model acts on.
     #[test]
-    fn test_expired_budget_reports_timeout_not_missing_path() {
+    fn expired_budget_reports_timeout_not_missing_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::write(temp.path().join("a.txt"), "needle\n").expect("write");
 
@@ -773,13 +1010,14 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
+            &[],
         )
         .expect("an expired budget must not be reported as a missing path");
-        assert!(output.contains("still running"), "got: {}", output);
+        assert!(output.contains("still running"), "got: {output}");
     }
 
     #[test]
-    fn test_search_with_grep_discloses_timeout_with_no_matches() {
+    fn search_with_grep_discloses_timeout_with_no_matches() {
         // The dangerous shape: the budget expires before anything is found, and reporting a bare
         // "No matches found." would present an unfinished search as a definitive answer.
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -793,15 +1031,16 @@ mod tests {
             None,
             MAX_INLINE_MATCHES,
             &budget,
+            &[],
         )
         .expect("search should return, not error");
 
-        assert!(output.contains("No matches found."), "got: {}", output);
-        assert!(output.contains("incomplete"), "got: {}", output);
+        assert!(output.contains("No matches found."), "got: {output}");
+        assert!(output.contains("incomplete"), "got: {output}");
     }
 
     #[test]
-    fn test_search_file_stops_collecting_past_the_cap() {
+    fn search_file_stops_collecting_past_the_cap() {
         // A single file can hold millions of matching lines; the cap has to bound collection here
         // and not only at the end of the walk.
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -813,7 +1052,7 @@ mod tests {
             .build("match")
             .expect("matcher");
         let mut results = Vec::new();
-        search_file(&matcher, &file_path, &mut results, 10).expect("search");
+        search_file(&matcher, &file_path, &mut results, 10, &mut 0).expect("search");
 
         assert_eq!(
             results.len(),

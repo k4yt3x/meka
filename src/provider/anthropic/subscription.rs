@@ -8,10 +8,7 @@
 
 mod attestation;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -21,27 +18,28 @@ use uuid::Uuid;
 
 use super::shared::{
     self, DEFAULT_EFFORT, convert_messages_to_claude_content, convert_tools_to_claude_tools,
-    drive_claude_sse_stream, model_is_haiku, model_supports_effort,
-    model_supports_mid_conversation_system, model_supports_modern_features,
-    model_supports_temperature, parse_non_streaming_response,
+    model_is_haiku, model_supports_effort, model_supports_mid_conversation_system,
+    model_supports_modern_features, model_supports_temperature,
 };
 use crate::{
+    config::ThinkingMode,
+    conversation::Message,
     error::{MekaError, Result},
     provider::{
-        AccountIdentity, AccountUsage, AuthCredential, DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID,
-        ExtraUsage, Message, Notice, Provider, StopReason, StreamEvent, ThinkingMode, TokenUsage,
-        ToolDefinition, UsageHistory, UsageWindow,
+        AccountIdentity, AccountUsage, CompletionRequest, DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID,
+        ExtraUsage, Provider, StreamEvent, ThinkingOverride, ToolDefinition, UsageHistory,
+        UsageWindow,
     },
-    session::TokenStore,
+    store::{AuthCredential, TokenStore},
 };
 
 /// Claude Code system prompt prefix.
 const CC_SYSTEM_PROMPT_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-pub struct ClaudeSubscriptionProvider {
+pub(crate) struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
-    /// Serialises refreshes without blocking readers. Held across the database and network awaits
+    /// Serializes refreshes without blocking readers. Held across the database and network awaits
     /// a refresh performs; `credential` is not.
     refresh_gate: tokio::sync::Mutex<()>,
     base_url: String,
@@ -49,8 +47,8 @@ pub struct ClaudeSubscriptionProvider {
     client_id: String,
     oauth_token_url: String,
     token_store: Option<Arc<TokenStore>>,
-    /// Profile name this provider's credential is stored under, so refreshed tokens are written
-    /// back to the correct `provider_credentials` row.
+    /// Account name this provider's credential is stored under, so refreshed tokens are written
+    /// back to the correct `account_credentials` row.
     credential_key: String,
     session_id: String,
     device_id: String,
@@ -60,9 +58,17 @@ pub struct ClaudeSubscriptionProvider {
     account_uuid: String,
     thinking: ThinkingMode,
     thinking_budget_tokens: u64,
-    /// Set while an internal turn (compaction) runs, so its summary doesn't pay for reasoning.
-    /// Only ever suppresses; it cannot turn thinking on for a profile that asked for none.
-    thinking_suppressed: AtomicBool,
+    /// The access token a request site got a 401 for, read by every `ensure_valid_credential`
+    /// until a refresh installs a replacement.
+    ///
+    /// A rejection is the backend saying the stored expiry is wrong: the token was revoked, or
+    /// its issuer shortened lifetimes. The expiry alone would keep presenting the dead token until
+    /// it passed, which can be hours or, for an expiry meka had to assume, a full lifetime. The
+    /// token's identity rather than a flag, because a flag was spent by whichever read came first:
+    /// two requests refused in the same window left one of them re-sending the dead bearer and
+    /// failing with the login remedy while the other's refresh succeeded beside it. A second
+    /// rejection of the replacement is the account, not the token.
+    rejected_access_token: std::sync::Mutex<Option<String>>,
     /// The settled `output_config.effort` for the request body, resolved once at construction: the
     /// profile's value if it set one, otherwise [`DEFAULT_EFFORT`]. `None` only where the model
     /// takes no effort at all, and then the `effort-2025-11-24` beta is withheld too -- both read
@@ -73,31 +79,32 @@ pub struct ClaudeSubscriptionProvider {
     redact_thinking: bool,
     /// Per-request output token cap from the profile; `None` keeps the built-in default.
     max_output_tokens: Option<u64>,
-    /// Per-session counters incremented when image-redaction events fire.
-    session_stats: Option<Arc<crate::stats::SessionStats>>,
+    /// See [`crate::config::ProfileConfig::max_request_bytes`].
+    max_request_bytes: Option<usize>,
 }
 
 impl ClaudeSubscriptionProvider {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        credential: AuthCredential,
-        model: String,
-        base_url: Option<String>,
-        client_id: Option<String>,
-        oauth_token_url: Option<String>,
-        token_store: Option<Arc<TokenStore>>,
-        credential_key: String,
-        thinking: ThinkingMode,
-        thinking_budget_tokens: u64,
-        device_id: String,
-        effort: Option<String>,
-        redact_thinking: bool,
-        max_output_tokens: Option<u64>,
-        session_stats: Option<Arc<crate::stats::SessionStats>>,
-    ) -> Result<Self> {
+    pub(crate) fn new(settings: crate::provider::ProviderBuilder) -> Result<Self> {
+        let credential_key = settings.credential_key_or_default();
+        let crate::provider::ProviderBuilder {
+            credential,
+            model,
+            base_url,
+            client_id,
+            oauth_token_url,
+            token_store,
+            thinking,
+            thinking_budget_tokens,
+            device_id,
+            effort,
+            redact_thinking,
+            max_output_tokens,
+            max_request_bytes,
+            ..
+        } = settings;
         let account_uuid = match &credential {
             AuthCredential::OAuthToken { account_id, .. } => account_id.clone().unwrap_or_default(),
-            _ => String::new(),
+            AuthCredential::ApiKey(_) => String::new(),
         };
         let configured_effort = crate::provider::resolve_effort_level(effort.as_deref());
         // Settled once, because it is a property of the profile and the model rather than of a
@@ -108,9 +115,7 @@ impl ClaudeSubscriptionProvider {
         } else {
             if let Some(configured) = &configured_effort {
                 tracing::warn!(
-                    "model '{}' takes no reasoning effort; ignoring the profile's effort = '{}'",
-                    model,
-                    configured
+                    "model '{model}' takes no reasoning effort; ignoring the profile's effort = '{configured}'"
                 );
             }
             None
@@ -136,16 +141,16 @@ impl ClaudeSubscriptionProvider {
             account_uuid,
             thinking,
             thinking_budget_tokens,
-            thinking_suppressed: AtomicBool::new(false),
+            rejected_access_token: std::sync::Mutex::new(None),
             resolved_effort,
             redact_thinking,
             max_output_tokens,
-            session_stats,
+            max_request_bytes,
         })
     }
 
-    fn effective_thinking(&self) -> ThinkingMode {
-        shared::effective_thinking(&self.thinking_suppressed, self.thinking)
+    fn effective_thinking(&self, thinking: ThinkingOverride) -> ThinkingMode {
+        shared::effective_thinking(thinking, self.thinking)
     }
 
     /// The settled effort to send as `output_config.effort` (see [`Self::resolved_effort`]). The
@@ -184,7 +189,7 @@ impl ClaudeSubscriptionProvider {
     /// the `redact_thinking` knob (default on) is an opt-out. With it on, the model returns empty
     /// `thinking` blocks carrying only a signature, plus opaque `redacted_thinking` blocks; both
     /// are preserved and replayed verbatim (see
-    /// [`crate::provider::ContentBlock::RedactedThinking`]).
+    /// [`crate::conversation::ContentBlock::RedactedThinking`]).
     fn compute_betas(&self, has_tools: bool) -> Option<String> {
         let model = self.model.as_str();
         let mut parts: Vec<&'static str> = Vec::with_capacity(12);
@@ -232,7 +237,7 @@ impl ClaudeSubscriptionProvider {
     /// expiry.
     ///
     /// Concurrency contract (relevant under multi-session ACP where two sessions may call this in
-    /// parallel): `refresh_gate` serialises refreshers, and `credential` is held only across the
+    /// parallel): `refresh_gate` serializes refreshers, and `credential` is held only across the
     /// reads and writes themselves, never across an await on the network or the database. Two tasks
     /// that both observe an expiring token queue on the gate; the loser re-checks after acquiring
     /// it and finds the winner's fresh token. Exactly one refresh API call fires under
@@ -244,7 +249,11 @@ impl ClaudeSubscriptionProvider {
     /// process, not just the one refreshing. A stalled refresh now blocks only another refresh, and
     /// the bounded HTTP timeout ends even that.
     async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
-        {
+        // Compared, not consumed: the rejection stands until a refresh replaces the token it
+        // names, so a second request carrying the same refused bearer refreshes too instead of
+        // finding a flag the first one spent.
+        let refused = crate::sync::lock(&self.rejected_access_token).clone();
+        let (rejected, entry_access_token) = {
             let credential = self.credential.read().await;
             match &*credential {
                 AuthCredential::ApiKey(_) => {
@@ -258,29 +267,31 @@ impl ClaudeSubscriptionProvider {
                     refresh_token,
                     ..
                 } => {
-                    if !crate::provider::oauth_needs_refresh(
-                        *expires_at,
-                        refresh_token.is_some(),
-                        crate::provider::now_epoch_millis(),
-                    ) {
-                        return Ok(("Authorization", format!("Bearer {}", access_token)));
+                    let rejected = refused.as_deref() == Some(access_token.as_str());
+                    if !rejected
+                        && !crate::oauth::oauth_needs_refresh(
+                            *expires_at,
+                            refresh_token.is_some(),
+                            crate::oauth::now_epoch_millis(),
+                        )
+                    {
+                        return Ok(("Authorization", crate::text::bearer(access_token)));
                     }
+                    (rejected, access_token.clone())
                 }
             }
-        }
+        };
 
         // Token expired: attempt refresh. Only refreshers queue here; readers are untouched.
         let _refreshing = self.refresh_gate.lock().await;
 
         // And the same thing one layer out. `refresh_gate` is a `tokio::sync::Mutex`, so it
-        // serialises the tasks in *this* process and says nothing about the meka in the next
+        // serializes the tasks in *this* process and says nothing about the meka in the next
         // terminal, which is holding the same refresh token and is just as due. Bounded, and
         // advisory: the compare-and-swap on the write is what makes the outcome correct whether or
         // not this is held.
         let _across_processes = match &self.token_store {
-            Some(store) => {
-                crate::provider::await_credential_lock(store, &self.credential_key).await
-            }
+            Some(store) => crate::oauth::await_credential_lock(store, &self.credential_key).await,
             None => None,
         };
 
@@ -291,24 +302,37 @@ impl ClaudeSubscriptionProvider {
         //
         // The store call is awaited with no credential lock held, and the result installed under a
         // write lock that spans an assignment and nothing else.
+        //
+        // Installed only when it is at least as new as what memory holds. The row is behind in one
+        // case, a refresh in this process whose persist failed: adopting it spent a refresh token
+        // the issuer had already retired while the live one sat here. The row's version is kept
+        // either way: the refresh below replaces the row on it, so a stale row catches up.
+        let mut observed_version = None;
         if let Some(store) = &self.token_store {
-            match store.load_provider_credential(&self.credential_key).await {
-                Ok(Some(latest)) => *self.credential.write().await = latest,
+            match store
+                .load_account_credential_versioned(&self.credential_key)
+                .await
+            {
+                Ok(Some(latest)) => {
+                    let crate::store::StoredCredential {
+                        credential: latest,
+                        version,
+                    } = latest;
+                    observed_version = Some(version);
+                    let mut credential = self.credential.write().await;
+                    if crate::oauth::row_is_at_least_as_new(&credential, &latest) {
+                        *credential = latest;
+                    }
+                }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(
-                        "failed to re-read Claude OAuth token before refresh: {}",
-                        error
-                    );
+                    tracing::warn!("failed to re-read Claude OAuth token before refresh: {error}");
                 }
             }
         }
 
         // Double-check after the DB re-read: another task or process may have already rotated and
         // persisted a new access token that is still valid.
-        // Cloned whole, not just its refresh token: the swap below has to name the exact credential
-        // this refresh is derived from, and anything less cannot tell "the row still holds what I
-        // read" from "the row holds something equivalent".
         let derived_from = {
             let credential = self.credential.read().await;
             if let AuthCredential::OAuthToken {
@@ -317,13 +341,21 @@ impl ClaudeSubscriptionProvider {
                 refresh_token,
                 ..
             } = &*credential
-                && !crate::provider::oauth_needs_refresh(
-                    *expires_at,
-                    refresh_token.is_some(),
-                    crate::provider::now_epoch_millis(),
-                )
             {
-                return Ok(("Authorization", format!("Bearer {}", access_token)));
+                // After a rejection the expiry is not trusted, but a token that is not the refused
+                // one is: a sibling process may already have rotated past it.
+                let usable = if rejected {
+                    *access_token != entry_access_token
+                } else {
+                    !crate::oauth::oauth_needs_refresh(
+                        *expires_at,
+                        refresh_token.is_some(),
+                        crate::oauth::now_epoch_millis(),
+                    )
+                };
+                if usable {
+                    return Ok(("Authorization", crate::text::bearer(access_token)));
+                }
             }
             credential.clone()
         };
@@ -333,12 +365,17 @@ impl ClaudeSubscriptionProvider {
                 account_id,
                 ..
             } => (refresh_token.clone(), account_id.clone()),
-            _ => (None, None),
+            AuthCredential::ApiKey(_) => (None, None),
         };
 
+        // With nothing to refresh with, a rejected or expired token has one remedy, and this is
+        // the one exit from the refresh path that did not name it.
         let Some(refresh_token) = refresh_token else {
-            return Err(MekaError::Provider(
-                "OAuth access token expired and no refresh token available".to_string(),
+            return Err(crate::oauth::with_login_remedy(
+                MekaError::Provider(
+                    "OAuth access token expired and no refresh token available".to_string(),
+                ),
+                &self.credential_key,
             ));
         };
 
@@ -351,10 +388,10 @@ impl ClaudeSubscriptionProvider {
         // back is the newer credential to use instead of this one.
         let new_credential = match &self.token_store {
             Some(store) => {
-                crate::provider::store_refreshed_credential(
+                crate::oauth::store_refreshed_credential(
                     store,
                     &self.credential_key,
-                    &derived_from,
+                    observed_version.as_deref(),
                     refreshed,
                 )
                 .await
@@ -380,7 +417,71 @@ impl ClaudeSubscriptionProvider {
 
         let (header_name, header_value) = new_credential.auth_header();
         *self.credential.write().await = new_credential;
+        // The refused token is gone, whatever the issuer minted; a rejection of the replacement is
+        // recorded afresh by the request that meets it.
+        crate::sync::lock(&self.rejected_access_token).take();
         Ok((header_name, header_value))
+    }
+
+    /// Record that the backend refused the current access token, so every credential read until
+    /// it is replaced refreshes it instead of trusting the stored expiry.
+    async fn note_credential_rejected(&self) {
+        tracing::warn!(
+            "claude-subscription rejected the access token; refreshing it and retrying once"
+        );
+        let refused = match &*self.credential.read().await {
+            AuthCredential::OAuthToken { access_token, .. } => Some(access_token.clone()),
+            AuthCredential::ApiKey(_) => None,
+        };
+        *crate::sync::lock(&self.rejected_access_token) = refused;
+    }
+
+    /// GET one of the OAuth account endpoints (usage, profile, history) as text.
+    ///
+    /// The three shared everything but the path and the word in their error messages, and each
+    /// needs the same one retry after a 401 that a completion gets. `what` names the call in the
+    /// transport and read errors, which is how a user tells a usage probe from a profile read.
+    async fn fetch_oauth_endpoint(&self, path: &str, what: &str) -> Result<String> {
+        let response = crate::oauth::send_with_one_refresh(
+            self,
+            crate::error::ProviderRequest::Auxiliary,
+            |error| {
+                crate::error::provider_transport_error(
+                    &format!("{what} request failed"),
+                    error,
+                    None,
+                )
+            },
+            || async {
+                let (auth_name, auth_value) = self.ensure_valid_credential().await?;
+                Ok(attestation::apply_headers(
+                    self.client.get(format!("{}{}", self.base_url, path)),
+                    auth_name,
+                    &auth_value,
+                    &self.session_id,
+                    Some("oauth-2025-04-20"),
+                ))
+            },
+        )
+        .await?;
+        let status = response.status();
+        let retry_after = crate::error::parse_retry_after(response.headers());
+        let text = response.text().await.map_err(|error| {
+            crate::error::provider_transport_error(
+                &format!("failed to read {what} response"),
+                &error,
+                retry_after,
+            )
+        })?;
+        if !status.is_success() {
+            return Err(crate::error::provider_http_error(
+                status,
+                &text,
+                retry_after,
+                crate::error::ProviderRequest::Auxiliary,
+            ));
+        }
+        Ok(text)
     }
 
     async fn refresh_oauth_token(
@@ -405,26 +506,27 @@ impl ClaudeSubscriptionProvider {
 
         // Only the shape of the answer is this backend's own; posting the grant and judging what
         // came back is the same act for every issuer, and lives in one place so it cannot drift
-        // between the two subscription backends (see `provider::exchange_refresh_token`).
+        // between the two subscription backends (see `crate::oauth::exchange_refresh_token`).
         let data: RefreshResponse =
-            crate::provider::exchange_refresh_token(crate::provider::RefreshExchange {
+            crate::oauth::exchange_refresh_token(crate::oauth::RefreshExchange {
                 client: &self.client,
                 token_url: &self.oauth_token_url,
                 client_id: &self.client_id,
                 refresh_token,
-                profile: &self.credential_key,
+                account: &self.credential_key,
                 context: "OAuth token refresh",
             })
             .await?;
 
-        // Saturating rather than wrapping: a nonsense `expires_in` should read as "far future" and
-        // let the 401 correct it, not overflow to a past instant and refresh on every request.
-        //
-        // An *absent* `expires_in` gets an assumed lifetime rather than staying `None`, for the
-        // same reason: `None` reads as due, so a token whose issuer never states an expiry sent
-        // every later request back through this whole path, rotating the refresh token each time.
+        // An absent or nonsensical `expires_in` gets the assumed lifetime rather than `None` or
+        // "never". `None` reads as due, so a token whose issuer never states an expiry sent every
+        // later request back through this whole path, rotating the refresh token each time. And a
+        // far-future stamp pins whatever the issuer actually minted for the rest of the process:
+        // the 401 that would correct it forces one refresh, but a bounded guess is what makes that
+        // the exception rather than the only path off a dead token.
+        let now = crate::oauth::now_epoch_millis();
         let expires_at = Some(data.expires_in.map_or_else(
-            || crate::provider::oauth_assumed_expiry(crate::provider::now_epoch_millis()),
+            || crate::oauth::oauth_assumed_expiry(now),
             |seconds| {
                 // `try_from` rather than `as`: the cast wraps, and it happens *before* the
                 // `checked_mul` that was supposed to make this saturating, so an `expires_in` past
@@ -433,9 +535,10 @@ impl ClaudeSubscriptionProvider {
                 i64::try_from(seconds)
                     .ok()
                     .and_then(|seconds| seconds.checked_mul(1000))
-                    .map_or(i64::MAX, |millis| {
-                        crate::provider::now_epoch_millis().saturating_add(millis)
-                    })
+                    .map_or_else(
+                        || crate::oauth::oauth_assumed_expiry(now),
+                        |millis| now.saturating_add(millis),
+                    )
             },
         ));
 
@@ -459,8 +562,11 @@ impl ClaudeSubscriptionProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
         stream: bool,
+        thinking: ThinkingOverride,
+        attribution: &crate::provider::Attribution,
     ) -> serde_json::Value {
-        let claude_messages = convert_messages_to_claude_content(messages);
+        let claude_messages =
+            convert_messages_to_claude_content(messages, super::shared::CacheBreakpoint::OneHour);
 
         let metadata_user_id = serde_json::json!({
             "device_id": self.device_id,
@@ -484,7 +590,7 @@ impl ClaudeSubscriptionProvider {
         body.insert("messages".to_string(), serde_json::json!(claude_messages));
 
         if !system_prompt.is_empty() {
-            let billing_header = attestation::generate_billing_header(messages);
+            let billing_header = attestation::generate_billing_header(messages, attribution);
             // Matches recent Claude Code wire shape: only the user system prompt carries
             // `cache_control`. Billing header and identity prefix are unmarked; the source's
             // Billing header and identity prefix are unmarked, and the `1h` ttl is what an OAuth
@@ -525,7 +631,7 @@ impl ClaudeSubscriptionProvider {
 
         shared::insert_thinking_fields(
             &mut body,
-            self.effective_thinking(),
+            self.effective_thinking(thinking),
             self.thinking_budget_tokens,
             self.max_output_tokens,
         );
@@ -533,13 +639,14 @@ impl ClaudeSubscriptionProvider {
         // Claude Code sends `temperature: 1` only when thinking is off AND the model is on the
         // sampling-params allowlist (see `model_supports_temperature`). Opus 4.7+, the 5 line, and
         // Fable/Mythos reject `temperature` with a 400.
-        if !self.effective_thinking().is_on() && model_supports_temperature(&self.model) {
+        if !self.effective_thinking(thinking).is_on() && model_supports_temperature(&self.model) {
             body.insert("temperature".to_string(), serde_json::json!(1));
         }
 
         // Mirrors `Yph`, which returns exactly this edit when thinking is on and nothing
         // otherwise: it preserves thinking blocks across previous assistant turns.
-        if self.effective_thinking().is_on() && model_supports_modern_features(&self.model) {
+        if self.effective_thinking(thinking).is_on() && model_supports_modern_features(&self.model)
+        {
             body.insert(
                 "context_management".to_string(),
                 serde_json::json!({
@@ -562,217 +669,129 @@ impl ClaudeSubscriptionProvider {
 }
 
 #[async_trait]
-impl Provider for ClaudeSubscriptionProvider {
-    async fn complete(
+impl crate::oauth::RefreshesCredential for ClaudeSubscriptionProvider {
+    /// Sent once more after a 401, on a credential refreshed for the purpose; see
+    /// `rejected_access_token`. A second refusal gets the login remedy instead.
+    async fn refresh_after_rejection(&self) -> bool {
+        self.note_credential_rejected().await;
+        true
+    }
+
+    fn with_login_remedy(&self, error: MekaError) -> MekaError {
+        crate::oauth::with_login_remedy(error, &self.credential_key)
+    }
+}
+
+#[async_trait]
+impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
+    fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    fn endpoint(&self) -> String {
+        format!("{}/v1/messages?beta=true", self.base_url)
+    }
+
+    fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+            .unwrap_or(super::shared::MAX_REQUEST_BYTES)
+    }
+
+    fn request_body(
         &self,
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage, Vec<Notice>)> {
-        let (body_json, redaction_notice) =
-            shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
-                serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, false))
-                    .map_err(|error| {
-                        MekaError::Provider(format!("failed to serialize body: {}", error))
-                    })
-            })?;
-        let body_json = if !system_prompt.is_empty() {
-            attestation::patch_request_body(&body_json)?
+        stream: bool,
+        thinking: ThinkingOverride,
+        attribution: &crate::provider::Attribution,
+    ) -> serde_json::Value {
+        self.build_request_body(
+            system_prompt,
+            messages,
+            tools,
+            stream,
+            thinking,
+            attribution,
+        )
+    }
+
+    fn finish_body(&self, system_prompt: &str, body_json: String) -> Result<String> {
+        if system_prompt.is_empty() {
+            Ok(body_json)
         } else {
-            body_json
-        };
-        let body_length = body_json.len();
+            attestation::patch_request_body(&body_json)
+        }
+    }
+
+    async fn authenticated_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        has_tools: bool,
+        _stream: bool,
+        _thinking: ThinkingOverride,
+    ) -> Result<reqwest::RequestBuilder> {
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
-
-        let betas = self.compute_betas(!tools.is_empty());
-
-        let request = attestation::apply_headers(
-            self.client
-                .post(format!("{}/v1/messages?beta=true", self.base_url)),
+        Ok(attestation::apply_headers(
+            request,
             auth_header_name,
             &auth_header_value,
             &self.session_id,
-            betas.as_deref(),
-        );
+            self.compute_betas(has_tools).as_deref(),
+        ))
+    }
 
-        let response = request.body(body_json).send().await.map_err(|error| {
-            crate::error::provider_transport_error(
-                &format!(
-                    "HTTP request failed (body {} MiB)",
-                    shared::body_size_mib(body_length)
-                ),
-                &error,
-                None,
-            )
-        })?;
+    fn remember_request_id(
+        &self,
+        attribution: &crate::provider::Attribution,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        remember_request_id(attribution, headers);
+    }
+}
 
-        let status = response.status();
-        let retry_after = crate::error::parse_retry_after(response.headers());
-        remember_request_id(response.headers());
-        let response_text = response.text().await.map_err(|error| {
-            crate::error::provider_transport_error("failed to read response", &error, retry_after)
-        })?;
-
-        if !status.is_success() {
-            return Err(crate::error::provider_http_error(
-                status,
-                &response_text,
-                retry_after,
-                crate::error::ProviderRequest::Completion,
-            ));
-        }
-
-        let response_json: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|error| MekaError::Provider(format!("invalid JSON response: {}", error)))?;
-
-        let (message, stop_reason, usage) = parse_non_streaming_response(&response_json)?;
-        let notices = redaction_notice.into_iter().collect();
-        Ok((message, stop_reason, usage, notices))
+#[async_trait]
+impl Provider for ClaudeSubscriptionProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest<'_>,
+    ) -> Result<crate::provider::Completion> {
+        shared::complete(self, request).await
     }
 
     async fn stream(
         &self,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[ToolDefinition],
+        request: CompletionRequest<'_>,
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let (body_json, redaction_notice) =
-            shared::build_body_within_budget(messages, self.session_stats.as_ref(), |msgs| {
-                serde_json::to_string(&self.build_request_body(system_prompt, msgs, tools, true))
-                    .map_err(|error| {
-                        MekaError::Provider(format!("failed to serialize body: {}", error))
-                    })
-            })?;
-        // Surface the redaction notice ahead of any provider text. See the mirror in
-        // `provider/anthropic/messages.rs::stream` for the rationale.
-        if let Some(notice) = redaction_notice
-            && let Err(error) = event_sender.send(StreamEvent::Notice(notice)).await
-        {
-            tracing::debug!("failed to forward redaction notice into stream: {}", error);
-        }
-        let body_json = if !system_prompt.is_empty() {
-            attestation::patch_request_body(&body_json)?
-        } else {
-            body_json
-        };
-        let body_length = body_json.len();
-        let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
-
-        let betas = self.compute_betas(!tools.is_empty());
-
-        let request = attestation::apply_headers(
-            self.client
-                .post(format!("{}/v1/messages?beta=true", self.base_url)),
-            auth_header_name,
-            &auth_header_value,
-            &self.session_id,
-            betas.as_deref(),
-        );
-
-        let response = request.body(body_json).send().await.map_err(|error| {
-            crate::error::provider_transport_error(
-                &format!(
-                    "HTTP request failed (body {} MiB)",
-                    shared::body_size_mib(body_length)
-                ),
-                &error,
-                None,
-            )
-        })?;
-
-        remember_request_id(response.headers());
-        drive_claude_sse_stream(response, event_sender, cancellation).await
-    }
-
-    fn name(&self) -> &str {
-        "claude-subscription"
+        shared::stream(self, request, event_sender, cancellation).await
     }
 
     fn resolved_effort(&self) -> Option<String> {
         self.wire_effort()
     }
 
-    fn suppress_thinking(&self, suppressed: bool) {
-        self.thinking_suppressed
-            .store(suppressed, Ordering::Relaxed);
-    }
-
     async fn fetch_usage(&self) -> Result<Option<AccountUsage>> {
-        let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
         // Reuse the full Claude Code header set; the `oauth-2025-04-20` beta is what unlocks the
         // usage endpoint for OAuth tokens.
-        let request = attestation::apply_headers(
-            self.client
-                .get(format!("{}/api/oauth/usage", self.base_url)),
-            auth_header_name,
-            &auth_header_value,
-            &self.session_id,
-            Some("oauth-2025-04-20"),
-        );
-        let response = request.send().await.map_err(|error| {
-            crate::error::provider_transport_error("usage request failed", &error, None)
-        })?;
-        let status = response.status();
-        let retry_after = crate::error::parse_retry_after(response.headers());
-        let response_text = response.text().await.map_err(|error| {
-            crate::error::provider_transport_error(
-                "failed to read usage response",
-                &error,
-                retry_after,
-            )
-        })?;
-        if !status.is_success() {
-            return Err(crate::error::provider_http_error(
-                status,
-                &response_text,
-                retry_after,
-                crate::error::ProviderRequest::Auxiliary,
-            ));
-        }
+        let response_text = self
+            .fetch_oauth_endpoint("/api/oauth/usage", "usage")
+            .await?;
         let parsed: OAuthUsageResponse = serde_json::from_str(&response_text)
-            .map_err(|error| MekaError::Provider(format!("invalid usage JSON: {}", error)))?;
+            .map_err(|error| MekaError::Provider(format!("invalid usage JSON: {error}")))?;
         Ok(Some(parsed.into_account_usage()))
     }
 
     async fn fetch_identity(&self) -> Result<Option<AccountIdentity>> {
-        let (auth_name, auth_value) = self.ensure_valid_credential().await?;
-
         // Required: the profile (identity + plan/tier/org).
-        let profile_text = {
-            let request = attestation::apply_headers(
-                self.client
-                    .get(format!("{}/api/oauth/profile", self.base_url)),
-                auth_name,
-                &auth_value,
-                &self.session_id,
-                Some("oauth-2025-04-20"),
-            );
-            let response = request.send().await.map_err(|error| {
-                crate::error::provider_transport_error("profile request failed", &error, None)
-            })?;
-            let status = response.status();
-            let retry_after = crate::error::parse_retry_after(response.headers());
-            let text = response.text().await.map_err(|error| {
-                crate::error::provider_transport_error(
-                    "failed to read profile response",
-                    &error,
-                    retry_after,
-                )
-            })?;
-            if !status.is_success() {
-                return Err(crate::error::provider_http_error(
-                    status,
-                    &text,
-                    retry_after,
-                    crate::error::ProviderRequest::Auxiliary,
-                ));
-            }
-            text
-        };
+        let profile_text = self
+            .fetch_oauth_endpoint("/api/oauth/profile", "profile")
+            .await?;
+        // The credential the profile read succeeded with, for the best-effort call below.
+        let (auth_name, auth_value) = self.ensure_valid_credential().await?;
         let profile: OAuthProfileResponse = serde_json::from_str(&profile_text)
-            .map_err(|error| MekaError::Provider(format!("invalid profile JSON: {}", error)))?;
+            .map_err(|error| MekaError::Provider(format!("invalid profile JSON: {error}")))?;
 
         // Best-effort: the org/workspace role. A failure here (missing scope, network) must not
         // sink the whole command, so any error degrades `role` to `None`.
@@ -801,43 +820,15 @@ impl Provider for ClaudeSubscriptionProvider {
 
     async fn fetch_history(&self) -> Result<Option<UsageHistory>> {
         // Anthropic exposes only a first-used date, not the rich Codex-style stats.
-        let (auth_name, auth_value) = self.ensure_valid_credential().await?;
-        let request = attestation::apply_headers(
-            self.client.get(format!(
-                "{}/api/organization/claude_code_first_token_date",
-                self.base_url
-            )),
-            auth_name,
-            &auth_value,
-            &self.session_id,
-            Some("oauth-2025-04-20"),
-        );
-        let response = request.send().await.map_err(|error| {
-            crate::error::provider_transport_error("history request failed", &error, None)
-        })?;
-        let status = response.status();
-        let retry_after = crate::error::parse_retry_after(response.headers());
-        let text = response.text().await.map_err(|error| {
-            crate::error::provider_transport_error(
-                "failed to read history response",
-                &error,
-                retry_after,
-            )
-        })?;
-        if !status.is_success() {
-            return Err(crate::error::provider_http_error(
-                status,
-                &text,
-                retry_after,
-                crate::error::ProviderRequest::Auxiliary,
-            ));
-        }
+        let text = self
+            .fetch_oauth_endpoint("/api/organization/claude_code_first_token_date", "history")
+            .await?;
         #[derive(Deserialize)]
         struct FirstTokenDate {
             first_token_date: Option<String>,
         }
         let parsed: FirstTokenDate = serde_json::from_str(&text)
-            .map_err(|error| MekaError::Provider(format!("invalid history JSON: {}", error)))?;
+            .map_err(|error| MekaError::Provider(format!("invalid history JSON: {error}")))?;
         Ok(Some(UsageHistory {
             lifetime_tokens: None,
             peak_daily_tokens: None,
@@ -905,12 +896,15 @@ impl OAuthUsageResponse {
 /// Claude Code stamps the id onto the assistant message as soon as the request resolves, error or
 /// not. A response with no `request-id` (a proxy that drops it) simply leaves the previous value in
 /// place, which is what Claude Code's "last assistant message that has one" does too.
-fn remember_request_id(headers: &reqwest::header::HeaderMap) {
+fn remember_request_id(
+    attribution: &crate::provider::Attribution,
+    headers: &reqwest::header::HeaderMap,
+) {
     if let Some(request_id) = headers
         .get("request-id")
         .and_then(|value| value.to_str().ok())
     {
-        crate::provider::record_request_id(request_id);
+        attribution.record_request_id(request_id);
     }
 }
 
@@ -1010,8 +1004,11 @@ impl OAuthProfileResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{attestation::CC_VERSION, *};
-    use crate::provider::{ContentBlock, Role, ToolResultContent};
+    use super::{attestation::CC_VERSION, shared::parse_non_streaming_response, *};
+    use crate::{
+        conversation::{ContentBlock, Role, ToolResultContent},
+        provider::StopReason,
+    };
 
     /// The body's keys in the order they will be serialized, which is the order they go on the
     /// wire: `serde_json`'s `preserve_order` feature makes `Map` insertion-ordered, and Claude
@@ -1024,26 +1021,28 @@ mod tests {
             .collect()
     }
 
-    fn test_provider() -> ClaudeSubscriptionProvider {
+    fn provider_for_test() -> ClaudeSubscriptionProvider {
         provider_with_base(None)
     }
 
     fn provider_with_base(base_url: Option<&str>) -> ClaudeSubscriptionProvider {
         ClaudeSubscriptionProvider::new(
-            AuthCredential::ApiKey("test-key".to_string()),
-            "claude-sonnet-4-20250514".to_string(),
-            base_url.map(str::to_string),
-            None,
-            None,
-            None,
-            "test".to_string(),
-            ThinkingMode::Off,
-            10000,
-            "a".repeat(64),
-            Some("high".to_string()),
-            false,
-            None,
-            None,
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::ApiKey("test-key".to_string()),
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .base_url(base_url.map(str::to_string))
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(Some("high".to_string()))
+            .redact_thinking(false)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
         )
         .expect("build test provider")
     }
@@ -1063,9 +1062,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(8);
         let error = provider
             .stream(
-                "you are a test",
-                &[Message::user("hello")],
-                &[],
+                CompletionRequest::new("you are a test", &[Message::user("hello")], &[]),
                 sender,
                 CancellationToken::new(),
             )
@@ -1128,35 +1125,44 @@ mod tests {
         drop(listener);
 
         ClaudeSubscriptionProvider::new(
-            AuthCredential::OAuthToken {
-                access_token: "access-test".to_string(),
-                refresh_token: Some("refresh-test".to_string()),
-                expires_at: Some(crate::provider::now_epoch_millis() + 86_400_000),
-                account_id: Some("workspace-test".to_string()),
-            },
-            "claude-sonnet-4-20250514".to_string(),
-            Some(format!("http://127.0.0.1:{port}")),
-            None,
-            None,
-            None,
-            "test".to_string(),
-            ThinkingMode::Off,
-            10000,
-            "a".repeat(64),
-            Some("high".to_string()),
-            false,
-            None,
-            None,
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::OAuthToken {
+                    access_token: "access-test".to_string(),
+                    refresh_token: Some("refresh-test".to_string()),
+                    expires_at: Some(crate::oauth::now_epoch_millis() + 86_400_000),
+                    account_id: Some("workspace-test".to_string()),
+                },
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .base_url(Some(format!("http://127.0.0.1:{port}")))
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(Some("high".to_string()))
+            .redact_thinking(false)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
         )
         .expect("build test provider")
     }
 
     #[test]
-    fn test_claude_request_body_simple() {
-        let provider = test_provider();
+    fn claude_request_body_simple() {
+        let provider = provider_for_test();
 
         let messages = vec![Message::user("hello")];
-        let body = provider.build_request_body("system prompt", &messages, &[], false);
+        let body = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
         assert_eq!(body["stream"], false);
@@ -1166,7 +1172,7 @@ mod tests {
 
         assert_eq!(system[0]["type"], "text");
         let billing = system[0]["text"].as_str().unwrap();
-        let expected_prefix = format!("x-anthropic-billing-header: cc_version={}.", CC_VERSION);
+        let expected_prefix = format!("x-anthropic-billing-header: cc_version={CC_VERSION}.");
         assert!(billing.starts_with(&expected_prefix), "{}", billing);
         assert!(billing.contains("cc_entrypoint=cli"));
         assert!(billing.contains("cch=00000"));
@@ -1219,8 +1225,8 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_request_body_with_tools() {
-        let provider = test_provider();
+    fn claude_request_body_with_tools() {
+        let provider = provider_for_test();
 
         let tools = vec![ToolDefinition::new(
             "read_file".to_string(),
@@ -1234,7 +1240,14 @@ mod tests {
             }),
         )];
 
-        let body = provider.build_request_body("", &[], &tools, false);
+        let body = provider.build_request_body(
+            "",
+            &[],
+            &tools,
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let claude_tools = body["tools"].as_array().expect("tools should be array");
         assert_eq!(claude_tools.len(), 1);
         assert_eq!(claude_tools[0]["name"], "read_file");
@@ -1245,8 +1258,8 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_request_body_with_tool_calls() {
-        let provider = test_provider();
+    fn claude_request_body_with_tool_calls() {
+        let provider = provider_for_test();
 
         let messages = vec![
             Message::user("read /tmp/test.txt"),
@@ -1270,7 +1283,14 @@ mod tests {
             },
         ];
 
-        let body = provider.build_request_body("", &messages, &[], false);
+        let body = provider.build_request_body(
+            "",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let claude_messages = body["messages"]
             .as_array()
             .expect("messages should be array");
@@ -1302,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_non_streaming_text() {
+    fn claude_parse_non_streaming_text() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1323,7 +1343,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_non_streaming_tool_use() {
+    fn claude_parse_non_streaming_tool_use() {
         let response = serde_json::json!({
             "id": "msg_456",
             "type": "message",
@@ -1363,18 +1383,25 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_request_body_replaces_placeholder() {
+    fn patch_request_body_replaces_placeholder() {
         let messages = vec![Message::user("hello")];
-        let provider = test_provider();
-        let body = provider.build_request_body("system prompt", &messages, &[], false);
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let body_json = serde_json::to_string(&body).unwrap();
 
         assert!(body_json.contains("cch=00000"));
 
         let patched = attestation::patch_request_body(&body_json).unwrap();
         assert!(!patched.contains("cch=00000"));
-        let cch_idx = patched.find("cch=").expect("cch= must be present");
-        let token = &patched[cch_idx + 4..cch_idx + 9];
+        let cch_index = patched.find("cch=").expect("cch= must be present");
+        let token = &patched[cch_index + 4..cch_index + 9];
         assert_eq!(token.len(), 5);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{}", token);
 
@@ -1383,12 +1410,19 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_request_body_ignores_cch_in_messages() {
+    fn patch_request_body_ignores_cch_in_messages() {
         let messages = vec![Message::user(
             "The billing header contains cch=00000 as a placeholder.",
         )];
-        let provider = test_provider();
-        let body = provider.build_request_body("system prompt", &messages, &[], false);
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let body_json = serde_json::to_string(&body).unwrap();
 
         let count = body_json.matches("cch=00000").count();
@@ -1403,15 +1437,22 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_no_system_prompt_when_empty() {
-        let provider = test_provider();
+    fn claude_no_system_prompt_when_empty() {
+        let provider = provider_for_test();
 
-        let body = provider.build_request_body("", &[], &[], false);
+        let body = provider.build_request_body(
+            "",
+            &[],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert!(body.get("system").is_none());
     }
 
     #[test]
-    fn test_claude_parse_missing_tool_use_id() {
+    fn claude_parse_missing_tool_use_id() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1429,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_missing_tool_use_name() {
+    fn claude_parse_missing_tool_use_name() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1447,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_request_body_cch_in_tool_result() {
+    fn patch_request_body_cch_in_tool_result() {
         let messages = vec![
             Message::user("run the tool"),
             Message {
@@ -1469,8 +1510,15 @@ mod tests {
                 }],
             },
         ];
-        let provider = test_provider();
-        let body = provider.build_request_body("system prompt", &messages, &[], false);
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let body_json = serde_json::to_string(&body).unwrap();
         assert!(body_json.matches("cch=00000").count() >= 2);
 
@@ -1484,31 +1532,51 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_request_body_preserves_length() {
-        let provider = test_provider();
-        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+    fn patch_request_body_preserves_length() {
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let body_json = serde_json::to_string(&body).unwrap();
         let patched = attestation::patch_request_body(&body_json).unwrap();
         assert_eq!(body_json.len(), patched.len());
     }
 
     #[test]
-    fn test_claude_request_body_stream_true() {
-        let provider = test_provider();
-        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], true);
+    fn claude_request_body_stream_true() {
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "prompt",
+            &[Message::user("hi")],
+            &[],
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert_eq!(body["stream"], true);
     }
 
     #[test]
-    fn test_claude_request_body_system_and_tools_together() {
-        let provider = test_provider();
+    fn claude_request_body_system_and_tools_together() {
+        let provider = provider_for_test();
         let tools = vec![ToolDefinition::new(
             "bash".to_string(),
             "Run a shell command".to_string(),
             serde_json::json!({"type": "object", "properties": {}}),
         )];
-        let body =
-            provider.build_request_body("system prompt", &[Message::user("hi")], &tools, true);
+        let body = provider.build_request_body(
+            "system prompt",
+            &[Message::user("hi")],
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         assert!(body.get("system").is_some());
         assert!(body.get("tools").is_some());
@@ -1533,9 +1601,16 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_request_body_metadata_fields() {
-        let provider = test_provider();
-        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+    fn claude_request_body_metadata_fields() {
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
@@ -1547,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_profile_maps_identity() {
+    fn oauth_profile_maps_identity() {
         // Trimmed from the live-verified `GET /api/oauth/profile` body.
         let body = r#"{
             "account": {"display_name": "Alice", "email": "a@example.com", "has_claude_max": true},
@@ -1568,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_profile_tolerates_missing_fields() {
+    fn oauth_profile_tolerates_missing_fields() {
         let identity = serde_json::from_str::<OAuthProfileResponse>(r#"{"account": {}}"#)
             .unwrap()
             .into_identity(None);
@@ -1578,7 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_usage_maps_windows() {
+    fn oauth_usage_maps_windows() {
         // Trimmed from a real `GET /api/oauth/usage` body: flat windows plus null/extra buckets we
         // must tolerate.
         let body = r#"{
@@ -1608,7 +1683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_extra_usage_maps_credits() {
+    fn oauth_extra_usage_maps_credits() {
         // Credit dollars are carried inline in `extra_usage`, in cents. The live API sends them as
         // JSON floats (e.g. `1832.0`), so the fields must be `f64`: used_credits=1832.0 -> $18.32
         // spent, monthly_limit=5000.0 -> $50.00 cap, so balance = (5000 - 1832)/100 = $31.68.
@@ -1629,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_usage_includes_opus_when_present() {
+    fn oauth_usage_includes_opus_when_present() {
         let body = r#"{
             "five_hour": {"utilization": 10.0, "resets_at": null},
             "seven_day": {"utilization": 5.0, "resets_at": null},
@@ -1647,25 +1722,29 @@ mod tests {
     #[test]
     fn a_claude_subscription_base_url_keeps_the_root_the_oauth_endpoints_hang_off() {
         let provider = ClaudeSubscriptionProvider::new(
-            AuthCredential::OAuthToken {
-                access_token: "token".to_string(),
-                refresh_token: None,
-                expires_at: None,
-                account_id: None,
-            },
-            "claude-opus-4-8".to_string(),
-            Some("https://gateway.example.com/anthropic/v1/".to_string()),
-            None,
-            None,
-            None,
-            "test".to_string(),
-            ThinkingMode::Off,
-            10000,
-            "a".repeat(64),
-            None,
-            false,
-            None,
-            None,
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::OAuthToken {
+                    access_token: "token".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    account_id: None,
+                },
+                "claude-opus-4-8".to_string(),
+            )
+            .base_url(Some(
+                "https://gateway.example.com/anthropic/v1/".to_string(),
+            ))
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(None)
+            .redact_thinking(false)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
         )
         .expect("build test provider");
         // This provider reaches `/v1/messages` *and* `/api/oauth/usage` off the same root, so the
@@ -1674,30 +1753,39 @@ mod tests {
     }
 
     #[test]
-    fn test_account_uuid_sourced_from_oauth_credential() {
+    fn account_uuid_sourced_from_oauth_credential() {
         let provider = ClaudeSubscriptionProvider::new(
-            AuthCredential::OAuthToken {
-                access_token: "token".to_string(),
-                refresh_token: None,
-                expires_at: None,
-                account_id: Some("7194a774-10cb-47f6-a031-78078f9054c9".to_string()),
-            },
-            "claude-opus-4-8".to_string(),
-            None,
-            None,
-            None,
-            None,
-            "test".to_string(),
-            ThinkingMode::Off,
-            10000,
-            "a".repeat(64),
-            Some("high".to_string()),
-            false,
-            None,
-            None,
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::OAuthToken {
+                    access_token: "token".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                    account_id: Some("7194a774-10cb-47f6-a031-78078f9054c9".to_string()),
+                },
+                "claude-opus-4-8".to_string(),
+            )
+            .base_url(None)
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(Some("high".to_string()))
+            .redact_thinking(false)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
         )
         .expect("build test provider");
-        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+        let body = provider.build_request_body(
+            "prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let user_id_str = body["metadata"]["user_id"].as_str().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
         assert_eq!(
@@ -1707,14 +1795,21 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_request_body_no_tools_key_when_empty() {
-        let provider = test_provider();
-        let body = provider.build_request_body("prompt", &[Message::user("hi")], &[], false);
+    fn claude_request_body_no_tools_key_when_empty() {
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert!(body.get("tools").is_none());
     }
 
     #[test]
-    fn test_claude_parse_missing_content_array() {
+    fn claude_parse_missing_content_array() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1726,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_missing_stop_reason_defaults_to_end_turn() {
+    fn claude_parse_missing_stop_reason_defaults_to_end_turn() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1738,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_max_tokens_stop_reason() {
+    fn claude_parse_max_tokens_stop_reason() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1751,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_unknown_stop_reason() {
+    fn claude_parse_unknown_stop_reason() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1767,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_empty_content_array() {
+    fn claude_parse_empty_content_array() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1781,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_thinking_block() {
+    fn claude_parse_thinking_block() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1801,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_unknown_block_type_skipped() {
+    fn claude_parse_unknown_block_type_skipped() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1818,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_parse_tool_use_missing_input_defaults() {
+    fn claude_parse_tool_use_missing_input_defaults() {
         let response = serde_json::json!({
             "id": "msg_123",
             "type": "message",
@@ -1844,20 +1939,22 @@ mod tests {
 
     fn provider_effort(model: &str, effort: Option<&str>) -> ClaudeSubscriptionProvider {
         ClaudeSubscriptionProvider::new(
-            AuthCredential::ApiKey("test-key".to_string()),
-            model.to_string(),
-            None,
-            None,
-            None,
-            None,
-            "test".to_string(),
-            ThinkingMode::Off,
-            10000,
-            "a".repeat(64),
-            effort.map(str::to_string),
-            false,
-            None,
-            None,
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::ApiKey("test-key".to_string()),
+                model.to_string(),
+            )
+            .base_url(None)
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(effort.map(str::to_string))
+            .redact_thinking(false)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
         )
         .expect("build test provider")
     }
@@ -1871,30 +1968,35 @@ mod tests {
         redact_thinking: bool,
     ) -> ClaudeSubscriptionProvider {
         ClaudeSubscriptionProvider::new(
-            AuthCredential::ApiKey("test-key".to_string()),
-            model.to_string(),
-            None,
-            None,
-            None,
-            None,
-            "test".to_string(),
-            if thinking {
-                ThinkingMode::Adaptive
-            } else {
-                ThinkingMode::Off
-            },
-            10000,
-            "a".repeat(64),
-            Some(effort.to_string()),
-            redact_thinking,
-            None,
-            None,
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::ApiKey("test-key".to_string()),
+                model.to_string(),
+            )
+            .base_url(None)
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(
+                if thinking {
+                    ThinkingMode::Adaptive
+                } else {
+                    ThinkingMode::Off
+                },
+                10000,
+            )
+            .device_id("a".repeat(64))
+            .effort(Some(effort.to_string()))
+            .redact_thinking(redact_thinking)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
         )
         .expect("build test provider")
     }
 
     #[test]
-    fn test_betas_no_adaptive_thinking_beta() {
+    fn betas_no_adaptive_thinking_beta() {
         // `adaptive-thinking-2026-01-28` does not exist in Claude Code; adaptive thinking is GA and
         // selected via the body `thinking` param, never a beta header.
         for (model, thinking) in [
@@ -1911,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_modern_thinking_model_full_set() {
+    fn betas_modern_thinking_model_full_set() {
         // Tools + thinking + redact_thinking on: matches the live Claude Code 2.1.241 interactive
         // CLI wire capture exactly (12 betas in this order, no `context-1m`;
         // `redact-thinking-2026-02-12` present, which CC sends by default).
@@ -1940,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_thinking_family_independent_of_toggle() {
+    fn betas_thinking_family_independent_of_toggle() {
         // Claude Code gates interleaved-thinking / thinking-token-count on model capability, not
         // the thinking toggle, so they appear whether thinking is on or off.
         for thinking in [true, false] {
@@ -1953,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_never_send_context_1m() {
+    fn betas_never_send_context_1m() {
         // Current Claude Code (2.1.241) does not send `context-1m-2025-08-07`; 1M is the default
         // (no beta) on the current 1M models, so meka never sends it either, across the
         // lineup.
@@ -1976,7 +2078,7 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_extended_cache_ttl_always_present() {
+    fn betas_extended_cache_ttl_always_present() {
         // meka always sends a 1h cache TTL, so the extended-cache-ttl beta is unconditional.
         for model in [
             "claude-opus-4-6-20250514",
@@ -1994,10 +2096,10 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_haiku_skips_claude_code_and_effort() {
+    fn betas_haiku_skips_claude_code_and_effort() {
         // Effort unset: Haiku (pre-4.6) omits the effort beta by default. (An explicit override is
         // absolute and would send it; see
-        // test_output_config_omitted_when_unset_and_model_lacks_effort.)
+        // output_config_omitted_when_unset_and_model_lacks_effort.)
         let betas = provider_effort("claude-haiku-4-5-20251001", None)
             .compute_betas(true)
             .unwrap();
@@ -2011,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_oauth_and_prompt_caching_scope_always_present() {
+    fn betas_oauth_and_prompt_caching_scope_always_present() {
         for model in [
             "claude-opus-4-6-20250514",
             "claude-sonnet-4-20250514",
@@ -2019,20 +2121,25 @@ mod tests {
         ] {
             let provider = provider_with(model, false);
             let betas = provider.compute_betas(true).unwrap();
-            assert!(betas.contains("oauth-2025-04-20"), "{} → {}", model, betas);
+            assert!(betas.contains("oauth-2025-04-20"), "{model} → {betas}");
             assert!(
                 betas.contains("prompt-caching-scope-2026-01-05"),
-                "{} → {}",
-                model,
-                betas
+                "{model} → {betas}"
             );
         }
     }
 
     #[test]
-    fn test_context_management_body_when_thinking_enabled() {
+    fn context_management_body_when_thinking_enabled() {
         let provider = provider_with("claude-opus-4-6-20250514", true);
-        let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        let body = provider.build_request_body(
+            "system prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let cm = body
             .get("context_management")
             .expect("context_management should be present when thinking is on");
@@ -2041,14 +2148,20 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_effort_uses_configured_value() {
+    fn output_config_effort_uses_configured_value() {
         for value in ["low", "medium", "high"] {
             let provider = provider_full("claude-opus-4-6-20250514", false, value, false);
-            let body =
-                provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+            let body = provider.build_request_body(
+                "system prompt",
+                &[Message::user("hi")],
+                &[],
+                false,
+                ThinkingOverride::Inherit,
+                &crate::provider::Attribution::default(),
+            );
             let oc = body
                 .get("output_config")
-                .unwrap_or_else(|| panic!("output_config missing for effort={}", value));
+                .unwrap_or_else(|| panic!("output_config missing for effort={value}"));
             assert_eq!(
                 oc["effort"], value,
                 "effort body field must reflect configured value"
@@ -2073,7 +2186,14 @@ mod tests {
             "claude-opus-4-7",
         ] {
             let provider = provider_effort(model, None);
-            let body = provider.build_request_body("s", &[Message::user("hi")], &[], false);
+            let body = provider.build_request_body(
+                "s",
+                &[Message::user("hi")],
+                &[],
+                false,
+                ThinkingOverride::Inherit,
+                &crate::provider::Attribution::default(),
+            );
             assert_eq!(body["output_config"]["effort"], "high", "{model}");
             assert!(
                 provider
@@ -2089,7 +2209,14 @@ mod tests {
         for model in ["claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"] {
             for configured in [None, Some("high")] {
                 let provider = provider_effort(model, configured);
-                let body = provider.build_request_body("s", &[Message::user("hi")], &[], false);
+                let body = provider.build_request_body(
+                    "s",
+                    &[Message::user("hi")],
+                    &[],
+                    false,
+                    ThinkingOverride::Inherit,
+                    &crate::provider::Attribution::default(),
+                );
                 assert!(
                     body.get("output_config").is_none(),
                     "{model} {configured:?}"
@@ -2107,7 +2234,14 @@ mod tests {
         // A configured value is absolute: it replaces the default and is never clamped down to what
         // a bundled table thinks the model supports.
         let forced = provider_effort("claude-sonnet-4-6", Some("max"));
-        let body = forced.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        let body = forced.build_request_body(
+            "system prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert_eq!(body["output_config"]["effort"], "max");
         assert!(
             forced
@@ -2119,18 +2253,32 @@ mod tests {
     }
 
     #[test]
-    fn test_temperature_present_when_model_supports_it() {
+    fn temperature_present_when_model_supports_it() {
         // Opus 4.6 accepts sampling params; with thinking off, `temperature: 1` is sent.
         let provider = provider_with("claude-opus-4-6-20250514", false);
-        let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        let body = provider.build_request_body(
+            "system prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert_eq!(body["temperature"], 1);
     }
 
     #[test]
-    fn test_temperature_omitted_when_model_rejects_it() {
+    fn temperature_omitted_when_model_rejects_it() {
         // Opus 4.8 rejects `temperature` (400); meka must omit it even with thinking off.
         let provider = provider_with("claude-opus-4-8", false);
-        let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        let body = provider.build_request_body(
+            "system prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert!(
             body.get("temperature").is_none(),
             "temperature must be omitted for sampling-param-removed models"
@@ -2138,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_advanced_tool_use_gated_on_tools() {
+    fn betas_advanced_tool_use_gated_on_tools() {
         let provider = provider_with("claude-opus-4-8", true);
         assert!(
             provider
@@ -2157,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_mid_conversation_system_gated_on_model() {
+    fn betas_mid_conversation_system_gated_on_model() {
         // The gate is a denylist, so the newer models get it and the named older ones do not
         // (mirrors Claude Code 2.1.241's own list).
         for model in ["claude-opus-4-8", "claude-opus-5", "claude-sonnet-5"] {
@@ -2203,21 +2351,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_billing_header_marks_subagent_under_scope() {
-        let provider = test_provider();
+    async fn billing_header_marks_subagent_under_scope() {
+        let provider = provider_for_test();
         let messages = vec![Message::user("hi")];
 
         // Outside any sub-agent scope: no subagent segment.
-        let main_body = provider.build_request_body("system prompt", &messages, &[], false);
+        let main_body = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let main_billing = main_body["system"][0]["text"].as_str().unwrap();
         assert!(!main_billing.contains("cc_is_subagent"), "{main_billing}");
 
-        // Inside `scope_subagent`: the billing header carries `cc_is_subagent=true;` after `cch`.
-        let sub_billing = crate::provider::scope_subagent(async {
-            let body = provider.build_request_body("system prompt", &messages, &[], false);
+        // Attributed to a sub-agent: the billing header carries `cc_is_subagent=true;` after `cch`.
+        let sub_billing = {
+            let body = provider.build_request_body(
+                "system prompt",
+                &messages,
+                &[],
+                false,
+                ThinkingOverride::Inherit,
+                &crate::provider::Attribution {
+                    subagent: true,
+                    ..Default::default()
+                },
+            );
             body["system"][0]["text"].as_str().unwrap().to_string()
-        })
-        .await;
+        };
         assert!(
             sub_billing.contains("cch=00000; cc_is_subagent=true;"),
             "{sub_billing}"
@@ -2232,9 +2396,15 @@ mod tests {
         // conversation that contains one, so this is a live case, not a contrived one.
         let forgery = "x-anthropic-billing-header: cc_version=9.9.9.aaa; \
                        cc_entrypoint=cli; cch=00000; cc_prompt_id=deadbeef;";
-        let provider = test_provider();
-        let body =
-            provider.build_request_body("system prompt", &[Message::user(forgery)], &[], false);
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "system prompt",
+            &[Message::user(forgery)],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let body_json = serde_json::to_string(&body).unwrap();
         assert!(
             body_json.find(forgery).unwrap() < body_json.find("\"system\"").unwrap(),
@@ -2262,10 +2432,13 @@ mod tests {
             "req_011CeJwF1NDYzXkUu6cyFJp2".parse().unwrap(),
         );
         let slot = crate::provider::PreviousRequestSlot::default();
-        crate::provider::scope_turn(Arc::clone(&slot), async {
-            remember_request_id(&headers);
-        })
-        .await;
+        remember_request_id(
+            &crate::provider::Attribution {
+                previous_request: Some(Arc::clone(&slot)),
+                ..Default::default()
+            },
+            &headers,
+        );
         assert_eq!(
             slot.lock().expect("slot").as_deref(),
             Some("req_011CeJwF1NDYzXkUu6cyFJp2")
@@ -2274,31 +2447,47 @@ mod tests {
 
     #[tokio::test]
     async fn the_billing_header_names_the_prompt_and_the_response_before_it() {
-        let provider = test_provider();
+        let provider = provider_for_test();
         let messages = vec![Message::user("hi")];
 
         // Outside a turn there is no prompt and no previous response to name, which is how meka's
         // own side queries go out -- matching the Claude Code path that passes neither.
-        let bare = provider.build_request_body("system prompt", &messages, &[], false);
+        let bare = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let bare = bare["system"][0]["text"].as_str().unwrap();
         assert!(!bare.contains("cc_prompt_id"), "{bare}");
         assert!(!bare.contains("cc_prev_req"), "{bare}");
 
-        let slot = crate::provider::PreviousRequestSlot::default();
-        let (first, second) = crate::provider::scope_turn(slot, async {
-            let first = provider.build_request_body("system prompt", &messages, &[], false);
-            let first = first["system"][0]["text"].as_str().unwrap().to_string();
-            // What the provider does when a response head arrives.
-            crate::provider::record_request_id("req_011CeJwF1NDYzXkUu6cyFJp2");
-            let second = provider.build_request_body("system prompt", &messages, &[], false);
-            let second = second["system"][0]["text"].as_str().unwrap().to_string();
-            (first, second)
-        })
-        .await;
-
-        // The conversation's first request has a prompt but no response behind it.
-        let prompt_id = crate::provider::current_prompt_id();
-        assert!(prompt_id.is_none(), "the scope must not outlive the turn");
+        let attribution = crate::provider::Attribution {
+            prompt_id: Some(uuid::Uuid::new_v4()),
+            previous_request: Some(crate::provider::PreviousRequestSlot::default()),
+            ..Default::default()
+        };
+        let first = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &attribution,
+        );
+        let first = first["system"][0]["text"].as_str().unwrap().to_string();
+        attribution.record_request_id("req_011CeJwF1NDYzXkUu6cyFJp2");
+        let second = provider.build_request_body(
+            "system prompt",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &attribution,
+        );
+        let second = second["system"][0]["text"].as_str().unwrap().to_string();
         assert!(first.contains("cch=00000; cc_prompt_id="), "{first}");
         assert!(!first.contains("cc_prev_req"), "{first}");
 
@@ -2320,45 +2509,49 @@ mod tests {
     }
 
     #[test]
-    fn test_betas_redact_thinking_added_when_enabled() {
+    fn betas_redact_thinking_added_when_enabled() {
         // Adaptive-thinking-capable model + thinking on + redact_thinking on.
         let provider = provider_full("claude-opus-4-6-20250514", true, "high", true);
         let betas = provider.compute_betas(true).unwrap();
         assert!(
             betas.contains("redact-thinking-2026-02-12"),
-            "redact-thinking beta must be present when redact_thinking=true: {}",
-            betas
+            "redact-thinking beta must be present when redact_thinking=true: {betas}"
         );
     }
 
     #[test]
-    fn test_betas_redact_thinking_omitted_when_disabled() {
+    fn betas_redact_thinking_omitted_when_disabled() {
         let provider = provider_full("claude-opus-4-6-20250514", true, "high", false);
         let betas = provider.compute_betas(true).unwrap();
         assert!(
             !betas.contains("redact-thinking-2026-02-12"),
-            "redact-thinking beta must be omitted when redact_thinking=false: {}",
-            betas
+            "redact-thinking beta must be omitted when redact_thinking=false: {betas}"
         );
     }
 
     #[test]
-    fn test_betas_redact_thinking_independent_of_toggle() {
+    fn betas_redact_thinking_independent_of_toggle() {
         // Claude Code gates redact-thinking on model capability, not the thinking toggle, so meka
         // sends it whenever the `redact_thinking` knob is on (here with thinking off).
         let provider = provider_full("claude-opus-4-6-20250514", false, "high", true);
         let betas = provider.compute_betas(true).unwrap();
         assert!(
             betas.contains("redact-thinking-2026-02-12"),
-            "redact-thinking is toggle-independent (gated on the knob + capability): {}",
-            betas
+            "redact-thinking is toggle-independent (gated on the knob + capability): {betas}"
         );
     }
 
     #[test]
-    fn test_context_management_body_absent_when_thinking_disabled() {
+    fn context_management_body_absent_when_thinking_disabled() {
         let provider = provider_with("claude-opus-4-6-20250514", false);
-        let body = provider.build_request_body("system prompt", &[Message::user("hi")], &[], false);
+        let body = provider.build_request_body(
+            "system prompt",
+            &[Message::user("hi")],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert!(
             body.get("context_management").is_none(),
             "context_management must be omitted when thinking is off"
@@ -2369,8 +2562,8 @@ mod tests {
     /// `getCacheControl` (returns `{type:"ephemeral", ttl:"1h"}` for OAuth subscribers via
     /// `should1hCacheTTL`).
     #[test]
-    fn test_cache_control_uses_one_hour_ttl_everywhere() {
-        let provider = test_provider();
+    fn cache_control_uses_one_hour_ttl_everywhere() {
+        let provider = provider_for_test();
         let tools = vec![ToolDefinition::new(
             "read_file",
             "Read a file",
@@ -2381,6 +2574,8 @@ mod tests {
             &[Message::user("hi")],
             &tools,
             false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
 
         let expected = serde_json::json!({"type": "ephemeral", "ttl": "1h"});
@@ -2400,14 +2595,14 @@ mod tests {
 
         // Messages: last block of the last message carries cache_control with ttl=1h.
         let messages_arr = body["messages"].as_array().unwrap();
-        let last_msg = messages_arr.last().unwrap();
-        let last_block = last_msg["content"].as_array().unwrap().last().unwrap();
+        let last_message = messages_arr.last().unwrap();
+        let last_block = last_message["content"].as_array().unwrap().last().unwrap();
         assert_eq!(last_block["cache_control"], expected);
     }
 
     #[test]
-    fn test_now_epoch_millis_reasonable() {
-        let ms = crate::provider::now_epoch_millis();
+    fn now_epoch_millis_reasonable() {
+        let ms = crate::oauth::now_epoch_millis();
         assert!(ms > 1_577_836_800_000);
         assert!(ms < 4_102_444_800_000);
     }
@@ -2499,7 +2694,7 @@ mod tests {
         for i in 0..shared_message_count {
             let a = strip_cache_control(&msgs_a[i]);
             let b = strip_cache_control(&msgs_b[i]);
-            assert_eq!(a, b, "message at index {} diverged between requests", i);
+            assert_eq!(a, b, "message at index {i} diverged between requests");
         }
     }
 
@@ -2521,7 +2716,7 @@ mod tests {
         count
     }
 
-    fn test_tools() -> Vec<ToolDefinition> {
+    fn tools_for_test() -> Vec<ToolDefinition> {
         vec![
             ToolDefinition::new(
                 "read_file".to_string(),
@@ -2537,14 +2732,21 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_turn_prefix_is_stable() {
-        let provider = test_provider();
+    fn multi_turn_prefix_is_stable() {
+        let provider = provider_for_test();
         let system = "You are a helpful assistant.";
-        let tools = test_tools();
+        let tools = tools_for_test();
 
         // Turn 1: single user message
         let messages_t1 = vec![Message::user("What files are in /tmp?")];
-        let body_t1 = provider.build_request_body(system, &messages_t1, &tools, true);
+        let body_t1 = provider.build_request_body(
+            system,
+            &messages_t1,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // Turn 2: previous turn + assistant response + new user message
         let messages_t2 = vec![
@@ -2552,7 +2754,14 @@ mod tests {
             Message::assistant_text("There are 3 files in /tmp."),
             Message::user("Show me the first one."),
         ];
-        let body_t2 = provider.build_request_body(system, &messages_t2, &tools, true);
+        let body_t2 = provider.build_request_body(
+            system,
+            &messages_t2,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // Turn 3: previous turns + another exchange
         let messages_t3 = vec![
@@ -2562,7 +2771,14 @@ mod tests {
             Message::assistant_text("Here is the content of file1.txt."),
             Message::user("Delete it."),
         ];
-        let body_t3 = provider.build_request_body(system, &messages_t3, &tools, true);
+        let body_t3 = provider.build_request_body(
+            system,
+            &messages_t3,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // The first message is shared across all three requests.
         assert_prefix_stable(&body_t1, &body_t2, 1);
@@ -2579,59 +2795,60 @@ mod tests {
     /// not invalidate the Claude prompt cache.
     ///
     /// Covers the full agent request-body assembly:
-    ///   - [`ToolRegistry::tool_catalogue`] / [`ToolRegistry::definitions_active`]
-    ///   - [`crate::context::build_system_prompt`]
-    ///   - [`crate::context::build_turn_context`]
+    ///   - [`ToolRegistry::tool_catalog`] / [`ToolRegistry::definitions_active`]
+    ///   - [`crate::prompt::build_system_prompt`]
+    ///   - [`crate::prompt::build_turn_context`]
     ///   - [`ClaudeSubscriptionProvider::build_request_body`]
     #[tokio::test]
-    async fn test_permission_toggle_preserves_cache_prefix() {
-        use std::path::Path;
-
+    async fn permission_toggle_preserves_cache_prefix() {
         use crate::{
-            context::{build_system_prompt, build_turn_context},
             permission::{Permission, SharedPermission},
-            session::SessionManager,
+            prompt::{TurnContext, build_system_prompt, build_turn_context},
+            store::Store,
             tools::ToolRegistry,
         };
 
-        let session_manager =
-            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory session manager");
+        let store = Store::for_test().await;
         let shared_permission =
             SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
-        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
-        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::tools::todo::TodoState::default(),
-        ));
+        let shared_session_id = crate::session::SharedSessionId::default();
+        let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
-            crate::config::WebClientConfig::default(),
-            shared_permission,
-            true,
-            crate::sandbox::detect(),
-            crate::config::SandboxBackend::Landlock,
-            crate::sandbox::BackendProbe::Missing {
-                reason: "test fixture".to_string(),
+            &crate::session::SessionMaterials {
+                core: crate::session::CoreMaterials {
+                    web_client: crate::config::WebClientConfig::default(),
+                    sandbox_enabled: true,
+                    sandbox_capability: crate::sandbox::detect(),
+                    sandbox_backend: crate::config::SandboxBackend::Landlock,
+                    backend_probe: crate::sandbox::BackendProbe::Missing {
+                        reason: "test fixture".to_string(),
+                    },
+                    builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
+                },
+                skills: crate::skills::SkillCache::for_root(None),
+                skills_agent_managed: false,
+                memories: crate::store::memory::MemoryStore::detached(),
+                schedule: crate::config::ResolvedScheduleConfig::default(),
+                background: crate::config::ResolvedBackgroundConfig::default(),
+                ..crate::session::SessionMaterials::for_test(store)
             },
-            todo_list,
-            session_manager,
-            shared_session_id,
-            crate::skills::SkillCache::for_root(None),
-            false,
-            crate::memory::MemoryStore::detached(),
-            crate::tools::BuiltinToolFilter::default(),
-            crate::workspace::test_cwd(),
-            crate::workspace::test_roots(),
-            std::sync::Arc::new(crate::frontend::SilentFrontend),
-            crate::config::ResolvedScheduleConfig::default(),
-            (
-                crate::config::ResolvedBackgroundConfig::default(),
-                crate::background::BackgroundTasks::default(),
-            ),
+            &crate::session::SessionCells {
+                session_id: shared_session_id,
+                todo_list,
+                background_tasks: crate::background::BackgroundTasks::default(),
+                ..crate::session::SessionCells::for_test(
+                    shared_permission,
+                    crate::workspace::cwd_for_test(),
+                    crate::workspace::roots_for_test(),
+                    std::sync::Arc::new(crate::frontend::SilentFrontend),
+                )
+            },
+            &crate::session::AgentOptions::for_test(),
         )
         .expect("default web client config should build cleanly");
 
-        let provider = test_provider();
+        let provider = provider_for_test();
 
         // The agent builds these once per turn. Neither takes the current permission; that's the
         // invariant we're testing.
@@ -2639,39 +2856,50 @@ mod tests {
         let tools = registry.definitions_active(&[]);
 
         let u1_text = {
-            let block = build_turn_context(
-                Permission::Read,
-                &crate::tools::todo::TodoState::default(),
-                std::path::Path::new("."),
-                &[],
-                "",
-                None,
-                &[],
-                false,
-            );
+            let block = build_turn_context(TurnContext {
+                permission: Permission::Read,
+                approvals: false,
+                todos: &crate::todo::TodoState::default(),
+                cwd: std::path::Path::new("."),
+                roots: &[],
+                world_state: "",
+                budget: None,
+                background: &[],
+                outcomes: None,
+                resumed: false,
+            });
             format!("{}\n\n{}", block, "list files under /tmp")
         };
         let messages_t1 = vec![Message::user(&u1_text)];
-        let body_t1 = provider.build_request_body(&system, &messages_t1, &tools, true);
+        let body_t1 = provider.build_request_body(
+            &system,
+            &messages_t1,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // Simulate a `/permission unrestricted` toggle: in real code this happens on a different
-        // thread via `SharedPermission::set`; here we just re-read the catalogue and rebuild
+        // thread via `SharedPermission::set`; here we just re-read the catalog and rebuild
         // everything to prove the outputs don't depend on the live permission state.
 
         let system_t2 = build_system_prompt(true, None);
         let tools_t2 = registry.definitions_active(&[]);
 
         let u2_text = {
-            let block = build_turn_context(
-                Permission::Unrestricted,
-                &crate::tools::todo::TodoState::default(),
-                std::path::Path::new("."),
-                &[],
-                "",
-                None,
-                &[],
-                false,
-            );
+            let block = build_turn_context(TurnContext {
+                permission: Permission::Unrestricted,
+                approvals: false,
+                todos: &crate::todo::TodoState::default(),
+                cwd: std::path::Path::new("."),
+                roots: &[],
+                world_state: "",
+                budget: None,
+                background: &[],
+                outcomes: None,
+                resumed: false,
+            });
             format!("{}\n\n{}", block, "now write 'hi' to /tmp/out.txt")
         };
         let messages_t2 = vec![
@@ -2679,7 +2907,14 @@ mod tests {
             Message::assistant_text("There are three files in /tmp."),
             Message::user(&u2_text),
         ];
-        let body_t2 = provider.build_request_body(&system_t2, &messages_t2, &tools_t2, true);
+        let body_t2 = provider.build_request_body(
+            &system_t2,
+            &messages_t2,
+            &tools_t2,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // 1. The system prompt is identical. (Breakpoint 2 cache-hit.)
         assert_eq!(
@@ -2713,81 +2948,91 @@ mod tests {
     /// hits); the tools array is what grows, append-only, so its prior entries also cache
     /// (breakpoint 3).
     ///
-    /// Mirrors [`test_permission_toggle_preserves_cache_prefix`] structurally.
+    /// Mirrors [`permission_toggle_preserves_cache_prefix`] structurally.
     #[tokio::test]
-    async fn test_load_tool_preserves_system_prompt_cache() {
-        use std::path::Path;
-
+    async fn load_tool_preserves_system_prompt_cache() {
         use crate::{
-            context::{build_system_prompt, build_turn_context},
             permission::{Permission, SharedPermission},
-            session::SessionManager,
+            prompt::{build_system_prompt, build_turn_context},
+            store::Store,
             tools::ToolRegistry,
         };
 
-        let session_manager =
-            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory session manager");
+        let store = Store::for_test().await;
         let shared_permission = SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
-        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
-        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::tools::todo::TodoState::default(),
-        ));
+        let shared_session_id = crate::session::SharedSessionId::default();
+        let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
-            crate::config::WebClientConfig::default(),
-            shared_permission,
-            true,
-            crate::sandbox::detect(),
-            crate::config::SandboxBackend::Landlock,
-            crate::sandbox::BackendProbe::Missing {
-                reason: "test fixture".to_string(),
+            &crate::session::SessionMaterials {
+                core: crate::session::CoreMaterials {
+                    web_client: crate::config::WebClientConfig::default(),
+                    sandbox_enabled: true,
+                    sandbox_capability: crate::sandbox::detect(),
+                    sandbox_backend: crate::config::SandboxBackend::Landlock,
+                    backend_probe: crate::sandbox::BackendProbe::Missing {
+                        reason: "test fixture".to_string(),
+                    },
+                    builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
+                },
+                skills: crate::skills::SkillCache::for_root(None),
+                skills_agent_managed: false,
+                memories: crate::store::memory::MemoryStore::detached(),
+                schedule: crate::config::ResolvedScheduleConfig::default(),
+                background: crate::config::ResolvedBackgroundConfig::default(),
+                ..crate::session::SessionMaterials::for_test(store)
             },
-            todo_list,
-            session_manager,
-            shared_session_id,
-            crate::skills::SkillCache::for_root(None),
-            false,
-            crate::memory::MemoryStore::detached(),
-            crate::tools::BuiltinToolFilter::default(),
-            crate::workspace::test_cwd(),
-            crate::workspace::test_roots(),
-            std::sync::Arc::new(crate::frontend::SilentFrontend),
-            crate::config::ResolvedScheduleConfig::default(),
-            (
-                crate::config::ResolvedBackgroundConfig::default(),
-                crate::background::BackgroundTasks::default(),
-            ),
+            &crate::session::SessionCells {
+                session_id: shared_session_id,
+                todo_list,
+                background_tasks: crate::background::BackgroundTasks::default(),
+                ..crate::session::SessionCells::for_test(
+                    shared_permission,
+                    crate::workspace::cwd_for_test(),
+                    crate::workspace::roots_for_test(),
+                    std::sync::Arc::new(crate::frontend::SilentFrontend),
+                )
+            },
+            &crate::session::AgentOptions::for_test(),
         )
         .expect("default web client config should build cleanly");
         // Register a deferred fixture *after* `build_default` so it lands at the tail of the tools
         // vector. Loading it later appends to the end of the API tools array, which is the
         // append-only growth shape the cache prefix invariant relies on.
-        crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
+        registry.register_deferred_fixture("fixture_deferred");
 
-        let provider = test_provider();
+        let provider = provider_for_test();
         let system = build_system_prompt(true, None);
 
         // Turn 1: empty history, fixture_deferred not yet exposed.
         let u1_text = {
-            let block = build_turn_context(
-                Permission::Unrestricted,
-                &crate::tools::todo::TodoState::default(),
-                std::path::Path::new("."),
-                &[],
-                "",
-                None,
-                &[],
-                false,
-            );
+            let block = build_turn_context(crate::prompt::TurnContext {
+                permission: Permission::Unrestricted,
+                approvals: false,
+                todos: &crate::todo::TodoState::default(),
+                cwd: std::path::Path::new("."),
+                roots: &[],
+                world_state: "",
+                budget: None,
+                background: &[],
+                outcomes: None,
+                resumed: false,
+            });
             format!("{}\n\n{}", block, "investigate scratchpad")
         };
         let messages_t1 = vec![Message::user(&u1_text)];
         let tools_t1 = registry.definitions_active(&messages_t1);
-        let body_t1 = provider.build_request_body(&system, &messages_t1, &tools_t1, true);
+        let body_t1 = provider.build_request_body(
+            &system,
+            &messages_t1,
+            &tools_t1,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         assert!(
             !tools_t1.iter().any(|t| t.name == "fixture_deferred"),
@@ -2818,10 +3063,17 @@ mod tests {
             },
         ];
         // System prompt is rebuilt the same way every turn; its content is a function of the
-        // catalogue, not the messages, so it must not shift when load_tool is invoked.
+        // catalog, not the messages, so it must not shift when load_tool is invoked.
         let system_t2 = build_system_prompt(true, None);
         let tools_t2 = registry.definitions_active(&messages_t2);
-        let body_t2 = provider.build_request_body(&system_t2, &messages_t2, &tools_t2, true);
+        let body_t2 = provider.build_request_body(
+            &system_t2,
+            &messages_t2,
+            &tools_t2,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // 1. The system prompt is byte-identical. (Breakpoint 2 cache-hit.)
         assert_eq!(
@@ -2847,11 +3099,10 @@ mod tests {
             strip_tool_cache_control(body_t1["tools"].as_array().expect("tools array in body_t1"));
         let tools_arr_t2 =
             strip_tool_cache_control(body_t2["tools"].as_array().expect("tools array in body_t2"));
-        for (idx, tool) in tools_arr_t1.iter().enumerate() {
+        for (index, tool) in tools_arr_t1.iter().enumerate() {
             assert_eq!(
-                &tools_arr_t2[idx], tool,
-                "tool at index {} mutated between turns: cache prefix invalidated",
-                idx
+                &tools_arr_t2[index], tool,
+                "tool at index {index} mutated between turns: cache prefix invalidated"
             );
         }
     }
@@ -2861,89 +3112,90 @@ mod tests {
     /// system prompt: that heads the cached prefix, so a byte moving there would re-cache the whole
     /// conversation on top of the tools-array cost.
     #[tokio::test]
-    async fn test_mcp_tool_swap_leaves_the_system_prompt_untouched() {
-        use std::path::Path;
-
+    async fn mcp_tool_swap_leaves_the_system_prompt_untouched() {
         use crate::{
-            context::build_system_prompt,
             permission::{Permission, SharedPermission},
-            session::SessionManager,
+            prompt::build_system_prompt,
+            store::Store,
             tools::ToolRegistry,
         };
 
-        let session_manager =
-            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory session manager");
+        let store = Store::for_test().await;
         let shared_permission = SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
         let registry = ToolRegistry::build_default(
-            crate::config::WebClientConfig::default(),
-            shared_permission,
-            true,
-            crate::sandbox::detect(),
-            crate::config::SandboxBackend::Landlock,
-            crate::sandbox::BackendProbe::Missing {
-                reason: "test fixture".to_string(),
+            &crate::session::SessionMaterials {
+                core: crate::session::CoreMaterials {
+                    web_client: crate::config::WebClientConfig::default(),
+                    sandbox_enabled: true,
+                    sandbox_capability: crate::sandbox::detect(),
+                    sandbox_backend: crate::config::SandboxBackend::Landlock,
+                    backend_probe: crate::sandbox::BackendProbe::Missing {
+                        reason: "test fixture".to_string(),
+                    },
+                    builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
+                },
+                skills: crate::skills::SkillCache::for_root(None),
+                skills_agent_managed: false,
+                memories: crate::store::memory::MemoryStore::detached(),
+                schedule: crate::config::ResolvedScheduleConfig::default(),
+                background: crate::config::ResolvedBackgroundConfig::default(),
+                ..crate::session::SessionMaterials::for_test(store)
             },
-            std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::tools::todo::TodoState::default(),
-            )),
-            session_manager,
-            std::sync::Arc::new(tokio::sync::RwLock::new(None)),
-            crate::skills::SkillCache::for_root(None),
-            false,
-            crate::memory::MemoryStore::detached(),
-            crate::tools::BuiltinToolFilter::default(),
-            crate::workspace::test_cwd(),
-            crate::workspace::test_roots(),
-            std::sync::Arc::new(crate::frontend::SilentFrontend),
-            crate::config::ResolvedScheduleConfig::default(),
-            (
-                crate::config::ResolvedBackgroundConfig::default(),
-                crate::background::BackgroundTasks::default(),
-            ),
+            &crate::session::SessionCells {
+                session_id: crate::session::SharedSessionId::default(),
+                todo_list: crate::todo::SharedTodoList::default(),
+                background_tasks: crate::background::BackgroundTasks::default(),
+                ..crate::session::SessionCells::for_test(
+                    shared_permission,
+                    crate::workspace::cwd_for_test(),
+                    crate::workspace::roots_for_test(),
+                    std::sync::Arc::new(crate::frontend::SilentFrontend),
+                )
+            },
+            &crate::session::AgentOptions::for_test(),
         )
         .expect("default web client config should build cleanly");
-        crate::tools::tests::register_deferred_fixture(&registry, "mcp__fs__old_tool");
+        registry.register_deferred_fixture("mcp__fs__old_tool");
 
-        let provider = test_provider();
+        let provider = provider_for_test();
         let before_system = build_system_prompt(true, None);
-        let before_catalogue = registry.tool_catalogue();
+        let before_catalog = registry.tool_catalog();
 
         // The server reconnects and advertises a different tool set.
         registry.replace_server_tools("fs", vec![std::sync::Arc::new(
-            crate::tools::tests::FixtureDeferredTool {
+            crate::tools::FixtureDeferredTool {
                 name: "mcp__fs__new_tool".to_string(),
             },
         )]);
 
         let after_system = build_system_prompt(true, None);
-        let after_catalogue = registry.tool_catalogue();
+        let after_catalog = registry.tool_catalog();
 
         assert_eq!(
             before_system, after_system,
             "the system prompt must survive an MCP tool swap: it heads the cached prefix",
         );
         assert_ne!(
-            before_catalogue, after_catalogue,
+            before_catalog, after_catalog,
             "the swap must actually be visible somewhere, or this test proves nothing",
         );
 
         // ...and the change is announced in the block that gets appended instead.
         let memories: Vec<crate::memory::Memory> = Vec::new();
-        let delta = crate::context::render_world_state(
-            &crate::context::WorldSnapshot::new(
-                &after_catalogue,
+        let delta = crate::prompt::render_world_state(
+            &crate::prompt::WorldSnapshot::new(
+                &after_catalog,
                 &crate::skills::SkillIndex::default(),
                 &memories,
                 &[],
                 &[],
             ),
-            Some(&crate::context::WorldSnapshot::new(
-                &before_catalogue,
+            Some(&crate::prompt::WorldSnapshot::new(
+                &before_catalog,
                 &crate::skills::SkillIndex::default(),
                 &memories,
                 &[],
@@ -2952,13 +3204,11 @@ mod tests {
         );
         assert!(
             delta.contains("mcp__fs__new_tool"),
-            "the new tool must be announced; got: {}",
-            delta,
+            "the new tool must be announced; got: {delta}",
         );
         assert!(
             delta.contains("No longer available, do not call: `mcp__fs__old_tool`"),
-            "the withdrawn tool must be retracted, or the model keeps calling it; got: {}",
-            delta,
+            "the withdrawn tool must be retracted, or the model keeps calling it; got: {delta}",
         );
 
         // Both request bodies still agree on the cached head.
@@ -2967,12 +3217,16 @@ mod tests {
             &[Message::user("hi")],
             &registry.definitions_active(&[]),
             true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
         let body_after = provider.build_request_body(
             &after_system,
             &[Message::user("hi")],
             &registry.definitions_active(&[]),
             true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
         assert_eq!(body_before["system"], body_after["system"]);
     }
@@ -2983,55 +3237,56 @@ mod tests {
     /// array even though the pre-compaction `load_tool` rows have moved below the materialized
     /// view's logical start.
     #[tokio::test]
-    async fn test_compaction_preserves_loaded_tools_active_set() {
-        use std::path::Path;
-
+    async fn compaction_preserves_loaded_tools_active_set() {
         use crate::{
-            conversation::{Conversation, Event, extract_loaded_tool_names_from_events},
+            conversation::{Conversation, Event},
             permission::{Permission, SharedPermission},
-            session::SessionManager,
-            tools::ToolRegistry,
+            store::Store,
+            tools::{ToolRegistry, load_tool::extract_loaded_tool_names_from_events},
         };
 
-        let session_manager =
-            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory session manager");
+        let store = Store::for_test().await;
         let shared_permission = SharedPermission::new(
             Permission::Unrestricted,
             crate::permission::EnabledPermissions::ALL,
         );
-        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
-        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::tools::todo::TodoState::default(),
-        ));
+        let shared_session_id = crate::session::SharedSessionId::default();
+        let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
-            crate::config::WebClientConfig::default(),
-            shared_permission,
-            true,
-            crate::sandbox::detect(),
-            crate::config::SandboxBackend::Landlock,
-            crate::sandbox::BackendProbe::Missing {
-                reason: "test fixture".to_string(),
+            &crate::session::SessionMaterials {
+                core: crate::session::CoreMaterials {
+                    web_client: crate::config::WebClientConfig::default(),
+                    sandbox_enabled: true,
+                    sandbox_capability: crate::sandbox::detect(),
+                    sandbox_backend: crate::config::SandboxBackend::Landlock,
+                    backend_probe: crate::sandbox::BackendProbe::Missing {
+                        reason: "test fixture".to_string(),
+                    },
+                    builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
+                },
+                skills: crate::skills::SkillCache::for_root(None),
+                skills_agent_managed: false,
+                memories: crate::store::memory::MemoryStore::detached(),
+                schedule: crate::config::ResolvedScheduleConfig::default(),
+                background: crate::config::ResolvedBackgroundConfig::default(),
+                ..crate::session::SessionMaterials::for_test(store)
             },
-            todo_list,
-            session_manager,
-            shared_session_id,
-            crate::skills::SkillCache::for_root(None),
-            false,
-            crate::memory::MemoryStore::detached(),
-            crate::tools::BuiltinToolFilter::default(),
-            crate::workspace::test_cwd(),
-            crate::workspace::test_roots(),
-            std::sync::Arc::new(crate::frontend::SilentFrontend),
-            crate::config::ResolvedScheduleConfig::default(),
-            (
-                crate::config::ResolvedBackgroundConfig::default(),
-                crate::background::BackgroundTasks::default(),
-            ),
+            &crate::session::SessionCells {
+                session_id: shared_session_id,
+                todo_list,
+                background_tasks: crate::background::BackgroundTasks::default(),
+                ..crate::session::SessionCells::for_test(
+                    shared_permission,
+                    crate::workspace::cwd_for_test(),
+                    crate::workspace::roots_for_test(),
+                    std::sync::Arc::new(crate::frontend::SilentFrontend),
+                )
+            },
+            &crate::session::AgentOptions::for_test(),
         )
         .expect("default web client config should build cleanly");
-        crate::tools::tests::register_deferred_fixture(&registry, "fixture_deferred");
+        registry.register_deferred_fixture("fixture_deferred");
 
         // Pre-compaction: load fixture_deferred via load_tool.
         let mut log = Conversation::new();
@@ -3098,63 +3353,62 @@ mod tests {
     /// Same invariant, but exercises every pairwise permission toggle (16 combinations). Catches
     /// any permission state that sneaks back into the cacheable prefix.
     #[tokio::test]
-    async fn test_permission_independence_all_levels() {
-        use std::path::Path;
-
+    async fn permission_independence_all_levels() {
         use crate::{
-            context::build_system_prompt,
             permission::{Permission, SharedPermission},
-            session::SessionManager,
+            prompt::build_system_prompt,
+            store::Store,
             tools::ToolRegistry,
         };
 
-        let session_manager =
-            SessionManager::open(Some(Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory session manager");
+        let store = Store::for_test().await;
         let shared_permission =
             SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL);
-        let shared_session_id = std::sync::Arc::new(tokio::sync::RwLock::new(None));
-        let todo_list = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::tools::todo::TodoState::default(),
-        ));
+        let shared_session_id = crate::session::SharedSessionId::default();
+        let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
-            crate::config::WebClientConfig::default(),
-            shared_permission.clone(),
-            true,
-            crate::sandbox::detect(),
-            crate::config::SandboxBackend::Landlock,
-            crate::sandbox::BackendProbe::Missing {
-                reason: "test fixture".to_string(),
+            &crate::session::SessionMaterials {
+                core: crate::session::CoreMaterials {
+                    web_client: crate::config::WebClientConfig::default(),
+                    sandbox_enabled: true,
+                    sandbox_capability: crate::sandbox::detect(),
+                    sandbox_backend: crate::config::SandboxBackend::Landlock,
+                    backend_probe: crate::sandbox::BackendProbe::Missing {
+                        reason: "test fixture".to_string(),
+                    },
+                    builtin_filter: crate::config::BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
+                },
+                skills: crate::skills::SkillCache::for_root(None),
+                skills_agent_managed: false,
+                memories: crate::store::memory::MemoryStore::detached(),
+                schedule: crate::config::ResolvedScheduleConfig::default(),
+                background: crate::config::ResolvedBackgroundConfig::default(),
+                ..crate::session::SessionMaterials::for_test(store)
             },
-            todo_list,
-            session_manager,
-            shared_session_id,
-            crate::skills::SkillCache::for_root(None),
-            false,
-            crate::memory::MemoryStore::detached(),
-            crate::tools::BuiltinToolFilter::default(),
-            crate::workspace::test_cwd(),
-            crate::workspace::test_roots(),
-            std::sync::Arc::new(crate::frontend::SilentFrontend),
-            crate::config::ResolvedScheduleConfig::default(),
-            (
-                crate::config::ResolvedBackgroundConfig::default(),
-                crate::background::BackgroundTasks::default(),
-            ),
+            &crate::session::SessionCells {
+                session_id: shared_session_id,
+                todo_list,
+                background_tasks: crate::background::BackgroundTasks::default(),
+                ..crate::session::SessionCells::for_test(
+                    shared_permission.clone(),
+                    crate::workspace::cwd_for_test(),
+                    crate::workspace::roots_for_test(),
+                    std::sync::Arc::new(crate::frontend::SilentFrontend),
+                )
+            },
+            &crate::session::AgentOptions::for_test(),
         )
         .expect("default web client config should build cleanly");
 
-        let provider = test_provider();
-        // All five. `Workspace` was missing, which is the level this release adds and the one the
-        // property is most load-bearing for: it sits between `read` and `ask` in the Shift+Tab
-        // cycle, so a user reaching `unrestricted` passes through it and would invalidate the
-        // cached prefix on the way if the array moved.
+        let provider = provider_for_test();
+        // All four. The property is most load-bearing for `Workspace`: it sits between `read` and
+        // `unrestricted` in the Shift+Tab cycle, so a user reaching `unrestricted` passes through
+        // it and would invalidate the cached prefix on the way if the array moved.
         let levels = [
             Permission::None,
             Permission::Read,
             Permission::Workspace,
-            Permission::Ask,
             Permission::Unrestricted,
         ];
 
@@ -3168,7 +3422,14 @@ mod tests {
                 !tools.is_empty(),
                 "{level} produced no tools, so the pairwise equality below would be vacuous"
             );
-            bodies.push(provider.build_request_body(&system, &messages, &tools, true));
+            bodies.push(provider.build_request_body(
+                &system,
+                &messages,
+                &tools,
+                true,
+                ThinkingOverride::Inherit,
+                &crate::provider::Attribution::default(),
+            ));
         }
 
         // Every pair must agree on the cacheable prefix.
@@ -3185,14 +3446,21 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_loop_prefix_is_stable() {
-        let provider = test_provider();
+    fn tool_loop_prefix_is_stable() {
+        let provider = provider_for_test();
         let system = "You are a helpful assistant.";
-        let tools = test_tools();
+        let tools = tools_for_test();
 
         // Iteration 1 of tool loop: user asks, model about to respond
         let messages_iter1 = vec![Message::user("Read /tmp/test.txt")];
-        let body_iter1 = provider.build_request_body(system, &messages_iter1, &tools, true);
+        let body_iter1 = provider.build_request_body(
+            system,
+            &messages_iter1,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // Iteration 2: model made a tool call, tool result came back
         let messages_iter2 = vec![
@@ -3216,7 +3484,14 @@ mod tests {
                 }],
             },
         ];
-        let body_iter2 = provider.build_request_body(system, &messages_iter2, &tools, true);
+        let body_iter2 = provider.build_request_body(
+            system,
+            &messages_iter2,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // Iteration 3: model made another tool call
         let messages_iter3 = vec![
@@ -3258,7 +3533,14 @@ mod tests {
                 }],
             },
         ];
-        let body_iter3 = provider.build_request_body(system, &messages_iter3, &tools, true);
+        let body_iter3 = provider.build_request_body(
+            system,
+            &messages_iter3,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
 
         // Prefix from iter1 is stable in iter2 and iter3
         assert_prefix_stable(&body_iter1, &body_iter2, 1);
@@ -3267,13 +3549,20 @@ mod tests {
     }
 
     #[test]
-    fn test_exactly_one_message_cache_control_per_request() {
-        let provider = test_provider();
+    fn exactly_one_message_cache_control_per_request() {
+        let provider = provider_for_test();
         let system = "You are a helpful assistant.";
-        let tools = test_tools();
+        let tools = tools_for_test();
 
         // Single message
-        let body1 = provider.build_request_body(system, &[Message::user("hello")], &tools, true);
+        let body1 = provider.build_request_body(
+            system,
+            &[Message::user("hello")],
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert_eq!(count_message_cache_controls(&body1), 1);
 
         // Three messages
@@ -3286,6 +3575,8 @@ mod tests {
             ],
             &tools,
             true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
         assert_eq!(count_message_cache_controls(&body3), 1);
 
@@ -3317,18 +3608,27 @@ mod tests {
             ],
             &tools,
             true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
         assert_eq!(count_message_cache_controls(&body5), 1);
     }
 
     #[test]
-    fn test_cache_control_shifts_to_new_last_message() {
-        let provider = test_provider();
+    fn cache_control_shifts_to_new_last_message() {
+        let provider = provider_for_test();
         let system = "system";
 
         // Build with 2 messages: cache_control should be on message[1]
         let messages_a = vec![Message::user("hello"), Message::assistant_text("hi")];
-        let body_a = provider.build_request_body(system, &messages_a, &[], false);
+        let body_a = provider.build_request_body(
+            system,
+            &messages_a,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let msgs_a = body_a["messages"].as_array().unwrap();
 
         // Message 0 should NOT have cache_control
@@ -3344,7 +3644,14 @@ mod tests {
             Message::assistant_text("hi"),
             Message::user("bye"),
         ];
-        let body_b = provider.build_request_body(system, &messages_b, &[], false);
+        let body_b = provider.build_request_body(
+            system,
+            &messages_b,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let msgs_b = body_b["messages"].as_array().unwrap();
 
         // Messages 0 and 1 should NOT have cache_control
@@ -3367,12 +3674,19 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_identical_across_turns() {
-        let provider = test_provider();
+    fn system_prompt_identical_across_turns() {
+        let provider = provider_for_test();
         let system = "You are a helpful assistant.";
-        let tools = test_tools();
+        let tools = tools_for_test();
 
-        let body1 = provider.build_request_body(system, &[Message::user("turn 1")], &tools, true);
+        let body1 = provider.build_request_body(
+            system,
+            &[Message::user("turn 1")],
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let body2 = provider.build_request_body(
             system,
             &[
@@ -3382,6 +3696,8 @@ mod tests {
             ],
             &tools,
             true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
         let body3 = provider.build_request_body(
             system,
@@ -3394,6 +3710,8 @@ mod tests {
             ],
             &tools,
             true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
 
         // System prompt must be byte-identical across all turns.
@@ -3410,11 +3728,18 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_schemas_stable_across_turns() {
-        let provider = test_provider();
-        let tools = test_tools();
+    fn tool_schemas_stable_across_turns() {
+        let provider = provider_for_test();
+        let tools = tools_for_test();
 
-        let body1 = provider.build_request_body("system", &[Message::user("a")], &tools, true);
+        let body1 = provider.build_request_body(
+            "system",
+            &[Message::user("a")],
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let body2 = provider.build_request_body(
             "system",
             &[
@@ -3424,6 +3749,8 @@ mod tests {
             ],
             &tools,
             true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
         );
 
         // Tool schemas (including cache_control on the last tool) must be identical when the same
@@ -3432,8 +3759,8 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_block_message_cache_control_on_last_block_only() {
-        let provider = test_provider();
+    fn multi_block_message_cache_control_on_last_block_only() {
+        let provider = provider_for_test();
 
         // An assistant message with text + tool_use (multiple blocks)
         let messages = vec![Message {
@@ -3449,9 +3776,16 @@ mod tests {
                 },
             ],
         }];
-        let body = provider.build_request_body("system", &messages, &[], false);
-        let msg = &body["messages"].as_array().unwrap()[0];
-        let blocks = msg["content"].as_array().unwrap();
+        let body = provider.build_request_body(
+            "system",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
+        let message = &body["messages"].as_array().unwrap()[0];
+        let blocks = message["content"].as_array().unwrap();
 
         // First block (text) should NOT have cache_control
         assert!(blocks[0].get("cache_control").is_none());
@@ -3460,10 +3794,10 @@ mod tests {
     }
 
     #[test]
-    fn test_long_conversation_prefix_stability() {
-        let provider = test_provider();
+    fn long_conversation_prefix_stability() {
+        let provider = provider_for_test();
         let system = "You are a helpful assistant.";
-        let tools = test_tools();
+        let tools = tools_for_test();
 
         // Build up a 10-turn conversation incrementally and verify each step preserves the prefix
         // from the previous step.
@@ -3471,8 +3805,15 @@ mod tests {
         let mut previous: Option<(serde_json::Value, usize)> = None;
 
         for turn in 0..10 {
-            messages.push(Message::user(format!("User message {}", turn)));
-            let body = provider.build_request_body(system, &messages, &tools, true);
+            messages.push(Message::user(format!("User message {turn}")));
+            let body = provider.build_request_body(
+                system,
+                &messages,
+                &tools,
+                true,
+                ThinkingOverride::Inherit,
+                &crate::provider::Attribution::default(),
+            );
 
             if let Some((prev_body, prev_msg_count)) = &previous {
                 // The shared prefix is exactly the messages that were in the previous request body.
@@ -3481,18 +3822,18 @@ mod tests {
 
             assert_eq!(count_message_cache_controls(&body), 1);
 
-            let msg_count = messages.len();
+            let message_count = messages.len();
             // Simulate assistant response
-            messages.push(Message::assistant_text(format!("Response {}", turn)));
-            previous = Some((body, msg_count));
+            messages.push(Message::assistant_text(format!("Response {turn}")));
+            previous = Some((body, message_count));
         }
     }
 
     #[test]
-    fn test_tool_loop_with_multiple_sequential_calls() {
-        let provider = test_provider();
+    fn tool_loop_with_multiple_sequential_calls() {
+        let provider = provider_for_test();
         let system = "system";
-        let tools = test_tools();
+        let tools = tools_for_test();
 
         // Simulate a user request that triggers 4 sequential tool calls. Each iteration of the loop
         // adds an assistant tool_use + user tool_result pair. Verify the prefix is stable across
@@ -3503,7 +3844,14 @@ mod tests {
         let mut previous_len = 0;
 
         for i in 0..4 {
-            let body = provider.build_request_body(system, &messages, &tools, true);
+            let body = provider.build_request_body(
+                system,
+                &messages,
+                &tools,
+                true,
+                ThinkingOverride::Inherit,
+                &crate::provider::Attribution::default(),
+            );
 
             if let Some(prev) = &previous_body {
                 assert_prefix_stable(prev, &body, previous_len);
@@ -3512,8 +3860,7 @@ mod tests {
             assert_eq!(
                 count_message_cache_controls(&body),
                 1,
-                "iteration {} should have exactly 1 message cache_control",
-                i
+                "iteration {i} should have exactly 1 message cache_control"
             );
 
             previous_len = messages.len();
@@ -3523,7 +3870,7 @@ mod tests {
             messages.push(Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
-                    id: format!("toolu_{}", i),
+                    id: format!("toolu_{i}"),
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path": format!("/tmp/file{}", i)}),
                 }],
@@ -3531,9 +3878,9 @@ mod tests {
             messages.push(Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
-                    tool_use_id: format!("toolu_{}", i),
+                    tool_use_id: format!("toolu_{i}"),
                     content: vec![ToolResultContent::Text {
-                        text: format!("contents of file{}", i),
+                        text: format!("contents of file{i}"),
                     }],
                     is_error: false,
                 }],
@@ -3541,22 +3888,36 @@ mod tests {
         }
 
         // Final body after all tool calls
-        let final_body = provider.build_request_body(system, &messages, &tools, true);
+        let final_body = provider.build_request_body(
+            system,
+            &messages,
+            &tools,
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert_prefix_stable(previous_body.as_ref().unwrap(), &final_body, previous_len);
         assert_eq!(count_message_cache_controls(&final_body), 1);
     }
 
     #[test]
-    fn test_empty_messages_produces_no_cache_control() {
-        let provider = test_provider();
-        let body = provider.build_request_body("system", &[], &[], false);
+    fn empty_messages_produces_no_cache_control() {
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "system",
+            &[],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         assert_eq!(count_message_cache_controls(&body), 0);
         assert!(body["messages"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn test_cache_control_on_tool_result_block() {
-        let provider = test_provider();
+    fn cache_control_on_tool_result_block() {
+        let provider = provider_for_test();
 
         // When the last message is a tool_result, cache_control should still appear on its last
         // content block.
@@ -3581,22 +3942,29 @@ mod tests {
                 }],
             },
         ];
-        let body = provider.build_request_body("system", &messages, &[], false);
-        let msgs = body["messages"].as_array().unwrap();
+        let body = provider.build_request_body(
+            "system",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
+        let messages = body["messages"].as_array().unwrap();
 
         // Only the tool_result message (last) should have cache_control
         assert!(
-            msgs[0]["content"].as_array().unwrap()[0]
+            messages[0]["content"].as_array().unwrap()[0]
                 .get("cache_control")
                 .is_none()
         );
         assert!(
-            msgs[1]["content"].as_array().unwrap()[0]
+            messages[1]["content"].as_array().unwrap()[0]
                 .get("cache_control")
                 .is_none()
         );
         assert!(
-            msgs[2]["content"].as_array().unwrap()[0]
+            messages[2]["content"].as_array().unwrap()[0]
                 .get("cache_control")
                 .is_some()
         );
@@ -3604,15 +3972,22 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_cache_control_on_last_message_only() {
-        let provider = test_provider();
+    fn claude_cache_control_on_last_message_only() {
+        let provider = provider_for_test();
 
         let messages = vec![
             Message::user("first"),
             Message::assistant_text("response"),
             Message::user("second"),
         ];
-        let body = provider.build_request_body("system", &messages, &[], false);
+        let body = provider.build_request_body(
+            "system",
+            &messages,
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let claude_messages = body["messages"].as_array().unwrap();
 
         let first_content = claude_messages[0]["content"].as_array().unwrap();
@@ -3626,8 +4001,8 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_tools_carry_no_cache_control() {
-        let provider = test_provider();
+    fn claude_tools_carry_no_cache_control() {
+        let provider = provider_for_test();
 
         let tools = vec![
             ToolDefinition::new(
@@ -3641,7 +4016,14 @@ mod tests {
                 serde_json::json!({"type": "object"}),
             ),
         ];
-        let body = provider.build_request_body("system", &[Message::user("hi")], &tools, false);
+        let body = provider.build_request_body(
+            "system",
+            &[Message::user("hi")],
+            &tools,
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let claude_tools = body["tools"].as_array().unwrap();
 
         // No tool carries cache_control: the rolling last-message breakpoint caches the
@@ -3651,9 +4033,16 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_no_message_cache_control_when_empty() {
-        let provider = test_provider();
-        let body = provider.build_request_body("system", &[], &[], false);
+    fn claude_no_message_cache_control_when_empty() {
+        let provider = provider_for_test();
+        let body = provider.build_request_body(
+            "system",
+            &[],
+            &[],
+            false,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        );
         let claude_messages = body["messages"].as_array().unwrap();
         assert!(claude_messages.is_empty());
     }
@@ -3679,7 +4068,7 @@ mod tests {
                 // Drain enough of the request to know we got a full POST body. The OAuth endpoint
                 // sends a small JSON body; read until we see two CRLFs (header end) and then
                 // enough bytes to satisfy Content-Length.
-                let mut buf = Vec::with_capacity(2048);
+                let mut buffer = Vec::with_capacity(2048);
                 let mut headers_end: Option<usize> = None;
                 let mut content_length: Option<usize> = None;
                 while headers_end.is_none() {
@@ -3689,22 +4078,22 @@ mod tests {
                         Ok(n) => n,
                         Err(_) => return,
                     };
-                    buf.extend_from_slice(&chunk[..n]);
-                    if let Some(idx) = find_crlf_crlf(&buf) {
-                        headers_end = Some(idx);
-                        content_length = parse_content_length(&buf[..idx]);
+                    buffer.extend_from_slice(&chunk[..n]);
+                    if let Some(index) = find_crlf_crlf(&buffer) {
+                        headers_end = Some(index);
+                        content_length = parse_content_length(&buffer[..index]);
                     }
                 }
                 if let (Some(end), Some(len)) = (headers_end, content_length) {
                     let body_start = end + 4;
-                    while buf.len() < body_start + len {
+                    while buffer.len() < body_start + len {
                         let mut chunk = [0u8; 1024];
                         let n = match socket.read(&mut chunk).await {
                             Ok(0) => break,
                             Ok(n) => n,
                             Err(_) => return,
                         };
-                        buf.extend_from_slice(&chunk[..n]);
+                        buffer.extend_from_slice(&chunk[..n]);
                     }
                 }
                 hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3741,7 +4130,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         while let Ok((mut socket, _)) = listener.accept().await {
-            let mut buf = Vec::with_capacity(2048);
+            let mut buffer = Vec::with_capacity(2048);
             loop {
                 let mut chunk = [0u8; 1024];
                 let read = match socket.read(&mut chunk).await {
@@ -3749,11 +4138,11 @@ mod tests {
                     Ok(read) => read,
                     Err(_) => return,
                 };
-                buf.extend_from_slice(&chunk[..read]);
-                let Some(end) = find_crlf_crlf(&buf) else {
+                buffer.extend_from_slice(&chunk[..read]);
+                let Some(end) = find_crlf_crlf(&buffer) else {
                     continue;
                 };
-                if buf.len() >= end + 4 + parse_content_length(&buf[..end]).unwrap_or(0) {
+                if buffer.len() >= end + 4 + parse_content_length(&buffer[..end]).unwrap_or(0) {
                     break;
                 }
             }
@@ -3764,14 +4153,13 @@ mod tests {
                 body.len()
             };
             let response = format!(
-                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                status_line, declared, body
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n{body}"
             );
             if socket.write_all(response.as_bytes()).await.is_err() {
                 return;
             }
             if socket.shutdown().await.is_err() {
-                tracing::debug!("mock refresh endpoint could not shut its socket down cleanly");
+                tracing::debug!("mock refresh endpoint failed to shut its socket down cleanly");
             }
         }
     }
@@ -3819,24 +4207,26 @@ mod tests {
             let credential = AuthCredential::OAuthToken {
                 access_token: "stale".to_string(),
                 refresh_token: Some("rt".to_string()),
-                expires_at: Some(crate::provider::now_epoch_millis()),
+                expires_at: Some(crate::oauth::now_epoch_millis()),
                 account_id: None,
             };
             let provider = ClaudeSubscriptionProvider::new(
-                credential,
-                "claude-sonnet-4-20250514".to_string(),
-                None,
-                None,
-                Some(format!("http://{}/", local)),
-                None,
-                "work".to_string(),
-                ThinkingMode::Off,
-                10000,
-                "a".repeat(64),
-                None,
-                false,
-                None,
-                None,
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::ClaudeSubscription,
+                    credential,
+                    "claude-sonnet-4-20250514".to_string(),
+                )
+                .base_url(None)
+                .client_id(None)
+                .oauth_token_url(Some(format!("http://{local}/")))
+                .token_store(None)
+                .credential_key(Some("work".to_string()))
+                .thinking(ThinkingMode::Off, 10000)
+                .device_id("a".repeat(64))
+                .effort(None)
+                .redact_thinking(false)
+                .max_output_tokens(None)
+                .max_request_bytes(None),
             )
             .expect("build test provider");
 
@@ -3859,7 +4249,7 @@ mod tests {
                         "{status_line}: {message}"
                     );
                     assert!(
-                        message.contains("meka provider login work"),
+                        message.contains("meka account login work"),
                         "{status_line} should name the profile to log in to: {message}"
                     );
                 }
@@ -3868,8 +4258,8 @@ mod tests {
         }
     }
 
-    fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
-        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    fn find_crlf_crlf(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
     }
 
     fn parse_content_length(headers: &[u8]) -> Option<usize> {
@@ -3904,26 +4294,28 @@ mod tests {
         let credential = AuthCredential::OAuthToken {
             access_token: "stale".to_string(),
             refresh_token: Some("rt".to_string()),
-            expires_at: Some(crate::provider::now_epoch_millis()),
+            expires_at: Some(crate::oauth::now_epoch_millis()),
             account_id: None,
         };
 
         let provider = Arc::new(
             ClaudeSubscriptionProvider::new(
-                credential,
-                "claude-sonnet-4-20250514".to_string(),
-                None,
-                None,
-                Some(format!("http://{}/", local)),
-                None,
-                "test".to_string(),
-                ThinkingMode::Off,
-                10000,
-                "a".repeat(64),
-                Some("high".to_string()),
-                false,
-                None,
-                None,
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::ClaudeSubscription,
+                    credential,
+                    "claude-sonnet-4-20250514".to_string(),
+                )
+                .base_url(None)
+                .client_id(None)
+                .oauth_token_url(Some(format!("http://{local}/")))
+                .token_store(None)
+                .credential_key(Some("test".to_string()))
+                .thinking(ThinkingMode::Off, 10000)
+                .device_id("a".repeat(64))
+                .effort(Some("high".to_string()))
+                .redact_thinking(false)
+                .max_output_tokens(None)
+                .max_request_bytes(None),
             )
             .expect("build test provider"),
         );
@@ -3954,8 +4346,7 @@ mod tests {
         let observed_hits = hits.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             observed_hits, 1,
-            "exactly one refresh API call must fire under concurrent demand; got {}",
-            observed_hits,
+            "exactly one refresh API call must fire under concurrent demand; got {observed_hits}",
         );
     }
 
@@ -3965,7 +4356,7 @@ mod tests {
     /// `expires_at: None` reads as due, which is right for a *stored* token of unknown age and
     /// wrong for one that has just been minted. Handing the `None` straight back meant the
     /// credential was due again the instant it arrived, so every request took the write lock,
-    /// re-read the database and ran a full OAuth round trip -- serialised, and rotating the
+    /// re-read the database and ran a full OAuth round trip -- serialized, and rotating the
     /// refresh token each pass, which is the state most likely to end in an `invalid_grant`
     /// nobody can explain.
     #[tokio::test]
@@ -3984,24 +4375,26 @@ mod tests {
         let credential = AuthCredential::OAuthToken {
             access_token: "stale".to_string(),
             refresh_token: Some("rt".to_string()),
-            expires_at: Some(crate::provider::now_epoch_millis()),
+            expires_at: Some(crate::oauth::now_epoch_millis()),
             account_id: None,
         };
         let provider = ClaudeSubscriptionProvider::new(
-            credential,
-            "claude-sonnet-4-20250514".to_string(),
-            None,
-            None,
-            Some(format!("http://{}/", local)),
-            None,
-            "test".to_string(),
-            ThinkingMode::Off,
-            10000,
-            "a".repeat(64),
-            Some("high".to_string()),
-            false,
-            None,
-            None,
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                credential,
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .base_url(None)
+            .client_id(None)
+            .oauth_token_url(Some(format!("http://{local}/")))
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(Some("high".to_string()))
+            .redact_thinking(false)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
         )
         .expect("build test provider");
 
@@ -4018,5 +4411,202 @@ mod tests {
             1,
             "the token the refresh returned must be usable without refreshing it again",
         );
+    }
+
+    /// One listener standing in for both the API and the token endpoint, so a request that is
+    /// refused, refreshed and sent again can be watched end to end.
+    struct RejectingApi {
+        /// How many `/v1/messages` calls to answer 401 before answering 200.
+        reject_first: usize,
+        messages_hits: std::sync::atomic::AtomicUsize,
+        token_hits: std::sync::atomic::AtomicUsize,
+        /// The `Authorization` header of each `/v1/messages` call, in order.
+        authorizations: std::sync::Mutex<Vec<String>>,
+    }
+
+    async fn run_rejecting_api(listener: tokio::net::TcpListener, api: Arc<RejectingApi>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let api = Arc::clone(&api);
+            tokio::spawn(async move {
+                let mut buffer = Vec::with_capacity(4096);
+                loop {
+                    let mut chunk = [0u8; 2048];
+                    let read = match socket.read(&mut chunk).await {
+                        Ok(0) => return,
+                        Ok(read) => read,
+                        Err(_) => return,
+                    };
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(end) = find_crlf_crlf(&buffer)
+                        && buffer.len()
+                            >= end + 4 + parse_content_length(&buffer[..end]).unwrap_or(0)
+                    {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buffer).to_string();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let authorization = head
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .and_then(|line| line.split_once(':'))
+                    .map(|(_, value)| value.trim().to_string())
+                    .unwrap_or_default();
+                let (status, reason, body) = if path.starts_with("/v1/oauth/token") {
+                    api.token_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        200,
+                        "OK",
+                        r#"{"access_token":"fresh-token-xyz","refresh_token":"fresh-refresh","expires_in":3600}"#,
+                    )
+                } else {
+                    let hit = api
+                        .messages_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    api.authorizations.lock().expect("lock").push(authorization);
+                    if hit < api.reject_first {
+                        (
+                            401,
+                            "Unauthorized",
+                            r#"{"type":"error","error":{"type":"authentication_error","message":"invalid token"}}"#,
+                        )
+                    } else {
+                        (
+                            200,
+                            "OK",
+                            r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                        )
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    }
+
+    /// A provider against the listener at `local`, holding a token the store believes is good for
+    /// another hour. Only the backend's word says otherwise.
+    fn provider_against(local: std::net::SocketAddr) -> ClaudeSubscriptionProvider {
+        ClaudeSubscriptionProvider::new(
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ClaudeSubscription,
+                AuthCredential::OAuthToken {
+                    access_token: "stale-token".to_string(),
+                    refresh_token: Some("rt".to_string()),
+                    expires_at: Some(crate::oauth::now_epoch_millis() + 3_600_000),
+                    account_id: None,
+                },
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .client_id(None)
+            .oauth_token_url(Some(format!("http://{local}/v1/oauth/token")))
+            .token_store(None)
+            .credential_key(Some("work".to_string()))
+            .thinking(ThinkingMode::Off, 10000)
+            .device_id("a".repeat(64))
+            .effort(None)
+            .redact_thinking(false)
+            .max_output_tokens(None)
+            .max_request_bytes(None),
+        )
+        .expect("build test provider")
+    }
+
+    /// A 401 is the backend saying the stored expiry is wrong. The token is refreshed once and the
+    /// same call sent again on the new one, so a revoked or shortened token costs one round trip
+    /// rather than every turn until the expiry meka believed in has passed.
+    #[tokio::test]
+    async fn a_rejected_token_is_refreshed_once_and_the_call_sent_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock API");
+        let local = listener.local_addr().expect("local addr");
+        let api = Arc::new(RejectingApi {
+            reject_first: 1,
+            messages_hits: std::sync::atomic::AtomicUsize::new(0),
+            token_hits: std::sync::atomic::AtomicUsize::new(0),
+            authorizations: std::sync::Mutex::new(Vec::new()),
+        });
+        tokio::spawn(run_rejecting_api(listener, Arc::clone(&api)));
+
+        let provider = provider_against(local);
+        let message = provider
+            .complete(CompletionRequest::new("", &[Message::user("hi")], &[]))
+            .await
+            .expect("the call sent again on the refreshed token succeeds")
+            .message;
+        assert_eq!(message.text_content(), "hi");
+        assert_eq!(
+            api.messages_hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one refused call, one retried"
+        );
+        assert_eq!(
+            api.token_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one refresh"
+        );
+        assert_eq!(
+            *api.authorizations.lock().expect("lock"),
+            vec![
+                "Bearer stale-token".to_string(),
+                "Bearer fresh-token-xyz".to_string()
+            ],
+            "the retry carries the refreshed token, not the refused one"
+        );
+    }
+
+    /// A second refusal is the account, not the token: the grant behind the refresh is gone and
+    /// only signing in again produces one the backend will take, so the error says so rather than
+    /// refreshing forever.
+    #[tokio::test]
+    async fn a_token_rejected_twice_names_the_login_remedy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock API");
+        let local = listener.local_addr().expect("local addr");
+        let api = Arc::new(RejectingApi {
+            reject_first: usize::MAX,
+            messages_hits: std::sync::atomic::AtomicUsize::new(0),
+            token_hits: std::sync::atomic::AtomicUsize::new(0),
+            authorizations: std::sync::Mutex::new(Vec::new()),
+        });
+        tokio::spawn(run_rejecting_api(listener, Arc::clone(&api)));
+
+        let provider = provider_against(local);
+        let error = provider
+            .complete(CompletionRequest::new("", &[Message::user("hi")], &[]))
+            .await
+            .expect_err("a token refused after its refresh is a failure");
+        match error {
+            MekaError::Provider(message) => assert!(
+                message.contains("meka account login work"),
+                "the remedy names the profile: {message}"
+            ),
+            other => panic!("expected a provider error naming the remedy, got {other:?}"),
+        }
+        assert_eq!(
+            api.messages_hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "refused, refreshed, refused again, and no third attempt"
+        );
+        assert_eq!(api.token_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

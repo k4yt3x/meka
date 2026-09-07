@@ -10,14 +10,14 @@
 //!
 //! On disk, events are stored row-per-event in the `messages` table; the encoding lives in
 //! `session.rs`'s `encode_event_for_db` / `decode_event_from_row` helpers, behind the
-//! [`crate::session::SessionManager::save_event`] / [`crate::session::SessionManager::load_events`]
+//! [`crate::store::Store::save_event`] / [`crate::store::Store::load_events`]
 //! API.
 
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{ContentBlock, Message, Role};
+use crate::image::ImageSource;
 
 /// Whether `message` is the one a turn opens with, rather than something appended inside one.
 ///
@@ -37,7 +37,7 @@ fn opens_turn(message: &Message) -> bool {
 /// One entry in the underlying event log of a [`Conversation`]. Persisted as a single row in the
 /// `messages` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Event {
+pub(crate) enum Event {
     /// Adds a message to the materialized view.
     Append(Message),
     /// Marks a compaction boundary: when materializing, drop the last `replaced_count` materialized
@@ -61,11 +61,29 @@ pub enum Event {
         replaced_count: usize,
         messages: Vec<Message>,
     },
+    /// Replaces the images at `images` with [`IMAGE_REDACTION_PLACEHOLDER`], once, so the body
+    /// that fit the request budget is the body every later request sends and the cache prefix
+    /// ahead of the newest turn stops moving. Redacting per request instead moved it on every
+    /// send, since each request re-derived the set from scratch.
+    ///
+    /// Tail-relative like [`Self::Repair`], and for the same reason: the producer,
+    /// `Agent::run_turn`, records it before appending the round's own messages, so the view it
+    /// addresses is the view the request was built from.
+    Redact { images: Vec<RedactedImage> },
 }
+
+pub(crate) use crate::image::RedactedImage;
+
+/// Placeholder text that replaces an image payload when the request body would otherwise exceed
+/// the ceiling.
+pub(crate) const IMAGE_REDACTION_PLACEHOLDER: &str = "[image redacted to fit request size budget]";
+
+/// Characters a session title keeps before it is cut.
+pub(crate) const TITLE_CHARS: usize = 80;
 
 /// Append-only conversation: an event log, plus the materialized message view derived from it.
 #[derive(Debug, Default, Clone)]
-pub struct Conversation {
+pub(crate) struct Conversation {
     events: Vec<Event>,
     /// Materialized view kept in lockstep with `events`. Rebuilt by `rebuild_materialized` after
     /// every mutation; reads are zero-cost.
@@ -84,13 +102,13 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Hydrate from a sequence of events (typically loaded from the session DB on resume). The
     /// materialized view is computed once and cached.
-    pub fn from_events(events: Vec<Event>) -> Self {
+    pub(crate) fn from_events(events: Vec<Event>) -> Self {
         let mut log = Self {
             events,
             ..Self::default()
@@ -108,13 +126,40 @@ impl Conversation {
     /// express the boundary and repair events a real log carries, so a production caller would be
     /// silently discarding them.
     #[cfg(test)]
-    pub fn from_vec(entries: Vec<Message>) -> Self {
+    pub(crate) fn from_vec(entries: Vec<Message>) -> Self {
         let events = entries.into_iter().map(Event::Append).collect();
         Self::from_events(events)
     }
 
+    /// The session's title, the same on every surface that labels one: the first `Text` block a
+    /// user message carries, its whitespace collapsed to single spaces, cut to [`TITLE_CHARS`] with
+    /// an ellipsis. Empty until a user has said something. A turn's context block is not a `Text`
+    /// block, so what rode in front of the words never becomes the label.
+    pub(crate) fn title(&self) -> String {
+        self.materialized
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::Text { text } => {
+                    let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    (!words.is_empty()).then_some(words)
+                }
+                _ => None,
+            })
+            .map(|words| {
+                if words.chars().count() <= TITLE_CHARS {
+                    words
+                } else {
+                    let kept: String = words.chars().take(TITLE_CHARS).collect();
+                    format!("{}…", kept.trim_end())
+                }
+            })
+            .unwrap_or_default()
+    }
+
     /// Read the underlying event log (e.g. for persistence or scanning).
-    pub fn events(&self) -> &[Event] {
+    pub(crate) fn events(&self) -> &[Event] {
         &self.events
     }
 
@@ -123,8 +168,8 @@ impl Conversation {
     /// Told once. The conversation the model reads back is a record of what happened, not proof
     /// that any of it still holds: a tool that was holding something open across those turns has
     /// been restarted along with the process, and nothing else in the context block says so
-    /// (permission, cwd, todos, and the tool catalogue are all restated every turn regardless).
-    pub fn take_resumed_notice(&mut self) -> bool {
+    /// (permission, cwd, todos, and the tool catalog are all restated every turn regardless).
+    pub(crate) fn take_resumed_notice(&mut self) -> bool {
         std::mem::take(&mut self.resumed_undisclosed)
     }
 
@@ -134,13 +179,13 @@ impl Conversation {
     /// errors is never told. Same withdrawal [`Agent::run_turn`] performs on the world snapshot.
     ///
     /// [`Agent::run_turn`]: crate::agent::Agent::run_turn
-    pub fn restore_resumed_notice(&mut self) {
+    pub(crate) fn restore_resumed_notice(&mut self) {
         self.resumed_undisclosed = true;
     }
 
     /// The only canonical mutation. Push a fully-formed message onto the log as a new
     /// `Event::Append`.
-    pub fn append(&mut self, message: Message) {
+    pub(crate) fn append(&mut self, message: Message) {
         self.materialized.push(message.clone());
         self.events.push(Event::Append(message));
         // Pushed straight onto the view rather than going through `rebuild_materialized`, so the
@@ -155,19 +200,20 @@ impl Conversation {
     /// what providers and the token scanner consume. Anything asking what *happened* reads
     /// [`Self::events`] instead, because a compaction or a repair can take a record out of this
     /// view while leaving it in the log.
-    pub fn as_slice(&self) -> &[Message] {
+    pub(crate) fn as_slice(&self) -> &[Message] {
         &self.materialized
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.materialized.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.materialized.is_empty()
     }
 
-    pub fn last(&self) -> Option<&Message> {
+    #[cfg(test)]
+    pub(crate) fn last(&self) -> Option<&Message> {
         self.materialized.last()
     }
 
@@ -178,7 +224,7 @@ impl Conversation {
     /// much stronger statement than any inspection of the materialized tail: compaction, a
     /// repair, a thinking-only nudge and a tool round all move it, including the ones that
     /// leave a tail still shaped like a turn-opening prompt.
-    pub fn events_len(&self) -> usize {
+    pub(crate) fn events_len(&self) -> usize {
         self.events.len()
     }
 
@@ -196,41 +242,46 @@ impl Conversation {
     /// [`Event::Append`] says "the message on the end is one somebody appended", which a summary
     /// carried by a `CompactBoundary` is not. [`Self::pop_unsaved`] guards its own removal the same
     /// way and for the same reason.
-    pub fn ends_on_a_turn_opening(&self) -> bool {
+    pub(crate) fn ends_on_a_turn_opening(&self) -> bool {
         matches!(self.events.last(), Some(Event::Append(_)))
             && self.materialized.last().is_some_and(opens_turn)
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Message> {
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, Message> {
         self.materialized.iter()
     }
 
     /// Text content of the most recent `Role::Assistant` message, or `None` when no assistant
     /// message exists. Walks backward, which is necessary because a turn that ended via tool-use
     /// leaves a `Role::User` tool-result trailer in the conversation, hiding the assistant's
-    /// final text from the plain [`Self::last`].
-    pub fn last_assistant_text(&self) -> Option<String> {
+    /// final text from a look at the last message alone.
+    pub(crate) fn last_assistant_text(&self) -> Option<String> {
         self.materialized
             .iter()
             .rev()
-            .find(|message| matches!(message.role, crate::provider::Role::Assistant))
+            .find(|message| matches!(message.role, crate::conversation::Role::Assistant))
             .map(|message| message.text_content())
     }
 
     /// Roll back an [`Conversation::append`] that did not reach the persistence layer. Used by
-    /// `Agent::run_turn`'s error path when `save_message(user)` fails before any consumer could
-    /// observe the message. Returns the popped message for diagnostics.
+    /// `Agent::run_turn`'s failure arm when the prompt's eager persist failed and nothing was
+    /// persisted after it. Returns the popped message for diagnostics.
     ///
     /// Removes only a trailing `Event::Append`. If the last event is a `Event::CompactBoundary`
     /// (which can only be true after a successful compaction round-trip), this is a programmer
     /// error and the call returns `None` without mutating the log.
-    pub fn pop_unsaved(&mut self) -> Option<Message> {
+    pub(crate) fn pop_unsaved(&mut self) -> Option<Message> {
         match self.events.last() {
             Some(Event::Append(_)) => {}
             _ => return None,
         }
         let popped = match self.events.pop() {
             Some(Event::Append(message)) => message,
+            #[allow(
+                clippy::unreachable,
+                reason = "the match above returned unless the last event is an `Append`, and nothing ran between"
+            )]
             _ => unreachable!("checked Append above"),
         };
         // Mirror the in-memory removal in the materialized view.
@@ -248,7 +299,7 @@ impl Conversation {
     /// *before* the boundary is appended. Carried so `extract_loaded_tool_names_from_events` can
     /// recover deferred tools after the boundary; otherwise a session that loaded a tool, then
     /// compacted, would fall back to the deferred state.
-    pub fn replace_for_compaction(
+    pub(crate) fn replace_for_compaction(
         &mut self,
         summary: Message,
         tail: Vec<Message>,
@@ -256,7 +307,7 @@ impl Conversation {
     ) {
         let replaced_count = self.materialized.len();
         self.events.push(Event::CompactBoundary {
-            summary: summary.clone(),
+            summary,
             replaced_count,
             loaded_tools_snapshot,
         });
@@ -264,10 +315,6 @@ impl Conversation {
             self.events.push(Event::Append(message));
         }
         self.rebuild_materialized();
-        // Make sure `summary` is referenced even if `tail` is empty; the boundary's summary alone
-        // is the visible head after the truncate. (Materialization handles this; the let-binding
-        // above only exists to consume `summary`.)
-        let _ = summary;
     }
 
     /// Undo the most recent [`Self::replace_for_compaction`], restoring the pre-compaction view.
@@ -282,7 +329,7 @@ impl Conversation {
     /// [`Self::prune_compacted_events`] has dropped the superseded events: this truncates back to
     /// the boundary on the assumption that everything from there on is what the compaction just
     /// pushed. Returns `false` when there is no boundary to undo.
-    pub fn pop_compaction(&mut self) -> bool {
+    pub(crate) fn pop_compaction(&mut self) -> bool {
         let Some(boundary) = self
             .events
             .iter()
@@ -302,11 +349,21 @@ impl Conversation {
     /// Used by `Agent::run_turn` when the provider rejects content it has just appended, and by
     /// [`Self::rewind`] with an empty `messages`. Callers must satisfy [`Event::Repair`]'s
     /// invariant: the replaced messages have to be the current tail.
-    pub fn replace_tail(&mut self, replaced_count: usize, messages: Vec<Message>) -> Event {
+    pub(crate) fn replace_tail(&mut self, replaced_count: usize, messages: Vec<Message>) -> Event {
         let event = Event::Repair {
             replaced_count,
             messages,
         };
+        self.events.push(event.clone());
+        self.rebuild_materialized();
+        event
+    }
+
+    /// Record that a request budget redacted `images`, replacing each with the placeholder in the
+    /// view. Returns the event so the caller can persist it; see [`Event::Redact`] for why it is
+    /// recorded rather than redone per request.
+    pub(crate) fn redact_images(&mut self, images: Vec<RedactedImage>) -> Event {
+        let event = Event::Redact { images };
         self.events.push(event.clone());
         self.rebuild_materialized();
         event
@@ -318,7 +375,7 @@ impl Conversation {
     /// calls this when the retry fails too, so a misdiagnosed rejection leaves the conversation
     /// byte-identical instead of permanently losing a good tool result. Returns whether anything
     /// was undone; a trailing event that isn't a `Repair` is left alone.
-    pub fn pop_repair(&mut self) -> bool {
+    pub(crate) fn pop_repair(&mut self) -> bool {
         if !matches!(self.events.last(), Some(Event::Repair { .. })) {
             return false;
         }
@@ -336,7 +393,7 @@ impl Conversation {
     /// boundary: rewinding far enough past a compaction discards the summary too, which is right
     /// (it stands in for the turns before it) but means a big `turns` can empty a compacted session
     /// faster than the turn count suggests.
-    pub fn rewind(&mut self, turns: usize) -> Option<Event> {
+    pub(crate) fn rewind(&mut self, turns: usize) -> Option<Event> {
         if turns == 0 {
             return None;
         }
@@ -354,15 +411,16 @@ impl Conversation {
     /// Drop every event preceding the most recent `CompactBoundary`.
     ///
     /// Those events are fully superseded: a `CompactBoundary` truncates all materialized messages
-    /// before it and replaces them with its summary, and [`extract_loaded_tool_names_from_events`]
-    /// reads the boundary's `loaded_tools_snapshot` rather than the events preceding it. So the
-    /// materialized view and the recovered tool set are byte-identical before and after this call;
-    /// it only stops the in-memory log from growing unbounded across a long-lived,
-    /// repeatedly-compacted session.
+    /// before it and replaces them with its summary, and
+    /// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`] reads the boundary's
+    /// `loaded_tools_snapshot` rather than the events preceding it. So the materialized view
+    /// and the recovered tool set are byte-identical before and after this call; it only stops
+    /// the in-memory log from growing unbounded across a long-lived, repeatedly-compacted
+    /// session.
     ///
     /// Persistence is unaffected: every event was already written to its own row by `save_event`,
     /// so the on-disk log stays complete.
-    pub fn prune_compacted_events(&mut self) {
+    pub(crate) fn prune_compacted_events(&mut self) {
         let last_boundary = self
             .events
             .iter()
@@ -383,7 +441,7 @@ impl Conversation {
     /// Removes the corresponding `Event::Append` entries from the event log so future
     /// re-materializations stay clean. `Event::CompactBoundary` events are never touched (their
     /// synthetic summary is a plain user message that can't be orphaned).
-    pub fn sanitize_orphans(&mut self) -> Vec<Message> {
+    pub(crate) fn sanitize_orphans(&mut self) -> Vec<Message> {
         let dropped_indices = orphan_event_indices(&self.events);
         if dropped_indices.is_empty() {
             return Vec::new();
@@ -393,10 +451,10 @@ impl Conversation {
         // Walk indices in reverse so each `swap_remove`-style remove doesn't invalidate the rest.
         // Use `remove` (linear) to preserve ordering; the dropped vector is filled in original
         // order via a post-sort.
-        let mut to_remove = dropped_indices.clone();
+        let mut to_remove = dropped_indices;
         to_remove.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in to_remove {
-            if let Event::Append(message) = self.events.remove(idx) {
+        for index in to_remove {
+            if let Event::Append(message) = self.events.remove(index) {
                 dropped.push(message);
             }
         }
@@ -410,35 +468,161 @@ impl Conversation {
     /// [`repair_invalid_images`] for why that is done at all; callers use this only to log it at
     /// resume, where it is read straight after [`Self::from_events`] and so counts exactly the
     /// images the stored log carried.
-    pub fn invalid_images_replaced(&self) -> usize {
+    pub(crate) fn invalid_images_replaced(&self) -> usize {
         self.invalid_images_replaced
     }
 
     fn rebuild_materialized(&mut self) {
-        self.materialized.clear();
-        for event in &self.events {
-            match event {
-                Event::Append(message) => self.materialized.push(message.clone()),
-                Event::CompactBoundary {
-                    summary,
-                    replaced_count,
-                    ..
-                } => {
-                    let truncate_to = self.materialized.len().saturating_sub(*replaced_count);
-                    self.materialized.truncate(truncate_to);
-                    self.materialized.push(summary.clone());
-                }
-                Event::Repair {
-                    replaced_count,
-                    messages,
-                } => {
-                    let truncate_to = self.materialized.len().saturating_sub(*replaced_count);
-                    self.materialized.truncate(truncate_to);
-                    self.materialized.extend(messages.iter().cloned());
+        let (placed, _) = replay(self.events.iter());
+        self.materialized = placed.into_iter().map(|placed| placed.message).collect();
+        self.invalid_images_replaced = repair_invalid_images(&mut self.materialized);
+    }
+}
+
+/// The event a materialised message came from.
+#[derive(Debug, Clone, Copy)]
+enum Source {
+    Append(usize),
+    Boundary(usize),
+    Repair(usize),
+}
+
+/// One materialised message and where it came from.
+struct Placed {
+    message: Message,
+    source: Source,
+    marker: Option<CompactionMarker>,
+}
+
+/// Which compaction a summary stands for, as a view of the log reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionMarker {
+    /// How many materialised messages the boundary recorded replacing.
+    pub(crate) replaced_count: usize,
+    /// Which compaction produced it, counting from 1.
+    pub(crate) generation: u64,
+}
+
+/// Replay `events` into the messages the model sees, with each one's origin, and the count of
+/// rewrites (boundaries and repairs) the log has been through.
+///
+/// The one statement of the rules. A boundary replaces everything before it: its producer,
+/// [`Conversation::replace_for_compaction`], records the whole view as `replaced_count`, but that
+/// number was measured against the view in memory, which a resume that dropped orphans has made
+/// shorter than what the store replays. Truncating by the count left the difference standing
+/// above the summary, and every later compaction widened it. A repair is position-relative by
+/// design, since it replaces a trailing run its producer just appended.
+fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<Placed>, u64) {
+    let mut placed: Vec<Placed> = Vec::new();
+    let mut generation: u64 = 0;
+    let mut revision: u64 = 0;
+    for (index, event) in events.enumerate() {
+        match event {
+            Event::Append(message) => placed.push(Placed {
+                message: message.clone(),
+                source: Source::Append(index),
+                marker: None,
+            }),
+            Event::CompactBoundary {
+                summary,
+                replaced_count,
+                ..
+            } => {
+                revision = revision.saturating_add(1);
+                generation = generation.saturating_add(1);
+                placed.clear();
+                placed.push(Placed {
+                    message: summary.clone(),
+                    source: Source::Boundary(index),
+                    marker: Some(CompactionMarker {
+                        replaced_count: *replaced_count,
+                        generation,
+                    }),
+                });
+            }
+            Event::Repair {
+                replaced_count,
+                messages,
+            } => {
+                revision = revision.saturating_add(1);
+                let truncate_to = placed.len().saturating_sub(*replaced_count);
+                placed.truncate(truncate_to);
+                placed.extend(messages.iter().map(|message| Placed {
+                    message: message.clone(),
+                    source: Source::Repair(index),
+                    marker: None,
+                }));
+            }
+            Event::Redact { images } => {
+                revision = revision.saturating_add(1);
+                for image in images {
+                    let Some(at) = placed.len().checked_sub(image.from_end) else {
+                        continue;
+                    };
+                    if let Some(placed) = placed.get_mut(at) {
+                        redact_image(&mut placed.message, image);
+                    }
                 }
             }
         }
-        self.invalid_images_replaced = repair_invalid_images(&mut self.materialized);
+    }
+    (placed, revision)
+}
+
+/// Replace the image `image` names in `message` with the placeholder. A position that names
+/// something else is left alone: the event was recorded against a view this one may not be, and
+/// removing text on a stale address would be worse than keeping an image.
+fn redact_image(message: &mut Message, image: &RedactedImage) {
+    let placeholder = || IMAGE_REDACTION_PLACEHOLDER.to_string();
+    match (message.content.get_mut(image.block), image.item) {
+        (Some(block @ ContentBlock::Image { .. }), None) => {
+            *block = ContentBlock::Text {
+                text: placeholder(),
+            };
+        }
+        (Some(ContentBlock::ToolResult { content, .. }), Some(item)) => {
+            if let Some(entry @ ToolResultContent::Image { .. }) = content.get_mut(item) {
+                *entry = ToolResultContent::Text {
+                    text: placeholder(),
+                };
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The replayed log with, for each message, when it was written and whether it is a compaction
+/// summary. Three vectors of one length, which every arm of the replay maintains.
+pub(crate) struct AnnotatedView {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) timestamps: Vec<String>,
+    pub(crate) markers: Vec<Option<CompactionMarker>>,
+    /// How many times the log was rewritten: every boundary and every repair.
+    pub(crate) revision: u64,
+}
+
+/// What `GET /v1/sessions/{id}/messages` serves: the same view the model gets, by the same rules,
+/// with each message stamped from the row that produced it. A summary takes its boundary's time
+/// and a repair's replacements take the repair's, because that is when the content came to be.
+pub(crate) fn materialize_annotated(events: &[(String, Event)]) -> AnnotatedView {
+    let (placed, revision) = replay(events.iter().map(|(_, event)| event));
+    let mut messages = Vec::with_capacity(placed.len());
+    let mut timestamps = Vec::with_capacity(placed.len());
+    let mut markers = Vec::with_capacity(placed.len());
+    for placed in placed {
+        let index = match placed.source {
+            Source::Append(index) | Source::Boundary(index) | Source::Repair(index) => index,
+        };
+        timestamps.push(events[index].0.clone());
+        markers.push(placed.marker);
+        messages.push(placed.message);
+    }
+    repair_invalid_images(&mut messages);
+    AnnotatedView {
+        messages,
+        timestamps,
+        markers,
+        revision,
     }
 }
 
@@ -469,22 +653,26 @@ pub(crate) const HARNESS_NOTE: &str = "[meka harness]";
 /// compaction or rewind can't quietly reinstate what it removed. Only the first few base64
 /// characters of each image are decoded, so the cost is a fixed handful of bytes per image.
 fn repair_invalid_images(messages: &mut [Message]) -> usize {
-    let mismatched = |source: &crate::provider::ImageSource| {
-        match crate::image::classify_base64_prefix(&source.data) {
+    let mismatched = |source: &crate::image::ImageSource| {
+        // A reference carries no bytes to judge; the bytes are checked once they are inlined.
+        let Some(data) = source.base64_data() else {
+            return false;
+        };
+        match crate::image::classify_base64_prefix(data) {
             // Undecodable bytes aren't evidence of a mismatch: an encoding this build can't read
             // may still be one the provider accepts.
             crate::image::ImageHandling::Unsupported => false,
             crate::image::ImageHandling::PassThrough(format)
             | crate::image::ImageHandling::Convert(format) => !format
                 .to_mime_type()
-                .eq_ignore_ascii_case(&source.media_type),
+                .eq_ignore_ascii_case(source.media_type()),
         }
     };
-    let note = |source: &crate::provider::ImageSource| {
+    let note = |source: &crate::image::ImageSource| {
         format!(
             "{HARNESS_NOTE} An image here was removed: it is declared {} but the bytes are \
              something else, which the provider refuses.",
-            source.media_type
+            source.media_type()
         )
     };
 
@@ -501,12 +689,13 @@ fn repair_invalid_images(messages: &mut [Message]) -> usize {
                 } => {
                     let mut touched = false;
                     for item in content.iter_mut() {
-                        if let crate::provider::ToolResultContent::Image { source } = item
+                        if let crate::conversation::ToolResultContent::Image { source } = item
                             && mismatched(source)
                         {
                             replaced += 1;
                             touched = true;
-                            *item = crate::provider::ToolResultContent::Text { text: note(source) };
+                            *item =
+                                crate::conversation::ToolResultContent::Text { text: note(source) };
                         }
                     }
                     if touched {
@@ -534,7 +723,7 @@ impl<'a> IntoIterator for &'a Conversation {
 /// The check uses the *materialized* view so a `CompactBoundary` between an orphan and its would-be
 /// result correctly counts as orphaned.
 fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
-    // Build (event_idx, &Message) pairs in materialization order so we can scan adjacency and
+    // Build (event_index, &Message) pairs in materialization order so we can scan adjacency and
     // report orphan event indices, not just materialized indices. Skip the "previous Append is
     // gone" case (the event was truncated by a CompactBoundary) since the materialized view never
     // sees that orphan.
@@ -542,28 +731,23 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
     // The index is `None` for messages that don't come from an `Append` event (a repair's
     // replacement). They still take part in the adjacency scan, since a `tool_result` inside one
     // answers the `tool_use` before it, but they can't be removed.
-    let mut pairs: Vec<(Option<usize>, &Message)> = Vec::new();
-    for (idx, event) in events.iter().enumerate() {
-        match event {
-            Event::Append(message) => pairs.push((Some(idx), message)),
-            Event::CompactBoundary { replaced_count, .. } => {
-                let truncate_to = pairs.len().saturating_sub(*replaced_count);
-                pairs.truncate(truncate_to);
-            }
-            Event::Repair {
-                replaced_count,
-                messages,
-            } => {
-                let truncate_to = pairs.len().saturating_sub(*replaced_count);
-                pairs.truncate(truncate_to);
-                pairs.extend(messages.iter().map(|message| (None, message)));
-            }
-        }
-    }
+    let (placed, _) = replay(events.iter());
+    let pairs: Vec<(Option<usize>, &Message)> = placed
+        .iter()
+        .map(|placed| {
+            (
+                match placed.source {
+                    Source::Append(index) => Some(index),
+                    Source::Boundary(_) | Source::Repair(_) => None,
+                },
+                &placed.message,
+            )
+        })
+        .collect();
 
     let mut orphan = Vec::new();
-    for window_idx in 0..pairs.len() {
-        let (Some(event_idx), message) = pairs[window_idx] else {
+    for window_index in 0..pairs.len() {
+        let (Some(event_index), message) = pairs[window_index] else {
             continue;
         };
         if message.role != Role::Assistant {
@@ -584,119 +768,457 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
             continue;
         }
 
-        let next = pairs.get(window_idx + 1).map(|(_, m)| *m);
-        let has_results = next.is_some_and(|next_msg| {
-            next_msg.role == Role::User
+        let next = pairs.get(window_index + 1).map(|(_, m)| *m);
+        let has_results = next.is_some_and(|next_message| {
+            next_message.role == Role::User
                 && tool_use_ids.iter().all(|id| {
-                    next_msg.content.iter().any(|block| {
+                    next_message.content.iter().any(|block| {
                         matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == *id)
                     })
                 })
         });
 
         if !has_results {
-            orphan.push(event_idx);
+            orphan.push(event_index);
         }
     }
     orphan
 }
 
-/// Walk events and collect the names of tools loaded via successful `load_tool` calls. **The only
-/// door for this question**: a scan of the materialized slice cannot see a load whose exchange a
-/// compaction has summarised away or a repair has emptied, and this absorbs
-/// [`Event::CompactBoundary::loaded_tools_snapshot`] when it crosses a boundary. Pending uses
-/// inside the summarized window are cleared at the boundary (the actual tool_use/tool_result rows
-/// for those uses are still in the log on disk, but they're below the materialized view's "logical
-/// start" so the model can't act on them).
-/// Returns names in **load order**, de-duplicated. The order is what makes the tools array a stable
-/// cache prefix: `load_tool` calls only ever append to the conversation, so appending each newly
-/// loaded tool to the tail means the array can only grow at the end. Returning an unordered set and
-/// letting the registry impose its own order would reinsert an earlier-registered tool ahead of a
-/// later-registered one that was loaded first, which is a mid-array edit and re-caches the whole
-/// conversation behind it.
-pub fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
-    use std::collections::HashMap;
-    let mut loaded: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut pending: HashMap<String, Vec<String>> = HashMap::new();
-
-    let absorb = |message: &Message,
-                  pending: &mut HashMap<String, Vec<String>>,
-                  seen: &mut HashSet<String>,
-                  loaded: &mut Vec<String>| {
-        for block in &message.content {
-            match block {
-                ContentBlock::ToolUse { id, name, input }
-                    if name == crate::tools::LOAD_TOOL_NAME =>
-                {
-                    let names = crate::tools::load_tool_names(input);
-                    if !names.is_empty() {
-                        pending.insert(id.clone(), names);
-                    }
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    is_error,
-                    ..
-                } => {
-                    if let Some(loaded_names) = pending.remove(tool_use_id)
-                        && !is_error
-                    {
-                        // A batch load appends its names in call order, keeping the tools array's
-                        // growth append-only exactly as a sequence of single loads would.
-                        for loaded_name in loaded_names {
-                            if seen.insert(loaded_name.clone()) {
-                                loaded.push(loaded_name);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Role {
+    User,
+    Assistant,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ToolResultContent {
+    Text { text: String },
+    Image { source: ImageSource },
+}
+/// The half of a thinking block meka cannot read, and which provider it belongs to.
+///
+/// The two backends that emit reasoning hand back different things, and the difference decides both
+/// what may be replayed and what the readable half is worth. Holding them as one nullable
+/// `signature` made wrong states representable, and one of them shipped: `chatgpt-subscription`
+/// stored OpenAI's `encrypted_content` in that field, and resuming such a session under Claude
+/// replayed it verbatim as Claude's `signature`, a blob from the wrong cryptosystem presented as
+/// authentication for text it does not authenticate.
+///
+/// The mirror of that was only ever unreachable by omission: the Responses encoder dropped every
+/// thinking block, so nothing Claude wrote could reach OpenAI. This release starts replaying
+/// reasoning there, which is exactly what would have opened the other direction. Naming the two
+/// shapes makes both a type error instead of a thing to remember.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum OpaqueReasoning {
+    /// Anthropic. The reasoning is in the block's `thinking` text; this authenticates it, and the
+    /// API wants both back together.
+    Signed { signature: String },
+    /// The Responses API. This *is* the reasoning, sealed, and the block's `thinking` holds only
+    /// the summary the server chose to show. Replayed under `id` when the server issued one.
+    Sealed {
+        encrypted_content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ContentBlock {
+    Text {
+        text: String,
+    },
+    /// What meka injected ahead of the user's words for this turn: the permission and environment
+    /// context, todos, world state, budget, background outcomes and the resume notice. Its own
+    /// block, so every reader that shows what the user typed can skip it, and every provider
+    /// renders it as text ahead of the words. A user message carries zero or one of these, first.
+    TurnContext {
+        text: String,
+    },
+    /// Image supplied as *input* (e.g. an ACP client's @-mention or pasted screenshot). Distinct
+    /// from a tool result's image, which travels inside [`ContentBlock::ToolResult`] as a
+    /// [`ToolResultContent::Image`].
+    Image {
+        source: ImageSource,
+    },
+    Thinking {
+        /// The readable half, and only the readable half. How much of the reasoning it is depends
+        /// on `opaque`: under [`OpaqueReasoning::Signed`] this is the reasoning, under
+        /// [`OpaqueReasoning::Sealed`] it is a summary of reasoning kept elsewhere.
+        thinking: String,
+        /// What the provider wants handed back to carry this reasoning into the next request.
+        /// `None` when it gave nothing to carry, which makes the block display-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opaque: Option<OpaqueReasoning>,
+    },
+    /// Encrypted reasoning the API declines to return in the clear (the `redact-thinking` beta).
+    /// `data` is opaque: it cannot be read, only replayed verbatim on later turns so the model can
+    /// continue its prior reasoning chain. Distinct from a [`ContentBlock::Thinking`] with empty
+    /// text, which carries a `signature` instead of `data`.
+    RedactedThinking {
+        data: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Vec<ToolResultContent>,
+        is_error: bool,
+    },
+}
+impl ContentBlock {
+    /// Extract the text content of a ToolResult (for display/logging).
+    pub(crate) fn tool_result_text_content(content: &[ToolResultContent]) -> String {
+        content
+            .iter()
+            .map(|block| match block {
+                ToolResultContent::Text { text } => text.as_str(),
+                ToolResultContent::Image { .. } => "[Image]",
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Message {
+    pub(crate) role: Role,
+    pub(crate) content: Vec<ContentBlock>,
+}
+impl Message {
+    pub(crate) fn user(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: text.into() }],
         }
-    };
+    }
 
+    /// The user message a turn appends: meka's context block, the words as typed, then any input
+    /// images. The words are left out when there are none (a turn that only delivers background
+    /// outcomes), so [`Self::text_content`] stays what the user typed.
+    pub(crate) fn user_turn(
+        context: impl Into<String>,
+        words: impl Into<String>,
+        images: Vec<ImageSource>,
+    ) -> Self {
+        let words = words.into();
+        let mut content = vec![ContentBlock::TurnContext {
+            text: context.into(),
+        }];
+        if !words.is_empty() {
+            content.push(ContentBlock::Text { text: words });
+        }
+        content.extend(
+            images
+                .into_iter()
+                .map(|source| ContentBlock::Image { source }),
+        );
+        Self {
+            role: Role::User,
+            content,
+        }
+    }
+
+    /// User message carrying a text block followed by zero or more input images; `images` empty
+    /// yields the same shape as [`Message::user`].
+    #[cfg(test)]
+    pub(crate) fn user_with_images(text: impl Into<String>, images: Vec<ImageSource>) -> Self {
+        let mut content = vec![ContentBlock::Text { text: text.into() }];
+        content.extend(
+            images
+                .into_iter()
+                .map(|source| ContentBlock::Image { source }),
+        );
+        Self {
+            role: Role::User,
+            content,
+        }
+    }
+
+    pub(crate) fn assistant_text(text: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// The words: every `Text` block joined, and nothing else. A turn's context block is not
+    /// something the user wrote and is left out; [`Self::wire_text`] is the whole.
+    pub(crate) fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Everything a provider renders as text, in order: the turn's context block, a blank line,
+    /// then the words. What the two were joined with when they were one string, for the wires that
+    /// take a user message as a single string.
+    pub(crate) fn wire_text(&self) -> String {
+        let context = self.content.iter().find_map(|block| match block {
+            ContentBlock::TurnContext { text } => Some(text.as_str()),
+            _ => None,
+        });
+        let words = self.text_content();
+        match context {
+            Some(context) if words.is_empty() => context.to_string(),
+            Some(context) => format!("{context}\n\n{words}"),
+            None => words,
+        }
+    }
+
+    /// A copy of this message with every [`ContentBlock::ToolUse`] removed. Used when persisting a
+    /// turn that was interrupted before its tools ran: keeping the `tool_use` blocks would orphan
+    /// them (no matching `tool_result`) and the provider would reject the next request.
+    pub(crate) fn without_tool_use(&self) -> Message {
+        Message {
+            role: self.role.clone(),
+            content: self
+                .content
+                .iter()
+                .filter(|block| !matches!(block, ContentBlock::ToolUse { .. }))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_uses(&self) -> Vec<&ContentBlock> {
+        self.content
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            .collect()
+    }
+}
+
+/// What becomes of a turn's prompt when the turn fails before the model ever saw it.
+///
+/// The prompt is persisted eagerly, before the first provider call, so a crash mid-roundtrip cannot
+/// lose it. That is right when losing it would be losing something, and wrong when the prompt will
+/// simply be produced again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptRetention {
+    /// Keep it. A human typed it and can see the error, or it carries something that exists nowhere
+    /// else -- a background-task outcome, whose row is stamped `delivered` before the turn starts
+    /// and is never handed out again.
+    Keep,
+    /// Withdraw it. A scheduled job's prompt is regenerated from the job on its next occurrence,
+    /// and the fire that delivers it says how many were missed, so the failed copy carries
+    /// nothing. Left in place, a provider outage would deposit one unanswered user message per
+    /// fire for as long as the outage lasted.
+    WithdrawOnFailure,
+}
+pub(crate) fn format_session_as_markdown(
+    session_id: uuid::Uuid,
+    events: &[Event],
+    tool_outputs: &std::collections::HashMap<String, String>,
+) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::new();
+    writeln!(output, "# Session {session_id}\n").ok();
+
+    // Walk the raw event log so the full conversation is exported, including turns a compaction
+    // later hid from the model. Each `CompactBoundary` becomes a marker; the turns it summarized
+    // stay above it (the kept tail is re-appended after it, so the recent turns appear on both
+    // sides of the marker, as stored).
     for event in events {
         match event {
-            Event::Append(message) => absorb(message, &mut pending, &mut seen, &mut loaded),
-            // A repair never *un*-loads a tool: the array is a cache prefix that may only grow, and
-            // rewinding past a `load_tool` would drop an entry from its middle and re-cache the
-            // whole conversation behind it. Pending uses inside the replaced window are dropped the
-            // same way a boundary drops them, since their results are gone from the view.
-            Event::Repair { messages, .. } => {
-                pending.clear();
-                for message in messages {
-                    absorb(message, &mut pending, &mut seen, &mut loaded);
-                }
+            Event::Append(message) => {
+                write_message_markdown(&mut output, message, tool_outputs);
             }
-            Event::CompactBoundary {
-                loaded_tools_snapshot,
-                ..
+            Event::CompactBoundary { summary, .. } => {
+                writeln!(output, "---\n").ok();
+                writeln!(output, "<details>").ok();
+                writeln!(
+                    output,
+                    "<summary>Session compaction (summary the model saw in place of the turns above)</summary>\n"
+                )
+                .ok();
+                writeln!(output, "{}\n", summary.text_content()).ok();
+                writeln!(output, "</details>\n").ok();
+            }
+            Event::Redact { images } => {
+                writeln!(
+                    output,
+                    "*{} image{} above {} redacted to fit the request size budget.*\n",
+                    images.len(),
+                    if images.len() == 1 { "" } else { "s" },
+                    if images.len() == 1 { "was" } else { "were" },
+                )
+                .ok();
+            }
+            // Same treatment as a boundary: mark what happened and render the replacement, leaving
+            // the superseded messages above it. An export is the record of the session, and a
+            // repair (or a rewind, which is a repair with nothing to put back) is the one place
+            // where what the model saw and what actually happened diverge.
+            Event::Repair {
+                replaced_count,
+                messages,
             } => {
-                // Pending uses inside the summarized window are gone from the model's view; their
-                // would-be results are also gone. Drop them and absorb the snapshot.
-                pending.clear();
-                // The snapshot is an unordered set, so sort it for a deterministic tail. Continuity
-                // with the pre-boundary order isn't needed: compaction rewrites the head of the
-                // conversation and re-caches everything anyway. What matters is that every turn
-                // *after* the boundary agrees on the order.
-                let mut absorbed: Vec<&String> = loaded_tools_snapshot.iter().collect();
-                absorbed.sort();
-                for name in absorbed {
-                    if seen.insert(name.clone()) {
-                        loaded.push(name.clone());
-                    }
+                writeln!(output, "---\n").ok();
+                writeln!(output, "<details>").ok();
+                writeln!(
+                    output,
+                    "<summary>{} message(s) above replaced with {} (rejected by the provider, or rewound)</summary>\n",
+                    replaced_count,
+                    if messages.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        format!("{} message(s)", messages.len())
+                    },
+                )
+                .ok();
+                for message in messages {
+                    write_message_markdown(&mut output, message, tool_outputs);
                 }
+                writeln!(output, "</details>\n").ok();
             }
         }
     }
 
-    loaded
+    output
 }
+pub(crate) fn write_message_markdown(
+    output: &mut String,
+    message: &crate::conversation::Message,
+    tool_outputs: &std::collections::HashMap<String, String>,
+) {
+    use std::fmt::Write;
+
+    match message.role {
+        crate::conversation::Role::User => {
+            // A "user" message can be either a plain user turn or a tool_results envelope.
+            // Inspect content blocks rather than role to decide.
+            let has_tool_results = message
+                .content
+                .iter()
+                .any(|block| matches!(block, crate::conversation::ContentBlock::ToolResult { .. }));
+            if has_tool_results {
+                for block in &message.content {
+                    if let crate::conversation::ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } = block
+                    {
+                        let label = if *is_error {
+                            "Tool result (error)"
+                        } else {
+                            "Tool result"
+                        };
+                        writeln!(output, "<details>").ok();
+                        writeln!(output, "<summary>{label}</summary>\n").ok();
+                        let text =
+                            crate::conversation::ContentBlock::tool_result_text_content(content);
+                        let text = resolve_large_output_tags(&text, tool_outputs);
+                        writeln!(output, "```\n{text}\n```\n").ok();
+                        writeln!(output, "</details>\n").ok();
+                    }
+                }
+            } else {
+                writeln!(output, "## User\n").ok();
+                writeln!(output, "{}\n", message.text_content()).ok();
+            }
+        }
+        crate::conversation::Role::Assistant => {
+            writeln!(output, "## Assistant\n").ok();
+            for block in &message.content {
+                match block {
+                    crate::conversation::ContentBlock::Text { text } => {
+                        writeln!(output, "{text}\n").ok();
+                    }
+                    crate::conversation::ContentBlock::ToolUse { name, input, .. } => {
+                        let input_pretty = serde_json::to_string_pretty(input)
+                            .unwrap_or_else(|_| input.to_string());
+                        writeln!(output, "<details>").ok();
+                        writeln!(output, "<summary>Tool call: {name}</summary>\n").ok();
+                        writeln!(output, "```json\n{input_pretty}\n```\n").ok();
+                        writeln!(output, "</details>\n").ok();
+                    }
+                    crate::conversation::ContentBlock::ToolResult { .. }
+                    | crate::conversation::ContentBlock::TurnContext { .. }
+                    | crate::conversation::ContentBlock::Thinking { .. }
+                    | crate::conversation::ContentBlock::RedactedThinking { .. }
+                    | crate::conversation::ContentBlock::Image { .. } => {}
+                }
+            }
+        }
+    }
+}
+pub(crate) fn resolve_large_output_tags(
+    text: &str,
+    tool_outputs: &std::collections::HashMap<String, String>,
+) -> String {
+    let re = match regex::Regex::new(r#"<large-output name="([^"]+)"[^>]*>[\s\S]*?</large-output>"#)
+    {
+        Ok(re) => re,
+        Err(_) => return text.to_string(),
+    };
+
+    re.replace_all(text, |caps: &regex::Captures| {
+        let name = &caps[1];
+        match tool_outputs.get(name) {
+            Some(content) => content.clone(),
+            None => caps[0].to_string(),
+        }
+    })
+    .into_owned()
+}
+/// Stands in for a block whose text the server withheld, under Claude's `redact-thinking` beta.
+///
+/// meka's own words rather than the model's, but rendered down the same path so there is one way a
+/// thinking block reaches the terminal. It survives CommonMark unchanged: a bracketed run is a
+/// shortcut reference link only when a matching definition exists, and none does.
+pub(crate) const REDACTED_THINKING: &str = "[redacted thinking]";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title is the user's words and nothing that rode in front of them, flattened and cut the
+    /// same way for every surface that labels a session.
+    #[test]
+    fn a_title_is_the_first_user_words_collapsed_and_cut() {
+        let mut conversation = Conversation::new();
+        conversation.append(Message::user_turn(
+            "<context>\n[Environment context]\n</context>",
+            "find\tall\n\n  rust files",
+            Vec::new(),
+        ));
+        conversation.append(Message::assistant_text("ok"));
+        conversation.append(Message::user("a later prompt"));
+        assert_eq!(conversation.title(), "find all rust files");
+
+        let long = Conversation::from_vec(vec![Message::user("x".repeat(TITLE_CHARS + 20))]);
+        let title = long.title();
+        assert_eq!(title.chars().count(), TITLE_CHARS + 1, "{title:?}");
+        assert!(title.ends_with('…'), "{title:?}");
+    }
+
+    /// No words, no title: a session nobody has spoken to, and one whose first turn carried no
+    /// text, until a later turn brings words.
+    #[test]
+    fn a_title_is_empty_until_a_user_message_carries_words() {
+        assert_eq!(Conversation::new().title(), "");
+        let mut conversation = Conversation::from_vec(vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::TurnContext {
+                text: "<context/>".to_string(),
+            }],
+        }]);
+        assert_eq!(conversation.title(), "");
+        conversation.append(Message::user("   "));
+        assert_eq!(conversation.title(), "", "whitespace is not words");
+        conversation.append(Message::user("now with words"));
+        assert_eq!(conversation.title(), "now with words");
+    }
 
     fn assistant_with_tool_use(use_id: &str) -> Message {
         Message {
@@ -714,7 +1236,7 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: use_id.to_string(),
-                content: vec![crate::provider::ToolResultContent::Text {
+                content: vec![crate::conversation::ToolResultContent::Text {
                     text: "ok".to_string(),
                 }],
                 is_error: false,
@@ -738,7 +1260,7 @@ mod tests {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: use_id.to_string(),
-                content: vec![crate::provider::ToolResultContent::Text {
+                content: vec![crate::conversation::ToolResultContent::Text {
                     text: "ok".to_string(),
                 }],
                 is_error,
@@ -748,7 +1270,7 @@ mod tests {
 
     /// A plain appended prompt is withdrawable; anything appended after it is not.
     #[test]
-    fn test_a_turn_opening_is_recognised_only_while_it_is_the_tail() {
+    fn a_turn_opening_is_recognized_only_while_it_is_the_tail() {
         let mut conversation = Conversation::new();
         assert!(
             !conversation.ends_on_a_turn_opening(),
@@ -774,7 +1296,7 @@ mod tests {
     /// conversation, which is unrecoverable -- the events it replaced are below the view's logical
     /// start. Only the shape of the event log tells the two apart.
     #[test]
-    fn test_a_compaction_summary_is_not_mistaken_for_a_withdrawable_prompt() {
+    fn a_compaction_summary_is_not_mistaken_for_a_withdrawable_prompt() {
         let mut conversation = Conversation::new();
         conversation.append(Message::user("first"));
         conversation.append(Message::assistant_text("reply"));
@@ -803,12 +1325,12 @@ mod tests {
     /// The interaction that makes `run_turn`'s withdrawal guard need *both* of its conditions.
     ///
     /// A compaction can legitimately keep the running turn's prompt as its tail, and then the tail
-    /// is once again an appended, turn-opening `User` message — indistinguishable from an untouched
+    /// is once again an appended, turn-opening `User` message, indistinguishable from an untouched
     /// prompt by inspection. Only the event count records that a whole compaction happened in
     /// between, which is why `run_turn` compares it against the value taken at the append rather
     /// than trusting the shape of the tail alone.
     #[test]
-    fn test_a_compaction_that_keeps_the_prompt_still_moves_the_event_count() {
+    fn a_compaction_that_keeps_the_prompt_still_moves_the_event_count() {
         let mut conversation = Conversation::new();
         conversation.append(Message::user("first"));
         conversation.append(Message::assistant_text("reply"));
@@ -837,7 +1359,7 @@ mod tests {
     /// The flag tracks "came off disk with something in it", which is the only condition under
     /// which the model can be holding a belief the restart invalidated.
     #[test]
-    fn test_resumed_notice_is_set_only_by_hydration_and_taken_once() {
+    fn resumed_notice_is_set_only_by_hydration_and_taken_once() {
         let mut hydrated = Conversation::from_events(vec![Event::Append(Message::user("earlier"))]);
         assert!(hydrated.take_resumed_notice());
         assert!(
@@ -858,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_append_and_read() {
+    fn message_log_append_and_read() {
         let mut log = Conversation::new();
         log.append(Message::user("first"));
         log.append(Message::assistant_text("second"));
@@ -874,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_last_assistant_text_walks_past_tool_results() {
+    fn last_assistant_text_walks_past_tool_results() {
         // Sub-agent turn shape after a tool-use round: assistant emits a tool_use, then the loop
         // appends the matching tool_result as a Role::User trailer. `last()` would return that
         // trailer, not the assistant's text; the helper has to walk backward.
@@ -890,20 +1412,20 @@ mod tests {
     }
 
     #[test]
-    fn test_last_assistant_text_none_on_empty() {
+    fn last_assistant_text_none_on_empty() {
         let log = Conversation::new();
         assert_eq!(log.last_assistant_text(), None);
     }
 
     #[test]
-    fn test_last_assistant_text_none_when_no_assistant_message() {
+    fn last_assistant_text_none_when_no_assistant_message() {
         let mut log = Conversation::new();
         log.append(Message::user("only user message"));
         assert_eq!(log.last_assistant_text(), None);
     }
 
     #[test]
-    fn test_message_log_replace_for_compaction_replaces_all() {
+    fn message_log_replace_for_compaction_replaces_all() {
         let mut log = Conversation::new();
         log.append(Message::user("m1"));
         log.append(Message::assistant_text("m2"));
@@ -921,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_replace_for_compaction_empty_tail() {
+    fn message_log_replace_for_compaction_empty_tail() {
         let mut log = Conversation::new();
         log.append(Message::user("m1"));
         log.replace_for_compaction(Message::user("[summary]"), Vec::new(), HashSet::new());
@@ -930,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_pop_unsaved() {
+    fn message_log_pop_unsaved() {
         let mut log = Conversation::new();
         log.append(Message::user("staying"));
         log.append(Message::user("rolling-back"));
@@ -943,13 +1465,13 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_pop_unsaved_on_empty() {
+    fn message_log_pop_unsaved_on_empty() {
         let mut log = Conversation::new();
         assert!(log.pop_unsaved().is_none());
     }
 
     #[test]
-    fn test_replace_tail_swaps_the_trailing_messages() {
+    fn replace_tail_swaps_the_trailing_messages() {
         let mut log = Conversation::new();
         log.append(Message::user("kept"));
         log.append(assistant_with_tool_use("call_1"));
@@ -970,18 +1492,18 @@ mod tests {
     /// A failed repair has to leave nothing behind, or a misdiagnosed rejection would permanently
     /// cost a good tool result.
     #[test]
-    fn test_pop_repair_restores_the_originals_exactly() {
+    fn pop_repair_restores_the_originals_exactly() {
         let mut log = Conversation::new();
         log.append(Message::user("kept"));
         log.append(assistant_with_tool_use("call_1"));
         log.append(user_with_tool_result("call_1"));
-        let before: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+        let before: Vec<String> = log.iter().map(|m| format!("{m:?}")).collect();
 
         log.replace_tail(2, vec![Message::assistant_text("degraded")]);
         assert_eq!(log.len(), 2);
 
         assert!(log.pop_repair());
-        let after: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+        let after: Vec<String> = log.iter().map(|m| format!("{m:?}")).collect();
         assert_eq!(before, after);
         // And the event log is clean, not carrying a repair that cancels another repair.
         assert_eq!(log.events().len(), 3);
@@ -990,12 +1512,12 @@ mod tests {
     /// The rollback compaction takes when its write fails. Getting this wrong is silent: the model
     /// would keep reasoning from a summary the database never accepted.
     #[test]
-    fn test_pop_compaction_restores_the_pre_compaction_view() {
+    fn pop_compaction_restores_the_pre_compaction_view() {
         let mut log = Conversation::new();
         log.append(Message::user("one"));
         log.append(Message::assistant_text("two"));
         log.append(Message::user("three"));
-        let before: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+        let before: Vec<String> = log.iter().map(|m| format!("{m:?}")).collect();
         let events_before = log.events().len();
 
         log.replace_for_compaction(
@@ -1008,7 +1530,7 @@ mod tests {
         assert!(log.pop_compaction());
         assert_eq!(
             before,
-            log.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>()
+            log.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>()
         );
         assert_eq!(
             log.events().len(),
@@ -1021,13 +1543,13 @@ mod tests {
     /// it. `rposition` picking the wrong boundary would resurrect turns the earlier compaction
     /// legitimately retired.
     #[test]
-    fn test_pop_compaction_on_an_already_compacted_session() {
+    fn pop_compaction_on_an_already_compacted_session() {
         let mut log = Conversation::new();
         log.append(Message::user("old"));
         log.append(Message::assistant_text("older"));
         log.replace_for_compaction(Message::user("summary one"), Vec::new(), HashSet::new());
         log.append(Message::user("after the first summary"));
-        let before: Vec<String> = log.iter().map(|m| format!("{:?}", m)).collect();
+        let before: Vec<String> = log.iter().map(|m| format!("{m:?}")).collect();
 
         log.replace_for_compaction(
             Message::user("summary two"),
@@ -1037,13 +1559,13 @@ mod tests {
         assert!(log.pop_compaction());
         assert_eq!(
             before,
-            log.iter().map(|m| format!("{:?}", m)).collect::<Vec<_>>(),
+            log.iter().map(|m| format!("{m:?}")).collect::<Vec<_>>(),
             "rollback must land on the first boundary's view"
         );
     }
 
     #[test]
-    fn test_pop_compaction_without_a_boundary_is_a_no_op() {
+    fn pop_compaction_without_a_boundary_is_a_no_op() {
         let mut log = Conversation::new();
         log.append(Message::user("only"));
         assert!(!log.pop_compaction());
@@ -1051,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_repair_ignores_a_non_repair_tail() {
+    fn pop_repair_ignores_a_non_repair_tail() {
         let mut log = Conversation::new();
         log.append(Message::user("only"));
         assert!(!log.pop_repair());
@@ -1060,7 +1582,7 @@ mod tests {
 
     /// A repair is position-relative, so removing an earlier event must not retarget it.
     #[test]
-    fn test_repair_survives_orphan_sanitization_of_an_earlier_event() {
+    fn repair_survives_orphan_sanitization_of_an_earlier_event() {
         let mut log = Conversation::new();
         log.append(Message::user("first"));
         // Orphaned: no tool_result follows.
@@ -1095,8 +1617,7 @@ mod tests {
 
     fn image_block(data: String, media_type: &str) -> ContentBlock {
         ContentBlock::Image {
-            source: crate::provider::ImageSource {
-                source_type: "base64".to_string(),
+            source: crate::image::ImageSource::Base64 {
                 media_type: media_type.to_string(),
                 data,
             },
@@ -1104,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn test_materialization_replaces_a_mislabelled_image() {
+    fn materialization_replaces_a_mislabeled_image() {
         let mut log = Conversation::new();
         log.append(Message {
             role: Role::User,
@@ -1124,20 +1645,19 @@ mod tests {
         );
         match &content[1] {
             ContentBlock::Text { text } => assert!(text.contains("image/png"), "{text}"),
-            other => panic!("expected the image to become text, got {:?}", other),
+            other => panic!("expected the image to become text, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_materialization_marks_a_repaired_tool_result_as_an_error() {
+    fn materialization_marks_a_repaired_tool_result_as_an_error() {
         let mut log = Conversation::new();
         log.append(Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
-                content: vec![crate::provider::ToolResultContent::Image {
-                    source: crate::provider::ImageSource {
-                        source_type: "base64".to_string(),
+                content: vec![crate::conversation::ToolResultContent::Image {
+                    source: crate::image::ImageSource::Base64 {
                         media_type: "image/png".to_string(),
                         data: base64_of(image::ImageFormat::Jpeg),
                     },
@@ -1157,17 +1677,17 @@ mod tests {
                 assert!(is_error);
                 assert!(matches!(
                     content[0],
-                    crate::provider::ToolResultContent::Text { .. }
+                    crate::conversation::ToolResultContent::Text { .. }
                 ));
             }
-            other => panic!("expected ToolResult, got {:?}", other),
+            other => panic!("expected ToolResult, got {other:?}"),
         }
     }
 
-    /// A correctly-labelled image, and one whose bytes this build simply can't identify, both have
+    /// A correctly-labeled image, and one whose bytes this build simply can't identify, both have
     /// to survive: the second may be a format the provider accepts and we don't decode.
     #[test]
-    fn test_materialization_leaves_valid_and_unidentifiable_images_alone() {
+    fn materialization_leaves_valid_and_unidentifiable_images_alone() {
         let mut log = Conversation::new();
         log.append(Message {
             role: Role::User,
@@ -1189,7 +1709,7 @@ mod tests {
     /// The repair lives in materialization, not in a one-shot pass, precisely so a later rebuild
     /// can't quietly put the refused bytes back.
     #[test]
-    fn test_materialization_repair_survives_a_later_rebuild() {
+    fn materialization_repair_survives_a_later_rebuild() {
         let mut log = Conversation::new();
         log.append(Message::user("turn one"));
         log.append(Message::assistant_text("answer one"));
@@ -1209,12 +1729,12 @@ mod tests {
             log.iter()
                 .flat_map(|message| message.content.iter())
                 .all(|block| !matches!(block, ContentBlock::Image { .. })),
-            "the mislabelled image must not come back"
+            "the mislabeled image must not come back"
         );
     }
 
     #[test]
-    fn test_rewind_drops_whole_turns_and_snaps_to_a_user_boundary() {
+    fn rewind_drops_whole_turns_and_snaps_to_a_user_boundary() {
         let mut log = Conversation::new();
         log.append(Message::user("turn one"));
         log.append(Message::assistant_text("answer one"));
@@ -1240,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewind_past_the_start_returns_none() {
+    fn rewind_past_the_start_returns_none() {
         let mut log = Conversation::new();
         log.append(Message::user("only turn"));
         log.append(Message::assistant_text("answer"));
@@ -1251,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewind_all_turns_empties_the_view() {
+    fn rewind_all_turns_empties_the_view() {
         let mut log = Conversation::new();
         log.append(Message::user("turn one"));
         log.append(Message::assistant_text("answer one"));
@@ -1262,8 +1782,122 @@ mod tests {
         assert!(log.is_empty());
     }
 
+    /// A redaction names one image, tail-relative, and the replay puts the placeholder exactly
+    /// there: an input image by block, a tool result's image by item, and nothing else.
     #[test]
-    fn test_message_log_sanitize_orphans_drops_unmatched_tool_use() {
+    fn a_redaction_replaces_the_image_it_names_and_nothing_else() {
+        let image = crate::image::ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "aGk=".to_string(),
+        };
+        let mut log = Conversation::new();
+        log.append(Message::user_with_images("look", vec![image.clone()]));
+        log.append(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "u1".to_string(),
+                content: vec![
+                    ToolResultContent::Text {
+                        text: "[Image: x.png]".to_string(),
+                    },
+                    ToolResultContent::Image {
+                        source: image.clone(),
+                    },
+                ],
+                is_error: false,
+            }],
+        });
+        log.append(Message::assistant_text("seen"));
+
+        let event = log.redact_images(vec![
+            RedactedImage {
+                from_end: 3,
+                block: 1,
+                item: None,
+            },
+            RedactedImage {
+                from_end: 2,
+                block: 0,
+                item: Some(1),
+            },
+            // A position naming text, which a stale address could: left alone.
+            RedactedImage {
+                from_end: 3,
+                block: 0,
+                item: None,
+            },
+        ]);
+        assert!(matches!(event, Event::Redact { .. }));
+
+        let check = |view: &[Message]| {
+            assert!(matches!(&view[0].content[0], ContentBlock::Text { text } if text == "look"));
+            assert!(
+                matches!(&view[0].content[1], ContentBlock::Text { text } if text == IMAGE_REDACTION_PLACEHOLDER),
+                "{:?}",
+                view[0].content
+            );
+            match &view[1].content[0] {
+                ContentBlock::ToolResult { content, .. } => {
+                    assert!(
+                        matches!(&content[0], ToolResultContent::Text { text } if text == "[Image: x.png]")
+                    );
+                    assert!(
+                        matches!(&content[1], ToolResultContent::Text { text } if text == IMAGE_REDACTION_PLACEHOLDER)
+                    );
+                }
+                other => panic!("expected the tool result, got {other:?}"),
+            }
+            assert_eq!(view[2].text_content(), "seen");
+        };
+        check(log.as_slice());
+        // And the same from the store's replay of the same events.
+        check(Conversation::from_events(log.events().to_vec()).as_slice());
+    }
+
+    /// A compaction after a resume that dropped an orphan replaces the whole view when the store
+    /// replays it, not the whole view minus one.
+    ///
+    /// `sanitize_orphans` shortens the log in memory only, so the `replaced_count` a compaction
+    /// then records is one short of what the store holds. Truncating by it left the session's
+    /// first message standing above the summary on every later turn, and each compaction after a
+    /// dropped orphan widened the gap by one.
+    #[test]
+    fn a_compaction_after_an_orphan_dropping_resume_replaces_the_whole_view() {
+        // What the store holds: a crash left a tool call without its result.
+        let stored = vec![
+            Event::Append(Message::user("first")),
+            Event::Append(Message::assistant_text("second")),
+            Event::Append(assistant_with_tool_use("u1")),
+        ];
+        // The resume drops the orphan in memory, then the session compacts.
+        let mut resumed = Conversation::from_events(stored.clone());
+        assert_eq!(resumed.sanitize_orphans().len(), 1);
+        resumed.replace_for_compaction(
+            Message::assistant_text("summary"),
+            Vec::new(),
+            HashSet::new(),
+        );
+        let boundary = resumed
+            .events()
+            .last()
+            .cloned()
+            .expect("the boundary was recorded");
+        // The next resume replays the store, which still has the orphan.
+        let mut replayed = stored;
+        replayed.push(boundary);
+        let view = Conversation::from_events(replayed);
+        assert_eq!(
+            view.as_slice()
+                .iter()
+                .map(|message| message.text_content())
+                .collect::<Vec<_>>(),
+            vec!["summary".to_string()],
+            "nothing from before the boundary may survive it"
+        );
+    }
+
+    #[test]
+    fn message_log_sanitize_orphans_drops_unmatched_tool_use() {
         let mut log = Conversation::new();
         log.append(Message::user("hello"));
         log.append(assistant_with_tool_use("u1"));
@@ -1276,7 +1910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_sanitize_orphans_drops_truncated_multi_tool_use_tail() {
+    fn message_log_sanitize_orphans_drops_truncated_multi_tool_use_tail() {
         // Reproduces the real corruption shape: a model response truncated at `max_tokens` while
         // emitting tools, persisted as a trailing assistant message with leading text plus several
         // `tool_use` blocks and no following `tool_result`. Anthropic rejects this on the next turn
@@ -1315,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_sanitize_orphans_preserves_matched_tool_use() {
+    fn message_log_sanitize_orphans_preserves_matched_tool_use() {
         let mut log = Conversation::new();
         log.append(Message::user("ask"));
         log.append(assistant_with_tool_use("u1"));
@@ -1327,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_clone_independent() {
+    fn message_log_clone_independent() {
         let mut log = Conversation::new();
         log.append(Message::user("original"));
         let mut cloned = log.clone();
@@ -1338,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_log_into_iter_for_ref() {
+    fn message_log_into_iter_for_ref() {
         let mut log = Conversation::new();
         log.append(Message::user("a"));
         log.append(Message::user("b"));
@@ -1347,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn test_events_are_append_only_after_compaction() {
+    fn events_are_append_only_after_compaction() {
         // After replace_for_compaction, the prior Append events MUST still be present in the events
         // log, even though the materialized view has truncated them. This is the structural
         // invariant: events in the log only ever grow.
@@ -1376,10 +2010,10 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_with_compact_boundary() {
+    fn materialize_with_compact_boundary() {
         let mut log = Conversation::new();
         for i in 1..=5 {
-            log.append(Message::user(format!("m{}", i)));
+            log.append(Message::user(format!("m{i}")));
         }
         log.replace_for_compaction(
             Message::user("[summary]"),
@@ -1395,19 +2029,19 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_loaded_tool_names_pure_appends() {
+    fn extract_loaded_tool_names_pure_appends() {
         let log = Conversation::from_vec(vec![
             load_tool_use("u1", "scratchpad_read"),
             load_tool_result("u1", false),
         ]);
-        let loaded = extract_loaded_tool_names_from_events(log.events());
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
         assert!(loaded.iter().any(|name| name == "scratchpad_read"));
     }
 
     /// Load order, not registry order, is what makes the tools array append-only. A failed load
     /// contributes nothing, and a repeat load must not move a name to the back.
     #[test]
-    fn test_extract_loaded_tool_names_preserves_load_order() {
+    fn extract_loaded_tool_names_preserves_load_order() {
         let log = Conversation::from_vec(vec![
             load_tool_use("u1", "omega"),
             load_tool_result("u1", false),
@@ -1418,14 +2052,14 @@ mod tests {
             load_tool_use("u4", "omega"),
             load_tool_result("u4", false),
         ]);
-        assert_eq!(extract_loaded_tool_names_from_events(log.events()), vec![
-            "omega".to_string(),
-            "alpha".to_string()
-        ]);
+        assert_eq!(
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events()),
+            vec!["omega".to_string(), "alpha".to_string()]
+        );
     }
 
     #[test]
-    fn test_extract_loaded_tool_names_recovers_snapshot_across_boundary() {
+    fn extract_loaded_tool_names_recovers_snapshot_across_boundary() {
         // Pre-boundary: load_tool(scratchpad_read) succeeds. After the boundary swallows it, the
         // snapshot must restore scratchpad_read in the active set.
         let mut log = Conversation::new();
@@ -1435,12 +2069,12 @@ mod tests {
         let snapshot: HashSet<String> = ["scratchpad_read".to_string()].into_iter().collect();
         log.replace_for_compaction(Message::user("[summary]"), Vec::new(), snapshot);
 
-        let loaded = extract_loaded_tool_names_from_events(log.events());
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
         assert!(loaded.iter().any(|name| name == "scratchpad_read"));
     }
 
     #[test]
-    fn test_prune_compacted_events_drops_pre_boundary_log() {
+    fn prune_compacted_events_drops_pre_boundary_log() {
         let mut log = Conversation::new();
         log.append(load_tool_use("u1", "scratchpad_read"));
         log.append(load_tool_result("u1", false));
@@ -1460,7 +2094,8 @@ mod tests {
         );
 
         let view_before: Vec<String> = log.as_slice().iter().map(|m| m.text_content()).collect();
-        let loaded_before = extract_loaded_tool_names_from_events(log.events());
+        let loaded_before =
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
 
         log.prune_compacted_events();
 
@@ -1469,10 +2104,10 @@ mod tests {
         assert_eq!(view_before, view_after);
         assert_eq!(
             loaded_before,
-            extract_loaded_tool_names_from_events(log.events())
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events())
         );
         assert!(
-            extract_loaded_tool_names_from_events(log.events())
+            crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events())
                 .iter()
                 .any(|name| name == "scratchpad_read"),
             "deferred tool must survive the prune"
@@ -1492,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_loaded_tool_names_pending_use_wiped_at_boundary() {
+    fn extract_loaded_tool_names_pending_use_wiped_at_boundary() {
         // load_tool tool_use lives on one side of the boundary, its tool_result on the other; both
         // vanish from the materialized view, so the scanner must NOT count the pending pair across
         // the boundary.
@@ -1505,12 +2140,12 @@ mod tests {
             HashSet::new(),
         );
 
-        let loaded = extract_loaded_tool_names_from_events(log.events());
+        let loaded = crate::tools::load_tool::extract_loaded_tool_names_from_events(log.events());
         assert!(!loaded.iter().any(|name| name == "scratchpad_read"));
     }
 
     #[test]
-    fn test_pop_unsaved_only_removes_trailing_append() {
+    fn pop_unsaved_only_removes_trailing_append() {
         // After a CompactBoundary, the next legal call is `append`. A failed-save rollback after
         // that should remove the failed append, not the boundary.
         let mut log = Conversation::new();
@@ -1532,14 +2167,14 @@ mod tests {
     }
 
     #[test]
-    fn test_from_vec_produces_append_events() {
+    fn from_vec_produces_append_events() {
         let log = Conversation::from_vec(vec![Message::user("a"), Message::assistant_text("b")]);
         assert_eq!(log.events().len(), 2);
         assert!(log.events().iter().all(|e| matches!(e, Event::Append(_))));
     }
 
     #[test]
-    fn test_event_serializes_round_trip() {
+    fn event_serializes_round_trip() {
         // Serialize one of each event variant and round-trip through JSON.
         let append = Event::Append(Message::user("hi"));
         let json = serde_json::to_string(&append).expect("serialize append");
@@ -1571,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_orphans_does_not_touch_compact_boundary() {
+    fn sanitize_orphans_does_not_touch_compact_boundary() {
         let mut log = Conversation::new();
         log.append(Message::user("u1"));
         log.append(Message::assistant_text("a1"));

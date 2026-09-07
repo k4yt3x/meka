@@ -17,14 +17,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    conversation::{ContentBlock, Message, Role},
     error::{MekaError, Result},
     provider::{
-        ContentBlock, Message, Provider, Role, StopReason, StreamEvent, TokenUsage,
-        ToolCallAccumulator, ToolDefinition, finalize_tool_call_accumulators,
+        CompletionRequest, Provider, StopReason, StreamEvent, ToolCallAccumulator, ToolDefinition,
+        finalize_tool_call_accumulators,
+        sse::{End, Step},
     },
+    stats::TokenUsage,
 };
 
-pub struct OpenAiChatCompletionsProvider {
+pub(crate) struct OpenAiChatCompletionsProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
@@ -35,16 +38,21 @@ pub struct OpenAiChatCompletionsProvider {
     /// reaches.
     resolved_effort: Option<String>,
     max_output_tokens: Option<u64>,
+    /// See [`crate::config::ProfileConfig::max_request_bytes`]; unset means no ceiling here.
+    max_request_bytes: Option<usize>,
 }
 
 impl OpenAiChatCompletionsProvider {
-    pub fn new(
-        api_key: String,
-        model: String,
-        base_url: Option<String>,
-        reasoning_effort: Option<String>,
-        max_output_tokens: Option<u64>,
-    ) -> Result<Self> {
+    /// `api_key` is the credential `settings` carries, already checked to be one by the builder.
+    pub(crate) fn new(api_key: String, settings: crate::provider::ProviderBuilder) -> Result<Self> {
+        let crate::provider::ProviderBuilder {
+            model,
+            base_url,
+            effort: reasoning_effort,
+            max_output_tokens,
+            max_request_bytes,
+            ..
+        } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
         Ok(Self {
             client: crate::provider::build_http_client("openai-chat-completions", |builder| {
@@ -59,12 +67,47 @@ impl OpenAiChatCompletionsProvider {
             model,
             resolved_effort,
             max_output_tokens,
+            max_request_bytes,
         })
     }
 
     /// The settled reasoning-effort to send as `reasoning_effort` (see [`Self::resolved_effort`]).
     fn wire_effort(&self) -> Option<String> {
         self.resolved_effort.clone()
+    }
+
+    /// The serialized request, within the profile's ceiling when it states one; see
+    /// [`crate::provider::budget`].
+    fn request_body_within_budget(
+        &self,
+        system_prompt: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        stream: bool,
+    ) -> Result<(String, Option<crate::frontend::Notice>)> {
+        match self.max_request_bytes {
+            Some(max_request_bytes) => crate::provider::budget::fit_body_to_budget(
+                messages,
+                max_request_bytes,
+                |messages| {
+                    crate::provider::budget::serialize_body(&self.build_request_body(
+                        system_prompt,
+                        messages,
+                        tools,
+                        stream,
+                    ))
+                },
+            ),
+            None => Ok((
+                crate::provider::budget::serialize_body(&self.build_request_body(
+                    system_prompt,
+                    messages,
+                    tools,
+                    stream,
+                ))?,
+                None,
+            )),
+        }
     }
 
     pub(super) fn build_request_body(
@@ -96,7 +139,7 @@ impl OpenAiChatCompletionsProvider {
                             if let ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
-                                is_error,
+                                is_error: _,
                             } = block
                             {
                                 // Chat Completions deliberately restricts the `tool` role's content
@@ -110,15 +153,15 @@ impl OpenAiChatCompletionsProvider {
                                 // in `function_call_output.output`,
                                 // and we emit those there.
                                 let text = ContentBlock::tool_result_text_content(content);
-                                let mut tool_msg = serde_json::json!({
+                                let tool_message = serde_json::json!({
                                     "role": "tool",
                                     "tool_call_id": tool_use_id,
                                     "content": text,
                                 });
-                                if *is_error {
-                                    tool_msg["is_error"] = serde_json::json!(true);
-                                }
-                                openai_messages.push(tool_msg);
+                                // No `is_error`: the `tool` message has no such field in this
+                                // API, and an endpoint that validates its schema rejects the
+                                // whole request for it. The text carries the failure.
+                                openai_messages.push(tool_message);
                             }
                         }
                     } else {
@@ -132,16 +175,23 @@ impl OpenAiChatCompletionsProvider {
                             .any(|block| matches!(block, ContentBlock::Image { .. }));
                         if has_images {
                             let mut parts: Vec<serde_json::Value> = Vec::new();
-                            let text = message.text_content();
+                            // The context block and the words, as one text part.
+                            let text = message.wire_text();
                             if !text.is_empty() {
                                 parts.push(serde_json::json!({"type": "text", "text": text}));
                             }
                             for block in &message.content {
                                 if let ContentBlock::Image { source } = block {
-                                    parts.push(serde_json::json!({
-                                        "type": "image_url",
-                                        "image_url": { "url": super::data_url(source) },
-                                    }));
+                                    parts.push(match super::data_url(source) {
+                                        Some(url) => serde_json::json!({
+                                            "type": "image_url",
+                                            "image_url": { "url": url },
+                                        }),
+                                        None => serde_json::json!({
+                                            "type": "text",
+                                            "text": crate::image::UNRESOLVED_IMAGE_PLACEHOLDER,
+                                        }),
+                                    });
                                 }
                             }
                             openai_messages.push(serde_json::json!({
@@ -151,7 +201,7 @@ impl OpenAiChatCompletionsProvider {
                         } else {
                             openai_messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": message.text_content(),
+                                "content": message.wire_text(),
                             }));
                         }
                     }
@@ -181,14 +231,14 @@ impl OpenAiChatCompletionsProvider {
                         }));
                     } else {
                         let text = message.text_content();
-                        let mut msg = serde_json::json!({
+                        let mut assistant_message = serde_json::json!({
                             "role": "assistant",
                             "tool_calls": tool_calls,
                         });
                         if !text.is_empty() {
-                            msg["content"] = serde_json::json!(text);
+                            assistant_message["content"] = serde_json::json!(text);
                         }
-                        openai_messages.push(msg);
+                        openai_messages.push(assistant_message);
                     }
                 }
             }
@@ -210,14 +260,12 @@ impl OpenAiChatCompletionsProvider {
         let reasoning_effort = self.wire_effort();
         if let Some(effort) = &reasoning_effort {
             body["reasoning_effort"] = serde_json::json!(effort);
-            // Reasoning eats output tokens, so a request that asks for it gets a generous cap or
-            // it truncates mid-thought. This keys off the profile naming a tier, not off the model:
-            // meka no longer decides which models reason, so a reasoning model with no configured
-            // effort now goes without the 32k floor and takes the endpoint's own cap. The profile's
-            // `max_output_tokens` wins either way.
-            body["max_completion_tokens"] =
-                serde_json::json!(self.max_output_tokens.unwrap_or(32_000));
-        } else if let Some(max_output) = self.max_output_tokens {
+        }
+        // Only the profile's own cap: the endpoint's default is the endpoint's fact, and this
+        // backend reaches whatever `base_url` names. A 32k floor sent whenever `effort` was set was
+        // rejected by every model with a smaller output cap, and each rejection cost a degraded
+        // retry that failed the same way.
+        if let Some(max_output) = self.max_output_tokens {
             body["max_completion_tokens"] = serde_json::json!(max_output);
         }
 
@@ -301,24 +349,12 @@ impl OpenAiChatCompletionsProvider {
                             .and_then(|arguments| arguments.as_str())
                     })
                     .unwrap_or("{}");
-                let input: serde_json::Value = match serde_json::from_str(arguments_str) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        // Mirror the streaming path: surface the parse failure via the sentinel so
-                        // the dispatch loop rejects the call instead of silently running the tool
-                        // with empty arguments.
-                        tracing::warn!(
-                            "rejecting tool call with unparseable JSON arguments: {}",
-                            error
-                        );
-                        serde_json::json!({
-                            crate::provider::INVALID_TOOL_ARGS_MARKER:
-                                format!("invalid JSON arguments: {}", error),
-                        })
-                    }
-                };
-
-                content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                content_blocks.push(
+                    match crate::provider::finalize_tool_arguments(&name, arguments_str) {
+                        Ok(input) => ContentBlock::ToolUse { id, name, input },
+                        Err(reason) => crate::provider::rejected_tool_use(id, name, reason),
+                    },
+                );
             }
         }
 
@@ -351,22 +387,23 @@ impl OpenAiChatCompletionsProvider {
 impl Provider for OpenAiChatCompletionsProvider {
     async fn complete(
         &self,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[ToolDefinition],
-    ) -> Result<(
-        Message,
-        StopReason,
-        TokenUsage,
-        Vec<crate::provider::Notice>,
-    )> {
-        let body = self.build_request_body(system_prompt, messages, tools, false);
+        request: CompletionRequest<'_>,
+    ) -> Result<crate::provider::Completion> {
+        let CompletionRequest {
+            system_prompt,
+            messages,
+            tools,
+            ..
+        } = request;
+        let (body_json, redaction_notice) =
+            self.request_body_within_budget(system_prompt, messages, tools, false)?;
 
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
+            .header("Authorization", crate::text::bearer(&self.api_key))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_json)
             .send()
             .await
             .map_err(|error| {
@@ -389,178 +426,64 @@ impl Provider for OpenAiChatCompletionsProvider {
         }
 
         let response_json: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|error| MekaError::Provider(format!("invalid JSON response: {}", error)))?;
+            .map_err(|error| MekaError::Provider(format!("invalid JSON response: {error}")))?;
 
         let (message, stop_reason, usage) = self.parse_non_streaming_response(&response_json)?;
-        Ok((message, stop_reason, usage, Vec::new()))
+        Ok(crate::provider::Completion {
+            message,
+            stop_reason,
+            usage,
+            notices: redaction_notice.into_iter().collect(),
+        })
     }
 
     async fn stream(
         &self,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[ToolDefinition],
+        request: CompletionRequest<'_>,
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        use eventsource_stream::Eventsource;
-        use futures::StreamExt;
-
-        let body = self.build_request_body(system_prompt, messages, tools, true);
+        let CompletionRequest {
+            system_prompt,
+            messages,
+            tools,
+            ..
+        } = request;
+        let (body_json, redaction_notice) =
+            self.request_body_within_budget(system_prompt, messages, tools, true)?;
+        // A send error here means the consumer hung up already, which the SSE driver reports
+        // itself.
+        if let Some(notice) = redaction_notice
+            && event_sender
+                .send(StreamEvent::Notice(notice))
+                .await
+                .is_err()
+        {
+            tracing::trace!("stream event receiver dropped");
+        }
 
         let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
+            .header("Authorization", crate::text::bearer(&self.api_key))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_json)
             .send()
             .await
             .map_err(|error| {
                 crate::error::provider_transport_error("HTTP request failed", &error, None)
             })?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = crate::error::parse_retry_after(response.headers());
-            let response_text = response.text().await.unwrap_or_else(|error| {
-                tracing::warn!("failed to read error response body: {}", error);
-                String::new()
-            });
-            return Err(crate::error::provider_http_error(
-                status,
-                &response_text,
-                retry_after,
-                crate::error::ProviderRequest::Completion,
-            ));
-        }
-
-        let mut event_stream = response.bytes_stream().eventsource();
-
-        let mut tool_call_accumulators: std::collections::HashMap<i64, ToolCallAccumulator> =
-            std::collections::HashMap::new();
-
-        // Set when a `finish_reason` chunk arrives. The loop keeps running afterward so the
-        // trailing usage chunk (emitted by `stream_options.include_usage`) is captured;
-        // finalisation and the single MessageEnd run once the stream ends, below the loop.
-        let mut final_stop: Option<StopReason> = None;
-        // See the terminal-event check after the loop.
-        let mut saw_terminal_event = false;
-
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => {
-                    return Err(MekaError::Interrupted);
-                }
-                event = tokio::time::timeout(
-                    crate::provider::STREAM_IDLE_TIMEOUT,
-                    event_stream.next(),
-                ) => {
-                    // Bounds silence, not the turn: every delta resets it. Without it a connection
-                    // that died without an RST left the turn parked on a socket that would never
-                    // speak again, for as long as the process ran.
-                    let event = match event {
-                        Ok(event) => event,
-                        Err(_elapsed) => {
-                            let message = format!(
-                                "idle timeout waiting for OpenAI SSE event after {}s",
-                                crate::provider::STREAM_IDLE_TIMEOUT.as_secs()
-                            );
-                            if event_sender
-                                .send(StreamEvent::Error(message.clone()))
-                                .await
-                                .is_err()
-                            {
-            tracing::trace!("stream event receiver dropped");
-                            }
-                            return Err(MekaError::StreamError(message));
-                        }
-                    };
-                    let Some(event) = event else {
-                        break;
-                    };
-
-                    match event {
-                        Ok(event) => {
-                            if event.data == "[DONE]" {
-                                saw_terminal_event = true;
-                                break;
-                            }
-
-                            let data: serde_json::Value = match serde_json::from_str(&event.data) {
-                                Ok(data) => data,
-                                Err(error) => {
-                                    tracing::warn!("failed to parse OpenAI SSE data: {}", error);
-                                    continue;
-                                }
-                            };
-
-                            if matches!(
-                                handle_stream_chunk(
-                                    &data,
-                                    &mut tool_call_accumulators,
-                                    &mut final_stop,
-                                    &event_sender,
-                                )
-                                .await,
-                                ChunkOutcome::Stop
-                            ) {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            if event_sender
-                                .send(StreamEvent::Error(error.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                tracing::trace!("stream event receiver dropped");
-                            }
-                            return Err(MekaError::StreamError(error.to_string()));
-                        }
-                    }
-                }
-            }
-        }
-
-        // A stream that stopped without saying so is a failure, not a short turn.
-        //
-        // `next()` returning `None` -- a proxy closing the chunked response, a dropped connection
-        // -- is indistinguishable here from the `[DONE]` above unless it is tracked, and
-        // treating the two alike committed a truncated message as a finished one:
-        // `final_stop` is `None`, so the fallback below stamps `EndTurn` and the partial
-        // answer is persisted as complete with no retry. The Claude and Codex drivers
-        // already return `StreamError` in this case (src/provider/anthropic/shared.rs,
-        // src/provider/openai/responses_wire.rs); this is the sibling that did not get it.
-        // `StreamError` is retryable, so the existing retry path applies.
-        // No `receiver_gone` companion here, unlike the Claude driver: every send-failure site in
-        // this loop returns immediately, so a dropped receiver never reaches this check.
-        if !saw_terminal_event {
-            let message = "OpenAI stream ended before a terminal event".to_string();
-            tracing::warn!("{}", message);
-            return Err(MekaError::StreamError(message));
-        }
-
-        // Finalise any pending tool calls and emit the single MessageEnd, preferring the
-        // finish_reason we recorded; fall back to tool-presence when no finish_reason arrived.
-        let has_tools =
-            finalize_tool_call_accumulators(&mut tool_call_accumulators, &event_sender).await;
-        let stop_reason = final_stop.unwrap_or(if has_tools {
-            StopReason::ToolUse
-        } else {
-            StopReason::EndTurn
-        });
-        if event_sender
-            .send(StreamEvent::MessageEnd { stop_reason })
-            .await
-            .is_err()
-        {
-            tracing::trace!("stream event receiver dropped");
-        }
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        "openai-chat-completions"
+        let mut protocol = ChatCompletionsStream::default();
+        let end = crate::provider::sse::drive(
+            response,
+            "Chat Completions",
+            &event_sender,
+            &cancellation,
+            &mut protocol,
+        )
+        .await?;
+        conclude_stream(end, protocol, &event_sender).await
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -568,12 +491,93 @@ impl Provider for OpenAiChatCompletionsProvider {
     }
 }
 
+/// End the stream: finalize pending tool calls and emit the single `MessageEnd`, preferring the
+/// recorded `finish_reason` and falling back to tool presence when none arrived.
+///
+/// A stream that stopped without saying so is a failure, not a short turn. The read ending before
+/// `[DONE]` -- a proxy closing the chunked response, a dropped connection -- is indistinguishable
+/// from the terminal frame unless it is tracked, and treating the two alike committed a truncated
+/// message as a finished one: `final_stop` is `None`, so the fallback stamps `EndTurn` and the
+/// partial answer is persisted as complete with no retry. `StreamError` is retryable, so the
+/// existing retry path applies. A close *after* the `finish_reason` chunk is the other case: the
+/// stream has said everything it had to, and a gateway that omits the `[DONE]` sentinel is read
+/// the way the Claude driver reads a close after `message_delta`. Failing it dropped every tool
+/// call of the turn.
+async fn conclude_stream(
+    end: End,
+    mut protocol: ChatCompletionsStream,
+    event_sender: &mpsc::Sender<StreamEvent>,
+) -> Result<()> {
+    if matches!(end, End::Ended) && protocol.final_stop.is_none() {
+        let message = "OpenAI stream ended before a terminal event".to_string();
+        tracing::warn!("{message}");
+        return Err(crate::provider::sse::stream_error(event_sender, message).await);
+    }
+
+    let has_tools =
+        finalize_tool_call_accumulators(&mut protocol.tool_call_accumulators, event_sender).await;
+    let stop_reason = protocol.final_stop.unwrap_or(if has_tools {
+        StopReason::ToolUse
+    } else {
+        StopReason::EndTurn
+    });
+    if event_sender
+        .send(StreamEvent::MessageEnd { stop_reason })
+        .await
+        .is_err()
+    {
+        tracing::trace!("stream event receiver dropped");
+    }
+    Ok(())
+}
+
+/// The Chat Completions driver's state between frames.
+#[derive(Default)]
+struct ChatCompletionsStream {
+    tool_call_accumulators: std::collections::HashMap<i64, ToolCallAccumulator>,
+    /// Set when a `finish_reason` chunk arrives. The read keeps going afterward so the trailing
+    /// usage chunk (emitted by `stream_options.include_usage`) is captured; finalization and the
+    /// single MessageEnd run once the stream ends.
+    final_stop: Option<StopReason>,
+}
+
+#[async_trait]
+impl crate::provider::sse::Protocol for ChatCompletionsStream {
+    async fn frame(
+        &mut self,
+        event: eventsource_stream::Event,
+        event_sender: &mpsc::Sender<StreamEvent>,
+    ) -> Result<Step> {
+        if event.data == "[DONE]" {
+            return Ok(Step::Finished);
+        }
+        let Some(data) = crate::provider::sse::frame_json("Chat Completions", &event.data) else {
+            return Ok(Step::Continue);
+        };
+        match handle_stream_chunk(
+            &data,
+            &mut self.tool_call_accumulators,
+            &mut self.final_stop,
+            event_sender,
+        )
+        .await
+        {
+            ChunkOutcome::Continue => Ok(Step::Continue),
+            ChunkOutcome::Stop => Ok(Step::ReceiverGone),
+            ChunkOutcome::Fail(error) => Err(error),
+        }
+    }
+}
+
 /// Whether the caller should keep reading the stream after a chunk. `Stop` means the event receiver
-/// has been dropped, so there is nobody left to stream to.
-#[derive(Debug, PartialEq, Eq)]
+/// has been dropped, so there is nobody left to stream to; `Fail` means the endpoint reported an
+/// error inside the stream, which ends the turn the way a failed request would; the read loop
+/// announces it on the channel.
+#[derive(Debug)]
 enum ChunkOutcome {
     Continue,
     Stop,
+    Fail(MekaError),
 }
 
 /// Folds one Chat Completions streaming chunk into the in-progress response: forwards usage and
@@ -587,6 +591,18 @@ async fn handle_stream_chunk(
     final_stop: &mut Option<StopReason>,
     event_sender: &mpsc::Sender<StreamEvent>,
 ) -> ChunkOutcome {
+    // An error object in a 200 stream is how OpenRouter, vLLM and OpenAI itself report a failure
+    // that began after the headers went out. It has no `choices`, so reading past it committed
+    // whatever had streamed as a finished turn with no error and no retry.
+    //
+    // `"error": null` is a field some servers emit on every chunk, and is no error.
+    if let Some(error) = data.get("error").filter(|error| !error.is_null()) {
+        return ChunkOutcome::Fail(crate::error::provider_stream_error_object(
+            error,
+            "the endpoint reported an error mid-stream",
+        ));
+    }
+
     if let Some(usage) = data.get("usage") {
         let token_usage = TokenUsage {
             input_tokens: usage
@@ -618,7 +634,7 @@ async fn handle_stream_chunk(
         .and_then(|reason| reason.as_str())
     {
         // Record the stop reason but keep reading: with `stream_options.include_usage` the usage
-        // arrives in a trailing chunk AFTER this one (and before `[DONE]`). Finalisation and the
+        // arrives in a trailing chunk AFTER this one (and before `[DONE]`). Finalization and the
         // single MessageEnd happen once the stream ends, back in the caller.
         //
         // Fall through to the delta below rather than returning here: OpenAI itself sends
@@ -663,21 +679,23 @@ async fn handle_stream_chunk(
             .and_then(|name| name.as_str())
             .or_else(|| tool_call.get("name").and_then(|name| name.as_str()));
 
-        if let Some(id) = tool_call.get("id").and_then(|id| id.as_str()) {
-            let accumulator = accumulators
-                .entry(index)
-                .or_insert_with(|| ToolCallAccumulator {
-                    id: id.to_string(),
-                    name: String::new(),
-                    arguments: String::new(),
-                });
-            if let Some(name) = name
-                && accumulator.name.is_empty()
-            {
-                accumulator.name = name.to_string();
-            }
-        } else if let Some(name) = name
-            && let Some(accumulator) = accumulators.get_mut(&index)
+        // Keyed on the index alone. The id is filled in by whichever fragment carries it, so an
+        // endpoint that sends the name and the first arguments before the id, or never sends one,
+        // still accumulates a call rather than streaming its arguments to the screen and dropping
+        // them from the request.
+        let accumulator = accumulators
+            .entry(index)
+            .or_insert_with(|| ToolCallAccumulator {
+                id: String::new(),
+                name: String::new(),
+                arguments: String::new(),
+            });
+        if let Some(id) = tool_call.get("id").and_then(|id| id.as_str())
+            && accumulator.id.is_empty()
+        {
+            accumulator.id = id.to_string();
+        }
+        if let Some(name) = name
             && accumulator.name.is_empty()
         {
             accumulator.name = name.to_string();
@@ -694,17 +712,7 @@ async fn handle_stream_chunk(
             })
             && !args.is_empty()
         {
-            if let Some(accumulator) = accumulators.get_mut(&index) {
-                accumulator.arguments.push_str(args);
-            }
-            if event_sender
-                .send(StreamEvent::ToolInputDelta(args.to_string()))
-                .await
-                .is_err()
-            {
-                tracing::trace!("stream event receiver dropped");
-                return ChunkOutcome::Stop;
-            }
+            accumulator.arguments.push_str(args);
         }
     }
 
@@ -728,7 +736,7 @@ fn parse_openai_stop_reason(reason: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ToolResultContent;
+    use crate::conversation::ToolResultContent;
 
     /// Drives [`handle_stream_chunk`] over a sequence of chunks and returns everything it produced,
     /// mirroring what the read loop in `stream_completion` does with a live SSE stream.
@@ -755,13 +763,60 @@ mod tests {
         (events, accumulators, final_stop)
     }
 
+    /// A gateway that ends the response after the final `finish_reason` chunk and never writes
+    /// `[DONE]` has delivered a complete message; failing it dropped every tool call of the turn.
+    /// A close with no `finish_reason` seen is still the truncation the check exists for.
+    #[tokio::test]
+    async fn a_close_after_finish_reason_completes_the_message() {
+        let (sender, mut receiver) = mpsc::channel::<StreamEvent>(8);
+        let protocol = ChatCompletionsStream {
+            final_stop: Some(StopReason::EndTurn),
+            ..Default::default()
+        };
+        conclude_stream(End::Ended, protocol, &sender)
+            .await
+            .expect("the stop reason was seen, so the message is whole");
+        drop(sender);
+        let mut events = Vec::new();
+        while let Some(event) = receiver.recv().await {
+            events.push(event);
+        }
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::MessageEnd {
+                stop_reason: StopReason::EndTurn
+            }]),
+            "{events:?}"
+        );
+
+        let (sender, _receiver) = mpsc::channel::<StreamEvent>(8);
+        let error = conclude_stream(End::Ended, ChatCompletionsStream::default(), &sender)
+            .await
+            .expect_err("no stop reason and no terminal frame is a truncated stream");
+        assert!(matches!(error, MekaError::StreamError(_)), "{error:?}");
+    }
+
+    /// `"error": null` rides on every chunk from some servers and is not a failure.
+    #[tokio::test]
+    async fn a_null_error_field_is_not_an_error() {
+        let (events, _, final_stop) = drive_chunks(&[serde_json::json!({
+            "error": null,
+            "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]
+        })])
+        .await;
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::TextDelta(text)] if text == "hi"),
+            "{events:?}"
+        );
+        assert_eq!(final_stop, Some(StopReason::EndTurn));
+    }
+
     /// vLLM-backed endpoints coalesce the final tool-call delta into the same chunk as
     /// `finish_reason`, rather than sending `finish_reason` alone with an empty delta the way
     /// OpenAI does. The chunk below is a real capture. Skipping the delta on a chunk that carries a
     /// `finish_reason` drops the tool call outright, leaving `StopReason::ToolUse` with no tool-use
     /// block, which the agent surfaces as "the model returned an empty response".
     #[tokio::test]
-    async fn test_stream_chunk_keeps_tool_call_coalesced_with_finish_reason() {
+    async fn stream_chunk_keeps_tool_call_coalesced_with_finish_reason() {
         let chunk = serde_json::json!({
             "choices": [{
                 "index": 0,
@@ -799,7 +854,7 @@ mod tests {
     /// The same coalescing applies to plain text: the tail of a response must not be swallowed
     /// because it shared a chunk with `finish_reason: "stop"`.
     #[tokio::test]
-    async fn test_stream_chunk_keeps_text_coalesced_with_finish_reason() {
+    async fn stream_chunk_keeps_text_coalesced_with_finish_reason() {
         let chunk = serde_json::json!({
             "choices": [{
                 "index": 0,
@@ -823,7 +878,7 @@ mod tests {
     /// with an empty delta - must keep working. The same endpoint emits this shape too; which of
     /// the two arrives is a timing race.
     #[tokio::test]
-    async fn test_stream_chunk_handles_finish_reason_in_its_own_chunk() {
+    async fn stream_chunk_handles_finish_reason_in_its_own_chunk() {
         let chunks = [
             serde_json::json!({
                 "choices": [{
@@ -865,40 +920,85 @@ mod tests {
     }
 
     #[test]
-    fn test_an_openai_base_url_is_normalized_at_construction() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            Some("https://openrouter.ai/api/v1/".to_string()),
-            None,
-            None,
-        )
+    fn an_openai_base_url_is_normalized_at_construction() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(Some("https://openrouter.ai/api/v1/".to_string()))
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
         // Without this the request path would carry a doubled separator, since the endpoint is
         // appended as `{base}/chat/completions`.
         assert_eq!(provider.base_url, "https://openrouter.ai/api/v1");
 
         // The version segment belongs in an OpenAI-family base and must survive.
-        let default = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+        let default = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
         assert_eq!(default.base_url, "https://api.openai.com/v1");
     }
 
+    /// The context block and the words are one `content` string with a blank line between, the
+    /// context first: this wire has no typed blocks to keep them apart.
     #[test]
-    fn test_openai_request_body_simple() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn the_context_block_precedes_the_words() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
+        .expect("build test provider");
+        let messages = vec![Message::user_turn("ctx", "hello", Vec::new())];
+        let body = provider.build_request_body("", &messages, &[], false);
+        assert_eq!(body["messages"][0]["content"], "ctx\n\nhello");
+    }
+
+    #[test]
+    fn openai_request_body_simple() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let messages = vec![Message::user("hello")];
@@ -918,18 +1018,24 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_request_body_user_image_uses_content_array() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_request_body_user_image_uses_content_array() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
         let message =
-            Message::user_with_images("what is this", vec![crate::provider::ImageSource {
-                source_type: "base64".to_string(),
+            Message::user_with_images("what is this", vec![crate::image::ImageSource::Base64 {
                 media_type: "image/png".to_string(),
                 data: "QUJD".to_string(),
             }]);
@@ -943,31 +1049,118 @@ mod tests {
         assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
     }
 
+    /// A profile that states `max_request_bytes` is held to it here too. This backend renders a
+    /// tool-result image as the text `[Image]`, so there is nothing for the redaction to remove;
+    /// what the ceiling still buys is the refusal: a body the endpoint would reject is refused
+    /// before the send as `InvalidRequest`, which the turn answers by degrading its own
+    /// attachments instead of failing every later turn against the same body. Without a ceiling
+    /// the body is sent as built.
     #[test]
-    fn test_openai_request_body_max_output_tokens_override_without_effort() {
+    fn a_stated_ceiling_refuses_an_oversize_body_here_too() {
+        let with_ceiling = |max_request_bytes: Option<usize>| {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None)
+                .max_request_bytes(max_request_bytes),
+            )
+            .expect("build test provider")
+        };
+        let image = "A".repeat(8_000);
+        let messages = vec![Message::user_with_images("what is this", vec![
+            crate::image::ImageSource::Base64 {
+                media_type: "image/png".to_string(),
+                data: image.clone(),
+            },
+        ])];
+
+        let refused = with_ceiling(Some(4_000))
+            .request_body_within_budget("", &messages, &[], false)
+            .expect_err("the newest message's image cannot be redacted, so the ceiling refuses");
+        // meka's own ceiling, so `RequestTooLarge` rather than the provider's `InvalidRequest`;
+        // both arm the degrade-and-retry, and only one of them claims an upstream judged this.
+        assert!(
+            matches!(refused, MekaError::RequestTooLarge(_)),
+            "the refusal arms the degrade-and-retry: {refused:?}"
+        );
+
+        let (body, notice) = with_ceiling(None)
+            .request_body_within_budget("", &messages, &[], false)
+            .expect("no ceiling, no refusal");
+        assert!(body.contains(&image), "sent as built without a ceiling");
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn openai_request_body_max_output_tokens_override_without_effort() {
         // No reasoning_effort, but an explicit cap: `max_completion_tokens` is set.
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            Some(8_000),
-        )
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(Some(8_000)),
+            )
+        }
         .expect("build test provider");
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert_eq!(body["max_completion_tokens"], 8_000);
     }
 
+    /// `effort` alone sends no output cap: the endpoint's default is its own fact, and a guessed
+    /// 32k floor was refused by every model with a smaller cap.
     #[test]
-    fn test_openai_request_body_max_output_tokens_override_wins_over_effort_default() {
-        // With effort the default cap is 32k; the profile override replaces it.
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-5".to_string(),
-            None,
-            Some("high".to_string()),
-            Some(120_000),
-        )
+    fn openai_request_body_effort_alone_sends_no_output_cap() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-5".to_string(),
+                )
+                .base_url(None)
+                .effort(Some("high".to_string()))
+                .max_output_tokens(None),
+            )
+        }
+        .expect("build test provider");
+        let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("max_completion_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn openai_request_body_max_output_tokens_override_wins_over_effort_default() {
+        // With effort and a profile cap, the cap is sent alongside.
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-5".to_string(),
+                )
+                .base_url(None)
+                .effort(Some("high".to_string()))
+                .max_output_tokens(Some(120_000)),
+            )
+        }
         .expect("build test provider");
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert_eq!(body["max_completion_tokens"], 120_000);
@@ -975,14 +1168,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_request_body_no_cap_without_effort_or_override() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_request_body_no_cap_without_effort_or_override() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
         let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
         assert!(body.get("max_completion_tokens").is_none());
@@ -993,39 +1193,60 @@ mod tests {
         // Recognized reasoning model or local weights, the answer is the same: OpenAI owns the
         // default and meka asks for it by omitting the field.
         for model in ["gpt-5.6-sol", "o3", "llama3.1"] {
-            let provider = OpenAiChatCompletionsProvider::new(
-                "test-key".to_string(),
-                model.to_string(),
-                None,
-                None,
-                None,
-            )
+            let provider = {
+                let api_key: String = "test-key".to_string();
+                OpenAiChatCompletionsProvider::new(
+                    api_key.clone(),
+                    crate::provider::ProviderBuilder::new(
+                        crate::config::Backend::OpenAiChatCompletions,
+                        crate::store::AuthCredential::ApiKey(api_key),
+                        model.to_string(),
+                    )
+                    .base_url(None)
+                    .effort(None)
+                    .max_output_tokens(None),
+                )
+            }
             .expect("build test provider");
             let body = provider.build_request_body("", &[Message::user("hi")], &[], false);
             assert!(body.get("reasoning_effort").is_none(), "{model}");
         }
         // A configured value is absolute, including on a model meka does not recognize.
-        let configured = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "llama3.1".to_string(),
-            None,
-            Some("low".to_string()),
-            None,
-        )
+        let configured = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "llama3.1".to_string(),
+                )
+                .base_url(None)
+                .effort(Some("low".to_string()))
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
         let body = configured.build_request_body("", &[Message::user("hi")], &[], false);
         assert_eq!(body["reasoning_effort"], "low");
     }
 
     #[test]
-    fn test_openai_request_body_with_tools() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_request_body_with_tools() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let tools = vec![ToolDefinition::new(
@@ -1048,14 +1269,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_request_body_with_tool_calls() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_request_body_with_tool_calls() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let messages = vec![
@@ -1093,14 +1321,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_non_streaming_text() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_non_streaming_text() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1122,14 +1357,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_non_streaming_tool_call() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_non_streaming_tool_call() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1168,14 +1410,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_non_streaming_malformed_tool_args() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_non_streaming_malformed_tool_args() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1208,8 +1457,7 @@ mod tests {
                     .get(crate::provider::INVALID_TOOL_ARGS_MARKER)
                     .and_then(|reason| reason.as_str())
                     .is_some(),
-                "malformed args must surface the invalid-args sentinel, got: {}",
-                input
+                "malformed args must surface the invalid-args sentinel, got: {input}"
             );
         } else {
             panic!("expected ToolUse block");
@@ -1217,14 +1465,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_missing_message_in_choice() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_missing_message_in_choice() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1238,14 +1493,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_missing_tool_call_id() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_missing_tool_call_id() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1270,14 +1532,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_missing_tool_call_function_name() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_missing_tool_call_function_name() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1302,14 +1571,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_non_streaming_flattened_tool_call() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_non_streaming_flattened_tool_call() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1346,14 +1622,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_parse_non_streaming_flattened_missing_name_still_errors() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_parse_non_streaming_flattened_missing_name_still_errors() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let response = serde_json::json!({
@@ -1376,14 +1659,21 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_tool_definitions_use_standard_chat_completions_format() {
-        let provider = OpenAiChatCompletionsProvider::new(
-            "test-key".to_string(),
-            "gpt-4o".to_string(),
-            None,
-            None,
-            None,
-        )
+    fn openai_tool_definitions_use_standard_chat_completions_format() {
+        let provider = {
+            let api_key: String = "test-key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider");
 
         let tools = vec![ToolDefinition::new(
@@ -1415,5 +1705,97 @@ mod tests {
         assert!(openai_tools[0].get("name").is_none());
         assert!(openai_tools[0].get("description").is_none());
         assert!(openai_tools[0].get("parameters").is_none());
+    }
+
+    /// An error object in a 200 stream ends the turn as a failure. Read past, it left the partial
+    /// answer committed as complete with no error and no retry. The read loop announces the
+    /// failure on the channel; this asserts the classification it hands back.
+    #[tokio::test]
+    async fn an_error_object_mid_stream_fails_the_turn() {
+        let (sender, _receiver) = mpsc::channel::<StreamEvent>(8);
+        let mut accumulators = std::collections::HashMap::new();
+        let mut final_stop = None;
+        let outcome = handle_stream_chunk(
+            &serde_json::json!({"error": {"message": "upstream capacity", "type": "server_error"}}),
+            &mut accumulators,
+            &mut final_stop,
+            &sender,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                ChunkOutcome::Fail(MekaError::RetryableProvider { .. })
+            ),
+            "a server_error is the transient kind: {outcome:?}"
+        );
+    }
+
+    /// A tool call whose id arrives after its first arguments, or never, is still one call.
+    #[tokio::test]
+    async fn a_tool_call_is_accumulated_before_its_id_arrives() {
+        let (_events, accumulators, _) = drive_chunks(&[
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "function": {"name": "read_file", "arguments": "{\"path\":"}
+            }]}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call_1", "function": {"arguments": " \"a.txt\"}"}
+            }]}}]}),
+        ])
+        .await;
+        let accumulator = accumulators.get(&0).expect("one call accumulated");
+        assert_eq!(accumulator.id, "call_1");
+        assert_eq!(accumulator.name, "read_file");
+        assert_eq!(accumulator.arguments, "{\"path\": \"a.txt\"}");
+    }
+
+    /// The `tool` message has no `is_error` field in this API; a strict endpoint rejects the
+    /// request for one, and only on the turns where a tool failed.
+    #[test]
+    fn a_failed_tool_result_carries_no_is_error_key() {
+        let provider = {
+            let api_key: String = "key".to_string();
+            OpenAiChatCompletionsProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiChatCompletions,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-4o".to_string(),
+                )
+                .base_url(None)
+                .effort(None)
+                .max_output_tokens(None),
+            )
+        }
+        .expect("provider");
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "x"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: vec![ToolResultContent::Text {
+                        text: "Error: no such file".to_string(),
+                    }],
+                    is_error: true,
+                }],
+            },
+        ];
+        let body = provider.build_request_body("system", &messages, &[], false);
+        let tool_message = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("the tool message");
+        assert!(tool_message.get("is_error").is_none(), "{tool_message}");
+        assert_eq!(tool_message["content"], "Error: no such file");
     }
 }

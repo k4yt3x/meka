@@ -7,12 +7,421 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-09-06
+
+The account and profile release. A provider profile splits into the account that logs in and bills
+and the profile that picks a model on it, so one login can run several models; `meka account` and
+`meka profile` replace `meka provider`, the prompt becomes `-p`, and a one-shot run can print its
+turn as JSON. The `ask` level gives way to an `approvals` switch beside the four levels, so an
+approved call runs at the session's level rather than unconfined. Images live once in a `blobs`
+table, meka's per-turn context is its own content block, and a scheduled job runs at exactly the
+level its session recorded. Under the surface, one definition answers each question that several
+doors used to answer differently: unknown names, session writes, recorded levels, working
+directories, titles, timestamps, sizes, error mapping, JSON record shapes. A 0.45 `config.toml` is
+converted by `scripts/migrate-0.45-to-0.46.py`; the store migrates itself in nine ledger steps behind
+a backup. The upgrade guide lists every breaking change with its remedy.
+
+### Added
+
+- `meka account add`/`login`/`list`/`remove` manage accounts, and `meka profile add`/`set`/`use`/
+  `list`/`remove` manage profiles; two profiles on one account share one login.
+- `-p -` reads the first turn's prompt from stdin, to end of input.
+- `scratchpad_merge` takes an optional `prefix` selecting every own entry that starts with it, and
+  its description states the order, the separator and that the sources are kept.
+- Image bytes are stored once in a `blobs` table and referenced by content hash; exports carry them,
+  and the last session to reference one takes it along when deleted.
+- `GET /v1/sessions/{id}/blobs/{hash}` serves a stored image's bytes.
+- An `approvals` switch beside the permission level: a tool call above the level is put to the user
+  instead of refused. It is recorded on the session and carried by exports and forks.
+- `/approvals`, `PATCH /v1/sessions/{id}`, the ACP `approvals` config option and
+  `[permissions].approvals` set the approvals switch.
+- `--format json` on a `--oneshot` run prints one object for the turn: session, profile, stop
+  reason, text, tool calls, usage and the notices the provider raised.
+- `scripts/migrate-0.45-to-0.46.py` rewrites a 0.45 `config.toml` into the account and profile
+  shape, dry-run by default, keeping comments.
+- `search_contents` takes a `limit` of 1 to 100 matches; `scratchpad` still lifts the cap when none
+  is passed.
+- The REPL approval prompt takes `always` and `never`, answering for that tool for the rest of the
+  session, as ACP and the HTTP API already could.
+- ACP permission requests carry `rawInput` and a JSON content block with the call's arguments; ACP
+  reports a compaction, a failed or interrupted scheduled turn and a declined elicitation as `[meka]`
+  or `[meka warn]` chunks.
+- An HTTP SSE `progress` event relays MCP `notifications/progress` for a running tool.
+- `--format json` on every listing and `show` command: a listing prints `{"<nouns>": [...]}`, a show
+  prints one object, both serialized through the HTTP API's own record shapes.
+- `read_count` on HTTP memory records and `read_only_hint_declined` on `GET /v1/mcp/{name}/tools`,
+  as `meka memory` and `meka mcp tools` already print.
+- Cargo features: `serve` (on by default) carries the HTTP API and its dependencies, and
+  `mock-provider` compiles the scripted test provider into a release-profile build.
+- `[display] stream` sets whether answers stream; `--no-stream` keeps turning it off for one run.
+- `max_request_bytes` on a profile, with a `profile add` flag and a `profile set` key, states the
+  request ceiling an Anthropic-compatible endpoint has instead of Anthropic's.
+- A contributor page, `docs/book/src/internals.md`, mapping the tree, one turn, and the store.
+- A store stamped at the current schema version but shaped otherwise is refused, naming the `-wal`
+  a copy may have left behind; another tool's table beside meka's own is not a difference.
+- The MCP `initialize` request names meka as the client, pins the protocol version, and declares
+  elicitation, so a server that checks before it asks may ask.
+- A `schedule.fired` webhook reports `cancelled` for a stopped turn, distinct from `failed`.
+- A `turn.cancelled` event carries `reason: "sse_lag"` when a slow consumer stopped the turn.
+- Every HTTP operation's OpenAPI entry names the scopes that admit it and lists its 500 response.
+
+### Changed
+
+- **Breaking:** `[providers.<name>]` is split into `[accounts.<name>]` (`backend`, endpoint, OAuth
+  settings) and `[profiles.<name>]` (`account`, `model`, every model-tied setting).
+- **Breaking:** `default_provider` is `default_profile`; the old config shape is refused, and
+  `scripts/migrate-0.45-to-0.46.py` converts it.
+- **Breaking:** the prompt is `-p, --prompt`, with no positional form, and `--provider` is
+  `--profile` with no short form.
+- **Breaking:** `provider` is `profile` on `POST /v1/sessions`, `PATCH /v1/sessions/{id}` and every
+  session response; `GET /v1/providers` is `GET /v1/profiles`, listing `account` and `backend`.
+- **Breaking:** ACP's `provider` config option is `profile`; the REPL's `/provider` is `/profile`.
+- **Breaking:** a session export archive names its `profile`, and its `format_version` is 2.
+- **Breaking:** `[permissions].default` and `enabled` refuse a level meka does not have where the
+  file is parsed, naming the line, instead of warning and running at `read`.
+- **Breaking:** a scheduled job runs at its session's recorded level alone; the polling process's
+  `--permission` no longer answers for a row without one, since every door now records a level.
+- A session row that recorded no level adopts `[permissions].default` once, when the store migrates.
+- **Breaking:** an image block in `GET /v1/sessions/{id}/messages` and in a session export carries
+  a `hash` in place of its bytes; a migration moves every stored image into `blobs`.
+- **Breaking:** a user message stores meka's per-turn context as a `turn_context` block ahead of
+  the `text` block; a migration splits every stored turn.
+- `GET /v1/sessions/{id}/messages` returns the `turn_context` block typed; exports and replays show
+  the words alone.
+- **Breaking:** `conversation_search` takes `is_regex` (was `regex`) and `conversation_read` takes
+  `limit` (was `count`).
+- **Breaking:** `find_files` takes its glob as `glob` (was `pattern`), and `fetch_url` its character
+  cap as `limit` (was `max_length`).
+- **Breaking:** `agent_followup` and `agent_delete` name the sub-agent by `id` (was `agent`).
+- **Breaking:** every config duration is a humantime string: `[web].request_timeout`,
+  `connect_timeout` and `read_timeout`, `[mcp].grace` and `connect_timeout`, `[session].retention`
+  (`"30d"`); the `_seconds` and `_days` keys are gone and `"0s"` is refused where zero is meaningless.
+- **Breaking:** `[mcp].strict` is `default_required`, with the same meaning, and
+  `[thinking].budget_tokens` is `budget`; the script converts all of these.
+- **Breaking:** `MEKA_MCP_STDIO_CONCURRENCY` and `MEKA_MCP_HTTP_CONCURRENCY` are gone; set
+  `[mcp].stdio_concurrency` and `http_concurrency` (3 and 20, zero refused).
+- **Breaking:** `MEKA_MCP_TOOL_TIMEOUT` takes a duration such as `10m`, not milliseconds.
+- **Breaking:** `[mcp].default_permission`, a server's `permission` and `tool_permissions`, and
+  `[tools].tool_permissions` refuse a level meka does not have where the file is parsed.
+- **Breaking:** `--permission`, `--render-mode`, `--sandbox-backend`, `--format` and `--transport`
+  take one exact spelling each; `session export` and `GET /v1/sessions/{id}/export` drop the `md`
+  alias of `markdown`.
+- **Breaking:** ACP answers `InvalidParams`, not `InternalError`, for a locked session, a sub-agent's
+  id, a profile the config no longer has, and every builder refusal the caller can act on.
+- **Breaking:** `GET /v1/health/ready` reports `profile_configured` (was `provider_configured`).
+- **Breaking:** `mcp add --auth` takes `oauth`, `client_credentials` or `client_credentials_jwt`, the
+  spelling the `[auth]` block records; the hyphenated forms and case variants are gone.
+- **Breaking:** ACP `session/set_config_option` refuses a profile switch while a turn is in flight
+  instead of writing the row and deferring the move.
+- One sentence per refusal on every host: `session '<id>' not found`, `cannot <verb> while a turn is
+  in flight`, `permission level '<x>' is not enabled (enabled: ...)`, `no profile named '<x>'
+  (configured: ...)`.
+- `POST /v1/sessions/{id}/turn` with an empty `message` and `options.skill` runs the skill body
+  alone, as `--skill` does, instead of answering 422.
+- Every session column is written by one store method; a `PATCH` whose row write for `permission`,
+  `approvals` or `cwd` fails applies them to the live session and logs it, while a `profile` that
+  cannot be recorded still fails the request. Activating ACP `additionalDirectories` bumps
+  `updated_at` like every other column.
+- `meka schedule show` reports a job whose session's recorded level is disabled as withheld at
+  `none`, as the fire door reads it, rather than unknown.
+- `meka session import` and `POST /v1/sessions/import` take the imported root's lock while its row
+  is written, like every other door that creates a session.
+- **Breaking:** the HTTP `permission_required` event carries `input`, the call's arguments, beside
+  `request_id`, `tool_name` and `expires_in_seconds`, and stays answerable for 30 minutes, as on ACP.
+- **Breaking:** ACP `tool_call` and permission titles read `<DisplayName> <argument>` (`ReadFile
+  src/x`, `Shell ls`), and the sticky options name the display name.
+- REPL notices are colored by level (dim for info, yellow for warn), and the REPL echoes a scheduled
+  job's prompt before its reply, as ACP does.
+- Every terminal timestamp is local time with its UTC offset, from one formatter; `session list`,
+  `session show` and `background show` no longer print unlabeled UTC.
+- Sizes in tool results, notices and `/status` print as MiB, KiB or B to one decimal, from one
+  formatter.
+- A session's title is one definition on every surface: the first user words, whitespace collapsed,
+  cut at 80 characters; `meka session show` labels it `title` (was `opening`).
+- Every host records a session's `cwd` in its canonical spelling, and a listing's `cwd` filter is
+  compared the same way.
+- Every empty listing says `No <nouns>.` on stderr, and `session show`, `schedule show`, `/tasks show`
+  and `mcp get` align their fields through one formatter; `mcp get` lists env and header names inline.
+- Every optional field on the HTTP API is omitted when absent, never `null`; `display_summary` on
+  `tool_calls` and the `tool_call.executing` event follows the rule it was the exception to.
+- One sentence for an unknown name on every surface: `no <noun> named 'x' (configured: a, b)` for
+  REPL commands, skills and MCP servers, ACP levels and config options, HTTP export formats and
+  webhook events, gate conditions, schedule kinds, accounts and profiles.
+- Messages quote a value or name in single quotes and a key or command in backticks; every failure
+  log reads `failed to <verb>`; a lost write is warned about on every host; American spelling in
+  every message the user or the model reads (`canceled`, `summarize`), wire values unchanged.
+- Help text: `--effort <EFFORT>`, `--render-mode <RENDERER>`, `--sandbox-backend <BACKEND>`, `serve
+  --bind <ADDR>`, `mcp add --client-id <ID>`; `(default: x)` and `(repeatable)` spelled the same on
+  every flag; `--format` help reads "Output format: plain or json" everywhere it appears.
+- `[serve].relay_provider_errors` governs `meka acp` too, so one key decides what a failed turn's
+  text carries on both wire hosts.
+- Every tool parameter description is a sentence, declares its default in the schema, and `force`
+  says what it proceeds despite; the three workspace writers say a path outside the roots is refused.
+- `skill_read` renders as `SkillRead` in tool-call indicators (was `Skill`).
+- The store records a session's `profile` and keys credentials by `account`, through two ledger
+  entries; a `provider_credentials` view stays for the frozen step that reads it on replay.
+- `meka profile add` no longer writes `default_profile`; a sole profile is the default and
+  `meka profile use` chooses among several.
+- An ACP prompt refused because the session is busy says what holds it and that a retry resolves it.
+- The REPL's approval prompt is headed `[approval]` instead of `[ask]`, matching the switch.
+- Every `mcp`, `memory` and `skill` `<NAME>` positional has help text; `/help` says `/cd [path]`
+  and lists what `/status` shows.
+- A request body that fails to parse answers `invalid <endpoint> request body: <diagnostic>` on
+  every endpoint; three session doors hid the diagnostic.
+- `meka account add` refuses a `chatgpt-subscription` `base_url` that is neither an origin nor a
+  path ending in `/backend-api/codex`, and a hand-edited one is refused when the provider is built.
+- A failed permission restriction, a capture-directory fallback, a directory that cannot be synced
+  and an unreadable `~/.claude.json` are warned about instead of logged at debug.
+- A scheduled job's clock is read when it is prepared, not once per sweep.
+- The store's columns and indexes follow one naming rule (`gate_spec_json`, `claim_expires_at`,
+  `memories.created_at`, `idx_<table>_<columns>`), stored thinking blocks tag their `opaque` object
+  with `type`, and gate pointer tests read `not_empty`; one automatic step converts a store.
+- `anthropic-messages` sends `cache_control: {"type": "ephemeral"}`; the one-hour TTL and its beta
+  stay with `claude-subscription`, whose captured wire pins them.
+- `POST /v1/sessions/{id}/responses/{id}` answers 404 for a session that is not resident instead
+  of reconstructing it, taking its lock and pinning it in memory.
+- A gate may call a tool that needs `read` or less, not only one that needs exactly `read`.
+- ACP `available_commands` use the REPL's wording for the slash commands, and `/status` matches.
+- The REPL, ACP and `meka serve` run scheduled jobs through one driver: a fire that finds its
+  session busy is held for the next sweep, and a canceled one is reported alike, on all three.
+- `meka account usage` resolves its profile and builds its provider as a run does, so a missing
+  credential or an unknown profile is refused in the same words everywhere.
+- `/profile` refusing a profile that is not configured names the profiles that are.
+- Only `meka mcp login` runs the interactive OAuth flow. A host connecting a server with no stored
+  credential marks it failed with that command as the remedy instead of reading its terminal.
+- `meka schedule list --session` reports an unknown session id as such, not as a configuration
+  error.
+- OAuth logins (`meka account add`/`login` for the subscription backends and `meka mcp login`)
+  print the authorization URL and no longer open a browser.
+- `meka session export` writes the file atomically and owner-only, as `memory export` does.
+- `meka account add` drops `client_id` and `oauth_token_url` on a backend that never reads them,
+  and a hand-written account that sets one warns at startup.
+- `meka profile set` refuses a thinking key on a backend without thinking.
+- `max_request_bytes` applies to every backend: the OpenAI backends redact the oldest tool-result
+  images to fit a ceiling the profile states, where before nothing bounded a window's bytes.
+
+### Removed
+
+- **Breaking:** `meka provider`: `meka account` and `meka profile` replace it, and `account usage`,
+  `whoami` and `stats` take `--profile <name>` in place of a positional name.
+- **Breaking:** the `ask` permission level: a migration turns an `ask` session into `none` with
+  approvals on, and an approved call runs at the session's level rather than unconfined.
+- **Breaking:** the one-letter spellings of `--permission` and `MEKA_PERMISSION`, and the `rich`
+  spelling of the `termimad` render mode: one spelling per value, everywhere it is read.
+- **Breaking:** the undocumented `text` spelling of `--format plain`.
+
+### Fixed
+
+- An image the request budget redacts is recorded on the conversation once, as its own event, so
+  later requests send the same body and the cache prefix holds; each request used to redact anew.
+- `openai-chat-completions` sends `max_completion_tokens` only when the profile states it; `effort`
+  alone sent a guessed 32000.
+- A scheduled job whose gate tool is not yet resolvable, or whose session row cannot be read, keeps
+  its occurrence for the next sweep instead of spending it; one whose session cannot be reached
+  leaves its claim to expire and retry.
+- `meka mcp list` and `meka account list` report orphaned credentials on stderr, and `meka memory
+  list` its priority histogram, so stdout stays the table that was asked for.
+- `meka mcp add --eager-load-tool` reaches `config.toml`; it was accepted, reported, and dropped.
+- `POST /v1/sessions/{id}/responses/{request_id}` at a sub-agent's id answers 422
+  `session-not-drivable`, as documented, not 404 `request-not-found`.
+- The SSE lag notice carries the documented `level` and `text`, and the lag failure is the cataloged
+  `sse-lag` problem type; the `stream-detached` terminal carries `turn_id` like every other.
+- A session response omits `permission` for an unloaded row that records no level, as documented,
+  instead of sending an empty string.
+- `scratchpad_save_file` said it overwrites by default; it refuses an existing file without `force`.
+- `scratchpad_read` described `offset` in characters; `offset` and `limit` are bytes, and a range
+  that falls inside a character is moved to its boundaries.
+- `meka memory edit` and `meka skill add --edit` help name `$VISUAL`, then `$EDITOR`, the order the
+  code tries.
+- A sub-agent's activity line survives a poisoned lock instead of going blank for the rest of the
+  run.
+- An empty or malformed turn body on a busy session is refused as 422 rather than 409; validation
+  runs ahead of admission.
+- `POST /v1/sessions/{id}/fork` and ACP `session/fork` refuse a source another meka process holds
+  instead of copying a half-written conversation.
+- A session whose recorded level has left `[permissions].enabled` warns and starts at the configured
+  default on every host; ACP logged it at debug and HTTP said nothing.
+- A tool nobody could approve was reported as canceled by the REPL and denied silently by
+  `--format json`; every frontend now denies it and says which tool was refused.
+- An MCP elicitation declined for want of a prompt was only logged; every host now raises a notice.
+- A store entry name over 64 bytes but under 64 characters was refused for its length in bytes.
+- `meka account add --api-key-stdin` refuses an empty stdin by name, as `mcp add` does.
+- ACP `session/new`, `load`, `resume` and `fork` refuse a `cwd` that is not an existing directory, as
+  the HTTP API and `/cd` did.
+- An image on an ACP prompt is judged against the profile the turn runs on, after the recorded
+  profile is applied, not against the process default.
+- `POST /v1/sessions/{id}/fork` and ACP `session/fork` refuse a resident source mid-turn (409
+  `turn-in-flight`, `InvalidParams`) instead of copying an unanswered prompt.
+- A `repair` row's thinking blocks are retagged on upgrade, so the row decodes instead of being
+  dropped on load.
+- A root session row that recorded no level is stamped with `[permissions].default` even when the
+  first 0.46 launch could not read `config.toml`: the store refuses to migrate until the file
+  reads, as the 0.44 step does, instead of skipping the stamp and moving on.
+- A fork whose copy fails, and an archive refused while encoding, no longer leave a lock file behind;
+  a failed session build rolls its row back through the guarded delete, sparing a row another
+  process took meanwhile; a fork whose row cannot be read back fails instead of answering `201`.
+- A tool round whose save failed left the conversation on an unanswered `tool_use`; the results now
+  reach memory first, and the store is reported as one round behind.
+- A background task whose outcome write failed stayed `running` and was later reported interrupted;
+  the write is retried once, then the row is marked `failed` with the reason.
+- The scheduler read a resident session's level from its row, so a level change whose row write
+  failed still fired a shell gate; the process holding the session now answers from the live cell.
+- `always` and `never` approval answers survived `/fork`; the copy starts with nothing remembered.
+- A typed or scheduled prompt claimed background outcomes before it was admitted; an interrupted or
+  thinking-only round dropped the request's image redactions and redacted them again next time; the
+  thinking-only nudge reached memory before its save.
+- A detached call that would be refused anyway (no session, zero ceiling, slot full) was first put
+  to the user for approval; `agent_followup` moved a sub-agent's profile row before the lock or
+  hydration could refuse the turn.
+- Wrapping a tool argument to one or two rows produced one row more than the budget allowed.
+- A `[web]` client meka cannot build fails startup on every host, not the first turn of a session.
+- Skill-store refusals name the skill and log the path instead of putting it in HTTP 409 and 422
+  bodies; a skill that cannot be read mid-turn no longer names the skills directory in its 500.
+- ACP `session/load` and `session/resume` no longer rewrite a session's cwd and roots before refusing
+  it, and ACP no longer relays provider bodies, MCP connector reasons or store paths in a failed
+  turn's `error.data`.
+- `--oneshot --format json` omits `session_id` rather than sending `null` when a turn had no session.
+- **Breaking:** a `[web]` or `base_url` misconfiguration is a sanitized 500, not a 422 naming the
+  operator's path; a session lock meka cannot open answers 500, not a 409 claiming another process
+  holds it.
+- **Breaking:** meka's own request-ceiling refusal is 422 `request-too-large`, not 502 `provider`; it
+  still degrades the newest content and retries.
+- **Breaking:** `GET` and `PATCH /v1/sessions/{id}` answer 404 or 500 rather than 200 with
+  `profile: ""`, and `POST /v1/sessions/{id}/schedule` with scheduling disabled is 404, not 422.
+- A compaction after a resume that dropped an orphaned tool call replaces the whole window when the
+  store replays it; the session's first messages no longer survive above the summary.
+- `GET /v1/sessions/{id}/messages` replays the log by the same rules as the model's view, so a
+  repaired image or tool result reads the same on the wire as in the window.
+- The text that streamed before a connection died is kept in the conversation and the store.
+- A Chat Completions stream reporting an `error` object mid-stream fails the turn instead of
+  committing the partial answer; its tool messages no longer carry `is_error`.
+- A Chat Completions tool call whose id arrives after its first arguments is accumulated rather
+  than dropped.
+- A Responses stream's top-level `error` frame ends the turn with its reason instead of as a
+  truncated stream retried twice.
+- A Claude-protocol gateway that sends bare `data:` frames without `event:` lines is read by the
+  `type` each frame names; every frame was discarded and the turn retried three times.
+- A ChatGPT subscription refresh that returns no id token keeps the account id it already had.
+- A ChatGPT subscription `base_url` whose host name contains `codex` is routed by its path.
+- The cache breakpoint lands on the last block actually sent, after trailing thinking is stripped.
+- `context_compact` cannot be detached with `background: true`; it fired against a later turn.
+- `agent_spawn` refuses `deny_tools`, `deny_servers`, `inherit_scratchpad` and `max_depth` of the
+  wrong type instead of reading them as empty and spawning an unrestricted sub-agent.
+- `edit_file` refuses an empty `old_string`; with `replace_all` it rewrote the whole file.
+- `todo` accepts the universal `scratchpad` parameter instead of refusing the call.
+- The retention sweep re-applies its `updated_at` cutoff inside the delete, so a session resumed
+  between the select and the delete survives.
+- A checkpoint compaction reads the permission at each tool call, so a level dropped during it
+  stops the next call.
+- `skill_write` and `skill_delete` take the store lock before their collision and symlink checks.
+- `scratchpad_save_file` refuses a target it cannot stat instead of overwriting it as absent.
+- `GET /v1/sessions?limit=0` returns one session rather than an empty page with no cursor.
+- `save_message` writes the message and the session's `updated_at` in one transaction.
+- Every atomic write, `write_file`, `edit_file` and `scratchpad_save_file` included, syncs the
+  directory that names the file after the rename, so a crash cannot lose the entry.
+- The schema lock is taken on a blocking thread, so a store another process holds parks no worker.
+- A Ctrl+C at the REPL's approval prompt withdraws the prompt as canceled; a bare Enter after it
+  no longer approves the call.
+- Wrapping a line padded with zero-width characters is linear; it held the REPL for minutes.
+- A relayed log line never blocks on a full editor queue, which could hang the shell.
+- A pending idempotency slot lives as long as its request; a retry of a long turn is told the
+  request is in flight instead of getting `turn-in-flight`.
+- ACP `session/new` deletes the row it created when the session cannot be built or locked.
+- A scheduled fire cut short by the shutdown drain is deferred without a `failed` webhook first.
+- The sessions map's write lock is no longer held across a store read or a background-task count.
+- A cancel that lands between claiming a session and publishing its token is honored for
+  compaction, scheduled fires and outcome deliveries, as it already was for client turns.
+- A session row the scheduler cannot read grants nothing; it fell back to the host's level.
+- A gate's shell probe reads at most the parse limit and stops the command, instead of buffering
+  everything it prints until the time budget runs out.
+- `--permission` on a resume is recorded after the provider is known to run, so a refused start
+  leaves the row at the level it had.
+- `meka account` reports its failures through the ordinary exit path instead of exiting mid-handler.
+- `meka profile add` re-checks that the profile is absent once it holds the config lock.
+- `/rewind` with an argument that is not a count says so, instead of rewinding one turn.
+- A sub-agent spawned while its parent auto-compacts no longer switches the parent's thinking off.
+- An MCP tool called during a checkpoint compaction carries the session id, so its progress and
+  elicitations reach the session that asked.
+- `meka -r <id>` under `[session].retention_days` no longer deletes the session it was asked for.
+- `DELETE /v1/sessions/{id}` refuses a session another meka process holds with 409, not a cascade.
+- A subscription token the backend rejects is refreshed once and the call sent again; a second
+  rejection names `meka account login` instead of failing every turn until the stored expiry.
+- Image redactions are counted on the session that sent the request, checkpoint and summarizer
+  requests included; every host's `/status` showed none, since nothing read the providers' counter.
+- `meka serve` and `meka acp` keep statistics per session; a resumed session continues its totals on
+  every host, not only in the REPL.
+- ACP `session/close` cancels the session's detached tool calls, as the HTTP delete already did.
+- A body still over `max_request_bytes` after redaction degrades the turn's attachments and
+  retries, instead of failing every later turn until a rewind.
+- A partial answer kept after a mid-stream failure is written after its prompt, so a resume no
+  longer replays the answer before its question.
+- A compaction inside a turn counts as the prompt's persist, so the prompt is not written twice.
+- A conversation of four messages or fewer keeps its unanswered prompt verbatim when compacted.
+- An automatic compaction whose token fired before the summarizer no longer pays for a summary it
+  then discards.
+- A thinking-only round shows its reasoning under `--no-stream`, as it does when streaming.
+- A Responses stream cut by `max_output_tokens` ends the message as `MaxTokens` with its usage;
+  reported as an error, the non-streaming path lost the whole answer.
+- A Chat Completions stream that delivered `finish_reason` and closed without `[DONE]` completes
+  the message instead of failing the turn.
+- A mid-stream error whose `code` is a number is classified by that status, so a relayed 429 or
+  5xx is retried; an `"error": null` field is no longer a failure.
+- Two requests refused with the same subscription token both get the replacement for one refresh;
+  the second used to re-send the refused bearer and fail with the login remedy.
+- A store row older than the credential in memory is not installed before a refresh, so a failed
+  persist no longer spends a retired refresh token an hour later.
+- A subscription token with no refresh token names `meka account login` when it is rejected.
+- `meka account` on a `chatgpt-subscription` profile whose `base_url` ends in `/backend-api/codex`
+  reaches the usage endpoints beside `codex`, not under it.
+- `thinking_budget` no longer overflows the output-cap arithmetic in debug builds.
+- The universal `scratchpad` parameter refuses an inherited entry's name, so a sub-agent can no
+  longer shadow the parent's entry with a local row.
+- The Windows sandbox warning says a workspace root above meka's directories can write them.
+- `agent_spawn` with `scratchpad: null` keeps the sub-agent id in its result.
+- `search_contents` counts files it could not read in its "skipped" note.
+- Command-output captures that fall back to the temp directory are swept there too.
+- A one-shot turn that fails after detaching a command waits for it, reports it and shuts down
+  cleanly instead of leaving the child running untracked.
+- The REPL and one-shot admit a turn before waiting for MCP servers, so a Ctrl+C in that window
+  cancels the turn instead of being lost to the escalation ladder.
+- A scheduled fire or outcome delivery that wins its session's lock after the session was closed
+  or evicted is deferred instead of running against it.
+- A re-attach that finds the row deleted, and a delete whose store write fails, detach the
+  session's tool registry from the MCP manager.
+- The ACP shutdown drain cancels a prompt admitted but not yet published.
+- A delivery webhook's veto on outcomes riding a scheduled fire is logged instead of discarded.
+- `/clear` clears the terminal on stderr, so a redirected stdout no longer receives the escapes.
+- An MCP server whose `headers` or `env` name an unset variable is refused at every connect door;
+  the connector sent the literal `${VAR}` and retried for the life of the process.
+- The OAuth callback port is bound only when a login runs, so an MCP server with stored
+  credentials no longer fails on a busy port.
+- A gate whose stderr exceeds the cap is drained past it instead of dying on `SIGPIPE` before it
+  answers.
+- A failed `meka mcp login` restores the bundle it replaced.
+- A pasted OAuth callback URL decodes form encoding like the listener does.
+- `[web].ca_cert_file` goes through `~` expansion like every other path setting.
+- A subscription token refresh replaces the stored row by its version rather than its bytes, so a
+  field added to the stored shape no longer leaves every existing row unrefreshable.
+- `POST /v1/sessions/{id}/fork` takes the copy's lock before its row exists, as the REPL and ACP
+  do, so a concurrent `meka session delete --all` cannot take the copy from under it.
+- A `claude-subscription` device id is resolved once at startup on a blocking thread instead of on
+  the first request, which could wait on another process holding the config lock.
+
+### Security
+
+- The read-mode sandbox hides meka's config, data and capture directories, so a prompt-injected
+  command cannot read the credential store; Landlock and Windows say at startup that they cannot.
+- `write_file` and `edit_file` refuse a target inside meka's own directories at `workspace`, even
+  from a root that contains them.
+- `read_file`, `search_contents`, `find_files` and `scratchpad_load_file` refuse meka's config, data
+  and capture directories below `unrestricted`; a search from a root above them steps around them.
+
 ## [0.45.1] - 2026-09-04
 
 ### Fixed
 
 - Cancelling a turn in Zed or another ACP editor no longer cancels the next prompt you submit.
-- A stop in an ACP editor with nothing to stop is discarded, rather than cancelling a later prompt.
+- A stop in an ACP editor with nothing to stop is discarded, rather than canceling a later prompt.
 
 ## [0.45.0] - 2026-09-04
 
@@ -34,7 +443,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/tasks` fits 120 columns instead of ~138, bounding the tool name and elapsed time.
 - Cancelling a background task costs no turn; its report rides your next turn or a job's.
 - Under `[thinking].show_content`, reasoning streams as it arrives instead of landing in one lump.
-- Reasoning follows `display.render_mode`, in dark grey throughout, so emphasis shows as bold.
+- Reasoning follows `display.render_mode`, in dark gray throughout, so emphasis shows as bold.
 - The one-line thinking preview styles its markdown too, rather than printing the markers.
 - A shown thinking block has no height limit; asking to see the reasoning asks to see all of it.
 - Showing reasoning costs a turn its retry on a transient failure, rather than sending it twice.
@@ -55,7 +464,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - meka prints no blank line against your shell prompt, above its first line or below its last.
 - `Leaving session:` and the background-task notice below it are no longer split by a blank line.
 - `task.finished` fires when a task ends, so an interrupted one is announced even if unreported.
-- An empty id prefix matches nothing, instead of cancelling the only job or task in the session.
+- An empty id prefix matches nothing, instead of canceling the only job or task in the session.
 - An uppercase id prefix resolves a job or task, as it already resolved a session.
 - A background outcome is no longer discarded unread when the turn that would report it cannot run.
 - `meka session delete` exits non-zero when a session it was asked to delete was not deleted.
@@ -155,7 +564,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A stored MCP bearer and an `[auth]` block are mutually exclusive; the block wins.
 - `meka mcp add` refuses a name that still holds a credential, rather than reusing it.
 - A failing provider call is attempted three times rather than four, with 1s then 2s of backoff.
-- A provider's `Retry-After` is honoured up to 60 seconds, where it was capped at 15.
+- A provider's `Retry-After` is honored up to 60 seconds, where it was capped at 15.
 - A 502 from `meka serve` relays the upstream's `Retry-After`, capped at an hour.
 - Notes meka writes into a conversation are prefixed `[meka harness]`, not `[meka]`.
 - `/provider` lists one profile per line with its backend; `/status` follows the config's order.
@@ -194,7 +603,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `provider add` wrote a negative integer for a setting above `i64::MAX`, leaving config unreadable.
 - `provider add --client-id` minted the grant as the default client, so refresh always failed.
 - The OpenAI API-key backends took an OAuth token they could never refresh, failing at its expiry.
-- The OAuth mint posts to the profile's `oauth_token_url`; only refreshes honoured it before.
+- The OAuth mint posts to the profile's `oauth_token_url`; only refreshes honored it before.
 - A rejected OAuth refresh names the profile to run `meka provider login` on.
 - `--api-key-stdin` no longer lets a prompt eat the piped key, and is refused for browser logins.
 - A resume is no longer blocked by an ambiguous `default_provider` it does not use.
@@ -240,7 +649,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `GET /v1/schedule` renders a gate as `check`/`kind`/`when`, not `command`/`fire`.
 - **Breaking:** a due job is leased rather than consumed, which adds three `scheduled_jobs` columns.
 - A store from an older release than 0.42, or from a newer meka, is refused by name and left alone.
-- A tool gate is authorised at the tool's own level, so gating no longer demands `unrestricted`.
+- A tool gate is authorized at the tool's own level, so gating no longer demands `unrestricted`.
 - A gate's authority is re-resolved at fire time, tool level included, not trusted from creation.
 - A gate refused for an unknown or non-read-only tool is a 422, not a 403; no token or level helps.
 - `schedule_list` shows a tool gate's arguments and its kind; other listings show the kind only.
@@ -315,7 +724,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `workspace` is enabled by default, so Shift+Tab reaches it before `unrestricted`.
 - **Breaking:** ACP `additionalDirectories` and `--writable-root` are writable at `workspace`.
 - **Breaking:** `ask` runs the shell unsandboxed and unscrubbed: writes anywhere, full environment.
-- **Breaking:** a gate needs `unrestricted`; `workspace` used to authorise one and no longer does.
+- **Breaking:** a gate needs `unrestricted`; `workspace` used to authorize one and no longer does.
 - **Breaking:** `[shell].sandbox = false` now refuses the shell rather than unconfining it.
 - **Breaking:** Landlock requires ABI v3; below it `truncate(2)` was unmediated. Use Bubblewrap.
 - **Breaking:** `every = "..."` fires on its own grid; jobs that silently ran slow now run on time.
@@ -349,7 +758,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memory has no discovery cap and no per-turn walk; the index is one indexed query over FTS5.
 - The `[Skills]` index is ordered by priority and capped, then points at `skill_search`.
 - An unknown or stale tool name now suggests the built-in it probably meant.
-- `[display].input_style` applies on submit; text keeps the terminal's own colours while typing.
+- `[display].input_style` applies on submit; text keeps the terminal's own colors while typing.
 - Every built-in tool indicator is PascalCase; whole families used to render as raw snake_case.
 - Every rendered line is budgeted whole, so none wraps by default and a cut keeps both ends.
 - CLI output that is not requested data moved to stderr or the log, keeping stdout pipeable.
@@ -380,10 +789,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Two files whose names differ outside UTF-8 shared one temp file, splicing a write into the other.
 - A non-UTF-8 path slipped past the hidden-file skip and read as missing to the search tools.
 - `find_files` left a trailing `\` on a Windows root, so the glob's separator handling decided.
-- File writes are atomic and serialised per path, so a crash or a concurrent edit cannot lose one.
+- File writes are atomic and serialized per path, so a crash or a concurrent edit cannot lose one.
 - Store files and roots are created private, and a rewrite no longer re-modes a file or its target.
 - `config.toml` writes take an exclusive lock and follow symlinks, so no edit is silently dropped.
-- Store writes release their lock before `$EDITOR`; `$VISUAL` and editor arguments are honoured.
+- Store writes release their lock before `$EDITOR`; `$VISUAL` and editor arguments are honored.
 - `scratchpad_save_file` refuses to replace a file without `force`, and records its write.
 - `read_file` discloses every cut, preserves CRLF, bounds itself at 16 MiB, and windows past it.
 - Every door said a skill did not exist when its `SKILL.md` was there but would not parse.
@@ -419,7 +828,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A deferred job's restore overwrote another host's claim, so an occurrence came due twice.
 - A database hiccup during a sweep dropped an occurrence and skipped every other job due that tick.
 - A one-shot job was destroyed when its gate timed out or failed to spawn, having answered nothing.
-- A cancelled or retired job left its held-back state behind for the life of a `meka serve`.
+- A canceled or retired job left its held-back state behind for the life of a `meka serve`.
 - A gate is re-checked against the live permission, runs in its session's cwd, and `list` shows it.
 - An `on-change` gate that exits non-zero is reported, not folded into the comparison or refused.
 - `cron` parses the documented five fields, and a job whose next fire is years out is kept.
@@ -588,8 +997,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - One provider-rejected message killed a session for good; meka now drops the content and retries.
 - The model is told what the provider refused, so it can adapt instead of losing the turn.
-- Images were labelled from the filename, `Content-Type`, or MCP `mime_type` instead of the bytes.
-- A session already holding a mislabelled image is repaired on resume, with no provider call.
+- Images were labeled from the filename, `Content-Type`, or MCP `mime_type` instead of the bytes.
+- A session already holding a mislabeled image is repaired on resume, with no provider call.
 - MCP images above the size providers accept were forwarded anyway, only to be rejected.
 - OpenAI-compatible streaming dropped a tool call or text that shared a chunk with `finish_reason`.
 - REPL text streamed before an interrupt or error no longer leaks into the next turn's output.
@@ -616,15 +1025,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `termimad` render mode is now coloured from the same theme as `syntect` instead of greyscale.
-- `termimad` no longer centres a top-level heading, which read as a formatting glitch.
+- `termimad` render mode is now colored from the same theme as `syntect` instead of grayscale.
+- `termimad` no longer centers a top-level heading, which read as a formatting glitch.
 - Tools, skills, and MCP instructions moved from the system prompt into the per-turn context.
 - **Breaking:** `-c` takes no session id; use `-r`/`--resume <SESSION>` to resume a specific one.
 - **Breaking:** `execute_command` no longer runs in the ACP client's terminal; meka always owns it.
 
 ### Fixed
 
-- `--oneshot` now honours `-c`/`-r` instead of silently starting a new session.
+- `--oneshot` now honors `-c`/`-r` instead of silently starting a new session.
 - Loading a deferred tool no longer reorders the tools array, which invalidated the prompt cache.
 - A new skill or a reconnecting MCP server no longer re-caches the whole conversation.
 - ACP clients now see images a tool looked at, instead of an `[image]` placeholder.
@@ -660,7 +1069,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `find_files` and `search_contents` now stop after 60 seconds instead of running unbounded.
-- Both search tools now honour Ctrl+C and ACP `session/cancel`.
+- Both search tools now honor Ctrl+C and ACP `session/cancel`.
 - A search that was cut short now says so instead of reporting "no matches".
 - Searching no longer logs one warning per unreadable path.
 - meka can now read and edit files outside the project an ACP editor has open.
@@ -679,7 +1088,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Don't send `temperature` to Opus 5, Sonnet 5, or any unrecognised model.
+- Don't send `temperature` to Opus 5, Sonnet 5, or any unrecognized model.
 - Default Claude Mythos Preview to `high` effort; it supports `max` but not `xhigh`.
 
 ## [0.34.0] - 2026-07-22
@@ -869,7 +1278,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `!` shell escape and `scratchpad_load_file` / `save_file` honour `/cd`, not the process cwd.
+- `!` shell escape and `scratchpad_load_file` / `save_file` honor `/cd`, not the process cwd.
 
 ## [0.27.0] - 2026-05-29
 
@@ -963,7 +1372,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Setup wizard no longer prompts for a sandbox backend — it auto-detects at runtime.
+- Setup wizard no longer prompts for a sandbox backend: it auto-detects at runtime.
 
 ### Fixed
 
@@ -994,7 +1403,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Sub-agents now run unbounded; the prior 20-round cap is removed, no replacement knob.
 - `scratchpad_list` renders own and inherited entries in one table with an `Origin` column.
-- Scratchpad tool output reports sizes in bytes (was mislabeled "characters" — always byte counts).
+- Scratchpad tool output reports sizes in bytes (was mislabeled "characters": always byte counts).
 
 ### Fixed
 
@@ -1219,17 +1628,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Deferred tools are activated by `load_tool` calls in the conversation (no in-memory state).
 - System prompt is byte-stable across deferred-tool activation (cache breakpoint 2 stays warm).
-- Resumed sessions reconstruct the active tool set from the conversation — no out-of-band state.
+- Resumed sessions reconstruct the active tool set from the conversation: no out-of-band state.
 - REPL `agsh mcp tools` STATUS column renamed to VISIBILITY.
-- `compact_session` appends a `compact_boundary` row instead of DELETEing — log stays append-only.
+- `compact_session` appends a `compact_boundary` row instead of DELETEing: log stays append-only.
 - All conversation persistence flows through `save_event` / `load_events`.
 - Terminology unified: `Conversation` (type), `Event` (storage atom), `Message` (API atom).
 
 ### Removed
 
 - `ToolRegistry::activate()` and dispatch-side auto-promotion of deferred tools.
-- `SessionManager::clear_messages_only` — no caller after the event-log refactor.
-- `pub` visibility on `save_message` / `load_messages` / `StoredMessage` — internal helpers now.
+- `SessionManager::clear_messages_only`: no caller after the event-log refactor.
+- `pub` visibility on `save_message` / `load_messages` / `StoredMessage`: internal helpers now.
 
 ## [0.16.1] - 2026-04-26
 
@@ -1342,7 +1751,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/mcp login <server>` and `/mcp logout <server>` REPL commands mirror the CLI subcommands.
 - Server `InitializeResult.instructions` spliced into the system prompt each turn.
 - Progress notifications forwarded to the REPL as a live status line under the running tool call.
-- Form + URL elicitation — the shell prompts the user and returns typed values to the server.
+- Form + URL elicitation: the shell prompts the user and returns typed values to the server.
 - Tool annotations / `_meta` / `structuredContent` preserved through to the provider.
 - Builtin MCP resource/prompt tools for list/read, subscribe/unsubscribe, and get-prompt flows.
 - OAuth token revocation via `agsh mcp logout` (RFC 7009) + 15-min auth-probe cache for 401s.
@@ -1357,13 +1766,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP image tool-result content reaches providers as image blocks instead of `[image content]`.
 - OAuth callback listener binds to an ephemeral port when `redirect_port` is omitted.
 - Ctrl-C now sends `notifications/cancelled` to the server with the in-flight request id.
-- Dynamic tool list refresh on `tools/list_changed` — new tools picked up without restart.
+- Dynamic tool list refresh on `tools/list_changed`: new tools picked up without restart.
 
 ### Changed
 
 - `execute_command` names the platform's shell and warns against wrapping PowerShell twice.
 - Per-turn `[Permission context]` is a constant two-line block; no longer enumerates blocked tools.
-- The tool catalogue lists name and permission for active tools, short summaries for deferred.
+- The tool catalog lists name and permission for active tools, short summaries for deferred.
 - System prompt and `body["tools"]` no longer vary with permission; toggles keep the cache warm.
 - **Breaking**: an MCP tool with no `readOnlyHint` and no `[mcp].default_permission` needs `Write`.
 
@@ -1385,7 +1794,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MCP sampling `system_prompt` stripped of Cc/Cf codepoints before reaching the provider.
 - `read_mcp_resource` + `get_mcp_prompt` + list tools sanitise server-supplied text and URIs.
 - `read_mcp_resource` total output capped at 10 MiB; oversized chunks replaced with a marker.
-- `headers_helper` stdout capped at 64 KiB, stderr at 4 KiB, to contain helper misbehaviour.
+- `headers_helper` stdout capped at 64 KiB, stderr at 4 KiB, to contain helper misbehavior.
 - OAuth revocation rejects redirects, caps metadata at 256 KiB, pins endpoint to issuer origin.
 - OAuth callback `error=…` query parameter is stripped of Cc/Cf codepoints before display.
 - JWT signing key files rejected on Unix when group/other perm bits are set (must be 0600).
@@ -1839,7 +2248,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.45.1...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.46.0...HEAD
+[0.46.0]: https://github.com/k4yt3x/meka/compare/0.45.1...0.46.0
 [0.45.1]: https://github.com/k4yt3x/meka/compare/0.45.0...0.45.1
 [0.45.0]: https://github.com/k4yt3x/meka/compare/0.44.4...0.45.0
 [0.44.4]: https://github.com/k4yt3x/meka/compare/0.44.3...0.44.4

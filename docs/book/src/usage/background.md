@@ -1,4 +1,4 @@
-# Background Tasks
+# Background tasks
 
 An ordinary tool call holds the turn open until it returns. That is right for reading a file and wrong for a twenty-minute build: the agent cannot answer anything else while it waits, and the alternative it reaches for on its own, `nohup … &` plus polling, gets no notification when the work is done.
 
@@ -38,7 +38,7 @@ running; its result will be delivered to you when it finishes.
 The agent then carries on. When the task ends, its outcome arrives as a new turn:
 
 ```text
-[Background task reporting at 2026-08-12 14:31 CEST]
+[Background task reporting at 2026-08-12 14:31 +02:00]
 
 7f3a1c22 (cargo test --all) finished after 12m 4s.
 
@@ -84,15 +84,15 @@ The agent has `task_list` and `task_cancel`. You have:
 /tasks cancel --all       # stop all of them
 ```
 
-A cancelled task still reports back, so the agent learns it stopped rather than waiting on it -- but
+A canceled task still reports back, so the agent learns it stopped rather than waiting on it, but
 it does not interrupt to say so. Every other outcome wakes the agent when it lands, because nobody
 chose it: a build finished, a tool failed, or a host died holding the task. A cancellation is always
 somebody's deliberate act, and that somebody already knows, so it waits and is read at the top of
-whichever turn the session takes next -- yours, or a scheduled job's -- as part of that message
-rather than as one of its own. Cancelling several tasks costs no turns at all.
+whichever turn the session takes next (yours, or a scheduled job's), as part of that message
+rather than as one of its own. Canceling several tasks costs no turns at all.
 
 Webhooks do not wait on any of that. Under `meka serve`, `task.finished` fires as soon as a task
-reaches a terminal state, rather than when a turn gets around to reporting it -- so a cancelled task
+reaches a terminal state, rather than when a turn gets around to reporting it, so a canceled task
 is announced immediately, and one left running by a host that died is announced when the session is
 next opened, which it was not before.
 
@@ -119,7 +119,7 @@ A **second** Ctrl+C during the same turn stops them. Between turns, `/tasks canc
 
 ## Where it works
 
-| Host | Behaviour |
+| Host | Behavior |
 |------|-----------|
 | REPL | Full. Outcomes arrive between turns |
 | `meka serve` | Full, for sessions currently resident |

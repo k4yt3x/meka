@@ -10,7 +10,7 @@
 //! This mirrors Codex's "4 bytes per token" heuristic. It is deliberately approximate; precision is
 //! not needed for a transient interim value.
 
-use crate::provider::{ContentBlock, Message, ToolResultContent};
+use crate::conversation::{ContentBlock, Message, ToolResultContent};
 
 /// UTF-8 bytes of text per estimated token.
 const BYTES_PER_TOKEN: u64 = 4;
@@ -24,16 +24,18 @@ const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 
 /// Estimate the tokens a string contributes, from its UTF-8 byte length. Rounds up so non-empty
 /// text never estimates to zero.
-pub fn estimate_text(text: &str) -> u64 {
+pub(crate) fn estimate_text(text: &str) -> u64 {
     (text.len() as u64).div_ceil(BYTES_PER_TOKEN)
 }
 
 /// Estimate the tokens one message contributes to the context.
-pub fn estimate_message(message: &Message) -> u64 {
+pub(crate) fn estimate_message(message: &Message) -> u64 {
     let mut total = MESSAGE_OVERHEAD_TOKENS;
     for block in &message.content {
         let block_tokens = match block {
             ContentBlock::Text { text } => estimate_text(text),
+            // Sent as text ahead of the words, so it costs what text costs.
+            ContentBlock::TurnContext { text } => estimate_text(text),
             ContentBlock::Image { .. } => IMAGE_TOKENS,
             // The readable half only, which is the whole cost under `Signed` and an under-read
             // under `Sealed`: there the text is a summary and the reasoning is the sealed blob
@@ -70,7 +72,7 @@ pub fn estimate_message(message: &Message) -> u64 {
 /// no fresh provider reading (post-compaction, or on resume before the first turn). It omits the
 /// fixed system-prompt + tool-schema overhead, so it under-reads the true input until the next real
 /// response corrects it; acceptable for the transient interim value.
-pub fn estimate_messages(messages: &[Message]) -> u64 {
+pub(crate) fn estimate_messages(messages: &[Message]) -> u64 {
     messages
         .iter()
         .map(estimate_message)
@@ -80,7 +82,10 @@ pub fn estimate_messages(messages: &[Message]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ContentBlock, ImageSource, Message, Role, ToolResultContent};
+    use crate::{
+        conversation::{ContentBlock, Message, Role, ToolResultContent},
+        image::ImageSource,
+    };
 
     #[test]
     fn estimate_text_rounds_up_on_bytes_not_chars() {
@@ -94,8 +99,8 @@ mod tests {
     #[test]
     fn estimate_text_counts_cjk_by_bytes_not_codepoints() {
         // 10 CJK chars = 30 UTF-8 bytes. Byte-based: 30/4 -> 8 tokens (right ballpark, ~1
-        // tok/char). A char-count/4 estimate would give 10/4 = 3, undercounting ~3x — the
-        // bug we avoid.
+        // tok/char). A char-count/4 estimate would give 10/4 = 3, undercounting ~3x, which is the
+        // bug this avoids.
         let cjk = "字".repeat(10);
         assert_eq!(cjk.chars().count(), 10);
         assert_eq!(cjk.len(), 30);
@@ -134,8 +139,7 @@ mod tests {
 
     #[test]
     fn estimate_message_charges_flat_for_input_images() {
-        let message = Message::user_with_images("look", vec![ImageSource {
-            source_type: "base64".to_string(),
+        let message = Message::user_with_images("look", vec![ImageSource::Base64 {
             media_type: "image/png".to_string(),
             data: "x".repeat(100_000), // payload length must NOT inflate the estimate
         }]);
@@ -153,8 +157,7 @@ mod tests {
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "1".to_string(),
                 content: vec![ToolResultContent::Image {
-                    source: ImageSource {
-                        source_type: "base64".to_string(),
+                    source: ImageSource::Base64 {
                         media_type: "image/png".to_string(),
                         data: "x".repeat(100_000), // huge payload must NOT be counted by length
                     },

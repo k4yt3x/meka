@@ -1,6 +1,6 @@
-# Providers Overview
+# Providers overview
 
-Providers are the LLM inference backends meka uses to run your instructions. meka ships with five, each selectable as a profile `type`:
+A backend is how meka reaches an LLM inference service. meka ships with five, each selectable as an account's `backend`:
 
 | Backend | Protocol | Endpoint | Auth |
 |---------|----------|----------|------|
@@ -17,57 +17,66 @@ The two subscription backends are the exception, and carry a vendor name instead
 Synthetic is the clearest case for why this matters. One vendor, two protocols, two base URLs:
 
 ```toml
-[providers.synthetic-claude]
-type     = "anthropic-messages"
+[accounts.synthetic-claude]
+backend  = "anthropic-messages"
 base_url = "https://api.synthetic.new/anthropic/v1"
 
-[providers.synthetic-gpt]
-type     = "openai-chat-completions"
+[accounts.synthetic-gpt]
+backend  = "openai-chat-completions"
 base_url = "https://api.synthetic.new/openai/v1"
 ```
 
-## Configuring a Provider
+## Configuring an account and a profile
 
-Providers are configured as named profiles. The easiest way is `meka provider add`, which writes the
-profile to the config file and stores the secret (API key or OAuth token) in the database:
+A backend is reached through an **account**, which holds the endpoint and the credential, and asked
+for a model through a **profile** on that account. The easiest way is the two command suites:
+`meka account add` writes the account to the config file and stores the secret (API key or OAuth
+token) in the store, and `meka profile add` names the model:
 
 ```console
-$ meka provider add work --type claude-subscription --model claude-opus-5
+$ meka account add anthropic --backend claude-subscription
+$ meka profile add work --account anthropic --model claude-opus-5
 ```
 
-This produces a `[providers.work]` entry in `~/.config/meka/config.toml`:
+This produces an `[accounts.anthropic]` and a `[profiles.work]` entry in
+`~/.config/meka/config.toml`:
 
 ```toml
-default_provider = "work"
+[accounts.anthropic]
+backend = "claude-subscription"
 
-[providers.work]
-type  = "claude-subscription"
-model = "claude-opus-5"
+[profiles.work]
+account = "anthropic"
+model   = "claude-opus-5"
 ```
 
-## Selecting a Provider
+Two profiles on one account share one login, which is how one subscription runs two models. With
+one profile configured, it is the default. Once there are several, `meka profile use <name>` writes
+`default_profile`; `add` never does.
 
-A **new** session runs on the profile named by `--provider <name>`, else `default_provider`, else
-the sole profile. Switch the default with `meka provider use <name>`:
+## Selecting a profile
+
+A **new** session runs on the profile named by `--profile <name>`, else `default_profile`, else the
+sole profile. Switch the default with `meka profile use <name>`:
 
 ```bash
-meka --provider work     # pick the profile this session starts on
-meka provider use work   # persist as default_provider
+meka --profile work      # pick the profile this session starts on
+meka profile use work    # persist as default_profile
 ```
 
-There is no environment-variable override for provider selection.
+There is no environment-variable override for profile selection.
 
 A **resumed** session ignores all three and runs on the profile it recorded, so `meka -c` stays
-where the conversation was had whatever `default_provider` currently says. `--provider` on a resume
-is not a per-run override either: it **repins** the session, rewriting the row so every later resume
+where the conversation was had whatever `default_profile` currently says. `--profile` on a resume is
+not a per-run override either: it **repins** the session, rewriting the row so every later resume
 keeps it. `meka session list` shows which profile each session runs on, which is the whole story: a
-session records a profile name and nothing else. You can move a live session with `/provider <name>`
-in the REPL, `PATCH /v1/sessions/{id}` over HTTP, or the Provider picker in an ACP client. See
+session records a profile name and nothing else. You can move a live session with `/profile <name>`
+in the REPL, `PATCH /v1/sessions/{id}` over HTTP, or the Profile picker in an ACP client. See
 [Sessions](../usage/sessions.md#what-a-resume-restores).
 
 ## Pointing a backend somewhere else
 
-Every API-key backend takes a `base_url`, so the protocol you pick is independent of who serves it:
+Every API-key account takes a `base_url`, so the protocol you pick is independent of who serves it:
 
 | Server | Chat Completions | Responses | Anthropic Messages |
 |--------|------------------|-----------|--------------------|
@@ -99,7 +108,7 @@ Three backends, two protocols:
 
 The first two differ by protocol; the last two differ only by auth and endpoint.
 
-## Streaming vs Non-Streaming
+## Streaming vs non-streaming
 
 By default, meka uses streaming mode: tokens appear in the terminal as they are generated. Use `--no-stream` to wait for the complete response before displaying it.
 

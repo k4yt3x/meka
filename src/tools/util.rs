@@ -2,16 +2,18 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::ToolOutput;
-use crate::error::{MekaError, Result};
+use crate::{
+    conversation::ToolResultContent,
+    error::{MekaError, Result},
+    image::{ImageHandling, prepare_image_source},
+};
 
 /// Default cap for regex-search-mode hits; shared by `read_file` and `scratchpad_read`.
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
@@ -27,7 +29,7 @@ const WALK_TIME_BUDGET: Duration = Duration::from_secs(60);
 /// Why a walk stopped before it ran out of tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WalkStop {
-    /// The enclosing turn was cancelled (Ctrl+C, ACP `session/cancel`).
+    /// The enclosing turn was canceled (Ctrl+C, ACP `session/cancel`).
     Cancelled,
     /// The walk outran [`WALK_TIME_BUDGET`].
     TimedOut,
@@ -77,20 +79,36 @@ impl WalkBudget {
 
 /// Resolve the active session id for a session-scoped tool, erroring if no session is open. Shared
 /// by the scratchpad and conversation tool families.
-pub(super) async fn resolve_session_id(
-    session_id: &Arc<RwLock<Option<Uuid>>>,
+pub(super) fn resolve_session_id(
+    session_id: &crate::session::SharedSessionId,
     tool_name: &str,
 ) -> Result<Uuid> {
-    session_id
-        .read()
-        .await
-        .ok_or_else(|| MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
-            message: "no active session".to_string(),
-        })
+    session_id.get().ok_or_else(|| MekaError::ToolExecution {
+        tool_name: tool_name.to_string(),
+        message: "no active session".to_string(),
+    })
 }
 
 pub(super) fn require_str(
+    input: &serde_json::Value,
+    field: &str,
+    tool_name: &str,
+) -> Result<String> {
+    // Blank is missing. Every caller names a thing (a path, a pattern, a command, a name), and an
+    // empty one is never that thing: `edit_file` with an empty `old_string` and `replace_all`
+    // spliced the replacement between every character of the file and reported success.
+    input[field]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(|s| s.to_string())
+        .ok_or_else(|| MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!("missing or blank '{field}' parameter"),
+        })
+}
+
+/// [`require_str`] for the one field whose empty value is meaningful: a file's whole content.
+pub(super) fn require_str_allowing_empty(
     input: &serde_json::Value,
     field: &str,
     tool_name: &str,
@@ -100,7 +118,7 @@ pub(super) fn require_str(
         .map(|s| s.to_string())
         .ok_or_else(|| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
-            message: format!("missing '{}' parameter", field),
+            message: format!("missing '{field}' parameter"),
         })
 }
 
@@ -109,8 +127,8 @@ pub(super) fn require_str(
 /// engines already avoid catastrophic backtracking at *match* time; the remaining DoS surface is
 /// the one-time cost of building the automaton, which this bounds.
 pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex::Regex> {
-    const PATTERN_SIZE_LIMIT: usize = 1 << 20;
-    const DFA_SIZE_LIMIT: usize = 1 << 20;
+    const PATTERN_SIZE_LIMIT: usize = crate::text::MIB;
+    const DFA_SIZE_LIMIT: usize = crate::text::MIB;
 
     regex::RegexBuilder::new(pattern)
         .size_limit(PATTERN_SIZE_LIMIT)
@@ -118,7 +136,7 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
         .build()
         .map_err(|error| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
-            message: format!("invalid or oversized regex '{}': {}", pattern, error),
+            message: format!("invalid or oversized regex '{pattern}': {error}"),
         })
 }
 
@@ -132,7 +150,23 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
 /// denied, etc.). For `write_file` where the target file may not exist yet, callers must
 /// canonicalize the *parent* directory (which they create first) and re-join the filename. Falling
 /// back to the raw path on failure would leave `..`/symlink components in parent directories
-/// unresolved, defeating the TOCTOU protection.
+/// unresolved, defeating the TOCTOU protection. Refuse a read inside meka's own directories below
+/// `unrestricted`. `canonical` must be canonical, which every caller has from
+/// [`canonicalize_for_tool`].
+pub(super) fn refuse_private_read(
+    tool_name: &str,
+    site: &crate::session::ToolSite,
+    canonical: &Path,
+) -> Result<()> {
+    match crate::workspace::private_read_refusal(site.permission.get(), canonical) {
+        Some(message) => Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message,
+        }),
+        None => Ok(()),
+    }
+}
+
 pub(super) async fn canonicalize_for_tool(tool_name: &str, path: &Path) -> Result<PathBuf> {
     tokio::fs::canonicalize(path)
         .await
@@ -145,7 +179,7 @@ pub(super) async fn canonicalize_for_tool(tool_name: &str, path: &Path) -> Resul
         // refused while writes outside stayed refused too -- the boundary looked right and allowed
         // nothing. The read tracker and the per-path write lock key on this value while
         // `resolve_write_target` strips, so `write_file` and `edit_file` took different locks for
-        // one file and recorded different freshness keys for it. Normalising once, here, is what
+        // one file and recorded different freshness keys for it. Normalizing once, here, is what
         // makes every door agree; `strip_verbatim` is the identity everywhere else.
         .map(crate::workspace::strip_verbatim)
         .map_err(|error| MekaError::ToolExecution {
@@ -193,8 +227,7 @@ pub(super) fn search_lines(content: &str, pattern: &str, tool_name: &str) -> Res
     let mut result = matches.join("\n");
     if total_matches > MAX_SEARCH_MATCHES {
         result.push_str(&format!(
-            "\n\n... (showing first {} of {} matches)",
-            MAX_SEARCH_MATCHES, total_matches,
+            "\n\n... (showing first {MAX_SEARCH_MATCHES} of {total_matches} matches)",
         ));
     }
 
@@ -220,48 +253,76 @@ pub(super) fn redirects_to_scratchpad(input: &serde_json::Value) -> bool {
         .is_some_and(|s| !s.is_empty())
 }
 
+/// Build a two-block `ToolOutput` (text marker + multimodal Image) from raw image bytes plus a
+/// pre-computed classification. Wraps `prepare_image_payload` so error paths become a text
+/// `ToolOutput` with `is_error: true`. Shared by `fetch_url`, `read_file`, and `render_image`.
+pub(crate) fn build_image_tool_output(
+    marker: &str,
+    handling: ImageHandling,
+    bytes: &[u8],
+) -> ToolOutput {
+    let source = match prepare_image_source(handling, bytes) {
+        Ok(source) => source,
+        Err(message) => {
+            return ToolOutput::text(format!("Error: {marker}: {message}"), true);
+        }
+    };
+
+    ToolOutput {
+        content: vec![
+            ToolResultContent::Text {
+                text: format!("[{marker}]"),
+            },
+            ToolResultContent::Image { source },
+        ],
+        is_error: false,
+        scratchpad_hint: None,
+        frontend_metadata: None,
+        structured: None,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_truncate_string() {
+    fn truncate_string_cuts_only_what_exceeds_the_limit() {
         assert_eq!(truncate_string("hello", 10), "hello");
         assert_eq!(truncate_string("hello world", 5), "hello");
     }
 
     #[test]
-    fn test_compile_user_regex_rejects_oversized() {
+    fn compile_user_regex_rejects_oversized() {
         // Pattern that compiles to a gigantic automaton; must be rejected by the size limit rather
         // than consume host memory.
-        let result = compile_user_regex("a{10000000}", "test_tool");
+        let result = compile_user_regex("a{10000000}", "tool_for_test");
         assert!(result.is_err(), "oversized pattern should be rejected");
     }
 
     #[test]
-    fn test_compile_user_regex_accepts_normal_pattern() {
-        let re = compile_user_regex(r"\d+", "test_tool").expect("normal pattern compiles");
+    fn compile_user_regex_accepts_normal_pattern() {
+        let re = compile_user_regex(r"\d+", "tool_for_test").expect("normal pattern compiles");
         assert!(re.is_match("abc 123"));
     }
 
     #[test]
-    fn test_compile_user_regex_rejects_invalid_syntax() {
-        let result = compile_user_regex("[invalid", "test_tool");
+    fn compile_user_regex_rejects_invalid_syntax() {
+        let result = compile_user_regex("[invalid", "tool_for_test");
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_canonicalize_for_tool_resolves_existing() {
+    async fn canonicalize_for_tool_resolves_existing() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("a.txt");
         std::fs::write(&file_path, "x").expect("write");
 
-        let canonical = canonicalize_for_tool("test_tool", &file_path)
+        let canonical = canonicalize_for_tool("tool_for_test", &file_path)
             .await
             .expect("canonicalize");
         assert_eq!(canonical, crate::workspace::canonical_for_test(&file_path));
         // And specifically *not* the raw spelling, which is the whole reason this function is not
-        // a bare `canonicalize`: every other door in the tree normalises, so one that did not
+        // a bare `canonicalize`: every other door in the tree normalizes, so one that did not
         // handed back a key nothing else could match.
         assert!(
             !canonical.to_string_lossy().starts_with(r"\\?\"),
@@ -271,35 +332,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_canonicalize_for_tool_errors_on_missing() {
+    async fn canonicalize_for_tool_errors_on_missing() {
         let result = canonicalize_for_tool(
-            "test_tool",
+            "tool_for_test",
             std::path::Path::new("/this/path/definitely/does/not/exist-xyzzy"),
         )
         .await;
-        let err = result.expect_err("missing path should error");
-        let message = err.to_string();
+        let error = result.expect_err("missing path should error");
+        let message = error.to_string();
         assert!(
             message.contains("failed to resolve path"),
-            "unexpected error message: {}",
-            message,
+            "unexpected error message: {message}",
         );
     }
 
     #[test]
-    fn test_walk_budget_allows_work_within_budget() {
+    fn walk_budget_allows_work_within_budget() {
         let budget = WalkBudget::new(CancellationToken::new());
         assert!(budget.check().is_none());
     }
 
     #[test]
-    fn test_walk_budget_stops_on_expired_deadline() {
+    fn walk_budget_stops_on_expired_deadline() {
         let budget = WalkBudget::with_budget(CancellationToken::new(), Duration::from_secs(0));
         assert_eq!(budget.check(), Some(WalkStop::TimedOut));
     }
 
     #[test]
-    fn test_walk_budget_reports_cancellation_before_timeout() {
+    fn walk_budget_reports_cancellation_before_timeout() {
         // Both conditions hold; cancellation is the more specific answer and maps to
         // `MekaError::Interrupted` rather than a partial result.
         let cancellation = CancellationToken::new();
@@ -309,13 +369,13 @@ mod tests {
     }
 
     #[test]
-    fn test_walk_budget_reports_its_own_budget() {
+    fn walk_budget_reports_its_own_budget() {
         let budget = WalkBudget::with_budget(CancellationToken::new(), Duration::from_secs(5));
         assert_eq!(budget.budget_secs(), 5);
     }
 
     #[test]
-    fn test_redirects_to_scratchpad() {
+    fn redirects_to_scratchpad_needs_a_non_empty_scratchpad_name() {
         assert!(redirects_to_scratchpad(
             &serde_json::json!({ "scratchpad": "img" })
         ));
@@ -326,5 +386,19 @@ mod tests {
         assert!(!redirects_to_scratchpad(
             &serde_json::json!({ "from_scratchpad": "img" })
         ));
+    }
+
+    /// A blank string names nothing, so it is refused the way a missing field is. Two copies of
+    /// this function disagreed on it, and the lenient one let `edit_file` accept an empty
+    /// `old_string`.
+    #[test]
+    fn a_blank_string_is_a_missing_parameter() {
+        let input = serde_json::json!({"path": "  ", "content": ""});
+        assert!(require_str(&input, "path", "t").is_err());
+        assert!(require_str(&input, "absent", "t").is_err());
+        assert_eq!(
+            require_str_allowing_empty(&input, "content", "t").expect("empty content is content"),
+            ""
+        );
     }
 }

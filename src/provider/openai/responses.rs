@@ -21,15 +21,14 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::responses_wire::{
-    aggregate_stream, build_request_body, drive_responses_sse_stream, drop_replayed_reasoning,
-};
+use super::responses_wire::{build_request_body, drop_replayed_reasoning};
 use crate::{
+    conversation::Message,
     error::Result,
-    provider::{Message, Notice, Provider, StopReason, StreamEvent, TokenUsage, ToolDefinition},
+    provider::{CompletionRequest, Provider, StreamEvent, ToolDefinition},
 };
 
-pub struct OpenAiResponsesProvider {
+pub(crate) struct OpenAiResponsesProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
@@ -41,23 +40,29 @@ pub struct OpenAiResponsesProvider {
     resolved_effort: Option<String>,
     /// Per-request output token cap from the profile; `None` leaves the endpoint's default.
     max_output_tokens: Option<u64>,
+    /// See [`crate::config::ProfileConfig::max_request_bytes`]; unset means no ceiling here.
+    max_request_bytes: Option<usize>,
 }
 
 impl OpenAiResponsesProvider {
-    pub fn new(
-        api_key: String,
-        model: String,
-        base_url: Option<String>,
-        reasoning_effort: Option<String>,
-        max_output_tokens: Option<u64>,
-    ) -> Result<Self> {
+    /// `api_key` is the credential `settings` carries, already checked to be one by the builder.
+    pub(crate) fn new(api_key: String, settings: crate::provider::ProviderBuilder) -> Result<Self> {
+        let crate::provider::ProviderBuilder {
+            model,
+            base_url,
+            effort: reasoning_effort,
+            max_output_tokens,
+            max_request_bytes,
+            ..
+        } = settings;
         let resolved_effort = crate::provider::resolve_effort_level(reasoning_effort.as_deref());
         Ok(Self {
             client: crate::provider::build_http_client("openai-responses", |builder| builder)?,
             api_key,
             // The same normalizer Chat Completions uses, and for the same reason:
-            // `{base}/responses` composes exactly as `{base}/chat/completions` does, so `https://api.openai.com/v1`,
-            // `http://localhost:11434/v1` and `https://openrouter.ai/api/v1` all work verbatim.
+            // `{base}/responses` composes exactly as `{base}/chat/completions` does, so
+            // `https://api.openai.com/v1`, `http://localhost:11434/v1` and
+            // `https://openrouter.ai/api/v1` all work verbatim.
             base_url: crate::provider::normalize_base_url(
                 base_url
                     .as_deref()
@@ -66,6 +71,7 @@ impl OpenAiResponsesProvider {
             model,
             resolved_effort,
             max_output_tokens,
+            max_request_bytes,
         })
     }
 
@@ -106,63 +112,57 @@ impl OpenAiResponsesProvider {
 }
 
 #[async_trait]
-impl Provider for OpenAiResponsesProvider {
-    async fn complete(
+impl crate::oauth::RefreshesCredential for OpenAiResponsesProvider {}
+
+#[async_trait::async_trait]
+impl super::responses_wire::ResponsesBackend for OpenAiResponsesProvider {
+    fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    fn endpoint(&self) -> String {
+        self.responses_url()
+    }
+
+    fn request_body(
         &self,
         system_prompt: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-    ) -> Result<(Message, StopReason, TokenUsage, Vec<Notice>)> {
-        // Streaming-only, like the subscription backend: the Responses API's non-streaming shape is
-        // a second decoder to keep correct for no gain, so `complete` folds its own SSE. Both
-        // futures are awaited together so the channel drains while the stream fills it; awaiting
-        // them in sequence would deadlock on a full buffer.
-        let (event_sender, event_receiver) = mpsc::channel::<StreamEvent>(1024);
-        let (stream_result, aggregated) = tokio::join!(
-            self.stream(
-                system_prompt,
-                messages,
-                tools,
-                event_sender,
-                CancellationToken::new(),
-            ),
-            aggregate_stream(event_receiver),
-        );
-        stream_result?;
-        Ok(aggregated)
+    ) -> serde_json::Value {
+        self.build_body(system_prompt, messages, tools)
+    }
+
+    fn max_request_bytes(&self) -> Option<usize> {
+        self.max_request_bytes
+    }
+
+    async fn authenticated_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder> {
+        Ok(request
+            .header("Authorization", crate::text::bearer(&self.api_key))
+            .header("Accept", "text/event-stream"))
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiResponsesProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest<'_>,
+    ) -> Result<crate::provider::Completion> {
+        super::responses_wire::complete(self, request).await
     }
 
     async fn stream(
         &self,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[ToolDefinition],
+        request: CompletionRequest<'_>,
         event_sender: mpsc::Sender<StreamEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        let body = self.build_body(system_prompt, messages, tools);
-
-        let response = self
-            .client
-            .post(self.responses_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                crate::error::provider_transport_error(
-                    "Responses HTTP request failed",
-                    &error,
-                    None,
-                )
-            })?;
-
-        drive_responses_sse_stream(response, event_sender, cancellation).await
-    }
-
-    fn name(&self) -> &str {
-        "openai-responses"
+        super::responses_wire::stream(self, request, event_sender, cancellation).await
     }
 
     fn resolved_effort(&self) -> Option<String> {
@@ -175,13 +175,20 @@ mod tests {
     use super::*;
 
     fn provider(effort: Option<&str>, base_url: Option<&str>) -> OpenAiResponsesProvider {
-        OpenAiResponsesProvider::new(
-            "test-key".to_string(),
-            "gpt-5.6-sol".to_string(),
-            base_url.map(str::to_string),
-            effort.map(str::to_string),
-            None,
-        )
+        {
+            let api_key: String = "test-key".to_string();
+            OpenAiResponsesProvider::new(
+                api_key.clone(),
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::OpenAiResponses,
+                    crate::store::AuthCredential::ApiKey(api_key),
+                    "gpt-5.6-sol".to_string(),
+                )
+                .base_url(base_url.map(str::to_string))
+                .effort(effort.map(str::to_string))
+                .max_output_tokens(None),
+            )
+        }
         .expect("build test provider")
     }
 
@@ -202,9 +209,7 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(8);
         let error = provider
             .stream(
-                "",
-                &[Message::user("hello")],
-                &[],
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
                 sender,
                 CancellationToken::new(),
             )
@@ -252,7 +257,7 @@ mod tests {
     /// `reasoning.summary`.
     ///
     /// Both are OpenAI extensions, and this backend reaches Ollama, vLLM, LM Studio and OpenRouter,
-    /// where an unrecognised field is a rejected request. `chatgpt-subscription` sends them because
+    /// where an unrecognized field is a rejected request. `chatgpt-subscription` sends them because
     /// its endpoint is always ChatGPT; the split is the whole reason they were lifted out of the
     /// shared body builder, so it is asserted on both sides.
     #[test]
@@ -281,16 +286,16 @@ mod tests {
         let history = vec![
             Message::user("hi"),
             Message {
-                role: crate::provider::Role::Assistant,
+                role: crate::conversation::Role::Assistant,
                 content: vec![
-                    crate::provider::ContentBlock::Thinking {
+                    crate::conversation::ContentBlock::Thinking {
                         thinking: "summary".to_string(),
-                        opaque: Some(crate::provider::OpaqueReasoning::Sealed {
+                        opaque: Some(crate::conversation::OpaqueReasoning::Sealed {
                             encrypted_content: "CHATGPT_SEALED".to_string(),
                             id: Some("rs_1".to_string()),
                         }),
                     },
-                    crate::provider::ContentBlock::Text {
+                    crate::conversation::ContentBlock::Text {
                         text: "answer".to_string(),
                     },
                 ],

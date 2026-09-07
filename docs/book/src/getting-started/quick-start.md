@@ -1,73 +1,78 @@
-# Quick Start
+# Quick start
 
-## 1. Add a Provider
+## 1. Add an account and a profile
 
-Before the first run, configure a provider profile. `meka provider add` runs the right credential
-flow (OAuth login or API-key prompt) and writes the profile to `~/.config/meka/config.toml`:
+Before the first run, configure an account and a profile on it. `meka account add` runs the right
+credential flow (OAuth login or API-key prompt) and writes the account to
+`~/.config/meka/config.toml`; `meka profile add` names the model to ask it for:
 
 ```bash
 # Claude Code subscription (OAuth)
-meka provider add work --type claude-subscription --model claude-opus-5
+meka account add anthropic --backend claude-subscription
+meka profile add work --account anthropic --model claude-opus-5
 
 # or a Claude API key
-meka provider add work --type anthropic-messages --model claude-opus-5
+meka account add anthropic --backend anthropic-messages
+meka profile add work --account anthropic --model claude-opus-5
 
 # or OpenAI
-meka provider add work --type openai-chat-completions --model gpt-5.6-sol
+meka account add openai --backend openai-chat-completions
+meka profile add work --account openai --model gpt-5.6-sol
 ```
 
-`add` prompts for any of `--type` / `--model` you omit, acquires the secret (browser OAuth for
-`claude-subscription` / `chatgpt-subscription`, an API-key prompt otherwise), stores it in the database, and makes
-the profile the default. Add more profiles later and switch with `meka provider use <name>` or the
-per-run `--provider <name>` flag.
+`account add` prompts for the backend you omit and acquires the secret (browser OAuth for
+`claude-subscription` / `chatgpt-subscription`, an API-key prompt otherwise), keeping it in the
+store. `profile add` prompts for the account and model you omit. A sole profile is the default;
+add more later and switch with `meka profile use <name>` or the per-run `--profile <name>` flag.
 
-> If you launch `meka` with no provider configured, it errors and tells you to run `meka provider add`.
-> See [Configuration](../configuration/overview.md) for all options and the full `meka provider` reference.
+> If you launch `meka` with no profile configured, it errors and tells you to run `meka account add`
+> and `meka profile add`. See [Configuration](../configuration/overview.md) for all options and the
+> full `meka account` / `meka profile` reference.
 
-## 2. Start Using meka
+## 2. Start using meka
 
 After setup, you will see a prompt:
 
 ```text
-meka [r] >
+meka ~/project [r] >
 ```
 
-The `[r]` indicates **read** permission mode (the default). The agent can read files, search, and run shell commands in a sandbox that blocks writes. It cannot modify your files.
+The `[r]` indicates the **read** permission level (the default). The agent can read files, search, and run shell commands in a sandbox that blocks writes. It cannot modify your files.
 
-## 3. Ask It Something
+## 3. Ask it something
 
 ```text
-meka [r] > what files are in the current directory?
+meka ~/project [r] > what files are in the current directory?
 ```
 
 The agent will use the `find_files` tool to list files and describe them.
 
-## 4. Enable Workspace Mode
+## 4. Enable the workspace level
 
 Press **Shift+Tab** to cycle the permission to `workspace`, where the agent may write inside your working directory:
 
 ```text
-meka [w] >
+meka ~/project [w] >
 ```
 
 Now it can modify files too, and its shell may write inside the same boundary:
 
 ```text
-meka [w] > create a file called hello.txt with the text "hello world"
+meka ~/project [w] > create a file called hello.txt with the text "hello world"
 ```
 
-## 5. One-Shot Mode
+## 5. One-shot mode
 
 For quick tasks without entering the interactive shell:
 
 ```bash
-meka --oneshot "what is my current working directory?"
+meka --oneshot -p "what is my current working directory?"
 ```
 
 The process exits after the agent responds. Without `--oneshot` the same prompt runs as the first
 turn and then drops you into the interactive shell.
 
-## 6. Continue a Previous Session
+## 6. Continue a previous session
 
 To pick up where you left off, continue the last session:
 
@@ -75,7 +80,7 @@ To pick up where you left off, continue the last session:
 meka -c
 ```
 
-Or resume a specific session by its UUID:
+Or resume a specific session by its id:
 
 ```bash
 meka -r 550e8400-e29b-41d4-a716-446655440000

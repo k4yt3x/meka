@@ -1,22 +1,38 @@
 //! Clap-derived CLI definition. Owns the top-level argument struct, the subcommand enum
-//! (`provider`, `session`, `history`, `mcp`, `tools`, `skill`, `account`, `acp`, `serve`), and the
-//! small parsers for permission/render-mode/output-format flag values.
+//! (`account`, `profile`, `session`, `history`, `mcp`, `tools`, `skill`, `acp`, `serve`), and the
+//! value enums a flag parses into through their `FromStr`.
 
 use clap::Parser;
 
 use crate::permission::Permission;
 
-// `Mcp { action: McpAction }` is bigger than every other variant because `McpAction::Add` holds
-// every CLI flag inline, but the enum is only ever constructed once per process by clap and held on
-// the stack of `main`, so the few extra words of padding on the other variants aren't worth the
-// indirection cost of boxing.
-#[allow(clippy::large_enum_variant)]
+pub(crate) mod account;
+pub(crate) mod background;
+pub(crate) mod history;
+pub(crate) mod instructions;
+pub(crate) mod mcp;
+pub(crate) mod memory;
+pub(crate) mod profile;
+pub(crate) mod schedule;
+pub(crate) mod session;
+pub(crate) mod skills;
+pub(crate) mod tools;
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`McpAction::Add` holds every flag inline; clap builds the enum once and `main` holds it on the stack, so boxing buys nothing"
+)]
 #[derive(clap::Subcommand, Debug)]
-pub enum Command {
-    /// Manage provider profiles
-    Provider {
+pub(crate) enum Command {
+    /// Manage accounts and their credentials
+    Account {
         #[command(subcommand)]
-        action: ProviderAction,
+        action: AccountAction,
+    },
+    /// Manage profiles
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
     },
     /// Manage stored sessions
     Session {
@@ -58,11 +74,6 @@ pub enum Command {
         #[command(subcommand)]
         action: ScheduleAction,
     },
-    /// Show account usage, identity, and history for scripting
-    Account {
-        #[command(subcommand)]
-        action: AccountAction,
-    },
     /// Run meka as an ACP (Agent Client Protocol) agent over stdio
     ///
     /// Speaks newline-framed JSON-RPC on stdin/stdout so ACP clients (Zed, JetBrains, Neovim, VS
@@ -76,19 +87,23 @@ pub enum Command {
     /// under `[serve]` in config.toml.
     Serve {
         /// Override `[serve].bind` (e.g. `0.0.0.0:8080`)
-        #[arg(long)]
+        #[arg(long, value_name = "ADDR")]
         bind: Option<String>,
     },
 }
 
 #[derive(clap::Subcommand, Debug)]
-pub enum ToolsAction {
+pub(crate) enum ToolsAction {
     /// List every built-in tool with its effective permission and status
-    List,
+    List {
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
-pub enum SessionAction {
+pub(crate) enum SessionAction {
     /// List past sessions
     List {
         /// Maximum number of sessions to show
@@ -99,6 +114,9 @@ pub enum SessionAction {
         /// Hidden by default, so the view stays on conversations you started.
         #[arg(long)]
         include_children: bool,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
     },
     /// Export a session as Markdown or JSON
     Export {
@@ -106,16 +124,15 @@ pub enum SessionAction {
         session_id: String,
         /// Output file (`-` for stdout)
         ///
-        /// Defaults to `session-<id>.md` for markdown or `session-<id>.json`
-        /// for json, written to the current directory.
+        /// Defaults to `session-<id>.md` for markdown or `session-<id>.json` for json, written to
+        /// the current directory.
         #[arg(short, long)]
         output: Option<String>,
-        /// Export format: markdown or json
+        /// Output format: markdown or json
         ///
-        /// `json` is structured and round-trippable via `meka session import`,
-        /// and includes any sub-agent child sessions. `markdown` is rendered
-        /// and covers the single session only.
-        #[arg(long, value_parser = parse_session_export_format, default_value = "markdown")]
+        /// `json` is structured and round-trippable via `meka session import`, and includes any
+        /// sub-agent child sessions. `markdown` is rendered and covers the single session only.
+        #[arg(long, default_value = "markdown")]
         format: SessionExportFormat,
     },
     /// Delete one or more sessions
@@ -130,14 +147,14 @@ pub enum SessionAction {
         session_ids: Vec<String>,
         /// Delete all sessions
         ///
-        /// Conflicts with explicit IDs for the reason `--older-than-days` does: naming some
+        /// Conflicts with explicit ids for the reason `--older-than-days` does: naming some
         /// sessions and then asking for every session is two different requests, and running the
-        /// wider one silently makes the narrower one look honoured.
+        /// wider one silently makes the narrower one look honored.
         #[arg(long, conflicts_with_all = ["older_than_days", "session_ids"])]
         all: bool,
         /// Delete sessions not updated in this many days
         ///
-        /// Conflicts with explicit IDs rather than ignoring them: a listed session younger than
+        /// Conflicts with explicit ids rather than ignoring them: a listed session younger than
         /// the window would otherwise be silently spared.
         #[arg(
             long = "older-than-days",
@@ -148,16 +165,16 @@ pub enum SessionAction {
     },
     /// Import a session from a JSON export
     ///
-    /// Recreates the session and any sub-agent children under fresh IDs so it
-    /// can be resumed with `meka -r <new-id>`. Prints the new root session ID.
+    /// Recreates the session and any sub-agent children under fresh ids so it can be resumed with
+    /// `meka -r <new-id>`. Prints the new root session id.
     Import {
         /// Export file to read (`-` for stdin)
         input: String,
     },
     /// Fork a session into an independent copy
     ///
-    /// The copy carries the original's full conversation and continues from
-    /// there; the original is untouched. Prints the new session ID.
+    /// The copy carries the original's full conversation and continues from there; the original is
+    /// untouched. Prints the new session id.
     Fork {
         /// Session id, or any unique prefix of one
         session_id: String,
@@ -166,12 +183,15 @@ pub enum SessionAction {
     Show {
         /// Session id, or any unique prefix of one
         session_id: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
     },
     /// Drop the most recent turns from a session
     ///
-    /// Cuts at a clean user boundary so no tool call is separated from its
-    /// result. The log is append-only, so `meka session export` still shows
-    /// what was dropped. Use this to recover a session the provider refuses.
+    /// Cuts at a clean user boundary so no tool call is separated from its result. The log is
+    /// append-only, so `meka session export` still shows what was dropped. Use this to recover a
+    /// session the provider refuses.
     Rewind {
         /// Session id, or any unique prefix of one
         session_id: String,
@@ -182,187 +202,222 @@ pub enum SessionAction {
 }
 
 #[derive(clap::Subcommand, Debug)]
-pub enum HistoryAction {
+pub(crate) enum HistoryAction {
     /// List recorded input history
     List {
-        /// Max entries to show (0 = all)
+        /// Maximum number of entries to show (0 = all)
         #[arg(short = 'n', long, default_value = "50")]
         limit: u32,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
     },
     /// Delete all recorded input history
     Clear,
 }
 
-// `Add` is the outlier with several flags inline; same one-shot CLI dispatch reasoning as the
-// other action enums.
-#[allow(clippy::large_enum_variant)]
+/// Accounts: what a login produces and what bills. `add`/`login`/`list`/`remove` manage the
+/// `[accounts.<name>]` tables and the credential each holds; `usage`/`whoami`/`stats` are the
+/// read-only views, each reached through a profile because a request needs a model.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`Add` holds several flags inline; built once per process, so boxing buys nothing"
+)]
 #[derive(clap::Subcommand, Debug)]
-pub enum ProviderAction {
-    /// Add a provider profile and authenticate it
+pub(crate) enum AccountAction {
+    /// Add an account and authenticate it
     ///
-    /// Prompts for any of type/model/base-url not passed as flags, offers an
-    /// optional advanced step (thinking, context window, effort), then acquires
-    /// the secret (OAuth login for the subscription backends, API-key prompt for
-    /// the rest) and stores it in the database. Becomes the default provider
-    /// whenever no `default_provider` is set, not only for the first profile.
+    /// Prompts for the backend and base URL when not flagged, then acquires the secret (an OAuth
+    /// login for the subscription backends, an API-key prompt for the rest) and stores it in the
+    /// database.
     Add {
-        /// Profile name (e.g. `work`, `personal`).
+        /// Account name
         name: String,
-        /// Backend type: the wire protocol
-        ///
-        /// One of: anthropic-messages, chatgpt-subscription,
-        /// claude-subscription, openai-chat-completions, openai-responses.
-        #[arg(long = "type")]
-        r#type: Option<String>,
-        /// API base URL
-        ///
-        /// Any endpoint serving the chosen protocol.
+        /// Backend: anthropic-messages, chatgpt-subscription, claude-subscription,
+        /// openai-chat-completions, openai-responses
+        #[arg(long, value_name = "BACKEND")]
+        backend: Option<String>,
+        /// API base URL; any endpoint serving the backend's protocol
         #[arg(long = "base-url", value_name = "URL")]
         base_url: Option<String>,
-        /// OAuth token endpoint override (advanced)
-        ///
-        /// Used for the initial code exchange and every refresh. For a proxied
-        /// route out; the backend's own endpoint is used when this is unset.
+        /// OAuth token endpoint override, used for the code exchange and every refresh
         #[arg(long = "oauth-token-url", value_name = "URL")]
         oauth_token_url: Option<String>,
-        /// OAuth client ID override (advanced)
-        ///
-        /// Subscription backends only. Like --oauth-token-url, it replaces a
-        /// value meka has to hardcode but does not own.
+        /// OAuth client id override (subscription backends only)
         #[arg(long = "client-id", value_name = "ID")]
         client_id: Option<String>,
-        /// Model name.
+        /// Read the API key from stdin (API-key backends only); needs --backend
+        #[arg(long = "api-key-stdin")]
+        api_key_stdin: bool,
+    },
+    /// List configured accounts
+    List {
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
+    /// Re-authenticate an account, keeping its settings
+    Login {
+        /// Account name
+        name: String,
+        /// Read the API key from stdin (API-key backends only)
+        #[arg(long = "api-key-stdin")]
+        api_key_stdin: bool,
+    },
+    /// Remove an account and clear its stored credential
+    ///
+    /// Refused while any profile names the account.
+    Remove {
+        /// Account name
+        name: String,
+    },
+    /// Show account rate-limit usage (session / weekly windows)
+    Usage {
+        /// Profile to reach the account through (default: the profile a new session runs on)
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
+    /// Show account identity (plan, tier, org, role) and local auth status
+    Whoami {
+        /// Profile to reach the account through (default: the profile a new session runs on)
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
+    /// Show historical usage (lifetime tokens, streaks, per-day counts)
+    Stats {
+        /// Profile to reach the account through (default: the profile a new session runs on)
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
+}
+
+/// Profiles: an account plus the model and every model-tied setting. A session records the profile
+/// it runs on; `use` is the only command that writes `default_profile`.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`Add` holds several flags inline; built once per process, so boxing buys nothing"
+)]
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum ProfileAction {
+    /// Add a profile on an account
+    ///
+    /// Prompts for the account and model when not flagged, then offers an optional advanced step
+    /// (thinking, context window, effort). Does not touch `default_profile`: a sole profile is
+    /// the default, and `meka profile use` picks among several.
+    Add {
+        /// Profile name
+        name: String,
+        /// Account the profile bills
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
+        /// Model name
         #[arg(long)]
         model: Option<String>,
-        /// Context window in tokens
-        ///
-        /// Skips the advanced prompt for this setting. Defaults to 1000000. Set the model's real
-        /// window so compaction fires at the right point; meka never infers or probes for it.
+        /// Context window in tokens (default: 1000000); meka never infers or probes for it
         #[arg(long = "context-window", value_name = "TOKENS")]
         context_window: Option<u64>,
-        /// Per-request output token cap
-        ///
-        /// Unset leaves the backend's own default. On Claude with thinking =
-        /// budgeted this must exceed the thinking budget.
+        /// Per-request output token cap; unset leaves the backend's default
         #[arg(long = "max-output-tokens", value_name = "TOKENS")]
         max_output_tokens: Option<u64>,
-        /// Reasoning effort (e.g. low, high)
-        ///
-        /// Skips the advanced prompt for this setting. Unset sends nothing, so the provider
-        /// applies its own default.
-        #[arg(long, value_name = "LEVEL")]
+        /// Reasoning effort; unset sends nothing, so the provider applies its own default
+        #[arg(long, value_name = "EFFORT")]
         effort: Option<String>,
         /// Accept image input (default: true)
-        ///
-        /// Set false for a text-only model, so the ACP frontend stops offering
-        /// images it cannot use.
         #[arg(long, hide_possible_values = true, value_name = "BOOL")]
         vision: Option<bool>,
-        /// Thinking mode: adaptive, budgeted, off
-        ///
-        /// Skips the advanced prompt for this setting. Anthropic Messages backends only; the rest
-        /// ignore it. Defaults to adaptive.
+        /// Thinking mode: adaptive, budgeted, off (Anthropic Messages backends only; default:
+        /// adaptive)
         #[arg(long, value_enum, hide_possible_values = true, value_name = "MODE")]
-        thinking: Option<crate::provider::ThinkingMode>,
-        /// Token budget when thinking = budgeted
-        ///
-        /// Ignored by the other two modes, which send no budget. Defaults to
-        /// `[thinking].budget_tokens`, then to 16000.
+        thinking: Option<crate::config::ThinkingMode>,
+        /// Token budget when thinking = budgeted (default: `[thinking].budget`, then 16000)
         #[arg(long = "thinking-budget", value_name = "TOKENS")]
         thinking_budget: Option<u64>,
-        /// Redact thinking blocks (default: true)
-        ///
-        /// claude-subscription only. Saves bandwidth, but redacted payloads
-        /// cannot be replayed to the server across turns.
+        /// Largest request body in bytes before old images are redacted (Anthropic backends
+        /// default to 30 MiB)
+        #[arg(long = "max-request-bytes", value_name = "BYTES")]
+        max_request_bytes: Option<u64>,
+        /// Redact thinking blocks (claude-subscription only; default: true)
         #[arg(
             long = "redact-thinking",
             hide_possible_values = true,
             value_name = "BOOL"
         )]
         redact_thinking: Option<bool>,
-        /// Read the API key from stdin
-        ///
-        /// Non-interactive alternative to the key prompt. API backends only.
-        #[arg(long = "api-key-stdin")]
-        api_key_stdin: bool,
     },
-    /// List configured provider profiles
-    List,
-    /// Change one setting on a provider profile
+    /// List configured profiles
+    List {
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
+    /// Change one setting on a profile, keeping the rest and every comment
     ///
-    /// Keeps every other setting and every comment, and leaves the profile's
-    /// keys in meka's documented order. This is how a profile's model changes;
-    /// there is no per-run flag for it, because a profile is an indivisible
-    /// bundle and a session records which one it runs on, not a rewritten copy.
-    ///
-    /// Keys: base_url, oauth_token_url, client_id, model, context_window,
-    /// max_output_tokens, effort, vision, thinking, thinking_budget,
-    /// redact_thinking. `type` is not settable, because the stored credential
-    /// was acquired for the current backend.
-    ///
-    /// Examples:
-    ///   meka provider set work model claude-opus-5
-    ///   meka provider set work context_window 200000
-    ///   meka provider set work effort --unset
-    #[command(verbatim_doc_comment)]
+    /// Keys: model, context_window, max_output_tokens, effort, vision, thinking, thinking_budget,
+    /// max_request_bytes, redact_thinking. `account` is not settable; add a profile on the other
+    /// account instead.
     Set {
-        /// Profile name to change.
+        /// Profile name
         name: String,
-        /// Setting to write.
+        /// Setting to write
         key: String,
-        /// New value. Omit it and pass --unset to remove the setting instead.
+        /// New value; omit it and pass --unset to remove the setting
         value: Option<String>,
         /// Remove the setting, so the profile falls back to the default
-        ///
-        /// The inverse of setting a value, and not the same as setting an
-        /// empty one: an absent key follows whatever meka's default becomes,
-        /// which is what an unstated setting has always meant.
         #[arg(long, conflicts_with = "value")]
         unset: bool,
     },
-    /// Set the default provider profile
+    /// Set the default profile
     Use {
-        /// Profile name to make the default.
+        /// Profile name
         name: String,
     },
-    /// Remove a provider profile and clear its stored credential
+    /// Remove a profile
     Remove {
-        /// Profile name to remove.
+        /// Profile name
         name: String,
-    },
-    /// Re-authenticate an existing provider profile
-    ///
-    /// Keeps every other setting on the profile. Rotating a key with
-    /// `remove` + `add` instead rebuilds the whole table, discarding
-    /// `context_window`, `effort`, `thinking` and the rest.
-    Login {
-        /// Profile name to re-authenticate.
-        name: String,
-        /// Read the API key from stdin instead of prompting
-        ///
-        /// For scripted key rotation, the same as on `meka provider add`.
-        /// API-key backends only; the subscription backends authenticate
-        /// through the browser and have no key to read.
-        #[arg(long = "api-key-stdin")]
-        api_key_stdin: bool,
     },
 }
 
-// `Add` is the outlier with several flags inline; same one-shot CLI dispatch reasoning as
-// [`Command`] and [`McpAction`] above.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`Add` holds several flags inline; built once per process, so boxing buys nothing"
+)]
 #[derive(clap::Subcommand, Debug)]
-pub enum SkillAction {
+pub(crate) enum SkillAction {
     /// List installed skills
     List {
         /// Also show where each skill is on disk
         #[arg(long)]
         paths: bool,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
     },
     /// Print one skill's frontmatter and on-disk paths
-    Get { name: String },
+    Get {
+        /// Skill name
+        name: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Print the rendered skill body
-    Show { name: String },
+    Show {
+        /// Skill name
+        name: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Scaffold a new skill at `~/.config/meka/skills/<name>/SKILL.md`
     ///
     /// Examples:
@@ -378,11 +433,11 @@ pub enum SkillAction {
         #[arg(long)]
         description: Option<String>,
 
-        /// Listing rank 0-9, lower first. Defaults to 5
+        /// Priority 0-9, lower first (default: 5)
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
         priority: Option<u8>,
 
-        /// Frontmatter metadata as key=value. Repeatable
+        /// Frontmatter metadata as key=value (repeatable)
         #[arg(long, value_name = "KEY=VALUE")]
         metadata: Vec<String>,
 
@@ -394,18 +449,21 @@ pub enum SkillAction {
         #[arg(long)]
         force: bool,
 
-        /// Open the new SKILL.md in $EDITOR afterwards
+        /// Open the new SKILL.md afterwards in $VISUAL, then $EDITOR
         #[arg(long)]
         edit: bool,
     },
     /// Remove a skill's directory
-    Remove { name: String },
+    Remove {
+        /// Skill name
+        name: String,
+    },
 }
 
 /// Inspect and cancel the wakeups the agent scheduled for itself through the `schedule_*` tools.
 /// Read-and-cancel only: creating a job needs a session to attach it to, which is the agent's job.
 #[derive(clap::Subcommand, Debug)]
-pub enum ScheduleAction {
+pub(crate) enum ScheduleAction {
     /// List scheduled jobs
     ///
     /// Examples:
@@ -416,11 +474,17 @@ pub enum ScheduleAction {
         /// One session's jobs, by id or prefix (default: all)
         #[arg(long)]
         session: Option<String>,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
     },
     /// Show a job's full details
     Show {
         /// Job id, or any unique prefix of one
         id: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
     },
     /// Cancel a job by id or unique prefix
     Cancel {
@@ -430,14 +494,13 @@ pub enum ScheduleAction {
 }
 
 #[derive(clap::Subcommand, Debug)]
-pub enum InstructionsAction {
+pub(crate) enum InstructionsAction {
     /// Print the resolved instructions and where they came from
     ///
-    /// Resolution order is `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`,
-    /// then `instructions.md` (or `instructions/`) in the config directory.
-    /// `--instructions` belongs to a run, so it is not consulted here. The
-    /// text goes to stdout and the source to stderr, so
-    /// `meka instructions show 2>/dev/null` pipes cleanly.
+    /// Resolution order is `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, then `instructions.md`
+    /// (or `instructions/`) in the config directory. `--instructions` belongs to a run, so it is
+    /// not consulted here. The text goes to stdout and the source to stderr, so `meka instructions
+    /// show 2>/dev/null` pipes cleanly.
     #[command(verbatim_doc_comment)]
     Show,
     /// Print the paths checked for instructions, and whether each exists
@@ -447,13 +510,29 @@ pub enum InstructionsAction {
 /// Inspect and curate the agent's durable notes. The agent maintains these itself through the
 /// `memory_*` tools; these subcommands are for reading, auditing, and pruning them by hand.
 #[derive(clap::Subcommand, Debug)]
-pub enum MemoryAction {
+pub(crate) enum MemoryAction {
     /// List saved memories and the priority distribution
-    List,
+    List {
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Print one memory's stored fields
-    Get { name: String },
+    Get {
+        /// Memory name
+        name: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Print a memory's body
-    Show { name: String },
+    Show {
+        /// Memory name
+        name: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Write a memory by hand
     ///
     /// Examples:
@@ -468,11 +547,11 @@ pub enum MemoryAction {
         #[arg(long)]
         description: String,
 
-        /// 0 is most important, 9 least; defaults to 5
+        /// Priority 0-9, lower first (default: 5)
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
         priority: Option<u8>,
 
-        /// Label for grouping and filtering; repeatable
+        /// Label for grouping and filtering (repeatable)
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
 
@@ -488,22 +567,24 @@ pub enum MemoryAction {
         #[arg(long)]
         force: bool,
     },
-    /// Open a memory's body in $EDITOR
+    /// Open a memory's body in $VISUAL, then $EDITOR
     ///
-    /// The body only. To change a description, priority or tags, use
-    /// `meka memory add <name> --force`, which keeps whatever it does
-    /// not mention.
+    /// The body only. To change a description, priority or tags, use `meka memory add <name>
+    /// --force`, which keeps whatever it does not mention.
     #[command(verbatim_doc_comment)]
     Edit {
         /// Name of the memory to edit
         name: String,
     },
     /// Delete a memory permanently
-    Remove { name: String },
+    Remove {
+        /// Memory name
+        name: String,
+    },
     /// Check the search index against the stored memories
     ///
-    /// The index is derived from the memories and can be regenerated,
-    /// so neither answer here risks losing a note.
+    /// The index is derived from the memories and can be regenerated, so neither answer here risks
+    /// losing a note.
     #[command(verbatim_doc_comment)]
     Verify {
         /// Regenerate the index instead of only checking it
@@ -512,8 +593,7 @@ pub enum MemoryAction {
     },
     /// Write every memory out as Markdown, one file per memory
     ///
-    /// The backup, grep and git answer for a store that lives in
-    /// meka's database.
+    /// The backup, grep and git answer for a store that lives in meka's database.
     ///
     /// Examples:
     ///   meka memory export
@@ -526,89 +606,96 @@ pub enum MemoryAction {
     },
 }
 
-/// Read-only account introspection, for scripting (e.g. an i3blocks status bar). Both subcommands
-/// take an optional profile (defaults to the active provider) and a `--format`.
-#[derive(clap::Subcommand, Debug)]
-pub enum AccountAction {
-    /// Show account rate-limit usage (session / weekly windows)
-    Usage {
-        /// Provider profile (defaults to the active provider)
-        profile: Option<String>,
-        /// Output format
-        #[arg(long, value_parser = parse_output_format, default_value = "plain")]
-        format: OutputFormat,
-    },
-    /// Show account identity (plan, tier, org, role) and local auth status
-    Whoami {
-        /// Provider profile (defaults to the active provider)
-        profile: Option<String>,
-        /// Output format
-        #[arg(long, value_parser = parse_output_format, default_value = "plain")]
-        format: OutputFormat,
-    },
-    /// Show historical usage (lifetime tokens, streaks, per-day counts)
-    Stats {
-        /// Provider profile (defaults to the active provider)
-        profile: Option<String>,
-        /// Output format
-        #[arg(long, value_parser = parse_output_format, default_value = "plain")]
-        format: OutputFormat,
-    },
-}
+pub(crate) use crate::config::OutputFormat;
 
-/// Output format for `meka account` subcommands.
+/// Output format for `meka session export`. One spelling, [`Self::name`], on `--format`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
-    /// Human-readable text.
-    Plain,
-    /// JSON (stable shape, for scripts).
-    Json,
-}
-
-fn parse_output_format(s: &str) -> std::result::Result<OutputFormat, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "plain" | "text" => Ok(OutputFormat::Plain),
-        "json" => Ok(OutputFormat::Json),
-        other => Err(format!(
-            "unknown format '{}' (expected plain or json)",
-            other
-        )),
-    }
-}
-
-/// Output format for `meka session export`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionExportFormat {
+pub(crate) enum SessionExportFormat {
     /// Rendered Markdown (single session).
     Markdown,
     /// Structured JSON (round-trippable; includes sub-agent children).
     Json,
 }
 
-fn parse_session_export_format(s: &str) -> std::result::Result<SessionExportFormat, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "markdown" | "md" => Ok(SessionExportFormat::Markdown),
-        "json" => Ok(SessionExportFormat::Json),
-        other => Err(format!(
-            "unknown format '{}' (expected markdown or json)",
-            other
-        )),
+impl SessionExportFormat {
+    /// Every format, in the order the names sort.
+    pub(crate) const ALL: [SessionExportFormat; 2] = [Self::Json, Self::Markdown];
+
+    /// The one spelling `--format` takes.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Json => "json",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|format| format.name())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
-// Same reasoning as `Command` above: `Add` is the outlier and the enum lives on `main`'s stack for
-// exactly one dispatch, not in a hot collection, so boxing would trade clarity for nothing.
-#[allow(clippy::large_enum_variant)]
+impl std::fmt::Display for SessionExportFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for SessionExportFormat {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not an export format. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "`Add` holds every flag inline; built once per process, so boxing buys nothing"
+)]
 #[derive(clap::Subcommand, Debug)]
-pub enum McpAction {
+pub(crate) enum McpAction {
     /// List all configured MCP servers
-    List,
+    List {
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Print the configuration for one server
-    Get { name: String },
+    Get {
+        /// Name of a server in config.toml
+        name: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Connect once and exit non-zero if the handshake fails
-    Reconnect { name: String },
+    Reconnect {
+        /// Name of a server in config.toml
+        name: String,
+    },
     /// List a server's advertised tools with their resolved permissions
-    Tools { name: String },
+    Tools {
+        /// Name of a server in config.toml
+        name: String,
+        /// Output format: plain or json
+        #[arg(long, default_value = "plain")]
+        format: OutputFormat,
+    },
     /// Authenticate a server interactively (OAuth assumed for HTTP)
     ///
     /// With neither flag, runs the OAuth authorization-code flow. With one, stores the secret read
@@ -626,7 +713,10 @@ pub enum McpAction {
         client_secret_stdin: bool,
     },
     /// Clear every stored credential for a server, revoking OAuth first
-    Logout { name: String },
+    Logout {
+        /// Name of a server in config.toml
+        name: String,
+    },
     /// Add a server to config.toml
     ///
     /// Examples:
@@ -634,24 +724,22 @@ pub enum McpAction {
     ///   meka mcp add notion https://mcp.notion.com/mcp
     ///   meka mcp add api https://api.example.com/mcp --auth-token-stdin
     ///   meka mcp add notion https://mcp.notion.com/mcp --auth oauth
-    // `rustdoc::bare_urls` normally turns URLs like https://example into auto-links, but these doc
-    // lines are ALSO the text clap prints for `meka mcp add --help`. Angle-brackets would leak into
-    // the CLI help. Allow bare URLs just on this variant.
-    #[allow(rustdoc::bare_urls)]
-    // Preserve line breaks in the `Examples:` block; clap's default joins consecutive `///` lines
-    // into one re-wrapped paragraph.
+    #[allow(
+        rustdoc::bare_urls,
+        reason = "these lines are also clap's help text, where the angle brackets of an auto-link would print literally"
+    )]
     #[command(verbatim_doc_comment)]
     Add {
         /// Unique server name (alphanumerics, `-`, `_` only)
         name: String,
         /// URL (HTTP) or executable path (stdio); transport auto-detected
         location: Option<String>,
-        /// Arguments to pass to the stdio command.
+        /// Arguments to pass to the stdio command
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
 
         /// Force transport (stdio or http); auto-detected otherwise
-        #[arg(long, value_parser = parse_mcp_transport)]
+        #[arg(long)]
         transport: Option<crate::config::McpTransport>,
 
         /// Environment variable for stdio (KEY=VALUE, repeatable)
@@ -662,8 +750,8 @@ pub enum McpAction {
         #[arg(long = "header", value_name = "KEY=VALUE")]
         header: Vec<String>,
 
-        /// Authentication: oauth | client-credentials | client-credentials-jwt
-        #[arg(long, value_parser = parse_mcp_auth_kind)]
+        /// Authentication: oauth, client_credentials, client_credentials_jwt
+        #[arg(long)]
         auth: Option<McpAuthKind>,
 
         /// Read a static bearer token from stdin (excludes --auth)
@@ -674,8 +762,8 @@ pub enum McpAction {
         #[arg(long = "auth-token-stdin", conflicts_with = "client_secret_stdin")]
         auth_token_stdin: bool,
 
-        /// OAuth / client-credentials client ID
-        #[arg(long)]
+        /// OAuth or client_credentials client id
+        #[arg(long, value_name = "ID")]
         client_id: Option<String>,
 
         /// Read the OAuth client secret from stdin
@@ -686,12 +774,12 @@ pub enum McpAction {
         #[arg(long = "client-secret-stdin")]
         client_secret_stdin: bool,
 
-        /// JWT signing key path (for client-credentials-jwt)
-        #[arg(long)]
+        /// JWT signing key path (for client_credentials_jwt)
+        #[arg(long, value_name = "KEY")]
         signing_key: Option<String>,
 
         /// JWT signing algorithm (RS256, RS384, RS512, ES256, ES384)
-        #[arg(long)]
+        #[arg(long, value_name = "ALGORITHM")]
         signing_algorithm: Option<String>,
 
         /// OAuth scope (repeatable)
@@ -699,11 +787,11 @@ pub enum McpAction {
         scope: Vec<String>,
 
         /// Fixed OAuth redirect port (default: ephemeral)
-        #[arg(long)]
+        #[arg(long, value_name = "PORT")]
         redirect_port: Option<u16>,
 
-        /// Permission: none, read, workspace, ask, unrestricted (default: read)
-        #[arg(long)]
+        /// Permission: none, read, workspace, unrestricted (default: read)
+        #[arg(long, value_name = "LEVEL")]
         permission: Option<String>,
 
         /// Raw tool name to allow (repeatable; restricts which register)
@@ -730,151 +818,245 @@ pub enum McpAction {
         #[arg(long = "disabled")]
         disabled: bool,
 
-        /// Gate turns on this server: reject the turn if it is not connected
+        /// Gate turns on this server: refuse the turn if it is not connected
         #[arg(long = "required")]
         required: bool,
     },
-    /// Remove a server from config.toml and clear stored creds
-    Remove { name: String },
+    /// Remove a server from config.toml and clear every stored credential
+    Remove {
+        /// Name of a server in config.toml
+        name: String,
+    },
     /// Temporarily turn off a server without removing it from config
-    Disable { name: String },
+    Disable {
+        /// Name of a server in config.toml
+        name: String,
+    },
     /// Turn a disabled server back on
-    Enable { name: String },
+    Enable {
+        /// Name of a server in config.toml
+        name: String,
+    },
 }
 
-/// Authentication flavours selectable from the CLI. Maps onto the [`crate::config::McpAuthConfig`]
+/// Authentication flavors selectable from the CLI. Maps onto the [`crate::config::McpAuthConfig`]
 /// variants, except `None` which means "no `[auth]` block at all" (static token or
 /// unauthenticated).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum McpAuthKind {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum McpAuthKind {
     OAuth,
     ClientCredentials,
     ClientCredentialsJwt,
 }
 
-fn parse_mcp_transport(s: &str) -> std::result::Result<crate::config::McpTransport, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "stdio" => Ok(crate::config::McpTransport::Stdio),
-        "http" => Ok(crate::config::McpTransport::Http),
-        other => Err(format!(
-            "unknown transport '{}' (expected stdio or http)",
-            other
-        )),
+impl McpAuthKind {
+    pub(crate) const ALL: [Self; 3] = [
+        Self::OAuth,
+        Self::ClientCredentials,
+        Self::ClientCredentialsJwt,
+    ];
+
+    /// The one spelling, shared with the `type` the `[auth]` block records.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::OAuth => "oauth",
+            Self::ClientCredentials => "client_credentials",
+            Self::ClientCredentialsJwt => "client_credentials_jwt",
+        }
     }
 }
 
-fn parse_mcp_auth_kind(s: &str) -> std::result::Result<McpAuthKind, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "oauth" => Ok(McpAuthKind::OAuth),
-        "client-credentials" | "client_credentials" => Ok(McpAuthKind::ClientCredentials),
-        "client-credentials-jwt" | "client_credentials_jwt" => {
-            Ok(McpAuthKind::ClientCredentialsJwt)
-        }
-        other => Err(format!(
-            "unknown auth '{}' (expected oauth, client-credentials, or client-credentials-jwt)",
-            other
-        )),
+impl std::fmt::Display for McpAuthKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for McpAuthKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.name() == value)
+            .ok_or_else(|| {
+                crate::text::unknown_name("auth", value, Self::ALL.iter().map(|kind| kind.name()))
+            })
     }
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "meka", version, about = "A general-purpose AI agent harness")]
-pub struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
-    pub command: Option<Command>,
+    pub(crate) command: Option<Command>,
 
-    /// Prompt for the first turn; add --oneshot to exit after it
-    pub prompt: Option<String>,
+    /// Prompt for the first turn; `-` reads it from stdin
+    #[arg(short = 'p', long = "prompt", value_name = "TEXT")]
+    pub(crate) prompt: Option<String>,
 
     /// Continue the most recent session
     #[arg(short = 'c', long = "continue", conflicts_with = "resume")]
-    pub continue_last: bool,
+    pub(crate) continue_last: bool,
 
-    /// Resume a session by UUID or leading prefix
+    /// Resume a session by id or any unique prefix
     #[arg(short = 'r', long = "resume", value_name = "SESSION")]
-    pub resume: Option<String>,
+    pub(crate) resume: Option<String>,
 
-    /// Initial permission mode (none, read, workspace, ask, unrestricted)
-    #[arg(long = "permission", value_parser = parse_permission)]
-    pub permission: Option<Permission>,
+    /// Initial permission level (none, read, workspace, unrestricted)
+    #[arg(long = "permission", value_name = "LEVEL")]
+    pub(crate) permission: Option<Permission>,
 
     /// Extra directory writable at `workspace` permission (repeatable)
     ///
     /// The working directory is always writable at that level, as are any folders an
     /// ACP client supplies. This adds to them.
     ///
-    /// Deliberately a flag rather than a config key: which folders this run may write
-    /// is a per-run scope, like the working directory itself, not a preference to
-    /// persist.
+    /// Deliberately a flag rather than a config key: which folders this run may write is a per-run
+    /// scope, like the working directory itself, not a preference to persist.
     #[arg(long = "writable-root", value_name = "PATH")]
-    pub writable_root: Vec<std::path::PathBuf>,
+    pub(crate) writable_root: Vec<std::path::PathBuf>,
 
-    /// Provider profile for this session; on a resume, repins it
+    /// Profile for this session; on a resume, repins it
     ///
-    /// The only provider flag on a run. A profile is an indivisible bundle of a backend, an
-    /// endpoint, a credential and every model-tied setting, so this selects one rather than
-    /// rewriting part of one. Change a field with `meka provider set`.
-    #[arg(short = 'p', long = "provider")]
-    pub provider: Option<String>,
+    /// The only profile flag on a run. A profile is an indivisible bundle of an account, a model
+    /// and every model-tied setting, so this selects one rather than rewriting part of one.
+    /// Change a field with `meka profile set`.
+    #[arg(long = "profile", value_name = "NAME")]
+    pub(crate) profile: Option<String>,
 
     /// Linux sandbox backend: landlock or bubblewrap
-    #[arg(long = "sandbox-backend", value_parser = parse_sandbox_backend)]
-    pub sandbox_backend: Option<crate::config::SandboxBackend>,
+    #[arg(long = "sandbox-backend", value_name = "BACKEND")]
+    pub(crate) sandbox_backend: Option<crate::config::SandboxBackend>,
 
-    /// Disable streaming mode
+    /// Disable streaming for this run (see `[display] stream`)
     #[arg(long = "no-stream")]
-    pub no_stream: bool,
+    pub(crate) no_stream: bool,
 
     /// Markdown render mode: termimad (default), syntect, or raw
-    #[arg(long = "render-mode", value_parser = parse_render_mode)]
-    pub render_mode: Option<crate::render::RenderMode>,
+    #[arg(long = "render-mode", value_name = "RENDERER")]
+    pub(crate) render_mode: Option<crate::config::RenderMode>,
 
     /// Standing instructions for this run, replacing the discovered ones
     #[arg(long = "instructions", value_name = "STRING")]
-    pub instructions: Option<String>,
+    pub(crate) instructions: Option<String>,
 
-    /// Invoke a user-invocable skill on the first turn.
+    /// Invoke a user-invocable skill on the first turn
     #[arg(long = "skill", value_name = "NAME")]
-    pub skill: Option<String>,
+    pub(crate) skill: Option<String>,
 
-    /// Exit after the first turn finishes (requires a prompt or `--skill`).
+    /// Exit after the first turn finishes (requires --prompt or --skill)
     #[arg(long = "oneshot")]
-    pub oneshot: bool,
+    pub(crate) oneshot: bool,
+
+    /// Output format: plain or json
+    #[arg(long = "format", default_value = "plain", value_name = "FORMAT")]
+    pub(crate) format: OutputFormat,
 
     /// Eager-load an MCP tool this session (raw SERVER:TOOL, repeatable)
     #[arg(long = "eager-load-tool", value_name = "SERVER:TOOL")]
-    pub eager_load_tool: Vec<String>,
+    pub(crate) eager_load_tool: Vec<String>,
 
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
-    pub verbosity: u8,
+    pub(crate) verbosity: u8,
 }
 
-fn parse_permission(s: &str) -> std::result::Result<Permission, String> {
-    s.parse()
+impl Cli {
+    /// Replace `-p -` with what stdin holds, read to end of input.
+    ///
+    /// Done here rather than in clap, which cannot read a stream, and before `overrides()` so every
+    /// consumer sees the words. Trailing newlines are dropped, since `echo hi | meka -p -` means
+    /// `hi`; an empty read is refused, because a prompt of nothing is a turn spent on nothing.
+    pub(crate) fn read_prompt_from_stdin_if_asked(&mut self) -> anyhow::Result<()> {
+        if self.prompt.as_deref() != Some("-") {
+            return Ok(());
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        let text = text.trim_end_matches(['\n', '\r']).to_string();
+        if text.trim().is_empty() {
+            anyhow::bail!("`-p -` read nothing from stdin");
+        }
+        self.prompt = Some(text);
+        Ok(())
+    }
+
+    /// The root flags as the value `config` resolves from. One place knows both names.
+    pub(crate) fn overrides(&self) -> crate::config::CliOverrides {
+        crate::config::CliOverrides {
+            profile: self.profile.clone(),
+            eager_load_tools: self.eager_load_tool.clone(),
+            instructions: self.instructions.clone(),
+            permission: self.permission,
+            sandbox_backend: self.sandbox_backend,
+            writable_roots: self.writable_root.clone(),
+            no_stream: self.no_stream,
+            render_mode: self.render_mode,
+            resume: self.resume.clone(),
+            continue_last: self.continue_last,
+            prompt: self.prompt.clone(),
+            oneshot: self.oneshot,
+            output_format: self.format,
+        }
+    }
+}
+/// Read a secret from stdin when its `--…-stdin` flag was passed, and return `None` when it was
+/// not.
+///
+/// stdin is read to end, so exactly one secret can be taken per command; the flags that reach here
+/// conflict with each other in clap for that reason. An empty stream is an error rather than
+/// `None`: a caller that asked for a token and got nothing should hear it here, not from the server
+/// later.
+pub(crate) fn read_secret_from_stdin(
+    from_stdin: bool,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    if !from_stdin {
+        return Ok(None);
+    }
+    use std::io::Read as _;
+    let mut buffer = String::new();
+    std::io::stdin().read_to_string(&mut buffer)?;
+    let secret = buffer.trim().to_string();
+    if secret.is_empty() {
+        anyhow::bail!("no {label} was read from stdin");
+    }
+    Ok(Some(secret))
 }
 
-fn parse_render_mode(s: &str) -> std::result::Result<crate::render::RenderMode, String> {
-    s.parse()
+/// A `show` command's answer under `--format json`: one pretty-printed object, and nothing else on
+/// stdout.
+pub(crate) fn write_json(document: &impl serde::Serialize) -> std::io::Result<()> {
+    crate::render::write_stdout_line(serde_json::to_string_pretty(document)?)
 }
 
-fn parse_sandbox_backend(s: &str) -> std::result::Result<crate::config::SandboxBackend, String> {
-    s.parse()
+/// A `list` command's answer under `--format json`: `{"<nouns>": [...]}`, the envelope the HTTP
+/// API's collection endpoints answer with, so one client type reads both. An empty listing is the
+/// envelope around an empty array; the `No <nouns>.` note belongs to the plain rendering.
+pub(crate) fn write_json_listing(
+    nouns: &str,
+    items: &impl serde::Serialize,
+) -> std::io::Result<()> {
+    let mut document = serde_json::Map::new();
+    document.insert(nouns.to_string(), serde_json::to_value(items)?);
+    write_json(&document)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_cli_defaults() {
+    fn cli_defaults() {
         let cli = Cli::parse_from(["meka"]);
         assert!(cli.command.is_none());
         assert!(cli.prompt.is_none());
         assert!(!cli.continue_last);
         assert!(cli.resume.is_none());
         assert!(cli.permission.is_none());
-        assert!(cli.provider.is_none());
+        assert!(cli.profile.is_none());
+        assert_eq!(cli.format, OutputFormat::Plain);
         assert!(!cli.no_stream);
         assert!(cli.render_mode.is_none());
         assert!(cli.skill.is_none());
@@ -884,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_eager_load_tool_repeatable() {
+    fn cli_eager_load_tool_repeatable() {
         let cli = Cli::parse_from([
             "meka",
             "--eager-load-tool",
@@ -899,41 +1081,51 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_oneshot_flag() {
-        let cli = Cli::parse_from(["meka", "--oneshot", "do thing"]);
+    fn cli_oneshot_flag() {
+        let cli = Cli::parse_from(["meka", "--oneshot", "-p", "do thing"]);
         assert!(cli.oneshot);
         assert_eq!(cli.prompt.as_deref(), Some("do thing"));
+        let cli = Cli::parse_from(["meka", "--oneshot", "-p", "do thing", "--format", "json"]);
+        assert_eq!(cli.format, OutputFormat::Json);
     }
 
     #[test]
-    fn test_cli_oneshot_prompt() {
-        let cli = Cli::parse_from(["meka", "hello world"]);
+    fn cli_prompt_flag() {
+        let cli = Cli::parse_from(["meka", "--prompt", "hello world"]);
         assert_eq!(cli.prompt.as_deref(), Some("hello world"));
     }
 
+    /// The bare positional is gone: a mistyped subcommand is an error, not a session opened with
+    /// the typo as its first turn.
     #[test]
-    fn test_cli_skill_flag_alone() {
+    fn an_unknown_subcommand_is_refused_rather_than_taken_as_a_prompt() {
+        assert!(Cli::try_parse_from(["meka", "unknowncommand"]).is_err());
+        assert!(Cli::try_parse_from(["meka", "hello world"]).is_err());
+    }
+
+    #[test]
+    fn cli_skill_flag_alone() {
         let cli = Cli::parse_from(["meka", "--skill", "demo"]);
         assert_eq!(cli.skill.as_deref(), Some("demo"));
         assert!(cli.prompt.is_none());
     }
 
     #[test]
-    fn test_cli_skill_flag_with_extra_prompt() {
-        let cli = Cli::parse_from(["meka", "--skill", "demo", "extra context"]);
+    fn cli_skill_flag_with_extra_prompt() {
+        let cli = Cli::parse_from(["meka", "--skill", "demo", "-p", "extra context"]);
         assert_eq!(cli.skill.as_deref(), Some("demo"));
         assert_eq!(cli.prompt.as_deref(), Some("extra context"));
     }
 
     #[test]
-    fn test_cli_continue_last() {
+    fn cli_continue_last() {
         let cli = Cli::parse_from(["meka", "-c"]);
         assert!(cli.continue_last);
         assert!(cli.resume.is_none());
     }
 
     #[test]
-    fn test_cli_resume_specific_session() {
+    fn cli_resume_specific_session() {
         let cli = Cli::parse_from(["meka", "-r", "550e8400-e29b-41d4-a716-446655440000"]);
         assert_eq!(
             cli.resume.as_deref(),
@@ -942,85 +1134,123 @@ mod tests {
         assert!(!cli.continue_last);
     }
 
-    /// The reason `-c` stopped taking an optional value: it was the only root flag that could
-    /// swallow the next argument, so a prompt after it was read as a session prefix.
+    /// `-c` takes no value: it would otherwise be the only root flag that could swallow the next
+    /// argument, and a prompt after it would be read as a session prefix.
     #[test]
-    fn test_cli_continue_does_not_consume_the_prompt() {
-        let cli = Cli::parse_from(["meka", "-c", "fix the bug"]);
+    fn cli_continue_does_not_consume_the_prompt() {
+        let cli = Cli::parse_from(["meka", "-c", "-p", "fix the bug"]);
         assert!(cli.continue_last);
         assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
     }
 
     #[test]
-    fn test_cli_resume_takes_the_id_and_leaves_the_prompt() {
-        let cli = Cli::parse_from(["meka", "-r", "550e8400", "fix the bug"]);
+    fn cli_resume_takes_the_id_and_leaves_the_prompt() {
+        let cli = Cli::parse_from(["meka", "-r", "550e8400", "-p", "fix the bug"]);
         assert_eq!(cli.resume.as_deref(), Some("550e8400"));
         assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
     }
 
     #[test]
-    fn test_cli_continue_and_resume_are_mutually_exclusive() {
+    fn cli_continue_and_resume_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["meka", "-c", "-r", "550e8400"]).is_err());
     }
 
     #[test]
-    fn test_cli_flags() {
-        let cli = Cli::parse_from([
-            "meka",
-            "--provider",
-            "openai-chat-completions",
-            "--no-stream",
-            "-c",
-            "-vv",
-        ]);
-        assert_eq!(cli.provider.as_deref(), Some("openai-chat-completions"));
+    fn cli_flags() {
+        let cli = Cli::parse_from(["meka", "--profile", "work", "--no-stream", "-c", "-vv"]);
+        assert_eq!(cli.profile.as_deref(), Some("work"));
         assert!(cli.no_stream);
         assert!(cli.continue_last);
         assert_eq!(cli.verbosity, 2);
     }
 
+    /// `-p` is the prompt, and the profile has no short form: were the two one letter apart, a
+    /// `-p work` meant to pick a profile would become a turn that said "work".
     #[test]
-    fn test_cli_provider_short_form() {
-        let cli = Cli::parse_from(["meka", "-p", "work", "fix the bug"]);
-        assert_eq!(cli.provider.as_deref(), Some("work"));
+    fn cli_prompt_short_form_and_profile_long_form() {
+        let cli = Cli::parse_from(["meka", "-p", "fix the bug", "--profile", "work"]);
+        assert_eq!(cli.profile.as_deref(), Some("work"));
         assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
     }
 
     #[test]
-    fn test_cli_permission_flag() {
+    fn cli_permission_flag() {
         let cli = Cli::parse_from(["meka", "--permission", "workspace"]);
         assert_eq!(cli.permission, Some(Permission::Workspace));
         let cli = Cli::parse_from(["meka", "--permission", "unrestricted"]);
         assert_eq!(cli.permission, Some(Permission::Unrestricted));
-        // The single-letter aliases are the indicator characters, so what the prompt shows is
-        // always something the flag accepts.
-        let cli = Cli::parse_from(["meka", "--permission", "u"]);
-        assert_eq!(cli.permission, Some(Permission::Unrestricted));
+        // One spelling per level: the prompt's indicator character is display, not a name the
+        // flag takes.
+        assert!(Cli::try_parse_from(["meka", "--permission", "u"]).is_err());
     }
 
-    /// A mode meka does not have must fail *loudly* at the CLI rather than resolve to anything.
+    /// One spelling per value on every flag that takes an enum: an `md` alias and a case variant
+    /// are refused, and the refusal lists what would have been accepted.
+    #[test]
+    fn every_enum_flag_takes_one_spelling_and_refuses_the_rest() {
+        let cli = Cli::parse_from(["meka", "session", "export", "x", "--format", "json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                action: SessionAction::Export {
+                    format: SessionExportFormat::Json,
+                    ..
+                }
+            })
+        ));
+        let refused: [&[&str]; 7] = [
+            &["meka", "session", "export", "x", "--format", "md"],
+            &["meka", "session", "export", "x", "--format", "JSON"],
+            &["meka", "--oneshot", "-p", "x", "--format", "Json"],
+            &["meka", "--render-mode", "RAW", "-p", "x"],
+            &["meka", "--sandbox-backend", "Landlock", "-p", "x"],
+            &["meka", "--permission", "Read", "-p", "x"],
+            &["meka", "mcp", "add", "s", "http://x", "--transport", "HTTP"],
+        ];
+        for arguments in refused {
+            let error = Cli::try_parse_from(arguments)
+                .expect_err("a second spelling must not parse")
+                .to_string();
+            assert!(error.contains("Supported:"), "{arguments:?}: {error}");
+        }
+        let cli = Cli::parse_from(["meka", "mcp", "add", "s", "x", "--transport", "stdio"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mcp {
+                action: McpAction::Add {
+                    transport: Some(crate::config::McpTransport::Stdio),
+                    ..
+                }
+            })
+        ));
+    }
+
+    /// A level meka does not have must fail *loudly* at the CLI rather than resolve to anything.
     ///
     /// This is the surface where an invocation is most likely to be automated, and a hard exit is
-    /// the good outcome there: a nonzero status stops a script, where quietly picking a mode would
+    /// the good outcome there: a nonzero status stops a script, where quietly picking a level would
     /// let it run on with authority nobody chose.
     #[test]
-    fn permission_flag_refuses_a_mode_it_does_not_have() {
+    fn the_permission_flag_refuses_a_level_meka_does_not_have() {
         let error = Cli::try_parse_from(["meka", "--permission", "elevated"])
-            .expect_err("an unknown mode must not parse");
+            .expect_err("an unknown level must not parse");
         let rendered = error.to_string();
-        for mode in ["none", "read", "workspace", "ask", "unrestricted"] {
-            assert!(rendered.contains(mode), "clap must list {mode}: {rendered}");
+        for level in ["none", "read", "workspace", "unrestricted"] {
+            assert!(
+                rendered.contains(level),
+                "clap must list {level}: {rendered}"
+            );
         }
     }
 
     #[test]
-    fn test_cli_continue_long_form() {
+    fn cli_continue_long_form() {
         let cli = Cli::parse_from(["meka", "--continue"]);
         assert!(cli.continue_last);
     }
 
     #[test]
-    fn test_cli_resume_long_form() {
+    fn cli_resume_long_form() {
         let cli = Cli::parse_from(["meka", "--resume", "550e8400-e29b-41d4-a716-446655440000"]);
         assert_eq!(
             cli.resume.as_deref(),
@@ -1029,28 +1259,58 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_provider_add_subcommand() {
+    fn cli_account_add_subcommand() {
         let cli = Cli::parse_from([
             "meka",
-            "provider",
+            "account",
             "add",
             "work",
-            "--type",
+            "--backend",
             "claude-subscription",
         ]);
         match cli.command {
-            Some(Command::Provider {
-                action: ProviderAction::Add { name, r#type, .. },
+            Some(Command::Account {
+                action: AccountAction::Add { name, backend, .. },
             }) => {
                 assert_eq!(name, "work");
-                assert_eq!(r#type.as_deref(), Some("claude-subscription"));
+                assert_eq!(backend.as_deref(), Some("claude-subscription"));
             }
-            other => panic!("expected provider add, got {:?}", other),
+            other => panic!("expected account add, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_cli_session_list_subcommand() {
+    fn cli_profile_add_subcommand() {
+        let cli = Cli::parse_from([
+            "meka",
+            "profile",
+            "add",
+            "daily",
+            "--account",
+            "work",
+            "--model",
+            "claude-opus-5",
+        ]);
+        match cli.command {
+            Some(Command::Profile {
+                action:
+                    ProfileAction::Add {
+                        name,
+                        account,
+                        model,
+                        ..
+                    },
+            }) => {
+                assert_eq!(name, "daily");
+                assert_eq!(account.as_deref(), Some("work"));
+                assert_eq!(model.as_deref(), Some("claude-opus-5"));
+            }
+            other => panic!("expected profile add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_session_list_subcommand() {
         let cli = Cli::parse_from(["meka", "session", "list"]);
         match cli.command {
             Some(Command::Session {
@@ -1058,17 +1318,71 @@ mod tests {
                     SessionAction::List {
                         limit,
                         include_children,
+                        format,
                     },
             }) => {
                 assert_eq!(limit, 20);
                 assert!(!include_children);
+                assert_eq!(format, OutputFormat::Plain);
             }
-            other => panic!("expected session list, got {:?}", other),
+            other => panic!("expected session list, got {other:?}"),
+        }
+    }
+
+    /// Every listing and `show` command takes `--format` with the one vocabulary `OutputFormat`
+    /// has, defaulting to plain, and refuses a spelling it does not have.
+    #[test]
+    fn every_listing_and_show_command_takes_the_same_format_flag() {
+        let commands: [&[&str]; 17] = [
+            &["session", "list"],
+            &["session", "show", "0e5f"],
+            &["account", "list"],
+            &["profile", "list"],
+            &["mcp", "list"],
+            &["mcp", "get", "s"],
+            &["mcp", "tools", "s"],
+            &["schedule", "list"],
+            &["schedule", "show", "7f3a"],
+            &["memory", "list"],
+            &["memory", "get", "m"],
+            &["memory", "show", "m"],
+            &["tools", "list"],
+            &["history", "list"],
+            &["skill", "list"],
+            &["skill", "get", "s"],
+            &["skill", "show", "s"],
+        ];
+        for command in commands {
+            let mut arguments = vec!["meka"];
+            arguments.extend_from_slice(command);
+            let plain = Cli::try_parse_from(&arguments)
+                .unwrap_or_else(|error| panic!("{command:?} must parse without the flag: {error}"));
+            arguments.extend_from_slice(&["--format", "json"]);
+            let json = Cli::try_parse_from(&arguments)
+                .unwrap_or_else(|error| panic!("{command:?} must take --format json: {error}"));
+            // The flag is inside each variant, so its value is read back through `Debug`: one
+            // assertion shape for seventeen variants.
+            assert!(
+                format!("{:?}", plain.command).contains("format: Plain"),
+                "{command:?} must default to plain: {:?}",
+                plain.command
+            );
+            assert!(
+                format!("{:?}", json.command).contains("format: Json"),
+                "{command:?} must record json: {:?}",
+                json.command
+            );
+            arguments.pop();
+            arguments.push("JSON");
+            let refused = Cli::try_parse_from(&arguments)
+                .expect_err("a second spelling must not parse")
+                .to_string();
+            assert!(refused.contains("Supported:"), "{command:?}: {refused}");
         }
     }
 
     #[test]
-    fn test_cli_session_delete_all_subcommand() {
+    fn cli_session_delete_all_subcommand() {
         let cli = Cli::parse_from(["meka", "session", "delete", "--all"]);
         match cli.command {
             Some(Command::Session {
@@ -1080,18 +1394,18 @@ mod tests {
                 assert!(session_ids.is_empty());
                 assert!(all);
             }
-            other => panic!("expected session delete, got {:?}", other),
+            other => panic!("expected session delete, got {other:?}"),
         }
     }
 
     /// Naming sessions and then asking for every session are two different requests.
     ///
-    /// It used to take both and quietly honour the wider one, so `meka session delete "$ID" --all`
-    /// with `$ID` unset deleted the store and reported the empty id as a failure -- a complete
-    /// success reported as an error, over work nobody asked for. Same reasoning as the
-    /// `--older-than-days` conflicts beside it.
+    /// Taking both and quietly honoring the wider one would let `meka session delete "$ID" --all`
+    /// with `$ID` unset delete the store and report the empty id as a failure: a complete success
+    /// reported as an error, over work nobody asked for. Same reasoning as the `--older-than-days`
+    /// conflicts beside it.
     #[test]
-    fn test_cli_session_delete_all_conflicts_with_explicit_ids() {
+    fn cli_session_delete_all_conflicts_with_explicit_ids() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
         assert!(
             Cli::try_parse_from(["meka", "session", "delete", id, "--all"]).is_err(),
@@ -1099,9 +1413,9 @@ mod tests {
         );
     }
 
-    /// The manual replacement for size-based auto-cleanup, so it has to actually parse.
+    /// The manual counterpart to `[session].retention`, so it has to actually parse.
     #[test]
-    fn test_cli_session_delete_older_than_days() {
+    fn cli_session_delete_older_than_days() {
         let cli = Cli::parse_from(["meka", "session", "delete", "--older-than-days", "90"]);
         match cli.command {
             Some(Command::Session {
@@ -1116,17 +1430,17 @@ mod tests {
                 assert!(!all);
                 assert_eq!(older_than_days, Some(90));
             }
-            other => panic!("expected session delete, got {:?}", other),
+            other => panic!("expected session delete, got {other:?}"),
         }
     }
 
     /// Both other selectors must be refused alongside it. `--all` because the two windows
-    /// disagree, and explicit IDs because a listed session younger than the window would be
+    /// disagree, and explicit ids because a listed session younger than the window would be
     /// silently spared while the user watched a different count come back.
     #[test]
-    fn test_cli_session_delete_older_than_days_conflicts() {
+    fn cli_session_delete_older_than_days_conflicts() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
-        for args in [
+        for arguments in [
             vec![
                 "meka",
                 "session",
@@ -1138,49 +1452,49 @@ mod tests {
             vec!["meka", "session", "delete", "--older-than-days", "90", id],
         ] {
             assert!(
-                Cli::try_parse_from(&args).is_err(),
-                "{args:?} must be rejected"
+                Cli::try_parse_from(&arguments).is_err(),
+                "{arguments:?} must be refused"
             );
         }
     }
 
     #[test]
-    fn test_cli_session_export_stdout_subcommand() {
+    fn cli_session_export_stdout_subcommand() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
         let cli = Cli::parse_from(["meka", "session", "export", id, "-o", "-"]);
         match cli.command {
             Some(Command::Session {
                 action: SessionAction::Export { output, .. },
             }) => assert_eq!(output.as_deref(), Some("-")),
-            other => panic!("expected session export, got {:?}", other),
+            other => panic!("expected session export, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_cli_session_fork_subcommand() {
+    fn cli_session_fork_subcommand() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
         let cli = Cli::parse_from(["meka", "session", "fork", id]);
         match cli.command {
             Some(Command::Session {
                 action: SessionAction::Fork { session_id },
-            }) => assert_eq!(session_id.to_string(), id),
-            other => panic!("expected session fork, got {:?}", other),
+            }) => assert_eq!(session_id, id),
+            other => panic!("expected session fork, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_cli_history_list_subcommand() {
+    fn cli_history_list_subcommand() {
         let cli = Cli::parse_from(["meka", "history", "list", "-n", "10"]);
         match cli.command {
             Some(Command::History {
-                action: HistoryAction::List { limit },
+                action: HistoryAction::List { limit, .. },
             }) => assert_eq!(limit, 10),
-            other => panic!("expected history list, got {:?}", other),
+            other => panic!("expected history list, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_cli_history_clear_subcommand() {
+    fn cli_history_clear_subcommand() {
         let cli = Cli::parse_from(["meka", "history", "clear"]);
         assert!(matches!(
             cli.command,

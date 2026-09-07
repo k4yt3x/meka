@@ -1,10 +1,10 @@
-# Shell Tool
+# Shell tool
 
 ## `execute_command`
 
 Execute a shell command and return its output.
 
-**Permission:** `read` (sandboxed read-only) / `workspace` (sandboxed, writable inside the workspace roots) / `ask` and `unrestricted` (unsandboxed)
+**Permission:** `read` (sandboxed read-only) / `workspace` (sandboxed, writable inside the workspace roots) / `unrestricted` (unsandboxed)
 
 ### Parameters
 
@@ -16,11 +16,11 @@ Execute a shell command and return its output.
 
 ### Behavior
 
-- Executes the command via `sh -c "<command>"` on Unix, or `powershell.exe -NoProfile -NonInteractive -Command "<command>"` on Windows (same shell in both sandboxed and unsandboxed mode).
+- Executes the command via `sh -c "<command>"` on Unix, or `powershell.exe -NoProfile -NonInteractive -Command "<command>"` on Windows, whether or not the command is sandboxed.
 - Captures both stdout and stderr.
 - Returns the exit code along with the output if non-zero.
 - Oversized output is losslessly persisted to the scratchpad by the agent layer; the tool does not truncate what it returns to the agent, up to the residency ceiling below.
-- There is no cap on how much a command may print, but there is a cap on how much of it meka holds in memory. Past 8 MiB on one stream the bytes are written to a file in the cache directory instead, and the tool result carries the first and last 32 KiB plus that file's path, so the whole capture stays reachable with `read_file`. This exists because a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) previously grew one buffer until the process died.
+- There is no cap on how much a command may print, but there is a cap on how much of it meka holds in memory. Past 8 MiB on one stream the bytes are written to a file instead, and the tool result carries the first and last 32 KiB plus that file's path, so the whole capture stays reachable with `read_file`. The file goes under `MEKA_DATA_DIR/command-output` when that variable is set, else the platform cache directory's `meka` subdirectory, else the temp directory; the temp directory is also the fallback when that directory cannot be created. Captures older than a day are swept on the way past. This exists because a command that writes faster than the turn ends (`cat /dev/zero`, a runaway build log) previously grew one buffer until the process died.
 - Default timeout is 30 seconds. If the command exceeds the timeout, it is killed (on Unix, via the process group so backgrounded grandchildren are caught too).
 - Supports cancellation: pressing Ctrl+C while a command is running kills the child process.
 
@@ -29,9 +29,9 @@ Execute a shell command and return its output.
 - **Unix (`sh -c`)**: POSIX `$VAR` expansion applies. Pass a literal `$` with single quotes (`'$foo'`) or backslash escape (`\$foo`).
 - **Windows (`powershell.exe -Command`)**: The script body reaches PowerShell directly. Use PowerShell syntax (`$var = ...`, `$env:PATH`), and crucially, **do not** wrap your command in another `powershell -Command "..."`. The outer PowerShell will expand your inner `$var` references to empty strings before the inner shell runs, producing a parser error on mangled syntax. If you need to invoke a nested script, drop it into a `.ps1` file and run it by path, use `-EncodedCommand <base64>`, or escape each `$` as `` `$ ``.
 
-### Read-Only Sandbox
+### Read-only sandbox
 
-In **read mode**, commands run inside a sandbox that blocks writes to the user's real data. Reads, program execution, and network access still work normally: the threat model is "no state mutation, but `curl http://x | pdftotext` must keep working."
+At **`read`**, commands run inside a sandbox that blocks writes to the user's real data. Reads, program execution, and network access still work normally: the threat model is "no state mutation, but `curl http://x | pdftotext` must keep working."
 
 #### What's blocked vs allowed (across all backends)
 
@@ -61,15 +61,15 @@ A confined command may or may not get a writable temporary directory, and this i
 
 Under Bubblewrap the child gets a private writable `/tmp`, so `mktemp` succeeds and the write goes nowhere real. Under Landlock there is no such directory and the write is simply denied, which takes `git`'s index lock, Python's `tempfile`, `gpg` and `pip` with it. The same is true of `workspace` on Windows outside the granted roots.
 
-This divergence is deliberate. Granting a scratch directory under Landlock would weaken what `read` promises on the backend that currently keeps that promise strictly, so the narrower behaviour stays.
+This divergence is deliberate. Granting a scratch directory under Landlock would weaken what `read` promises on the backend that currently keeps that promise strictly, so the narrower behavior stays.
 
 The practical cost is diagnostic: the model sees a bare `Permission denied` naming a path in `/tmp` (or `%TEMP%`), with nothing in the message connecting it to the sandbox, and cannot act on it. If a command fails that way and you expected it to work, install `bwrap` for Landlock hosts, or add the directory it wants as a writable root at `workspace`.
 
 #### Environment variable scrubbing
 
-Read-mode sandboxes still permit outbound network (the threat model intentionally keeps `curl http://x | pdftotext`-style pipelines working), so any secret in the parent process's environment (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, OAuth tokens, etc.) would be a live exfiltration vector under prompt injection. meka scrubs the child environment at spawn time across every backend (Bubblewrap, Landlock, Seatbelt, Windows Low-integrity).
+The `read` sandbox still permits outbound network (the threat model intentionally keeps `curl http://x | pdftotext`-style pipelines working), so any secret in the parent process's environment (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, OAuth tokens, etc.) would be a live exfiltration vector under prompt injection. meka scrubs the child environment at spawn time across every backend (Bubblewrap, Landlock, Seatbelt, Windows Low-integrity).
 
-- **Unix (Linux + macOS): allow-list.** Only a curated set of vars survives into the read-mode child: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PWD`, `TERM`, `COLORTERM`, `LANG`, `TMPDIR`, `TMP`, `TEMP`, plus everything matching the `LC_*` and `XDG_*` prefixes. Because read mode intentionally keeps outbound network working, the proxy and CA-bundle vars survive too: `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY` (and their lowercase spellings), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` -- several of which redirect TLS trust, so treat them as part of the boundary. Anything else is dropped, including credential-shaped vars (`AWS_*`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, …) and credential-pointer vars (`SSH_AUTH_SOCK`, `KUBECONFIG`, `GNUPGHOME`, `NETRC`, `GIT_ASKPASS`, `GIT_SSH_COMMAND`, etc.) as well as benign-but-unlisted vars like `EDITOR`, `PAGER`, `DISPLAY`, custom toolchain vars, and so on. Unknown vars are dropped by default.
+- **Unix (Linux + macOS): allow-list.** Only a curated set of vars survives into the `read` child: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PWD`, `TERM`, `COLORTERM`, `LANG`, `TMPDIR`, `TMP`, `TEMP`, plus everything matching the `LC_*` and `XDG_*` prefixes. Because `read` intentionally keeps outbound network working, the proxy and CA-bundle vars survive too: `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY` (and their lowercase spellings), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`, several of which redirect TLS trust, so treat them as part of the boundary. Anything else is dropped, including credential-shaped vars (`AWS_*`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, …) and credential-pointer vars (`SSH_AUTH_SOCK`, `KUBECONFIG`, `GNUPGHOME`, `NETRC`, `GIT_ASKPASS`, `GIT_SSH_COMMAND`, etc.) as well as benign-but-unlisted vars like `EDITOR`, `PAGER`, `DISPLAY`, custom toolchain vars, and so on. Unknown vars are dropped by default.
 - **Windows: deny-list.** PowerShell pulls in a long tail of system vars (`PSModulePath`, `APPDATA`, `ProgramFiles`, etc.) that don't fit a tidy allow-list, so the Windows path lets everything through *except* names that match a heuristic deny-list. Dropped names include:
     - Credential-shaped substrings: `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*PASSPHRASE*`, `*API_KEY*`, `*_KEY*`, `*BEARER*`, `*CREDENTIAL*`, etc.
     - Credential-pointer substrings: `SSH_AUTH_SOCK`, `KUBECONFIG`, `GNUPGHOME`, `NETRC`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH_COMMAND`.
@@ -77,18 +77,18 @@ Read-mode sandboxes still permit outbound network (the threat model intentionall
 
   The deny-list is intentionally aggressive on false positives (a legitimate `GITHUB_ACTOR` is dropped alongside `GITHUB_TOKEN`) because the cost of a missing env var is a confusing tool error, while the cost of a leaked credential is a live exfiltration channel.
 
-**`ask` and `unrestricted` keep the full parent environment.** These are the trusted-operation paths where users legitimately need `NPM_TOKEN` for `npm publish`, `AWS_*` creds for `aws s3 cp`, `GH_TOKEN` for `gh pr create`, etc. If you need a specific var inside a sandboxed shell command, switch to one of them for that turn.
+**`unrestricted` keeps the full parent environment.** This is the trusted-operation path where users legitimately need `NPM_TOKEN` for `npm publish`, `AWS_*` creds for `aws s3 cp`, `GH_TOKEN` for `gh pr create`, etc. If you need a specific var inside a sandboxed shell command, switch to it for that turn.
 
-For `ask` specifically this is worth stating outright, because the approval prompt shows you a *command* and not its environment: an approved `npm test` whose postinstall script reads `process.env` sees `ANTHROPIC_API_KEY` and every other secret in meka's environment, on a sandbox that deliberately leaves the network open. That is the same reach an approved `write_file` has, which is the point of the level -- the prompt is what you are trusting, not a scrub behind it. If you want the scrub, `workspace` keeps it and confines writes to the workspace roots.
+An approved command is not an exception: with [approvals](../usage/permissions.md#approvals) on, a command you approve at `read` or `workspace` still runs in that level's sandbox with the scrubbed environment. Approval never widens reach, so the prompt is a question about whether to run the command, not a grant of the environment behind it.
 
 #### Linux: pick a backend
 
 Linux supports two backends, selected via `[shell].sandbox_backend` in `config.toml`:
 
 - **Bubblewrap** (`sandbox_backend = "bubblewrap"`, recommended): wraps the command in `bwrap` with `--ro-bind /`, tmpfs masks over `/run`, `/tmp`, `/var/tmp`, and `$XDG_RUNTIME_DIR`, plus `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks make the dbus session bus, systemd-user socket, and other socket-on-disk IPC paths unreachable, so `systemctl --user start <unit>`, `dbus-send`, and similar state-changing calls fail. Network is not unshared. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
-- **Landlock** (`sandbox_backend = "landlock"`, legacy / fallback): uses the [Landlock LSM](https://landlock.io/). Blocks filesystem writes via `landlock_restrict_self`. **Requires ABI v3 (kernel 6.2+)**: below that the kernel does not mediate `truncate(2)`, so a sandboxed command could still empty an existing file despite every open-for-write being denied. meka reports Landlock unusable on those kernels rather than sandboxing with a ruleset that does not enforce what read mode promises, which means kernels 5.13–6.1 need Bubblewrap installed for read-mode shell. On kernel 7.1+ (ABI v9) Landlock also blocks `connect()` to every Unix socket on disk, which closes the dbus / systemd-user route out of the sandbox but likewise breaks socket-based clients such as `docker` and `psql` in read mode. **Between ABI v3 and v9 that right does not exist**, so a sandboxed shell can invoke state-mutating dbus methods and `systemd-run --user` escapes the filesystem restriction entirely; meka warns at startup naming exactly which mitigations the running ABI lacks. Prefer Bubblewrap, which removes those sockets on any kernel.
+- **Landlock** (`sandbox_backend = "landlock"`, legacy / fallback): uses the [Landlock LSM](https://landlock.io/). Blocks filesystem writes via `landlock_restrict_self`. **Requires ABI v3 (kernel 6.2+)**: below that the kernel does not mediate `truncate(2)`, so a sandboxed command could still empty an existing file despite every open-for-write being denied. meka reports Landlock unusable on those kernels rather than sandboxing with a ruleset that does not enforce what `read` promises, which means kernels 5.13–6.1 need Bubblewrap installed for the shell at `read`. On kernel 7.1+ (ABI v9) Landlock also blocks `connect()` to every Unix socket on disk, which closes the dbus / systemd-user route out of the sandbox but likewise breaks socket-based clients such as `docker` and `psql` at `read`. **Between ABI v3 and v9 that right does not exist**, so a sandboxed shell can invoke state-mutating dbus methods and `systemd-run --user` escapes the filesystem restriction entirely; meka warns at startup naming exactly which mitigations the running ABI lacks. Prefer Bubblewrap, which removes those sockets on any kernel.
 
-`sandbox_backend` is unset unless you pin it yourself; `meka provider add` does not write it. When unset, meka probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with a one-shot warning that points at the install path and the suppress-this-warning escape hatch.
+`sandbox_backend` is unset unless you pin it yourself; no command writes it. When unset, meka probes Bubblewrap once at startup and prefers it when available, falling back to Landlock with a one-shot warning that points at the install path and the suppress-this-warning escape hatch.
 
 ```toml
 [shell]
@@ -122,11 +122,11 @@ See [Permissions](../usage/permissions.md#per-platform-enforcement) for the full
 
 #### When the configured backend is unavailable
 
-If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `execute_command` in read mode returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to `unrestricted` (Shift+Tab).
+If `sandbox_backend = "bubblewrap"` is set but `bwrap` isn't on `$PATH` (or user namespaces are denied), `execute_command` at `read` returns a hard error rather than silently falling back. The error names the configured backend and the specific failure reason. Either install `bubblewrap`, set `sandbox_backend = "landlock"`, or switch to `unrestricted` (Shift+Tab).
 
 #### Disabling the sandbox entirely
 
-To disable sandboxed shell execution altogether, set `sandbox = false` under `[shell]`. When disabled, shell commands require `ask` or `unrestricted`: `read` loses the tool entirely, and `workspace` refuses it with an error naming the key, because there is no longer anything to hold the boundary that mode promises. Reach for `unrestricted` on those turns rather than expecting `workspace` to quietly run unconfined.
+To disable sandboxed shell execution altogether, set `sandbox = false` under `[shell]`. When disabled, shell commands require `unrestricted`: `read` loses the tool entirely, and `workspace` refuses it with an error naming the key, because there is no longer anything to hold the boundary that level promises. Reach for `unrestricted` on those turns rather than expecting `workspace` to quietly run unconfined.
 
 ```toml
 [shell]

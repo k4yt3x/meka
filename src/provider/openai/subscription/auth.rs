@@ -66,11 +66,11 @@ fn decode_jwt_payload<T: serde::de::DeserializeOwned>(jwt: &str) -> Result<T> {
         }
     };
 
-    let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|error| {
-        MekaError::Provider(format!("id_token base64 decode failed: {}", error))
-    })?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|error| MekaError::Provider(format!("id_token base64 decode failed: {error}")))?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| MekaError::Provider(format!("id_token JSON decode failed: {}", error)))
+        .map_err(|error| MekaError::Provider(format!("id_token JSON decode failed: {error}")))
 }
 
 #[cfg(test)]
@@ -84,11 +84,11 @@ mod tests {
         let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
         let payload = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(b"signature");
-        format!("{}.{}.{}", header, payload, signature)
+        format!("{header}.{payload}.{signature}")
     }
 
     #[test]
-    fn test_extract_account_id_namespaced_claim() {
+    fn extract_account_id_namespaced_claim() {
         let jwt = make_jwt(serde_json::json!({
             "sub": "user-1",
             "https://api.openai.com/auth": {
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_account_id_missing_claim() {
+    fn extract_account_id_missing_claim() {
         let jwt = make_jwt(serde_json::json!({
             "sub": "user-1",
             "https://api.openai.com/auth": {
@@ -114,41 +114,41 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_account_id_no_auth_namespace() {
+    fn extract_account_id_no_auth_namespace() {
         let jwt = make_jwt(serde_json::json!({"sub": "user-1"}));
         assert!(extract_account_id(&jwt).unwrap().is_none());
     }
 
     #[test]
-    fn test_extract_account_id_malformed_jwt_two_parts() {
+    fn extract_account_id_malformed_jwt_two_parts() {
         let result = extract_account_id("only.two");
         assert!(matches!(result, Err(MekaError::Provider(_))));
     }
 
     #[test]
-    fn test_extract_account_id_malformed_jwt_empty_parts() {
+    fn extract_account_id_malformed_jwt_empty_parts() {
         let result = extract_account_id("..");
         assert!(matches!(result, Err(MekaError::Provider(_))));
     }
 
     #[test]
-    fn test_extract_account_id_invalid_base64() {
+    fn extract_account_id_invalid_base64() {
         let result = extract_account_id("aaa.!!!.bbb");
         assert!(matches!(result, Err(MekaError::Provider(_))));
     }
 
     #[test]
-    fn test_extract_account_id_invalid_json() {
+    fn extract_account_id_invalid_json() {
         let header = URL_SAFE_NO_PAD.encode(b"{}");
         let payload = URL_SAFE_NO_PAD.encode(b"not json");
         let signature = URL_SAFE_NO_PAD.encode(b"sig");
-        let jwt = format!("{}.{}.{}", header, payload, signature);
+        let jwt = format!("{header}.{payload}.{signature}");
         let result = extract_account_id(&jwt);
         assert!(matches!(result, Err(MekaError::Provider(_))));
     }
 
     #[test]
-    fn test_extract_expiration_seconds_present() {
+    fn extract_expiration_seconds_present() {
         let jwt = make_jwt(serde_json::json!({"exp": 1_700_000_000}));
         assert_eq!(
             extract_expiration_seconds(&jwt).unwrap(),
@@ -157,13 +157,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_expiration_seconds_absent() {
+    fn extract_expiration_seconds_absent() {
         let jwt = make_jwt(serde_json::json!({"sub": "user"}));
         assert!(extract_expiration_seconds(&jwt).unwrap().is_none());
     }
 
     #[test]
-    fn test_extract_account_id_alongside_other_claims() {
+    fn extract_account_id_alongside_other_claims() {
         let jwt = make_jwt(serde_json::json!({
             "sub": "user-1",
             "iat": 1_700_000_000,

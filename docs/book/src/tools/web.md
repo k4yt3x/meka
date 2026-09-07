@@ -1,4 +1,4 @@
-# Web Tools
+# Web tools
 
 ## `fetch_url`
 
@@ -11,7 +11,7 @@ Fetch a web page and return its content as markdown text.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `url` | string | yes | The URL to fetch |
-| `max_length` | integer | no | Maximum characters to return (default: 30000, 0 for no limit) |
+| `limit` | integer | no | Maximum characters to return (default: 30000, 0 for no limit) |
 | `headers` | object | no | Custom HTTP headers (overrides defaults like User-Agent) |
 | `regex` | string | no | If provided, return only matching content (matches joined by newlines) |
 | `raw` | boolean | no | Return raw HTML instead of converting to markdown (default: false) |
@@ -22,10 +22,11 @@ Fetch a web page and return its content as markdown text.
 - Fetches the page via HTTP GET.
 - Converts HTML to Markdown using `fast_html2md` (unless `raw` is true). `<nav>` and `<footer>` containers are preserved (rewritten to `<div>` before conversion) so their links survive; `fast_html2md` would otherwise drop those subtrees as boilerplate. `<script>` / `<style>` / `<head>` are still stripped.
 - Resolves root-relative links against the page's final (post-redirect) URL, so a `/docs` href renders as the absolute `https://host/docs` the model can follow directly.
-- Truncates the output to `max_length` characters (default: 30,000). When `regex` is given, the pattern runs against the whole document *before* this cap, so `max_length` never decides which matches exist; the cap then applies to the joined match list.
-- HTTP timeout: 30 seconds.
+- Truncates the output to `limit` characters (default: 30,000). When `regex` is given, the pattern runs against the whole document *before* this cap, so `limit` never decides which matches exist; the cap then applies to the joined match list.
+- HTTP timeout: 30 seconds by default; [`[web].request_timeout`](../configuration/config-file.md#web) changes it, and `connect_timeout` / `read_timeout` add tighter caps on the handshake and on a stalled body.
 - Reads at most 10 MiB of decompressed body, checked while streaming so a small compressed payload cannot expand past it.
 - Returns the HTTP status code as an error if the request fails (e.g., 404, 500).
+- `fetch_url` is not a network boundary. It reaches whatever the process can reach, including private and loopback addresses, and so does a sandboxed `execute_command`, whose network is open. Confine the network at the host, not per tool.
 
 ### Image URLs
 
@@ -39,7 +40,7 @@ If the response `Content-Type` is a supported raster image format, `fetch_url` r
 
 **Unsupported formats** (fall through to the text branch): `image/svg+xml`, `image/jxl`, `image/heic`, `image/avif`.
 
-- The `max_length`, `regex`, and `raw` options do **not** apply to image responses.
+- The `limit`, `regex`, and `raw` options do **not** apply to image responses.
 - Size cap of ~3.75 MB applies to the **output** bytes (after conversion). Conversion can enlarge an image, so a 1 MB TIFF may produce a larger PNG.
 - Detection uses the response's actual `Content-Type` header, so redirect chains and extension-less URLs are handled correctly.
 
@@ -64,11 +65,11 @@ Search DuckDuckGo and return the top results.
 ### Behavior
 
 - Returns up to 10 results per search.
-- Each result includes the title, source domain, URL, and a snippet with matched terms emphasised in **bold**.
+- Each result includes the title, source domain, URL, and a snippet with matched terms emphasized in **bold**.
 - Snippets are capped at 300 characters; use `fetch_url` on the result URL for the full page.
 - Uses HTML scraping (no API key required).
-- HTTP timeout: 30 seconds, and the same 10 MiB streamed body cap as `fetch_url`.
-- A non-2xx response is an error rather than an empty result set. A block or rate-limit page still carries HTML, and parsing it found no result rows, so being turned away used to read as "No search results found." -- a statement about the query rather than about the request.
+- HTTP timeout: 30 seconds by default, from the same [`[web]`](../configuration/config-file.md#web) keys as `fetch_url`, and the same 10 MiB streamed body cap.
+- A non-2xx response is an error rather than an empty result set. A block or rate-limit page still carries HTML, and parsing it found no result rows, so being turned away used to read as "No search results found.", a statement about the query rather than about the request.
 
 ### CAPTCHA detection
 

@@ -3,10 +3,10 @@
 //! Deliberately a separate family from `conversation_*`, which reads the *archive* - the full
 //! on-disk log, including turns compaction removed from the window entirely. These three act on the
 //! live window instead. The two families sort adjacently (`cont` precedes `conv`), so the split
-//! costs nothing in the catalogue while keeping each name honest about what it touches.
+//! costs nothing in the catalog while keeping each name honest about what it touches.
 //!
 //! `context_check` exists because the pushed `[Context budget]` block
-//! ([`crate::context::ContextBudget`]) is rendered once per turn, into the user message at turn
+//! ([`crate::prompt::ContextBudget`]) is rendered once per turn, into the user message at turn
 //! start. The counter behind it moves on every provider response including mid-tool-loop, but the
 //! rendered text does not, so the gauge is stalest exactly when a tool loop is ingesting large
 //! results. Refreshing the block in place would rewrite a message the cached prefix already covers
@@ -19,64 +19,52 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::{Tool, ToolOutput, util::resolve_session_id};
 use crate::{
-    agent::{CompactOrigin, CompactRequest, compaction_tail_budget},
     error::Result,
     permission::Permission,
     provider::ToolDefinition,
-    session::SessionManager,
+    session::{CompactOrigin, CompactRequest, PendingCompaction, compaction_tail_budget},
+    store::Store,
 };
 
-/// A compaction the agent asked for, parked until the loop reaches a point that can run it.
-///
-/// Tools hold no `&mut Conversation` - the agent loop owns it for the duration of the turn - so
-/// `context_compact` cannot compact where it stands. It records the request here and the tool loop
-/// drains it once the batch's results are in, which is what lets the turn carry on against the
-/// summary instead of ending at the request. A turn that fails before reaching that point leaves
-/// the request behind, and the drain after the loop takes it so it cannot fire against a later one.
-pub type PendingCompaction = Arc<std::sync::Mutex<Option<CompactRequest>>>;
-
 /// The summary a checkpoint turn submitted, and what it decided about the tail.
-pub struct Submission {
-    pub summary: String,
-    pub keep_recent: Option<bool>,
+pub(crate) struct Submission {
+    pub(crate) summary: String,
+    pub(crate) keep_recent: Option<bool>,
 }
 
 /// Slot `context_replace` writes into. Owned by the checkpoint turn that registered the tool, so a
 /// fresh one is created per compaction and never outlives it.
-pub type SubmissionSlot = Arc<std::sync::Mutex<Option<Submission>>>;
+pub(crate) type SubmissionSlot = Arc<std::sync::Mutex<Option<Submission>>>;
 
 /// Live numbers `context_check` reports, kept current by the agent.
 #[derive(Clone)]
-pub struct ContextGauge {
+pub(crate) struct ContextGauge {
     /// Total tokens behind the most recent provider round: the same handle
     /// `Agent::last_context_tokens` writes after every response, so this moves within a turn
     /// rather than only between turns.
-    pub used: Arc<AtomicU64>,
+    pub(crate) used: Arc<AtomicU64>,
     /// Estimated system prompt + tool schemas, re-stamped by the agent each turn. Separate from
     /// `used` because it is the part compaction *cannot* reclaim, which is what makes it worth
     /// reporting.
-    pub overhead: Arc<AtomicU64>,
+    pub(crate) overhead: Arc<AtomicU64>,
     /// The model's window, or zero when meka has no metadata for it.
     ///
     /// A handle rather than a value because a session can move onto another profile mid-run, and a
-    /// window frozen when the tools were registered reported the old profile's size to the model
-    /// for the rest of the session. Written by `Agent::set_provider` through
-    /// [`crate::agent::PublishedBinding`].
-    pub window: Arc<AtomicU64>,
+    /// window frozen when the tools were registered would report the previous profile's size to
+    /// the model for the rest of the session. Written by `Agent::set_provider` through
+    /// [`crate::provider::PublishedProfile`].
+    pub(crate) window: Arc<AtomicU64>,
     /// Occupancy at which auto-compaction fires, or `None` when it is off.
-    pub compact_at_percent: Option<u64>,
+    pub(crate) compact_at_percent: Option<u64>,
 }
 
 pub(super) struct ContextCheckTool {
-    pub gauge: ContextGauge,
-    pub session_manager: SessionManager,
-    pub session_id: Arc<RwLock<Option<Uuid>>>,
+    pub(crate) gauge: ContextGauge,
+    pub(crate) store: Store,
+    pub(crate) site: crate::session::ToolSite,
 }
 
 #[async_trait]
@@ -93,9 +81,7 @@ impl Tool for ContextCheckTool {
                 "type": "object",
                 "properties": {},
             }),
-            title: None,
-            annotations: None,
-            meta: None,
+            ..Default::default()
         }
     }
 
@@ -106,7 +92,7 @@ impl Tool for ContextCheckTool {
     async fn execute(
         &self,
         _input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let used = self.gauge.used.load(Ordering::Relaxed);
         let overhead = self.gauge.overhead.load(Ordering::Relaxed);
@@ -122,10 +108,7 @@ impl Tool for ContextCheckTool {
                 "Context window: unknown for this model, so occupancy cannot be reported.\n",
             ),
             Some(percent) => {
-                report.push_str(&format!(
-                    "Using {} of {} tokens ({}%).\n",
-                    used, window, percent
-                ));
+                report.push_str(&format!("Using {used} of {window} tokens ({percent}%).\n"));
                 match self.gauge.compact_at_percent {
                     Some(threshold) => {
                         let limit = window.saturating_mul(threshold) / 100;
@@ -151,9 +134,8 @@ impl Tool for ContextCheckTool {
 
         if overhead > 0 {
             report.push_str(&format!(
-                "Fixed overhead: about {} tokens of system prompt and tool schemas (estimated). \
-                 Compaction does not reclaim this.\n",
-                overhead
+                "Fixed overhead: about {overhead} tokens of system prompt and tool schemas (estimated). \
+                 Compaction does not reclaim this.\n"
             ));
             if used > overhead {
                 report.push_str(&format!(
@@ -165,8 +147,8 @@ impl Tool for ContextCheckTool {
 
         // Best-effort: a session that has not been created yet, or a read that fails, should not
         // fail the whole call over a line that is context rather than the answer.
-        if let Ok(session_id) = resolve_session_id(&self.session_id, "context_check").await
-            && let Ok(generation) = self.session_manager.count_compactions(session_id).await
+        if let Ok(session_id) = resolve_session_id(&self.site.session_id, "context_check")
+            && let Ok(generation) = self.store.count_compactions(session_id).await
         {
             report.push_str(&match generation {
                 0 => "Compactions so far: none, so nothing has been summarized away yet.\n".into(),
@@ -174,10 +156,9 @@ impl Tool for ContextCheckTool {
                       `conversation_search` reaches the original turns.\n"
                     .to_string(),
                 count => format!(
-                    "Compactions so far: {}. Each one summarizes the previous summary, so early \
+                    "Compactions so far: {count}. Each one summarizes the previous summary, so early \
                      detail is now several removes from the original; write anything that must \
-                     last to memory rather than trusting it to survive another pass.\n",
-                    count
+                     last to memory rather than trusting it to survive another pass.\n"
                 ),
             });
         }
@@ -187,7 +168,7 @@ impl Tool for ContextCheckTool {
 }
 
 pub(super) struct ContextCompactTool {
-    pub pending: PendingCompaction,
+    pub(crate) pending: PendingCompaction,
     /// Whether a checkpoint turn will actually run (`[session].compact_checkpoint`).
     ///
     /// Carried so this tool can tell the truth about what happens next. The difference is not
@@ -195,7 +176,7 @@ pub(super) struct ContextCompactTool {
     /// compact, so it can reasonably defer that work; without one the summary is written by a
     /// separate call with no tools, and anything not already saved is simply gone. An agent told
     /// it would get a checkpoint that never comes would skip the one action that mattered.
-    pub checkpoint_enabled: bool,
+    pub(crate) checkpoint_enabled: bool,
 }
 
 #[async_trait]
@@ -232,13 +213,12 @@ impl Tool for ContextCompactTool {
                     },
                     "keep_recent": {
                         "type": "boolean",
-                        "description": "Whether to keep the most recent turns verbatim after the summary. Default: true. Set false to start clean, only when the summary and what you have saved cover everything - e.g. closing out a day's work."
+                        "default": true,
+                        "description": "Whether to keep the most recent turns verbatim after the summary. Default: true. Set false to start clean, only when the summary and what you have saved cover everything, such as when closing out a day's work."
                     }
                 },
             }),
-            title: None,
-            annotations: None,
-            meta: None,
+            ..Default::default()
         }
     }
 
@@ -249,7 +229,7 @@ impl Tool for ContextCompactTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let request = CompactRequest {
             origin: CompactOrigin::Requested,
@@ -259,16 +239,15 @@ impl Tool for ContextCompactTool {
                 .filter(|instructions| !instructions.is_empty())
                 .map(str::to_string),
             keep_recent: input["keep_recent"].as_bool(),
+            prompt_id: context.prompt_id,
         };
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pending = crate::sync::lock(&self.pending);
         // Last call wins rather than first, within the batch the loop drains as a unit: a model
         // that asks twice before the drain most likely refined what it wanted, and keeping the
         // first would silently apply the stale instructions. Across batches the decision is not
         // here but at the drain, which acts on one request per turn and drops the rest.
         *pending = Some(request);
+        drop(pending);
         Ok(ToolOutput::text(
             if self.checkpoint_enabled {
                 "Compaction runs once this batch of tool calls finishes, and then this turn \
@@ -289,10 +268,10 @@ impl Tool for ContextCompactTool {
 }
 
 /// The checkpoint turn's terminal call. Registered only for that turn, so it never appears in the
-/// ordinary catalogue and is deliberately absent from `BUILTIN_TOOL_NAMES`: listing it there would
-/// let a `disabled_tools` entry silently downgrade every compaction to the fallback summariser.
+/// ordinary catalog and is deliberately absent from `BUILTIN_TOOL_NAMES`: listing it there would
+/// let a `disabled_tools` entry silently downgrade every compaction to the fallback summarizer.
 pub(super) struct ContextReplaceTool {
-    pub slot: SubmissionSlot,
+    pub(crate) slot: SubmissionSlot,
 }
 
 #[async_trait]
@@ -314,14 +293,13 @@ impl Tool for ContextReplaceTool {
                     },
                     "keep_recent": {
                         "type": "boolean",
+                        "default": true,
                         "description": "Whether to keep the most recent turns verbatim after the summary. Default: true. Set false only when your summary and what you have saved fully cover them."
                     }
                 },
                 "required": ["summary"]
             }),
-            title: None,
-            annotations: None,
-            meta: None,
+            ..Default::default()
         }
     }
 
@@ -332,7 +310,7 @@ impl Tool for ContextReplaceTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let summary = input["summary"].as_str().unwrap_or_default().trim();
         if summary.is_empty() {
@@ -345,22 +323,21 @@ impl Tool for ContextReplaceTool {
                 true,
             ));
         }
-        let mut slot = self
-            .slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = crate::sync::lock(&self.slot);
         *slot = Some(Submission {
             summary: summary.to_string(),
             keep_recent: input["keep_recent"].as_bool(),
         });
+        drop(slot);
         Ok(ToolOutput::text("Checkpoint accepted.".to_string(), false))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
-    use crate::tools::tests::text_content;
 
     fn gauge(used: u64, overhead: u64, window: u64, compact_at: Option<u64>) -> ContextGauge {
         ContextGauge {
@@ -374,19 +351,18 @@ mod tests {
     async fn check(gauge: ContextGauge) -> String {
         let tool = ContextCheckTool {
             gauge,
-            session_manager: SessionManager::open(
-                Some(std::path::Path::new(":memory:")),
-                &Default::default(),
-            )
-            .await
-            .expect("in-memory db"),
-            session_id: Arc::new(RwLock::new(None)),
+            store: Store::for_test().await,
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(crate::session::SharedSessionId::default()),
         };
         let output = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await
             .expect("context_check");
-        text_content(&output)
+        output.text_content()
     }
 
     #[tokio::test]
@@ -431,7 +407,7 @@ mod tests {
         };
         tool.execute(
             serde_json::json!({"instructions": "keep the decisions", "keep_recent": false}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("context_compact");
@@ -453,11 +429,14 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({"summary": "   "}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("context_replace");
-        assert!(output.content.iter().any(|_| true));
+        assert!(
+            output.is_error,
+            "an empty summary must be refused as an error the model can act on"
+        );
         assert!(slot.lock().expect("lock").is_none());
     }
 
@@ -469,7 +448,7 @@ mod tests {
         };
         tool.execute(
             serde_json::json!({"summary": "what happened", "keep_recent": false}),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("context_replace");

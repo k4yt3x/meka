@@ -1,26 +1,22 @@
 //! `render_image` tool: turns base64 image data (provided inline or read from a scratchpad entry)
 //! into a multimodal Image content block so the provider can view it.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use base64::Engine;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::{Tool, ToolOutput};
 use crate::{
     error::{MekaError, Result},
-    image::{build_image_tool_output, classify_bytes},
+    image::classify_bytes,
     permission::Permission,
     provider::ToolDefinition,
-    session::SessionManager,
+    store::Store,
+    tools::util::build_image_tool_output,
 };
 
 pub(super) struct RenderImageTool {
-    pub session_id: Arc<RwLock<Option<Uuid>>>,
-    pub session_manager: SessionManager,
+    pub(crate) site: crate::session::ToolSite,
+    pub(crate) store: Store,
 }
 
 #[async_trait]
@@ -60,7 +56,7 @@ impl Tool for RenderImageTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         let from_scratchpad = input.get("from_scratchpad").and_then(|v| v.as_str());
         let inline = input.get("base64").and_then(|v| v.as_str());
@@ -81,19 +77,19 @@ impl Tool for RenderImageTool {
             }
             (Some(name), None) => {
                 let session_id =
-                    self.session_id
-                        .read()
-                        .await
+                    self.site
+                        .session_id
+                        .get()
                         .ok_or_else(|| MekaError::ToolExecution {
                             tool_name: "render_image".to_string(),
                             message: "no active session".to_string(),
                         })?;
-                self.session_manager
-                    .load_tool_output(session_id, name)
+                self.store
+                    .load_scratchpad_entry(session_id, name)
                     .await?
                     .ok_or_else(|| MekaError::ToolExecution {
                         tool_name: "render_image".to_string(),
-                        message: format!("scratchpad entry \"{}\" not found", name),
+                        message: format!("scratchpad entry '{name}' not found"),
                     })?
             }
             (None, Some(text)) => text.to_string(),
@@ -106,7 +102,7 @@ impl Tool for RenderImageTool {
             Ok(bytes) => bytes,
             Err(error) => {
                 return Ok(ToolOutput::text(
-                    format!("Error: invalid base64 input: {}", error),
+                    format!("Error: invalid base64 input: {error}"),
                     true,
                 ));
             }
@@ -114,7 +110,7 @@ impl Tool for RenderImageTool {
 
         let handling = classify_bytes(&bytes);
         let marker = match from_scratchpad {
-            Some(name) => format!("Image rendered from scratchpad \"{}\"", name),
+            Some(name) => format!("Image rendered from scratchpad \"{name}\""),
             None => "Image rendered from base64 input".to_string(),
         };
 
@@ -123,25 +119,21 @@ impl Tool for RenderImageTool {
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "render_image".to_string(),
-                message: format!("image decode task failed: {}", error),
+                message: format!("image decode task failed: {error}"),
             })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Cursor, path::Path};
+    use std::io::Cursor;
 
     use image::{ImageFormat, RgbaImage};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     use super::*;
-    use crate::{provider::ToolResultContent, tools::tests::text_content};
-
-    async fn test_manager() -> SessionManager {
-        SessionManager::open(Some(Path::new(":memory:")), &Default::default())
-            .await
-            .expect("open in-memory db")
-    }
+    use crate::conversation::ToolResultContent;
 
     fn synthesize_image_bytes(format: ImageFormat) -> Vec<u8> {
         let img = RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
@@ -151,22 +143,23 @@ mod tests {
         out
     }
 
-    fn build_tool(session_manager: SessionManager, session_id: Option<Uuid>) -> RenderImageTool {
+    fn build_tool(store: Store, session_id: Option<Uuid>) -> RenderImageTool {
         RenderImageTool {
-            session_id: Arc::new(RwLock::new(session_id)),
-            session_manager,
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(crate::session::SharedSessionId::new(session_id)),
+            store,
         }
     }
 
     #[tokio::test]
-    async fn test_render_image_base64_input_png() {
+    async fn render_image_base64_input_png() {
         let png = synthesize_image_bytes(ImageFormat::Png);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
-        let tool = build_tool(test_manager().await, None);
+        let tool = build_tool(Store::for_test().await, None);
         let output = tool
             .execute(
                 serde_json::json!({ "base64": encoded }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -175,21 +168,21 @@ mod tests {
         assert_eq!(output.content.len(), 2);
         match &output.content[1] {
             ToolResultContent::Image { source } => {
-                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.media_type(), "image/png");
             }
             _ => panic!("expected Image block"),
         }
     }
 
     #[tokio::test]
-    async fn test_render_image_base64_input_converts_tiff() {
+    async fn render_image_base64_input_converts_tiff() {
         let tiff = synthesize_image_bytes(ImageFormat::Tiff);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&tiff);
-        let tool = build_tool(test_manager().await, None);
+        let tool = build_tool(Store::for_test().await, None);
         let output = tool
             .execute(
                 serde_json::json!({ "base64": encoded }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
@@ -197,25 +190,25 @@ mod tests {
         assert!(!output.is_error);
         match &output.content[1] {
             ToolResultContent::Image { source } => {
-                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.media_type(), "image/png");
             }
             _ => panic!("expected Image block"),
         }
     }
 
     #[tokio::test]
-    async fn test_render_image_scratchpad_input() {
+    async fn render_image_scratchpad_input() {
         let png = synthesize_image_bytes(ImageFormat::Png);
         let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
 
-        let manager = test_manager().await;
+        let manager = Store::for_test().await;
         let session_id = manager
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create session");
         // Trailing newline mimics how command-pipe output typically lands in the scratchpad.
         manager
-            .save_tool_output(session_id, "frame", &format!("{}\n", encoded))
+            .save_scratchpad_entry(session_id, "frame", &format!("{encoded}\n"))
             .await
             .expect("save");
 
@@ -223,18 +216,18 @@ mod tests {
         let output = tool
             .execute(
                 serde_json::json!({ "from_scratchpad": "frame" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
         assert!(!output.is_error);
-        assert!(text_content(&output).contains("frame"));
+        assert!(output.text_content().contains("frame"));
     }
 
     #[tokio::test]
-    async fn test_render_image_missing_scratchpad_entry() {
-        let manager = test_manager().await;
+    async fn render_image_missing_scratchpad_entry() {
+        let manager = Store::for_test().await;
         let session_id = manager
             .create_session(None, "test-profile".to_string())
             .await
@@ -244,62 +237,65 @@ mod tests {
         let result = tool
             .execute(
                 serde_json::json!({ "from_scratchpad": "nonexistent" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_render_image_missing_both_inputs_errors() {
-        let tool = build_tool(test_manager().await, None);
+    async fn render_image_missing_both_inputs_errors() {
+        let tool = build_tool(Store::for_test().await, None);
         let result = tool
-            .execute(serde_json::json!({}), CancellationToken::new())
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_render_image_both_inputs_errors() {
-        let tool = build_tool(test_manager().await, None);
+    async fn render_image_both_inputs_errors() {
+        let tool = build_tool(Store::for_test().await, None);
         let output = tool
             .execute(
                 serde_json::json!({ "from_scratchpad": "a", "base64": "aGVsbG8=" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("returns error tool output");
         assert!(output.is_error);
-        assert!(text_content(&output).contains("exactly one"));
+        assert!(output.text_content().contains("exactly one"));
     }
 
     #[tokio::test]
-    async fn test_render_image_invalid_base64() {
-        let tool = build_tool(test_manager().await, None);
+    async fn render_image_invalid_base64() {
+        let tool = build_tool(Store::for_test().await, None);
         let output = tool
             .execute(
                 serde_json::json!({ "base64": "!!!not-base64!!!" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("returns error tool output");
         assert!(output.is_error);
-        assert!(text_content(&output).contains("invalid base64"));
+        assert!(output.text_content().contains("invalid base64"));
     }
 
     #[tokio::test]
-    async fn test_render_image_unsupported_bytes() {
+    async fn render_image_unsupported_bytes() {
         let garbage = b"not actually an image in any format";
         let encoded = base64::engine::general_purpose::STANDARD.encode(garbage);
-        let tool = build_tool(test_manager().await, None);
+        let tool = build_tool(Store::for_test().await, None);
         let output = tool
             .execute(
                 serde_json::json!({ "base64": encoded }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("returns error tool output");
         assert!(output.is_error);
-        assert!(text_content(&output).contains("unsupported"));
+        assert!(output.text_content().contains("unsupported"));
     }
 }

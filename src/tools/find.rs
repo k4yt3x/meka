@@ -1,7 +1,6 @@
 //! `find_files` tool: glob-pattern file discovery.
 
 use async_trait::async_trait;
-use tokio_util::sync::CancellationToken;
 
 use super::{
     Tool, ToolOutput,
@@ -28,10 +27,7 @@ struct FindOutcome {
 }
 
 pub(super) struct FindFilesTool {
-    pub cwd: crate::workspace::SharedCwd,
-    /// Extra workspace roots swept when the caller names no explicit `path`. Empty outside a
-    /// multi-root ACP session.
-    pub roots: crate::workspace::SharedRoots,
+    pub(crate) site: crate::session::ToolSite,
 }
 
 #[async_trait]
@@ -44,20 +40,19 @@ impl Tool for FindFilesTool {
                  Avoid overly broad searches: scanning a large tree can take \
                  a long time and will hit many directories the user has no \
                  read permission for, producing noisy errors. Start with the \
-                 smallest `path` and most specific pattern that plausibly \
+                 smallest `path` and most specific `glob` that plausibly \
                  contains the answer; if that returns nothing, widen the \
-                 `path` by one level or loosen the pattern, and repeat. Only \
+                 `path` by one level or loosen the `glob`, and repeat. Only \
                  fall back to a tree-wide scan if targeted attempts have all \
-                 failed. Inline results default to {} entries; pass `limit` to \
+                 failed. Inline results default to {DEFAULT_INLINE_RESULTS} entries; pass `limit` to \
                  raise the cap or `scratchpad` to collect them all. \
                  Multiple independent find_files calls in one assistant message \
                  run in parallel.",
-                DEFAULT_INLINE_RESULTS,
             ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {
+                    "glob": {
                         "type": "string",
                         "description": "Glob pattern to match files against. Prefer narrow patterns over broad ones like `**/*`."
                     },
@@ -68,6 +63,7 @@ impl Tool for FindFilesTool {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
+                        "default": DEFAULT_INLINE_RESULTS,
                         "description": format!(
                             "Maximum results to return. Defaults to {} when output is inline, \
                              unbounded when `scratchpad` is set. Pass an explicit value to \
@@ -80,7 +76,7 @@ impl Tool for FindFilesTool {
                         "description": "If provided, save the output to the scratchpad under this name instead of returning it inline."
                     }
                 },
-                "required": ["pattern"]
+                "required": ["glob"]
             }),
             ..Default::default()
         }
@@ -93,25 +89,39 @@ impl Tool for FindFilesTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let pattern = require_str(&input, "pattern", "find_files")?;
+        let cancellation = context.cancellation.clone();
+        let pattern = require_str(&input, "glob", "find_files")?;
         // An explicit `path` searches exactly that tree, resolved against the per-session cwd so
         // the search runs in the right place regardless of where the process was launched. With no
         // `path`, sweep every workspace root: in a multi-root ACP workspace, searching only `cwd`
         // silently misses whole folders the user can see in their editor.
         let base_paths = match input["path"].as_str() {
-            Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.cwd, raw)],
-            None => crate::workspace::glob_roots(&self.cwd, &self.roots),
+            Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
+            None => crate::workspace::glob_roots(&self.site.cwd, &self.site.roots),
         };
+        let private = crate::workspace::private_directories_hidden_at(self.site.permission.get());
         let mut full_patterns: Vec<String> = Vec::with_capacity(base_paths.len());
         for base in &base_paths {
-            // Normalised through the type rather than by trimming a character. The old code did
-            // `trim_end_matches('/')`, which leaves a Windows `C:\work\` alone and yields
-            // `C:\work\/*.md`, whose meaning then depends on `glob`'s separator handling rather
-            // than on anything meka decided. Re-collecting the components drops a trailing
-            // separator on both platforms. A trailing separator is reachable: `resolve_against_cwd`
-            // preserves one, and an ACP client may send it in `additionalDirectories`.
+            // A root the caller named inside meka's own directories is refused, as
+            // `search_contents` refuses it; a walk that reaches them from above skips what it finds
+            // there in `run_walk`.
+            if crate::workspace::resolves_into_private(base, &private) {
+                return Err(MekaError::ToolExecution {
+                    tool_name: "find_files".to_string(),
+                    message: format!(
+                        "'{}' is inside meka's own directories, which only `unrestricted` reads.",
+                        base.display()
+                    ),
+                });
+            }
+            // Normalized through the type rather than by trimming a character:
+            // `trim_end_matches('/')` leaves a Windows `C:\work\` alone and yields `C:\work\/*.md`,
+            // whose meaning then depends on `glob`'s separator handling rather than on anything
+            // meka decided. Re-collecting the components drops a trailing separator on both
+            // platforms. A trailing separator is reachable: `resolve_against_cwd` preserves one,
+            // and an ACP client may send it in `additionalDirectories`.
             let base: std::path::PathBuf = base.components().collect();
             // `glob` takes a `&str` and there is no byte-oriented entry point, so a root that is
             // not valid UTF-8 cannot be searched. Refused loudly. Left to `to_string_lossy` it
@@ -126,14 +136,14 @@ impl Tool for FindFilesTool {
                     ),
                 });
             };
-            // The base is escaped, the caller's `pattern` is not: a root is a literal directory,
+            // The base is escaped, the caller's `glob` is not: a root is a literal directory,
             // and a client is free to have one named `2024*` or `notes[1]`. Without this those
             // parse as wildcards, silently widening the search past the named roots.
             full_patterns.push(format!("{}/{}", glob::Pattern::escape(base), pattern));
         }
 
         // Cap precedence:
-        //   1. explicit `limit` parameter: honoured verbatim
+        //   1. explicit `limit` parameter: honored verbatim
         //   2. no limit + `scratchpad` set: unbounded (preserves the "collect everything" escape
         //      hatch)
         //   3. otherwise: DEFAULT_INLINE_RESULTS
@@ -151,7 +161,8 @@ impl Tool for FindFilesTool {
         // construction, so a per-root budget would silently give a four-root workspace four times
         // the ceiling. `run_walk` walks the roots in order under this single deadline.
         let budget = WalkBudget::new(cancellation.clone());
-        let walk = tokio::task::spawn_blocking(move || run_walk(&full_patterns, cap, &budget));
+        let walk =
+            tokio::task::spawn_blocking(move || run_walk(&full_patterns, cap, &budget, &private));
 
         // Race the walk against the token rather than just awaiting it. The walk checks the same
         // token itself, but `glob`'s iterator does its directory reads inside `next()`, so a walk
@@ -161,7 +172,7 @@ impl Tool for FindFilesTool {
         let outcome = tokio::select! {
             joined = walk => joined.map_err(|error| MekaError::ToolExecution {
                 tool_name: "find_files".to_string(),
-                message: format!("task join error: {}", error),
+                message: format!("task join error: {error}"),
             })??,
             _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
         };
@@ -178,7 +189,12 @@ impl Tool for FindFilesTool {
 /// `budget`. Counts accumulate across roots so the caller's cap and truncation message describe the
 /// whole search rather than its last leg, and a timeout part-way through root two still reports the
 /// matches root one produced.
-fn run_walk(full_patterns: &[String], cap: usize, budget: &WalkBudget) -> Result<FindOutcome> {
+fn run_walk(
+    full_patterns: &[String],
+    cap: usize,
+    budget: &WalkBudget,
+    private: &[std::path::PathBuf],
+) -> Result<FindOutcome> {
     let mut matches: Vec<String> = Vec::new();
     // Roots are kept even when one nests inside another (see `glob_roots`), so a pattern that
     // crosses directories can match the same file from two of them: with roots `/work` and
@@ -216,7 +232,7 @@ fn run_walk(full_patterns: &[String], cap: usize, budget: &WalkBudget) -> Result
         // hand the model a definitive-looking answer to a question that was never asked.
         let paths = glob::glob(full_pattern).map_err(|error| MekaError::ToolExecution {
             tool_name: "find_files".to_string(),
-            message: format!("invalid glob pattern '{}': {}", full_pattern, error),
+            message: format!("invalid glob pattern '{full_pattern}': {error}"),
         })?;
 
         for entry in paths {
@@ -229,6 +245,9 @@ fn run_walk(full_patterns: &[String], cap: usize, budget: &WalkBudget) -> Result
                 None => {}
             }
             match entry {
+                // `glob` follows symlinked directories, so a match is judged on its real path: a
+                // link out of the workspace into the store must not list what the store holds.
+                Ok(path) if crate::workspace::resolves_into_private(&path, private) => {}
                 Ok(path) => {
                     let rendered = path.display().to_string();
                     if full_patterns.len() > 1 && !seen.insert(rendered.clone()) {
@@ -241,7 +260,7 @@ fn run_walk(full_patterns: &[String], cap: usize, budget: &WalkBudget) -> Result
                 }
                 Err(error) => {
                     unreadable += 1;
-                    tracing::debug!("glob error: {}", error);
+                    tracing::debug!("glob error: {error}");
                 }
             }
         }
@@ -263,7 +282,7 @@ fn render_outcome(outcome: &FindOutcome, cap: usize) -> String {
     let mut notes: Vec<String> = Vec::new();
     if outcome.total > outcome.matches.len() {
         notes.push(format!(
-            "showed first {} of {} matches; refine `pattern` to narrow, pass `limit: <n>` to \
+            "showed first {} of {} matches; refine `glob` to narrow, pass `limit: <n>` to \
              raise the cap, or pass `scratchpad: \"name\"` to collect them all",
             cap, outcome.total,
         ));
@@ -271,7 +290,7 @@ fn render_outcome(outcome: &FindOutcome, cap: usize) -> String {
     if outcome.timed_out {
         notes.push(format!(
             "search was still running after {}s and was stopped, so this list is incomplete: \
-             narrow `path` to a smaller subtree or make `pattern` more specific",
+             narrow `path` to a smaller subtree or make `glob` more specific",
             outcome.budget_secs,
         ));
     }
@@ -296,35 +315,37 @@ fn render_outcome(outcome: &FindOutcome, cap: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
-    use crate::tools::tests::text_content;
 
     #[tokio::test]
-    async fn test_find_files() {
+    async fn find_files_matches_a_glob_under_a_directory() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         std::fs::write(temp_dir.path().join("a.txt"), "").expect("failed");
         std::fs::write(temp_dir.path().join("b.txt"), "").expect("failed");
         std::fs::write(temp_dir.path().join("c.rs"), "").expect("failed");
 
         let tool = FindFilesTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
                 serde_json::json!({
-                    "pattern": "*.txt",
+                    "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
         assert!(!result.is_error);
-        assert!(text_content(&result).contains("a.txt"));
-        assert!(text_content(&result).contains("b.txt"));
-        assert!(!text_content(&result).contains("c.rs"));
+        assert!(result.text_content().contains("a.txt"));
+        assert!(result.text_content().contains("b.txt"));
+        assert!(!result.text_content().contains("c.rs"));
     }
 
     /// End-to-end guard for the root set `execute` picks. [`crate::workspace::search_roots`] and
@@ -332,7 +353,7 @@ mod tests {
     /// still compiles and the `run_walk` tests (which take patterns, not roots) stay green.
     /// Only a tool-level search of a workspace whose roots nest catches it.
     #[tokio::test]
-    async fn test_find_files_sweeps_cwd_when_an_additional_root_contains_it() {
+    async fn find_files_sweeps_cwd_when_an_additional_root_contains_it() {
         let top = tempfile::tempdir().expect("tempdir");
         let nested = top.path().join("main");
         std::fs::create_dir(&nested).expect("mkdir");
@@ -340,80 +361,83 @@ mod tests {
         std::fs::write(top.path().join("top.md"), "").expect("write");
 
         let tool = FindFilesTool {
-            cwd: std::sync::Arc::new(std::sync::RwLock::new(nested.clone())),
-            roots: std::sync::Arc::new(std::sync::RwLock::new(vec![top.path().to_path_buf()])),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::SharedCwd::new(nested.clone()))
+                .with_roots(crate::workspace::SharedRoots::new(vec![
+                    top.path().to_path_buf(),
+                ])),
         };
         let result = tool
             .execute(
-                serde_json::json!({ "pattern": "*.md" }),
-                CancellationToken::new(),
+                serde_json::json!({ "glob": "*.md" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             text.contains("README.md"),
-            "a file in cwd must be found even when the workspace also names cwd's parent; got: {}",
-            text,
+            "a file in cwd must be found even when the workspace also names cwd's parent; got: {text}",
         );
-        assert!(text.contains("top.md"), "got: {}", text);
+        assert!(text.contains("top.md"), "got: {text}");
     }
 
     #[tokio::test]
-    async fn test_find_files_inline_default_cap_reports_total() {
+    async fn find_files_inline_default_cap_reports_total() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..600 {
-            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "").expect("write");
         }
 
         let tool = FindFilesTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
                 serde_json::json!({
-                    "pattern": "*.txt",
+                    "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             text.contains("showed first 500 of 600 matches"),
-            "expected real total in truncation message, got: {:.300}",
-            text,
+            "expected real total in truncation message, got: {text:.300}",
         );
     }
 
     #[tokio::test]
-    async fn test_find_files_limit_overrides_default() {
+    async fn find_files_limit_overrides_default() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..600 {
-            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "").expect("write");
         }
 
         let tool = FindFilesTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
                 serde_json::json!({
-                    "pattern": "*.txt",
+                    "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path"),
                     "limit": 100
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(text.contains("showed first 100 of 600 matches"));
         // 100 entries plus the trailing truncation line.
         let path_lines = text.lines().filter(|line| line.ends_with(".txt")).count();
@@ -421,118 +445,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_files_scratchpad_lifts_cap() {
+    async fn find_files_scratchpad_lifts_cap() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..600 {
-            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "").expect("write");
         }
 
         let tool = FindFilesTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
                 serde_json::json!({
-                    "pattern": "*.txt",
+                    "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path"),
                     "scratchpad": "paths"
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(
             !text.contains("showed first"),
-            "expected no truncation marker when scratchpad set, got: {:.200}...",
-            text,
+            "expected no truncation marker when scratchpad set, got: {text:.200}...",
         );
         let line_count = text.lines().filter(|l| l.ends_with(".txt")).count();
         assert!(
             line_count >= 600,
-            "expected >= 600 entries, got {}",
-            line_count
+            "expected >= 600 entries, got {line_count}"
         );
     }
 
     #[tokio::test]
-    async fn test_find_files_explicit_limit_with_scratchpad_caps() {
+    async fn find_files_explicit_limit_with_scratchpad_caps() {
         // Regression: an explicit `limit` should beat the scratchpad "unbounded" default; the
         // agent might legitimately want a bounded scratchpad collection.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..600 {
-            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "").expect("write");
         }
 
         let tool = FindFilesTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let result = tool
             .execute(
                 serde_json::json!({
-                    "pattern": "*.txt",
+                    "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path"),
                     "scratchpad": "paths",
                     "limit": 50
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("should succeed");
 
-        let text = text_content(&result);
+        let text = result.text_content();
         assert!(text.contains("showed first 50 of 600 matches"));
     }
 
     #[tokio::test]
-    async fn test_find_files_cancelled_walk_is_interrupted() {
+    async fn find_files_canceled_walk_is_interrupted() {
         // An ignored cancellation token leaves an over-broad walk unstoppable by Ctrl+C, by ACP
         // `session/cancel`, or by anything else.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..50 {
-            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "").expect("write");
         }
 
         let tool = FindFilesTool {
-            cwd: crate::workspace::test_cwd(),
-            roots: crate::workspace::test_roots(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::cwd_for_test())
+                .with_roots(crate::workspace::roots_for_test()),
         };
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         let error = tool
             .execute(
                 serde_json::json!({
-                    "pattern": "*.txt",
+                    "glob": "*.txt",
                     "path": temp_dir.path().to_str().expect("path")
                 }),
-                cancellation,
+                crate::tools::ToolContext::detached(cancellation),
             )
             .await
-            .expect_err("a cancelled turn must not run the walk to completion");
-        assert!(matches!(error, MekaError::Interrupted), "got: {}", error);
+            .expect_err("a canceled turn must not run the walk to completion");
+        assert!(matches!(error, MekaError::Interrupted), "got: {error}");
     }
 
     #[test]
-    fn test_run_walk_stops_on_exhausted_budget() {
+    fn run_walk_stops_on_exhausted_budget() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..50 {
-            std::fs::write(temp_dir.path().join(format!("f{}.txt", i)), "").expect("write");
+            std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "").expect("write");
         }
         let pattern = format!("{}/*.txt", temp_dir.path().to_string_lossy());
 
         let budget =
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
-        let outcome = run_walk(&[pattern], 500, &budget).expect("walk should return, not error");
+        let outcome =
+            run_walk(&[pattern], 500, &budget, &[]).expect("walk should return, not error");
         assert!(outcome.timed_out, "expired budget must stop the walk");
     }
 
     /// A malformed `pattern` is the caller's mistake and must surface as an error. Returning
     /// "no files found" instead would read as a definitive answer to a search that never ran.
     #[test]
-    fn test_run_walk_errors_on_a_malformed_caller_pattern() {
+    fn run_walk_errors_on_a_malformed_caller_pattern() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pattern = format!(
             "{}/{}",
@@ -540,13 +566,12 @@ mod tests {
             "[unterminated",
         );
         let budget = WalkBudget::new(CancellationToken::new());
-        let Err(error) = run_walk(&[pattern], 500, &budget) else {
+        let Err(error) = run_walk(&[pattern], 500, &budget, &[]) else {
             panic!("a malformed caller pattern must not be swallowed");
         };
         assert!(
-            format!("{}", error).contains("invalid glob pattern"),
-            "got: {}",
-            error
+            format!("{error}").contains("invalid glob pattern"),
+            "got: {error}"
         );
     }
 
@@ -557,7 +582,7 @@ mod tests {
     /// be created there, and a root containing one is unreachable on that platform anyway.
     /// Brackets are legal on both, so this keeps the escaping covered everywhere CI runs.
     #[test]
-    fn test_glob_metacharacters_in_a_root_are_literal() {
+    fn glob_metacharacters_in_a_root_are_literal() {
         let temp = tempfile::tempdir().expect("tempdir");
         let literal = temp.path().join("notes[1]");
         let decoy = temp.path().join("notes1");
@@ -572,7 +597,7 @@ mod tests {
             "*.txt",
         );
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome = run_walk(&[pattern], 500, &budget).expect("walk");
+        let outcome = run_walk(&[pattern], 500, &budget, &[]).expect("walk");
 
         assert_eq!(outcome.total, 1, "must not match the decoy directory");
         assert!(outcome.matches[0].ends_with("a.txt"));
@@ -580,7 +605,7 @@ mod tests {
 
     /// Multi-root walks accumulate into one outcome rather than reporting only the last root.
     #[test]
-    fn test_run_walk_accumulates_across_roots() {
+    fn run_walk_accumulates_across_roots() {
         let first = tempfile::tempdir().expect("tempdir");
         let second = tempfile::tempdir().expect("tempdir");
         std::fs::write(first.path().join("a.txt"), "").expect("write");
@@ -591,7 +616,8 @@ mod tests {
         ];
 
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+        let outcome =
+            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
 
         assert_eq!(outcome.total, 2, "both roots must be searched");
         assert!(outcome.matches.iter().any(|m| m.ends_with("a.txt")));
@@ -604,7 +630,7 @@ mod tests {
     /// so pruning the nested root (which is right for a descending walk, and what `search_roots`
     /// does) would answer `*.md` from the ancestor alone and report the file as missing.
     #[test]
-    fn test_run_walk_finds_files_under_a_root_nested_in_another() {
+    fn run_walk_finds_files_under_a_root_nested_in_another() {
         let top = tempfile::tempdir().expect("tempdir");
         let nested = top.path().join("main");
         std::fs::create_dir(&nested).expect("mkdir");
@@ -617,7 +643,8 @@ mod tests {
             format!("{}/*.md", top.path().to_string_lossy()),
         ];
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+        let outcome =
+            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
 
         assert!(
             outcome.matches.iter().any(|m| m.ends_with("README.md")),
@@ -632,7 +659,7 @@ mod tests {
     /// The dedupe is what makes that safe; without it the file is listed twice and burns two slots
     /// of the result cap.
     #[test]
-    fn test_run_walk_reports_a_doubly_matched_file_once() {
+    fn run_walk_reports_a_doubly_matched_file_once() {
         let top = tempfile::tempdir().expect("tempdir");
         let nested = top.path().join("main");
         std::fs::create_dir(&nested).expect("mkdir");
@@ -643,7 +670,8 @@ mod tests {
             format!("{}/**/*.md", nested.to_string_lossy()),
         ];
         let budget = WalkBudget::new(CancellationToken::new());
-        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+        let outcome =
+            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
 
         assert_eq!(
             outcome.matches.len(),
@@ -658,7 +686,7 @@ mod tests {
     /// the walk begins must stop it at the first root, not grant each root a fresh deadline: that
     /// is what would silently multiply the 60s ceiling by the workspace's root count.
     #[test]
-    fn test_run_walk_shares_one_budget_across_roots() {
+    fn run_walk_shares_one_budget_across_roots() {
         let first = tempfile::tempdir().expect("tempdir");
         let second = tempfile::tempdir().expect("tempdir");
         std::fs::write(first.path().join("a.txt"), "").expect("write");
@@ -670,7 +698,8 @@ mod tests {
 
         let budget =
             WalkBudget::with_budget(CancellationToken::new(), std::time::Duration::from_secs(0));
-        let outcome = run_walk(&patterns, 500, &budget).expect("walk should return, not error");
+        let outcome =
+            run_walk(&patterns, 500, &budget, &[]).expect("walk should return, not error");
 
         assert!(outcome.timed_out, "expired budget must stop the walk");
         assert_eq!(
@@ -680,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_outcome_discloses_timeout_with_no_matches() {
+    fn render_outcome_discloses_timeout_with_no_matches() {
         // The dangerous shape: a walk that was cut short found nothing, and saying only "No files
         // found" would report that as a definitive answer.
         let outcome = FindOutcome {
@@ -691,18 +720,17 @@ mod tests {
             budget_secs: 60,
         };
         let rendered = render_outcome(&outcome, DEFAULT_INLINE_RESULTS);
-        assert!(rendered.contains("No files found"), "got: {}", rendered);
-        assert!(rendered.contains("incomplete"), "got: {}", rendered);
-        assert!(rendered.contains("after 60s"), "got: {}", rendered);
+        assert!(rendered.contains("No files found"), "got: {rendered}");
+        assert!(rendered.contains("incomplete"), "got: {rendered}");
+        assert!(rendered.contains("after 60s"), "got: {rendered}");
         assert!(
             rendered.contains("3 path(s) could not be read"),
-            "got: {}",
-            rendered
+            "got: {rendered}"
         );
     }
 
     #[test]
-    fn test_render_outcome_clean_walk_has_no_notes() {
+    fn render_outcome_clean_walk_has_no_notes() {
         let outcome = FindOutcome {
             matches: vec!["/tmp/a.txt".to_string()],
             total: 1,

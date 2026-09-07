@@ -8,12 +8,10 @@
 //! `compatibility`, `allowed-tools` and `metadata`. Anything meka wants to record that the spec has
 //! no field for goes inside `metadata`, which exists for exactly that ("Clients can use this to
 //! store additional properties not defined by the Agent Skills spec"). meka carries that map
-//! *verbatim* rather than modelling its keys, so a rewrite cannot silently drop what another client
+//! *verbatim* rather than modeling its keys, so a rewrite cannot silently drop what another client
 //! put there; see [`Skill::metadata`].
 //!
 //! [spec]: https://agentskills.io/specification
-
-pub mod cli;
 
 use std::{
     collections::BTreeMap,
@@ -25,7 +23,12 @@ use std::{
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::store::{parse_priority, split_frontmatter};
+use crate::entry::{parse_priority, split_frontmatter};
+
+mod store;
+
+pub(crate) use self::store::*;
+use crate::paths::skills_dir;
 
 /// The `metadata` key holding meka's index ordering.
 ///
@@ -43,30 +46,30 @@ const META_VERSION: &str = "version";
 const MAX_COMPATIBILITY_CHARS: usize = 500;
 
 #[derive(Debug, Clone)]
-pub struct Skill {
+pub(crate) struct Skill {
     /// The skill's identity, which is its *directory* name.
     ///
     /// The spec requires frontmatter `name` and the directory to match, so for a conforming skill
     /// this is the same string. Where they disagree, discovery warns and the directory wins:
-    /// [`write_skill`] and [`delete_skill`] both join this onto a root, and the
-    /// `/skill` grammar keys on it, so identity has to stay the filesystem key.
-    pub name: String,
-    pub source_dir: PathBuf,
-    pub description: String,
+    /// [`write_skill`] and [`delete_skill`] both join this onto a root, and the `/skill` grammar
+    /// keys on it, so identity has to stay the filesystem key.
+    pub(crate) name: String,
+    pub(crate) source_dir: PathBuf,
+    pub(crate) description: String,
     /// Spec field. Informational; surfaced by `meka skill get` and over HTTP, never to the model.
-    pub license: Option<String>,
+    pub(crate) license: Option<String>,
     /// Spec field: what the skill needs from its environment.
     ///
     /// The only new spec field that is *actionable* for the model, so unlike `license` it is
     /// surfaced at activation by [`skill_context_header`].
-    pub compatibility: Option<String>,
+    pub(crate) compatibility: Option<String>,
     /// Spec field, experimental: tools the skill would like pre-approved.
     ///
     /// Read and round-tripped, never acted on. meka's permission system is the authority for what
     /// a tool may do, and a skill author's wishlist is not; a file dropped into the skills
     /// directory must not be able to widen what the agent may run.
-    pub allowed_tools: Option<String>,
-    /// Listing rank, [`crate::store::MIN_PRIORITY`] ..= [`crate::store::MAX_PRIORITY`], lower
+    pub(crate) allowed_tools: Option<String>,
+    /// Listing rank, [`crate::entry::MIN_PRIORITY`] ..= [`crate::entry::MAX_PRIORITY`], lower
     /// first. Orders the `[Skills]` index and therefore decides which skills the index's cap
     /// drops.
     ///
@@ -77,10 +80,10 @@ pub struct Skill {
     ///
     /// Stored on disk under [`META_PRIORITY`], and taken *out* of [`Self::metadata`] on parse so
     /// the value has one owner rather than two that can disagree.
-    pub priority: u8,
+    pub(crate) priority: u8,
     /// The file's `metadata:`, exactly as written, less [`META_PRIORITY`].
     ///
-    /// Carried whole rather than modelled key by key. [`write_skill`] rebuilds the file from a
+    /// Carried whole rather than modeled key by key. [`write_skill`] rebuilds the file from a
     /// `Skill`, so any key this struct cannot hold is a key a rewrite destroys: an agent asked to
     /// refine an imported skill's description would have silently stripped its `license`.
     ///
@@ -95,7 +98,7 @@ pub struct Skill {
     /// own key order, where a `BTreeMap` re-sorted someone else's frontmatter on every edit.
     ///
     /// meka reads keys out of it only when it *is* a mapping; see [`Self::metadata_text`].
-    pub metadata: Option<serde_norway::Value>,
+    pub(crate) metadata: Option<serde_norway::Value>,
     /// Top-level frontmatter keys the spec does not define and meka does not model.
     ///
     /// Kept as parsed YAML and written back verbatim. Skills authored for Claude Code carry
@@ -113,17 +116,17 @@ pub struct Skill {
     /// Nothing is lost, but skills are files people keep in version control, so each `skill_write`
     /// produced a diff that was not a change. `metadata` was moved off `BTreeMap` for exactly this
     /// reason one field up, and this one was left behind.
-    pub extra: serde_norway::Mapping,
+    pub(crate) extra: serde_norway::Mapping,
     /// What the raw file said, for `meka skill add --from-file`. See [`Conformance`].
-    pub conformance: Conformance,
-    pub body_path: PathBuf,
+    pub(crate) conformance: Conformance,
+    pub(crate) body_path: PathBuf,
     /// The root this skill was discovered under.
     ///
     /// Only meaningful against [`SkillCache::root`]: a skill whose root is a different one came
     /// from `[skills] extra_paths` and belongs to whoever put it there, so meka must not write
     /// over it or delete it. Stored rather than derived by prefix-matching the path, because a
     /// symlinked or `..`-containing root would make that comparison quietly wrong.
-    pub root: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 /// A directory in a skills root that discovery could not turn into a [`Skill`].
@@ -132,14 +135,21 @@ pub struct Skill {
 /// inside a session an unparseable `SKILL.md` is indistinguishable from a skill nobody ever wrote
 /// -- the index omits it and `skill_read` reports it missing -- so someone can drop in a procedure
 /// and believe it is available for as long as it takes them to look at stderr. Memory reached that
-/// conclusion first, and no longer needs it: a memory is a database row, so there is no file to be
+/// conclusion first, and does not need it: a memory is a database row, so there is no file to be
 /// unreadable. Skills stay on files because a `SKILL.md` is a shared spec other clients read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkippedSkill {
+pub(crate) struct SkippedSkill {
     /// The directory name as it appears on disk. Callers render it with `escape_debug`, since one
     /// of the reasons a directory lands here is a name meka cannot print.
-    pub name: String,
-    pub reason: String,
+    pub(crate) name: String,
+    /// Why the file did not load, and nothing else.
+    ///
+    /// **No path.** This string reaches an HTTP 422 body through [`SkillIndex::unavailable`] and a
+    /// tool result through `skill_read`, so an absolute path out of the operator's `config.toml`
+    /// would travel to a caller who can do nothing with it. Whoever recorded the skip logs the
+    /// path beside it, and [`Self::source_dir`] is here for a local surface that wants to render
+    /// it.
+    pub(crate) reason: String,
     /// The root it was found under, so the read-only rule applies to it too.
     ///
     /// Without this a directory that failed to parse was a name the store had no opinion about,
@@ -147,12 +157,12 @@ pub struct SkippedSkill {
     /// `PUT /v1/skills/{name}` refused to shadow a working skill in an `extra_paths` root and
     /// silently shadowed a broken one, which is the case where masking the file is least
     /// recoverable: nothing then reports the original at all.
-    pub root: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 impl SkippedSkill {
     /// The directory this skill would have been.
-    pub fn source_dir(&self) -> PathBuf {
+    pub(crate) fn source_dir(&self) -> PathBuf {
         self.root.join(&self.name)
     }
 }
@@ -163,17 +173,17 @@ impl SkippedSkill {
 /// name available?", so a name in both would be answered both ways. [`discover_skills_in_roots`]
 /// establishes that at the end of its walk; see the note there for the case that makes it possible.
 #[derive(Debug, Clone, Default)]
-pub struct SkillIndex {
+pub(crate) struct SkillIndex {
     /// Loaded skills, in the order [`sort_skills`] produced.
-    pub skills: Vec<Skill>,
+    pub(crate) skills: Vec<Skill>,
     /// Directories that failed to load and whose name nothing else supplied, in the order they
     /// were walked.
-    pub skipped: Vec<SkippedSkill>,
+    pub(crate) skipped: Vec<SkippedSkill>,
 }
 
 impl SkillIndex {
     /// The skill of this name, if one loaded.
-    pub fn find(&self, name: &str) -> Option<&Skill> {
+    pub(crate) fn find(&self, name: &str) -> Option<&Skill> {
         self.skills.iter().find(|skill| skill.name == name)
     }
 
@@ -182,7 +192,7 @@ impl SkillIndex {
     /// Every lookup about to report a name as absent asks this first. "No such skill" and "it is
     /// right there and unreadable" call for opposite responses from whoever hears them, and from
     /// the outside the two are the same thing: a name the index does not have.
-    pub fn skip_reason(&self, name: &str) -> Option<&str> {
+    pub(crate) fn skip_reason(&self, name: &str) -> Option<&str> {
         self.skipped
             .iter()
             .find(|skipped| skipped.name == name)
@@ -199,13 +209,14 @@ impl SkillIndex {
     ///
     /// The tools say more than this to the *model*, because a model hearing "not found" will
     /// improvise the procedure and one hearing this must not; see `skill_read`.
-    pub fn unavailable(&self, name: &str) -> String {
+    pub(crate) fn unavailable(&self, name: &str) -> String {
         match self.skip_reason(name) {
-            Some(reason) => format!(
-                "skill '{}' exists on disk but could not be read: {}",
-                name, reason
-            ),
-            None => format!("no skill named '{}'", name),
+            Some(reason) => {
+                format!("skill '{name}' exists on disk but could not be read: {reason}")
+            }
+            // The `unknown_name` head without its configured list: a targeted resolve holds only
+            // the skill it was asked for, so listing what this index knows would say "none".
+            None => format!("no skill named '{name}'"),
         }
     }
 
@@ -214,7 +225,7 @@ impl SkillIndex {
     /// The skipped half is the point. A name is claimed by the directory that holds it regardless
     /// of what is inside, so the read-only rule has to answer from both lists: consulting only
     /// [`Self::skills`] made the refusal depend on whether the shadowed file happened to be valid.
-    pub fn location(&self, name: &str) -> Option<(&Path, PathBuf)> {
+    pub(crate) fn location(&self, name: &str) -> Option<(&Path, PathBuf)> {
         if let Some(skill) = self.find(name) {
             return Some((skill.root.as_path(), skill.source_dir.clone()));
         }
@@ -225,50 +236,6 @@ impl SkillIndex {
     }
 }
 
-/// Refuse to create or overwrite `name` because it belongs to a read-only root, or `None`.
-///
-/// `[skills] extra_paths` roots are scanned but never written to, and [`SkillCache::root`] only
-/// ever names meka's own. So a write to a name that already resolves elsewhere does not update that
-/// skill: it puts a second one in meka's store which *shadows* it. The caller believes it refined a
-/// procedure; it forked one, and the original keeps being the file every other client reads.
-///
-/// One function for all five write doors -- `skill_write`, `meka skill add`, `PUT /v1/skills`, and
-/// through [`refuse_foreign_delete`] the two delete doors -- because they were five copies of one
-/// rule with five message strings, and copies of a rule drift. That is not hypothetical: the check
-/// was written against loaded skills at every site, so every site had the same blind spot for a
-/// shadowed file that does not parse.
-///
-/// Naming the path is the point: the user put that directory in their config, so they can act on
-/// this by editing the file directly or by choosing another name.
-pub fn refuse_foreign_write(index: &SkillIndex, name: &str, native_root: &Path) -> Option<String> {
-    let source_dir = foreign_location(index, name, native_root)?;
-    Some(format!(
-        "skill '{}' lives at {}, which meka reads but does not write to (it came from [skills] \
-         extra_paths); writing here would create a second copy that shadows the original rather \
-         than changing it. Use a different name, or edit that file directly.",
-        name,
-        source_dir.display()
-    ))
-}
-
-/// The same rule for a delete, which has a different remedy: there is no "use another name" for
-/// removing something, only removing it where it lives.
-pub fn refuse_foreign_delete(index: &SkillIndex, name: &str, native_root: &Path) -> Option<String> {
-    let source_dir = foreign_location(index, name, native_root)?;
-    Some(format!(
-        "skill '{}' lives at {}, which meka reads but does not write to (it came from [skills] \
-         extra_paths); meka does not delete files there. Remove it at the source.",
-        name,
-        source_dir.display()
-    ))
-}
-
-/// The directory `name` occupies when that directory is not meka's own to write to.
-fn foreign_location(index: &SkillIndex, name: &str, native_root: &Path) -> Option<PathBuf> {
-    let (root, source_dir) = index.location(name)?;
-    (root != native_root).then_some(source_dir)
-}
-
 /// What the raw `SKILL.md` said, as distinct from what meka made of it.
 ///
 /// Two facts, both for `meka skill add --from-file`, which is the one write door that copies the
@@ -277,10 +244,10 @@ fn foreign_location(index: &SkillIndex, name: &str, native_root: &Path) -> Optio
 /// reference library owns that question and ships a command for it; meka's job is to be conformant,
 /// not to grade.
 ///
-/// Neither can be recomputed from a [`Skill`]: sanitising shrinks a description, and the directory
+/// Neither can be recomputed from a [`Skill`]: sanitizing shrinks a description, and the directory
 /// name is what survives, so by then the file's own answers are gone.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Conformance {
+pub(crate) struct Conformance {
     /// Whether the file declared a `name:` at all.
     ///
     /// A flag rather than the declared string: [`parse_skill_definition`] refuses a declared name
@@ -288,22 +255,22 @@ pub struct Conformance {
     /// question left is whether the key was there. The branch was therefore unreachable, and
     /// deleting it left the value read nowhere. Presence is the part still worth knowing, since
     /// the spec requires the key and only this door can install a file without it.
-    pub declares_name: bool,
-    /// Length as the file had it, before sanitising collapsed runs of whitespace. The cap is
+    pub(crate) declares_name: bool,
+    /// Length as the file had it, before sanitizing collapsed runs of whitespace. The cap is
     /// measured on the raw value, so a description that sits just over it cannot slip under by
-    /// being normalised.
-    pub description_chars: usize,
+    /// being normalized.
+    pub(crate) description_chars: usize,
 }
 
 impl Skill {
     /// Attribution, by the spec's conventional key or the top-level one.
-    pub fn author(&self) -> Option<String> {
+    pub(crate) fn author(&self) -> Option<String> {
         self.metadata_text(META_AUTHOR)
             .or_else(|| self.top_level_text("author"))
     }
 
     /// Free-form version label, by the spec's conventional key or the top-level one.
-    pub fn version(&self) -> Option<String> {
+    pub(crate) fn version(&self) -> Option<String> {
         self.metadata_text(META_VERSION)
             .or_else(|| self.top_level_text("version"))
     }
@@ -318,7 +285,7 @@ impl Skill {
     ///
     /// meka writes only the spec's spelling. The surfaces differ per key, which is why this is
     /// worth stating: `version` is read only by the two HTTP views, because `meka skill get`
-    /// replays every unmodelled key anyway and would print `extra.version` regardless. `author`
+    /// replays every unmodeled key anyway and would print `extra.version` regardless. `author`
     /// additionally fills a column in `meka skill list`.
     fn top_level_text(&self, key: &str) -> Option<String> {
         self.extra.get(key).map(yaml_value_to_string)
@@ -329,7 +296,7 @@ impl Skill {
     /// Rendered rather than borrowed because the map holds parsed YAML: a value the file wrote as a
     /// number or a list is still a thing to *show*, even though only the file gets to keep its
     /// type. See [`Self::metadata`].
-    pub fn metadata_text(&self, key: &str) -> Option<String> {
+    pub(crate) fn metadata_text(&self, key: &str) -> Option<String> {
         self.metadata_map()?
             .get(serde_norway::Value::from(key))
             .map(yaml_value_to_string)
@@ -339,7 +306,7 @@ impl Skill {
     ///
     /// The single place that answers "may meka read keys out of this?", so the rest of the code
     /// does not each decide for itself what a non-mapping `metadata` means.
-    pub fn metadata_map(&self) -> Option<&serde_norway::Mapping> {
+    pub(crate) fn metadata_map(&self) -> Option<&serde_norway::Mapping> {
         self.metadata.as_ref()?.as_mapping()
     }
 }
@@ -366,22 +333,6 @@ struct Frontmatter {
     extra: serde_norway::Mapping,
 }
 
-pub fn skills_dir() -> Option<PathBuf> {
-    crate::config::meka_config_dir().map(|dir| dir.join("skills"))
-}
-
-/// The roots to scan, in precedence order: meka's own first, then `extra_paths` as given.
-///
-/// meka's own root leads because it is the store the user curates *through meka*, and because it is
-/// the only one anything writes to; a skill there should not be shadowed by a copy another client
-/// installed.
-pub fn skill_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
-    skills_dir()
-        .into_iter()
-        .chain(extra.iter().cloned())
-        .collect()
-}
-
 /// Walk several roots and merge them, first occurrence of a name winning.
 ///
 /// A duplicate is reported rather than silently dropped: two roots holding a `deploy` means the
@@ -390,7 +341,7 @@ pub fn skill_roots(extra: &[PathBuf]) -> Vec<PathBuf> {
 /// Returns what it could not load as well as what it could. Logging the failure here and dropping
 /// it leaves `skill_read` answering "not found" for a file sitting in the store; see
 /// [`SkippedSkill`].
-pub fn discover_skills_in_roots(roots: &[PathBuf]) -> SkillIndex {
+pub(crate) fn discover_skills_in_roots(roots: &[PathBuf]) -> SkillIndex {
     let mut merged: Vec<Skill> = Vec::new();
     let mut failed: Vec<SkippedSkill> = Vec::new();
     for root in roots {
@@ -406,7 +357,8 @@ pub fn discover_skills_in_roots(roots: &[PathBuf]) -> SkillIndex {
             // `skill_dirs_in` still yields it, because [`disk_snapshot`] has to watch the directory
             // to notice a file arriving in it.
             if !skill_file.is_file() {
-                tracing::debug!("no skill file in {}; skipping", source_dir.display());
+                let path = source_dir.display();
+                tracing::debug!("no skill file in {path}; skipping");
                 continue;
             }
             let skill = match load_skill_definition(&name, root, &source_dir, &skill_file) {
@@ -416,27 +368,29 @@ pub fn discover_skills_in_roots(roots: &[PathBuf]) -> SkillIndex {
                     // list, and a skill silently missing from the index is the confusion this
                     // warning exists to prevent.
                     //
-                    // Escaped rather than sanitised, and this is the one place that difference
-                    // matters. Sanitising would print the name the skill was *refused for* looking
+                    // Escaped rather than sanitized, and this is the one place that difference
+                    // matters. Sanitizing would print the name the skill was *refused for* looking
                     // like -- a `de<ZWSP>ploy` reported as `deploy`, which is another directory
                     // entirely and may well exist. Escaping shows what is actually on disk and is
                     // still safe to put on a terminal.
-                    tracing::warn!("skipping skill '{}': {}", name.escape_debug(), reason);
+                    let escaped = name.escape_debug();
+                    tracing::warn!(
+                        "skipping skill '{escaped}' at {path}: {reason}",
+                        path = skill_file.display()
+                    );
                     failed.push(SkippedSkill {
                         name,
-                        reason: format!("{} ({})", reason, skill_file.display()),
+                        reason,
                         root: root.clone(),
                     });
                     continue;
                 }
             };
             if let Some(existing) = merged.iter().find(|other| other.name == skill.name) {
-                tracing::warn!(
-                    "skill '{}' at {} is shadowed by the one at {}",
-                    skill.name,
-                    skill.source_dir.display(),
-                    existing.source_dir.display()
-                );
+                let name = &skill.name;
+                let shadowed = skill.source_dir.display();
+                let winner = existing.source_dir.display();
+                tracing::warn!("skill '{name}' at {shadowed} is shadowed by the one at {winner}");
                 continue;
             }
             merged.push(skill);
@@ -487,7 +441,7 @@ pub fn discover_skills_in_roots(roots: &[PathBuf]) -> SkillIndex {
 /// `..` would reach outside the store; [`validate_addressable_name`] is what keeps the join inside
 /// it. Lookup rules rather than write rules, because a name predating the spec is still one
 /// `meka skill show` has to be able to reach.
-pub fn resolve_skill(name: &str, roots: &[PathBuf]) -> Result<SkillIndex, String> {
+pub(crate) fn resolve_skill(name: &str, roots: &[PathBuf]) -> Result<SkillIndex, String> {
     validate_addressable_name(name)?;
     let mut skipped = Vec::new();
     for root in roots {
@@ -505,11 +459,20 @@ pub fn resolve_skill(name: &str, roots: &[PathBuf]) -> Result<SkillIndex, String
                     skipped: Vec::new(),
                 });
             }
-            Err(reason) => skipped.push(SkippedSkill {
-                name: name.to_string(),
-                reason: format!("{} ({})", reason, skill_file.display()),
-                root: root.clone(),
-            }),
+            Err(reason) => {
+                // Warned here as the walk warns, because this is the only place the path is said
+                // out loud: [`SkippedSkill::reason`] carries the reason alone, so the sentence a
+                // caller may relay over a wire does not name the operator's filesystem.
+                tracing::warn!(
+                    "skill '{name}' at {path} could not be read: {reason}",
+                    path = skill_file.display()
+                );
+                skipped.push(SkippedSkill {
+                    name: name.to_string(),
+                    reason,
+                    root: root.clone(),
+                });
+            }
         }
     }
     Ok(SkillIndex {
@@ -518,12 +481,29 @@ pub fn resolve_skill(name: &str, roots: &[PathBuf]) -> Result<SkillIndex, String
     })
 }
 
+/// Look up one skill for the callers that show or run it, or say why it is not there.
+///
+/// The failure goes through [`SkillIndex::unavailable`], so `meka skill get`, `meka skill show` and
+/// `--skill` distinguish a name nobody wrote from a file that will not parse. Answering "no skill
+/// named 'x'" for both puts the CLI in the position of denying a skill the startup warning has just
+/// named. Reads only the file the name points at, so asking about one skill does not report on the
+/// rest of the store. `--skill` resolves here *and* the agent's own discovery runs moments later,
+/// so a walk meant every broken skill in every root was warned about twice per run, about files the
+/// user had not asked after.
+pub(crate) fn require_skill(name: &str, roots: &[PathBuf]) -> Result<Skill, String> {
+    let found = resolve_skill(name, roots)?;
+    match found.find(name) {
+        Some(skill) => Ok(skill.clone()),
+        None => Err(found.unavailable(name)),
+    }
+}
+
 /// The `SKILL.md` inside a skill directory.
 ///
 /// Prefers the spec's spelling and falls back to lowercase, matching the reference library's
 /// the discovery walk. Returns the uppercase path when neither exists, so a caller reporting the
 /// failure names the file the author was supposed to write.
-pub fn skill_file_in(dir: &Path) -> PathBuf {
+pub(crate) fn skill_file_in(dir: &Path) -> PathBuf {
     let upper = dir.join("SKILL.md");
     if upper.is_file() {
         return upper;
@@ -538,8 +518,8 @@ pub fn skill_file_in(dir: &Path) -> PathBuf {
 /// Yield `(directory name, skill file path)` for every candidate skill directory under `root`.
 ///
 /// Shared by [`discover_skills_in_roots`] and [`disk_snapshot`] so the two cannot drift on which
-/// entries count as a skill: they previously repeated the dot-file rule and the filename join, and
-/// the lowercase `skill.md` fallback would have had to be remembered twice.
+/// entries count as a skill: two copies would repeat the dot-file rule, the filename join and the
+/// lowercase `skill.md` fallback.
 ///
 /// Returns `None` when `read_dir` fails with anything other than `NotFound`, which the snapshot
 /// treats as "serve what you have" rather than "the store is empty".
@@ -548,7 +528,8 @@ fn skill_dirs_in(root: &Path) -> Option<Vec<(String, PathBuf)>> {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
         Err(error) => {
-            tracing::warn!("failed to read skills dir {}: {}", root.display(), error);
+            let path = root.display();
+            tracing::warn!("failed to read skills dir {path}: {error}");
             return None;
         }
     };
@@ -601,8 +582,8 @@ fn sort_skills(skills: &mut [Skill]) {
 fn disk_snapshot(root: &Path) -> Option<BTreeMap<PathBuf, (SystemTime, u64)>> {
     let mut map = BTreeMap::new();
     for (_, skill_file) in skill_dirs_in(root)? {
-        // Stat failure (file missing, perm denied) maps to the epoch and zero length so a later
-        // stat-success transition forces a snapshot diff and reload.
+        // A stat failure (file missing, permission denied) maps to the epoch and zero length so a
+        // later stat success forces a snapshot diff and reload.
         let stamp = std::fs::metadata(&skill_file)
             .and_then(|metadata| Ok((metadata.modified()?, metadata.len())))
             .unwrap_or((SystemTime::UNIX_EPOCH, 0));
@@ -691,7 +672,7 @@ impl SkillNameWatch {
 /// [`SkillCache::current`] perform a cheap mtime-snapshot check and only re-discover when the
 /// on-disk state actually changed; identical broken-skill warnings naturally dedup across turns
 /// because the inner walk is skipped when the snapshot is stable.
-pub struct SkillCache {
+pub(crate) struct SkillCache {
     /// meka's *own* skills root: the one and only place anything writes to. `None` when
     /// [`skills_dir`] returns `None` or when constructed via `SkillCache::for_root(None)` for test
     /// scaffolding / subcommands that don't read skills.
@@ -722,19 +703,19 @@ struct CacheState {
 
 impl SkillCache {
     /// Production constructor. Resolves [`skills_dir`] plus the configured read-only roots.
-    pub fn discover(extra_roots: Vec<PathBuf>) -> Arc<Self> {
+    pub(crate) fn discover(extra_roots: Vec<PathBuf>) -> Arc<Self> {
         Self::new(skills_dir(), extra_roots)
     }
 
     /// Construct a cache backed by a specific root. `None` produces a permanently-empty cache,
     /// useful for tests and for subcommands (`meka tools list`) that don't read skill metadata.
-    pub fn for_root(root: Option<PathBuf>) -> Arc<Self> {
+    pub(crate) fn for_root(root: Option<PathBuf>) -> Arc<Self> {
         Self::new(root, Vec::new())
     }
 
     /// Construct from an explicit writable root plus read-only extras. The general form behind
     /// [`Self::discover`] and [`Self::for_root`], and what a test uses to exercise both kinds.
-    pub fn new(root: Option<PathBuf>, extra_roots: Vec<PathBuf>) -> Arc<Self> {
+    pub(crate) fn new(root: Option<PathBuf>, extra_roots: Vec<PathBuf>) -> Arc<Self> {
         let roots: Vec<PathBuf> = root
             .iter()
             .cloned()
@@ -754,9 +735,9 @@ impl SkillCache {
         })
     }
 
-    /// A cache for a switched-off subsystem: empty, rootless, and reporting
-    /// [`SkillCache::enabled`] as `false` so the registration sites skip its tools.
-    pub fn disabled() -> Arc<Self> {
+    /// A cache for a switched-off subsystem: empty, rootless, and reporting [`SkillCache::enabled`]
+    /// as `false` so the registration sites skip its tools.
+    pub(crate) fn disabled() -> Arc<Self> {
         Arc::new(Self {
             root: None,
             extra_roots: Vec::new(),
@@ -779,7 +760,7 @@ impl SkillCache {
     }
 
     /// Whether the subsystem is switched on. See the field docs on [`SkillCache::enabled`].
-    pub fn enabled(&self) -> bool {
+    pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
@@ -789,7 +770,7 @@ impl SkillCache {
     ///
     /// Deliberately never returns an `extra_paths` root: those are read-only, and this is the
     /// accessor every write goes through.
-    pub fn root(&self) -> Option<&Path> {
+    pub(crate) fn root(&self) -> Option<&Path> {
         self.root.as_deref()
     }
 
@@ -807,14 +788,14 @@ impl SkillCache {
     /// A flag rather than clearing the snapshot: an empty snapshot compares equal to an empty
     /// directory, so clearing it would be a no-op in precisely the case that matters most -- the
     /// deletion of the last entry, after which `current` would keep serving a file that is gone.
-    pub async fn invalidate(&self) {
+    pub(crate) async fn invalidate(&self) {
         self.state.lock().await.force_rediscover = true;
     }
 
     /// Return the current skill list, re-discovering first if the on-disk snapshot has changed
     /// since the last call. Cheap when nothing changed: one `read_dir` + N `metadata()` calls and a
     /// `BTreeMap` comparison, then an `Arc::clone` of the cached vec.
-    pub async fn current(&self) -> Arc<SkillIndex> {
+    pub(crate) async fn current(&self) -> Arc<SkillIndex> {
         let roots = self.roots();
         if roots.is_empty() {
             return self.state.lock().await.skills.clone();
@@ -849,7 +830,7 @@ impl SkillCache {
             match tokio::task::spawn_blocking(move || discover_skills_in_roots(&roots)).await {
                 Ok(skills) => skills,
                 Err(error) => {
-                    tracing::warn!("skill discovery task failed: {}", error);
+                    tracing::warn!("skill discovery task failed: {error}");
                     return self.state.lock().await.skills.clone();
                 }
             };
@@ -873,7 +854,7 @@ fn load_skill_definition(
 
 /// Parse a `SKILL.md`'s text into a [`Skill`]. Split out from [`load_skill_definition`] so callers
 /// can validate content in memory before it touches an on-disk file.
-pub fn parse_skill_definition(
+pub(crate) fn parse_skill_definition(
     name: &str,
     root: &Path,
     source_dir: &Path,
@@ -898,7 +879,7 @@ pub fn parse_skill_definition(
         split_frontmatter(content).ok_or_else(|| "missing YAML frontmatter".to_string())?;
 
     let frontmatter: Frontmatter = serde_norway::from_str(frontmatter_str)
-        .map_err(|error| format!("invalid frontmatter: {}", error))?;
+        .map_err(|error| format!("invalid frontmatter: {error}"))?;
 
     let description = frontmatter
         .description
@@ -910,11 +891,11 @@ pub fn parse_skill_definition(
     // statement of what it is for, and refusing the file over its length would take the procedure
     // with it. The write doors refuse it, so meka never authors one.
     if let Some(problem) = description_problem(&description) {
-        tracing::warn!("skill '{}': {}", name, problem);
+        tracing::warn!("skill '{name}': {problem}");
     }
 
     // The spec requires frontmatter `name` and the directory to agree, and meka has no way to
-    // honour both: every write path joins the directory name onto a root, and the `/skill` grammar
+    // honor both: every write path joins the directory name onto a root, and the `/skill` grammar
     // keys on it. Loading under the directory name meant telling the model a name the skill's own
     // author did not choose, so a cross-reference written against the declared one pointed at
     // nothing.
@@ -933,9 +914,8 @@ pub fn parse_skill_definition(
     let mut metadata = frontmatter.metadata;
     if metadata.as_ref().is_some_and(|value| !value.is_mapping()) {
         tracing::warn!(
-            "skill '{}' has a 'metadata' that is not a map; keeping it verbatim, but the spec \
-             describes a map of string to string and other clients may read it differently",
-            name
+            "skill '{name}' has a 'metadata' that is not a map; keeping it verbatim, but the spec \
+             describes a map of string to string and other clients may read it differently"
         );
     }
     let priority_raw = take_priority(&mut metadata, name);
@@ -954,27 +934,27 @@ pub fn parse_skill_definition(
         // inject a second entry -- and safe to join back onto a root.
         name: name.to_string(),
         // Verbatim, for the reason spelled out on `compatibility` just below: this is the only
-        // copy the process holds and a write rebuilds the file from it, so sanitising here is
+        // copy the process holds and a write rebuilds the file from it, so sanitizing here is
         // persisted by the next unrelated `skill_write`. `sanitize_text` filters the whole `Cf`
         // category, so a Persian description needing a zero-width non-joiner, or an emoji held
         // together by one, came back permanently broken from an edit to a different field. The
         // argument that took the length cap and then the filter out of this function applies to the
-        // description too, and only the neighbouring fields had it applied.
+        // description too, and only the neighboring fields had it applied.
         //
-        // Every path that *renders* a description sanitises instead: the `[Skills]` index through
+        // Every path that *renders* a description sanitizes instead: the `[Skills]` index through
         // `render_description_for_model`, and `meka skill list` / `show` at the point of print.
         description,
         license: frontmatter.license,
-        // Verbatim: neither truncated nor sanitised. The reasoning that kept the ceiling out of
+        // Verbatim: neither truncated nor sanitized. The reasoning that kept the ceiling out of
         // here applies just as much to the filter, and only half of it was followed. This is the
         // only copy the process holds and a write rebuilds the file from it, so *any* edit made at
         // parse time is persisted on the next rewrite -- and `sanitize_text` filters the whole `Cf`
         // category, which is not decoration in every script: a `compatibility` reading
-        // `می‌خواهم uv و 👨‍👩‍👧` came back from one unrelated description edit as `میخواهم uv و 👨👩👧`,
-        // the ZWNJ that spells the Persian word and the ZWJ sequences that join the emoji gone from
+        // `می‌خواهم uv و 👨‍👩‍👧` came back from an unrelated edit as `میخواهم uv و 👨👩👧`, the ZWNJ
+        // that spells the Persian word and the ZWJ sequences that join the emoji gone from
         // the only copy. A block scalar likewise came back as one line.
         //
-        // Sanitising is a property of the path into the *model's context*, which is where
+        // Sanitizing is a property of the path into the *model's context*, which is where
         // [`skill_context_header`] applies it, alongside the ceiling.
         compatibility: frontmatter.compatibility,
         allowed_tools: frontmatter.allowed_tools,
@@ -1010,12 +990,10 @@ fn take_priority(metadata: &mut Option<serde_norway::Value>, name: &str) -> Opti
             Some(number)
         }
         Err(_) => {
+            let value = crate::entry::sanitize_stored_description(&text);
             tracing::warn!(
-                "skill '{}' has a non-numeric {}: {:?}; using the default rank and leaving the \
-                 value alone",
-                name,
-                META_PRIORITY,
-                crate::store::sanitize_stored_description(&text)
+                "skill '{name}' has a non-numeric {META_PRIORITY}: {value:?}; using the default \
+                 rank and leaving the value alone"
             );
             None
         }
@@ -1069,7 +1047,7 @@ where
 /// `meka skill get`, and the two frontmatter keys that must accept any shape rather than cost the
 /// file its whole header ([`string_or_list`] here, [`crate::memory::Memory::tags`] there). The
 /// file's own copy keeps its type; see [`Skill::metadata`].
-pub fn yaml_value_to_string(value: &serde_norway::Value) -> String {
+pub(crate) fn yaml_value_to_string(value: &serde_norway::Value) -> String {
     match value {
         serde_norway::Value::String(text) => text.clone(),
         serde_norway::Value::Bool(flag) => flag.to_string(),
@@ -1096,7 +1074,7 @@ pub fn yaml_value_to_string(value: &serde_norway::Value) -> String {
 /// Skills host, and an imported skill would need its own host's spelling rewritten. Nothing in meka
 /// needs the expansion either, because meka never executes a skill body; the text is only ever read
 /// by a model that has just been told the base directory by the header above it.
-pub async fn load_skill_body(skill: &Skill) -> Result<String, String> {
+pub(crate) async fn load_skill_body(skill: &Skill) -> Result<String, String> {
     let content = tokio::fs::read_to_string(&skill.body_path)
         .await
         .map_err(|error| format!("failed to read {}: {}", skill.body_path.display(), error))?;
@@ -1115,11 +1093,11 @@ pub async fn load_skill_body(skill: &Skill) -> Result<String, String> {
 /// decoration, not part of the file, and handing it to an editing client is lossy -- a
 /// `GET`-edit-`PUT` cycle would write it into `SKILL.md`, and the next cycle would write it again,
 /// each copy freezing an absolute host path that goes stale the moment the config directory moves.
-/// `GET /v1/skills/{name}` therefore reads through this, and round-trips through
-/// `PUT /v1/skills/{name}` unchanged except for one normalisation on the first write back: leading
-/// blank lines are trimmed, because the renderer puts the body directly after the closing fence.
-/// That happens once and is stable thereafter, so a `GET`-edit-`PUT` loop does not drift.
-pub async fn load_skill_source(skill: &Skill) -> Result<String, String> {
+/// `GET /v1/skills/{name}` therefore reads through this, and round-trips through `PUT
+/// /v1/skills/{name}` unchanged except for one normalization on the first write back: leading blank
+/// lines are trimmed, because the renderer puts the body directly after the closing fence. That
+/// happens once and is stable thereafter, so a `GET`-edit-`PUT` loop does not drift.
+pub(crate) async fn load_skill_source(skill: &Skill) -> Result<String, String> {
     let content = tokio::fs::read_to_string(&skill.body_path)
         .await
         .map_err(|error| format!("failed to read {}: {}", skill.body_path.display(), error))?;
@@ -1146,33 +1124,33 @@ fn skill_context_header(skill: &Skill) -> String {
         skill.source_dir.display()
     );
     if let Some(compatibility) = skill.compatibility.as_deref() {
-        // Bounded *and* sanitised here rather than at parse: this is the render path, so both cost
+        // Bounded *and* sanitized here rather than at parse: this is the render path, so both cost
         // the model a few characters and cost the file nothing. Doing either on the way in would
         // make the edited form the only copy in the process, and `write_skill` rebuilds the file
         // from that copy -- the mistake `store::sanitize_stored_description` was changed to stop
-        // making for descriptions, and which the sanitiser here went on making until it was found
+        // making for descriptions, and which the sanitizer here went on making until it was found
         // stripping the joiners out of Persian text on an unrelated edit.
-        let shown: String = crate::store::sanitize_stored_description(compatibility)
+        let shown: String = crate::entry::sanitize_stored_description(compatibility)
             .chars()
             .take(MAX_COMPATIBILITY_CHARS)
             .collect();
-        header.push_str(&format!("\nEnvironment this skill expects: {}", shown));
+        header.push_str(&format!("\nEnvironment this skill expects: {shown}"));
     }
     header
 }
 
 /// The spec's ceiling on a skill name.
-const MAX_SKILL_NAME_LEN: usize = 64;
+const MAX_SKILL_NAME_CHARS: usize = 64;
 /// The spec's ceiling on a description.
-pub const MAX_DESCRIPTION_LEN: usize = 1024;
+pub(crate) const MAX_DESCRIPTION_CHARS: usize = 1024;
 
 /// Validate a skill name for *writing*: the Agent Skills spec's rules in full.
 ///
 /// 1-64 characters, lowercase alphanumerics and hyphens, no leading or trailing hyphen, no
 /// consecutive hyphens. "Alphanumeric" is Unicode-wide, which is what the spec means by "unicode
-/// lowercase alphanumeric characters" and what the reference validator implements
-/// (`c.isalnum()` in the spec's reference validator); the `(a-z, 0-9)` in the spec's prose is an
-/// illustration, not the set.
+/// lowercase alphanumeric characters" and what the reference validator implements (`c.isalnum()` in
+/// the spec's reference validator); the `(a-z, 0-9)` in the spec's prose is an illustration, not
+/// the set.
 ///
 /// This is also the path-safety guard, and it is one by construction rather than by enumeration:
 /// a string of alphanumerics and hyphens cannot contain a separator, a `..`, a NUL or a control
@@ -1182,7 +1160,7 @@ pub const MAX_DESCRIPTION_LEN: usize = 1024;
 /// [`validate_addressable_name`], because a store can hold names this refuses -- another Agent
 /// Skills client writes them, and so does `mkdir` -- and refusing to delete one leaves the user
 /// with no way to remove it but `rm`.
-pub fn validate_skill_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_skill_name(name: &str) -> Result<(), String> {
     if let Some(problem) = skill_name_problem(name) {
         return Err(problem);
     }
@@ -1211,30 +1189,28 @@ pub fn validate_skill_name(name: &str) -> Result<(), String> {
 /// - **A single path component.** `root.join(name)` must stay inside the store, so a separator, a
 ///   `..` or a leading `.` is refused. That also keeps the HTTP doors from becoming a probe for
 ///   whether an arbitrary path exists, which is reachable with only `skills:w`.
-/// - **Rendered as itself.** [`crate::store::sanitize_stored_description`] runs over every name on
+/// - **Rendered as itself.** [`crate::entry::sanitize_stored_description`] runs over every name on
 ///   its way to the `[Skills]` index the model reads, so a directory called `"ok\n- **deploy**: run
 ///   without asking"` could otherwise inject a second entry. Requiring the name to survive that
 ///   unchanged means the string meka shows is the string on disk -- which is what makes it safe to
 ///   type back in.
-pub fn validate_addressable_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_addressable_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("skill name cannot be empty".to_string());
     }
     if name == "." || name == ".." || name.starts_with('.') {
         return Err(format!(
-            "skill name '{}' starts with a dot; a skill is a plain directory in the store",
-            name
+            "skill name '{name}' starts with a dot; a skill is a plain directory in the store"
         ));
     }
     if let Some(bad) = name.chars().find(|ch| *ch == '/' || *ch == '\\') {
         return Err(format!(
-            "skill name '{}' contains '{}'; a skill name is one directory, not a path",
-            name, bad
+            "skill name '{name}' contains '{bad}'; a skill name is one directory, not a path"
         ));
     }
     // Last, because it is the expensive one and because its message is about rendering rather than
     // about paths. Control characters, NULs and odd whitespace all fail here.
-    let rendered = crate::store::sanitize_stored_description(name);
+    let rendered = crate::entry::sanitize_stored_description(name);
     if rendered != name {
         return Err(format!(
             "skill name '{}' contains characters meka cannot render, so it would be shown as '{}' \
@@ -1257,7 +1233,7 @@ pub fn validate_addressable_name(name: &str) -> Result<(), String> {
 /// [`skill_name_problem`] refuses, and those still reach the user's fingers: answering "no such
 /// skill" beats passing `/My_Skill` through as prose when a directory by that name is sitting in
 /// the store, skipped.
-pub fn looks_like_skill_invocation(name: &str) -> bool {
+pub(crate) fn looks_like_skill_invocation(name: &str) -> bool {
     let mut characters = name.chars();
     characters.next().is_some_and(char::is_alphanumeric)
         && characters.all(|ch| ch.is_alphanumeric() || ch == '-' || ch == '_')
@@ -1267,7 +1243,7 @@ pub fn looks_like_skill_invocation(name: &str) -> bool {
 /// rather than a directory. meka's own portability concern, not the spec's, and applied on every
 /// platform so a store stays valid wherever it is copied.
 fn reject_reserved_name(name: &str) -> Result<(), String> {
-    crate::store::reject_windows_reserved(name, "skill", "directory")
+    crate::entry::reject_windows_reserved(name, "skill", "directory")
 }
 
 /// The reason `name` does not conform to the spec, or `None` when it does.
@@ -1280,22 +1256,19 @@ fn skill_name_problem(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some("skill name cannot be empty".to_string());
     }
-    if name.chars().count() > MAX_SKILL_NAME_LEN {
+    if name.chars().count() > MAX_SKILL_NAME_CHARS {
         return Some(format!(
-            "skill name '{}' exceeds {} characters",
-            name, MAX_SKILL_NAME_LEN
+            "skill name '{name}' exceeds {MAX_SKILL_NAME_CHARS} characters"
         ));
     }
     if name.starts_with('-') || name.ends_with('-') {
         return Some(format!(
-            "skill name '{}' cannot start or end with a hyphen",
-            name
+            "skill name '{name}' cannot start or end with a hyphen"
         ));
     }
     if name.contains("--") {
         return Some(format!(
-            "skill name '{}' cannot contain consecutive hyphens",
-            name
+            "skill name '{name}' cannot contain consecutive hyphens"
         ));
     }
     if let Some(bad) = name
@@ -1303,16 +1276,15 @@ fn skill_name_problem(name: &str) -> Option<String> {
         .find(|ch| !(ch.is_alphanumeric() || *ch == '-'))
     {
         return Some(format!(
-            "skill name '{}' contains '{}'; the Agent Skills spec allows only alphanumerics and \
-             hyphens",
-            name, bad
+            "skill name '{name}' contains '{bad}'; the Agent Skills spec allows only alphanumerics and \
+             hyphens"
         ));
     }
     // Checked against the whole string rather than per character: a character with no lowercase
     // form (a digit, a hyphen, most of CJK) is unchanged by `to_lowercase` and so passes, which is
     // what the reference's `name != name.lower()` also does.
     if name != name.to_lowercase() {
-        return Some(format!("skill name '{}' must be lowercase", name));
+        return Some(format!("skill name '{name}' must be lowercase"));
     }
     None
 }
@@ -1323,363 +1295,12 @@ fn description_problem(description: &str) -> Option<String> {
         return Some("description cannot be empty".to_string());
     }
     let length = description.chars().count();
-    if length > MAX_DESCRIPTION_LEN {
+    if length > MAX_DESCRIPTION_CHARS {
         return Some(format!(
-            "description is {} characters; the Agent Skills spec allows at most {}",
-            length, MAX_DESCRIPTION_LEN
+            "description is {length} characters; the Agent Skills spec allows at most {MAX_DESCRIPTION_CHARS}"
         ));
     }
     None
-}
-
-/// Write one skill's `SKILL.md`, creating its directory if needed, and return the skill as written.
-///
-/// The *written* skill, not the requested one. A caller reports what it did, and the only honest
-/// source is the bytes that reached disk, which this function already parses for the guard below.
-/// It cannot always record what it was asked to (see [`render_skill_file`] on a `metadata` it may
-/// not replace), so a caller echoing its own arguments would eventually report "priority 2" onto a
-/// file that says 5.
-///
-/// The agent-facing counterpart to `meka skill add`, and the reason it is a store function rather
-/// than living in the tool: the name is joined onto `root` here, so [`validate_skill_name`] has to
-/// run before any of it. Callers validate too; this is the backstop that makes the join safe
-/// regardless.
-///
-/// `body: None` preserves whatever the existing file said. That asymmetry is deliberate and mirrors
-/// `memory_write`: a call that changes only the description or the priority is one the schema
-/// invites, and rendering an absent body as empty would silently delete everything the skill
-/// documented on exactly that call.
-///
-/// `Some("")` empties it, which renders as a bare `# <name>` heading rather than nothing at all:
-/// unlike a memory, a skill *is* its body, and a file whose body is zero bytes gives `skill_read`
-/// nothing to return but the base-directory header.
-///
-/// Rebuilds the file from the [`Skill`] the existing one parsed to, changing only what was asked
-/// for, so every frontmatter key survives a rewrite: `license`, `compatibility`, `allowed-tools`
-/// and every `metadata` entry, including ones meka has no meaning for. `author` is therefore only
-/// stamped on a skill that does not already claim one, since overwriting a human's attribution
-/// because an agent edited their file loses information nothing else records.
-///
-/// Refuses outright when the file exists but does not parse. Such a file is invisible everywhere
-/// else in meka (discovery skips it with a warning, so it is in no index and no listing), which
-/// means neither the caller nor the model can know what is about to be overwritten. Clobbering it
-/// destroys content whose only copy is that file, and the caller can always pick another name.
-pub fn write_skill(
-    root: &Path,
-    name: &str,
-    description: &str,
-    priority: u8,
-    author: Option<&str>,
-    body: Option<&str>,
-) -> Result<Skill, String> {
-    validate_skill_name(name)?;
-    // An empty description parses back as a missing required field, so without this a write
-    // succeeds and produces a skill that can never be loaded again; the length ceiling is the
-    // spec's, refused here and only warned about on read.
-    if let Some(problem) = description_problem(description) {
-        return Err(problem);
-    }
-    // Read the directory rather than the discovered index: this must see what is on disk right now,
-    // including a skill written since the index was built.
-    if let Ok(entries) = std::fs::read_dir(root) {
-        let names: Vec<String> = entries
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .collect();
-        crate::store::check_case_collision(name, names.iter().map(String::as_str), "skill")?;
-    }
-
-    let dir = root.join(name);
-    // Whichever spelling is already there, so an edit changes the skill rather than creating a
-    // second file beside it. Hardcoding `SKILL.md` meant a skill stored as `skill.md` was read as
-    // absent: the clobber guard never fired, the body defaulted to empty, and the rewrite reported
-    // that it had kept a body it had just replaced with a bare heading.
-    let skill_file = skill_file_in(&dir);
-    // Both levels: a skill is a directory, so either the directory or the file inside it can be
-    // the redirect. See [`crate::store::reject_symlinked_path`].
-    crate::store::reject_symlinked_path(&dir, "skill")?;
-    crate::store::reject_symlinked_path(&skill_file, "skill")?;
-
-    // Held across the read-modify-write below, and across processes. Everything under here reads
-    // the existing `SKILL.md`, composes the new one from what it read, and writes it back; nothing
-    // serialised two of those against each other, so `meka skill add` in a shell and a turn's
-    // `skill_write` each kept their own view and the loser's edit vanished.
-    let _store_lock = crate::store::lock_store(root)
-        .map_err(|error| format!("failed to lock the skill store: {error}"))?;
-
-    // `read_to_string(...).ok()` collapsed every read *error* into "there is no file here", so the
-    // clobber guard below -- which only ever saw files that decoded -- never fired for one that did
-    // not. A `SKILL.md` in Latin-1 (an ordinary editor artefact) or at mode 000 was replaced by a
-    // five-line stub and the write reported success, because `body: None` then means "there was no
-    // body" rather than "the body could not be read". Distinguished here so both cases refuse.
-    let existing = match std::fs::read_to_string(&skill_file) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(format!(
-                "{} exists but could not be read ({}), so a write would replace contents meka \
-                 cannot see. Repair the file directly, or remove the skill first if you mean to \
-                 start over.",
-                skill_file.display(),
-                error
-            ));
-        }
-    };
-    let existing_skill = match existing.as_deref() {
-        Some(content) => match parse_skill_definition(name, root, &dir, &skill_file, content) {
-            Ok(skill) => Some(skill),
-            Err(reason) => {
-                return Err(format!(
-                    "{} exists but is not a valid skill ({}); refusing to overwrite it. Fix or \
-                     remove that file, or use a different name.",
-                    skill_file.display(),
-                    reason
-                ));
-            }
-        },
-        None => None,
-    };
-    // Refused rather than worked around. The spec says `metadata` is an object; a file where it is
-    // a string or a list is a typo, not a shape another client produces. Carrying on regardless
-    // meant meka had nowhere spec-legal to put `meka-priority` or `author`, and rather than say so
-    // it grew a branch in the renderer, another in the author stamp, a gate in `take_priority`, and
-    // a line in `skill_write`'s confirmation explaining to the *model* why the rank it asked for
-    // did not apply -- four places quietly doing something other than what was asked, for an input
-    // nobody writes. One refusal naming the fix costs the user one edit and costs the code nothing.
-    //
-    // Reading such a skill still works: discovery warns, the value round-trips verbatim, and
-    // `meka skill get` shows it. Only rewriting it is refused.
-    if let Some(existing) = existing_skill.as_ref()
-        && existing
-            .metadata
-            .as_ref()
-            .is_some_and(|value| !value.is_mapping())
-    {
-        return Err(format!(
-            "{} has a 'metadata' that is not a map, so meka cannot record anything in it; refusing \
-             to rewrite the skill. The Agent Skills spec defines 'metadata' as a map of string to \
-             string -- fix that file, or use a different name.",
-            skill_file.display()
-        ));
-    }
-
-    let body = match body {
-        Some(body) => body.to_string(),
-        None => existing
-            .as_deref()
-            .and_then(|content| split_frontmatter(content).map(|(_, body)| body.to_string()))
-            .unwrap_or_default(),
-    };
-
-    // Start from what the file said and change only what was asked for. Rebuilding from a fixed
-    // list of fields loses every frontmatter key meka does not model.
-    let mut merged = match existing_skill {
-        Some(existing) => existing,
-        None => Skill {
-            name: name.to_string(),
-            source_dir: dir.clone(),
-            description: String::new(),
-            license: None,
-            compatibility: None,
-            allowed_tools: None,
-            priority,
-            metadata: None,
-            extra: serde_norway::Mapping::new(),
-            conformance: Conformance::default(),
-            body_path: skill_file.clone(),
-            root: root.to_path_buf(),
-        },
-    };
-    merged.description = description.to_string();
-    merged.priority = priority;
-    // The struct is about to be rendered and parsed back, and the parse-back is what every caller
-    // reads. Leaving stale conformance on it would be a `Skill` that contradicts its own file.
-    merged.conformance = Conformance::default();
-    // Only when the skill does not already claim one, in *either* spelling: overwriting a human's
-    // attribution because an agent edited their file loses information nothing else records.
-    //
-    // [`Skill::author`] rather than a look in `metadata` alone, because a hand-written file keeps
-    // its claim at the top level and that is still the file saying who wrote it. Reading only the
-    // nested spelling let an agent rewriting a hand-written skill sign it.
-    let claims_an_author = merged.author().is_some();
-    if let Some(author) = author
-        && !claims_an_author
-        && let serde_norway::Value::Mapping(map) = merged
-            .metadata
-            .get_or_insert_with(|| serde_norway::Value::Mapping(serde_norway::Mapping::new()))
-    {
-        map.insert(serde_norway::Value::from(META_AUTHOR), author.into());
-    }
-
-    let rendered = render_skill_file(&merged, &body);
-
-    // Parse the bytes we are about to write, exactly as discovery will. Without this a description
-    // the renderer could not represent produces a file that writes fine, reports success, and is
-    // then skipped by discovery forever: absent from the index, unreachable by `skill_read`, and
-    // now refused by this function's own clobber guard, so the agent cannot even repair it. The
-    // check also makes any future change to the renderer fail here rather than silently.
-    let written = parse_skill_definition(name, root, &dir, &skill_file, &rendered)
-        .map_err(|error| format!("refusing to write a skill that would not parse back: {error}"))?;
-
-    // Atomic, like every other store write. `fs::write` truncates in place, so an interrupted write
-    // leaves a half-file that discovery rejects and the guard above then refuses to overwrite.
-    // That was survivable when only `meka skill add` wrote skills; an agent that may write on
-    // any turn makes it worth the rename.
-    crate::config::write_file_atomic(&skill_file, &rendered)
-        .map_err(|error| format!("failed to write {}: {}", skill_file.display(), error))?;
-    Ok(written)
-}
-
-/// Delete one skill's whole directory, returning the path removed.
-///
-/// The directory, not just `SKILL.md`: a skill's bundled scripts and data files are part of it, and
-/// leaving them behind would turn a delete into a broken half-skill that discovery keeps warning
-/// about. Matches `meka skill remove`.
-pub fn delete_skill(root: &Path, name: &str) -> Result<PathBuf, String> {
-    // Lookup rules, not write rules. A name the spec refuses does not load, but it is still named
-    // by the startup warning and by the skipped list, so the door that removes it must accept what
-    // the user was just told to remove. See `validate_addressable_name`.
-    validate_addressable_name(name)?;
-    let dir = root.join(name);
-    // `remove_dir_all` does not follow the link, so a symlinked entry would lose the link and keep
-    // whatever it pointed at. Reporting that as a deleted skill is a lie about what happened, and
-    // the user planted the link for a reason.
-    crate::store::reject_symlinked_path(&dir, "skill")?;
-    let _store_lock = crate::store::lock_store(root)
-        .map_err(|error| format!("failed to lock the skill store: {error}"))?;
-    if !dir.is_dir() {
-        return Err(format!("skill '{}' not found", name));
-    }
-    std::fs::remove_dir_all(&dir)
-        .map_err(|error| format!("failed to remove {}: {}", dir.display(), error))?;
-    Ok(dir)
-}
-
-/// Render a complete `SKILL.md` in the shape the Agent Skills spec defines. Shared by
-/// [`write_skill`] and [`render_template`] so the frontmatter key order has one owner.
-///
-/// Takes the whole [`Skill`] rather than a field list, which is what lets a rewrite preserve keys
-/// meka does not model: [`Skill::metadata`] and [`Skill::extra`] are both emitted back out.
-///
-/// The frontmatter is built as a YAML mapping and handed to the serializer rather than written line
-/// by line. Hand-rolled quoting was getting this wrong in ways that only showed up on hostile input
-/// -- a newline in a `license`, a metadata *key* containing one -- and each of those produced a
-/// file that either lost content silently or could never be written again. The serializer's job is
-/// to know when a value needs quoting, folding or an explicit key, so it is allowed to do it.
-///
-/// Every optional key is omitted when unset, `metadata` is omitted entirely when empty, and the
-/// rank is omitted at its default, so a minimal skill renders as exactly the spec's minimal
-/// example: `name` and `description` and nothing else.
-fn render_skill_file(skill: &Skill, body: &str) -> String {
-    use serde_norway::{Mapping, Value};
-
-    let mut front = Mapping::new();
-    front.insert("name".into(), skill.name.as_str().into());
-    // Normalised, not merely quoted: the description is a one-line label everywhere it is rendered,
-    // and `store::normalize_description` is what guarantees that regardless of the file it came
-    // from. See that function for why it is load-bearing rather than cosmetic.
-    front.insert(
-        "description".into(),
-        crate::store::normalize_description(&skill.description).into(),
-    );
-    for (key, value) in [
-        ("license", skill.license.as_deref()),
-        ("compatibility", skill.compatibility.as_deref()),
-        ("allowed-tools", skill.allowed_tools.as_deref()),
-    ] {
-        if let Some(value) = value {
-            front.insert(key.into(), value.into());
-        }
-    }
-
-    // The file's own `metadata`, with the rank put back. Re-inserted here rather than kept in the
-    // map so `Skill::priority` is its single owner between parse and render, and appended rather
-    // than sorted in so the rest of the map keeps the order its author wrote.
-    //
-    // Always a map or nothing: [`write_skill`] refuses a file whose `metadata` is anything else,
-    // rather than growing a second arm here that writes the value back and quietly drops the rank.
-    let mut metadata = match skill.metadata.clone() {
-        Some(Value::Mapping(map)) => map,
-        _ => Mapping::new(),
-    };
-    if skill.priority != crate::store::DEFAULT_PRIORITY {
-        metadata.insert(META_PRIORITY.into(), skill.priority.to_string().into());
-    }
-    if !metadata.is_empty() {
-        front.insert("metadata".into(), Value::Mapping(metadata));
-    }
-    // Last, so a key the spec defines never sorts below one it does not, and so a file meka wrote
-    // reads top-down as the spec's own field order. Safe against clobbering the fields above:
-    // `metadata` is a named field, so `flatten` cannot route one here.
-    for (key, value) in &skill.extra {
-        front.insert(key.clone(), value.clone());
-    }
-
-    let mut out = String::from("---\n");
-    // A serializer failure here would mean a YAML value that cannot be represented as YAML, which
-    // this map cannot hold. The empty string it degrades to is caught by `write_skill`'s
-    // parse-back guard rather than reaching disk.
-    out.push_str(&serde_norway::to_string(&Value::Mapping(front)).unwrap_or_default());
-    out.push_str("---\n\n");
-    if body.trim().is_empty() {
-        out.push_str(&format!("# {}\n", skill.name));
-    } else {
-        out.push_str(body.trim_start_matches('\n'));
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Render the default `SKILL.md` template for a new skill. Optional fields are emitted only when
-/// set, so the resulting file stays as minimal as the user's input.
-pub fn render_template(
-    name: &str,
-    description: &str,
-    priority: u8,
-    metadata: BTreeMap<String, String>,
-) -> String {
-    // `--metadata key=value` can only produce strings, so the conversion is total and one-way; the
-    // richer [`Skill::metadata`] type exists for values that arrive from a file. Absent rather than
-    // an empty map when nothing was given, so a minimal skill renders as the spec's minimal
-    // example.
-    let metadata = (!metadata.is_empty()).then(|| {
-        serde_norway::Value::Mapping(
-            metadata
-                .into_iter()
-                .map(|(key, value)| (key.as_str().into(), value.as_str().into()))
-                .collect(),
-        )
-    });
-    let skill = Skill {
-        name: name.to_string(),
-        source_dir: PathBuf::new(),
-        description: description.to_string(),
-        license: None,
-        compatibility: None,
-        allowed_tools: None,
-        priority,
-        metadata,
-
-        extra: serde_norway::Mapping::new(),
-        conformance: Conformance {
-            declares_name: true,
-            ..Default::default()
-        },
-        body_path: PathBuf::new(),
-        root: PathBuf::new(),
-    };
-    render_skill_file(
-        &skill,
-        &format!(
-            "# {}\n\nSkill body. Reference files bundled in this skill's directory by relative \
-             path\n(e.g. `scripts/helper.sh`); they resolve against the directory this file is \
-             in.\n",
-            name
-        ),
-    )
 }
 
 #[cfg(test)]
@@ -1689,8 +1310,8 @@ mod tests {
     /// Discovery takes the name verbatim and never calls `validate_skill_name`, and it reaches the
     /// `[Skills]` index the model reads every turn, so a directory whose name carries a newline
     /// injected a second, fabricated entry -- a skill the model would then believe it had.
-    /// Sanitising the name closed that, and opened a quieter one: the listed name was no longer the
-    /// directory, so it addressed nothing and the real name could not be typed either. The skill is
+    /// Sanitizing the name would close that and open a quieter hole: the listed name is not the
+    /// directory, so it addresses nothing and the real name cannot be typed either. The skill is
     /// refused instead, and the reason is reported rather than being a name that silently lies.
     #[test]
     fn a_skill_directory_name_cannot_inject_an_index_entry() {
@@ -1807,7 +1428,7 @@ mod tests {
             match validate_addressable_name(name) {
                 Ok(()) => {
                     super::delete_skill(temp.path(), name).unwrap_or_else(|error| {
-                        panic!("'{}' is addressable but not deletable: {error}", name)
+                        panic!("'{name}' is addressable but not deletable: {error}")
                     });
                 }
                 Err(reason) => {
@@ -1891,7 +1512,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create skill dir");
         std::fs::write(
             dir.join("SKILL.md"),
-            format!("---\ndescription: {}\n---\n\nbody\n", long),
+            format!("---\ndescription: {long}\n---\n\nbody\n"),
         )
         .expect("write");
 
@@ -1904,7 +1525,7 @@ mod tests {
         assert!(!skills[0].description.ends_with("..."));
 
         // The index is still bounded; that is the render path's job.
-        let shown = crate::store::elide_description_for_index(&skills[0].description);
+        let shown = crate::entry::elide_description_for_index(&skills[0].description);
         assert!(shown.chars().count() <= 503, "{}", shown.chars().count());
         assert!(shown.ends_with("..."));
     }
@@ -1919,10 +1540,10 @@ mod tests {
     ///
     /// The guard must not sit at parse, which makes it destructive: the parsed `Skill` is the only
     /// copy the process holds and a write rebuilds the file from it, so an unrelated `skill_write`
-    /// would persist the sanitised text over the author's. `sanitize_text` filters the whole `Cf`
+    /// would persist the sanitized text over the author's. `sanitize_text` filters the whole `Cf`
     /// category, so a description needing a zero-width non-joiner came back permanently broken.
     /// Both halves are asserted here: the parse is byte-faithful, and every path that shows the
-    /// description neutralises it.
+    /// description neutralizes it.
     #[test]
     fn a_hand_written_skill_file_cannot_inject_lines_into_the_index() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1957,7 +1578,7 @@ mod tests {
     /// A description carrying a format character survives a read, an unrelated edit and a write.
     ///
     /// This is the loss the parse-time filter caused, in the shape a user meets it: the store is
-    /// the only copy, so editing *one other field* rewrote the file from sanitised text and took
+    /// the only copy, so editing *one other field* rewrote the file from sanitized text and took
     /// every `Cf` character with it. Persian needs U+200C between letters, and an emoji ZWJ
     /// sequence is held together by U+200D; both are in the category `sanitize_text` drops.
     #[test]
@@ -1991,8 +1612,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create skill dir");
         let render = |priority: u8| {
             format!(
-                "---\ndescription: a description\nmetadata:\n  meka-priority: {}\n---\n\nbody\n",
-                priority
+                "---\ndescription: a description\nmetadata:\n  meka-priority: {priority}\n---\n\nbody\n"
             )
         };
         std::fs::write(dir.join("SKILL.md"), render(3)).expect("write v1");
@@ -2043,6 +1663,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::paths::skill_roots;
 
     /// Discover one root, through the same code every caller uses.
     fn discover_skills_in(root: &Path) -> Vec<Skill> {
@@ -2112,8 +1733,7 @@ mod tests {
     /// `write_skill` rebuilds the file from a `Skill`, so any frontmatter key the struct cannot
     /// hold is one a rewrite destroys. An agent asked to refine an imported skill's description
     /// would have silently stripped its `license` and every `metadata` entry another client put
-    /// there.
-    /// A name that loaded never also appears as unloadable, in either walk order.
+    /// there. A name that loaded never also appears as unloadable, in either walk order.
     ///
     /// Two roots can hold one name with only one of the copies parsing, and discovery records a
     /// failure wherever it finds one. Both halves then claimed the name, and every reader of the
@@ -2199,7 +1819,7 @@ mod tests {
         std::fs::create_dir_all(native.join("empty-dir")).expect("empty");
         write_skill(&shared, "empty-dir", &good("empty-dir"));
 
-        let roots = vec![native.clone(), shared.clone()];
+        let roots = vec![native, shared];
         let walked = discover_skills_in_roots(&roots);
         for name in [
             "native-only",
@@ -2341,7 +1961,7 @@ mod tests {
         );
         assert_eq!(
             skill.priority,
-            crate::store::DEFAULT_PRIORITY,
+            crate::entry::DEFAULT_PRIORITY,
             "a bare `priority` is not `meka-priority`"
         );
         assert!(
@@ -2425,7 +2045,7 @@ mod tests {
                 "---\nname: weird-metadata-key\ndescription: d\nmetadata:\n  \"a: b\": v\n  ? |-\n    x\n    y\n  : z\n---\nb\n",
             ),
             (
-                // The one unmodelled key with a modelled counterpart at render time. `extra` goes
+                // The one unmodeled key with a modeled counterpart at render time. `extra` goes
                 // into the top-level map and the rank into the nested one, so a fixed point here
                 // is what says the two cannot collide.
                 "bare-priority-beside-a-rank",
@@ -2441,9 +2061,9 @@ mod tests {
             ),
             // A `metadata` that is not a map is deliberately absent: `write_skill` refuses such a
             // file rather than rendering it, so the renderer can never see one. See
-            // `a_metadata_that_is_not_a_map_refuses_the_rewrite`.
-            // Structured values inside a `metadata` map: the shapes a `BTreeMap<String, String>`
-            // flattened on the way in and then wrote back flattened.
+            // `a_metadata_that_is_not_a_map_refuses_the_rewrite`. Structured values inside a
+            // `metadata` map: the shapes a `BTreeMap<String, String>` flattened on the way in and
+            // then wrote back flattened.
             (
                 "structured-metadata",
                 "---\nname: structured-metadata\ndescription: d\nmetadata:\n  tags:\n    - pdf\n    - forms\n  origin:\n    repo: x\n  count: 3\n  flag: true\n---\nb\n",
@@ -2480,7 +2100,7 @@ mod tests {
             // hatch were separate, only the map was checked here, so the renderer bug that let one
             // silently overwrite the other slipped past the strongest test in the file.
             assert_eq!(second.metadata, first.metadata, "{name}: metadata");
-            assert_eq!(second.extra, first.extra, "{name}: unmodelled keys");
+            assert_eq!(second.extra, first.extra, "{name}: unmodeled keys");
             assert_eq!(second.priority, first.priority, "{name}: priority");
             // Both renders emit `name:`, so both parse back declaring one. A file that arrived
             // without the key does not stay that way: `render_skill_file` writes the directory name
@@ -2536,7 +2156,7 @@ mod tests {
     /// The custom deserializer bypasses serde_norway's scalar coercion, so where `license: 2024`
     /// beside it read fine, `allowed-tools: 42` matched neither variant of an untagged
     /// `String | Vec<String>` and failed the *entire frontmatter*. The skill then vanished from
-    /// every index and `write_skill`'s clobber guard refused to repair it -- unreachable and
+    /// every index and `write_skill`'s clobber guard would refuse to repair it -- unreachable and
     /// unfixable, over a field meka deliberately never acts on.
     #[test]
     fn a_scalar_allowed_tools_still_loads() {
@@ -2712,12 +2332,22 @@ mod tests {
             names.contains(&"broken") && names.contains(&"nodesc"),
             "{names:?}"
         );
-        // The reason names the file, so the user can go and fix it.
+        // The reason says why and nothing else. It travels to an HTTP caller through
+        // `SkillIndex::unavailable`, so the path it used to carry named the operator's filesystem
+        // in a 422 body; discovery logs the file instead, and `source_dir` is here for a local
+        // surface that wants to render it.
+        assert!(
+            failed.iter().all(|skipped| {
+                !skipped.reason.contains(&temp.path().display().to_string())
+                    && !skipped.reason.is_empty()
+            }),
+            "{failed:?}"
+        );
         assert!(
             failed
                 .iter()
-                .all(|skipped| skipped.reason.contains("SKILL.md")),
-            "{failed:?}"
+                .all(|skipped| skipped.source_dir().starts_with(temp.path())),
+            "the location is still answerable, as data: {failed:?}"
         );
     }
 
@@ -2725,7 +2355,7 @@ mod tests {
     /// the file than round-trips.
     ///
     /// Moving `extra` to a `serde_norway::Mapping` widened its key type from `String` to `Value`,
-    /// which is a real behaviour change and not obviously a safe one: the renderer replays every
+    /// which is a real behavior change and not obviously a safe one: the renderer replays every
     /// key straight back into the file, so a key the serializer cannot represent, or one that
     /// re-parses as something else, would corrupt a skill on the next edit rather than merely
     /// reorder it.
@@ -2801,7 +2431,7 @@ mod tests {
         }
     }
 
-    /// A rewrite replays unmodelled frontmatter in the order the author wrote it.
+    /// A rewrite replays unmodeled frontmatter in the order the author wrote it.
     ///
     /// Nothing was lost before this, which is why no existing test caught it: the round-trip test
     /// next door compares `extra` maps for equality, and map equality does not see order. What the
@@ -2835,7 +2465,7 @@ mod tests {
         assert_eq!(
             order,
             vec!["zzz-last", "when_to_use", "aaa-first"],
-            "unmodelled keys were reordered:\n{rewritten}"
+            "unmodeled keys were reordered:\n{rewritten}"
         );
     }
 
@@ -2975,7 +2605,7 @@ mod tests {
         write_skill(
             temp.path(),
             "verbose",
-            &format!("---\ndescription: d\ncompatibility: {}\n---\nbody\n", long),
+            &format!("---\ndescription: d\ncompatibility: {long}\n---\nbody\n"),
         );
 
         let skill = discover_skills_in(temp.path()).remove(0);
@@ -3285,10 +2915,10 @@ mod tests {
 
     /// The precedence `discover_skills_in_roots` relies on is decided here, so it needs its own
     /// assertion: passing a hand-built list to that function would not notice this reordering.
-    /// Holds [`crate::config::CONFIG_DIR_ENV_LOCK`] because `skills_dir` re-reads
-    /// `MEKA_CONFIG_DIR` on every call and `skills::cli`'s tests set and unset it from other
-    /// threads. Without the lock the two reads here can disagree, and the read races an
-    /// `unsafe set_var`, which is the hazard the lock exists for.
+    /// Holds [`crate::config::CONFIG_DIR_ENV_LOCK`] because `skills_dir` re-reads `MEKA_CONFIG_DIR`
+    /// on every call and `skills::cli`'s tests set and unset it from other threads. Without the
+    /// lock the two reads here can disagree, and the read races an `unsafe set_var`, which is the
+    /// hazard the lock exists for.
     #[tokio::test]
     async fn skill_roots_puts_mekas_own_store_first() {
         let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
@@ -3330,7 +2960,7 @@ mod tests {
         }
 
         // A memory is not an Agent Skills object and keeps the looser character class.
-        assert!(crate::store::validate_entry_name("My_Note", "memory").is_ok());
+        assert!(crate::entry::validate_entry_name("My_Note", "memory").is_ok());
 
         for name in ["deploy", "deploy-service", "s3", "a"] {
             assert!(
@@ -3373,7 +3003,7 @@ mod tests {
     #[test]
     fn an_overlong_description_is_refused_on_write_and_reported_on_read() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let long = "d".repeat(MAX_DESCRIPTION_LEN + 1);
+        let long = "d".repeat(MAX_DESCRIPTION_CHARS + 1);
 
         let error = super::write_skill(temp.path(), "verbose", &long, 5, None, Some("b"))
             .expect_err("an overlong description must be refused");
@@ -3382,7 +3012,7 @@ mod tests {
         write_skill(
             temp.path(),
             "verbose",
-            &format!("---\ndescription: {}\n---\nbody\n", long),
+            &format!("---\ndescription: {long}\n---\nbody\n"),
         );
         let logged = capture_warnings(|| {
             assert_eq!(
@@ -3409,7 +3039,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_valid_skill() {
+    fn load_valid_skill() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3429,7 +3059,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_skill_with_all_fields() {
+    fn load_skill_with_all_fields() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3458,7 +3088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_frontmatter_keys_are_ignored() {
+    fn unknown_frontmatter_keys_are_ignored() {
         // Skills authored for Claude Code carry keys meka doesn't model (when_to_use,
         // allowed-tools, hooks, ...). serde ignores unknown fields, so such a skill still parses on
         // a `description`.
@@ -3486,7 +3116,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_description_rejected() {
+    fn missing_description_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3506,7 +3136,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_frontmatter_rejected() {
+    fn no_frontmatter_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "no-fm", "Just body, no frontmatter\n");
 
@@ -3522,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_yaml_rejected() {
+    fn malformed_yaml_rejected() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3546,7 +3176,7 @@ mod tests {
     /// is what would tie a skill to meka. Asserting that they survive untouched is what stops the
     /// substitution being quietly reintroduced.
     #[tokio::test]
-    async fn test_load_skill_body_passes_the_body_through_verbatim() {
+    async fn load_skill_body_passes_the_body_through_verbatim() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3582,7 +3212,7 @@ mod tests {
     }
 
     fn valid_frontmatter(description: &str) -> String {
-        format!("---\ndescription: {}\n---\nBody\n", description)
+        format!("---\ndescription: {description}\n---\nBody\n")
     }
 
     /// Bump the mtime of a file far enough in the future to defeat 1-second filesystem resolution.
@@ -3597,7 +3227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_cache_picks_up_new_skill() {
+    async fn skill_cache_picks_up_new_skill() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
         assert!(cache.current().await.skills.is_empty());
@@ -3610,7 +3240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_cache_detects_modified_frontmatter() {
+    async fn skill_cache_detects_modified_frontmatter() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "foo", &valid_frontmatter("old"));
 
@@ -3627,7 +3257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_cache_drops_removed_skill() {
+    async fn skill_cache_drops_removed_skill() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "foo", &valid_frontmatter("first"));
 
@@ -3640,7 +3270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_cache_stable_when_unchanged() {
+    async fn skill_cache_stable_when_unchanged() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "foo", &valid_frontmatter("first"));
 
@@ -3657,7 +3287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skill_context_header_points_at_source_dir() {
+    fn skill_context_header_points_at_source_dir() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "demo", &valid_frontmatter("x"));
         let skill_path = temp.path().join("demo");
@@ -3675,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_defaults_and_clamps() {
+    fn priority_defaults_and_clamps() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "unranked", &valid_frontmatter("x"));
         write_skill(
@@ -3697,16 +3327,16 @@ mod tests {
                 .map(|skill| skill.priority)
                 .expect("skill present")
         };
-        assert_eq!(priority_of("unranked"), crate::store::DEFAULT_PRIORITY);
+        assert_eq!(priority_of("unranked"), crate::entry::DEFAULT_PRIORITY);
         assert_eq!(priority_of("ranked"), 1);
         // Clamped rather than rejected: a nonsense priority is not a reason to make the skill
         // itself unreachable.
-        assert_eq!(priority_of("nonsense"), crate::store::MAX_PRIORITY);
+        assert_eq!(priority_of("nonsense"), crate::entry::MAX_PRIORITY);
     }
 
     /// Discovery order is what the `[Skills]` cap cuts from, so priority has to beat name.
     #[test]
-    fn test_discovery_sorts_by_priority_then_name() {
+    fn discovery_sorts_by_priority_then_name() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3723,7 +3353,7 @@ mod tests {
 
     /// A metadata-only rewrite must not strip attribution the agent was never asked about.
     #[test]
-    fn test_write_skill_preserves_untouched_metadata_and_body() {
+    fn write_skill_preserves_untouched_metadata_and_body() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3749,7 +3379,7 @@ mod tests {
     /// it, so it is in no index and no listing, and nothing could have told the caller what was
     /// about to be lost. Overwriting it destroyed content whose only copy was that file.
     #[test]
-    fn test_write_skill_refuses_to_clobber_an_unparseable_file() {
+    fn write_skill_refuses_to_clobber_an_unparseable_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let dir = temp.path().join("triage");
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -3778,7 +3408,7 @@ mod tests {
     /// The same refusal for a `SKILL.md` that could not be *read*, not merely not parsed.
     ///
     /// `read_to_string(...).ok()` collapsed every read error into "there is no file here", so the
-    /// clobber guard above never saw it: a Latin-1 `SKILL.md` (an ordinary editor artefact) or one
+    /// clobber guard above never saw it: a Latin-1 `SKILL.md` (an ordinary editor artifact) or one
     /// at mode 000 was replaced by a five-line stub and the write reported success, because
     /// `body: None` then means "there was no body" rather than "the body could not be read".
     #[test]
@@ -3814,7 +3444,7 @@ mod tests {
     /// An empty description parses back as a missing required field, so without this guard the
     /// write succeeds and leaves behind a skill that can never be discovered or loaded again.
     #[test]
-    fn test_write_skill_rejects_an_empty_description() {
+    fn write_skill_rejects_an_empty_description() {
         let temp = tempfile::tempdir().expect("tempdir");
         for description in ["", "   ", "\n\t"] {
             assert!(
@@ -3828,7 +3458,7 @@ mod tests {
     /// Attribution is the one field nothing else records. An agent refining a skill you wrote must
     /// not reassign it to itself, so an existing `author` wins over the caller's.
     #[test]
-    fn test_write_skill_keeps_an_existing_author() {
+    fn write_skill_keeps_an_existing_author() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(
             temp.path(),
@@ -3865,7 +3495,7 @@ mod tests {
     /// survive a write/parse round trip: `split_frontmatter` takes the *first* `---` after the
     /// opening one, and a body full of them must not be able to steal that role.
     #[test]
-    fn test_write_skill_round_trips_a_hostile_body() {
+    fn write_skill_round_trips_a_hostile_body() {
         let temp = tempfile::tempdir().expect("tempdir");
         let hostile = "---\nnot: frontmatter\n---\n\nA line with: a colon\n# heading\n---\n";
         super::write_skill(
@@ -3890,10 +3520,10 @@ mod tests {
     }
 
     /// A description is written into a YAML scalar, so a newline in it renders a `---` line inside
-    /// the header that `split_frontmatter` mistakes for the closing fence. Without normalisation
+    /// the header that `split_frontmatter` mistakes for the closing fence. Without normalization
     /// the write succeeded, reported success, and left a skill discovery could never load again.
     #[test]
-    fn test_write_skill_survives_a_description_that_would_break_the_frontmatter() {
+    fn write_skill_survives_a_description_that_would_break_the_frontmatter() {
         let temp = tempfile::tempdir().expect("tempdir");
         let hostile = [
             ("newline", "step 1\nstep 2"),
@@ -3922,7 +3552,7 @@ mod tests {
     /// A directory with no `SKILL.md` has nothing in it to lose: a half-finished `meka skill add`
     /// or an interrupted write. Creating there must work rather than being refused as unreadable.
     #[test]
-    fn test_write_skill_creates_into_a_bare_directory() {
+    fn write_skill_creates_into_a_bare_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(temp.path().join("halfmade")).expect("mkdir");
 
@@ -3932,13 +3562,115 @@ mod tests {
         assert_eq!(skills[0].description, "now real");
     }
 
+    /// Every refusal the skill store composes names the skill and not the file.
+    ///
+    /// These strings are put on the wire by `PUT` and `DELETE /v1/skills/{name}` and handed to the
+    /// model by `skill_write` and `skill_delete`, and each one used to open with an absolute path
+    /// out of the operator's `config.toml`. Asserted as a sweep rather than per case because the
+    /// leak is per *string*: the two that were fixed first left four more, and a new refusal
+    /// composed the old way would pass any test written for one of them.
+    ///
+    /// The path is not lost; each of these warns with it. That is what makes the trade honest, and
+    /// it is why this asserts the name is present rather than only that the path is absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_refusal_names_the_skill_and_never_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        let shared = temp.path().join("shared");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(shared.join("borrowed")).expect("foreign dir");
+        std::fs::write(
+            shared.join("borrowed").join("SKILL.md"),
+            "---\nname: borrowed\ndescription: theirs\n---\nTHEIRS\n",
+        )
+        .expect("seed foreign");
+
+        // A directory that does not parse, one that cannot be read, one whose `metadata` is not a
+        // map, and one that is a symlink: the four shapes `write_skill` refuses on its own.
+        for (name, body) in [
+            (
+                "wrecked",
+                "---\ndescription: [unclosed\n---\nBODY\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "odd-meta",
+                "---\ndescription: d\nmetadata: nope\n---\nBODY\n"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                "unreadable",
+                b"---\ndescription: d\n---\nP \xff\xfe HERE\n".to_vec(),
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(name)).expect("dir");
+            std::fs::write(root.join(name).join("SKILL.md"), body).expect("seed");
+        }
+        std::os::unix::fs::symlink(temp.path().join("elsewhere"), root.join("linked"))
+            .expect("symlink");
+
+        let index = discover_skills_in_roots(&[root.clone(), shared.clone()]);
+        let mut refusals: Vec<(&str, String)> = Vec::new();
+        for name in ["wrecked", "odd-meta", "unreadable", "linked"] {
+            refusals.push((
+                name,
+                super::write_skill(&root, name, "mine now", 5, None, Some("MINE"))
+                    .expect_err("each of these must be refused"),
+            ));
+        }
+        refusals.push((
+            "linked",
+            super::delete_skill(&root, "linked").expect_err("a symlink is not deletable either"),
+        ));
+        refusals.push((
+            "borrowed",
+            refuse_foreign_write(&index, "borrowed", &root)
+                .expect("a foreign root is refused")
+                .to_string(),
+        ));
+        refusals.push((
+            "borrowed",
+            refuse_foreign_delete(&index, "borrowed", &root)
+                .expect("and not deletable")
+                .to_string(),
+        ));
+
+        // A path that cannot be written to at all: the failure the write itself reports.
+        std::fs::create_dir_all(root.join("sealed")).expect("dir");
+        std::fs::set_permissions(root.join("sealed"), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        if let Err(refusal) = super::write_skill(&root, "sealed", "mine", 5, None, Some("MINE")) {
+            refusals.push(("sealed", refusal));
+        }
+        std::fs::set_permissions(root.join("sealed"), std::fs::Permissions::from_mode(0o700))
+            .expect("restore");
+
+        let root_text = root.display().to_string();
+        let shared_text = shared.display().to_string();
+        for (name, refusal) in &refusals {
+            assert!(
+                refusal.contains(&format!("'{name}'")),
+                "a refusal must say which skill: {refusal}"
+            );
+            assert!(
+                !refusal.contains(&root_text) && !refusal.contains(&shared_text),
+                "{name}: the operator's path reached the caller: {refusal}"
+            );
+        }
+    }
+
     /// `validate_skill_name` stops a name from escaping the root, but it cannot see a symlink
     /// already sitting at that name. Archives preserve symlinks, so unpacking a downloaded skill
     /// bundle is enough to plant one, and following it would write outside the store at *read*
     /// permission, whose whole contract is that the user's tree does not change.
     #[cfg(unix)]
     #[test]
-    fn test_write_and_delete_refuse_a_symlinked_skill_directory() {
+    fn write_and_delete_refuse_a_symlinked_skill_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("skills");
         let outside = temp.path().join("outside");
@@ -3962,7 +3694,7 @@ mod tests {
     /// The file inside a legitimate directory is the second way in.
     #[cfg(unix)]
     #[test]
-    fn test_write_refuses_a_symlinked_skill_file() {
+    fn write_refuses_a_symlinked_skill_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("skills");
         let victim = temp.path().join("victim.md");
@@ -3981,7 +3713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_skill_rejects_a_traversing_name() {
+    fn write_skill_rejects_a_traversing_name() {
         let temp = tempfile::tempdir().expect("tempdir");
         assert!(super::write_skill(temp.path(), "../escape", "d", 5, None, Some("b")).is_err());
         assert!(super::write_skill(temp.path(), "a/b", "d", 5, None, Some("b")).is_err());
@@ -4029,7 +3761,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_skill_removes_the_directory() {
+    fn delete_skill_removes_the_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
         write_skill(temp.path(), "doomed", &valid_frontmatter("x"));
         std::fs::write(temp.path().join("doomed/data.txt"), "payload").expect("bundled file");
@@ -4051,7 +3783,7 @@ mod tests {
     /// coarse-resolution filesystem could serve the pre-edit body to the `agent_spawn` the edit was
     /// preparing. The size in the snapshot is what closes that.
     #[tokio::test]
-    async fn test_cache_sees_a_write_and_a_rewrite_without_waiting() {
+    async fn cache_sees_a_write_and_a_rewrite_without_waiting() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cache = SkillCache::for_root(Some(temp.path().to_path_buf()));
         assert!(cache.current().await.skills.is_empty());
@@ -4089,7 +3821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_cache_with_no_root_is_empty() {
+    async fn skill_cache_with_no_root_is_empty() {
         let cache = SkillCache::for_root(None);
         assert!(cache.current().await.skills.is_empty());
     }

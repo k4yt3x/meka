@@ -33,12 +33,12 @@ use crate::console::Console;
 /// Process-global relay. Tracing's `MakeWriter` clones this; the REPL installs its printer at
 /// startup. Stays uninstalled for non-interactive commands, so they keep getting plain stderr
 /// output.
-pub static RELAY: LazyLock<Relay> = LazyLock::new(Relay::new);
+pub(crate) static RELAY: LazyLock<Relay> = LazyLock::new(Relay::new);
 
 /// Routes log output through reedline's [`ExternalPrinter`] when the interactive REPL has installed
 /// one; falls back to stderr otherwise.
 #[derive(Clone)]
-pub struct Relay {
+pub(crate) struct Relay {
     printer: Arc<RwLock<Option<ExternalPrinter<String>>>>,
     /// True only while reedline's `read_line()` owns the terminal (raw mode, prompt drawn).
     /// reedline drains the `ExternalPrinter` channel exclusively inside that loop, so routing a
@@ -52,7 +52,7 @@ pub struct Relay {
     /// Weak on purpose: this static outlives every REPL, and an owning handle would keep a console
     /// (and the renderer behind it) alive for the life of the process after the host that made it
     /// has gone. A dead weak pointer answers the same as no console at all, which is the
-    /// non-interactive behaviour.
+    /// non-interactive behavior.
     console: Arc<RwLock<Weak<Mutex<Console>>>>,
 }
 
@@ -69,31 +69,15 @@ impl Relay {
     ///
     /// Both CLI hosts install one. `--oneshot` has no reedline and so no `ExternalPrinter`, but it
     /// draws the same thinking indicator, so it has the same row to be written over.
-    pub fn install_console(&self, console: &Arc<Mutex<Console>>) {
-        *self
-            .console
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(console);
+    pub(crate) fn install_console(&self, console: &Arc<Mutex<Console>>) {
+        *crate::sync::write(&self.console) = Arc::downgrade(console);
     }
 
     /// Register an [`ExternalPrinter`] so subsequent log lines get printed above the live prompt
     /// instead of racing reedline's redraw. Caller keeps a clone of the same printer to hand to
     /// [`reedline::Reedline::with_external_printer`].
-    pub fn install(&self, printer: ExternalPrinter<String>) {
-        *self
-            .printer
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(printer);
-    }
-
-    /// Drop the registered printer. Called on REPL teardown so tracing reverts to plain stderr
-    /// (e.g. interrupt handlers that fire after reedline has exited).
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        *self
-            .printer
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    pub(crate) fn install(&self, printer: ExternalPrinter<String>) {
+        *crate::sync::write(&self.printer) = Some(printer);
     }
 
     /// Mark whether reedline's `read_line()` is currently active. The REPL sets this true around
@@ -101,7 +85,7 @@ impl Relay {
     /// `ExternalPrinter` only while the prompt is live (and reedline is draining it) and go
     /// straight to stderr the rest of the time, surfacing immediately instead of buffering until
     /// the next prompt.
-    pub fn set_at_prompt(&self, at_prompt: bool) {
+    pub(crate) fn set_at_prompt(&self, at_prompt: bool) {
         self.at_prompt.store(at_prompt, Ordering::Relaxed);
     }
 }
@@ -124,14 +108,14 @@ impl<'a> MakeWriter<'a> for Relay {
 /// a pair of crossbeam channel handles) captured at the moment `make_writer` was called, so a
 /// printer install or clear racing with an in-flight write doesn't tear. `at_prompt` is read at
 /// write time so the routing reflects the live REPL state, not whatever it was at `make_writer`.
-pub struct RelayWriter {
+pub(crate) struct RelayWriter {
     printer: Option<ExternalPrinter<String>>,
     at_prompt: Arc<AtomicBool>,
     console: Option<Arc<Mutex<Console>>>,
 }
 
 impl Write for RelayWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         // Only hand the line to reedline's ExternalPrinter while the prompt is live: reedline
         // drains that channel exclusively inside `read_line()`, so off-prompt (during a turn) the
         // line would sit buffered until the next prompt. Off-prompt the terminal is in cooked mode,
@@ -143,13 +127,26 @@ impl Write for RelayWriter {
             // adds its own line break, so we strip the trailing newline tracing's formatter
             // appends. Empty messages are dropped to avoid blank-line spam from formatter
             // buffering.
-            match std::str::from_utf8(buf) {
+            match std::str::from_utf8(buffer) {
                 Ok(text) => {
                     let trimmed = text.trim_end_matches('\n');
-                    if !trimmed.is_empty() {
-                        let _ = printer.print(trimmed.to_string());
+                    if trimmed.is_empty() {
+                        return Ok(buffer.len());
                     }
-                    return Ok(buf.len());
+                    // `try_send`, never `print`: the printer is a bounded channel reedline drains
+                    // once per poll, and its `print` blocks when full. A burst of warnings then
+                    // parked a runtime worker until the next poll tick, and a line logged from the
+                    // REPL thread itself, which is the only drainer, hung the shell for good. A
+                    // full queue falls through to stderr below, which is where the line would have
+                    // gone off-prompt anyway.
+                    match printer.sender().try_send(trimmed.to_string()) {
+                        Ok(()) => return Ok(buffer.len()),
+                        Err(error) if error.is_disconnected() => {
+                            tracing::trace!("the editor has gone; a relayed line was dropped");
+                            return Ok(buffer.len());
+                        }
+                        Err(_full) => {}
+                    }
                 }
                 Err(_) => {
                     // Non-UTF-8 bytes from tracing are unexpected; fall through to stderr so
@@ -158,7 +155,7 @@ impl Write for RelayWriter {
             }
         }
         self.settle_the_row();
-        io::stderr().write(buf)
+        io::stderr().write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -213,8 +210,8 @@ impl RelayWriter {
 mod tests {
     use super::*;
     use crate::{
-        console::{Console, Neighbour, RowState, Spacing},
-        render::RenderMode,
+        config::RenderMode,
+        console::{Console, Neighbor, RowState, Spacing},
     };
 
     fn console() -> Arc<Mutex<Console>> {
@@ -225,6 +222,33 @@ mod tests {
             },
             RenderMode::Raw,
         )))
+    }
+
+    /// A full printer queue does not block the writer. The queue is drained only inside reedline's
+    /// `read_line`, so a write that waited for room could wait on the very thread doing the
+    /// writing.
+    #[test]
+    fn a_full_printer_queue_does_not_block_a_log_line() {
+        let relay = Relay::new();
+        let printer = ExternalPrinter::<String>::new(1);
+        relay.install(printer);
+        relay.set_at_prompt(true);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+
+            use tracing_subscriber::fmt::MakeWriter;
+            for line in ["first\n", "second\n", "third\n"] {
+                relay
+                    .make_writer()
+                    .write_all(line.as_bytes())
+                    .expect("write");
+            }
+            done.send(()).expect("report");
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the third line blocked on a queue nobody drains");
     }
 
     /// An off-prompt log line settles the row instead of landing on it.
@@ -247,7 +271,7 @@ mod tests {
         console
             .lock()
             .expect("console")
-            .open_episode(RowState::Empty, Neighbour::Prompt);
+            .open_episode(RowState::Empty, Neighbor::Prompt);
         console
             .lock()
             .expect("console")
@@ -277,7 +301,7 @@ mod tests {
     /// `render::report_lost_output` when their renderer fails, so a thread inside a console
     /// method reaches this writer while holding the very lock it wants. A blocking acquire
     /// would hang the REPL for good; the fallback is the raw stderr write that was the only
-    /// behaviour before this existed.
+    /// behavior before this existed.
     ///
     /// The guard is held across the write, which is exactly the reentrant shape, and the test
     /// completing at all is the assertion.
@@ -289,7 +313,7 @@ mod tests {
         relay.set_at_prompt(false);
 
         let mut held = console.lock().expect("console");
-        held.open_episode(RowState::Empty, Neighbour::Prompt);
+        held.open_episode(RowState::Empty, Neighbor::Prompt);
 
         relay
             .make_writer()

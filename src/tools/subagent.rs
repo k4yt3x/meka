@@ -4,57 +4,42 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{BuiltinToolFilter, Tool, ToolDenials, ToolOutput, ToolRegistry};
+use super::{Tool, ToolDenials, ToolOutput, ToolRegistry};
 use crate::{
-    agent::{Agent, AgentOptions},
-    config::{InstructionAccess, MemoryAccess},
-    context::build_environment_context,
+    agent::Agent,
+    config::{BuiltinToolFilter, InstructionAccess, MemoryAccess},
     conversation::Conversation,
     error::{MekaError, Result},
     permission::{EnabledPermissions, Permission, SharedPermission},
+    prompt::build_environment_context,
     provider::ToolDefinition,
-    session::SessionManager,
+    session::AgentOptions,
 };
 
-/// Hard ceiling on sub-agent nesting depth, independent of the tunable
-/// `session.subagent_max_depth` budget. Guarantees recursion always terminates even if an agent
-/// re-grants `max_depth` at every level: no agent nested deeper than this is given a `agent_spawn`
-/// tool, so the tree can never exceed this height.
+/// Hard ceiling on sub-agent nesting depth, independent of the tunable `session.subagent_max_depth`
+/// budget. Guarantees recursion always terminates even if an agent re-grants `max_depth` at every
+/// level: no agent nested deeper than this is given a `agent_spawn` tool, so the tree can never
+/// exceed this height.
 const SUBAGENT_ABSOLUTE_MAX_DEPTH: usize = 16;
 
-/// Parameters needed to build a fresh ToolRegistry for sub-agents.
+/// What a spawning agent hands its workers: the session's materials, its own live cells, and the
+/// ceilings a worker may not exceed.
 #[derive(Clone)]
-pub struct ToolBuilderParams {
-    /// What the parent runs on *now*. Ambient like every other field here, and inherited rather
-    /// than chosen: a sub-agent continues the parent's work on the parent's account.
-    ///
-    /// A live handle rather than the binding itself, because these tools are registered once when
-    /// the session is assembled and the parent may move afterwards. A copy taken at registration
-    /// sent every worker spawned after a `/provider` switch to the profile the user had just left,
-    /// billing that account, while the worker's own row recorded the new one.
-    pub live_binding: crate::agent::PublishedBinding,
-    pub web_client: crate::config::WebClientConfig,
-    pub sandbox_enabled: bool,
-    pub sandbox_capability: crate::sandbox::SandboxCapability,
-    pub sandbox_backend: crate::config::SandboxBackend,
-    pub backend_probe: crate::sandbox::BackendProbe,
-    /// Parent's `[tools]` filter; sub-agents inherit it.
-    pub builtin_filter: BuiltinToolFilter,
-    /// Shared skill cache. Sub-agents read from the same cache as the parent so their system
-    /// prompts stay consistent and pick up the same auto-reloads.
-    pub skills: Arc<crate::skills::SkillCache>,
-    /// Shared memory cache, reached at whatever level `memory_access` allows. The cache itself is
-    /// shared because memory is scoped to the meka instance, not to a conversation.
-    pub memories: Arc<crate::memory::MemoryStore>,
-    /// How much of the store the agent doing the spawning holds, which is the ceiling on what it
-    /// can grant. `Write` for the primary agent; for a worker, whatever its own spawn call
+pub(crate) struct ToolBuilderParams {
+    pub(crate) materials: crate::session::SessionMaterials,
+    /// The spawning agent's own cells. `cells.profile` is what the parent runs on *now*, read at
+    /// spawn time rather than at registration: a worker spawned after a `/profile` switch went
+    /// to the profile the user had just left, billing that account, while its own row recorded
+    /// the new one. `cells.cwd` is snapshotted per spawn so a parent `/cd` mid-turn cannot move a
+    /// running worker; the roots are shared, because nothing mutates them after construction.
+    pub(crate) cells: crate::session::SessionCells,
+    /// How much of the memory store the agent doing the spawning holds, which is the ceiling on
+    /// what it can grant. `Write` for the root agent; for a worker, whatever its own spawn call
     /// granted. A grant is clamped against this, so authority only ever narrows going down the
     /// tree.
-    pub memory_access: MemoryAccess,
+    pub(crate) memory_access: MemoryAccess,
     /// `[subagents].disabled_servers` / `disabled_tools` as config reads *now*.
     ///
     /// Distinct from `AgentSpawnTool::inherited_denials`, which is the accumulated set for this
@@ -63,52 +48,11 @@ pub struct ToolBuilderParams {
     /// a denial and resumes a session would find their existing workers still reaching what
     /// they just took away. Restrictions are combined, never replaced, so this can only ever
     /// narrow.
-    pub config_denials: ToolDenials,
-    /// Parent's MCP client manager, if any servers are configured. When `Some`, every
-    /// `agent_spawn` invocation calls [`crate::mcp::McpClientManager::install_tools_on`] on
-    /// the freshly-built sub-agent registry so sub-agents see the same MCP resource meta-tools
-    /// and per-server adapters as the parent. `None` is the no-MCP-configured case.
-    ///
-    /// Stored as a `Weak` to break the strong reference cycle that would otherwise form:
-    /// `McpClientManager.attached_registries` holds each session's `ToolRegistry`, which holds
-    /// this `AgentSpawnTool`, which holds the manager. Without a `Weak`, a session that drops
-    /// without `session/close` calling `detach_registry` leaks the entire chain until process
-    /// exit.
-    pub mcp_manager: Option<std::sync::Weak<crate::mcp::McpClientManager>>,
-    /// Shared `SessionManager` so sub-agents can create their own DB session at spawn time and
-    /// persist their conversation under it.
-    pub session_manager: SessionManager,
-    /// Parent agent's session ID. Read at spawn time so the new sub-agent session's
-    /// `parent_session_id` column points back here; cascade-on- delete in
-    /// `SessionManager::delete_session` then sweeps sub-agent rows when the parent is deleted.
-    pub parent_shared_session_id: Arc<RwLock<Option<Uuid>>>,
-    /// Parent's session-level counters. Shared so sub-agent token usage rolls up into the same
-    /// `/status` totals; operators see the full cost of a session including everything its
-    /// sub-agents consumed.
-    pub session_stats: Arc<crate::stats::SessionStats>,
-    /// Parent's options, used to derive the sub-agent's inherited fields (`sandboxed_shell`,
-    /// `context_messages`, the auto-compaction settings) inside [`Agent::new_subagent`].
-    /// `user_instructions` is deliberately *not* among them; see
-    /// [`build_subagent_system_prompt`].
-    pub parent_options: AgentOptions,
-    /// Parent's per-session working directory. Sub-agents snapshot the current value at spawn time
-    /// so a parent `/cd` mid-sub-agent-turn can't change the sub-agent's path resolution
-    /// mid-flight.
-    pub parent_cwd: crate::workspace::SharedCwd,
-    /// Parent's extra workspace roots, so a delegated search sees the same folders the parent does
-    /// and, at `workspace` permission, may write to the same ones.
-    ///
-    /// Shared rather than snapshotted, unlike `parent_cwd`: that one is copied into a fresh `Arc`
-    /// at spawn time so a mid-flight `/cd` in the parent can't move a running sub-agent. Roots
-    /// have no such hazard today because ACP fixes them for a session runtime's lifetime and
-    /// nothing mutates them after construction. If that ever changes, this needs the same
-    /// snapshot.
-    pub parent_roots: crate::workspace::SharedRoots,
-    /// Parent's frontend. Sub-agents wrap it in a
-    /// [`crate::frontend::PermissionForwardingFrontend`] so their permission prompts surface
-    /// in the parent's UI (REPL line or ACP `session/request_permission`). Without this,
-    /// sub-agents have no human to ask and would have to refuse Ask-mode tools outright.
-    pub parent_frontend: Arc<dyn crate::frontend::Frontend>,
+    pub(crate) config_denials: ToolDenials,
+    /// The spawning agent's options, from which a worker inherits `sandboxed_shell`,
+    /// `context_messages` and the auto-compaction settings inside [`Agent::new_subagent`].
+    /// `user_instructions` is deliberately *not* among them; see [`build_subagent_system_prompt`].
+    pub(crate) parent_options: AgentOptions,
 }
 
 /// The terms a sub-agent was spawned under, persisted as JSON on its session row
@@ -128,37 +72,37 @@ pub struct ToolBuilderParams {
 /// What is deliberately *not* here: the cwd (already on the session row) and the task (already in
 /// the event log).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct SubagentSpec {
+pub(crate) struct SubagentSpec {
     /// The level the worker ran at, already clamped against its parent at spawn time.
-    pub permission: Permission,
+    pub(crate) permission: Permission,
     /// The clamped enabled-permission set, so a rebuilt worker cannot climb past the ceiling its
     /// spawn call set even if a future runtime switch path appears.
     #[serde(default)]
-    pub enabled_permissions: Vec<Permission>,
+    pub(crate) enabled_permissions: Vec<Permission>,
     #[serde(default)]
-    pub denied_servers: Vec<String>,
+    pub(crate) denied_servers: Vec<String>,
     #[serde(default)]
-    pub denied_tools: Vec<String>,
+    pub(crate) denied_tools: Vec<String>,
     /// A spec that somehow lacks the field costs the worker its memory tools rather than handing
     /// it the store. [`MemoryAccess`] has no `Default` for the same reason: the only sensible one
-    /// would be `Write`, which is the primary agent's level and the wrong answer everywhere else.
+    /// would be `Write`, which is the root agent's level and the wrong answer everywhere else.
     #[serde(default = "MemoryAccess::none")]
-    pub memory: MemoryAccess,
+    pub(crate) memory: MemoryAccess,
     /// Whether the worker was handed the installation's instructions file. Defaults to `None` for
     /// a spec that lost the field, for the same fail-closed reason as `memory`.
     #[serde(default)]
-    pub instructions: InstructionAccess,
+    pub(crate) instructions: InstructionAccess,
     /// Parent scratchpad names the worker may read. Persisted because it is baked into both the
     /// registry and the system prompt at spawn; without it a follow-up would silently lose the
     /// entries the first turn was working from.
     #[serde(default)]
-    pub inherited_scratchpad: Vec<String>,
+    pub(crate) inherited_scratchpad: Vec<String>,
     /// The worker's own recursion budgets, so a followed-up worker can spawn exactly what it could
     /// have spawned on its first turn.
     #[serde(default)]
-    pub remaining_depth: usize,
+    pub(crate) remaining_depth: usize,
     #[serde(default)]
-    pub absolute_depth: usize,
+    pub(crate) absolute_depth: usize,
 }
 
 impl SubagentSpec {
@@ -200,9 +144,9 @@ impl SubagentSpec {
     }
 
     fn clamped_enabled(&self, effective: Permission) -> EnabledPermissions {
-        let enabled = EnabledPermissions::from_modes(self.enabled_permissions.iter().copied())
+        let enabled = EnabledPermissions::from_levels(self.enabled_permissions.iter().copied())
             .unwrap_or_else(|| {
-                EnabledPermissions::from_modes([effective]).unwrap_or(EnabledPermissions::DEFAULT)
+                EnabledPermissions::from_levels([effective]).unwrap_or(EnabledPermissions::DEFAULT)
             });
         clamp_enabled_permissions(enabled, effective)
     }
@@ -219,8 +163,8 @@ impl SubagentSpec {
         self.memory.min(MemoryAccess::Read)
     }
 
-    /// The level this worker actually runs at, given the parent's current ceiling.
-    /// What a **replayed** grant resolves to under the parent's current level.
+    /// The level this worker actually runs at, given the parent's current ceiling. What a
+    /// **replayed** grant resolves to under the parent's current level.
     ///
     /// `greatest_within_both`, not `clamp_to`: a follow-up must never run the worker at more than
     /// the spawn call asked for. `clamp_to` would resolve a recorded `workspace` under an `ask`
@@ -232,9 +176,9 @@ impl SubagentSpec {
     }
 }
 
-pub struct AgentSpawnTool {
-    pub parent_permission: SharedPermission,
-    pub tool_builder_params: ToolBuilderParams,
+pub(crate) struct AgentSpawnTool {
+    pub(crate) parent_permission: SharedPermission,
+    pub(crate) tool_builder_params: ToolBuilderParams,
     /// Everything a sub-agent spawned by *this* tool is denied. Seeded from `[subagents]` at the
     /// root and, for a nested `agent_spawn`, from its own parent's effective set unioned with what
     /// that spawn call added.
@@ -242,21 +186,20 @@ pub struct AgentSpawnTool {
     /// Carried on the tool rather than looked up per call because it has to accumulate: a worker
     /// that could spawn a grandchild free of its own denials would make every restriction one
     /// `agent_spawn` deep.
-    pub inherited_denials: ToolDenials,
+    pub(crate) inherited_denials: ToolDenials,
     /// Soft, agent-tunable recursion budget for sub-agents spawned by this tool. The root tool is
     /// seeded from `session.subagent_max_depth`; each level hands the child `remaining_depth - 1`
     /// unless the caller overrides it via the `max_depth` param. A nested `agent_spawn` is granted
     /// only while the child's budget is `>= 1`.
-    pub remaining_depth: usize,
+    pub(crate) remaining_depth: usize,
     /// Monotonic absolute nesting depth of the agent holding this tool (root = 0). Unlike
     /// `remaining_depth` it can't be reset by `max_depth`, so it bounds real recursion at
     /// [`SUBAGENT_ABSOLUTE_MAX_DEPTH`] regardless of what the agent requests.
-    pub absolute_depth: usize,
+    pub(crate) absolute_depth: usize,
 }
 
 /// `agent_spawn`'s schema, as a free function so a caller holding no tool can still name it.
-/// See [`agent_tool_catalogue`] for why that matters.
-pub fn agent_spawn_definition() -> ToolDefinition {
+pub(crate) fn agent_spawn_definition() -> ToolDefinition {
     ToolDefinition {
         name: "agent_spawn".to_string(),
         description: "Spawn a sub-agent to perform a research, analysis, or delegated task. \
@@ -315,31 +258,31 @@ pub fn agent_spawn_definition() -> ToolDefinition {
                 },
                 "permission": {
                     "type": "string",
-                    "enum": ["none", "read", "workspace", "ask", "unrestricted"],
+                    "enum": ["none", "read", "workspace", "unrestricted"],
                     "description": "Permission level for the sub-agent, never above your \
                                     own. Defaults to your current level; use a lower one \
-                                    (e.g. \"read\") to sandbox risky work. \"workspace\" and \
-                                    \"ask\" do not contain each other, so asking for one from \
-                                    the other yields \"read\"."
+                                    (e.g. \"read\") to sandbox risky work."
                 },
                 "memory": {
                     "type": "string",
                     "enum": ["none", "read"],
+                    "default": "none",
                     "description": "Grant the sub-agent read access to your memory store. \
-                                    Defaults to \"none\": a worker starts with a clean slate, \
+                                    Defaults to \"none\": a sub-agent starts with a clean slate, \
                                     since memories from unrelated work are context it pays for \
                                     and reasons from. Grant \"read\" when the task genuinely \
                                     depends on what you have recorded. Sub-agents can never \
                                     write to the store; record anything worth keeping \
-                                    yourself, from the worker's report."
+                                    yourself, from the sub-agent's report."
                 },
                 "instructions": {
                     "type": "string",
                     "enum": ["none", "inherit"],
+                    "default": "none",
                     "description": "Give the sub-agent the installation's instructions file. \
                                     Defaults to \"none\", because those instructions describe \
-                                    you -- your persona, how to address the user -- and a \
-                                    worker is not you. Pass \"inherit\" when the task needs \
+                                    you (your persona, how to address the user), and a \
+                                    sub-agent is not you. Pass \"inherit\" when the task needs \
                                     the project's standing rules verbatim and quoting the \
                                     relevant ones into `prompt` would be lossy or expensive."
                 },
@@ -349,7 +292,7 @@ pub fn agent_spawn_definition() -> ToolDefinition {
                     "description": "MCP server names the sub-agent must not see. Removes \
                                     everything the server offers: its tools, its resources, \
                                     and its prompts. Use this when a server exists to act on \
-                                    your behalf or to talk to the user, so a worker cannot \
+                                    your behalf or to talk to the user, so a sub-agent cannot \
                                     speak as you."
                 },
                 "deny_tools": {
@@ -388,8 +331,9 @@ impl Tool for AgentSpawnTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         // Both `prompt` and `skill` are optional, but at least one must be present. This mirrors
         // the CLI's `--oneshot` guard in `src/main.rs`. An empty/whitespace `prompt` counts
         // as absent.
@@ -414,7 +358,7 @@ impl Tool for AgentSpawnTool {
         // bad name fails fast without leaving an orphan child session behind.
         let skill = match &skill_name {
             Some(name) => {
-                let installed = self.tool_builder_params.skills.current().await;
+                let installed = self.tool_builder_params.materials.skills.current().await;
                 match installed.find(name) {
                     Some(skill) => Some(skill.clone()),
                     // A skill whose `SKILL.md` will not parse is in no index, so listing what *is*
@@ -443,7 +387,7 @@ impl Tool for AgentSpawnTool {
                         };
                         return Err(MekaError::ToolExecution {
                             tool_name: "agent_spawn".to_string(),
-                            message: format!("skill '{}' not found. {}", name, hint),
+                            message: format!("skill '{name}' not found. {hint}"),
                         });
                     }
                 }
@@ -452,11 +396,11 @@ impl Tool for AgentSpawnTool {
         };
 
         // `inherit_scratchpad`: optional array of parent-scratchpad names.
-        let inherited_scratchpad = string_array(&input, "inherit_scratchpad");
+        let inherited_scratchpad = string_array(&input, "inherit_scratchpad", "agent_spawn")?;
 
         // Resolve the sub-agent's permission: an optional `permission` param clamped to the
         // parent's level as a ceiling (restrict-only, never escalate); absent keeps the parent's
-        // level. Ask-mode prompts route through `PermissionForwardingFrontend` so they surface in
+        // level. Approval prompts route through `PermissionForwardingFrontend` so they surface in
         // the parent's UI.
         let requested_permission = optional_str(&input, "permission", "agent_spawn")?;
         let sub_perm =
@@ -466,23 +410,22 @@ impl Tool for AgentSpawnTool {
         // own parent) already denied. There is deliberately no allow-list parameter, because one
         // would let a parent hand a worker something the installation took away.
         let call_site_denials = ToolDenials::new(
-            string_array(&input, "deny_servers"),
-            string_array(&input, "deny_tools"),
+            string_array(&input, "deny_servers", "agent_spawn")?,
+            string_array(&input, "deny_tools", "agent_spawn")?,
         );
         // A name that matches nothing denies nothing, and the model gets no signal either way: it
         // asked for a sandboxed worker and would receive an unsandboxed one believing otherwise.
         // Warned rather than refused, because "deny it if it is there" is a legitimate thing to
         // write against a server list that varies by machine.
-        if let Some(weak) = self.tool_builder_params.mcp_manager.as_ref()
+        if let Some(weak) = self.tool_builder_params.materials.mcp_manager.as_ref()
             && let Some(manager) = weak.upgrade()
         {
             let configured = manager.server_names();
             for name in call_site_denials.server_list() {
                 if !configured.contains(&name) {
                     tracing::warn!(
-                        "agent_spawn deny_servers entry '{}' matches no configured MCP server, so \
-                         it denies nothing",
-                        name
+                        "agent_spawn deny_servers entry '{name}' matches no configured MCP server, so \
+                         it denies nothing"
                     );
                 }
             }
@@ -535,10 +478,8 @@ impl Tool for AgentSpawnTool {
         // Optional `max_depth`: the caller's override for how deep this sub-agent's own subtree may
         // recurse. Consumed by `child_spawn_depth` when deciding whether to grant a nested
         // `agent_spawn` below.
-        let max_depth_override = input
-            .get("max_depth")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize);
+        let max_depth_override =
+            optional_u64(&input, "max_depth", "agent_spawn")?.map(|value| value as usize);
 
         // Resolve parent session ID. By the time a tool runs, `Agent::run_turn` has already written
         // `shared_session_id` before dispatching tools. A missing value here means an agent ran a
@@ -546,9 +487,9 @@ impl Tool for AgentSpawnTool {
         // rather than silently producing an orphan.
         let parent_sid = self
             .tool_builder_params
-            .parent_shared_session_id
-            .read()
-            .await
+            .cells
+            .session_id
+            .get()
             .ok_or_else(|| MekaError::ToolExecution {
                 tool_name: "agent_spawn".to_string(),
                 message: "parent session ID not yet assigned (run_turn invariant)".to_string(),
@@ -567,7 +508,7 @@ impl Tool for AgentSpawnTool {
                     .await
                     .map_err(|error| MekaError::ToolExecution {
                         tool_name: "agent_spawn".to_string(),
-                        message: format!("failed to load skill: {}", error),
+                        message: format!("failed to load skill: {error}"),
                     })?;
                 Some(body)
             }
@@ -598,11 +539,10 @@ impl Tool for AgentSpawnTool {
 
         // Snapshot the parent's cwd once, here, so a parent `/cd` mid-sub-agent execution can't
         // shift the sub-agent's path resolution mid-flight. The same value is written to the
-        // child's session row, handed to its tool registry, and used to render its
-        // environment context; a follow-up reads it back off the row.
-        let sub_cwd_snapshot = crate::workspace::cwd_snapshot(&self.tool_builder_params.parent_cwd);
-        let sub_cwd: crate::workspace::SharedCwd =
-            Arc::new(std::sync::RwLock::new(sub_cwd_snapshot.clone()));
+        // child's session row, handed to its tool registry, and used to render its environment
+        // context; a follow-up reads it back off the row.
+        let sub_cwd_snapshot = self.tool_builder_params.cells.cwd.get();
+        let sub_cwd = crate::workspace::SharedCwd::new(sub_cwd_snapshot.clone());
 
         let spec = SubagentSpec {
             permission: sub_perm,
@@ -622,55 +562,50 @@ impl Tool for AgentSpawnTool {
         };
         let spec_json = serde_json::to_string(&spec).map_err(|error| MekaError::ToolExecution {
             tool_name: "agent_spawn".to_string(),
-            message: format!("failed to encode sub-agent spec: {}", error),
+            message: format!("failed to encode sub-agent spec: {error}"),
         })?;
 
         // Create the sub-agent's own DB session, linked back to the parent via `parent_session_id`.
         // Cascade-on-delete in `delete_session` sweeps it when the parent is removed.
         let (sub_session_id, sub_session_lock) = self
             .tool_builder_params
-            .session_manager
+            .materials
+            .store
             .create_child_session(
                 parent_sid,
                 Some(sub_cwd_snapshot.clone()),
                 Some(spec_json),
+                // The level the worker runs at, on the row like every other session's, so the row
+                // answers for it wherever a row is read.
+                sub_perm.to_string(),
                 // The same cell `build_subagent` reads a moment later, so the row this writes and
                 // the provider the worker is built on cannot come apart.
-                self.tool_builder_params.live_binding.current().binding,
+                self.tool_builder_params.cells.profile.current().profile,
             )
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_spawn".to_string(),
-                message: format!("failed to create sub-agent session: {}", error),
+                message: format!("failed to create sub-agent session: {error}"),
             })?;
         // Held for the whole of the worker's run, then released with this scope. Unlocked, a
         // sub-agent's row can be taken by a concurrent `meka session delete --all` and its
         // conversation cascaded away mid-turn. A failure to claim is a warning rather than a
-        // refusal, matching the primary agent's own creation path: the id is one nobody else can be
+        // refusal, matching the root agent's own creation path: the id is one nobody else can be
         // holding, so the only way here is a filesystem problem, and refusing to spawn over that
         // would break installations that work today.
         let _sub_session_lock = match sub_session_lock {
             Ok(lock) => Some(lock),
             Err(error) => {
-                tracing::warn!(
-                    "sub-agent session {} is running unlocked: {}",
-                    sub_session_id,
-                    error
-                );
+                tracing::warn!("sub-agent session {sub_session_id} is running unlocked: {error}");
                 None
             }
         };
-        tracing::info!(
-            "spawning sub-agent {} for parent {}",
-            sub_session_id,
-            parent_sid
-        );
+        tracing::info!("spawning sub-agent {sub_session_id} for parent {parent_sid}");
 
-        let sub_roots_snapshot =
-            crate::workspace::roots_snapshot(&self.tool_builder_params.parent_roots);
+        let sub_roots_snapshot = self.tool_builder_params.cells.roots.get();
         let environment_context =
             build_environment_context(sub_perm, &sub_cwd_snapshot, &sub_roots_snapshot);
-        let augmented_prompt = format!("{}\n{}", environment_context, task);
+        let augmented_prompt = format!("{environment_context}\n{task}");
 
         // The last step that can fail before the worker exists in its own right. Nothing here is
         // reachable in practice -- the web client is built from config the root already used, and a
@@ -684,14 +619,11 @@ impl Tool for AgentSpawnTool {
         let sub_agent = match build_subagent(
             &self.tool_builder_params,
             &spec,
-            // The parent's live handle. `resolve_subagent_permission` has already clamped the
-            // spec against it, so this re-derives the same starting level -- but it also stays
-            // bound to the parent afterwards, which a snapshot could not do.
-            &self.parent_permission,
             parent_sid,
             sub_session_id,
             sub_cwd,
             "agent_spawn",
+            &context,
         )
         .await
         {
@@ -699,15 +631,14 @@ impl Tool for AgentSpawnTool {
             Err(error) => {
                 if let Err(cleanup) = self
                     .tool_builder_params
-                    .session_manager
+                    .materials
+                    .store
                     .delete_session(sub_session_id)
                     .await
                 {
                     tracing::warn!(
-                        "sub-agent {} could not be built and its session row could not be removed \
-                         either: {}",
-                        sub_session_id,
-                        cleanup,
+                        "failed to build sub-agent {sub_session_id} and then failed to remove its \
+                         session row: {cleanup}"
                     );
                 }
                 return Err(error);
@@ -716,21 +647,24 @@ impl Tool for AgentSpawnTool {
 
         // Run the sub-agent's single turn via the shared `Agent::run_turn` path. Conversation
         // persistence (user message, assistant messages, tool results) happens inside `run_turn`
-        // against the sub-session, so the audit trail is identical to a primary agent's. Silent
+        // against the sub-session, so the audit trail is identical to the root agent's. Silent
         // rendering and the omitted MCP gate are baked into the options via `new_subagent`.
         let mut messages = Conversation::new();
-        let mut session_id_opt = Some(sub_session_id);
         // Mark every provider request made during this run as a sub-agent request so the Claude
         // OAuth billing header carries `cc_is_subagent=true;` (the provider is a shared `Arc`, so
         // the flag rides a task-local rather than provider state).
-        crate::provider::scope_subagent(sub_agent.run_turn(
-            &mut session_id_opt,
-            &mut messages,
-            augmented_prompt,
-            Vec::new(),
-            cancellation,
-        ))
-        .await?;
+        sub_agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts(augmented_prompt, Vec::new()).map_err(
+                    |empty| MekaError::ToolExecution {
+                        tool_name: "agent_spawn".to_string(),
+                        message: empty.to_string(),
+                    },
+                )?,
+                cancellation,
+            )
+            .await?;
 
         let report = messages
             .last_assistant_text()
@@ -744,10 +678,10 @@ impl Tool for AgentSpawnTool {
         // entry and handed to whatever later reads it -- while the model, which now sees only a
         // reference, would not get the id anyway. A scratchpad holds output the parent means to
         // pass around; the id is metadata about the call, and `agent_list` is where to find it.
-        let output = if input.get("scratchpad").is_some() {
+        let output = if super::util::redirects_to_scratchpad(&input) {
             report
         } else {
-            format!("agent: {}\n\n{}", sub_session_id, report)
+            format!("agent: {sub_session_id}\n\n{report}")
         };
         Ok(ToolOutput::text(output, false))
     }
@@ -764,11 +698,14 @@ impl Tool for AgentSpawnTool {
 /// is what this agent's future *children* are denied, and on the root agent that is the
 /// `[subagents]` config. Reading it here would make `[subagents] disabled_tools = ["agent_spawn"]`
 /// -- the natural way to write "workers may not spawn workers" -- delete `agent_spawn` from the
-/// top-level agent and turn delegation off entirely.
+/// root agent and turn delegation off entirely.
 ///
 /// Takes the already-built `AgentSpawnTool` because its depth counters differ between the root
 /// (seeded from config) and a nested level (derived from the parent's).
-pub fn register_subagent_tools(registry: &ToolRegistry, spawn: AgentSpawnTool) -> Result<()> {
+pub(crate) fn register_subagent_tools(
+    registry: &ToolRegistry,
+    spawn: AgentSpawnTool,
+) -> Result<()> {
     let params = spawn.tool_builder_params.clone();
     // The permission of the agent this registry belongs to. `AgentSpawnTool` clamps new workers
     // against it; `AgentFollowupTool` clamps rehydrated ones against it too.
@@ -828,41 +765,35 @@ pub fn register_subagent_tools(registry: &ToolRegistry, spawn: AgentSpawnTool) -
 /// Takes the filter rather than a [`ToolRegistry`] because the listing builds its reference
 /// registry unfiltered on purpose, to read every tool's hardcoded permission level; asking that
 /// registry would answer "yes" no matter what the user configured.
-pub fn agent_tools_registered(filter: &BuiltinToolFilter, subagent_max_depth: usize) -> bool {
+pub(crate) fn agent_tools_registered(
+    filter: &BuiltinToolFilter,
+    subagent_max_depth: usize,
+) -> bool {
     subagent_max_depth >= 1 && filter.admits("agent_spawn")
 }
 
-/// The name, schema and required level of each tool [`register_subagent_tools`] installs.
-///
-/// `meka tools list` prints a catalogue rather than running a session, and cannot build these
-/// tools: [`ToolBuilderParams::live_binding`] carries an `Arc<dyn Provider>`, so holding the
-/// objects would mean resolving a profile's credential before the command could name meka's own
-/// tools. Every value here is a constant, so the listing reads them directly. A test pins this
-/// against what a real registry ends up with, since the cost of a second door is that the two can
-/// disagree.
-pub fn agent_tool_catalogue() -> Vec<(ToolDefinition, Permission)> {
-    vec![
-        (agent_spawn_definition(), Permission::Read),
-        (agent_list_definition(), Permission::Read),
-        (agent_followup_definition(), Permission::Read),
-        (agent_delete_definition(), Permission::Read),
-    ]
-}
+/// The family [`agent_tools_registered`] decides about, for a listing that shows it as denied.
+pub(crate) const AGENT_TOOL_NAMES: [&str; 4] = [
+    "agent_spawn",
+    "agent_list",
+    "agent_followup",
+    "agent_delete",
+];
 
-/// Parse the `agent` argument, without checking ownership.
+/// Parse the `id` argument, without checking ownership.
 ///
 /// Split out so a caller can claim the per-worker guard *before* verifying ownership: verifying
 /// first leaves an await boundary between the check and the claim, which is exactly long enough for
 /// a concurrent `agent_delete` to remove the row the caller just validated.
 fn parse_agent_id(input: &serde_json::Value, tool_name: &'static str) -> Result<Uuid> {
-    let raw = super::util::require_str(input, "agent", tool_name)?;
+    let raw = super::util::require_str(input, "id", tool_name)?;
     Uuid::parse_str(raw.trim()).map_err(|_| MekaError::ToolExecution {
         tool_name: tool_name.to_string(),
-        message: format!("'{}' is not a valid agent id", raw),
+        message: format!("'{raw}' is not a valid agent id"),
     })
 }
 
-/// Refuse an `agent` argument that isn't a live child of the session running the tool.
+/// Refuse an `id` argument that isn't a live child of the session running the tool.
 ///
 /// One check, three failures it has to catch: an id that was never a sub-agent (a fabricated or
 /// mistyped UUID), a sub-agent belonging to a *different* parent, and a fork holding ids it does
@@ -873,16 +804,17 @@ async fn require_child_session(
     params: &ToolBuilderParams,
     tool_name: &'static str,
     input: &serde_json::Value,
-) -> Result<(Uuid, crate::session::SessionMetaRow)> {
+) -> Result<(Uuid, crate::store::SessionMetaRow)> {
     let agent_id = parse_agent_id(input, tool_name)?;
-    let parent_sid = current_session_id(params, tool_name).await?;
+    let parent_sid = current_session_id(params, tool_name)?;
     let children = params
-        .session_manager
+        .materials
+        .store
         .load_session_tree(parent_sid)
         .await
         .map_err(|error| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
-            message: format!("failed to list sub-agents: {}", error),
+            message: format!("failed to list sub-agents: {error}"),
         })?;
     children
         .into_iter()
@@ -891,9 +823,8 @@ async fn require_child_session(
         .ok_or_else(|| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: format!(
-                "no sub-agent '{}' belongs to this session. Use `agent_list` to see the ones that \
-                 do.",
-                agent_id
+                "no sub-agent '{agent_id}' belongs to this session. Use `agent_list` to see the ones that \
+                 do."
             ),
         })
 }
@@ -901,11 +832,11 @@ async fn require_child_session(
 /// The session id of the agent running the tool. By the time a tool runs, `Agent::run_turn` has
 /// written `shared_session_id`; a missing value means an agent ran a tool without first creating
 /// its session, an internal invariant break worth surfacing rather than papering over.
-async fn current_session_id(params: &ToolBuilderParams, tool_name: &'static str) -> Result<Uuid> {
+fn current_session_id(params: &ToolBuilderParams, tool_name: &'static str) -> Result<Uuid> {
     params
-        .parent_shared_session_id
-        .read()
-        .await
+        .cells
+        .session_id
+        .get()
         .ok_or_else(|| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: "session ID not yet assigned (run_turn invariant)".to_string(),
@@ -913,12 +844,12 @@ async fn current_session_id(params: &ToolBuilderParams, tool_name: &'static str)
 }
 
 /// Lists the sub-agents this session has spawned and can still follow up on.
-pub struct AgentListTool {
-    pub tool_builder_params: ToolBuilderParams,
+pub(crate) struct AgentListTool {
+    pub(crate) tool_builder_params: ToolBuilderParams,
 }
 
 /// `agent_list`'s schema. Free-standing for the reason [`agent_spawn_definition`] is.
-pub fn agent_list_definition() -> ToolDefinition {
+pub(crate) fn agent_list_definition() -> ToolDefinition {
     ToolDefinition {
         name: "agent_list".to_string(),
         description: "List the sub-agents you have spawned in this session, with each one's \
@@ -944,17 +875,18 @@ impl Tool for AgentListTool {
     async fn execute(
         &self,
         _input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        let session_id = current_session_id(&self.tool_builder_params, "agent_list").await?;
+        let session_id = current_session_id(&self.tool_builder_params, "agent_list")?;
         let rows = self
             .tool_builder_params
-            .session_manager
+            .materials
+            .store
             .load_session_tree(session_id)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_list".to_string(),
-                message: format!("failed to list sub-agents: {}", error),
+                message: format!("failed to list sub-agents: {error}"),
             })?;
 
         // Direct children only. Grandchildren belong to the worker that spawned them and are
@@ -968,7 +900,8 @@ impl Tool for AgentListTool {
             // tool results.
             let turns = self
                 .tool_builder_params
-                .session_manager
+                .materials
+                .store
                 .load_events(row.id)
                 .await
                 .map(|events| {
@@ -976,11 +909,11 @@ impl Tool for AgentListTool {
                         .iter()
                         .filter(|event| match event {
                             crate::conversation::Event::Append(message) => {
-                                message.role == crate::provider::Role::User
+                                message.role == crate::conversation::Role::User
                                     && !message.content.iter().all(|block| {
                                         matches!(
                                             block,
-                                            crate::provider::ContentBlock::ToolResult { .. }
+                                            crate::conversation::ContentBlock::ToolResult { .. }
                                         )
                                     })
                             }
@@ -992,7 +925,10 @@ impl Tool for AgentListTool {
             lines.push(format!(
                 "{}\t{}\tturns={}\tlast_active={}",
                 row.id,
-                row.cwd.as_deref().unwrap_or(""),
+                row.cwd
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
                 turns,
                 row.updated_at,
             ));
@@ -1009,15 +945,15 @@ impl Tool for AgentListTool {
 }
 
 /// Asks a sub-agent another question, on top of everything it already did.
-pub struct AgentFollowupTool {
+pub(crate) struct AgentFollowupTool {
     /// The level of the agent holding this tool, read live at each call. A worker never runs above
     /// it, so switching the session down to `read` reaches workers spawned while it was at
     /// `unrestricted`.
-    pub parent_permission: SharedPermission,
-    pub tool_builder_params: ToolBuilderParams,
+    pub(crate) parent_permission: SharedPermission,
+    pub(crate) tool_builder_params: ToolBuilderParams,
     /// Sub-agents currently running a follow-up, keyed by session id. Shared with every other
     /// `agent_followup` on this registry.
-    pub in_flight: InFlightFollowups,
+    pub(crate) in_flight: InFlightFollowups,
 }
 
 /// Sub-agent sessions with a follow-up in progress.
@@ -1026,7 +962,7 @@ pub struct AgentFollowupTool {
 /// interleave: both hydrate the same event log, both append to it, and the second overwrites the
 /// first's view of what happened. A `std::sync::Mutex` over a set is enough because every critical
 /// section is a set insert or removal, never an await.
-pub type InFlightFollowups = Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>;
+pub(crate) type InFlightFollowups = Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>;
 
 /// Claims a sub-agent for the duration of one follow-up, releasing it on drop so an error or a
 /// cancellation mid-turn cannot leave the worker permanently marked busy.
@@ -1037,9 +973,7 @@ struct FollowupGuard {
 
 impl FollowupGuard {
     fn claim(in_flight: &InFlightFollowups, agent_id: Uuid) -> Option<Self> {
-        let mut guard = in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = crate::sync::lock(in_flight);
         if !guard.insert(agent_id) {
             return None;
         }
@@ -1053,10 +987,7 @@ impl FollowupGuard {
 
 impl Drop for FollowupGuard {
     fn drop(&mut self) {
-        self.in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.agent_id);
+        crate::sync::lock(&self.in_flight).remove(&self.agent_id);
     }
 }
 
@@ -1070,7 +1001,7 @@ impl Drop for FollowupGuard {
 /// therefore survived the whole suite, and would have let a worker keep reaching an MCP server the
 /// operator had since denied.
 ///
-/// The spec is a floor on restriction, never a licence: config can only narrow it, and `..spec`
+/// The spec is a floor on restriction, never a license: config can only narrow it, and `..spec`
 /// carries everything config has no opinion about.
 fn combined_for_followup(
     spec: SubagentSpec,
@@ -1086,7 +1017,7 @@ fn combined_for_followup(
 }
 
 /// `agent_followup`'s schema. Free-standing for the reason [`agent_spawn_definition`] is.
-pub fn agent_followup_definition() -> ToolDefinition {
+pub(crate) fn agent_followup_definition() -> ToolDefinition {
     ToolDefinition {
         name: "agent_followup".to_string(),
         description: "Ask a sub-agent you already spawned another question. It keeps its own \
@@ -1099,7 +1030,7 @@ pub fn agent_followup_definition() -> ToolDefinition {
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "agent": {
+                "id": {
                     "type": "string",
                     "description": "The sub-agent's id, as returned by `agent_spawn` or \
                                     `agent_list`."
@@ -1114,7 +1045,7 @@ pub fn agent_followup_definition() -> ToolDefinition {
                                     scratchpad under this name instead of returning it inline."
                 }
             },
-            "required": ["agent", "prompt"]
+            "required": ["id", "prompt"]
         }),
         ..Default::default()
     }
@@ -1133,8 +1064,9 @@ impl Tool for AgentFollowupTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        cancellation: CancellationToken,
+        context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
+        let cancellation = context.cancellation.clone();
         let prompt = super::util::require_str(&input, "prompt", "agent_followup")?;
         // Claimed before the ownership check, not after: the check awaits, and a concurrent
         // `agent_delete` finishing inside that window would leave this turn writing to a session
@@ -1144,9 +1076,8 @@ impl Tool for AgentFollowupTool {
             return Err(MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
                 message: format!(
-                    "sub-agent '{}' is busy. Wait for the call already running against it to \
-                     return before asking again.",
-                    agent_id
+                    "sub-agent '{agent_id}' is busy. Wait for the call already running against it to \
+                     return before asking again."
                 ),
             });
         };
@@ -1158,27 +1089,27 @@ impl Tool for AgentFollowupTool {
         // `SubagentSpec`.
         let spec_json = self
             .tool_builder_params
-            .session_manager
+            .materials
+            .store
             .load_subagent_spec(agent_id)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
-                message: format!("failed to load sub-agent spec: {}", error),
+                message: format!("failed to load sub-agent spec: {error}"),
             })?
             .ok_or_else(|| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
                 message: format!(
-                    "sub-agent '{}' has no recorded spawn terms (it predates follow-up support), \
-                     so it cannot be resumed safely. Spawn a new one.",
-                    agent_id
+                    "sub-agent '{agent_id}' has no recorded spawn terms (it predates follow-up support), \
+                     so it cannot be resumed safely. Spawn a new one."
                 ),
             })?;
         let spec: SubagentSpec =
             serde_json::from_str(&spec_json).map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
-                message: format!("sub-agent '{}' has an unreadable spec: {}", agent_id, error),
+                message: format!("sub-agent '{agent_id}' has an unreadable spec: {error}"),
             })?;
-        // The spec records what the worker was granted; it is not a licence to ignore what applies
+        // The spec records what the worker was granted; it is not a license to ignore what applies
         // now. Config may have gained deny lists since the spawn -- most likely across the restart
         // an old worker had to survive to be here -- and the memory grant is re-clamped against
         // what *this* agent currently holds, so a worker cannot outlive its granter's own limits.
@@ -1191,15 +1122,13 @@ impl Tool for AgentFollowupTool {
 
         // The worker's own cwd, as recorded when it was spawned, not the parent's current one: a
         // `/cd` between the spawn and the follow-up must not move a worker mid-task.
-        let sub_cwd: crate::workspace::SharedCwd = Arc::new(std::sync::RwLock::new(
+        let sub_cwd = crate::workspace::SharedCwd::new(
             row.cwd
                 .as_deref()
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    crate::workspace::cwd_snapshot(&self.tool_builder_params.parent_cwd)
-                }),
-        ));
-        let sub_cwd_snapshot = crate::workspace::cwd_snapshot(&sub_cwd);
+                .unwrap_or_else(|| self.tool_builder_params.cells.cwd.get()),
+        );
+        let sub_cwd_snapshot = sub_cwd.get();
 
         let ceiling = self.parent_permission.get();
         let effective_permission = spec.effective_permission(ceiling);
@@ -1208,92 +1137,58 @@ impl Tool for AgentFollowupTool {
         // to `ask` compares as *greater* and reported nothing, even though the worker changed
         // level. Any difference from what was recorded is worth saying out loud.
         if effective_permission != spec.permission {
+            let recorded = spec.permission;
             tracing::info!(
-                "sub-agent {} runs at {} rather than its recorded {}: this session has since been \
-                 restricted",
-                agent_id,
-                effective_permission,
-                spec.permission,
+                "sub-agent {agent_id} runs at {effective_permission} rather than its recorded {recorded}: this session has since been \
+                 restricted"
             );
         }
 
         let sub_agent = build_subagent(
             &self.tool_builder_params,
             &spec,
-            &self.parent_permission,
             parent_sid,
             agent_id,
-            Arc::clone(&sub_cwd),
+            sub_cwd.clone(),
             "agent_followup",
+            &context,
         )
         .await?;
-
-        // The row has to follow the build, for the reason `agent_spawn` writes it from the same
-        // cell: `build_subagent` runs the worker on the parent's binding *now*, and a follow-up
-        // after a `/provider` switch therefore bills an account the worker's row does not name.
-        // Every reader disagrees with what ran until this lands -- `meka session list`, `GET
-        // /v1/sessions`, `session export`, and a later resume, which re-pins the worker to the
-        // profile it has not been running on.
-        //
-        // A write failure is a warning, not a refusal. The turn is about to happen either way, the
-        // worker is already built, and failing here would abandon work over a bookkeeping row. A
-        // write that matches no row is the same shape and gets the same treatment, but says
-        // something different, so it says it: the worker was deleted between the build and here.
-        //
-        // Read off the built agent rather than the live cell a second time. The cell is what
-        // `build_subagent` consulted, but a repin landing in the gap -- `/provider`, `PATCH
-        // /v1/sessions/{id}`, ACP's `session/set_config_option` -- would make the second read a
-        // different answer, and the row would name a profile this turn is not running on. That is
-        // the defect being fixed here, one race narrower.
-        let ran_on = sub_agent.provider_binding().clone();
-        match self
-            .tool_builder_params
-            .session_manager
-            .set_recorded_provider(agent_id, &ran_on)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::warn!(
-                "sub-agent {} is running on '{}' but has no row to record it on",
-                agent_id,
-                ran_on
-            ),
-            Err(error) => tracing::warn!(
-                "sub-agent {} is running on '{}' but its row could not be updated to say so: {}",
-                agent_id,
-                ran_on,
-                error
-            ),
-        }
 
         // Rehydrate the worker's own conversation: the same three calls the REPL's resume path
         // makes. `from_events` arms the resume notice, and it is left armed deliberately -- every
         // follow-up really is a fresh registry, a fresh read tracker and an empty todo list, so the
         // worker is being told something true each time rather than a stale banner.
-        let events = self
-            .tool_builder_params
-            .session_manager
-            .load_events(agent_id)
+        let store = &self.tool_builder_params.materials.store;
+        let mut events =
+            store
+                .load_events(agent_id)
+                .await
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: "agent_followup".to_string(),
+                    message: format!("failed to load sub-agent conversation: {error}"),
+                })?;
+        // Bytes back into every image reference, as the root agent's hydration does.
+        store
+            .inline_blobs(&mut events)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
-                message: format!("failed to load sub-agent conversation: {}", error),
+                message: format!("failed to load the sub-agent's images: {error}"),
             })?;
         let mut messages = Conversation::from_events(events);
         for dropped in messages.sanitize_orphans() {
+            let count = dropped.content.len();
             tracing::warn!(
-                "sub-agent {}: dropped an assistant message with orphaned tool_use blocks while \
-                 rehydrating ({} blocks)",
-                agent_id,
-                dropped.content.len(),
+                "sub-agent {agent_id}: dropped an assistant message with orphaned tool_use blocks while \
+                 rehydrating ({count} blocks)"
             );
         }
 
-        let roots_snapshot =
-            crate::workspace::roots_snapshot(&self.tool_builder_params.parent_roots);
+        let roots_snapshot = self.tool_builder_params.cells.roots.get();
         let environment_context =
             build_environment_context(effective_permission, &sub_cwd_snapshot, &roots_snapshot);
-        let augmented_prompt = format!("{}\n{}", environment_context, prompt);
+        let augmented_prompt = format!("{environment_context}\n{prompt}");
 
         // Held for this turn, as `agent_spawn` holds it for the spawn. A follow-up runs a full turn
         // against a row nothing else claims, so without this the worker sat unlocked for seconds to
@@ -1307,22 +1202,60 @@ impl Tool for AgentFollowupTool {
         // interleaved into one conversation is the thing the lock is for.
         let _worker_lock = self
             .tool_builder_params
-            .session_manager
+            .materials
+            .store
             .lock_session(agent_id)
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
-                message: format!("cannot follow up on sub-agent {}: {}", agent_id, error),
+                message: format!("cannot follow up on sub-agent {agent_id}: {error}"),
             })?;
 
-        let mut session_id_opt = Some(agent_id);
-        crate::provider::scope_subagent(sub_agent.run_turn(
-            &mut session_id_opt,
-            &mut messages,
-            augmented_prompt,
-            Vec::new(),
-            cancellation,
-        ))
-        .await?;
+        // The row has to follow the build, for the reason `agent_spawn` writes it from the same
+        // cell: `build_subagent` runs the worker on the parent's profile *now*, and a follow-up
+        // after a `/profile` switch therefore bills an account the worker's row does not name.
+        // Every reader disagrees with what ran until this lands -- `meka session list`, `GET
+        // /v1/sessions`, `session export`, and a later resume, which re-pins the worker to the
+        // profile it has not been running on.
+        //
+        // And it has to follow the lock and the hydration, immediately ahead of the turn: written
+        // earlier, a follow-up the lock then refused, or whose conversation could not be loaded,
+        // had already moved the row onto a profile the worker never ran on.
+        //
+        // Read off the built agent rather than the live cell a second time. The cell is what
+        // `build_subagent` consulted, but a repin landing in the gap -- `/profile`, `PATCH
+        // /v1/sessions/{id}`, ACP's `session/set_config_option` -- would make the second read a
+        // different answer, and the row would name a profile this turn is not running on.
+        //
+        // The row is the billing record, so a write that fails fails the call: the policy every
+        // host applies to a profile through `record_session_change`, which a tool cannot reach.
+        let ran_on = sub_agent.profile();
+        self.tool_builder_params
+            .materials
+            .store
+            .update_session(agent_id, crate::store::SessionPatch {
+                profile: Some(ran_on.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| MekaError::ToolExecution {
+                tool_name: "agent_followup".to_string(),
+                message: format!(
+                    "failed to record that sub-agent {agent_id} runs on '{ran_on}': {error}"
+                ),
+            })?;
+
+        sub_agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts(augmented_prompt, Vec::new()).map_err(
+                    |empty| MekaError::ToolExecution {
+                        tool_name: "agent_followup".to_string(),
+                        message: empty.to_string(),
+                    },
+                )?,
+                cancellation,
+            )
+            .await?;
 
         let report = messages
             .last_assistant_text()
@@ -1332,33 +1265,33 @@ impl Tool for AgentFollowupTool {
 }
 
 /// Discards a sub-agent and everything it accumulated.
-pub struct AgentDeleteTool {
-    pub tool_builder_params: ToolBuilderParams,
+pub(crate) struct AgentDeleteTool {
+    pub(crate) tool_builder_params: ToolBuilderParams,
     /// Shared with this registry's `agent_followup`, so the two cannot run on one worker at once.
-    pub in_flight: InFlightFollowups,
+    pub(crate) in_flight: InFlightFollowups,
 }
 
 /// `agent_delete`'s schema. Free-standing for the reason [`agent_spawn_definition`] is.
-pub fn agent_delete_definition() -> ToolDefinition {
+pub(crate) fn agent_delete_definition() -> ToolDefinition {
     ToolDefinition {
         name: "agent_delete".to_string(),
         description: "Delete a sub-agent you spawned, discarding its conversation, its \
                       scratchpad entries, and any sub-agents it spawned in turn. Use this once \
-                      you have what you needed from a worker, so a long session doesn't carry \
-                      every worker it ever ran. This removes only meka's own record of that \
+                      you have what you needed from a sub-agent, so a long session doesn't carry \
+                      every sub-agent it ever ran. This removes only meka's own record of that \
                       sub-agent and its descendants: files it wrote to disk, and your own \
                       conversation and scratchpad, are untouched."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "agent": {
+                "id": {
                     "type": "string",
                     "description": "The sub-agent's id, as returned by `agent_spawn` or \
                                     `agent_list`."
                 }
             },
-            "required": ["agent"]
+            "required": ["id"]
         }),
         ..Default::default()
     }
@@ -1377,9 +1310,9 @@ impl Tool for AgentDeleteTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _cancellation: CancellationToken,
+        _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
-        // Claimed before the ownership check, mirroring `agent_followup`, so the two serialise on
+        // Claimed before the ownership check, mirroring `agent_followup`, so the two serialize on
         // one worker whichever arrives first. Parallel tool calls in a single turn make this
         // reachable: without it, a delete completing inside a follow-up's ownership check leaves
         // that follow-up writing to a deleted session and failing on a foreign-key violation --
@@ -1389,9 +1322,8 @@ impl Tool for AgentDeleteTool {
             return Err(MekaError::ToolExecution {
                 tool_name: "agent_delete".to_string(),
                 message: format!(
-                    "sub-agent '{}' is busy. Wait for the call already running against it to \
-                     return before deleting it.",
-                    agent_id
+                    "sub-agent '{agent_id}' is busy. Wait for the call already running against it to \
+                     return before deleting it."
                 ),
             });
         };
@@ -1401,14 +1333,16 @@ impl Tool for AgentDeleteTool {
         // `tool_outputs.session_id` all carry `ON DELETE CASCADE`, so the worker's messages, its
         // scratchpad entries and its own descendants go with it.
         self.tool_builder_params
-            .session_manager
+            .materials
+            .store
             .delete_session(row.id)
             .await
             .map_err(|error| MekaError::ToolExecution {
                 tool_name: "agent_delete".to_string(),
-                message: format!("failed to delete sub-agent: {}", error),
+                message: format!("failed to delete sub-agent: {error}"),
             })?;
-        tracing::info!("deleted sub-agent session {}", row.id);
+        let id = row.id;
+        tracing::info!("deleted sub-agent session {id}");
         Ok(ToolOutput::text(format!("deleted agent {}", row.id), false))
     }
 }
@@ -1423,26 +1357,28 @@ impl Tool for AgentDeleteTool {
 /// follow-up that quietly runs under different terms than the spawn did, which is the exact failure
 /// the spec exists to prevent.
 ///
-/// `params` supplies the *ambient* collaborators (provider, caches, session manager, frontend) and
+/// `params` supplies the *ambient* collaborators (provider, caches, store, frontend) and
 /// `spec` supplies every restriction. `params.memory_access` is deliberately not read here: the
 /// spec's copy is authoritative, because config may have changed since the spawn.
-#[allow(clippy::too_many_arguments)]
 async fn build_subagent(
     params: &ToolBuilderParams,
     spec: &SubagentSpec,
-    // The parent's live handle, not a snapshot of its level. Taking a `Permission` here is what
-    // let a worker outlive its parent's downgrade: the value was read once and frozen into a fresh
-    // atomic, so nothing the user did afterwards could reach the running child.
-    parent_permission: &SharedPermission,
     parent_session_id: Uuid,
     sub_session_id: Uuid,
     sub_cwd: crate::workspace::SharedCwd,
     tool_name: &'static str,
+    // The call that spawns the worker: its tool-use id, so the worker's own tool calls roll up
+    // into that call's display, and the prompt it answers, so the worker's requests bill to it.
+    call: &crate::tools::ToolContext,
 ) -> Result<Agent> {
+    // The parent's live handle, not a snapshot of its level. Taking a `Permission` here is what
+    // let a worker outlive its parent's downgrade: the value was read once and frozen into a fresh
+    // atomic, so nothing the user did afterwards could reach the running child.
+    let parent_permission = &params.cells.permission;
     // Read at spawn time, not at registration: the parent may have switched profile since this
     // tool was registered, and a worker runs on what its parent runs on *now*.
-    let parent_binding = params.live_binding.current();
-    // A worker's window comes off `parent_binding` inside `Agent::new_subagent`, not from
+    let parent_profile = params.cells.profile.current();
+    // A worker's window comes off `parent_profile` inside `Agent::new_subagent`, not from
     // `params.parent_options`, which was cloned when the session was assembled and cannot hear
     // about a switch. Taking the provider from one and the window from the other is how a worker
     // came to talk to a 32k profile while auto-compacting at 80% of the 1M one the session had
@@ -1463,57 +1399,73 @@ async fn build_subagent(
     // A fresh, private todo list so the worker's `todo` calls don't touch the parent's task
     // tracking. Not persisted, so a follow-up starts with an empty one; the resume notice the
     // rehydrated conversation carries is what tells the worker its tool state is gone.
-    let sub_todo_list: super::todo::SharedTodoList =
-        Arc::new(tokio::sync::RwLock::new(super::todo::TodoState::default()));
-    let sub_shared_session_id: Arc<RwLock<Option<Uuid>>> =
-        Arc::new(RwLock::new(Some(sub_session_id)));
+    let sub_todo_list = crate::todo::SharedTodoList::default();
+    let sub_shared_session_id = crate::session::SharedSessionId::new(Some(sub_session_id));
+    // Wrap so permission prompts surface in the parent's UI while emits stay silent (the
+    // sub-agent's output flows back as this tool's result, not as live notifications). The one
+    // exception is the sub-agent's tool calls, which are rolled up into this call's own display
+    // so a long run isn't an opaque spinner -- hence the tool-call id.
+    let sub_frontend: Arc<dyn crate::frontend::Frontend> =
+        Arc::new(crate::frontend::PermissionForwardingFrontend::new(
+            Arc::clone(&params.cells.frontend),
+            call.tool_call_id.clone(),
+        ));
+    // The worker's own cells: its clamped permission, the snapshot of the parent's directory it
+    // was handed, a session of its own, fresh gauges, and a profile seeded from what the parent
+    // runs on now. A worker has no prompt gauge and no session entry watching it, and it never
+    // switches, so nothing outside needs the handle.
+    let sub_cells = crate::session::SessionCells {
+        permission: sub_shared_perm.clone(),
+        cwd: sub_cwd,
+        roots: params.cells.roots.clone(),
+        session_id: sub_shared_session_id,
+        todo_list: sub_todo_list,
+        profile: crate::provider::PublishedProfile::detached(&parent_profile),
+        context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        background_tasks: crate::background::BackgroundTasks::default(),
+        frontend: sub_frontend,
+        // Fresh per worker for the same reason the id is: a lock belongs to the session that
+        // was created, and every agent creates at most its own.
+        session_lock: crate::store::SessionLockSlot::default(),
+        pending_compaction: crate::session::PendingCompaction::default(),
+    };
 
     let sub_registry = ToolRegistry::build_for_subagent(
-        params.web_client.clone(),
-        sub_shared_perm.clone(),
-        params.sandbox_enabled,
-        params.sandbox_capability.clone(),
-        params.sandbox_backend,
-        params.backend_probe.clone(),
-        params.builtin_filter.clone(),
-        denials.clone(),
-        sub_todo_list.clone(),
-        params.session_manager.clone(),
-        sub_shared_session_id.clone(),
-        params.skills.clone(),
-        params.memories.clone(),
-        memory_access,
-        if spec.inherited_scratchpad.is_empty() {
-            None
-        } else {
-            Some(parent_session_id)
+        &params.materials,
+        &sub_cells,
+        super::registry::RegistryScope {
+            denials: denials.clone(),
+            memory_access,
+            parent_session_id: if spec.inherited_scratchpad.is_empty() {
+                None
+            } else {
+                Some(parent_session_id)
+            },
+            inherited_scratchpad_names: spec.inherited_scratchpad.clone(),
         },
-        spec.inherited_scratchpad.clone(),
-        sub_cwd.clone(),
-        Arc::clone(&params.parent_roots),
-        Arc::clone(&params.parent_frontend),
     )
     .map_err(|error| MekaError::ToolExecution {
         tool_name: tool_name.to_string(),
-        message: format!("failed to build sub-agent tool registry: {}", error),
+        message: format!("failed to build sub-agent tool registry: {error}"),
     })?;
 
-    // Inherit the parent's MCP toolset, minus anything the spec denies (`install_tools_on` reads
-    // the denials back off the registry). Skipped silently when no MCP manager is attached (no
-    // servers configured) or when the parent's servers are still Pending / Failed. Non-spawning and
-    // idempotent; see `src/mcp.rs:install_tools_on`.
-    if let Some(weak) = params.mcp_manager.as_ref() {
+    // Inherit the parent's MCP toolset, minus anything the spec denies (the install reads the
+    // denials back off the registry). Skipped silently when no MCP manager is attached (no servers
+    // configured) or when the parent's servers are still Pending / Failed. Non-spawning and
+    // idempotent.
+    if let Some(weak) = params.materials.mcp_manager.as_ref() {
         // Upgrade only if the manager is still alive. If the parent's `meka acp` process is
         // mid-shutdown, the Arc may already be gone. Skip silently.
         if let Some(manager) = weak.upgrade() {
-            manager.install_tools_on(&sub_registry).await;
+            super::mcp_adapter::install_on_worker_registry(&manager, &sub_registry).await;
         }
     }
 
     // Grant the sub-agent its own `agent_spawn` when its recursion budget allows, so it can
-    // orchestrate a team of its own. Registered here (before the tool catalogue is snapshotted for
+    // orchestrate a team of its own. Registered here (before the tool catalog is snapshotted for
     // the system prompt below) and outside `build_for_subagent`, mirroring the root registration in
-    // `assemble_agent` (main.rs). Two counters bound nesting: `remaining_depth` is the soft,
+    // `assemble_agent`. Two counters bound nesting: `remaining_depth` is the soft,
     // `max_depth`-tunable budget; `absolute_depth` is the hard cap that guarantees termination.
     // The three lifecycle tools ride the same gate: a worker that cannot spawn has no children to
     // list, follow up on, or delete.
@@ -1521,17 +1473,20 @@ async fn build_subagent(
         spec.remaining_depth >= 1 && spec.absolute_depth < SUBAGENT_ABSOLUTE_MAX_DEPTH;
     if allow_nested_spawn {
         let child_params = ToolBuilderParams {
-            // The *parent's* handle, not a snapshot of what it currently holds: a switch the user
-            // makes later must reach the whole subtree's future spawns, not just its first level.
-            live_binding: params.live_binding.clone(),
-            parent_shared_session_id: sub_shared_session_id.clone(),
-            parent_cwd: Arc::clone(&sub_cwd),
-            parent_roots: Arc::clone(&params.parent_roots),
+            materials: params.materials.clone(),
+            cells: crate::session::SessionCells {
+                // The *parent's* handle, not a snapshot of what it currently holds: a switch the
+                // user makes later must reach the whole subtree's future spawns, not just its
+                // first level.
+                profile: params.cells.profile.clone(),
+                ..sub_cells.clone()
+            },
             // The worker's own granted level, not its parent's. `params.memory_access` is what the
             // *spawning* agent holds, so letting the spread supply it would let a worker grant its
             // children up to its parent's level rather than its own -- reaching through a child
             // what it was denied directly. The deny lists come from `spec` for the same reason.
             memory_access,
+            config_denials: params.config_denials.clone(),
             // Both ceilings for whatever this worker spawns in turn. `parent_options` carries the
             // instruction text, so overwriting it with the grant is what stops a worker handing a
             // grandchild something it was not given itself.
@@ -1539,7 +1494,6 @@ async fn build_subagent(
                 user_instructions: granted_instructions.clone(),
                 ..parent_options.clone()
             },
-            ..params.clone()
         };
         register_subagent_tools(&sub_registry, AgentSpawnTool {
             // The worker's own (already clamped) permission is the ceiling for anything it spawns,
@@ -1553,20 +1507,23 @@ async fn build_subagent(
     }
 
     // Build the system prompt against the fully-loaded registry (which now includes MCP adapters).
-    // The override on `AgentOptions` is static, so this single build captures the whole catalogue
+    // The override on `AgentOptions` is static, so this single build captures the whole catalog
     // the sub-agent can see.
-    let tools = sub_registry.definitions_for_permission(effective_permission);
+    let tools = sub_registry
+        .definitions_for_permission(effective_permission, parent_permission.approvals());
     // Gated on the registry rather than on the spec alone: `[memory] enabled = false` or a
     // `[tools]` filter can leave a granted worker without `memory_read`, and an index describing
-    // memories it has no tool to open is pure cost. This mirrors how the primary agent's index is
-    // gated on the same tool being in its catalogue.
+    // memories it has no tool to open is pure cost. This mirrors how the root agent's index is
+    // gated on the same tool being in its catalog.
     let memory_index = if sub_registry.get("memory_read").is_some() {
-        render_subagent_memory_index(&params.memories.index().await.unwrap_or_else(|error| {
-            // Search still works, and the worker is told what it has. A store that cannot be read
-            // is not a reason to refuse to spawn.
-            tracing::warn!("could not read the memory index for a sub-agent: {}", error);
-            Vec::new()
-        }))
+        render_subagent_memory_index(&params.materials.memories.index().await.unwrap_or_else(
+            |error| {
+                // Search still works, and the worker is told what it has. A store that cannot be
+                // read is not a reason to refuse to spawn.
+                tracing::warn!("failed to read the memory index for a sub-agent: {error}");
+                Vec::new()
+            },
+        ))
     } else {
         String::new()
     };
@@ -1578,35 +1535,18 @@ async fn build_subagent(
         &memory_index,
     );
 
-    // Wrap so permission prompts surface in the parent's UI while emits stay silent (the
-    // sub-agent's output flows back as this tool's result, not as live notifications). The one
-    // exception is the sub-agent's tool calls, which are rolled up into this call's own display
-    // so a long run isn't an opaque spinner -- hence the tool-call id.
-    let sub_frontend: Arc<dyn crate::frontend::Frontend> =
-        Arc::new(crate::frontend::PermissionForwardingFrontend::new(
-            Arc::clone(&params.parent_frontend),
-            crate::tools::current_tool_call_id(),
-        ));
-
     Ok(Agent::new_subagent(
-        parent_binding,
+        &params.materials,
+        sub_cells,
         sub_registry,
-        params.session_manager.clone(),
-        sub_shared_perm,
         &parent_options,
         sub_system_prompt,
-        sub_todo_list,
-        sub_shared_session_id,
-        params.skills.clone(),
-        params.memories.clone(),
-        &sub_cwd,
-        &params.parent_roots,
-        sub_frontend,
-        params.session_stats.clone(),
+        call.prompt_id,
     ))
 }
 
-/// Read an optional string-valued parameter, refusing a value of the wrong type.
+/// Read an optional string-valued parameter, refusing a value of the wrong type./// Read an
+/// optional string-valued parameter, refusing a value of the wrong type.
 ///
 /// The obvious `input[key].as_str()` treats a non-string as absent, which for a restriction is the
 /// wrong way to fail: `permission: 0` would silently run the worker at the parent's own level
@@ -1630,8 +1570,7 @@ fn optional_str<'a>(
         Some(other) => Err(MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
             message: format!(
-                "'{}' must be a string, got {}. Leave it out to use the default.",
-                key, other
+                "'{key}' must be a string, got {other}. Leave it out to use the default."
             ),
         }),
     }
@@ -1639,27 +1578,72 @@ fn optional_str<'a>(
 
 /// Pull a `Vec<String>` out of an optional array parameter. Non-string entries are silently
 /// skipped, so a partially malformed array doesn't tank the whole spawn; a missing or non-array
-/// value yields an empty list.
-fn string_array(input: &serde_json::Value, key: &str) -> Vec<String> {
-    input
-        .get(key)
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::trim))
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+/// value yields an empty list. A list parameter, or an error if the model sent something that is
+/// not a list. Read as absent, a bare string in `deny_tools` spawned an unrestricted worker in
+/// place of the restricted one the caller asked for, with nothing to say so; the same guard
+/// `optional_str` gives the strings.
+fn string_array(
+    input: &serde_json::Value,
+    key: &str,
+    tool_name: &'static str,
+) -> Result<Vec<String>> {
+    match input.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => Ok(items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::trim))
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(other) => Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!(
+                "'{}' must be an array of strings, got {}. Leave it out to restrict nothing.",
+                key,
+                json_type_name(other)
+            ),
+        }),
+    }
+}
+
+/// An unsigned integer parameter, or an error if the model sent something else. `"0"` read as
+/// absent gave a worker the nesting budget its caller had just tried to deny it.
+fn optional_u64(
+    input: &serde_json::Value,
+    key: &str,
+    tool_name: &'static str,
+) -> Result<Option<u64>> {
+    match input.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) if number.as_u64().is_some() => Ok(number.as_u64()),
+        Some(other) => Err(MekaError::ToolExecution {
+            tool_name: tool_name.to_string(),
+            message: format!(
+                "'{}' must be a non-negative integer, got {}. Leave it out to use the default.",
+                key,
+                json_type_name(other)
+            ),
+        }),
+    }
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 /// Parse an optional caller-supplied permission string and clamp it to the parent's level as a
 /// ceiling. `None` keeps the parent's level (inherit verbatim). A sub-agent can only ever run at an
 /// equal-or-more-restricted level than its parent (`min` over the discriminant order
-/// `None < Read < Ask < Write`), so a parent turn can hand risky work to a locked-down sub-agent
-/// but can never escalate one. An unrecognized string is a hard error, not a silent fallback.
+/// `None < Read < Workspace < Unrestricted`), so a parent turn can hand risky work to a locked-down
+/// sub-agent but can never escalate one. An unrecognized string is a hard error, not a silent
+/// fallback.
 fn resolve_subagent_permission(requested: Option<&str>, parent: Permission) -> Result<Permission> {
     match requested {
         Some(text) => {
@@ -1669,41 +1653,30 @@ fn resolve_subagent_permission(requested: Option<&str>, parent: Permission) -> R
                         tool_name: "agent_spawn".to_string(),
                         message,
                     })?;
-            // `clamp_to`, not `min`. The ladder is a partial order: `Workspace` and `Ask` are
-            // incomparable, and `min` over the discriminants hands a child at `workspace` to a
-            // parent at `ask` because 2 < 3. That is not merely a mislabel. `SharedPermission::
-            // with_ceiling` flattens a grandchild's ceiling to the *root* cell, on the stated
-            // precondition that this clamp already folded the intermediate level in; with `min`
-            // that precondition is false, so an `ask` child spawning a `workspace` grandchild under
-            // an `unrestricted` root produced a worker that wrote unattended beneath a parent whose
-            // whole safety was the approval prompt.
+            // `clamp_to` rather than a bare comparison, so the door reads as the question it
+            // asks. `SharedPermission::with_ceiling` flattens a grandchild's ceiling to the *root*
+            // cell on the precondition that this clamp already folded the intermediate level in.
             Ok(requested.clamp_to(parent))
         }
         None => Ok(parent),
     }
 }
 
-/// Restrict an `EnabledPermissions` set to the modes *contained by* `ceiling`.
-///
-/// Not "at or below", which is a different question. The ladder is a partial order and the
-/// predicate is [`Permission::is_within`], so `workspace` and `ask` exclude each other in both
-/// directions: neither is within the other, and an `ask` ceiling therefore drops `workspace` from
-/// the set rather than keeping it as something lower down. Reading the doc as a `<=` over the
-/// discriminants would predict the opposite for exactly the pair this release introduced.
+/// Restrict an `EnabledPermissions` set to the levels *contained by* `ceiling`, through
+/// [`Permission::is_within`] so this door asks the same question every other bound does.
 ///
 /// Defense-in-depth for the permission clamp: sub-agents have no runtime permission-switch path
 /// today, so their initial level is what governs, but bounding the enabled set means any future
 /// switch path cannot climb a sub-agent back past the ceiling its parent set. Falls back to a
-/// singleton `{ceiling}` set when the intersection is empty, which the incomparable pair makes
-/// reachable rather than theoretical: a parent that enabled only `workspace` and hands down an
-/// `ask` ceiling leaves nothing behind.
+/// singleton `{ceiling}` set when the intersection is empty: a parent that enabled only
+/// `unrestricted` and hands down a `read` ceiling leaves nothing behind.
 fn clamp_enabled_permissions(
     enabled: EnabledPermissions,
     ceiling: Permission,
 ) -> EnabledPermissions {
-    EnabledPermissions::from_modes(enabled.iter().filter(|mode| mode.is_within(ceiling)))
+    EnabledPermissions::from_levels(enabled.iter().filter(|level| level.is_within(ceiling)))
         .unwrap_or_else(|| {
-            EnabledPermissions::from_modes([ceiling]).unwrap_or(EnabledPermissions::DEFAULT)
+            EnabledPermissions::from_levels([ceiling]).unwrap_or(EnabledPermissions::DEFAULT)
         })
 }
 
@@ -1743,21 +1716,21 @@ fn child_spawn_depth(
 /// when both inputs are absent; the caller treats that as an error.
 fn compose_subagent_task(prompt: Option<&str>, skill_body: Option<&str>) -> Option<String> {
     match (prompt, skill_body) {
-        (Some(prompt), Some(body)) => Some(format!("{}\n\n{}", prompt, body)),
+        (Some(prompt), Some(body)) => Some(format!("{prompt}\n\n{body}")),
         (Some(prompt), None) => Some(prompt.to_string()),
         (None, Some(body)) => Some(body.to_string()),
         (None, None) => None,
     }
 }
 
-/// Ceiling on the memory index handed to a granted worker. Smaller than the primary agent's 8 KiB
+/// Ceiling on the memory index handed to a granted worker. Smaller than the root agent's 8 KiB
 /// budget on purpose: a worker was spawned for one task, and the store is background for it rather
 /// than the running context it is for the agent that owns the session.
 const SUBAGENT_MEMORY_INDEX_MAX_BYTES: usize = 4_096;
 
 /// Render the memory index for a worker granted `memory: "read"`.
 ///
-/// Separate from the primary agent's `[Memory]` section rather than shared with it, for two
+/// Separate from the root agent's `[Memory]` section rather than shared with it, for two
 /// reasons. A sub-agent's system prompt is a static override, so it never receives the per-turn
 /// world state the parent's index rides in. And the parent's header tells the reader to call
 /// `memory_write` when it learns something durable, which a worker cannot do -- pointing it at a
@@ -1774,7 +1747,7 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
     );
     let mut shown = 0;
     for memory in memories {
-        // Sanitised at the boundary, like the primary agent's index: the store hands back stored
+        // Sanitized at the boundary, like the root agent's index: the store hands back stored
         // bytes, and this is a worker's context.
         //
         // Elided too, which the parent's index and both search renderers already did and this one
@@ -1783,7 +1756,7 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
         let line = format!(
             "- **{}**: {}\n",
             memory.name,
-            crate::store::elide_description_for_index(
+            crate::entry::elide_description_for_index(
                 &crate::memory::render_description_for_model(&memory.description)
             )
         );
@@ -1802,8 +1775,7 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
     let remaining = memories.len() - shown;
     if remaining > 0 {
         out.push_str(&format!(
-            "\n{} more not listed here. Use `memory_search` to reach them.\n",
-            remaining
+            "\n{remaining} more not listed here. Use `memory_search` to reach them.\n"
         ));
     }
     out.push('\n');
@@ -1813,7 +1785,7 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
 /// The sub-agent's system prompt.
 ///
 /// `user_instructions` is `None` unless the `agent_spawn` call asked for them. Instructions are
-/// installation-wide and describe the top-level agent: its persona, how it should address the user,
+/// installation-wide and describe the root agent: its persona, how it should address the user,
 /// what it should volunteer. A worker handed a task by another agent is not that agent, and
 /// inheriting the persona unasked is how a sub-agent ends up talking to the user as though it were
 /// the one they are speaking to.
@@ -1839,7 +1811,7 @@ fn build_subagent_system_prompt(
          read the current list. Your todo list is private to this sub-agent.\n\n",
     );
 
-    prompt.push_str(&format!("## Permission Level: {}\n\n", permission));
+    prompt.push_str(&format!("## Permission Level: {permission}\n\n"));
 
     if let Some(instructions) = user_instructions
         .map(str::trim)
@@ -1870,7 +1842,7 @@ fn build_subagent_system_prompt(
              state, save it under a different name (e.g. `<name>_local`).\n\n",
         );
         for name in inherited_scratchpad {
-            prompt.push_str(&format!("- {}\n", name));
+            prompt.push_str(&format!("- {name}\n"));
         }
         prompt.push('\n');
     }
@@ -1888,57 +1860,59 @@ fn build_subagent_system_prompt(
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
-    use crate::provider::Provider;
+    use crate::{
+        provider::{Provider, mock::text_round},
+        store::Store,
+    };
 
     #[test]
-    fn test_subagent_system_prompt_reflects_inherited_permission() {
+    fn subagent_system_prompt_reflects_inherited_permission() {
         let prompt = build_subagent_system_prompt(Permission::Unrestricted, &[], &[], None, "");
         assert!(
             prompt.contains(&format!(
                 "## Permission Level: {}",
                 Permission::Unrestricted
             )),
-            "expected Write level in prompt, got: {}",
-            prompt
+            "expected Write level in prompt, got: {prompt}"
         );
 
         let read_prompt = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
         assert!(read_prompt.contains(&format!("## Permission Level: {}", Permission::Read)));
     }
 
-    /// The installation's instructions describe the top-level agent, not a worker one of its turns
+    /// The installation's instructions describe the root agent, not a worker one of its turns
     /// handed a task to. A sub-agent that inherited them would answer the user in the leader's
     /// voice, under rules written for a conversation it is not part of.
     #[test]
-    fn test_subagent_system_prompt_carries_no_user_instructions() {
+    fn subagent_system_prompt_carries_no_user_instructions() {
         let prompt = build_subagent_system_prompt(Permission::Unrestricted, &[], &[], None, "");
         assert!(!prompt.contains("User Instructions"));
         assert!(!prompt.contains("installation-specific"));
     }
 
     #[test]
-    fn test_subagent_system_prompt_mentions_todo_tools() {
+    fn subagent_system_prompt_mentions_todo_tools() {
         let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
         assert!(
             prompt.contains("`todo` tool"),
-            "expected todo tool mention in prompt, got: {}",
-            prompt
+            "expected todo tool mention in prompt, got: {prompt}"
         );
     }
 
     #[test]
-    fn test_subagent_system_prompt_omits_inheritance_section_when_empty() {
+    fn subagent_system_prompt_omits_inheritance_section_when_empty() {
         let prompt = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
         assert!(
             !prompt.contains("Inherited Scratchpad"),
-            "no inherited section expected for empty allowlist, got: {}",
-            prompt
+            "no inherited section expected for empty allowlist, got: {prompt}"
         );
     }
 
     #[test]
-    fn test_subagent_system_prompt_lists_inherited_names() {
+    fn subagent_system_prompt_lists_inherited_names() {
         let names = vec!["captured_output".to_string(), "research_notes".to_string()];
         let prompt = build_subagent_system_prompt(Permission::Read, &[], &names, None, "");
         assert!(prompt.contains("## Inherited Scratchpad Entries"));
@@ -1948,23 +1922,21 @@ mod tests {
     }
 
     #[test]
-    fn test_subagent_system_prompt_warns_inherited_writes_will_error() {
+    fn subagent_system_prompt_warns_inherited_writes_will_error() {
         let names = vec!["build_log".to_string()];
         let prompt = build_subagent_system_prompt(Permission::Read, &[], &names, None, "");
         assert!(
             prompt.contains("will return an error"),
-            "expected write-rejection wording, got: {}",
-            prompt,
+            "expected write-rejection wording, got: {prompt}",
         );
         assert!(
             prompt.contains("_local"),
-            "expected naming suggestion, got: {}",
-            prompt,
+            "expected naming suggestion, got: {prompt}",
         );
     }
 
     #[test]
-    fn test_compose_subagent_task_combinations() {
+    fn compose_subagent_task_combinations() {
         assert_eq!(
             compose_subagent_task(Some("focus on UK news"), Some("skill body")),
             Some("focus on UK news\n\nskill body".to_string()),
@@ -1982,7 +1954,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_subagent_permission_inherits_when_absent() {
+    fn resolve_subagent_permission_inherits_when_absent() {
         assert_eq!(
             resolve_subagent_permission(None, Permission::Unrestricted).unwrap(),
             Permission::Unrestricted
@@ -1995,10 +1967,7 @@ mod tests {
 
     /// `agent_followup` resolves a stored grant with the meet, not the spawn clamp.
     ///
-    /// Reverting `effective_permission` to `clamp_to` passed every sub-agent test, so which of the
-    /// two operations the replay path uses was unguarded. The difference is not academic: it is
-    /// whether a worker that was deliberately confined to the workspace comes back able to write
-    /// anywhere once the parent moves to `ask`.
+    /// Replaying a recorded grant narrows it to the parent's current level and never widens it.
     #[test]
     fn a_followup_resolves_a_stored_grant_without_widening_it() {
         let spec = SubagentSpec {
@@ -2014,12 +1983,6 @@ mod tests {
         };
 
         assert_eq!(
-            spec.effective_permission(Permission::Ask),
-            Permission::Read,
-            "a `workspace` worker replayed under an `ask` parent must not gain whole-filesystem \
-             reach; `clamp_to` would have said `ask` here"
-        );
-        assert_eq!(
             spec.effective_permission(Permission::Unrestricted),
             Permission::Workspace,
             "a parent that still holds the recorded level replays it unchanged"
@@ -2031,37 +1994,26 @@ mod tests {
         );
     }
 
-    /// The incomparable pair, at the depth where nothing downstream re-clamps it.
+    /// The bound holds at the depth where nothing downstream re-clamps it.
     ///
-    /// `Workspace` and `Ask` are incomparable, and `min` picks `Workspace` because 2 < 3. At depth
-    /// 1 that is invisible: `SharedPermission::get` re-clamps against the parent and returns `Ask`.
-    /// At depth 2 it is not, because `with_ceiling` flattens a grandchild's ceiling to the *root*
+    /// At depth 1 a miss is invisible: `SharedPermission::get` re-clamps against the parent. At
+    /// depth 2 it is not, because `with_ceiling` flattens a grandchild's ceiling to the *root*
     /// cell on the stated precondition that the spawn-time clamp already folded the intermediate
-    /// level in. With `min` that precondition is false, so an `ask` child under an `unrestricted`
-    /// root could spawn a `workspace` grandchild that wrote unattended -- beneath a parent whose
-    /// entire safety was the approval prompt.
-    ///
-    /// The pre-existing ceiling test only exercised pairs the total order already gets right
-    /// (`unrestricted`/`read`, `ask`/`read`), which is why this shipped.
+    /// level in. A `read` child under an `unrestricted` root must therefore not be able to spawn
+    /// a `workspace` grandchild.
     ///
     /// **What this does not cover**, and the honest limit of the guarantee: the root cell here
     /// never moves. `with_ceiling`'s precondition is taken once, at spawn, so cycling the root
-    /// `unrestricted -> workspace -> unrestricted` between two spawns leaves a grandchild bound to
-    /// a root that has changed shape underneath it, and it can sit at `workspace` under an `ask`
-    /// parent. Nothing exceeds the *root*, which is the human's own level, so the headline
-    /// invariant holds and the next `agent_followup` re-clamps it -- but the direct-parent bound
-    /// does not hold across that sequence, and no test asserts it does.
+    /// `unrestricted -> read -> unrestricted` between two spawns leaves a grandchild bound to a
+    /// root that has changed shape underneath it. Nothing exceeds the *root*, which is the human's
+    /// own level, so the headline invariant holds and the next `agent_followup` re-clamps it -- but
+    /// the direct-parent bound does not hold across that sequence, and no test asserts it does.
     #[test]
-    fn a_grandchild_cannot_escape_an_intermediate_ask_parent() {
+    fn a_grandchild_cannot_escape_an_intermediate_parent() {
         assert_eq!(
-            resolve_subagent_permission(Some("workspace"), Permission::Ask).unwrap(),
-            Permission::Ask,
-            "a `workspace` request under an `ask` parent must resolve to the parent's own level"
-        );
-        assert_eq!(
-            resolve_subagent_permission(Some("ask"), Permission::Workspace).unwrap(),
-            Permission::Workspace,
-            "and the same in the other direction"
+            resolve_subagent_permission(Some("workspace"), Permission::Read).unwrap(),
+            Permission::Read,
+            "a `workspace` request under a `read` parent must resolve to the parent's own level"
         );
 
         // The full chain, through the handles production actually builds.
@@ -2083,13 +2035,13 @@ mod tests {
 
         let root = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
         let child_spec = spec_at(
-            resolve_subagent_permission(Some("ask"), root.get()).unwrap(),
+            resolve_subagent_permission(Some("read"), root.get()).unwrap(),
             root.enabled(),
         );
         let child = child_spec.shared_permission_bounded(&root);
         assert_eq!(
             child.get(),
-            Permission::Ask,
+            Permission::Read,
             "child holds what it asked for"
         );
 
@@ -2100,8 +2052,8 @@ mod tests {
         let grandchild = grandchild_spec.shared_permission_bounded(&child);
         assert_eq!(
             grandchild.get(),
-            Permission::Ask,
-            "a grandchild must not reach `workspace` past an `ask` parent, however the ceiling \
+            Permission::Read,
+            "a grandchild must not reach `workspace` past a `read` parent, however the ceiling \
              cell is flattened"
         );
         assert!(
@@ -2111,7 +2063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_subagent_permission_clamps_to_parent_ceiling() {
+    fn resolve_subagent_permission_clamps_to_parent_ceiling() {
         // Requesting a higher level than the parent is clamped down: a sub-agent can never be
         // escalated above its parent.
         assert_eq!(
@@ -2119,7 +2071,7 @@ mod tests {
             Permission::Read
         );
         assert_eq!(
-            resolve_subagent_permission(Some("ask"), Permission::Read).unwrap(),
+            resolve_subagent_permission(Some("workspace"), Permission::Read).unwrap(),
             Permission::Read
         );
         // Requesting a lower level restricts the sub-agent below the parent.
@@ -2134,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_subagent_permission_rejects_invalid() {
+    fn resolve_subagent_permission_rejects_invalid() {
         assert!(resolve_subagent_permission(Some("admin"), Permission::Unrestricted).is_err());
     }
 
@@ -2143,7 +2095,7 @@ mod tests {
     /// parent's level" -- so a malformed restriction would hand the worker *more* than the caller
     /// was reaching for.
     #[test]
-    fn test_optional_str_refuses_a_wrong_typed_value() {
+    fn optional_str_refuses_a_wrong_typed_value() {
         let input = serde_json::json!({
             "permission": 0,
             "memory": true,
@@ -2169,40 +2121,63 @@ mod tests {
     }
 
     #[test]
-    fn test_string_array_skips_non_strings_and_blanks() {
+    fn string_array_skips_non_strings_and_blanks() {
         let input = serde_json::json!({
             "deny_servers": ["notion", 7, "  ", "  linear  ", null],
         });
-        assert_eq!(string_array(&input, "deny_servers"), vec![
-            "notion".to_string(),
-            "linear".to_string()
-        ],);
-        assert!(string_array(&input, "absent").is_empty());
-        // A non-array value is not a one-element list.
-        assert!(string_array(&serde_json::json!({"x": "notion"}), "x").is_empty());
+        assert_eq!(
+            string_array(&input, "deny_servers", "agent_spawn").expect("a list"),
+            vec!["notion".to_string(), "linear".to_string()],
+        );
+        assert!(
+            string_array(&input, "absent", "agent_spawn")
+                .expect("absent is fine")
+                .is_empty()
+        );
+        // A non-array value is not a one-element list. A bare string is a refusal, not an empty
+        // list: read as empty, `deny_tools: "write_file"` spawned an unrestricted worker.
+        assert!(string_array(&serde_json::json!({"x": "notion"}), "x", "agent_spawn").is_err());
+        assert!(
+            optional_u64(
+                &serde_json::json!({"max_depth": "0"}),
+                "max_depth",
+                "agent_spawn"
+            )
+            .is_err(),
+            "a quoted zero is not a depth"
+        );
+        assert_eq!(
+            optional_u64(
+                &serde_json::json!({"max_depth": 0}),
+                "max_depth",
+                "agent_spawn"
+            )
+            .expect("an integer"),
+            Some(0)
+        );
     }
 
     #[test]
-    fn test_clamp_enabled_permissions_drops_higher_modes() {
+    fn clamp_enabled_permissions_drops_higher_levels() {
         let clamped = clamp_enabled_permissions(EnabledPermissions::ALL, Permission::Read);
         assert!(clamped.is_enabled(Permission::None));
         assert!(clamped.is_enabled(Permission::Read));
-        assert!(!clamped.is_enabled(Permission::Ask));
+        assert!(!clamped.is_enabled(Permission::Workspace));
         assert!(!clamped.is_enabled(Permission::Unrestricted));
     }
 
     #[test]
-    fn test_clamp_enabled_permissions_falls_back_to_singleton() {
+    fn clamp_enabled_permissions_falls_back_to_singleton() {
         // Parent enabled only Write; clamping to Read leaves an empty intersection, so we fall back
         // to a singleton set of the ceiling itself rather than an invalid empty set.
-        let only_write = EnabledPermissions::from_modes([Permission::Unrestricted]).unwrap();
+        let only_write = EnabledPermissions::from_levels([Permission::Unrestricted]).unwrap();
         let clamped = clamp_enabled_permissions(only_write, Permission::Read);
         assert!(clamped.is_enabled(Permission::Read));
         assert!(!clamped.is_enabled(Permission::Unrestricted));
     }
 
     #[test]
-    fn test_child_spawn_depth_natural_decrement() {
+    fn child_spawn_depth_natural_decrement() {
         let (remaining, absolute, allow) = child_spawn_depth(3, 0, None);
         assert_eq!(remaining, 2);
         assert_eq!(absolute, 1);
@@ -2210,7 +2185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_child_spawn_depth_leaf_when_budget_exhausted() {
+    fn child_spawn_depth_leaf_when_budget_exhausted() {
         // remaining_depth = 1 reproduces the historical "root spawns, sub-agents can't" behavior:
         // the child gets 0 and is not granted a nested agent_spawn.
         let (remaining, _absolute, allow) = child_spawn_depth(1, 0, None);
@@ -2222,7 +2197,7 @@ mod tests {
     /// subagent_max_depth` is documented as a ceiling, so a model asking for more than the operator
     /// allowed gets the operator's answer.
     #[test]
-    fn test_child_spawn_depth_override_only_narrows() {
+    fn child_spawn_depth_override_only_narrows() {
         // Asking for more than is left yields what is left, not what was asked for.
         let (remaining, _absolute, allow) = child_spawn_depth(3, 0, Some(9));
         assert_eq!(remaining, 2);
@@ -2233,7 +2208,7 @@ mod tests {
         assert_eq!(remaining, 0);
         assert!(!allow, "subagent_max_depth = 1 must forbid nesting");
 
-        // Asking for less than is left is honoured: the agent may still restrict itself.
+        // Asking for less than is left is honored: the agent may still restrict itself.
         let (remaining, _absolute, _allow) = child_spawn_depth(5, 0, Some(1));
         assert_eq!(remaining, 1);
 
@@ -2243,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_child_spawn_depth_absolute_cap_forces_leaf() {
+    fn child_spawn_depth_absolute_cap_forces_leaf() {
         // Even with a large soft budget, the monotonic absolute counter stops recursion at the cap.
         let (_remaining, absolute, allow) =
             child_spawn_depth(100, SUBAGENT_ABSOLUTE_MAX_DEPTH - 1, Some(100));
@@ -2251,10 +2226,8 @@ mod tests {
         assert!(!allow);
     }
 
-    async fn test_session_manager() -> SessionManager {
-        SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
-            .await
-            .expect("in-memory session manager")
+    async fn store_for_test() -> Store {
+        Store::for_test().await
     }
 
     // (Permission gating and "Unknown tool" fold-into-ToolOutput semantics belong to the shared
@@ -2262,60 +2235,70 @@ mod tests {
     // suites.)
 
     #[tokio::test]
-    async fn test_subagent_registry_has_independent_todo_list() {
+    async fn subagent_registry_has_independent_todo_list() {
         use crate::{
+            config::BuiltinToolFilter,
             sandbox::{BackendProbe, SandboxCapability},
-            tools::BuiltinToolFilter,
         };
 
-        let parent_list: super::super::todo::SharedTodoList = Arc::new(tokio::sync::RwLock::new(
-            super::super::todo::TodoState::default(),
-        ));
-        let sub_list: super::super::todo::SharedTodoList = Arc::new(tokio::sync::RwLock::new(
-            super::super::todo::TodoState::default(),
-        ));
+        let parent_list = crate::todo::SharedTodoList::default();
+        let sub_list = crate::todo::SharedTodoList::default();
 
         let sub_registry = ToolRegistry::build_for_subagent(
-            crate::config::WebClientConfig::default(),
-            SharedPermission::new(Permission::Read, crate::permission::EnabledPermissions::ALL),
-            true,
-            SandboxCapability::Unavailable,
-            crate::config::SandboxBackend::Landlock,
-            BackendProbe::Missing {
-                reason: "test fixture".to_string(),
+            &crate::session::SessionMaterials {
+                core: crate::session::CoreMaterials {
+                    web_client: crate::config::WebClientConfig::default(),
+                    sandbox_enabled: true,
+                    sandbox_capability: SandboxCapability::Unavailable,
+                    sandbox_backend: crate::config::SandboxBackend::Landlock,
+                    backend_probe: BackendProbe::Missing {
+                        reason: "test fixture".to_string(),
+                    },
+                    builtin_filter: BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
+                },
+                skills: crate::skills::SkillCache::for_root(None),
+                memories: crate::store::memory::MemoryStore::detached(),
+                ..crate::session::SessionMaterials::for_test(store_for_test().await)
             },
-            BuiltinToolFilter::default(),
-            ToolDenials::default(),
-            sub_list.clone(),
-            test_session_manager().await,
-            Arc::new(tokio::sync::RwLock::new(None)),
-            crate::skills::SkillCache::for_root(None),
-            crate::memory::MemoryStore::detached(),
-            MemoryAccess::Write,
-            None,
-            Vec::new(),
-            crate::workspace::test_cwd(),
-            crate::workspace::test_roots(),
-            Arc::new(crate::frontend::SilentFrontend),
+            &crate::session::SessionCells {
+                session_id: crate::session::SharedSessionId::default(),
+                todo_list: sub_list.clone(),
+                ..crate::session::SessionCells::for_test(
+                    SharedPermission::new(
+                        Permission::Read,
+                        crate::permission::EnabledPermissions::ALL,
+                    ),
+                    crate::workspace::cwd_for_test(),
+                    crate::workspace::roots_for_test(),
+                    Arc::new(crate::frontend::SilentFrontend),
+                )
+            },
+            crate::tools::registry::RegistryScope {
+                denials: ToolDenials::default(),
+                memory_access: MemoryAccess::Write,
+                parent_session_id: None,
+                inherited_scratchpad_names: Vec::new(),
+            },
         )
         .expect("subagent registry should build");
 
         let todo = sub_registry.get("todo").expect("subagent should have todo");
         todo.execute(
             serde_json::json!({ "title": "Sub work", "items": ["sub task"] }),
-            CancellationToken::new(),
+            crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("todo should succeed");
 
-        assert_eq!(sub_list.read().await.items.len(), 1);
+        assert_eq!(sub_list.get().items.len(), 1);
         assert!(
-            parent_list.read().await.items.is_empty(),
+            parent_list.get().items.is_empty(),
             "parent list must remain untouched"
         );
     }
 
-    fn test_spec(permission: Permission) -> SubagentSpec {
+    fn spec_for_test(permission: Permission) -> SubagentSpec {
         SubagentSpec {
             permission,
             enabled_permissions: vec![Permission::None, permission],
@@ -2329,40 +2312,37 @@ mod tests {
         }
     }
 
-    /// The window has to come off the same live binding as the provider.
+    /// The window has to come off the same live profile as the provider.
     ///
     /// `build_subagent` reads the provider from `live_binding.current()`, so the window must come
     /// from there too rather than from `parent_options`, a clone frozen when the session was
-    /// assembled. After a `/provider`, `PATCH` or `set_config_option` switch the two disagreed, and
+    /// assembled. After a `/profile`, `PATCH` or `set_config_option` switch the two disagreed, and
     /// a worker talked to the new profile while auto-compacting against the size of the one the
     /// session had left: on the way down it never compacted and the provider refused its turn, on
     /// the way up it compacted from the first round.
     ///
-    /// `parent_options` no longer carries a window at all, so the two can no longer be taken from
-    /// different places. This stays as the behavioural check that the worker gauges against what
-    /// `binding_on` published (200_000) rather than any default.
+    /// `parent_options` carries no window at all, so the two cannot be taken from different places.
+    /// This is the behavioral check that the worker gauges against what `binding_on` published
+    /// (200_000) rather than any default.
     #[tokio::test]
     async fn a_worker_gauges_against_the_window_its_parent_runs_on_now() {
-        let session_manager =
-            SessionManager::open(Some(std::path::Path::new(":memory:")), &Default::default())
-                .await
-                .expect("in-memory store");
-        let parent_session = session_manager
+        let store = Store::for_test().await;
+        let parent_session = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("create parent");
-        let params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_session))),
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_session)),
         );
         let worker = build_subagent(
             &params,
-            &test_spec(Permission::Read),
-            &SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
+            &spec_for_test(Permission::Read),
             parent_session,
             Uuid::new_v4(),
-            crate::workspace::test_cwd(),
+            crate::workspace::cwd_for_test(),
             "agent_spawn",
+            &crate::tools::ToolContext::detached(CancellationToken::new()),
         )
         .await
         .expect("build the worker");
@@ -2375,8 +2355,8 @@ mod tests {
     }
 
     #[test]
-    fn test_subagent_spec_round_trips_through_json() {
-        let spec = test_spec(Permission::Read);
+    fn subagent_spec_round_trips_through_json() {
+        let spec = spec_for_test(Permission::Read);
         let encoded = serde_json::to_string(&spec).expect("encode");
         let decoded: SubagentSpec = serde_json::from_str(&encoded).expect("decode");
         assert_eq!(spec, decoded);
@@ -2388,7 +2368,7 @@ mod tests {
     /// A spec missing fields still decodes rather than failing, but every absent field takes its
     /// *restrictive* value: losing a field must cost the worker authority, never grant it.
     #[test]
-    fn test_subagent_spec_decodes_a_minimal_document_and_fails_closed() {
+    fn subagent_spec_decodes_a_minimal_document_and_fails_closed() {
         let decoded: SubagentSpec =
             serde_json::from_str(r#"{"permission":"unrestricted"}"#).expect("decode");
         assert_eq!(decoded.permission, Permission::Unrestricted);
@@ -2407,29 +2387,29 @@ mod tests {
     /// `permission` is the one field with no default: a spec that lost it cannot be second-guessed,
     /// so the decode fails and `agent_followup` refuses the worker outright.
     #[test]
-    fn test_subagent_spec_without_a_permission_refuses_to_decode() {
+    fn subagent_spec_without_a_permission_refuses_to_decode() {
         assert!(serde_json::from_str::<SubagentSpec>(r#"{"memory":"write"}"#).is_err());
     }
 
     /// The core follow-up invariant: the worker is rebuilt at the level its spawn call chose. A
     /// parent that has since moved to `unrestricted` does not drag the worker up with it.
     #[test]
-    fn test_spec_permission_survives_a_parent_that_has_since_escalated() {
-        let spec = test_spec(Permission::Read);
+    fn spec_permission_survives_a_parent_that_has_since_escalated() {
+        let spec = spec_for_test(Permission::Read);
         let rebuilt = spec.shared_permission(Permission::Unrestricted);
         assert_eq!(rebuilt.get(), Permission::Read);
         assert!(!rebuilt.enabled().is_enabled(Permission::Unrestricted));
-        assert!(!rebuilt.enabled().is_enabled(Permission::Ask));
+        assert!(!rebuilt.enabled().is_enabled(Permission::Workspace));
     }
 
     /// And the other direction, which matters more: a worker spawned at `unrestricted` must drop to
     /// `read` when the user switches the session down. Otherwise pressing Shift+Tab would stop
     /// the agent writing while leaving every worker it already has free to write on its behalf.
     #[test]
-    fn test_spec_permission_follows_a_parent_that_has_since_been_restricted() {
+    fn spec_permission_follows_a_parent_that_has_since_been_restricted() {
         let spec = SubagentSpec {
             enabled_permissions: vec![Permission::Read, Permission::Unrestricted],
-            ..test_spec(Permission::Unrestricted)
+            ..spec_for_test(Permission::Unrestricted)
         };
         let rebuilt = spec.shared_permission(Permission::Read);
         assert_eq!(rebuilt.get(), Permission::Read);
@@ -2451,15 +2431,15 @@ mod tests {
 
     /// The clamp above happens once, at build time. This is the half that was missing: a worker
     /// already running when the user presses Shift+Tab has to see the new level on its next tool
-    /// call, not finish at the level it started with. Previously `shared_permission` minted a fresh
-    /// atomic from a snapshot, so a downgrade reached the parent's next call and nothing else --
-    /// while `permissions.md` presents cycling the parent as the way to restrict sub-agents.
+    /// call, not finish at the level it started with. A `shared_permission` minted from a snapshot
+    /// would let a downgrade reach the parent's next call and nothing else, while `permissions.md`
+    /// presents cycling the parent as the way to restrict sub-agents.
     #[test]
     fn a_running_sub_agent_sees_a_parent_downgrade() {
         let parent = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
         let spec = SubagentSpec {
             enabled_permissions: vec![Permission::Read, Permission::Unrestricted],
-            ..test_spec(Permission::Unrestricted)
+            ..spec_for_test(Permission::Unrestricted)
         };
 
         let worker = spec.shared_permission_bounded(&parent);
@@ -2488,7 +2468,7 @@ mod tests {
     #[test]
     fn a_parent_raise_does_not_lift_a_worker_above_its_own_grant() {
         let parent = SharedPermission::new(Permission::Read, EnabledPermissions::ALL);
-        let spec = test_spec(Permission::Read);
+        let spec = spec_for_test(Permission::Read);
 
         let worker = spec.shared_permission_bounded(&parent);
         parent.set_unchecked(Permission::Unrestricted);
@@ -2503,10 +2483,10 @@ mod tests {
     /// A spec whose enabled set is empty or unparseable must not fall back to "everything". The
     /// safe floor is the recorded level alone.
     #[test]
-    fn test_spec_permission_falls_back_narrow_not_wide() {
+    fn spec_permission_falls_back_narrow_not_wide() {
         let spec = SubagentSpec {
             enabled_permissions: Vec::new(),
-            ..test_spec(Permission::Read)
+            ..spec_for_test(Permission::Read)
         };
         let rebuilt = spec.shared_permission(Permission::Unrestricted);
         assert_eq!(rebuilt.get(), Permission::Read);
@@ -2515,43 +2495,34 @@ mod tests {
     }
 
     #[test]
-    fn test_spec_denials_reconstruct_both_lists() {
-        let denials = test_spec(Permission::Read).denials();
+    fn spec_denials_reconstruct_both_lists() {
+        let denials = spec_for_test(Permission::Read).denials();
         assert!(denials.denies_server("mekabridge"));
         assert!(denials.denies_tool("mcp__mekabridge__send_message"));
         assert!(denials.denies_tool("write_file"));
         assert!(!denials.denies_tool("read_file"));
     }
 
-    /// One round of scripted assistant text, for a sub-agent turn.
-    fn text_round(text: &str) -> Vec<crate::provider::mock::MockEvent> {
-        vec![
-            crate::provider::mock::MockEvent::Text {
-                text: text.to_string(),
-            },
-            crate::provider::mock::MockEvent::MessageEnd {
-                stop_reason: crate::provider::mock::MockStopReason::EndTurn,
-            },
-        ]
-    }
-
-    /// A published binding wrapping one provider, for a test that does not care about the profile.
-    fn test_binding() -> crate::agent::PublishedBinding {
+    /// A published profile wrapping one provider, for a test that does not care about the profile.
+    fn binding_for_test() -> crate::provider::PublishedProfile {
         binding_on(Arc::new(crate::provider::mock::MockProvider::from_rounds(
             Vec::new(),
         )))
     }
 
-    fn binding_on(provider: Arc<dyn Provider>) -> crate::agent::PublishedBinding {
+    fn binding_on(provider: Arc<dyn Provider>) -> crate::provider::PublishedProfile {
         binding_named(provider, "test-profile")
     }
 
-    /// The same, with the profile *name* chosen, for a test that needs the parent's live binding to
+    /// The same, with the profile *name* chosen, for a test that needs the parent's live profile to
     /// differ from what its row records.
-    fn binding_named(provider: Arc<dyn Provider>, profile: &str) -> crate::agent::PublishedBinding {
-        crate::agent::PublishedBinding::detached(&crate::provider::ResolvedBinding {
+    fn binding_named(
+        provider: Arc<dyn Provider>,
+        profile: &str,
+    ) -> crate::provider::PublishedProfile {
+        crate::provider::PublishedProfile::detached(&crate::provider::ResolvedProfile {
             provider,
-            binding: profile.to_string(),
+            profile: profile.to_string(),
             context_window: 200_000,
             vision: true,
         })
@@ -2560,38 +2531,33 @@ mod tests {
     impl ToolBuilderParams {
         /// Point these params at one provider, the way `assemble_agent` points the real ones at the
         /// session's. A method rather than a field write so a test reads as "the parent is running
-        /// on this", which is what `live_binding` means.
+        /// on this", which is what the cells' profile means.
         fn on_provider(mut self, provider: Arc<dyn Provider>) -> Self {
-            self.live_binding = binding_on(provider);
+            self.cells.profile = binding_on(provider);
             self
         }
     }
 
-    /// A parent agent's `ToolBuilderParams` pointing at `session_manager`, with `parent_permission`
+    /// A parent agent's `ToolBuilderParams` pointing at `store`, with `parent_permission`
     /// as the ceiling and no MCP manager attached.
-    fn test_params(
-        session_manager: SessionManager,
-        parent_session: Arc<RwLock<Option<Uuid>>>,
+    fn params_for_test(
+        store: Store,
+        parent_session: crate::session::SharedSessionId,
     ) -> ToolBuilderParams {
+        let mut cells = crate::session::SessionCells::new(
+            SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
+            crate::workspace::cwd_for_test(),
+            crate::workspace::roots_for_test(),
+            binding_for_test(),
+            Arc::new(crate::frontend::SilentFrontend),
+        );
+        cells.session_id = parent_session;
         ToolBuilderParams {
-            live_binding: test_binding(),
-            web_client: crate::config::WebClientConfig::default(),
-            sandbox_enabled: false,
-            sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
-            sandbox_backend: crate::config::SandboxBackend::Landlock,
-            backend_probe: crate::sandbox::BackendProbe::Missing {
-                reason: "test fixture".to_string(),
-            },
-            builtin_filter: BuiltinToolFilter::default(),
-            skills: crate::skills::SkillCache::for_root(None),
-            memories: crate::memory::MemoryStore::detached(),
+            materials: crate::session::SessionMaterials::for_test(store),
+            cells,
             // A root agent: holds the whole store, and has instructions it could pass on.
             memory_access: MemoryAccess::Write,
             config_denials: ToolDenials::default(),
-            mcp_manager: None,
-            session_manager,
-            parent_shared_session_id: parent_session,
-            session_stats: Arc::new(crate::stats::SessionStats::default()),
             parent_options: AgentOptions {
                 streaming: false,
                 sandboxed_shell: false,
@@ -2603,9 +2569,6 @@ mod tests {
                 mcp_grace: std::time::Duration::ZERO,
                 system_prompt_override: None,
             },
-            parent_cwd: crate::workspace::test_cwd(),
-            parent_roots: crate::workspace::test_roots(),
-            parent_frontend: Arc::new(crate::frontend::SilentFrontend),
         }
     }
 
@@ -2613,19 +2576,19 @@ mod tests {
     /// reports the worker, a follow-up sees the first turn's history, and `agent_delete`
     /// removes it.
     #[tokio::test]
-    async fn test_spawn_followup_and_delete_round_trip() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn spawn_followup_and_delete_round_trip() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent session");
-        let parent_session = Arc::new(RwLock::new(Some(parent_sid)));
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
         let provider: Arc<dyn Provider> =
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
                 text_round("first answer"),
                 text_round("second answer"),
             ]));
-        let params = test_params(session_manager.clone(), Arc::clone(&parent_session));
+        let params = params_for_test(store.clone(), parent_session.clone());
 
         let spawn = AgentSpawnTool {
             parent_permission: SharedPermission::new(
@@ -2640,11 +2603,11 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "prompt": "look into it", "permission": "read" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("spawn succeeds");
-        let text = super::super::tests::text_content(&output);
+        let text = output.text_content();
         assert!(text.contains("first answer"), "{text}");
 
         let agent_id: Uuid = text
@@ -2656,7 +2619,7 @@ mod tests {
         // The spawn call restricted the worker below the parent; the persisted spec says so, and
         // that is what a follow-up rebuilds from.
         let spec: SubagentSpec = serde_json::from_str(
-            &session_manager
+            &store
                 .load_subagent_spec(agent_id)
                 .await
                 .expect("load spec")
@@ -2668,12 +2631,14 @@ mod tests {
         let list = AgentListTool {
             tool_builder_params: params.clone(),
         };
-        let listed = super::super::tests::text_content(
-            &list
-                .execute(serde_json::json!({}), CancellationToken::new())
-                .await
-                .expect("list succeeds"),
-        );
+        let listed = list
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("list succeeds")
+            .text_content();
         assert!(listed.contains(&agent_id.to_string()), "{listed}");
 
         let followup = AgentFollowupTool {
@@ -2684,21 +2649,20 @@ mod tests {
             tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
-        let second = super::super::tests::text_content(
-            &followup
-                .execute(
-                    serde_json::json!({ "agent": agent_id.to_string(), "prompt": "and then?" }),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("followup succeeds"),
-        );
+        let second = followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "and then?" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("followup succeeds")
+            .text_content();
         assert!(second.contains("second answer"), "{second}");
 
         // The worker's own history carried into the second turn rather than starting over: its log
         // now holds both tasks and both answers.
-        let events = session_manager.load_events(agent_id).await.expect("events");
-        let transcript = format!("{:?}", events);
+        let events = store.load_events(agent_id).await.expect("events");
+        let transcript = format!("{events:?}");
         assert!(transcript.contains("look into it"), "{transcript}");
         assert!(transcript.contains("first answer"), "{transcript}");
         assert!(transcript.contains("and then?"), "{transcript}");
@@ -2709,13 +2673,13 @@ mod tests {
         };
         delete
             .execute(
-                serde_json::json!({ "agent": agent_id.to_string() }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": agent_id.to_string() }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("delete succeeds");
         assert!(
-            session_manager
+            store
                 .load_session_tree(parent_sid)
                 .await
                 .expect("tree")
@@ -2725,7 +2689,7 @@ mod tests {
         );
         // The parent itself is untouched.
         assert!(
-            session_manager
+            store
                 .load_session_tree(parent_sid)
                 .await
                 .expect("tree")
@@ -2749,13 +2713,13 @@ mod tests {
     /// into one conversation is the thing the lock is for.
     #[tokio::test]
     async fn a_followup_is_refused_while_something_else_holds_the_worker() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let parent_session = Arc::new(RwLock::new(Some(parent_sid)));
-        let params = test_params(session_manager.clone(), Arc::clone(&parent_session));
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
+        let params = params_for_test(store.clone(), parent_session.clone());
         // Never reached: the refusal happens before any turn runs, which is the point.
         let provider: Arc<dyn Provider> =
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
@@ -2763,9 +2727,8 @@ mod tests {
             ]));
         // The claim `create_child_session` takes *is* the contention: holding it here is exactly
         // what a second meka looks like from the follow-up's side, since `flock` conflicts across
-        // open file descriptions rather than across processes.
-        // A real spec, or the follow-up refuses at the resumability check before it ever reaches
-        // the lock.
+        // open file descriptions rather than across processes. A real spec, or the follow-up
+        // refuses at the resumability check before it ever reaches the lock.
         let spec = SubagentSpec {
             permission: Permission::Read,
             enabled_permissions: vec![Permission::Read],
@@ -2777,11 +2740,12 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
         };
-        let (worker, held) = session_manager
+        let (worker, held) = store
             .create_child_session(
                 parent_sid,
                 None,
                 Some(serde_json::to_string(&spec).expect("serialize the spec")),
+                "read".to_string(),
                 "test-profile".to_string(),
             )
             .await
@@ -2798,8 +2762,8 @@ mod tests {
         };
         let refused = followup
             .execute(
-                serde_json::json!({ "agent": worker.to_string(), "prompt": "carry on" }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a worker somebody else is running must not be run again");
@@ -2809,19 +2773,86 @@ mod tests {
         );
     }
 
+    /// A follow-up the lock refuses leaves the worker's row on the profile it was on. The row is
+    /// the billing record for a turn; written ahead of the lock, a refused follow-up moved it onto
+    /// the parent's profile for a turn that never ran.
+    #[tokio::test]
+    async fn a_refused_followup_leaves_the_workers_profile_alone() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
+        let params = params_for_test(store.clone(), parent_session.clone());
+        let provider: Arc<dyn Provider> =
+            Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+                text_round("unreachable"),
+            ]));
+        let spec = SubagentSpec {
+            permission: Permission::Read,
+            enabled_permissions: vec![Permission::Read],
+            denied_servers: Vec::new(),
+            denied_tools: Vec::new(),
+            memory: MemoryAccess::None,
+            instructions: InstructionAccess::None,
+            inherited_scratchpad: Vec::new(),
+            remaining_depth: 0,
+            absolute_depth: 1,
+        };
+        // On a profile the parent is not on, so a write that should not happen is visible.
+        let (worker, held) = store
+            .create_child_session(
+                parent_sid,
+                None,
+                Some(serde_json::to_string(&spec).expect("serialize the spec")),
+                "read".to_string(),
+                "stale-profile".to_string(),
+            )
+            .await
+            .expect("child");
+        let _held = held.expect("the spawn's own claim");
+
+        let followup = AgentFollowupTool {
+            parent_permission: SharedPermission::new(
+                Permission::Unrestricted,
+                EnabledPermissions::ALL,
+            ),
+            tool_builder_params: params.clone().on_provider(Arc::clone(&provider)),
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        followup
+            .execute(
+                serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("the held lock refuses the follow-up");
+
+        assert_eq!(
+            store
+                .recorded_profile(worker)
+                .await
+                .expect("read the row")
+                .as_deref(),
+            Some("stale-profile"),
+            "a turn that did not run must not move the row"
+        );
+    }
+
     /// A follow-up turn runs the worker at the parent's *current* level, not at the one it was
     /// spawned with.
     ///
     /// Asserted against the worker's persisted conversation rather than against its spec, since the
     /// registry is what actually decides what it can do.
     #[tokio::test]
-    async fn test_followup_drops_a_worker_when_the_session_is_restricted() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn followup_drops_a_worker_when_the_session_is_restricted() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let parent_session = Arc::new(RwLock::new(Some(parent_sid)));
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
         // A path unique to this run: a shared one would leave a file behind on the failing case and
         // make the *next* run fail for the wrong reason.
         let temporary = tempfile::tempdir().expect("tempdir");
@@ -2846,7 +2877,7 @@ mod tests {
                 ],
                 text_round("could not write"),
             ]));
-        let params = test_params(session_manager.clone(), Arc::clone(&parent_session));
+        let params = params_for_test(store.clone(), parent_session.clone());
 
         // Spawned at `unrestricted`.
         let spec = SubagentSpec {
@@ -2860,11 +2891,12 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
         };
-        let child = session_manager
+        let child = store
             .create_child_session(
                 parent_sid,
                 None,
                 Some(serde_json::to_string(&spec).expect("encode")),
+                "read".to_string(),
                 "test-profile".to_string(),
             )
             .await
@@ -2874,7 +2906,7 @@ mod tests {
         // The session is then restricted to Read, as `/permission` or Shift+Tab would.
         let restricted = SharedPermission::new(
             Permission::Read,
-            EnabledPermissions::from_modes([Permission::Read]).expect("set"),
+            EnabledPermissions::from_levels([Permission::Read]).expect("set"),
         );
         let followup = AgentFollowupTool {
             parent_permission: restricted,
@@ -2883,8 +2915,8 @@ mod tests {
         };
         followup
             .execute(
-                serde_json::json!({ "agent": child.to_string(), "prompt": "write the file" }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": child.to_string(), "prompt": "write the file" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("followup runs");
@@ -2892,10 +2924,7 @@ mod tests {
         // The worker really was refused, by the dispatcher, at Read. Asserted against its persisted
         // conversation rather than against the spec: what matters is what the worker was able to
         // *do*, and a spec-only assertion would still pass if the clamp never reached the registry.
-        let transcript = format!(
-            "{:?}",
-            session_manager.load_events(child).await.expect("events")
-        );
+        let transcript = format!("{:?}", store.load_events(child).await.expect("events"));
         assert!(
             transcript.contains("Permission denied") && transcript.contains("write_file"),
             "the worker should have been refused write_file at Read, got: {transcript}"
@@ -2905,7 +2934,7 @@ mod tests {
         // The recorded spec is untouched, so the worker returns to `unrestricted` if the session
         // does: the clamp is a live ceiling, not a rewrite of the spawn terms.
         let reloaded: SubagentSpec = serde_json::from_str(
-            &session_manager
+            &store
                 .load_subagent_spec(child)
                 .await
                 .expect("load")
@@ -2916,11 +2945,11 @@ mod tests {
     }
 
     /// A restriction added to config after a worker was spawned still reaches it on follow-up. The
-    /// spec is a floor on restriction, not a licence to ignore what the operator has since decided.
+    /// spec is a floor on restriction, not a license to ignore what the operator has since decided.
     #[tokio::test]
-    async fn test_followup_applies_denials_config_gained_since_the_spawn() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn followup_applies_denials_config_gained_since_the_spawn() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
@@ -2928,9 +2957,9 @@ mod tests {
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
                 text_round("ok"),
             ]));
-        let mut params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
         // Config now denies a server and all memory access; the spec predates both.
         params.config_denials = ToolDenials::new(vec!["mekabridge".to_string()], Vec::new());
@@ -2947,11 +2976,12 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
         };
-        let child = session_manager
+        let child = store
             .create_child_session(
                 parent_sid,
                 None,
                 Some(serde_json::to_string(&spec).expect("encode")),
+                "read".to_string(),
                 "test-profile".to_string(),
             )
             .await
@@ -2965,8 +2995,8 @@ mod tests {
         };
         followup
             .execute(
-                serde_json::json!({ "agent": child.to_string(), "prompt": "go" }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": child.to_string(), "prompt": "go" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("followup runs");
@@ -2974,7 +3004,7 @@ mod tests {
         // The combine happens in memory; the stored spec still records the original spawn terms, so
         // loosening config later restores them rather than leaving the worker permanently narrowed.
         let reloaded: SubagentSpec = serde_json::from_str(
-            &session_manager
+            &store
                 .load_subagent_spec(child)
                 .await
                 .expect("load")
@@ -3043,7 +3073,7 @@ mod tests {
         parent_sid: Uuid,
         input: serde_json::Value,
     ) -> Result<SubagentSpec> {
-        let session_manager = params.session_manager.clone();
+        let store = params.materials.store.clone();
         let spawn = AgentSpawnTool {
             parent_permission: SharedPermission::new(parent_permission, EnabledPermissions::ALL),
             tool_builder_params: params.on_provider(Arc::new(
@@ -3053,15 +3083,20 @@ mod tests {
             remaining_depth: 1,
             absolute_depth: 0,
         };
-        let output = spawn.execute(input, CancellationToken::new()).await?;
-        let text = super::super::tests::text_content(&output);
+        let output = spawn
+            .execute(
+                input,
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await?;
+        let text = output.text_content();
         let agent_id: Uuid = text
             .lines()
             .find_map(|line| line.strip_prefix("agent: "))
             .and_then(|id| Uuid::parse_str(id.trim()).ok())
             .unwrap_or_else(|| panic!("no agent id in: {text}"));
         let _ = parent_sid;
-        let json = session_manager
+        let json = store
             .load_subagent_spec(agent_id)
             .await?
             .expect("a spawned worker has a spec");
@@ -3079,24 +3114,24 @@ mod tests {
     /// The two come apart for as long as a repin that could not take the runtime lock. ACP's
     /// `session/set_config_option` moves the row mid-turn and `try_lock`s the runtime; when a turn
     /// is in flight that fails, and the agent stays where it was until the next turn. A worker
-    /// spawned in that window ran on the old profile and billed the old account, while its row
-    /// claimed the new one -- so a later `agent_followup` on that child resolved a different
-    /// account from the one that had done the work.
+    /// spawned in that window runs on the previous profile and bills its account while its row
+    /// claims the new one, so a later `agent_followup` on that child would resolve a different
+    /// account from the one that did the work.
     ///
-    /// The row here is deliberately left on `stale-row-profile` while the live binding says
+    /// The row here is deliberately left on `stale-row-profile` while the live profile says
     /// `live-profile`, because a test where the two agree cannot tell the fix from the bug.
     #[tokio::test]
     async fn a_spawned_worker_records_the_profile_its_parent_runs_on_now() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "stale-row-profile".to_string())
             .await
             .expect("parent");
-        let mut params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
-        params.live_binding = binding_named(
+        params.cells.profile = binding_named(
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
                 text_round("done"),
             ])),
@@ -3113,11 +3148,11 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({"prompt": "do a thing", "permission": "read"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("spawn");
-        let text = super::super::tests::text_content(&output);
+        let text = output.text_content();
         let agent_id: Uuid = text
             .lines()
             .find_map(|line| line.strip_prefix("agent: "))
@@ -3125,16 +3160,16 @@ mod tests {
             .unwrap_or_else(|| panic!("no agent id in: {text}"));
 
         assert_eq!(
-            session_manager
-                .recorded_provider(agent_id)
+            store
+                .recorded_profile(agent_id)
                 .await
                 .expect("read the child's row"),
             Some("live-profile".to_string()),
             "the worker's row must name what it was built on, not what the parent's row still says"
         );
         assert_eq!(
-            session_manager
-                .recorded_provider(parent_sid)
+            store
+                .recorded_profile(parent_sid)
                 .await
                 .expect("read the parent's row"),
             Some("stale-row-profile".to_string()),
@@ -3144,26 +3179,26 @@ mod tests {
 
     /// The sibling of the test above, on the door that was left open.
     ///
-    /// `build_subagent` takes the parent's live binding for a follow-up exactly as it does for a
+    /// `build_subagent` takes the parent's live profile for a follow-up exactly as it does for a
     /// spawn, but only the spawn wrote it down, so a worker spawned on `first-profile` and
-    /// followed up after a `/provider` switch ran on and billed `second-profile` while its row
-    /// still said `first-profile`. That is the one thing this release otherwise forbids: a session
+    /// followed up after a `/profile` switch ran on and billed `second-profile` while its row
+    /// still said `first-profile`. That is the one thing meka otherwise forbids: a session
     /// whose turns do not run on the profile its row names.
     ///
-    /// The switch between the two calls is the whole point; a test where the binding never moves
+    /// The switch between the two calls is the whole point; a test where the profile never moves
     /// passes with the write deleted.
     #[tokio::test]
     async fn a_followed_up_worker_records_the_profile_it_is_now_running_on() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "first-profile".to_string())
             .await
             .expect("parent");
-        let mut params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
-        params.live_binding = binding_named(
+        params.cells.profile = binding_named(
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
                 text_round("spawned"),
                 text_round("followed up"),
@@ -3181,20 +3216,20 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({"prompt": "do a thing", "permission": "read"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("spawn");
-        let text = super::super::tests::text_content(&output);
+        let text = output.text_content();
         let agent_id: Uuid = text
             .lines()
             .find_map(|line| line.strip_prefix("agent: "))
             .and_then(|id| Uuid::parse_str(id.trim()).ok())
             .unwrap_or_else(|| panic!("no agent id in: {text}"));
 
-        // What `/provider`, `PATCH /v1/sessions/{id}` and ACP's `session/set_config_option` all
+        // What `/profile`, `PATCH /v1/sessions/{id}` and ACP's `session/set_config_option` all
         // leave behind: the cell `build_subagent` reads now names a different profile.
-        params.live_binding = binding_named(
+        params.cells.profile = binding_named(
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
                 text_round("followed up"),
             ])),
@@ -3208,19 +3243,19 @@ mod tests {
         };
         followup
             .execute(
-                serde_json::json!({"agent": agent_id.to_string(), "prompt": "again"}),
-                CancellationToken::new(),
+                serde_json::json!({"id": agent_id.to_string(), "prompt": "again"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("follow up");
 
         assert_eq!(
-            session_manager
-                .recorded_provider(agent_id)
+            store
+                .recorded_profile(agent_id)
                 .await
                 .expect("read the worker's row"),
             Some("second-profile".to_string()),
-            "a follow-up runs the worker on the parent's binding now, so the row has to say so"
+            "a follow-up runs the worker on the parent's profile now, so the row has to say so"
         );
     }
 
@@ -3228,13 +3263,16 @@ mod tests {
     /// so a parent that never considers the question produces a clean slate rather than a copy of
     /// itself.
     #[tokio::test]
-    async fn test_grants_default_to_nothing() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn grants_default_to_nothing() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
+        let params = params_for_test(
+            store,
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
 
         let spec = spawn_and_read_spec(
             params,
@@ -3250,13 +3288,16 @@ mod tests {
 
     /// And gets exactly what it was given when the parent asks.
     #[tokio::test]
-    async fn test_grants_are_recorded_when_asked_for() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn grants_are_recorded_when_asked_for() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
+        let params = params_for_test(
+            store,
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
 
         let spec = spawn_and_read_spec(
             params,
@@ -3273,15 +3314,15 @@ mod tests {
     /// `write` is refused rather than clamped to `read`, so a parent asking for it learns that no
     /// sub-agent can have it instead of quietly getting something else.
     #[tokio::test]
-    async fn test_memory_write_is_refused_not_clamped() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn memory_write_is_refused_not_clamped() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
 
         let error = spawn_and_read_spec(
@@ -3295,7 +3336,7 @@ mod tests {
         assert!(error.to_string().contains("not available to sub-agents"));
         // A refused spawn leaves nothing behind.
         assert_eq!(
-            session_manager
+            store
                 .load_session_tree(parent_sid)
                 .await
                 .expect("tree")
@@ -3307,13 +3348,16 @@ mod tests {
     /// A worker cannot hand a grandchild more than it holds. Memory clamps against the spawning
     /// agent's own level; instructions clamp against whether it has the text at all.
     #[tokio::test]
-    async fn test_a_worker_cannot_grant_more_than_it_holds() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn a_worker_cannot_grant_more_than_it_holds() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let mut params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
+        let mut params = params_for_test(
+            store,
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
         // Stand in for a worker that was itself granted nothing: no memory, and no copy of the
         // instructions to pass on. This is exactly what `build_subagent` hands a nested
         // `AgentSpawnTool`.
@@ -3346,17 +3390,17 @@ mod tests {
     /// because the clamp is only as good as the params the nested `AgentSpawnTool` is handed, and a
     /// test that sets those params itself would pass even if `build_subagent` set them wrong.
     #[tokio::test]
-    async fn test_a_worker_granted_nothing_cannot_grant_its_own_child_anything() {
+    async fn a_worker_granted_nothing_cannot_grant_its_own_child_anything() {
         use crate::provider::mock::{MockEvent, MockStopReason};
 
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
 
         // Worker turn 1 asks for a grandchild with both grants; then the grandchild runs; then the
@@ -3398,15 +3442,12 @@ mod tests {
         spawn
             .execute(
                 serde_json::json!({ "prompt": "worker task" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("spawn");
 
-        let tree = session_manager
-            .load_session_tree(parent_sid)
-            .await
-            .expect("tree");
+        let tree = store.load_session_tree(parent_sid).await.expect("tree");
         assert_eq!(tree.len(), 3, "parent, worker, grandchild");
         let worker = tree
             .iter()
@@ -3418,7 +3459,7 @@ mod tests {
             .expect("the worker really spawned one");
 
         let spec: SubagentSpec = serde_json::from_str(
-            &session_manager
+            &store
                 .load_subagent_spec(grandchild.id)
                 .await
                 .expect("load")
@@ -3440,18 +3481,18 @@ mod tests {
     /// The report handed to a scratchpad must be the report, with no `agent:` header bolted on.
     ///
     /// The redirect is universal and stores the whole result text, so a header would end up inside
-    /// the entry that `inherit_scratchpad` later hands to another worker — and the model would not
+    /// the entry that `inherit_scratchpad` later hands to another worker, and the model would not
     /// even receive the id, since it sees only a reference once the redirect fires.
     #[tokio::test]
-    async fn test_a_redirected_report_carries_no_agent_header() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn a_redirected_report_carries_no_agent_header() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
         let spawn = AgentSpawnTool {
             parent_permission: SharedPermission::new(
@@ -3469,15 +3510,14 @@ mod tests {
             absolute_depth: 0,
         };
 
-        let redirected = super::super::tests::text_content(
-            &spawn
-                .execute(
-                    serde_json::json!({ "prompt": "go", "scratchpad": "findings" }),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("spawn"),
-        );
+        let redirected = spawn
+            .execute(
+                serde_json::json!({ "prompt": "go", "scratchpad": "findings" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn")
+            .text_content();
         assert_eq!(
             redirected.trim(),
             "the findings",
@@ -3486,15 +3526,14 @@ mod tests {
         assert!(!redirected.contains("agent:"), "{redirected}");
 
         // Without the redirect the id leads, which is how a parent reaches the worker again.
-        let inline = super::super::tests::text_content(
-            &spawn
-                .execute(
-                    serde_json::json!({ "prompt": "go" }),
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("spawn"),
-        );
+        let inline = spawn
+            .execute(
+                serde_json::json!({ "prompt": "go" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn")
+            .text_content();
         assert!(inline.starts_with("agent: "), "{inline}");
         assert!(inline.contains("the findings"));
     }
@@ -3503,29 +3542,29 @@ mod tests {
     /// the `agent_spawn` boundary, but a spec is persisted JSON and `meka session import` writes it
     /// verbatim from a user-supplied archive, so the guarantee is enforced where it is consumed.
     #[test]
-    fn test_a_spec_claiming_write_is_capped_at_read() {
+    fn a_spec_claiming_write_is_capped_at_read() {
         let forged = SubagentSpec {
             memory: MemoryAccess::Write,
-            ..test_spec(Permission::Unrestricted)
+            ..spec_for_test(Permission::Unrestricted)
         };
         assert_eq!(forged.granted_memory(), MemoryAccess::Read);
         // And the honest values pass through untouched.
         assert_eq!(
             SubagentSpec {
                 memory: MemoryAccess::Read,
-                ..test_spec(Permission::Read)
+                ..spec_for_test(Permission::Read)
             }
             .granted_memory(),
             MemoryAccess::Read
         );
         assert_eq!(
-            test_spec(Permission::Read).granted_memory(),
+            spec_for_test(Permission::Read).granted_memory(),
             MemoryAccess::None
         );
     }
 
     /// A `memory: "read"` grant has to arrive with an index, or it is only half a grant:
-    fn test_memory(name: &str, priority: u8, description: &str) -> crate::memory::Memory {
+    fn memory_for_test(name: &str, priority: u8, description: &str) -> crate::memory::Memory {
         crate::memory::Memory {
             name: name.to_string(),
             description: description.to_string(),
@@ -3539,13 +3578,13 @@ mod tests {
     }
 
     /// `memory_read` takes an exact name, and a sub-agent never receives the per-turn world state
-    /// the primary agent's `[Memory]` section rides in. Without this the worker holds two tools and
+    /// the root agent's `[Memory]` section rides in. Without this the worker holds two tools and
     /// no idea what to call them with.
     #[test]
-    fn test_a_granted_worker_gets_a_usable_memory_index() {
+    fn a_granted_worker_gets_a_usable_memory_index() {
         let index = [
-            test_memory("build-incantation", 1, "How this project is built"),
-            test_memory("review-style", 2, "What the user wants from a review"),
+            memory_for_test("build-incantation", 1, "How this project is built"),
+            memory_for_test("review-style", 2, "What the user wants from a review"),
         ];
 
         let rendered = render_subagent_memory_index(&index);
@@ -3553,7 +3592,7 @@ mod tests {
         assert!(rendered.contains("How this project is built"));
         assert!(rendered.contains("review-style"));
         assert!(rendered.contains("memory_read"), "and how to open one");
-        // A worker cannot write, so it must not be told to. The primary agent's header says to call
+        // A worker cannot write, so it must not be told to. The root agent's header says to call
         // `memory_write`, which is exactly why this renders separately.
         assert!(
             !rendered.contains("memory_write"),
@@ -3568,10 +3607,10 @@ mod tests {
     /// A truncated index must say so. Reading as "this is everything" is what turns a full store
     /// into a confidently incomplete answer.
     #[test]
-    fn test_a_truncated_memory_index_states_its_remainder() {
+    fn a_truncated_memory_index_states_its_remainder() {
         let memories: Vec<crate::memory::Memory> = (0..400)
             .map(|n| {
-                test_memory(
+                memory_for_test(
                     &format!("memory-{n:03}"),
                     1,
                     &"a description long enough to make the budget bite".repeat(3),
@@ -3596,9 +3635,9 @@ mod tests {
     /// access to them. The parent's index and both search renderers already guarded both halves.
     #[test]
     fn one_enormous_description_does_not_empty_the_subagent_index() {
-        let mut memories = vec![test_memory("enormous", 1, &"x".repeat(4_000))];
+        let mut memories = vec![memory_for_test("enormous", 1, &"x".repeat(4_000))];
         memories.extend(
-            (0..3).map(|n| test_memory(&format!("ordinary-{n}"), 3, "a short description")),
+            (0..3).map(|n| memory_for_test(&format!("ordinary-{n}"), 3, "a short description")),
         );
 
         let rendered = render_subagent_memory_index(&memories);
@@ -3624,7 +3663,7 @@ mod tests {
 
     /// The grant reaches the prompt, and its absence leaves no trace of the section.
     #[test]
-    fn test_system_prompt_carries_instructions_only_when_granted() {
+    fn system_prompt_carries_instructions_only_when_granted() {
         let ungranted = build_subagent_system_prompt(Permission::Read, &[], &[], None, "");
         assert!(!ungranted.contains("User Instructions"));
 
@@ -3641,7 +3680,7 @@ mod tests {
         // as an instruction to address the user directly.
         assert!(granted.contains("report"), "{granted}");
 
-        // Whitespace-only instructions are treated as absent, matching the primary agent.
+        // Whitespace-only instructions are treated as absent, matching the root agent.
         assert!(
             !build_subagent_system_prompt(Permission::Read, &[], &[], Some("  \n "), "")
                 .contains("User Instructions")
@@ -3652,15 +3691,15 @@ mod tests {
     /// it produced go with it. Leaving them behind would give an agent that cannot spawn a worker
     /// the ability to drive workers a previous run left in the database.
     #[tokio::test]
-    async fn test_denying_agent_spawn_takes_the_lifecycle_tools_with_it() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn denying_agent_spawn_takes_the_lifecycle_tools_with_it() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
         let spawn = |params: ToolBuilderParams| AgentSpawnTool {
             parent_permission: SharedPermission::new(
@@ -3705,18 +3744,20 @@ mod tests {
         }
     }
 
-    /// The two doors that describe this family must describe it identically. `meka tools list`
-    /// reads [`agent_tool_catalogue`] because it cannot build these tools, so a definition edited
-    /// on one side only would reach the model and the table differently, and nothing else in the
-    /// tree would notice.
+    /// Each registered tool has to actually describe itself: `meka tools list` reads the same
+    /// registration a session does, so a definition that lost its description or its schema would
+    /// tell the model and the listing nothing while still registering cleanly.
     #[tokio::test]
-    async fn the_agent_tool_catalogue_says_what_registration_produces() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn every_agent_tool_describes_itself_and_the_arguments_it_requires() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let params = test_params(session_manager, Arc::new(RwLock::new(Some(parent_sid))));
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
         let registry = ToolRegistry::new();
         register_subagent_tools(&registry, AgentSpawnTool {
             parent_permission: SharedPermission::new(
@@ -3731,44 +3772,16 @@ mod tests {
             absolute_depth: 0,
         })
         .expect("register");
-
-        // Serialised rather than compared field by field: `ToolDefinition` has no `PartialEq`, and
-        // going through JSON covers the parameter schema too, which the catalogue's callers read
-        // but `ToolRegistry::tool_catalogue` drops.
-        let as_json = |definition: &ToolDefinition| {
-            serde_json::to_value(definition).expect("definitions serialise")
-        };
-        let declared = agent_tool_catalogue();
-        for (definition, required) in &declared {
-            let registered = registry
-                .get(&definition.name)
-                .unwrap_or_else(|| panic!("'{}' must be registered", definition.name));
-            assert_eq!(as_json(&registered.definition()), as_json(definition));
-            assert_eq!(registered.required_permission(), *required);
-        }
-        // The other direction: a fifth tool added to `register_subagent_tools` and not to the
-        // catalogue vanishes from `meka tools list`.
-        let registered_names: Vec<String> = registry
-            .tool_catalogue()
-            .into_iter()
-            .map(|(name, ..)| name)
-            .collect();
-        let declared_names: Vec<String> = declared
-            .iter()
-            .map(|(definition, _)| definition.name.clone())
-            .collect();
-        assert_eq!(registered_names.len(), declared_names.len());
-        for name in &registered_names {
-            assert!(declared_names.contains(name), "'{name}' is not catalogued");
-        }
-    }
-
-    /// Each entry has to actually describe itself. The test above only proves the two doors agree,
-    /// and they agree by reading one function, so a definition that lost its description or its
-    /// schema would still match itself while telling the model and `meka tools list` nothing.
-    #[test]
-    fn every_agent_tool_describes_itself_and_the_arguments_it_requires() {
-        for (definition, _) in agent_tool_catalogue() {
+        for name in [
+            "agent_spawn",
+            "agent_list",
+            "agent_followup",
+            "agent_delete",
+        ] {
+            let definition = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("'{name}' is registered"))
+                .definition();
             let name = &definition.name;
             assert!(name.starts_with("agent_"), "'{name}' is not in the family");
             // A floor rather than an exact length: the point is that a sentence survived, and the
@@ -3836,25 +3849,26 @@ mod tests {
     /// the follow-up fail on a foreign-key violation -- a raw database error, on a path where the
     /// model did nothing wrong.
     #[tokio::test]
-    async fn test_delete_is_refused_while_a_followup_holds_the_worker() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn delete_is_refused_while_a_followup_holds_the_worker() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let child = session_manager
+        let child = store
             .create_child_session(
                 parent_sid,
                 None,
                 Some(r#"{"permission":"read"}"#.to_string()),
+                "read".to_string(),
                 "test-profile".to_string(),
             )
             .await
             .expect("child")
             .0;
-        let params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
         let in_flight: InFlightFollowups =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -3868,14 +3882,14 @@ mod tests {
         let held = FollowupGuard::claim(&in_flight, child).expect("claim");
         let error = delete
             .execute(
-                serde_json::json!({ "agent": child.to_string() }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": child.to_string() }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a busy worker must not be deleted mid-follow-up");
         assert!(error.to_string().contains("busy"), "{error}");
         assert_eq!(
-            session_manager
+            store
                 .load_session_tree(parent_sid)
                 .await
                 .expect("tree")
@@ -3888,8 +3902,8 @@ mod tests {
         drop(held);
         delete
             .execute(
-                serde_json::json!({ "agent": child.to_string() }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": child.to_string() }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("delete succeeds once the worker is free");
@@ -3898,22 +3912,20 @@ mod tests {
     /// `turns` counts tasks, not messages. `Agent::run_turn` persists tool results as user-role
     /// messages, so a single task that took three tool rounds must still read as one turn.
     #[tokio::test]
-    async fn test_agent_list_turns_excludes_tool_result_messages() {
-        use crate::{
-            conversation::Event,
-            provider::{ContentBlock, Message, Role, ToolResultContent},
-        };
+    async fn agent_list_turns_excludes_tool_result_messages() {
+        use crate::conversation::{ContentBlock, Event, Message, Role, ToolResultContent};
 
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let child = session_manager
+        let child = store
             .create_child_session(
                 parent_sid,
                 None,
                 Some(r#"{"permission":"read"}"#.to_string()),
+                "read".to_string(),
                 "test-profile".to_string(),
             )
             .await
@@ -3938,24 +3950,23 @@ mod tests {
             tool_result,
             Event::Append(Message::assistant_text("done")),
         ] {
-            session_manager
-                .save_event(child, &event)
-                .await
-                .expect("save");
+            store.save_event(child, &event).await.expect("save");
         }
 
         let list = AgentListTool {
-            tool_builder_params: test_params(
-                session_manager,
-                Arc::new(RwLock::new(Some(parent_sid))),
+            tool_builder_params: params_for_test(
+                store,
+                crate::session::SharedSessionId::new(Some(parent_sid)),
             ),
         };
-        let rendered = super::super::tests::text_content(
-            &list
-                .execute(serde_json::json!({}), CancellationToken::new())
-                .await
-                .expect("list"),
-        );
+        let rendered = list
+            .execute(
+                serde_json::json!({}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("list")
+            .text_content();
         assert!(
             rendered.contains("turns=1"),
             "one task through two tool rounds is one turn, got: {rendered}"
@@ -3969,7 +3980,7 @@ mod tests {
     /// Unix-only because it needs a directory the process cannot read.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_a_failed_skill_load_leaves_no_orphan_session() {
+    async fn a_failed_skill_load_leaves_no_orphan_session() {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().expect("tempdir");
@@ -4005,16 +4016,16 @@ mod tests {
             "resolution still succeeds"
         );
 
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let mut params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
-        params.skills = skills;
+        params.materials.skills = skills;
 
         let spawn = AgentSpawnTool {
             parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
@@ -4028,7 +4039,7 @@ mod tests {
         let error = spawn
             .execute(
                 serde_json::json!({ "skill": "broken" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("an unreadable skill body must fail the spawn");
@@ -4038,7 +4049,7 @@ mod tests {
         );
 
         assert_eq!(
-            session_manager
+            store
                 .load_session_tree(parent_sid)
                 .await
                 .expect("tree")
@@ -4076,16 +4087,16 @@ mod tests {
             std::fs::write(root.join(name).join("SKILL.md"), body).expect("write skill");
         }
 
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let mut params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(parent_sid))),
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
         );
-        params.skills = crate::skills::SkillCache::for_root(Some(root));
+        params.materials.skills = crate::skills::SkillCache::for_root(Some(root));
 
         let spawn = AgentSpawnTool {
             parent_permission: SharedPermission::new(Permission::Read, EnabledPermissions::ALL),
@@ -4099,12 +4110,12 @@ mod tests {
         let output = spawn
             .execute(
                 serde_json::json!({ "skill": "wrecked" }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("a broken skill is a tool result, not a tool error");
         assert!(output.is_error);
-        let text = super::super::tests::text_content(&output);
+        let text = output.text_content();
         assert!(
             text.contains("could not be read"),
             "a present-but-unparseable file must not read as absent: {text}"
@@ -4114,7 +4125,7 @@ mod tests {
             "naming substitutes invites the model to delegate one: {text}"
         );
         assert_eq!(
-            session_manager
+            store
                 .load_session_tree(parent_sid)
                 .await
                 .expect("tree")
@@ -4127,21 +4138,22 @@ mod tests {
     /// A session may only drive its own workers. This also covers a forked parent, whose copied
     /// conversation names children that are still linked to the original session.
     #[tokio::test]
-    async fn test_followup_and_delete_refuse_a_session_that_is_not_the_parent() {
-        let session_manager = test_session_manager().await;
-        let owner = session_manager
+    async fn followup_and_delete_refuse_a_session_that_is_not_the_parent() {
+        let store = store_for_test().await;
+        let owner = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("owner");
-        let stranger = session_manager
+        let stranger = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("stranger");
-        let child = session_manager
+        let child = store
             .create_child_session(
                 owner,
                 None,
                 Some("{\"permission\":\"read\"}".to_string()),
+                "read".to_string(),
                 "test-profile".to_string(),
             )
             .await
@@ -4152,9 +4164,9 @@ mod tests {
             Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
                 text_round("should never run"),
             ]));
-        let params = test_params(
-            session_manager.clone(),
-            Arc::new(RwLock::new(Some(stranger))),
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(stranger)),
         );
 
         let followup = AgentFollowupTool {
@@ -4167,8 +4179,8 @@ mod tests {
         };
         let error = followup
             .execute(
-                serde_json::json!({ "agent": child.to_string(), "prompt": "hello" }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": child.to_string(), "prompt": "hello" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a stranger's worker must be refused");
@@ -4181,8 +4193,8 @@ mod tests {
         assert!(
             delete
                 .execute(
-                    serde_json::json!({ "agent": child.to_string() }),
-                    CancellationToken::new()
+                    serde_json::json!({ "id": child.to_string() }),
+                    crate::tools::ToolContext::detached(CancellationToken::new())
                 )
                 .await
                 .is_err(),
@@ -4190,7 +4202,7 @@ mod tests {
         );
         // Still there.
         assert!(
-            session_manager
+            store
                 .load_session_tree(owner)
                 .await
                 .expect("tree")
@@ -4202,14 +4214,20 @@ mod tests {
     /// A worker spawned before the spec column existed has no recorded terms. Refuse rather than
     /// rebuild it from the parent, which is exactly the escalation the spec exists to prevent.
     #[tokio::test]
-    async fn test_followup_refuses_a_worker_with_no_recorded_spec() {
-        let session_manager = test_session_manager().await;
-        let parent_sid = session_manager
+    async fn followup_refuses_a_worker_with_no_recorded_spec() {
+        let store = store_for_test().await;
+        let parent_sid = store
             .create_session(None, "test-profile".to_string())
             .await
             .expect("parent");
-        let child = session_manager
-            .create_child_session(parent_sid, None, None, "test-profile".to_string())
+        let child = store
+            .create_child_session(
+                parent_sid,
+                None,
+                None,
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
             .await
             .expect("child")
             .0;
@@ -4223,17 +4241,17 @@ mod tests {
                 Permission::Unrestricted,
                 EnabledPermissions::ALL,
             ),
-            tool_builder_params: test_params(
-                session_manager,
-                Arc::new(RwLock::new(Some(parent_sid))),
+            tool_builder_params: params_for_test(
+                store,
+                crate::session::SharedSessionId::new(Some(parent_sid)),
             )
             .on_provider(provider),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         };
         let error = followup
             .execute(
-                serde_json::json!({ "agent": child.to_string(), "prompt": "hello" }),
-                CancellationToken::new(),
+                serde_json::json!({ "id": child.to_string(), "prompt": "hello" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect_err("a spec-less worker must be refused");
@@ -4247,7 +4265,7 @@ mod tests {
     /// independently, so the second's view of the conversation is already stale when it starts. The
     /// guard refuses rather than interleaving.
     #[test]
-    fn test_followup_guard_admits_one_holder_at_a_time() {
+    fn followup_guard_admits_one_holder_at_a_time() {
         let in_flight: InFlightFollowups =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let agent = Uuid::new_v4();
@@ -4262,44 +4280,8 @@ mod tests {
         let sibling = FollowupGuard::claim(&in_flight, other);
         assert!(sibling.is_some());
 
-        // Released on drop, so a turn that errors or is cancelled doesn't strand the worker.
+        // Released on drop, so a turn that errors or is canceled doesn't strand the worker.
         drop(first);
         assert!(FollowupGuard::claim(&in_flight, agent).is_some());
-    }
-}
-
-#[cfg(test)]
-mod clamp_enabled_permissions_doc {
-    use super::*;
-
-    /// The set a ceiling leaves behind is what `is_within` contains, not what a `<=` would keep.
-    ///
-    /// Written because the doc on `clamp_enabled_permissions` claimed "at or below", which is a
-    /// different question on a partial order and predicts the opposite answer for the one pair this
-    /// release introduced: `workspace` and `ask` exclude each other in both directions, so an `ask`
-    /// ceiling drops `workspace` entirely rather than keeping it as something lower down.
-    #[test]
-    fn an_ask_ceiling_drops_workspace_rather_than_keeping_it_as_lower() {
-        let all = EnabledPermissions::ALL;
-        let under_ask = clamp_enabled_permissions(all, Permission::Ask);
-        assert!(
-            !under_ask.is_enabled(Permission::Workspace),
-            "`workspace` is not within `ask`, so an `ask` ceiling must not leave it enabled"
-        );
-        assert!(under_ask.is_enabled(Permission::Ask));
-        assert!(under_ask.is_enabled(Permission::Read));
-
-        // And the reverse, which is the half a `<=` reading would get right by accident.
-        let under_workspace = clamp_enabled_permissions(all, Permission::Workspace);
-        assert!(!under_workspace.is_enabled(Permission::Ask));
-        assert!(under_workspace.is_enabled(Permission::Workspace));
-
-        // The empty-intersection fallback is reachable, not theoretical: a set holding only
-        // `workspace` under an `ask` ceiling has nothing left, so the ceiling itself stands in.
-        let only_workspace = EnabledPermissions::from_modes([Permission::Workspace])
-            .expect("a one-mode set is valid");
-        let collapsed = clamp_enabled_permissions(only_workspace, Permission::Ask);
-        assert!(collapsed.is_enabled(Permission::Ask));
-        assert!(!collapsed.is_enabled(Permission::Workspace));
     }
 }
