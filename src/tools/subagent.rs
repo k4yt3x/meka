@@ -1,7 +1,7 @@
 //! `agent_spawn` tool: delegates a self-contained research/exploration task to a fresh sub-agent
 //! with its own conversation, returning the sub-agent's final report as a single tool result.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use crate::{
     prompt::build_environment_context,
     provider::ToolDefinition,
     session::AgentOptions,
+    workspace::{BoundedWorkspace, SharedCwd, SharedRoots, accept_writable_roots},
 };
 
 /// Hard ceiling on sub-agent nesting depth, independent of the tunable `session.subagent_max_depth`
@@ -33,7 +34,8 @@ pub(crate) struct ToolBuilderParams {
     /// spawn time rather than at registration: a worker spawned after a `/profile` switch went
     /// to the profile the user had just left, billing that account, while its own row recorded
     /// the new one. `cells.cwd` is snapshotted per spawn so a parent `/cd` mid-turn cannot move a
-    /// running worker; the roots are shared, because nothing mutates them after construction.
+    /// running worker; the roots are shared, because nothing mutates them after construction. A
+    /// worker bounded by `writable_roots` takes neither: its directory and roots are its own.
     pub(crate) cells: crate::session::SessionCells,
     /// How much of the memory store the agent doing the spawning holds, which is the ceiling on
     /// what it can grant. `Write` for the root agent; for a worker, whatever its own spawn call
@@ -69,8 +71,10 @@ pub(crate) struct ToolBuilderParams {
 /// `agent_followup` turns into a refusal. Each default is the *restrictive* value, so a spec that
 /// loses a field loses authority rather than gaining it.
 ///
-/// What is deliberately *not* here: the cwd (already on the session row) and the task (already in
-/// the event log).
+/// What is deliberately *not* here: the task (already in the event log), and the cwd of a worker
+/// that shares its parent's workspace (already on the session row). A worker bounded by
+/// `writable_roots` records the list here as well as on the row, because the row cannot say
+/// whether an empty root list means "no boundary of its own" or "bounded to the cwd alone".
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SubagentSpec {
     /// The level the worker ran at, already clamped against its parent at spawn time.
@@ -103,6 +107,13 @@ pub(crate) struct SubagentSpec {
     pub(crate) remaining_depth: usize,
     #[serde(default)]
     pub(crate) absolute_depth: usize,
+    /// The write boundary the spawn call set through `writable_roots`, canonical and working
+    /// directory first; empty for a worker that shares its parent's workspace. Not a restrictive
+    /// default, and the one field where none exists: a spec that lost it falls back to the row's
+    /// cwd plus the parent's roots, which is the boundary its spawn call gave it, so nothing wider
+    /// is reachable from the absence.
+    #[serde(default)]
+    pub(crate) writable_roots: Vec<PathBuf>,
 }
 
 impl SubagentSpec {
@@ -171,7 +182,16 @@ impl SubagentSpec {
     /// `agent_spawn({permission: "workspace"})` explicitly declined. See the helper for why spawn
     /// and replay are different questions.
     fn effective_permission(&self, ceiling: Permission) -> Permission {
-        self.permission.greatest_within_both(ceiling)
+        let own = if self.writable_roots.is_empty() {
+            self.permission
+        } else {
+            // A boundary is a `workspace` thing: `agent_spawn` refuses `unrestricted` alongside
+            // `writable_roots`, but a spec is persisted JSON that `meka session import` writes
+            // verbatim, so the cap is applied where the level is consumed, as `granted_memory`
+            // does for the store.
+            self.permission.greatest_within_both(Permission::Workspace)
+        };
+        own.greatest_within_both(ceiling)
     }
 }
 
@@ -218,10 +238,11 @@ pub(crate) fn agent_spawn_definition() -> ToolDefinition {
                       sub-agents up to a configured depth; tune a subtree's depth with \
                       `max_depth`. Pass `permission` to run the sub-agent at a more \
                       restricted level than your own (you can restrict but never escalate), \
-                      and `deny_servers` / `deny_tools` to withhold MCP servers or individual \
-                      tools it would otherwise inherit. Restrictions only ever accumulate: \
-                      these add to whatever the installation already denies sub-agents, and \
-                      there is no way to grant back."
+                      `writable_roots` to confine its writes to directories within your own \
+                      reach, and `deny_servers` / `deny_tools` to withhold MCP servers or \
+                      individual tools it would otherwise inherit. Restrictions only ever \
+                      accumulate: these add to whatever the installation already denies \
+                      sub-agents, and there is no way to grant back."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -261,6 +282,22 @@ pub(crate) fn agent_spawn_definition() -> ToolDefinition {
                     "description": "Permission level for the sub-agent, never above your \
                                     own. Defaults to your current level; use a lower one \
                                     (e.g. \"read\") to sandbox risky work."
+                },
+                "writable_roots": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Directories the sub-agent may write under, and nowhere \
+                                    else. The first becomes its working directory, so relative \
+                                    paths in its tool calls resolve inside it; the rest are its \
+                                    additional workspace roots. Each must be an existing \
+                                    directory (relative entries resolve against your working \
+                                    directory) and, unless you are at `unrestricted`, must lie \
+                                    inside your own workspace: a sub-agent's reach never exceeds \
+                                    yours. Needs you at `workspace` or above; the sub-agent runs \
+                                    at `workspace` unless `permission` asks for less, and \
+                                    `permission: \"unrestricted\"` is refused alongside it since \
+                                    the list would then bound nothing. Omit it to share your \
+                                    workspace; an empty list is refused."
                 },
                 "memory": {
                     "type": "string",
@@ -401,9 +438,46 @@ impl Tool for AgentSpawnTool {
         // parent's level as a ceiling (restrict-only, never escalate); absent keeps the parent's
         // level. Approval prompts route through `PermissionForwardingFrontend` so they surface in
         // the parent's UI.
-        let requested_permission = optional_str(&input, "permission", "agent_spawn")?;
-        let sub_perm =
-            resolve_subagent_permission(requested_permission, self.parent_permission.get())?;
+        let requested_permission =
+            parse_subagent_permission(optional_str(&input, "permission", "agent_spawn")?)?;
+        let parent_level = self.parent_permission.get();
+
+        // `writable_roots`: an optional list that bounds the worker's writes and sets its working
+        // directory. Judged here, ahead of every side effect, by the one acceptor `agent_followup`
+        // also uses. Absent and null mean "share the parent's workspace"; a present list is
+        // accepted whole or refused whole, so an empty one is a refusal rather than a silent
+        // fall-through to the parent's reach.
+        let bounded = match input.get("writable_roots") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => {
+                if requested_permission == Some(Permission::Unrestricted) {
+                    return Err(MekaError::ToolExecution {
+                        tool_name: "agent_spawn".to_string(),
+                        message: "writable_roots bounds writes, and a sub-agent at `unrestricted` \
+                                  has no boundary for it to bound. Drop one or the other."
+                            .to_string(),
+                    });
+                }
+                let entries: Vec<PathBuf> = string_array(&input, "writable_roots", "agent_spawn")?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect();
+                let cells = &self.tool_builder_params.cells;
+                Some(
+                    accept_writable_roots(parent_level, &cells.cwd, &cells.roots, &entries)
+                        .map_err(|error| MekaError::ToolExecution {
+                            tool_name: "agent_spawn".to_string(),
+                            message: error.to_string(),
+                        })?,
+                )
+            }
+        };
+        // A bounded worker runs at `workspace` unless the call asked for less: the list is a
+        // boundary, and `workspace` is the level that has one.
+        let sub_perm = resolve_subagent_permission(
+            requested_permission.or(bounded.as_ref().map(|_| Permission::Workspace)),
+            parent_level,
+        );
 
         // Union, never replace: the call site adds to what config (and, when nested, this agent's
         // own parent) already denied. There is deliberately no allow-list parameter, because one
@@ -539,9 +613,25 @@ impl Tool for AgentSpawnTool {
         // Snapshot the parent's cwd once, here, so a parent `/cd` mid-sub-agent execution can't
         // shift the sub-agent's path resolution mid-flight. The same value is written to the
         // child's session row, handed to its tool registry, and used to render its environment
-        // context; a follow-up reads it back off the row.
-        let sub_cwd_snapshot = self.tool_builder_params.cells.cwd.get();
-        let sub_cwd = crate::workspace::SharedCwd::new(sub_cwd_snapshot.clone());
+        // context; a follow-up reads it back off the row. A bounded worker takes its directory
+        // and its roots from the accepted list instead, and nothing of the parent's: the roots it
+        // holds are exactly what its row and its spec record.
+        let (sub_cwd_snapshot, sub_additional_roots, sub_roots) = match &bounded {
+            Some(workspace) => (
+                workspace.cwd.clone(),
+                workspace.additional_roots.clone(),
+                SharedRoots::new(workspace.additional_roots.clone()),
+            ),
+            None => (
+                self.tool_builder_params.cells.cwd.get(),
+                Vec::new(),
+                self.tool_builder_params.cells.roots.clone(),
+            ),
+        };
+        let workspace = WorkerWorkspace {
+            cwd: SharedCwd::new(sub_cwd_snapshot.clone()),
+            roots: sub_roots,
+        };
 
         let spec = SubagentSpec {
             permission: sub_perm,
@@ -558,6 +648,10 @@ impl Tool for AgentSpawnTool {
             inherited_scratchpad: inherited_scratchpad.clone(),
             remaining_depth: child_remaining_depth,
             absolute_depth: child_absolute_depth,
+            writable_roots: bounded
+                .as_ref()
+                .map(BoundedWorkspace::roots)
+                .unwrap_or_default(),
         };
         let spec_json = serde_json::to_string(&spec).map_err(|error| MekaError::ToolExecution {
             tool_name: "agent_spawn".to_string(),
@@ -573,6 +667,7 @@ impl Tool for AgentSpawnTool {
             .create_child_session(
                 parent_sid,
                 Some(sub_cwd_snapshot.clone()),
+                sub_additional_roots,
                 Some(spec_json),
                 // The level the worker runs at, on the row like every other session's, so the row
                 // answers for it wherever a row is read.
@@ -601,7 +696,7 @@ impl Tool for AgentSpawnTool {
         };
         tracing::info!("spawning sub-agent {sub_session_id} for parent {parent_sid}");
 
-        let sub_roots_snapshot = self.tool_builder_params.cells.roots.get();
+        let sub_roots_snapshot = workspace.roots.get();
         let environment_context =
             build_environment_context(sub_perm, &sub_cwd_snapshot, &sub_roots_snapshot);
         let augmented_prompt = format!("{environment_context}\n{task}");
@@ -620,7 +715,7 @@ impl Tool for AgentSpawnTool {
             &spec,
             parent_sid,
             sub_session_id,
-            sub_cwd,
+            workspace,
             "agent_spawn",
             &context,
         )
@@ -1021,7 +1116,8 @@ pub(crate) fn agent_followup_definition() -> ToolDefinition {
                       conversation, so it still remembers what it found and can build on it \
                       rather than starting over from a summary. Returns its new report. The \
                       sub-agent runs under the terms it was spawned with (same permission \
-                      level, same restrictions), which your current settings cannot widen. \
+                      level, same write boundary, same restrictions), which your current \
+                      settings cannot widen. \
                       Get ids from `agent_spawn`'s result or from `agent_list`."
             .to_string(),
         parameters: serde_json::json!({
@@ -1117,17 +1213,43 @@ impl Tool for AgentFollowupTool {
             self.tool_builder_params.memory_access,
         );
 
-        // The worker's own cwd, as recorded when it was spawned, not the parent's current one: a
-        // `/cd` between the spawn and the follow-up must not move a worker mid-task.
-        let sub_cwd = crate::workspace::SharedCwd::new(
-            row.cwd
-                .as_deref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| self.tool_builder_params.cells.cwd.get()),
-        );
-        let sub_cwd_snapshot = sub_cwd.get();
-
         let ceiling = self.parent_permission.get();
+        // The worker's own cwd, as recorded when it was spawned, not the parent's current one: a
+        // `/cd` between the spawn and the follow-up must not move a worker mid-task. A bounded
+        // worker's directory and roots come off its spawn terms instead, put back through the
+        // acceptor against the parent's reach *now*: a parent that has since dropped below
+        // `workspace`, or moved to a directory that no longer contains the boundary, is refused
+        // rather than resuming a writer it could not spawn today, the way `effective_permission`
+        // narrows a plain worker to what the parent currently holds.
+        let cells = &self.tool_builder_params.cells;
+        let workspace = if spec.writable_roots.is_empty() {
+            WorkerWorkspace {
+                cwd: SharedCwd::new(
+                    row.cwd
+                        .as_deref()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| cells.cwd.get()),
+                ),
+                roots: cells.roots.clone(),
+            }
+        } else {
+            let bounded =
+                accept_writable_roots(ceiling, &cells.cwd, &cells.roots, &spec.writable_roots)
+                    .map_err(|error| MekaError::ToolExecution {
+                        tool_name: "agent_followup".to_string(),
+                        message: format!(
+                            "sub-agent '{agent_id}' was spawned with writable_roots this session \
+                             can no longer grant: {error}"
+                        ),
+                    })?;
+            WorkerWorkspace {
+                cwd: SharedCwd::new(bounded.cwd),
+                roots: SharedRoots::new(bounded.additional_roots),
+            }
+        };
+        let sub_cwd_snapshot = workspace.cwd.get();
+        let roots_snapshot = workspace.roots.get();
+
         let effective_permission = spec.effective_permission(ceiling);
         // `!=`, not `<`. The derived `Ord` is display order, which the enum doc says must not
         // decide authority, and it cannot see a sideways move at all: a `workspace` spec resolving
@@ -1146,7 +1268,7 @@ impl Tool for AgentFollowupTool {
             &spec,
             parent_sid,
             agent_id,
-            sub_cwd.clone(),
+            workspace,
             "agent_followup",
             &context,
         )
@@ -1182,7 +1304,6 @@ impl Tool for AgentFollowupTool {
             );
         }
 
-        let roots_snapshot = self.tool_builder_params.cells.roots.get();
         let environment_context =
             build_environment_context(effective_permission, &sub_cwd_snapshot, &roots_snapshot);
         let augmented_prompt = format!("{environment_context}\n{prompt}");
@@ -1342,6 +1463,16 @@ impl Tool for AgentDeleteTool {
     }
 }
 
+/// The workspace a worker is built on, resolved by the door that builds it: the parent's own
+/// handles for a worker that shares its parent's workspace, a directory and roots of its own for
+/// one bounded by `writable_roots`. One value rather than two arguments because the pair is
+/// decided together and a worker holding one door's directory with the other's roots is a
+/// boundary nobody granted.
+struct WorkerWorkspace {
+    cwd: SharedCwd,
+    roots: SharedRoots,
+}
+
 /// Build the worker described by `spec`: its tool registry, its inherited MCP toolset, its own
 /// `agent_spawn` when the recursion budget allows, its system prompt, and the `Agent` over all of
 /// it.
@@ -1360,7 +1491,7 @@ async fn build_subagent(
     spec: &SubagentSpec,
     parent_session_id: Uuid,
     sub_session_id: Uuid,
-    sub_cwd: crate::workspace::SharedCwd,
+    workspace: WorkerWorkspace,
     tool_name: &'static str,
     // The call that spawns the worker: its tool-use id, so the worker's own tool calls roll up
     // into that call's display, and the prompt it answers, so the worker's requests bill to it.
@@ -1404,14 +1535,15 @@ async fn build_subagent(
             Arc::clone(&params.cells.frontend),
             call.tool_call_id.clone(),
         ));
-    // The worker's own cells: its clamped permission, the snapshot of the parent's directory it
-    // was handed, a session of its own, fresh gauges, and a profile seeded from what the parent
-    // runs on now. A worker has no prompt gauge and no session entry watching it, and it never
-    // switches, so nothing outside needs the handle.
+    // The worker's own cells: its clamped permission, the directory and roots it was handed, a
+    // session of its own, fresh gauges, and a profile seeded from what the parent runs on now. A
+    // worker has no prompt gauge and no session entry watching it, and it never switches, so
+    // nothing outside needs the handle. The write fence and the shell sandbox are both built from
+    // `roots` by `register_core_tools`, so a bounded worker's boundary is what these cells say.
     let sub_cells = crate::session::SessionCells {
         permission: sub_shared_perm.clone(),
-        cwd: sub_cwd,
-        roots: params.cells.roots.clone(),
+        cwd: workspace.cwd,
+        roots: workspace.roots,
         session_id: sub_shared_session_id,
         todo_list: sub_todo_list,
         profile: crate::provider::PublishedProfile::detached(&parent_profile),
@@ -1630,27 +1762,31 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Parse an optional caller-supplied permission string and clamp it to the parent's level as a
-/// ceiling. `None` keeps the parent's level (inherit verbatim). A sub-agent can only ever run at an
-/// equal-or-more-restricted level than its parent (`min` over the discriminant order
-/// `None < Read < Workspace < Unrestricted`), so a parent turn can hand risky work to a locked-down
-/// sub-agent but can never escalate one. An unrecognized string is a hard error, not a silent
-/// fallback.
-fn resolve_subagent_permission(requested: Option<&str>, parent: Permission) -> Result<Permission> {
+/// Parse the caller's optional `permission` string. An unrecognized string is a hard error, not a
+/// silent fallback.
+fn parse_subagent_permission(requested: Option<&str>) -> Result<Option<Permission>> {
+    requested
+        .map(|text| {
+            text.parse::<Permission>()
+                .map_err(|message| MekaError::ToolExecution {
+                    tool_name: "agent_spawn".to_string(),
+                    message,
+                })
+        })
+        .transpose()
+}
+
+/// Clamp a requested level to the parent's as a ceiling. `None` keeps the parent's level (inherit
+/// verbatim). A sub-agent can only ever run at an equal-or-more-restricted level than its parent
+/// (`min` over the discriminant order `None < Read < Workspace < Unrestricted`), so a parent turn
+/// can hand risky work to a locked-down sub-agent but can never escalate one.
+fn resolve_subagent_permission(requested: Option<Permission>, parent: Permission) -> Permission {
     match requested {
-        Some(text) => {
-            let requested =
-                text.parse::<Permission>()
-                    .map_err(|message| MekaError::ToolExecution {
-                        tool_name: "agent_spawn".to_string(),
-                        message,
-                    })?;
-            // `clamp_to` rather than a bare comparison, so the door reads as the question it
-            // asks. `SharedPermission::with_ceiling` flattens a grandchild's ceiling to the *root*
-            // cell on the precondition that this clamp already folded the intermediate level in.
-            Ok(requested.clamp_to(parent))
-        }
-        None => Ok(parent),
+        // `clamp_to` rather than a bare comparison, so the door reads as the question it asks.
+        // `SharedPermission::with_ceiling` flattens a grandchild's ceiling to the *root* cell on
+        // the precondition that this clamp already folded the intermediate level in.
+        Some(requested) => requested.clamp_to(parent),
+        None => parent,
     }
 }
 
@@ -1945,11 +2081,11 @@ mod tests {
     #[test]
     fn resolve_subagent_permission_inherits_when_absent() {
         assert_eq!(
-            resolve_subagent_permission(None, Permission::Unrestricted).unwrap(),
+            resolve_subagent_permission(None, Permission::Unrestricted),
             Permission::Unrestricted
         );
         assert_eq!(
-            resolve_subagent_permission(None, Permission::Read).unwrap(),
+            resolve_subagent_permission(None, Permission::Read),
             Permission::Read
         );
     }
@@ -1969,6 +2105,7 @@ mod tests {
             inherited_scratchpad: Vec::new(),
             remaining_depth: 2,
             absolute_depth: 1,
+            writable_roots: Vec::new(),
         };
 
         assert_eq!(
@@ -1980,6 +2117,27 @@ mod tests {
             spec.effective_permission(Permission::Read),
             Permission::Read,
             "and a parent that has dropped below it narrows the worker with it"
+        );
+    }
+
+    /// A spec carrying `writable_roots` never resolves above `workspace`, whatever level it
+    /// claims: `agent_spawn` refuses the pair, but `meka session import` writes a spec verbatim,
+    /// and a boundary on a worker with no boundary would bound nothing.
+    #[test]
+    fn a_bounded_spec_never_resolves_above_workspace() {
+        let spec = SubagentSpec {
+            permission: Permission::Unrestricted,
+            writable_roots: vec![PathBuf::from("/work/sub")],
+            ..spec_for_test(Permission::Unrestricted)
+        };
+        assert_eq!(
+            spec.effective_permission(Permission::Unrestricted),
+            Permission::Workspace
+        );
+        assert_eq!(
+            spec.effective_permission(Permission::Read),
+            Permission::Read,
+            "and the parent's ceiling still applies beneath the cap"
         );
     }
 
@@ -2000,7 +2158,7 @@ mod tests {
     #[test]
     fn a_grandchild_cannot_escape_an_intermediate_parent() {
         assert_eq!(
-            resolve_subagent_permission(Some("workspace"), Permission::Read).unwrap(),
+            resolve_subagent_permission(Some(Permission::Workspace), Permission::Read),
             Permission::Read,
             "a `workspace` request under a `read` parent must resolve to the parent's own level"
         );
@@ -2019,12 +2177,13 @@ mod tests {
                 inherited_scratchpad: Vec::new(),
                 remaining_depth: 2,
                 absolute_depth: 1,
+                writable_roots: Vec::new(),
             }
         }
 
         let root = SharedPermission::new(Permission::Unrestricted, EnabledPermissions::ALL);
         let child_spec = spec_at(
-            resolve_subagent_permission(Some("read"), root.get()).unwrap(),
+            resolve_subagent_permission(Some(Permission::Read), root.get()),
             root.enabled(),
         );
         let child = child_spec.shared_permission_bounded(&root);
@@ -2035,7 +2194,7 @@ mod tests {
         );
 
         let grandchild_spec = spec_at(
-            resolve_subagent_permission(Some("workspace"), child.get()).unwrap(),
+            resolve_subagent_permission(Some(Permission::Workspace), child.get()),
             child.enabled(),
         );
         let grandchild = grandchild_spec.shared_permission_bounded(&child);
@@ -2056,27 +2215,32 @@ mod tests {
         // Requesting a higher level than the parent is clamped down: a sub-agent can never be
         // escalated above its parent.
         assert_eq!(
-            resolve_subagent_permission(Some("unrestricted"), Permission::Read).unwrap(),
+            resolve_subagent_permission(Some(Permission::Unrestricted), Permission::Read),
             Permission::Read
         );
         assert_eq!(
-            resolve_subagent_permission(Some("workspace"), Permission::Read).unwrap(),
+            resolve_subagent_permission(Some(Permission::Workspace), Permission::Read),
             Permission::Read
         );
         // Requesting a lower level restricts the sub-agent below the parent.
         assert_eq!(
-            resolve_subagent_permission(Some("read"), Permission::Unrestricted).unwrap(),
+            resolve_subagent_permission(Some(Permission::Read), Permission::Unrestricted),
             Permission::Read
         );
         assert_eq!(
-            resolve_subagent_permission(Some("none"), Permission::Unrestricted).unwrap(),
+            resolve_subagent_permission(Some(Permission::None), Permission::Unrestricted),
             Permission::None
         );
     }
 
     #[test]
-    fn resolve_subagent_permission_rejects_invalid() {
-        assert!(resolve_subagent_permission(Some("admin"), Permission::Unrestricted).is_err());
+    fn parse_subagent_permission_rejects_invalid() {
+        assert!(parse_subagent_permission(Some("admin")).is_err());
+        assert_eq!(parse_subagent_permission(None).unwrap(), None);
+        assert_eq!(
+            parse_subagent_permission(Some("read")).unwrap(),
+            Some(Permission::Read)
+        );
     }
 
     /// A restriction passed with the wrong type is refused, not read as absent. Reading it as
@@ -2298,6 +2462,7 @@ mod tests {
             inherited_scratchpad: vec!["build_log".to_string()],
             remaining_depth: 2,
             absolute_depth: 1,
+            writable_roots: Vec::new(),
         }
     }
 
@@ -2328,7 +2493,10 @@ mod tests {
             &spec_for_test(Permission::Read),
             parent_session,
             Uuid::new_v4(),
-            crate::workspace::cwd_for_test(),
+            WorkerWorkspace {
+                cwd: crate::workspace::cwd_for_test(),
+                roots: crate::workspace::roots_for_test(),
+            },
             "agent_spawn",
             &crate::tools::ToolContext::detached(CancellationToken::new()),
         )
@@ -2723,11 +2891,13 @@ mod tests {
             inherited_scratchpad: Vec::new(),
             remaining_depth: 0,
             absolute_depth: 1,
+            writable_roots: Vec::new(),
         };
         let (worker, held) = store
             .create_child_session(
                 parent_sid,
                 None,
+                Vec::new(),
                 Some(serde_json::to_string(&spec).expect("serialize the spec")),
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -2783,12 +2953,14 @@ mod tests {
             inherited_scratchpad: Vec::new(),
             remaining_depth: 0,
             absolute_depth: 1,
+            writable_roots: Vec::new(),
         };
         // On a profile the parent is not on, so a write that should not happen is visible.
         let (worker, held) = store
             .create_child_session(
                 parent_sid,
                 None,
+                Vec::new(),
                 Some(serde_json::to_string(&spec).expect("serialize the spec")),
                 "read".to_string(),
                 "stale-profile".to_string(),
@@ -2874,11 +3046,13 @@ mod tests {
             inherited_scratchpad: Vec::new(),
             remaining_depth: 0,
             absolute_depth: 1,
+            writable_roots: Vec::new(),
         };
         let child = store
             .create_child_session(
                 parent_sid,
                 None,
+                Vec::new(),
                 Some(serde_json::to_string(&spec).expect("encode")),
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -2959,11 +3133,13 @@ mod tests {
             inherited_scratchpad: Vec::new(),
             remaining_depth: 0,
             absolute_depth: 1,
+            writable_roots: Vec::new(),
         };
         let child = store
             .create_child_session(
                 parent_sid,
                 None,
+                Vec::new(),
                 Some(serde_json::to_string(&spec).expect("encode")),
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -3018,6 +3194,7 @@ mod tests {
             inherited_scratchpad: Vec::new(),
             remaining_depth: 0,
             absolute_depth: 1,
+            writable_roots: Vec::new(),
         };
         let config = ToolDenials::new(vec!["mekabridge".to_string()], vec![
             "web_search".to_string(),
@@ -3840,6 +4017,7 @@ mod tests {
             .create_child_session(
                 parent_sid,
                 None,
+                Vec::new(),
                 Some(r#"{"permission":"read"}"#.to_string()),
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -3905,6 +4083,7 @@ mod tests {
             .create_child_session(
                 parent_sid,
                 None,
+                Vec::new(),
                 Some(r#"{"permission":"read"}"#.to_string()),
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -4133,6 +4312,7 @@ mod tests {
             .create_child_session(
                 owner,
                 None,
+                Vec::new(),
                 Some("{\"permission\":\"read\"}".to_string()),
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -4205,6 +4385,7 @@ mod tests {
             .create_child_session(
                 parent_sid,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -4239,6 +4420,559 @@ mod tests {
         assert!(
             error.to_string().contains("no recorded spawn terms"),
             "{error}"
+        );
+    }
+
+    /// A parent at `level` working in `cwd`, for the `writable_roots` tests. The spawn tool's
+    /// ceiling and the cells' handle are one and the same, as `register_subagent_tools` wires
+    /// them, so the acceptor and the worker's live clamp read the same level.
+    fn params_at(
+        store: Store,
+        parent_session: crate::session::SharedSessionId,
+        level: Permission,
+        cwd: PathBuf,
+    ) -> ToolBuilderParams {
+        let mut params = params_for_test(store, parent_session);
+        params.cells.permission = SharedPermission::new(level, EnabledPermissions::ALL);
+        params.cells.cwd = SharedCwd::new(cwd);
+        params
+    }
+
+    /// A provider that replays `rounds`, handed back concrete so a test can also read what the
+    /// worker was sent.
+    fn mock(
+        rounds: Vec<Vec<crate::provider::mock::MockEvent>>,
+    ) -> Arc<crate::provider::mock::MockProvider> {
+        Arc::new(crate::provider::mock::MockProvider::from_rounds(rounds))
+    }
+
+    fn spawn_tool_for(params: ToolBuilderParams, provider: Arc<dyn Provider>) -> AgentSpawnTool {
+        AgentSpawnTool {
+            parent_permission: params.cells.permission.clone(),
+            tool_builder_params: params.on_provider(provider),
+            inherited_denials: ToolDenials::default(),
+            remaining_depth: 1,
+            absolute_depth: 0,
+        }
+    }
+
+    fn followup_tool_for(
+        params: ToolBuilderParams,
+        provider: Arc<dyn Provider>,
+    ) -> AgentFollowupTool {
+        AgentFollowupTool {
+            parent_permission: params.cells.permission.clone(),
+            tool_builder_params: params.on_provider(provider),
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// One round in which the worker writes `content` to `path` through `write_file`.
+    fn write_file_round(
+        id: &str,
+        path: &std::path::Path,
+        content: &str,
+    ) -> Vec<crate::provider::mock::MockEvent> {
+        vec![
+            crate::provider::mock::MockEvent::ToolUseStart {
+                id: id.to_string(),
+                name: "write_file".to_string(),
+            },
+            crate::provider::mock::MockEvent::ToolUseEnd {
+                input: serde_json::json!({ "path": path.to_string_lossy(), "content": content }),
+            },
+            crate::provider::mock::MockEvent::MessageEnd {
+                stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+            },
+        ]
+    }
+
+    fn agent_id_in(text: &str) -> Uuid {
+        text.lines()
+            .find_map(|line| line.strip_prefix("agent: "))
+            .and_then(|id| Uuid::parse_str(id.trim()).ok())
+            .unwrap_or_else(|| panic!("spawn must return a usable agent id, got: {text}"))
+    }
+
+    /// A parent's tree with only the parent in it: a refused spawn left no row behind.
+    async fn only_the_parent(store: &Store, parent_sid: Uuid) -> bool {
+        store
+            .load_session_tree(parent_sid)
+            .await
+            .expect("tree")
+            .len()
+            == 1
+    }
+
+    /// The directories the `writable_roots` tests share: a parent working in `work`, two
+    /// candidate roots under it, and one beside it that the parent's workspace does not contain.
+    struct Workspaces {
+        _temp: tempfile::TempDir,
+        work: PathBuf,
+        sub: PathBuf,
+        extra: PathBuf,
+        elsewhere: PathBuf,
+    }
+
+    fn workspaces() -> Workspaces {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = crate::workspace::canonical_for_test(temp.path());
+        let work = base.join("work");
+        let sub = work.join("sub");
+        let extra = work.join("extra");
+        let elsewhere = base.join("elsewhere");
+        for directory in [&sub, &extra, &elsewhere] {
+            std::fs::create_dir_all(directory).expect("dirs");
+        }
+        Workspaces {
+            _temp: temp,
+            work,
+            sub,
+            extra,
+            elsewhere,
+        }
+    }
+
+    /// Spawn under `level` in `cwd` with `input`, expecting a refusal, and hand back its text once
+    /// the store shows the refusal came before the row.
+    async fn refused_spawn(level: Permission, cwd: PathBuf, input: serde_json::Value) -> String {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            level,
+            cwd,
+        );
+        let spawn = spawn_tool_for(params, mock(vec![text_round("never runs")]));
+        let error = spawn
+            .execute(
+                input,
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("the spawn must be refused");
+        assert!(
+            only_the_parent(&store, parent_sid).await,
+            "a refused spawn must leave no child row behind"
+        );
+        error.to_string()
+    }
+
+    /// The feature end to end: a `workspace` parent hands a worker two directories inside its own
+    /// workspace, and the worker writes under those and nowhere else: not beside them in the
+    /// parent's directory, and not under a root the parent holds and did not pass on. The first
+    /// is its working directory, its environment context says so, and the row and the spec both
+    /// record the bounds.
+    #[tokio::test]
+    async fn a_bounded_worker_writes_under_its_roots_and_nowhere_else() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Workspace,
+            dirs.work.clone(),
+        );
+        // A root of the parent's own, so a worker that inherited the parent's roots rather than
+        // taking the list would be caught reaching it.
+        params.cells.roots = SharedRoots::new(vec![dirs.elsewhere.clone()]);
+        let inside = dirs.sub.join("inside.txt");
+        let also = dirs.extra.join("also.txt");
+        let beside = dirs.work.join("beside.txt");
+        let leak = dirs.elsewhere.join("leak.txt");
+        let provider = mock(vec![
+            write_file_round("call-1", &inside, "in"),
+            write_file_round("call-2", &also, "also"),
+            write_file_round("call-3", &beside, "beside"),
+            write_file_round("call-4", &leak, "leak"),
+            text_round("done"),
+        ]);
+        let spawn = spawn_tool_for(params, Arc::clone(&provider) as Arc<dyn Provider>);
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "write",
+                    "writable_roots": [dirs.sub.to_string_lossy(), dirs.extra.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        assert_eq!(
+            std::fs::read_to_string(&inside).expect("a write under the first root lands"),
+            "in"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&also).expect("a write under the second root lands"),
+            "also"
+        );
+        assert!(
+            !beside.exists(),
+            "a write beside the roots, inside the parent's own workspace, must be refused"
+        );
+        assert!(
+            !leak.exists(),
+            "a root the parent holds but did not pass on is outside the worker's boundary"
+        );
+        let transcript = format!("{:?}", store.load_events(agent_id).await.expect("events"));
+        assert!(
+            transcript.contains("outside the workspace"),
+            "the worker must have been told why: {transcript}"
+        );
+
+        // What the worker was told about its workspace on its first turn: its own directory and
+        // roots, and nothing of the parent's.
+        let first_turn = format!(
+            "{:?}",
+            provider
+                .completions()
+                .first()
+                .expect("the worker's first request")
+        );
+        let sub = dirs.sub.display().to_string();
+        let extra = dirs.extra.display().to_string();
+        let elsewhere = dirs.elsewhere.display().to_string();
+        assert!(
+            first_turn.contains(&format!("Working directory: {sub}")),
+            "the first root is the working directory the worker is told about: {first_turn}"
+        );
+        assert!(
+            first_turn.contains(&extra) && !first_turn.contains(&elsewhere),
+            "the worker is told its own additional root and not the parent's: {first_turn}"
+        );
+
+        let row = store
+            .load_session_tree(parent_sid)
+            .await
+            .expect("tree")
+            .into_iter()
+            .find(|row| row.id == agent_id)
+            .expect("the worker's row");
+        assert_eq!(
+            row.cwd.as_deref(),
+            Some(dirs.sub.as_path()),
+            "the first root is the worker's working directory"
+        );
+        assert_eq!(row.additional_roots, vec![dirs.extra.clone()]);
+        assert_eq!(row.permission, Some(Permission::Workspace));
+        let spec: SubagentSpec = serde_json::from_str(
+            &store
+                .load_subagent_spec(agent_id)
+                .await
+                .expect("load")
+                .expect("spec"),
+        )
+        .expect("decode");
+        assert_eq!(
+            spec.permission,
+            Permission::Workspace,
+            "bounded with no `permission` given runs at workspace"
+        );
+        assert_eq!(spec.writable_roots, vec![
+            dirs.sub.clone(),
+            dirs.extra.clone()
+        ]);
+    }
+
+    /// A `workspace` parent cannot name a directory its own boundary does not contain: the refusal
+    /// names the entry, and comes before the row.
+    #[tokio::test]
+    async fn a_root_outside_the_parents_workspace_is_refused_before_any_row_exists() {
+        let dirs = workspaces();
+        let refusal = refused_spawn(
+            Permission::Workspace,
+            dirs.work.clone(),
+            serde_json::json!({
+                "prompt": "write",
+                "writable_roots": [dirs.elsewhere.to_string_lossy()],
+            }),
+        )
+        .await;
+        assert!(
+            refusal.contains(&dirs.elsewhere.display().to_string())
+                && refusal.contains("outside this session's workspace"),
+            "{refusal}"
+        );
+    }
+
+    /// A parent below `workspace` has no write reach to delegate.
+    #[tokio::test]
+    async fn a_parent_below_workspace_cannot_bound_a_worker() {
+        let dirs = workspaces();
+        let refusal = refused_spawn(
+            Permission::Read,
+            dirs.work.clone(),
+            serde_json::json!({
+                "prompt": "write",
+                "writable_roots": [dirs.sub.to_string_lossy()],
+            }),
+        )
+        .await;
+        assert!(
+            refusal.contains("needs a parent at `workspace` or `unrestricted`"),
+            "{refusal}"
+        );
+    }
+
+    /// `unrestricted` has no boundary for a list to bound, so asking for both is a contradiction
+    /// rather than a worker that silently runs at one or the other.
+    #[tokio::test]
+    async fn writable_roots_alongside_an_unrestricted_level_are_refused() {
+        let dirs = workspaces();
+        let refusal = refused_spawn(
+            Permission::Unrestricted,
+            dirs.work.clone(),
+            serde_json::json!({
+                "prompt": "write",
+                "permission": "unrestricted",
+                "writable_roots": [dirs.sub.to_string_lossy()],
+            }),
+        )
+        .await;
+        assert!(refusal.contains("has no boundary"), "{refusal}");
+    }
+
+    /// An empty list is a refusal, not a fall-through to the parent's workspace.
+    #[tokio::test]
+    async fn an_empty_writable_roots_list_is_refused() {
+        let dirs = workspaces();
+        let refusal = refused_spawn(
+            Permission::Workspace,
+            dirs.work.clone(),
+            serde_json::json!({ "prompt": "write", "writable_roots": [] }),
+        )
+        .await;
+        assert!(refusal.contains("names no directory"), "{refusal}");
+    }
+
+    /// An `unrestricted` parent may write anywhere, so it may bound a worker to a directory its
+    /// own working directory does not contain; the worker still runs at `workspace`, confined to
+    /// that directory.
+    #[tokio::test]
+    async fn an_unrestricted_parent_may_bound_a_worker_outside_its_own_directory() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Unrestricted,
+            dirs.work.clone(),
+        );
+        let inside = dirs.elsewhere.join("out.txt");
+        let beside = dirs.work.join("beside.txt");
+        let spawn = spawn_tool_for(
+            params,
+            mock(vec![
+                write_file_round("call-1", &inside, "out"),
+                write_file_round("call-2", &beside, "beside"),
+                text_round("done"),
+            ]),
+        );
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "write",
+                    "writable_roots": [dirs.elsewhere.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        assert_eq!(
+            std::fs::read_to_string(&inside).expect("the named directory is writable"),
+            "out"
+        );
+        assert!(
+            !beside.exists(),
+            "the parent's own directory is not in the worker's boundary"
+        );
+        let row = store
+            .load_session_tree(parent_sid)
+            .await
+            .expect("tree")
+            .into_iter()
+            .find(|row| row.id == agent_id)
+            .expect("the worker's row");
+        assert_eq!(row.cwd.as_deref(), Some(dirs.elsewhere.as_path()));
+        assert_eq!(
+            row.permission,
+            Some(Permission::Workspace),
+            "bounded, so `workspace` rather than the parent's `unrestricted`"
+        );
+    }
+
+    /// A relative entry names a directory under the parent's working directory, not the process's.
+    #[tokio::test]
+    async fn a_relative_writable_root_resolves_against_the_parents_directory() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Workspace,
+            dirs.work.clone(),
+        );
+        let spawn = spawn_tool_for(params, mock(vec![text_round("done")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look", "writable_roots": ["sub"] }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+        let row = store
+            .load_session_tree(parent_sid)
+            .await
+            .expect("tree")
+            .into_iter()
+            .find(|row| row.id == agent_id)
+            .expect("the worker's row");
+        assert_eq!(row.cwd.as_deref(), Some(dirs.sub.as_path()));
+    }
+
+    /// Spawn a worker bounded to `dirs.sub` under a `workspace` parent in `dirs.work` that also
+    /// holds `dirs.elsewhere` as a root of its own, for the follow-up tests. Returns the parent's
+    /// params (whose cells the follow-up shares) and the worker's id.
+    async fn spawn_bounded_to_sub(store: &Store, dirs: &Workspaces) -> (ToolBuilderParams, Uuid) {
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Workspace,
+            dirs.work.clone(),
+        );
+        params.cells.roots = SharedRoots::new(vec![dirs.elsewhere.clone()]);
+        let spawn = spawn_tool_for(params.clone(), mock(vec![text_round("spawned")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({
+                    "prompt": "wait",
+                    "writable_roots": [dirs.sub.to_string_lossy()],
+                }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        (params, agent_id_in(&output.text_content()))
+    }
+
+    /// A follow-up rebuilds a bounded worker from its recorded bounds, not from the parent's
+    /// workspace: it still writes under its root, and is still refused beside it and under a root
+    /// the parent holds.
+    #[tokio::test]
+    async fn a_followup_keeps_a_workers_bounds() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let (params, agent_id) = spawn_bounded_to_sub(&store, &dirs).await;
+        let beside = dirs.work.join("beside.txt");
+        let leak = dirs.elsewhere.join("leak.txt");
+        let later = dirs.sub.join("later.txt");
+        let followup = followup_tool_for(
+            params,
+            mock(vec![
+                write_file_round("call-1", &beside, "beside"),
+                write_file_round("call-2", &leak, "leak"),
+                write_file_round("call-3", &later, "later"),
+                text_round("done"),
+            ]),
+        );
+        followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "write all three" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("the follow-up runs");
+
+        assert!(
+            !beside.exists(),
+            "the parent's directory is still outside the worker's boundary on a follow-up"
+        );
+        assert!(
+            !leak.exists(),
+            "and so is a root the parent holds: the bounds come off the spec, not the parent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&later).expect("the worker's own root is still writable"),
+            "later"
+        );
+        let transcript = format!("{:?}", store.load_events(agent_id).await.expect("events"));
+        assert!(transcript.contains("outside the workspace"), "{transcript}");
+    }
+
+    /// The bounds are put back through the acceptor against the parent's reach *now*. A parent
+    /// that has moved out from over them, or dropped below `workspace`, is refused rather than
+    /// resuming a writer it could not spawn today, and the worker's conversation is left alone.
+    #[tokio::test]
+    async fn a_followup_on_a_bounded_worker_is_refused_once_the_parent_cannot_grant_the_bounds() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let (params, agent_id) = spawn_bounded_to_sub(&store, &dirs).await;
+        let events_before = store.load_events(agent_id).await.expect("events").len();
+        let ask = || serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" });
+
+        // The parent `/cd`s to a directory that does not contain the worker's root.
+        params.cells.cwd.set(dirs.elsewhere.clone());
+        let followup = followup_tool_for(params.clone(), mock(vec![text_round("never runs")]));
+        let refusal = followup
+            .execute(
+                ask(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a parent whose workspace no longer contains the bounds cannot resume")
+            .to_string();
+        assert!(
+            refusal.contains("can no longer grant")
+                && refusal.contains("outside this session's workspace"),
+            "{refusal}"
+        );
+
+        // Back over the root, but dropped to `read`, as `/permission` or Shift+Tab would.
+        params.cells.cwd.set(dirs.work.clone());
+        params.cells.permission.set_unchecked(Permission::Read);
+        let followup = followup_tool_for(params, mock(vec![text_round("never runs")]));
+        let refusal = followup
+            .execute(
+                ask(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a parent below `workspace` cannot resume a writing worker")
+            .to_string();
+        assert!(
+            refusal.contains("needs a parent at `workspace` or `unrestricted`"),
+            "{refusal}"
+        );
+
+        assert_eq!(
+            store.load_events(agent_id).await.expect("events").len(),
+            events_before,
+            "neither refusal may have run a turn"
         );
     }
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `agent_spawn` takes `writable_roots`, bounding a sub-agent's writes within the parent's reach.
+
 ## [0.46.0] - 2026-09-06
 
 The account and profile release. A provider profile splits into the account that logs in and bills

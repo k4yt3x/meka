@@ -1931,6 +1931,72 @@ fn a_failed_oneshot_turn_still_waits_for_its_detached_work() {
     );
 }
 
+/// A sub-agent spawned with `writable_roots` writes under those directories and nowhere else,
+/// through the real wiring: the session's own permission handle, the worker registry's write
+/// fence, and the row the spawn leaves behind.
+///
+/// The worker's paths are relative on purpose. `inside.txt` lands where its working directory
+/// is, which is the first root and not the parent's directory; `../outside.txt` is inside the
+/// parent's workspace and still refused, since the worker's boundary is the list and nothing
+/// of the parent's.
+#[test]
+fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
+    let install = Install::new();
+    write_capable_config(&install);
+    let work = install.work_dir();
+    let sub = work.join("sub");
+    std::fs::create_dir_all(&sub).expect("sub dir");
+
+    let output = run_scripted_from(
+        &install,
+        &work,
+        r#"[
+          [{"type":"tool_use_start","id":"call-1","name":"agent_spawn"},
+           {"type":"tool_use_end","input":{"prompt":"write both","writable_roots":["sub"]}},
+           {"type":"message_end","stop_reason":"tool_use"}],
+          [{"type":"tool_use_start","id":"call-2","name":"write_file"},
+           {"type":"tool_use_end","input":{"path":"inside.txt","content":"in"}},
+           {"type":"message_end","stop_reason":"tool_use"}],
+          [{"type":"tool_use_start","id":"call-3","name":"write_file"},
+           {"type":"tool_use_end","input":{"path":"../outside.txt","content":"out"}},
+           {"type":"message_end","stop_reason":"tool_use"}],
+          [{"type":"text","text":"worker done"},{"type":"message_end","stop_reason":"end_turn"}],
+          [{"type":"text","text":"dispatched"},{"type":"message_end","stop_reason":"end_turn"}]
+        ]"#,
+        &["--oneshot", "-p", "delegate"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(sub.join("inside.txt")).expect("written under the root"),
+        "in"
+    );
+    assert!(
+        !work.join("outside.txt").exists(),
+        "a write into the parent's workspace but outside the worker's root must be refused"
+    );
+    let (cwd, spec): (String, String) = store(&install)
+        .query_row(
+            "SELECT cwd, subagent_spec_json FROM sessions WHERE parent_session_id IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("exactly one worker row");
+    assert_eq!(
+        std::path::PathBuf::from(cwd),
+        std::fs::canonicalize(&sub).expect("canonical"),
+        "the worker's working directory is the first root, spelled canonically"
+    );
+    assert!(
+        spec.contains("\"writable_roots\":[\""),
+        "the spawn terms carry the bounds: {spec}"
+    );
+}
+
 /// `meka -r <worker-id>` refuses, on the CLI door the HTTP test cannot reach.
 ///
 /// The sibling of `tests/serve.rs`'s `a_worker_session_refuses_a_turn_posted_straight_at_it`, and

@@ -63,6 +63,10 @@ The same set governs both halves, derived once so they cannot disagree: the file
 before writing, and the shell sandbox is built from it. A refusal from `write_file` names the roots
 so the agent can retry somewhere valid.
 
+A sub-agent can be handed a narrower boundary than its parent's: [`agent_spawn`'s
+`writable_roots`](../tools/overview.md#agent_spawn) names the directories it may write under, each
+of which must lie inside the parent's own.
+
 If `[shell].sandbox = false`, `execute_command` is refused at `workspace` rather than run
 unconfined. Nothing else would be holding the boundary, and half a boundary reported as a whole one
 is worse than an error that says so. Use `unrestricted` for those turns.
@@ -390,7 +394,7 @@ Any built-in tool's required permission can be overridden from `config.toml` wit
 
 ### Sub-agent permissions
 
-Sub-agents spawned via `agent_spawn` inherit the parent's permission level by default. At `unrestricted` the sub-agent can call `write_file`, `edit_file`, and unsandboxed `execute_command`; at `read` it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `agent_spawn({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. A sub-agent shares its parent's approvals switch, and its prompts reach the parent's frontend. Alternatively, cycle the parent into a lower level before issuing the spawning prompt to restrict every sub-agent it spawns.
+Sub-agents spawned via `agent_spawn` inherit the parent's permission level by default. At `unrestricted` the sub-agent can call `write_file`, `edit_file`, and unsandboxed `execute_command`; at `read` it's confined to read-only tools. To run one delegated task with reduced privileges, pass the `permission` parameter (e.g. `agent_spawn({prompt: "...", permission: "read"})`): it is clamped to the parent's level as a ceiling, so a sub-agent can only ever be equal-or-more restricted, never escalated. To narrow *where* it may write rather than whether, pass [`writable_roots`](../tools/overview.md#agent_spawn). A sub-agent shares its parent's approvals switch, and its prompts reach the parent's frontend. Alternatively, cycle the parent into a lower level before issuing the spawning prompt to restrict every sub-agent it spawns.
 
 ## Examples
 

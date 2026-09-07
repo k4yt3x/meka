@@ -472,6 +472,113 @@ pub(crate) fn cwd_filter(path: &Path) -> PathBuf {
     accept_cwd(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// A sub-agent's write boundary, as `agent_spawn`'s `writable_roots` named it and
+/// [`accept_writable_roots`] accepted it: the worker's cells are built from these two fields and
+/// from nothing of the parent's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundedWorkspace {
+    /// The first entry, canonical: the worker's working directory, where its relative paths
+    /// resolve and the first root its writes may land under.
+    pub(crate) cwd: PathBuf,
+    /// Every later entry, canonical, in the order given.
+    pub(crate) additional_roots: Vec<PathBuf>,
+}
+
+impl BoundedWorkspace {
+    /// The whole boundary, working directory first: the list the spawn terms record, so that a
+    /// follow-up hands it back through [`accept_writable_roots`] unchanged.
+    pub(crate) fn roots(&self) -> Vec<PathBuf> {
+        std::iter::once(self.cwd.clone())
+            .chain(self.additional_roots.iter().cloned())
+            .collect()
+    }
+}
+
+/// Admit the directories a parent agent names as a sub-agent's write boundary.
+///
+/// One definition for both doors a bounded worker comes through, `agent_spawn` and
+/// `agent_followup`, so the boundary a follow-up rebuilds is judged by the rule the spawn was.
+/// Every refusal happens here, before either door has written anything.
+///
+/// The parent must hold a writing level: below `workspace` it has no write reach to hand down, and
+/// the list would grant what the parent itself lacks. Each entry is resolved against the parent's
+/// working directory when relative and then admitted as a working directory is ([`accept_cwd`]),
+/// since the first one becomes exactly that, and refused when it is a directory no root may name
+/// ([`is_system_root`]), since a boundary the sandbox masks holds nothing. At `workspace` every
+/// entry must also lie inside the parent's own boundary, [`writable_roots`], compared canonical to
+/// canonical and component-wise, so a sub-agent's reach is never wider than its parent's; at
+/// `unrestricted` the parent may write anywhere, and so may name anywhere.
+pub(crate) fn accept_writable_roots(
+    parent_level: crate::permission::Permission,
+    parent_cwd: &SharedCwd,
+    parent_roots: &SharedRoots,
+    requested: &[PathBuf],
+) -> crate::error::Result<BoundedWorkspace> {
+    use crate::{error::MekaError, permission::Permission};
+
+    if !matches!(
+        parent_level,
+        Permission::Workspace | Permission::Unrestricted
+    ) {
+        return Err(MekaError::Usage(format!(
+            "writable_roots needs a parent at `workspace` or `unrestricted`; this one is at \
+             `{parent_level}`"
+        )));
+    }
+    // Computed once, and only at the level where it constrains: at `unrestricted` the parent's
+    // boundary is the whole filesystem and there is nothing to compare against.
+    let parent_reach =
+        (parent_level == Permission::Workspace).then(|| writable_roots(parent_cwd, parent_roots));
+
+    let mut accepted = Vec::with_capacity(requested.len());
+    for entry in requested {
+        let canonical = accept_cwd(&resolve_against_cwd(parent_cwd, entry))
+            .map_err(|error| MekaError::Usage(format!("writable_roots: {error}")))?;
+        if is_system_root(&canonical) {
+            return Err(MekaError::Usage(format!(
+                "writable_roots: '{}' is a system directory the sandbox masks, so it cannot be a \
+                 workspace root",
+                canonical.display()
+            )));
+        }
+        if let Some(reach) = &parent_reach
+            && !is_within_roots(&canonical, reach)
+        {
+            let where_to = if reach.is_empty() {
+                "no root of this session's workspace currently resolves".to_string()
+            } else {
+                format!(
+                    "this session's writes land under {}",
+                    reach
+                        .iter()
+                        .map(|root| root.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            return Err(MekaError::Usage(format!(
+                "writable_roots: '{}' is outside this session's workspace: {where_to}, and a \
+                 sub-agent's reach cannot exceed its parent's",
+                canonical.display()
+            )));
+        }
+        accepted.push(canonical);
+    }
+    // The one place an empty list is refused: a bounded worker with no working directory cannot
+    // be built, and a list that bounds nothing must not fall through to the parent's workspace.
+    let mut accepted = accepted.into_iter();
+    let cwd = accepted.next().ok_or_else(|| {
+        MekaError::Usage(
+            "writable_roots names no directory; leave it out to share the parent's workspace"
+                .to_string(),
+        )
+    })?;
+    Ok(BoundedWorkspace {
+        cwd,
+        additional_roots: accepted.collect(),
+    })
+}
+
 /// Whether `path` lies within one of `roots`.
 ///
 /// Split out so the fence and its tests agree on what containment means, and so a root that equals
@@ -845,6 +952,121 @@ mod tests {
         assert_eq!(cwd_filter(&link), canonical_for_test(&target));
         let gone = temp.path().join("gone");
         assert_eq!(cwd_filter(&gone), gone);
+    }
+
+    /// One acceptor for both doors a bounded sub-agent comes through. A parent below `workspace`
+    /// has no write reach to hand down, and an empty list would bound nothing, so both are refused
+    /// before any entry is resolved.
+    #[test]
+    fn a_sub_agent_boundary_needs_a_writing_parent_and_at_least_one_directory() {
+        use crate::permission::Permission;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work = canonical_for_test(temp.path()).join("work");
+        std::fs::create_dir_all(work.join("sub")).expect("dirs");
+        let parent_cwd = SharedCwd::new(work.clone());
+        let parent_roots = SharedRoots::default();
+        let requested = vec![work.join("sub")];
+
+        for level in [Permission::None, Permission::Read] {
+            let refusal = accept_writable_roots(level, &parent_cwd, &parent_roots, &requested)
+                .expect_err("a parent that cannot write cannot delegate writing")
+                .to_string();
+            assert!(
+                refusal.contains("needs a parent at `workspace` or `unrestricted`"),
+                "{refusal}"
+            );
+        }
+        let refusal = accept_writable_roots(Permission::Workspace, &parent_cwd, &parent_roots, &[])
+            .expect_err("an empty list bounds nothing")
+            .to_string();
+        assert!(refusal.contains("names no directory"), "{refusal}");
+    }
+
+    /// At `workspace` every entry must lie inside the parent's own boundary, judged canonical
+    /// against canonical and by path component, so a sibling that merely shares a prefix is
+    /// outside. At `unrestricted` the parent may write anywhere, and so may name anywhere.
+    #[test]
+    fn a_sub_agent_boundary_lies_within_the_parents_reach_unless_the_parent_is_unrestricted() {
+        use crate::permission::Permission;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = canonical_for_test(temp.path());
+        let work = base.join("work");
+        let docs = base.join("shared").join("docs");
+        std::fs::create_dir_all(work.join("sub")).expect("dirs");
+        std::fs::create_dir_all(base.join("work2")).expect("sibling");
+        std::fs::create_dir_all(&docs).expect("shared");
+        let parent_cwd = SharedCwd::new(work.clone());
+        let parent_roots = SharedRoots::new(vec![base.join("shared")]);
+
+        let accepted = accept_writable_roots(Permission::Workspace, &parent_cwd, &parent_roots, &[
+            work.join("sub"),
+            docs.clone(),
+        ])
+        .expect("a directory under the cwd and one under a named root are both inside");
+        assert_eq!(accepted, BoundedWorkspace {
+            cwd: work.join("sub"),
+            additional_roots: vec![docs.clone()],
+        });
+        assert_eq!(accepted.roots(), vec![work.join("sub"), docs]);
+
+        let refusal = accept_writable_roots(Permission::Workspace, &parent_cwd, &parent_roots, &[
+            work.join("sub"),
+            base.join("work2"),
+        ])
+        .expect_err("`work2` shares a prefix with `work` and is outside it")
+        .to_string();
+        assert!(
+            refusal.contains(&base.join("work2").display().to_string())
+                && refusal.contains("outside this session's workspace"),
+            "the refusal must name the entry and the rule: {refusal}"
+        );
+
+        let accepted =
+            accept_writable_roots(Permission::Unrestricted, &parent_cwd, &parent_roots, &[
+                base.join("work2"),
+            ])
+            .expect("an unrestricted parent may name a directory outside its own");
+        assert_eq!(accepted.cwd, base.join("work2"));
+    }
+
+    /// Entries are admitted as a working directory is: a relative one resolves against the
+    /// parent's directory, and a file or a missing directory is refused by name. A directory the
+    /// sandbox masks is refused at any level, since a boundary with no usable root holds nothing.
+    #[test]
+    fn a_sub_agent_boundary_is_resolved_and_admitted_like_a_working_directory() {
+        use crate::permission::Permission;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let work = canonical_for_test(temp.path()).join("work");
+        std::fs::create_dir_all(work.join("sub")).expect("dirs");
+        let file = work.join("notes.md");
+        std::fs::write(&file, b"x").expect("write");
+        let parent_cwd = SharedCwd::new(work.clone());
+        let parent_roots = SharedRoots::default();
+
+        let accepted = accept_writable_roots(Permission::Workspace, &parent_cwd, &parent_roots, &[
+            PathBuf::from("sub"),
+        ])
+        .expect("a relative entry resolves against the parent's directory");
+        assert_eq!(accepted.cwd, work.join("sub"));
+
+        let refused = |requested: &[PathBuf]| {
+            accept_writable_roots(Permission::Workspace, &parent_cwd, &parent_roots, requested)
+                .expect_err("refused")
+                .to_string()
+        };
+        assert!(refused(&[work.join("missing")]).contains("does not exist"));
+        assert!(refused(&[file]).contains("is not a directory"));
+
+        #[cfg(unix)]
+        {
+            let refusal =
+                accept_writable_roots(Permission::Unrestricted, &parent_cwd, &parent_roots, &[
+                    PathBuf::from("/tmp"),
+                ])
+                .expect_err("a masked system directory cannot be a root at any level")
+                .to_string();
+            assert!(refusal.contains("system directory"), "{refusal}");
+        }
     }
 
     /// A private directory refuses a root at or under it and nothing above it: the masks are

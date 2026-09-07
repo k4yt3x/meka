@@ -583,6 +583,7 @@ mod tests {
             .create_child_session(
                 root,
                 None,
+                Vec::new(),
                 Some(child_spec.to_string()),
                 "read".to_string(),
                 "test-profile".to_string(),

@@ -576,6 +576,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "profile".to_string(),

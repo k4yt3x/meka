@@ -740,17 +740,19 @@ impl Store {
     /// Create a session whose `parent_session_id` references an existing session, used by
     /// `agent_spawn` so sub-agent conversations persist as children of the parent for auditing.
     /// Cascades on parent delete (see [`Self::delete_session`]). The optional `cwd` is the parent's
-    /// cwd snapshot at spawn time.
+    /// cwd snapshot at spawn time, or the first of the sub-agent's `writable_roots`, and
+    /// `additional_roots` the rest of them: empty for a sub-agent sharing its parent's workspace.
     ///
     /// `subagent_spec_json` records the terms the sub-agent was spawned under so `agent_followup`
     /// can rebuild it from them rather than from whatever the parent looks like at follow-up
-    /// time. It is written with the row rather than updated afterwards: a spawn that fails
-    /// between the two would otherwise leave a child that can be followed up on with no
-    /// recorded terms.
+    /// time. It is written with the row rather than updated afterwards, as the roots are: a spawn
+    /// that fails between the two would otherwise leave a child that can be followed up on with
+    /// no recorded terms.
     pub(crate) async fn create_child_session(
         &self,
         parent: Uuid,
         cwd: Option<std::path::PathBuf>,
+        additional_roots: Vec<PathBuf>,
         subagent_spec_json: Option<String>,
         // The level the sub-agent runs at, already clamped against its parent, so the row answers
         // for a sub-agent wherever a row is read.
@@ -775,6 +777,13 @@ impl Store {
         let lock = self.claim_a_fresh_id(session_id);
         let now = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
+        let additional_roots_json = match encode_additional_roots(&additional_roots) {
+            Ok(json) => json,
+            Err(error) => {
+                self.discard_unused_claim(lock, session_id);
+                return Err(error);
+            }
+        };
 
         let inserted = self
             .connection
@@ -785,9 +794,10 @@ impl Store {
                     // the provider stopped being read off that row; see the parameter's note.
                     // `approvals` is still read off it: a sub-agent shares its parent's switch.
                     "INSERT INTO sessions
-                         (id, created_at, updated_at, parent_session_id, cwd, subagent_spec_json,
-                          permission, approvals, profile)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, approvals, ?8
+                         (id, created_at, updated_at, parent_session_id, cwd,
+                          additional_roots_json, subagent_spec_json, permission, approvals,
+                          profile)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, approvals, ?9
                      FROM sessions WHERE id = ?4",
                     rusqlite::params![
                         session_id.to_string(),
@@ -795,6 +805,7 @@ impl Store {
                         now,
                         parent.to_string(),
                         cwd_string,
+                        additional_roots_json,
                         subagent_spec_json,
                         permission,
                         profile,
@@ -2636,6 +2647,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "repinned-midturn".to_string(),
@@ -2813,6 +2825,7 @@ mod tests {
             .create_child_session(
                 source,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -3101,6 +3114,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "profile".to_string(),
@@ -3204,6 +3218,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 Some("{\"tools\":[]}".to_string()),
                 "read".to_string(),
                 "profile".to_string(),
@@ -3500,7 +3515,14 @@ mod tests {
             // never consulted. It said "on the parent's profile" while doing the opposite, so
             // deleting the filter outright left the suite green.
             let (_id, lock) = store
-                .create_child_session(parent, None, None, "read".to_string(), "work".to_string())
+                .create_child_session(
+                    parent,
+                    None,
+                    Vec::new(),
+                    None,
+                    "read".to_string(),
+                    "work".to_string(),
+                )
                 .await
                 .expect("spawn a sub-agent");
             lock.expect("claim the sub-agent's lock");
@@ -3548,6 +3570,7 @@ mod tests {
             .create_child_session(
                 Uuid::new_v4(),
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -4729,6 +4752,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -5402,6 +5426,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -5431,6 +5456,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "test-profile".to_string(),
@@ -5598,6 +5624,7 @@ mod tests {
             .create_child_session(
                 parent,
                 None,
+                Vec::new(),
                 None,
                 "read".to_string(),
                 "test-profile".to_string(),

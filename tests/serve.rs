@@ -8168,6 +8168,26 @@ fn a_canceled_task_rides_on_the_next_turn_instead_of_causing_one() {
          behind it"
     );
 
+    // The first turn detached the command and may still be finishing its own last round; the
+    // next turn is refused while it is, so wait for idle rather than for a clock.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let session: serde_json::Value = harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse");
+        if session["turn_in_flight"] == false {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first turn never finished: {session}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     let turn: serde_json::Value = harness
         .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
         .json(&serde_json::json!({"message": "what is in this CSV?"}))
