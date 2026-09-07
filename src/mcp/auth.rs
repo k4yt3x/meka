@@ -21,11 +21,10 @@ use crate::{
 
 /// The server URL a stored OAuth bundle was issued for, if it records one.
 ///
-/// rmcp writes `server_url` (older bundles: `issuer`) into the credential it hands the store, so
-/// the origin has always been on disk -- nothing surfaced it. Which matters because the row is
-/// keyed by `(server_name, kind)` and nothing else: point `[[mcp_servers]]` named `docs` at a
-/// different host and the token minted for the old one is presented to the new one, with no
-/// indication in `meka mcp get` that the two disagree.
+/// rmcp writes `server_url` (older bundles: `issuer`) into the credential it hands the store. The
+/// row is keyed by `(server_name, kind)` and nothing else: point `[[mcp_servers]]` named `docs` at
+/// a different host and the token minted for the old one is presented to the new one, so
+/// `meka mcp get` shows the origin beside the URL for the two to be compared.
 ///
 /// Best-effort by design, and `None` in three different ways that all mean the same thing to a
 /// caller: no bundle, a bundle that is not JSON, or one from a version of rmcp that recorded
@@ -41,7 +40,7 @@ pub(crate) async fn stored_credential_origin(
         Ok(json) => json?,
         // A store meka cannot read is not the same fact as a server with no stored grant, and this
         // function's `None` says the second. Logged rather than propagated: the caller is a display
-        // line, and losing one row of `mcp get` is not worth failing the command over -- but a
+        // line, and losing one row of `mcp get` is not worth failing the command over, but a
         // silent drop would present a locked store as "never logged in".
         Err(error) => {
             tracing::debug!(
@@ -95,14 +94,14 @@ pub(crate) async fn revoke_stored_token(
     let Some(json) = token_store
         .load_mcp_credentials(server_name, crate::store::McpCredentialKind::OAuth)
         .await
-        .map_err(|error| format!("load credentials: {error}"))?
+        .map_err(|error| format!("failed to load the stored credentials: {error}"))?
     else {
         return Ok(());
     };
     let parsed: serde_json::Value = serde_json::from_str(&json)
         .map_err(|error| format!("stored credentials are not valid JSON: {error}"))?;
     let issuer = origin_of(&parsed)
-        .ok_or_else(|| "stored credentials missing issuer/server_url".to_string())?;
+        .ok_or_else(|| "the stored credentials record no server URL".to_string())?;
     let access_token = parsed
         .get("tokens")
         .and_then(|t| t.get("access_token"))
@@ -116,22 +115,19 @@ pub(crate) async fn revoke_stored_token(
         return Ok(());
     };
 
-    // Discover the revocation endpoint. RFC 8414 says it lives under
-    // /.well-known/oauth-authorization-server; many providers also expose it under
-    // /.well-known/openid-configuration. Try OAuth first.
+    // RFC 8414 puts the metadata under `/.well-known/oauth-authorization-server`; many providers
+    // also expose it under `/.well-known/openid-configuration`, tried second.
     //
-    // Threat model: the `issuer` URL comes from credentials we stored during the original auth
-    // flow, so we trust the origin. We do NOT trust the network path or any redirect: reqwest
-    // follows redirects by default, which would let a MITM redirect the metadata fetch to an
-    // attacker host and coax us into POSTing the access token there. Redirects are turned off, the
-    // response body is size-capped, and the returned `revocation_endpoint` is pinned to the same
-    // host as the issuer.
+    // The `issuer` URL was stored during the original flow, so its origin is trusted; the network
+    // path and any redirect are not. reqwest follows redirects by default, which would let a MITM
+    // send the metadata fetch to an attacker host and the access token after it, so redirects are
+    // off, the body is size-capped, and `revocation_endpoint` is pinned to the issuer's origin.
     const METADATA_BODY_CAP: usize = 256 * crate::text::KIB;
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|error| format!("build http client: {error}"))?;
+        .map_err(|error| format!("failed to build the HTTP client: {error}"))?;
 
     let base = issuer.trim_end_matches('/');
     let candidates = [
@@ -146,8 +142,7 @@ pub(crate) async fn revoke_stored_token(
         if !response.status().is_success() {
             continue;
         }
-        // Read bytes before parsing so we can size-cap: reqwest's own Content-Length is
-        // server-supplied and therefore untrusted.
+        // Bytes before parsing, so the cap applies: Content-Length is server-supplied.
         let Ok(bytes) = response.bytes().await else {
             continue;
         };
@@ -165,8 +160,9 @@ pub(crate) async fn revoke_stored_token(
 
     validate_revocation_endpoint_origin(issuer, &endpoint)?;
 
-    // Build application/x-www-form-urlencoded body manually so we don't need an extra dependency.
-    // `form_urlencoded` uses %-encoded UTF-8, same as `percent_encoding::NON_ALPHANUMERIC`.
+    // The form body is built by hand rather than through another dependency;
+    // `percent_encoding::NON_ALPHANUMERIC` produces the same %-encoded UTF-8 `form_urlencoded`
+    // would.
     use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     let enc = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
     let mut body = format!("token={}&token_type_hint=access_token", enc(access_token));
@@ -186,7 +182,7 @@ pub(crate) async fn revoke_stored_token(
         .await
         .map_err(|error| {
             format!(
-                "revoke POST failed: {}",
+                "failed to POST the revocation: {}",
                 crate::error::format_reqwest_error(&error)
             )
         })?;
@@ -194,7 +190,7 @@ pub(crate) async fn revoke_stored_token(
     // OK. Non-2xx is a genuine failure.
     if !response.status().is_success() {
         return Err(format!(
-            "revoke POST returned HTTP {}",
+            "the revocation endpoint returned HTTP {}",
             response.status().as_u16()
         ));
     }
@@ -215,16 +211,15 @@ pub(crate) enum McpAuthProbe {
     /// Reachable but some other status (405, 404, …). Record it so the caller can surface it
     /// without claiming auth is or isn't needed.
     Unexpected { status: u16 },
-    /// Couldn't even talk to the server (DNS, TLS, timeout, …).
+    /// No answer at all (DNS, TLS, timeout).
     Unreachable { message: String },
 }
 
 /// Probe an MCP HTTP endpoint to see whether it requires OAuth.
 ///
-/// Runs an unauthenticated `GET` with a 3 s wall-clock timeout and redirects disabled; we never
-/// follow off-origin so a compromised DNS can't bait us into treating an attacker host as
-/// authoritative about the real server. The body is ignored; the verdict comes entirely from the
-/// status line and the `WWW-Authenticate` header.
+/// Runs an unauthenticated `GET` with a 3 s wall-clock timeout and redirects disabled, so a
+/// compromised DNS cannot make an attacker host authoritative about the real server. The body is
+/// ignored; the verdict comes entirely from the status line and the `WWW-Authenticate` header.
 pub(crate) async fn probe_http_auth(url: &str) -> McpAuthProbe {
     let http = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -234,7 +229,7 @@ pub(crate) async fn probe_http_auth(url: &str) -> McpAuthProbe {
         Ok(client) => client,
         Err(error) => {
             return McpAuthProbe::Unreachable {
-                message: format!("build http client: {error}"),
+                message: format!("failed to build the HTTP client: {error}"),
             };
         }
     };
@@ -282,10 +277,8 @@ fn classify_probe_response(status: u16, www_authenticate: Option<&str>) -> McpAu
     McpAuthProbe::Unexpected { status }
 }
 
-/// Extract a quoted parameter value from an RFC 6750 `WWW-Authenticate:
-/// Bearer …` challenge. Handles the forms seen in the wild:
-/// `key="value"`, `key=value`, trailing commas, mixed whitespace.
-/// Returns `None` if the key isn't present.
+/// Extract a parameter value from an RFC 6750 `WWW-Authenticate: Bearer …` challenge, quoted or
+/// bare, with trailing commas and mixed whitespace tolerated. `None` when the key is absent.
 fn extract_bearer_param(header: &str, key: &str) -> Option<String> {
     // Drop the `Bearer` scheme prefix; everything after is a comma-separated parameter list.
     let index = header.find(|c: char| c.is_whitespace())?;
@@ -339,7 +332,7 @@ fn validate_revocation_endpoint_origin(
         || endpoint_url.port_or_known_default() != issuer_url.port_or_known_default()
     {
         return Err(format!(
-            "revocation_endpoint '{endpoint}' is on a different origin than issuer '{issuer}'; refusing to send token"
+            "revocation_endpoint '{endpoint}' is on a different origin than issuer '{issuer}'; refusing to send the token"
         ));
     }
     Ok(())
@@ -397,7 +390,7 @@ pub(super) async fn connect_http_with_oauth(
             let secret = client_secret.as_deref().ok_or_else(|| MekaError::McpAuth {
                 server_name: server_name.to_string(),
                 message: format!(
-                    "no client secret stored for '{server_name}'. Run `meka mcp login {server_name} \
+                    "no client secret stored for '{server_name}'; run `meka mcp login {server_name} \
                      --client-secret-stdin`"
                 ),
             })?;
@@ -566,14 +559,14 @@ async fn authenticate_client_credentials_jwt(
         })
 }
 
-/// On Unix, refuse to read a JWT signing key that is group- or world- accessible. Matches the
-/// 0600-only policy already applied to the session DB and config.toml: if the key can be read by
-/// another local user, a local attacker can forge JWTs to the MCP server and impersonate us.
+/// On Unix, refuse to read a JWT signing key that is group- or world-accessible: a key another
+/// local user can read lets them forge JWTs to the MCP server. The same 0600 policy the store and
+/// `config.toml` get.
 ///
 /// Takes the open `File` so the permission check and the subsequent read share the same inode. A
 /// stat-then-read pair on the path could be swapped between syscalls.
 ///
-/// No-op on non-Unix: Windows uses ACLs and we don't try to audit them.
+/// No-op elsewhere: Windows uses ACLs, which are not audited.
 fn require_private_key_permissions_on_fd(
     server_name: &str,
     path: &str,
@@ -590,9 +583,7 @@ fn require_private_key_permissions_on_fd(
         if mode & 0o077 != 0 {
             return Err(MekaError::McpAuth {
                 server_name: server_name.to_string(),
-                message: format!(
-                    "signing key '{path}' has permissions {mode:o}; must be 0600 (group/other bits must be clear)"
-                ),
+                message: format!("signing key '{path}' has mode {mode:o}; it must be 0600"),
             });
         }
     }
@@ -668,7 +659,6 @@ async fn authenticate_oauth_authorization_code(
         });
     }
 
-    // Try loading existing credentials from the store
     let has_stored_credentials =
         manager
             .initialize_from_store()
@@ -693,9 +683,9 @@ async fn authenticate_oauth_authorization_code(
         });
     };
 
-    // Bound here, once a login is actually going to run, and not at the top: every connect of an
-    // OAuth server came through this function, and binding first refused a server with a perfectly
-    // good stored bundle whenever the port was taken, by another meka or by a second server sharing
+    // Bound here, once a login is going to run, and not at the top: every connect of an OAuth
+    // server comes through this function, and binding first would refuse a server with a good
+    // stored bundle whenever the port is taken, by another meka or by a second server sharing
     // `redirect_port`. Bound before the URL is built so a random port (`redirect_port = None`) can
     // be learned and put in `redirect_uri`.
     let bind_port = redirect_port.unwrap_or(0);
@@ -709,13 +699,13 @@ async fn authenticate_oauth_authorization_code(
         .local_addr()
         .map_err(|error| MekaError::McpAuth {
             server_name: server_name.to_string(),
-            message: format!("callback listener local_addr failed: {error}"),
+            message: format!("failed to read the callback listener's address: {error}"),
         })?
         .port();
     let redirect_uri = format!("http://127.0.0.1:{actual_port}/callback");
 
-    // Cleared first, and this is load-bearing. `initialize_from_store` can itself write -- on an
-    // issuer change it loads, saves cleared tokens, and returns `false` -- and if that write loses
+    // Cleared first, and this is load-bearing. `initialize_from_store` can itself write (on an
+    // issuer change it loads, saves cleared tokens, and returns `false`), and if that write loses
     // its swap the adapter is left `Superseded`, which refuses every later write. The interactive
     // flow performs no further `load`, so the credential the user is about to authorize in a
     // browser would be silently dropped and the next launch would ask again. Nothing this flow
@@ -723,13 +713,11 @@ async fn authenticate_oauth_authorization_code(
     forget_what_was_read(&last_read);
     tracing::info!("starting OAuth authorization flow for MCP server '{server_name}'");
 
-    // Wrap in OAuthState to use its start_authorization flow which handles metadata discovery,
-    // dynamic client registration, and PKCE setup
     let mut oauth_state = OAuthState::Unauthorized(manager);
 
-    // If we have a pre-configured client_id, configure it before starting
+    // A configured `client_id` skips dynamic registration, which `start_authorization` would
+    // otherwise do; configuring the client needs the metadata resolved first.
     if let Some(id) = client_id {
-        // We need to discover metadata first, then configure the client
         if let OAuthState::Unauthorized(ref mut manager) = oauth_state {
             let resolution =
                 manager
@@ -781,7 +769,6 @@ async fn authenticate_oauth_authorization_code(
             oauth_state = OAuthState::Session(session);
         }
     } else {
-        // No client_id configured; use dynamic registration via start_authorization
         let request = rmcp::transport::auth::AuthorizationRequest::new(redirect_uri.clone())
             .with_scopes(scope_strings.clone())
             .with_client_name("meka");
@@ -805,7 +792,6 @@ async fn authenticate_oauth_authorization_code(
 
     login_prompt.authorize_at(&auth_url);
 
-    // Wait for the authorization code on our pre-bound listener.
     let (code, state) = await_oauth_callback(callback_listener, login_prompt.as_ref())
         .await
         .map_err(|error| MekaError::McpAuth {
@@ -813,7 +799,6 @@ async fn authenticate_oauth_authorization_code(
             message: format!("OAuth callback failed: {error}"),
         })?;
 
-    // Exchange the authorization code for tokens
     oauth_state
         .handle_callback(&code, &state)
         .await
@@ -830,9 +815,8 @@ async fn authenticate_oauth_authorization_code(
         })
 }
 
-/// Max bytes we're willing to read from a single HTTP callback request before giving up. Large
-/// enough to handle big `Cookie:` headers (which can exceed 4 KiB), small enough to cap a
-/// resource-exhaustion attempt.
+/// The most of one HTTP callback request that is read before it is dropped. Large enough for big
+/// `Cookie:` headers (which can exceed 4 KiB), small enough to cap a resource-exhaustion attempt.
 const CALLBACK_READ_CAP: usize = 64 * crate::text::KIB;
 /// End-of-headers marker for HTTP/1.x.
 const CRLF_CRLF: &[u8] = b"\r\n\r\n";
@@ -843,12 +827,12 @@ const OAUTH_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Wait for the authorization code.
 ///
-/// The common case is that the OAuth provider redirects the user's browser to our localhost
-/// listener and we pick the code out of the HTTP request. But when meka runs on a different host
-/// than the browser (SSH sessions, containers, remote Codespaces), the browser can't reach back,
-/// so we race the TCP accept against a stdin prompt that lets the user paste the full callback URL
-/// (it's visible in the browser's address bar even when the connection is refused). Paste mode is
-/// only offered when the prompt can read one.
+/// The common case is the authorization server redirecting the user's browser to the localhost
+/// listener, and the code is read out of that request. When meka runs on a different host than
+/// the browser (SSH sessions, containers) the browser cannot reach back, so the TCP accept is
+/// raced against a prompt that takes the full callback URL pasted from the browser's address bar,
+/// which shows it even when the connection is refused. Paste mode is only offered when the prompt
+/// can read one.
 async fn await_oauth_callback(
     listener: tokio::net::TcpListener,
     prompt: &dyn LoginPrompt,
@@ -896,10 +880,9 @@ async fn accept_http_callback(
             Ok(Ok(pair)) => pair,
         };
 
-        // Read until we've seen CRLF-CRLF (end of request headers) or hit the byte cap. Browsers
-        // sometimes send favicon / preflight requests to the callback origin; if the path isn't
-        // `/callback?...`, respond with a minimal 404 so the browser stops retrying and keep
-        // waiting.
+        // Read to the end of the request headers or to the byte cap. A browser may send favicon
+        // or preflight requests to the callback origin; a path other than `/callback?...` gets a
+        // 404 so it stops retrying, and the wait continues.
         let mut buffer = Vec::with_capacity(4096);
         let mut temp = [0u8; 4096];
         let headers_complete = loop {
@@ -988,8 +971,7 @@ async fn accept_http_callback(
 }
 
 /// Paste-URL fallback for the OAuth callback: read a line the prompt hands over and extract the
-/// `code` and `state` from the pasted URL. Used when the browser can't reach back to our bound
-/// listener (e.g. meka is on an SSH host and the browser is on the user's laptop).
+/// `code` and `state` from the pasted URL, for a browser that cannot reach the bound listener.
 async fn read_pasted_callback(
     prompt: &dyn LoginPrompt,
     deadline: tokio::time::Instant,
@@ -1032,8 +1014,8 @@ fn parse_pasted_callback(input: &str) -> std::result::Result<(String, String), S
     let mut state = None;
     let mut error_param: Option<String> = None;
     // The same decoder as `parse_callback_query`: a redirect query is form-encoded, so `+` is a
-    // space, and `percent_decode_str` left it a literal `+`. A server that form-encodes a value
-    // containing a space then saw a code that failed the token exchange on the paste path only.
+    // space, which `percent_decode_str` would leave a literal `+` and the token exchange would
+    // then reject.
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         // Strict UTF-8: silently mangling a security-sensitive parameter (e.g. swapping invalid
         // bytes for U+FFFD) could let a tampered `state` value match the expected one despite
@@ -1158,12 +1140,11 @@ enum LastRead {
     ///
     /// Distinct from [`Self::Nothing`], and the distinction is the whole of it. Both mean "there
     /// is nothing to compare against", but they want opposite writes: `Nothing` wants an
-    /// unconditional one, and this wants none at all. Collapsing the two -- which is what
-    /// recording a lost swap as "unread" did -- meant a process reverted to blind upserts for the
-    /// rest of its run after losing a single race, quietly undoing the guarantee the swap exists
-    /// for. Every token rmcp mints from here descends from a credential another process has
-    /// already superseded, and that is true of the next one and the one after it, not just the one
-    /// that lost.
+    /// unconditional one, and this wants none at all. Collapsed (a lost swap recorded as
+    /// "unread"), a process reverts to blind upserts for the rest of its run after losing a single
+    /// race, quietly undoing the guarantee the swap exists for. Every token rmcp mints from here
+    /// descends from a credential another process has already superseded, and that is true of the
+    /// next one and the one after it, not just the one that lost.
     Superseded,
 }
 
@@ -1264,8 +1245,8 @@ impl CredentialStore for SqliteCredentialStore {
             // per refresh would turn one fact into a line an hour.
             LastRead::Superseded => {
                 tracing::debug!(
-                    "not persisting a refreshed token for MCP server '{server_name}': it descends from a \
-                     credential the store has moved past",
+                    "not persisting the refreshed token for MCP server '{server_name}': the stored \
+                     credential has moved on",
                     server_name = self.server_name
                 );
                 return Ok(());
@@ -1280,9 +1261,8 @@ impl CredentialStore for SqliteCredentialStore {
             // is that the *stored* credential stays the newest one, which is what the next process
             // to start will load.
             tracing::info!(
-                "MCP server '{server_name}' was re-authenticated elsewhere while this token was being \
-                 refreshed; the stored credential was left as it is, and this process will not \
-                 write to it again",
+                "MCP server '{server_name}' was re-authenticated elsewhere during this refresh; \
+                 keeping the stored credential",
                 server_name = self.server_name
             );
             self.remember(LastRead::Superseded);
@@ -1296,10 +1276,10 @@ impl CredentialStore for SqliteCredentialStore {
         self.remember(LastRead::Nothing);
         // Only the bundle this adapter owns. rmcp calls `clear` when the authorization server's
         // issuer changes, meaning the tokens it holds are bound to an issuer that is no longer the
-        // right one -- a statement about the tokens and nothing else. A confidential client's
-        // `client_secret` is not bound to an issuer, was typed by the user, and after this change
-        // meka is its only holder, so clearing every kind here would send them back to the
-        // provider to reissue one that was never invalid.
+        // right one, which is a statement about the tokens and nothing else. A confidential
+        // client's `client_secret` is not bound to an issuer, was typed by the user, and
+        // after this change meka is its only holder, so clearing every kind here would send
+        // them back to the provider to reissue one that was never invalid.
         self.token_store
             .clear_mcp_credentials_of_kind(
                 &self.server_name,

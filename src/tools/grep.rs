@@ -95,10 +95,8 @@ impl Tool for SearchContentsTool {
         // An explicit `path` searches exactly that tree, resolved against the per-session cwd. With
         // no `path`, sweep every workspace root: in a multi-root ACP workspace, searching only
         // `cwd` silently misses whole folders the user can see in their editor. Carried as
-        // `PathBuf` end to end. Rendering each root through `to_string_lossy` and rebuilding it
-        // with `Path::new` replaced every non-UTF-8 byte with U+FFFD, so a working directory whose
-        // name is not valid UTF-8 -- `mkdir $'proj\xff'` -- named a directory that does not exist,
-        // and the tool reported the user's own cwd as missing under a spelling they never typed.
+        // `PathBuf` end to end: a round trip through `to_string_lossy` would replace every
+        // non-UTF-8 byte with U+FFFD and report the user's own cwd as missing.
         let search_paths: Vec<std::path::PathBuf> = match input["path"].as_str() {
             Some(raw) => vec![crate::workspace::resolve_against_cwd(&self.site.cwd, raw)],
             None => crate::workspace::search_roots(&self.site.cwd, &self.site.roots),
@@ -177,10 +175,9 @@ fn search_with_grep(
 
     let mut results = Vec::new();
     let mut timed_out = false;
-    // A root that doesn't exist is skipped rather than fatal, because one stale entry in a
-    // multi-root workspace shouldn't sink a search the other roots can answer. With a single
-    // explicit `path` this reduces to today's behavior exactly: nothing existed, so the error
-    // below fires with the same message.
+    // A root that does not exist is skipped rather than fatal, because one stale entry in a
+    // multi-root workspace should not sink a search the other roots can answer; with a single
+    // explicit `path` the error below still fires.
     let mut searched_any = false;
     // Compiled lazily and at most once. Deliberately inside the directory branch rather than
     // hoisted above the loop: hoisting would report an invalid `glob` for a path that doesn't
@@ -188,7 +185,7 @@ fn search_with_grep(
     let mut glob_pattern: Option<glob::Pattern> = None;
     // Roots left unsearched because the match cap filled up first. cwd is always root #1, so a
     // busy cwd would otherwise starve every other root and report only "truncated", which reads as
-    // "the other folders had nothing" -- the exact failure multi-root support exists to prevent.
+    // "the other folders had nothing".
     let mut unsearched_roots = 0usize;
     let mut unreadable = 0usize;
 
@@ -333,7 +330,7 @@ fn search_file(
     results: &mut Vec<String>,
     max_results: usize,
     // Counted like an unreadable directory: a file that cannot be opened or searched may hold the
-    // match, and dropping it at `debug!` let "No matches found." read as definitive.
+    // match, and a `debug!` alone would let "No matches found." read as definitive.
     unreadable: &mut usize,
 ) -> Result<()> {
     use grep_searcher::{Searcher, sinks::UTF8};
@@ -376,10 +373,8 @@ struct SearchScope<'a> {
 /// canceled.
 ///
 /// `unreadable` counts the directories the walk could not open and the files it could not search,
-/// so the caller can say so. A silent skip turns `search_contents` over a tree with an unreadable
-/// subdirectory into a confident "No matches found.", which is the definitive-sounding wrong answer
-/// the truncation and timeout notices already exist to prevent. `find_files` has reported this all
-/// along.
+/// so the caller can say so: a silent skip turns a tree with an unreadable subdirectory into a
+/// confident "No matches found.".
 fn walk_directory(
     directory: &std::path::Path,
     scope: &SearchScope<'_>,
@@ -417,7 +412,7 @@ fn walk_directory(
             Ok(entries) => entries,
             Err(error) => {
                 let directory = dir.display();
-                tracing::debug!("search_contents: cannot read '{directory}': {error}");
+                tracing::debug!("failed to read directory '{directory}': {error}");
                 *unreadable += 1;
                 continue;
             }
@@ -433,11 +428,9 @@ fn walk_directory(
             let Ok(entry) = entry else { continue };
             let path = entry.path();
 
-            // `to_string_lossy`, not `to_str().unwrap_or("")`. A directory whose name is not
-            // valid UTF-8 made `to_str` yield `None` and the fallback yield `""`, which does not
-            // start with `.` -- so `.cache\xff` was the one shape that walked straight past the
-            // skip this exists for. Lossy conversion never alters ASCII bytes, so the leading dot
-            // and both literals below survive it intact.
+            // `to_string_lossy`, not `to_str().unwrap_or("")`: a `.cache\xff` would yield `""`
+            // and walk straight past this skip. Lossy conversion never alters ASCII bytes, so the
+            // leading dot and both literals below survive it intact.
             let file_name = path.file_name().unwrap_or_default().to_string_lossy();
             if file_name.starts_with('.') || file_name == "target" || file_name == "node_modules" {
                 continue;
@@ -925,8 +918,8 @@ mod tests {
     }
 
     /// cwd is always root #1, so a busy cwd filling the cap would otherwise starve every other
-    /// root while the output said only "truncated" -- which reads as "the other folders had
-    /// nothing", the exact failure multi-root support exists to prevent.
+    /// root while the output said only "truncated", which reads as "the other folders had
+    /// nothing".
     #[test]
     fn search_discloses_roots_left_unsearched_when_the_cap_fills() {
         let busy = tempfile::tempdir().expect("tempdir");
@@ -996,7 +989,7 @@ mod tests {
     }
 
     /// A budget that expired before any root was examined says nothing about whether the path
-    /// exists, so it must not report "does not exist" -- a definitive answer the model acts on.
+    /// exists, so it must not report "does not exist", a definitive answer the model acts on.
     #[test]
     fn expired_budget_reports_timeout_not_missing_path() {
         let temp = tempfile::tempdir().expect("tempdir");

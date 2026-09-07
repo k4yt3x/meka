@@ -113,11 +113,10 @@ impl SubagentSpec {
     /// The worker's `SharedPermission`, clamped to `ceiling` on top of what the spec recorded.
     ///
     /// Two ceilings, because there are two ways a worker could end up with authority it should not
-    /// have. The spec stops a follow-up *escalating* a worker its spawn call deliberately
-    /// restricted. `ceiling` -- the parent's level right now -- stops a worker *outliving* a
+    /// have. The spec stops a follow-up escalating a worker its spawn call deliberately
+    /// restricted. `ceiling` (the parent's level right now) stops a worker outliving a
     /// restriction: spawn at `unrestricted`, switch the session to `read`, and without this the
-    /// worker would still run at `unrestricted` on the next follow-up, so the user's downgrade
-    /// would silently not reach the work being done on their behalf. The effective level is the
+    /// worker would still run at `unrestricted` on the next follow-up. The effective level is the
     /// lower of the two.
     ///
     /// Falls back to a singleton set when the persisted list is empty or invalid, rather than to
@@ -156,8 +155,8 @@ impl SubagentSpec {
     /// `MemoryAccess::parse_grant` refuses `"write"` at the `agent_spawn` boundary, but a spec is
     /// persisted JSON and `meka session import` writes `subagent_spec_json` verbatim from a
     /// user-supplied archive, where `Write` deserializes fine. The documented guarantee is that no
-    /// sub-agent can write to the store, so it is enforced where the level is *consumed* rather
-    /// than resting on every writer having validated first -- the same shape as
+    /// sub-agent can write to the store, so it is enforced where the level is consumed rather
+    /// than resting on every writer having validated first, the same shape as
     /// [`clamp_enabled_permissions`], which bounds a persisted permission set for the same reason.
     fn granted_memory(&self) -> MemoryAccess {
         self.memory.min(MemoryAccess::Read)
@@ -608,8 +607,8 @@ impl Tool for AgentSpawnTool {
         let augmented_prompt = format!("{environment_context}\n{task}");
 
         // The last step that can fail before the worker exists in its own right. Nothing here is
-        // reachable in practice -- the web client is built from config the root already used, and a
-        // fresh registry cannot collide -- but the row is already on disk, so a failure would leave
+        // reachable in practice (the web client is built from config the root already used, and a
+        // fresh registry cannot collide), but the row is already on disk, so a failure would leave
         // a childless session that `agent_list` advertises and `agent_followup` would resume into
         // an empty conversation. Roll it back rather than rely on the failure staying unreachable.
         //
@@ -674,8 +673,8 @@ impl Tool for AgentSpawnTool {
         //
         // Skipped when the caller redirected the report to a scratchpad. That redirect is universal
         // (`scratchpad::save_explicit_scratchpad_results` keys off the `scratchpad` argument, not
-        // the tool) and stores the *whole* result text, so a header here would be written into the
-        // entry and handed to whatever later reads it -- while the model, which now sees only a
+        // the tool) and stores the whole result text, so a header here would be written into the
+        // entry and handed to whatever later reads it, while the model, which now sees only a
         // reference, would not get the id anyway. A scratchpad holds output the parent means to
         // pass around; the id is metadata about the call, and `agent_list` is where to find it.
         let output = if super::util::redirects_to_scratchpad(&input) {
@@ -697,8 +696,8 @@ impl Tool for AgentSpawnTool {
 /// the tool being written. The distinction is the whole point: `AgentSpawnTool::inherited_denials`
 /// is what this agent's future *children* are denied, and on the root agent that is the
 /// `[subagents]` config. Reading it here would make `[subagents] disabled_tools = ["agent_spawn"]`
-/// -- the natural way to write "workers may not spawn workers" -- delete `agent_spawn` from the
-/// root agent and turn delegation off entirely.
+/// (the natural way to write "workers may not spawn workers") delete `agent_spawn` from the root
+/// agent and turn delegation off entirely.
 ///
 /// Takes the already-built `AgentSpawnTool` because its depth counters differ between the root
 /// (seeded from config) and a nested level (derived from the parent's).
@@ -740,8 +739,8 @@ pub(crate) fn register_subagent_tools(
     ));
 
     // All four or none, gated on `agent_spawn`. The three lifecycle tools only ever operate on what
-    // `agent_spawn` produced, so an agent that cannot delegate has nothing for them to act on --
-    // and `disabled_tools = ["agent_spawn"]` means "no delegation", not "no *new* delegation while
+    // `agent_spawn` produced, so an agent that cannot delegate has nothing for them to act on, and
+    // `disabled_tools = ["agent_spawn"]` means "no delegation", not "no new delegation while
     // keeping the ability to drive workers a previous run left behind".
     if !registry.admits("agent_spawn") {
         return Ok(());
@@ -995,11 +994,9 @@ impl Drop for FollowupGuard {
 /// has denied since.
 ///
 /// Named rather than inlined at the call site because the narrowing is the security property and it
-/// was not observable there. The stored spec is deliberately left alone, so the only assertion a
-/// test could make against the call site was that the *recording* had not changed -- which is true
-/// whether or not the narrowing happened. A mutation dropping `denied_servers` from the expression
-/// therefore survived the whole suite, and would have let a worker keep reaching an MCP server the
-/// operator had since denied.
+/// is not observable there: the stored spec is deliberately left alone, so the only assertion a
+/// test could make against the call site is that the recording did not change, which is true
+/// whether or not the narrowing happened.
 ///
 /// The spec is a floor on restriction, never a license: config can only narrow it, and `..spec`
 /// carries everything config has no opinion about.
@@ -1110,9 +1107,9 @@ impl Tool for AgentFollowupTool {
                 message: format!("sub-agent '{agent_id}' has an unreadable spec: {error}"),
             })?;
         // The spec records what the worker was granted; it is not a license to ignore what applies
-        // now. Config may have gained deny lists since the spawn -- most likely across the restart
-        // an old worker had to survive to be here -- and the memory grant is re-clamped against
-        // what *this* agent currently holds, so a worker cannot outlive its granter's own limits.
+        // now. Config may have gained deny lists since the spawn (most likely across the restart
+        // an old worker had to survive to be here), and the memory grant is re-clamped against
+        // what this agent currently holds, so a worker cannot outlive its granter's own limits.
         // Both combines take the more restrictive side, so neither can widen the worker.
         let spec = combined_for_followup(
             spec,
@@ -1139,8 +1136,8 @@ impl Tool for AgentFollowupTool {
         if effective_permission != spec.permission {
             let recorded = spec.permission;
             tracing::info!(
-                "sub-agent {agent_id} runs at {effective_permission} rather than its recorded {recorded}: this session has since been \
-                 restricted"
+                "sub-agent {agent_id} runs at `{effective_permission}` rather than its recorded \
+                 `{recorded}`: this session has since been restricted"
             );
         }
 
@@ -1156,7 +1153,7 @@ impl Tool for AgentFollowupTool {
         .await?;
 
         // Rehydrate the worker's own conversation: the same three calls the REPL's resume path
-        // makes. `from_events` arms the resume notice, and it is left armed deliberately -- every
+        // makes. `from_events` arms the resume notice, and it is left armed deliberately: every
         // follow-up really is a fresh registry, a fresh read tracker and an empty todo list, so the
         // worker is being told something true each time rather than a stale banner.
         let store = &self.tool_builder_params.materials.store;
@@ -1180,8 +1177,8 @@ impl Tool for AgentFollowupTool {
         for dropped in messages.sanitize_orphans() {
             let count = dropped.content.len();
             tracing::warn!(
-                "sub-agent {agent_id}: dropped an assistant message with orphaned tool_use blocks while \
-                 rehydrating ({count} blocks)"
+                "sub-agent {agent_id}: dropped an assistant message with {count} orphaned tool_use \
+                 block(s) while rehydrating"
             );
         }
 
@@ -1191,10 +1188,9 @@ impl Tool for AgentFollowupTool {
         let augmented_prompt = format!("{environment_context}\n{prompt}");
 
         // Held for this turn, as `agent_spawn` holds it for the spawn. A follow-up runs a full turn
-        // against a row nothing else claims, so without this the worker sat unlocked for seconds to
-        // minutes and a concurrent `meka session delete --all` could take it and cascade the
-        // conversation away mid-run -- the same exposure `create_child_session` closed for spawn,
-        // still open on the sibling door.
+        // against a row nothing else claims, so without this the worker would sit unlocked for
+        // seconds to minutes and a concurrent `meka session delete --all` could take it and cascade
+        // the conversation away mid-run.
         //
         // A refusal here, where spawn only warns, and the asymmetry is the point: spawn's id is
         // brand new, so a failure can only be a filesystem problem, while this id already exists
@@ -1211,19 +1207,18 @@ impl Tool for AgentFollowupTool {
             })?;
 
         // The row has to follow the build, for the reason `agent_spawn` writes it from the same
-        // cell: `build_subagent` runs the worker on the parent's profile *now*, and a follow-up
-        // after a `/profile` switch therefore bills an account the worker's row does not name.
-        // Every reader disagrees with what ran until this lands -- `meka session list`, `GET
-        // /v1/sessions`, `session export`, and a later resume, which re-pins the worker to the
-        // profile it has not been running on.
+        // cell: `build_subagent` runs the worker on the parent's profile now, and a follow-up
+        // after a `/profile` switch would otherwise bill an account the worker's row does not
+        // name, so every reader (`meka session list`, `GET /v1/sessions`, `session export`, a
+        // later resume) would disagree with what ran.
         //
         // And it has to follow the lock and the hydration, immediately ahead of the turn: written
         // earlier, a follow-up the lock then refused, or whose conversation could not be loaded,
-        // had already moved the row onto a profile the worker never ran on.
+        // would have moved the row onto a profile the worker never ran on.
         //
         // Read off the built agent rather than the live cell a second time. The cell is what
-        // `build_subagent` consulted, but a repin landing in the gap -- `/profile`, `PATCH
-        // /v1/sessions/{id}`, ACP's `session/set_config_option` -- would make the second read a
+        // `build_subagent` consulted, but a repin landing in the gap (`/profile`, `PATCH
+        // /v1/sessions/{id}`, ACP's `session/set_config_option`) would make the second read a
         // different answer, and the row would name a profile this turn is not running on.
         //
         // The row is the billing record, so a write that fails fails the call: the policy every
@@ -1315,8 +1310,8 @@ impl Tool for AgentDeleteTool {
         // Claimed before the ownership check, mirroring `agent_followup`, so the two serialize on
         // one worker whichever arrives first. Parallel tool calls in a single turn make this
         // reachable: without it, a delete completing inside a follow-up's ownership check leaves
-        // that follow-up writing to a deleted session and failing on a foreign-key violation --
-        // a raw database error, on a path where the model did nothing wrong.
+        // that follow-up writing to a deleted session and failing on a foreign-key violation, a
+        // raw database error, on a path where the model did nothing wrong.
         let agent_id = parse_agent_id(&input, "agent_delete")?;
         let Some(_guard) = FollowupGuard::claim(&self.in_flight, agent_id) else {
             return Err(MekaError::ToolExecution {
@@ -1380,15 +1375,14 @@ async fn build_subagent(
     let parent_profile = params.cells.profile.current();
     // A worker's window comes off `parent_profile` inside `Agent::new_subagent`, not from
     // `params.parent_options`, which was cloned when the session was assembled and cannot hear
-    // about a switch. Taking the provider from one and the window from the other is how a worker
-    // came to talk to a 32k profile while auto-compacting at 80% of the 1M one the session had
-    // left: it never compacted, and the provider refused its turn instead.
+    // about a switch. Taking the provider from one and the window from the other would have a
+    // worker talk to a 32k profile while auto-compacting at 80% of the 1M one the session had left.
     let parent_options = params.parent_options.clone();
     let sub_shared_perm = spec.shared_permission_bounded(parent_permission);
     let effective_permission = spec.effective_permission(parent_permission.get());
     let denials = spec.denials();
     // Resolved once: it feeds both this worker's system prompt and what its own children can be
-    // given. `None` here is what makes nesting self-enforcing -- a worker that was not granted the
+    // given. `None` here is what makes nesting self-enforcing: a worker that was not granted the
     // instructions has no copy to pass on, so the restriction propagates through the data rather
     // than through a check every future call site has to remember.
     let memory_access = spec.granted_memory();
@@ -1404,7 +1398,7 @@ async fn build_subagent(
     // Wrap so permission prompts surface in the parent's UI while emits stay silent (the
     // sub-agent's output flows back as this tool's result, not as live notifications). The one
     // exception is the sub-agent's tool calls, which are rolled up into this call's own display
-    // so a long run isn't an opaque spinner -- hence the tool-call id.
+    // so a long run is not an opaque spinner, hence the tool-call id.
     let sub_frontend: Arc<dyn crate::frontend::Frontend> =
         Arc::new(crate::frontend::PermissionForwardingFrontend::new(
             Arc::clone(&params.cells.frontend),
@@ -1482,8 +1476,8 @@ async fn build_subagent(
                 ..sub_cells.clone()
             },
             // The worker's own granted level, not its parent's. `params.memory_access` is what the
-            // *spawning* agent holds, so letting the spread supply it would let a worker grant its
-            // children up to its parent's level rather than its own -- reaching through a child
+            // spawning agent holds, so letting the spread supply it would let a worker grant its
+            // children up to its parent's level rather than its own, reaching through a child
             // what it was denied directly. The deny lists come from `spec` for the same reason.
             memory_access,
             config_denials: params.config_denials.clone(),
@@ -1545,8 +1539,7 @@ async fn build_subagent(
     ))
 }
 
-/// Read an optional string-valued parameter, refusing a value of the wrong type./// Read an
-/// optional string-valued parameter, refusing a value of the wrong type.
+/// Read an optional string-valued parameter, refusing a value of the wrong type.
 ///
 /// The obvious `input[key].as_str()` treats a non-string as absent, which for a restriction is the
 /// wrong way to fail: `permission: 0` would silently run the worker at the parent's own level
@@ -1576,12 +1569,11 @@ fn optional_str<'a>(
     }
 }
 
-/// Pull a `Vec<String>` out of an optional array parameter. Non-string entries are silently
-/// skipped, so a partially malformed array doesn't tank the whole spawn; a missing or non-array
-/// value yields an empty list. A list parameter, or an error if the model sent something that is
-/// not a list. Read as absent, a bare string in `deny_tools` spawned an unrestricted worker in
-/// place of the restricted one the caller asked for, with nothing to say so; the same guard
-/// `optional_str` gives the strings.
+/// Pull a `Vec<String>` out of an optional array parameter. A missing or null value yields an
+/// empty list, and non-string entries inside an array are skipped so a partially malformed array
+/// does not sink the whole spawn, but anything that is not an array is an error: read as absent, a
+/// bare string in `deny_tools` would spawn an unrestricted worker in place of the restricted one
+/// the caller asked for, with nothing to say so. The same guard `optional_str` gives the strings.
 fn string_array(
     input: &serde_json::Value,
     key: &str,
@@ -1606,8 +1598,8 @@ fn string_array(
     }
 }
 
-/// An unsigned integer parameter, or an error if the model sent something else. `"0"` read as
-/// absent gave a worker the nesting budget its caller had just tried to deny it.
+/// An unsigned integer parameter, or an error if the model sent something else: `"0"` read as
+/// absent would give a worker the nesting budget its caller had just tried to deny it.
 fn optional_u64(
     input: &serde_json::Value,
     key: &str,
@@ -1691,10 +1683,9 @@ fn clamp_enabled_permissions(
 ///
 /// The override is clamped because `[session] subagent_max_depth` is documented as a ceiling
 /// ("`subagent_max_depth = 1` means sub-agents cannot spawn further sub-agents"), and an
-/// unclamped override made it merely a default: one `agent_spawn` passing `max_depth: 15` handed a
-/// worker a budget the operator had explicitly denied, and each level could re-grant it. Recursion
-/// was still bounded by [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], so this is about the config key meaning
-/// what it says rather than about termination.
+/// unclamped override would make it merely a default that one `agent_spawn` passing `max_depth:
+/// 15` re-grants at every level. Recursion is still bounded by [`SUBAGENT_ABSOLUTE_MAX_DEPTH`], so
+/// this is about the config key meaning what it says rather than about termination.
 fn child_spawn_depth(
     remaining_depth: usize,
     absolute_depth: usize,
@@ -1711,8 +1702,8 @@ fn child_spawn_depth(
 }
 
 /// Compose the sub-agent's first-turn task from an optional parent directive and an optional
-/// rendered skill body. Mirrors the CLI's `--skill` ordering (`build_skill_prompt` in
-/// `src/main.rs`): the parent directive comes first, the skill body second. Returns `None` only
+/// rendered skill body. Mirrors the CLI's `--skill` ordering (`host::build_skill_prompt`): the
+/// parent directive comes first, the skill body second. Returns `None` only
 /// when both inputs are absent; the caller treats that as an error.
 fn compose_subagent_task(prompt: Option<&str>, skill_body: Option<&str>) -> Option<String> {
     match (prompt, skill_body) {
@@ -1733,7 +1724,7 @@ const SUBAGENT_MEMORY_INDEX_MAX_BYTES: usize = 4_096;
 /// Separate from the root agent's `[Memory]` section rather than shared with it, for two
 /// reasons. A sub-agent's system prompt is a static override, so it never receives the per-turn
 /// world state the parent's index rides in. And the parent's header tells the reader to call
-/// `memory_write` when it learns something durable, which a worker cannot do -- pointing it at a
+/// `memory_write` when it learns something durable, which a worker cannot do: pointing it at a
 /// tool it does not have is how a model burns a turn discovering the tool is missing.
 fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
     if memories.is_empty() {
@@ -1748,11 +1739,9 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
     let mut shown = 0;
     for memory in memories {
         // Sanitized at the boundary, like the root agent's index: the store hands back stored
-        // bytes, and this is a worker's context.
-        //
-        // Elided too, which the parent's index and both search renderers already did and this one
-        // did not. Descriptions are unbounded at the write door, so a single 4,000-character one
-        // at the top of the store exceeded the whole budget on its own.
+        // bytes, and this is a worker's context. Elided too, as the parent's index and both search
+        // renderers do: descriptions are unbounded at the write door, so a single 4,000-character
+        // one at the top of the store would exceed the whole budget on its own.
         let line = format!(
             "- **{}**: {}\n",
             memory.name,
@@ -1761,8 +1750,8 @@ fn render_subagent_memory_index(memories: &[crate::memory::Memory]) -> String {
             )
         );
         // Always emit the first, for the same reason `render_hits` does. The elide above is what
-        // actually makes a collapse to zero entries unreachable -- `MAX_DESCRIPTION_CHARS` bounds
-        // one line far below this budget -- so this branch is the belt to that brace, and holds if
+        // actually makes a collapse to zero entries unreachable (`MAX_DESCRIPTION_CHARS` bounds
+        // one line far below this budget), so this branch is the belt to that brace, and holds if
         // that bound ever moves. It is deliberately not something the tests can distinguish.
         if shown > 0 && out.len() + line.len() > SUBAGENT_MEMORY_INDEX_MAX_BYTES {
             break;
@@ -2005,8 +1994,8 @@ mod tests {
     /// **What this does not cover**, and the honest limit of the guarantee: the root cell here
     /// never moves. `with_ceiling`'s precondition is taken once, at spawn, so cycling the root
     /// `unrestricted -> read -> unrestricted` between two spawns leaves a grandchild bound to a
-    /// root that has changed shape underneath it. Nothing exceeds the *root*, which is the human's
-    /// own level, so the headline invariant holds and the next `agent_followup` re-clamps it -- but
+    /// root that has changed shape underneath it. Nothing exceeds the root, which is the human's
+    /// own level, so the headline invariant holds and the next `agent_followup` re-clamps it, but
     /// the direct-parent bound does not hold across that sequence, and no test asserts it does.
     #[test]
     fn a_grandchild_cannot_escape_an_intermediate_parent() {
@@ -2092,8 +2081,8 @@ mod tests {
 
     /// A restriction passed with the wrong type is refused, not read as absent. Reading it as
     /// absent is the dangerous direction for `permission`, where "not specified" means "inherit the
-    /// parent's level" -- so a malformed restriction would hand the worker *more* than the caller
-    /// was reaching for.
+    /// parent's level", so a malformed restriction would hand the worker more than the caller was
+    /// reaching for.
     #[test]
     fn optional_str_refuses_a_wrong_typed_value() {
         let input = serde_json::json!({
@@ -2135,7 +2124,7 @@ mod tests {
                 .is_empty()
         );
         // A non-array value is not a one-element list. A bare string is a refusal, not an empty
-        // list: read as empty, `deny_tools: "write_file"` spawned an unrestricted worker.
+        // list: read as empty, `deny_tools: "write_file"` would spawn an unrestricted worker.
         assert!(string_array(&serde_json::json!({"x": "notion"}), "x", "agent_spawn").is_err());
         assert!(
             optional_u64(
@@ -2186,8 +2175,8 @@ mod tests {
 
     #[test]
     fn child_spawn_depth_leaf_when_budget_exhausted() {
-        // remaining_depth = 1 reproduces the historical "root spawns, sub-agents can't" behavior:
-        // the child gets 0 and is not granted a nested agent_spawn.
+        // remaining_depth = 1 is "root spawns, sub-agents cannot": the child gets 0 and is not
+        // granted a nested agent_spawn.
         let (remaining, _absolute, allow) = child_spawn_depth(1, 0, None);
         assert_eq!(remaining, 0);
         assert!(!allow);
@@ -2316,10 +2305,9 @@ mod tests {
     ///
     /// `build_subagent` reads the provider from `live_binding.current()`, so the window must come
     /// from there too rather than from `parent_options`, a clone frozen when the session was
-    /// assembled. After a `/profile`, `PATCH` or `set_config_option` switch the two disagreed, and
-    /// a worker talked to the new profile while auto-compacting against the size of the one the
-    /// session had left: on the way down it never compacted and the provider refused its turn, on
-    /// the way up it compacted from the first round.
+    /// assembled. After a `/profile`, `PATCH` or `set_config_option` switch the two disagree, and a
+    /// worker would talk to the new profile while auto-compacting against the size of the one the
+    /// session had left.
     ///
     /// `parent_options` carries no window at all, so the two cannot be taken from different places.
     /// This is the behavioral check that the worker gauges against what `binding_on` published
@@ -2698,15 +2686,11 @@ mod tests {
         );
     }
 
-    /// End to end: a worker spawned while the session was at `unrestricted` must not still be there
-    /// after the user restricts the session to Read. Asserted through the worker's registry
-    /// rather than A follow-up holds the worker's session for the length of its turn.
-    ///
-    /// `agent_spawn` gained this and `agent_followup` did not, which left the exposure open on the
-    /// door that reaches an *existing* worker: a follow-up runs a full turn against a row nothing
-    /// claims, for seconds to minutes, and a concurrent `meka session delete --all` takes the lock
-    /// nobody holds and cascades the conversation away. The follow-up's next message insert then
-    /// dies on a foreign-key violation with the worker's output lost.
+    /// A follow-up holds the worker's session for the length of its turn: it runs a full turn
+    /// against a row nothing else claims, for seconds to minutes, and unlocked, a concurrent `meka
+    /// session delete --all` would take the lock nobody holds and cascade the conversation away,
+    /// so the follow-up's next message insert would die on a foreign-key violation with the
+    /// worker's output lost.
     ///
     /// Refused rather than warned, unlike spawn: this id already exists, so a lock it cannot take
     /// genuinely means somebody else is running a turn on this worker, and two turns interleaved
@@ -3018,11 +3002,10 @@ mod tests {
     /// Config denials narrow a recorded grant on every axis, not just the ones a test happened to
     /// look at.
     ///
-    /// Asserted against the combined spec directly. The call site deliberately leaves the *stored*
+    /// Asserted against the combined spec directly. The call site deliberately leaves the stored
     /// spec alone so a later loosening restores the original terms, which means the only thing
-    /// observable there is that the recording did not change -- true whether or not the narrowing
-    /// ran. Dropping `denied_servers` from the expression survived the whole suite on exactly that
-    /// gap, while `denied_tools` beside it was caught.
+    /// observable there is that the recording did not change, true whether or not the narrowing
+    /// ran.
     #[test]
     fn a_followup_narrows_a_recorded_grant_by_config_on_every_axis() {
         let spec = SubagentSpec {
@@ -3106,10 +3089,9 @@ mod tests {
     /// A worker's row records the profile its parent is *running on*, not the one its parent's row
     /// says.
     ///
-    /// The sibling of [`a_worker_gauges_against_the_window_its_parent_runs_on_now`], and the same
-    /// defect a third time: provider, window and now the recorded profile all have to come off the
-    /// one live cell. This one was taken by SQL, `SELECT … provider FROM sessions`, which is the
-    /// parent's *row*.
+    /// The sibling of [`a_worker_gauges_against_the_window_its_parent_runs_on_now`]: provider,
+    /// window and the recorded profile all have to come off the one live cell, not the parent's
+    /// row.
     ///
     /// The two come apart for as long as a repin that could not take the runtime lock. ACP's
     /// `session/set_config_option` moves the row mid-turn and `try_lock`s the runtime; when a turn
@@ -3177,13 +3159,13 @@ mod tests {
         );
     }
 
-    /// The sibling of the test above, on the door that was left open.
+    /// The sibling of the test above, on the follow-up door.
     ///
     /// `build_subagent` takes the parent's live profile for a follow-up exactly as it does for a
-    /// spawn, but only the spawn wrote it down, so a worker spawned on `first-profile` and
-    /// followed up after a `/profile` switch ran on and billed `second-profile` while its row
-    /// still said `first-profile`. That is the one thing meka otherwise forbids: a session
-    /// whose turns do not run on the profile its row names.
+    /// spawn, so unless the follow-up writes it down too, a worker spawned on `first-profile` and
+    /// followed up after a `/profile` switch runs on and bills `second-profile` while its row still
+    /// says `first-profile`: a session whose turns do not run on the profile its row names, which
+    /// meka otherwise forbids.
     ///
     /// The switch between the two calls is the whole point; a test where the profile never moves
     /// passes with the write deleted.
@@ -3628,11 +3610,10 @@ mod tests {
 
     /// One enormous description must not empty a granted worker's whole index.
     ///
-    /// Descriptions are unbounded at the write door, and this was the one memory render that did
-    /// not elide them. With the budget checked before *every* push and nothing exempt, a single
-    /// 4,000-character description at the top of the store produced a header promising memories
-    /// followed by "N more not listed here" -- in a worker that had been deliberately granted
-    /// access to them. The parent's index and both search renderers already guarded both halves.
+    /// Descriptions are unbounded at the write door. With the budget checked before every push and
+    /// nothing elided, a single 4,000-character description at the top of the store would produce
+    /// a header promising memories followed by "N more not listed here", in a worker that had been
+    /// deliberately granted access to them.
     #[test]
     fn one_enormous_description_does_not_empty_the_subagent_index() {
         let mut memories = vec![memory_for_test("enormous", 1, &"x".repeat(4_000))];
@@ -3846,7 +3827,7 @@ mod tests {
 
     /// `agent_delete` shares the follow-up guard, so the two cannot run on one worker at once.
     /// Without it, a delete landing between a follow-up's ownership check and its first write makes
-    /// the follow-up fail on a foreign-key violation -- a raw database error, on a path where the
+    /// the follow-up fail on a foreign-key violation, a raw database error, on a path where the
     /// model did nothing wrong.
     #[tokio::test]
     async fn delete_is_refused_while_a_followup_holds_the_worker() {
@@ -4001,7 +3982,7 @@ mod tests {
         );
         // Making the root unreadable makes `disk_snapshot` return `None`, and `SkillCache::current`
         // then serves its cached list rather than wiping it. So the name still resolves and only
-        // the body read fails -- the ordering this test is about, and a real race with a
+        // the body read fails: the ordering this test is about, and a real race with a
         // `git checkout` or an editor moving a skill mid-turn. (Removing the root instead would not
         // do: a *missing* root is deliberately read as an empty store, which fails resolution.)
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000))
@@ -4066,9 +4047,9 @@ mod tests {
     /// Delegating a skill whose `SKILL.md` will not parse must say so, not offer substitutes.
     ///
     /// The `skill_read` wording exists because a model told "not found" improvises the procedure.
-    /// `agent_spawn` is the same audience with more at stake -- the improvisation runs in a worker,
-    /// out of sight -- and it kept answering "skill 'x' not found. Available skills: ...", which
-    /// reads as an invitation to pick one of those instead.
+    /// `agent_spawn` is the same audience with more at stake (the improvisation runs in a worker,
+    /// out of sight), and "skill 'x' not found. Available skills: ..." reads as an invitation to
+    /// pick one of those instead.
     #[tokio::test]
     async fn spawning_a_broken_skill_names_the_file_rather_than_offering_alternatives() {
         let temporary = tempfile::tempdir().expect("tempdir");
@@ -4117,7 +4098,7 @@ mod tests {
         assert!(output.is_error);
         let text = output.text_content();
         assert!(
-            text.contains("could not be read"),
+            text.contains("failed to load"),
             "a present-but-unparseable file must not read as absent: {text}"
         );
         assert!(

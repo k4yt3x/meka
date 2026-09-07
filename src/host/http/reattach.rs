@@ -151,10 +151,8 @@ impl ReconstructionLocks {
 /// Two handlers bypass [`ensure_session_loaded`] when a session is not resident, and both repeat
 /// one shape: take the reconstruction lock, re-check residency under it and hand the caller back to
 /// the resident path if the answer moved, take the session's on-disk lock, and only then write.
-/// Stated once here rather than per handler, because what keeps happening is a new site rather than
-/// a changed rule: this was asserted at `repin_dormant_session`, and the rewind path, written
-/// afterwards, arrived with none of it. Deleting its `lock_session` entirely left all 3056 tests
-/// green.
+/// Stated once here rather than per handler, because the likely regression is a new site rather
+/// than a changed rule.
 ///
 /// A source-text assertion, because what it protects is unreachable from a single process. The
 /// reconstruction lock is per process by construction, and the session lock only conflicts across
@@ -208,8 +206,7 @@ pub(crate) fn assert_dormant_fast_path_is_serialized(
          issued; found reconstruction@{reconstruction} recheck@{recheck} write@{write_at}"
     );
     // The re-check has to *act*, not merely look. Replacing its `return Ok(None)` with a log line
-    // leaves all three positions intact and reinstates the race, which is how this read as coverage
-    // while proving nothing; verified green with exactly that edit.
+    // leaves all three positions intact and reinstates the race.
     assert!(
         body.get(recheck..write_at)
             .is_some_and(|arm| arm.contains("return Ok(None)")),
@@ -218,8 +215,7 @@ pub(crate) fn assert_dormant_fast_path_is_serialized(
     );
 
     // The reconstruction lock is per process, so it says nothing about a second `meka serve` on the
-    // same store. Reproduced over HTTP for the repin: server B answered `200` for a session server
-    // A was running, and A went on from its own in-memory copy while both reported the write.
+    // same store, which would otherwise answer `200` for a session this one is running.
     let session = body
         .find("lock_session(id)")
         .expect("a dormant write must own the session it writes to, not just the process's map");
@@ -299,9 +295,7 @@ pub(crate) async fn ensure_session_loaded_holding(
     // Deliberately *not* justified by the `claim_session` sweep below. That sweep is keyed on this
     // id and a sub-agent has no `background_tasks` rows to key: `Agent::enable_background` is
     // reached only through `assemble_agent`, which is the host builders' path, and
-    // `Agent::new_subagent` never calls it. The UPDATE matches zero rows. Recording that here
-    // because the placement is right for the reason above and would otherwise keep being
-    // re-justified by a harm that cannot occur.
+    // `Agent::new_subagent` never calls it. The UPDATE matches zero rows.
     //
     // Here rather than at each door, because every write-side session endpoint funnels through this
     // function: `/turn`, `/compact`, `/rewind`, `/responses`, the fork's read-back and the
@@ -369,7 +363,7 @@ pub(crate) async fn ensure_session_loaded_holding(
                 tracing::warn!(
                     session_id = %id,
                     error = %error,
-                    "capabilities_json failed to parse; falling back to default capabilities"
+                    "failed to parse capabilities_json; using the default capabilities"
                 );
                 SessionCapabilities::default()
             }
@@ -534,11 +528,10 @@ mod tests {
 
     /// Two requests for the same unloaded session must not reconstruct it concurrently.
     ///
-    /// Both would open the session's file lock; the loser got a 409 whose documented remedy ("retry
-    /// against the process that holds it") did not apply, because the winner was this very process.
-    /// The fix serializes reconstruction per session id so the loser waits and then finds the
-    /// winner's entry. Nothing tested it: making [`ReconstructionLocks::lock`] hand out a fresh
-    /// mutex every call -- i.e. no serialization at all -- left every suite green.
+    /// Both would open the session's file lock; the loser gets a 409 whose documented remedy
+    /// ("retry against the process that holds it") does not apply, because the winner is this very
+    /// process. Serializing reconstruction per session id makes the loser wait and then find the
+    /// winner's entry.
     #[tokio::test]
     async fn reconstructing_one_session_twice_is_serialized() {
         let id = Uuid::from_u128(0x5eed);

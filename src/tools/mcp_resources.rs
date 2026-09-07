@@ -130,8 +130,6 @@ impl Tool for ListMcpResourcesTool {
             match crate::mcp::list_resources(&entry, &cancellation).await {
                 Ok(resources) => {
                     for resource in resources {
-                        // rmcp 2.1 flattened `Resource`: its fields sit directly on the struct, not
-                        // under `.raw`.
                         let raw = &resource;
                         let mime = raw.mime_type.as_deref().unwrap_or("");
                         let description = raw.description.as_deref().unwrap_or("");
@@ -465,9 +463,8 @@ impl Tool for GetMcpPromptTool {
 
         let result = crate::mcp::get_prompt(&entry, name.clone(), arguments, &cancellation).await?;
 
-        // Sanitized before truncation, like every other server-supplied string in this file. This
-        // one was the omission: `prompts/get`'s description is server text that reaches the model
-        // and the terminal, and it went through `truncate` alone.
+        // Sanitized before truncation, like every other server-supplied string in this file: it
+        // reaches the model and the terminal.
         let description = result
             .description
             .map(|description| {
@@ -484,8 +481,6 @@ impl Tool for GetMcpPromptTool {
         }
 
         for message in &result.messages {
-            // `PromptMessage` carries a plain `Role` and a `ContentBlock`, the same content enum
-            // used everywhere else.
             let role_label = match message.role {
                 rmcp::model::Role::User => "user",
                 rmcp::model::Role::Assistant => "assistant",
@@ -537,22 +532,20 @@ pub(crate) fn register_all(registry: &super::ToolRegistry, manager: Arc<McpClien
     if visible_servers(&manager, &denials).is_empty() {
         return;
     }
-    // These seven are registered directly rather than through `register_builtin`, so they only
-    // honor the `[tools]` block-list and the sub-agent deny list if this asks. Without it, naming
-    // one in `disabled_tools` did nothing at all. `admits_infrastructure` deliberately ignores
-    // `allowed_tools`, which never reached these and would silently delete them from any install
-    // that has one.
+    // These seven are registered directly rather than through `register_builtin`, so they honor
+    // the `[tools]` block-list and the sub-agent deny list only because this asks.
+    // `admits_infrastructure` ignores `allowed_tools`, which would silently delete them from any
+    // install that has one.
     //
-    // All seven are discovery-style helpers, so each is marked deferred: they stay out of the tool
-    // list until a prompt/resource-focused flow needs them, and the registry's auto-activate path
-    // promotes them when invoked. Marking deferred rides along in the same macro: a deferred marker
-    // for a tool that was never registered is a name `load_tool` would offer and then fail to find.
+    // All seven are discovery-style helpers, so each is marked deferred. Marking rides along in the
+    // same macro: a deferred marker for a tool that was never registered is a name `load_tool`
+    // would offer and then fail to find.
     macro_rules! register_meta {
         ($name:expr, $tool:expr) => {
             if registry.admits_infrastructure($name) {
                 #[allow(
                     clippy::expect_used,
-                    reason = "a collision means two builtins share a name, a bug the first build must surface rather than drop the second registration"
+                    reason = "two builtins sharing a name is a bug the first build must surface"
                 )]
                 registry.register(Arc::new($tool)).expect(concat!(
                     "builtin ",
@@ -873,10 +866,8 @@ mod tests {
         assert!(out[1].contains("beta"));
     }
 
-    /// Regression guard for the scratchpad un-defer change: the seven MCP resource tools must STILL
-    /// be deferred after registration. We only relaxed `scratchpad_*` deferral; if a future
-    /// refactor accidentally drops `mark_deferred` calls here too, every MCP-using session would
-    /// see seven extra tool schemas in its tools array on the first turn.
+    /// The seven MCP resource tools stay deferred after registration, or every MCP-using session
+    /// would carry seven extra tool schemas in its tools array on the first turn.
     #[tokio::test]
     async fn mcp_resource_tools_remain_deferred() {
         use crate::{

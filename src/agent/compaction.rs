@@ -236,10 +236,8 @@ impl Agent {
         }
 
         // Owned here rather than returned by the checkpoint, because a `memory_write` is durable
-        // the moment it runs and the turn can still fail or be canceled afterwards. Returned by
-        // value it would be dropped on exactly those paths, so the notes would be on disk --
-        // overwriting whatever was there -- while the caller was told none were written, with no
-        // trace at any verbosity. `CompactResponse::memories_written` promises the opposite.
+        // the moment it runs and the turn can still fail or be canceled afterwards; returned by
+        // value it would be dropped on exactly those paths, and the caller told none were written.
         let mut memories_written: Vec<String> = Vec::new();
         let checkpoint =
             if request.origin == CompactOrigin::Emergency || !self.options.compact_checkpoint {
@@ -282,11 +280,9 @@ impl Agent {
         };
 
         // A trailing user message is one nobody has answered yet. `CompactOrigin::Proactive` fires
-        // *after* `run_turn` appends this turn's prompt and *before* `base_messages` is built from
-        // the compacted conversation, so honoring `keep_recent: false` there would delete the
-        // request the model is about to answer and then answer the summary instead - the user's
-        // words gone from the window, and the reply addressed to whatever "next step" the summary
-        // happened to name.
+        // after `run_turn` appends this turn's prompt and before `base_messages` is built from the
+        // compacted conversation, so honoring `keep_recent: false` there would delete the request
+        // the model is about to answer and have it answer the summary instead.
         //
         // Phrased as a property of the conversation rather than a check on the origin, so a future
         // call site cannot reintroduce it by picking a different one.
@@ -350,38 +346,28 @@ impl Agent {
              this summary; resume as if the conversation had not been interrupted.]",
         );
 
-        // Snapshot the deferred-tool active set BEFORE compaction so the `CompactBoundary` event
+        // Snapshot the deferred-tool active set before compaction so the `CompactBoundary` event
         // carries it forward; otherwise tools the model loaded pre-compaction would silently drop
         // out of the active set on the next turn.
         //
-        // Read from the events, like the per-turn active set, and not from the materialized slice.
-        // A slice scan can only see `load_tool` exchanges still standing in the current view, and
-        // two things routinely take them out of it. `DegradeTier::ToolExchanges` empties a refused
-        // call in place, so its `input` no longer names anything and its result is marked
-        // `is_error`; a *previous* compaction replaced everything before it with a summary, which
-        // names nothing at all. Either way the snapshot came out short, `prune_compacted_events`
-        // then dropped the events that could have corrected it, and a tool the model had loaded
-        // disappeared from its array mid-session -- while a resume, reading the full log off disk,
-        // brought it back. `ToolRegistry::definitions_active` says this in its own doc comment; the
-        // one production caller was not doing it.
+        // Read from the events, like the per-turn active set, and not from the materialized slice:
+        // a slice scan sees only `load_tool` exchanges still standing in the current view, and
+        // `DegradeTier::ToolExchanges` empties a refused call in place while a previous compaction
+        // replaces everything before it with a summary that names nothing. A short snapshot would
+        // be made permanent by `prune_compacted_events`.
         let loaded_tools_snapshot: std::collections::HashSet<String> =
             crate::tools::load_tool::extract_loaded_tool_names_from_events(messages.events())
                 .into_iter()
                 .collect();
 
         // The last point before the window is destroyed, and the one that catches an interrupt
-        // arriving *inside* the summarizer, whose `provider.complete` takes no token at all.
-        // Without this a stop lands mid-summary and the conversation is replaced by a summary
-        // written without the agent -- the checkpoint it would have had is exactly what the fired
-        // token skipped.
+        // arriving inside the summarizer, whose `provider.complete` takes no token at all: without
+        // it a stop lands mid-summary and the conversation is replaced by a summary written without
+        // the agent.
         //
-        // Every origin but `Manual`, and the exception is the point rather than an oversight. A
-        // compaction the *turn* asked for is incidental to work the user has just stopped, so
-        // stopping it is what was meant. `/compact` is the opposite: the compaction is itself the
-        // thing asked for, and an interrupt there ends the checkpoint and falls back to the
-        // summarizer rather than abandoning the request. That is pinned by
-        // `an_interrupt_ends_the_checkpoint_and_falls_back`, and is why this cannot simply test
-        // the token.
+        // Every origin but `Manual`: a compaction the turn asked for is incidental to work the user
+        // has just stopped, whereas `/compact` is itself the thing asked for, so an interrupt there
+        // ends the checkpoint and falls back to the summarizer rather than abandoning the request.
         //
         // Memories the checkpoint already wrote stay written; they are durable the moment they run
         // and are not this call's to undo.
@@ -422,10 +408,9 @@ impl Agent {
             _ => 0,
         };
         // One transaction, for the reason `save_events_atomic` exists: a boundary that commits and
-        // a tail write that then fails leaves the database holding a *valid* boundary with a
-        // truncated tail, which puts those messages permanently outside the materialised view of
-        // every future load. Silent, unrecoverable, and reported to the caller as a failure. The
-        // whole rewrite is one unit or none of it is.
+        // a tail write that then fails leaves the database holding a valid boundary with a
+        // truncated tail, which puts those messages permanently outside the materialized view of
+        // every future load.
         let mut compaction_events = Vec::with_capacity(to_keep.len() + 1);
         compaction_events.push(boundary_event);
         compaction_events.extend(
@@ -438,11 +423,10 @@ impl Agent {
             .save_events_atomic(session_id, compaction_events)
             .await
         {
-            // Put the conversation back. The rewrite above already happened in memory, so without
+            // Put the conversation back: the rewrite above already happened in memory, so without
             // this the caller is told the compaction failed while the model goes on reasoning from
-            // a summary the database has never heard of -- and `GET /messages`, reading the DB,
-            // still serves the full history with `revision` unmoved. `POST /rewind` guards the
-            // same hazard with `pop_repair`; this is the compaction-shaped half of it.
+            // a summary the database has never heard of. `POST /rewind` guards the same hazard
+            // with `pop_repair`.
             messages.pop_compaction();
             return Err(error);
         }
@@ -561,8 +545,7 @@ impl Agent {
     ///   than a head-and-tail excerpt of it.
     ///
     /// Cancelable through the caller's token. A bare `CancellationToken::new()` here would be a
-    /// token with no signal source, which `run_turn_interruptible` documents as silently swallowing
-    /// Ctrl+C - and the checkpoint is the longest thing compaction does: up to
+    /// token with no signal source, and the checkpoint is the longest thing compaction does: up to
     /// `CHECKPOINT_MAX_ITERATIONS` full-conversation calls, plus a prompt, with approvals on, that
     /// blocks until a human answers.
     pub(super) async fn run_checkpoint_turn(
@@ -599,11 +582,9 @@ impl Agent {
         };
 
         // Bounded by the same window a normal turn uses. Without this the checkpoint would be the
-        // largest request meka ever sends: `context_messages` defaults to 200, and the reactive
-        // trigger means "the last 200-message request already filled 80% of the window", so handing
-        // the whole log over invites an overflow whose only trace is a warn line and a silent
-        // fallback - the checkpoint quietly doing nothing in exactly the long sessions it exists
-        // for.
+        // largest request meka ever sends: the reactive trigger means "the last
+        // `context_messages`-bounded request already filled 80% of the window", so handing the
+        // whole log over invites an overflow whose only trace is a warn line and a silent fallback.
         let mut checkpoint_messages: Vec<Message> =
             truncate_messages_for_context(messages, self.options.context_messages);
         for message in &mut checkpoint_messages {
@@ -613,12 +594,9 @@ impl Agent {
         // Deliver the instruction as a trailing text block on an existing user message when the
         // conversation already ends with one, and only otherwise as a message of its own.
         //
-        // `CompactOrigin::Proactive` is why: it fires *after* this turn's user message is appended
-        // (`run_turn`, the `messages.append(user_message)` above the pre-send check), so blindly
-        // pushing would produce two consecutive user turns. Anthropic rejects that, and the failure
-        // is near-silent - `compact_session` catches the error and falls back to the summarizer -
-        // so the proactive trigger would quietly never checkpoint at all, which is exactly the kind
-        // of degradation that never shows up in a test.
+        // `CompactOrigin::Proactive` is why: it fires after this turn's user message is appended,
+        // so blindly pushing would produce two consecutive user turns, which Anthropic rejects, and
+        // the failure would be near-silent because `compact_session` falls back to the summarizer.
         let instruction = checkpoint_instruction(request);
         match checkpoint_messages.last_mut() {
             Some(last) if last.role == Role::User => {
@@ -892,9 +870,8 @@ impl Agent {
         )
         .await?;
         self.session_stats.record_untracked_tokens(&usage);
-        // Surface any provider notices from the summary call (e.g. image redaction on a very large
-        // compaction window). Rare in practice; emitting before we mutate the conversation keeps
-        // the user-facing order stable.
+        // Provider notices from the summary call (image redaction on a very large window), emitted
+        // before the conversation is mutated so the user-facing order stays stable.
         for notice in notices {
             self.forward_notice(notice).await;
         }
@@ -902,7 +879,7 @@ impl Agent {
         let summary_text = summary_message.text_content();
         if summary_text.is_empty() {
             return Err(MekaError::Provider(
-                "LLM returned an empty summary".to_string(),
+                "provider returned an empty summary".to_string(),
             ));
         }
         Ok(summary_text)
@@ -942,8 +919,7 @@ impl Agent {
             Ok(entries) => entries,
             Err(error) => {
                 tracing::warn!(
-                    "post-compaction context omits the scratchpad inventory; failed to list it: \
-                     {error}"
+                    "failed to list scratchpad entries for the post-compaction context: {error}"
                 );
                 Vec::new()
             }
@@ -971,20 +947,16 @@ mod tests {
         session::{CompactOrigin, CompactRequest},
     };
 
-    /// The attempt cap binds, and the counter that enforces it counts up.
-    ///
-    /// The sibling of the cancellation test: that one never reaches `retries += 1`, so the counter
-    /// itself was unguarded and two mutants survived on it. Both are live failures rather than
-    /// arithmetic trivia. `*=` leaves the count at zero forever, so a provider that keeps failing
-    /// is retried until [`crate::provider::retry::RETRY_BUDGET`] runs out instead of three times --
-    /// five minutes of a user waiting, and up to a completion billed per attempt. `-=` underflows
-    /// on the first retry and panics the turn.
+    /// The attempt cap binds, and the counter that enforces it counts up: the cancellation test
+    /// never reaches `retries += 1`, and a counter stuck at zero would retry until
+    /// [`crate::provider::retry::RETRY_BUDGET`] runs out, with up to a completion billed per
+    /// attempt.
     ///
     /// Four rounds against a cap of three attempts: the fourth would succeed, so a run that
     /// reaches it is exactly the runaway being guarded against, and `completions()` says which
-    /// happened. Virtual time keeps the 1s and 2s of backoff free; `should_retry_provider_error`
-    /// measures its budget on `std::time::Instant`, which `start_paused` does not move, so the
-    /// budget cannot fire first and steal the assertion.
+    /// happened. Virtual time keeps the backoff free; `should_retry_provider_error` measures its
+    /// budget on `std::time::Instant`, which `start_paused` does not move, so the budget cannot
+    /// fire first and steal the assertion.
     #[tokio::test(start_paused = true)]
     async fn compaction_stops_retrying_at_the_attempt_cap() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -1028,24 +1000,18 @@ mod tests {
         );
     }
 
-    /// The wait between compaction's retries races the caller's token.
+    /// The wait between compaction's retries races the caller's token: a bare `tokio::time::sleep`
+    /// inside the round would sit out a `Retry-After` of up to
+    /// [`crate::provider::retry::RETRY_AFTER_CAP`] once per attempt, once per iteration, making
+    /// compaction the one provider call the user cannot stop.
     ///
-    /// Giving compaction a retry loop is what made this reachable: before it, the call was one
-    /// `complete` with no sleep in it, so there was nothing for a Ctrl+C to sit through.
-    /// [`Agent::run_checkpoint_turn`]'s own doc says it is cancelable through the caller's token,
-    /// and it checks that per round -- but a bare `tokio::time::sleep` inside the round would sit
-    /// out a `Retry-After` of up to [`crate::provider::retry::RETRY_AFTER_CAP`] first, once per
-    /// attempt, once per iteration. That is compaction becoming the one provider call the user
-    /// cannot stop.
+    /// The hint is five seconds and the cancel lands a tenth of a second in, so a neutered
+    /// `select!` takes the full five and then answers `Ok` from the second round, failing both
+    /// assertions rather than hanging.
     ///
-    /// The hint is five seconds and the cancel lands a tenth of a second in, so the fix returns
-    /// almost at once and its absence sleeps: a neutered `select!` takes the full five and then
-    /// answers `Ok` from the second round, failing both assertions rather than hanging.
-    ///
-    /// Canceled *during* the wait rather than before the call. Starting canceled would prove
-    /// less than it looks: `compact_session` reaches this helper with an already-canceled token on
-    /// its ordinary interrupt path, and that call is meant to go through, so a token read before
-    /// the first attempt would be a behavior change rather than a stricter test.
+    /// Canceled during the wait rather than before the call: `compact_session` reaches this helper
+    /// with an already-canceled token on its ordinary interrupt path, and that call is meant to go
+    /// through.
     #[tokio::test]
     async fn a_retry_wait_ends_when_the_turn_is_canceled() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -1095,9 +1061,9 @@ mod tests {
     }
 
     /// A conversation too short to be worth a boundary is summarized whole, except for the
-    /// request the model is about to answer. `compact_session` forces `keep_recent` for a trailing
-    /// prompt, and the split honored that only above `MIN_SUMMARIZE`: below it the prompt went
-    /// into the summary and the model answered a paraphrase of the user's words.
+    /// request the model is about to answer: `compact_session` forces `keep_recent` for a trailing
+    /// prompt, and the split has to honor that below `MIN_SUMMARIZE` too, or the model answers a
+    /// paraphrase of the user's words.
     #[test]
     fn compaction_split_small_summarizes_all_but_a_trailing_prompt() {
         let messages = vec![user_message("a"), assistant_message("b"), user_message("c")];
@@ -1253,11 +1219,10 @@ mod tests {
         }
     }
 
-    /// A checkpoint tool is told which session it serves and receives its arguments through
-    /// the same admission as an inline call. Before the context traveled with the call, the
-    /// checkpoint installed only the frontend, so an MCP tool called from a checkpoint carried
-    /// no `meka/sessionId`; and it handed the model's arguments over unexamined, so a
-    /// `background: true` reached a tool that never advertised the key.
+    /// A checkpoint tool is told which session it serves and receives its arguments through the
+    /// same admission as an inline call: an MCP tool called from a checkpoint carries
+    /// `meka/sessionId`, and a `background: true` does not reach a tool that never advertised the
+    /// key.
     #[tokio::test]
     async fn a_checkpoint_tool_is_told_its_session_and_gets_admitted_arguments() {
         let provider = Arc::new(MockProvider::from_rounds(vec![
@@ -1354,9 +1319,8 @@ mod tests {
     }
 
     /// The summary is the one request that turns thinking off, and it says so on the request
-    /// itself. A flag on the shared provider could not promise that: a sibling sub-agent's turn
-    /// in flight over the same `Arc<dyn Provider>` would have lost its thinking too, and the
-    /// guard that skipped the flag for sub-agents left their summaries paying for reasoning.
+    /// itself: a flag on the shared provider would take the thinking from a sibling sub-agent's
+    /// turn in flight over the same `Arc<dyn Provider>`.
     #[tokio::test]
     async fn the_summary_turns_thinking_off_on_its_own_request_only() {
         let provider = Arc::new(MockProvider::from_rounds(vec![
@@ -2010,8 +1974,7 @@ mod tests {
     }
 
     /// A redaction the summarizer's request reports is counted on the session like one during
-    /// a turn. Both compaction doors emitted the notice and skipped the count, so `/status`
-    /// under-reported on exactly the largest requests meka sends.
+    /// a turn, or `/status` under-reports on exactly the largest requests meka sends.
     #[tokio::test]
     async fn a_redaction_during_compaction_is_counted() {
         let provider = Arc::new(MockProvider::from_rounds(vec![vec![

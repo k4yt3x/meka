@@ -103,8 +103,8 @@ fn default_database_path() -> Result<PathBuf> {
     // confined shell: two answers to "where is the store" would leave one of them unmasked.
     let directory = crate::paths::meka_data_dir().ok_or_else(|| {
         MekaError::Config(
-            "failed to determine a data directory for the database; \
-             set MEKA_DATA_DIR to an absolute path"
+            "failed to determine a data directory for the database; set `MEKA_DATA_DIR` to an \
+             absolute path"
                 .into(),
         )
     })?;
@@ -150,11 +150,10 @@ impl Store {
         // return from any of them must not leave the directory created with nothing holding it.
         let ephemeral_lock_dir = is_in_memory.then(|| Arc::new(EphemeralLockDir(lock_dir.clone())));
 
-        // Pre-touch the DB file at 0600 so SQLite's `Connection::open` reuses an already-restricted
-        // file rather than creating one at umask defaults that we then chmod down; the latter
-        // leaves a window where another local user could open the file. `-wal`/`-shm` companions
-        // still inherit the umask, but the parent directory's 0700 mode keeps them inaccessible to
-        // other users.
+        // Pre-touched at 0600 so SQLite's `Connection::open` reuses an already-restricted file
+        // rather than creating one at umask defaults to be tightened afterwards, which leaves a
+        // window where another local user could open it. `-wal`/`-shm` companions still inherit
+        // the umask, but the parent directory's 0700 mode keeps them inaccessible to other users.
         #[cfg(unix)]
         if !is_in_memory {
             use std::os::unix::fs::OpenOptionsExt;
@@ -181,9 +180,8 @@ impl Store {
             ))
         })?;
 
-        // Belt-and-braces: if the file pre-existed at a more permissive mode (manual setup,
-        // restored backup, etc.), tighten it now. The pre-touch above is the primary protection for
-        // newly-created files.
+        // A file that pre-existed at a more permissive mode (manual setup, restored backup) is
+        // tightened now; the pre-touch above is the primary protection for a new one.
         if !is_in_memory {
             restrict_permissions(&database_path, 0o600);
         }
@@ -204,15 +202,13 @@ impl Store {
                      PRAGMA foreign_keys = ON;",
                 )?;
                 // The retry is the part that fixes something. Converting a rollback-journal
-                // database to WAL takes an exclusive lock, and SQLite does not
-                // always route *that* pragma's acquisition through the busy handler
-                // -- so with a handler installed and waiting, the conversion still
-                // returned `database is locked` outright. Measured at 2 to 9
-                // failures per 200-1200 launches of several meka processes starting together, each
-                // one a process exiting with `failed to set connection pragmas: database is
-                // locked`. An already-WAL database takes no exclusive lock here and never contends,
-                // so this only ever bit a first run on a fresh install -- a systemd unit and a
-                // shell coming up together, which is the ordinary case.
+                // database to WAL takes an exclusive lock, and SQLite does not always route *that*
+                // pragma's acquisition through the busy handler, so with a handler installed and
+                // waiting the conversion can still return `database is locked` outright when
+                // several meka processes start together. An already-WAL database takes no
+                // exclusive lock here and never contends, so this only ever bites a first run on a
+                // fresh install (a systemd unit and a shell coming up together, which is the
+                // ordinary case).
                 //
                 // WAL is what lets the REPL's history connection read without blocking the agent's
                 // writes, so a database left in rollback mode is a live contention problem rather
@@ -314,7 +310,7 @@ impl Store {
         // is nothing to do, so a long-running writer elsewhere fails commands that only read. An
         // external `BEGIN IMMEDIATE` held for eight seconds kills `meka --oneshot` at 5.1 seconds
         // with `failed to initialize schema in '<path>': database is locked`, and
-        // `meka session list` -- a pure read -- dies the same way. A rare, loud, retryable startup
+        // `meka session list` (a pure read) dies the same way. A rare, loud, retryable startup
         // error is the accepted half of that trade.
         let database_path = self.database_path.clone();
         let context = context.clone();
@@ -339,9 +335,9 @@ impl Store {
                 // `back_up_before_migrating` above guarantees, *and* the older copy must survive a
                 // migration that fails. `apply` rolls its own transaction back and reports "The
                 // store is unchanged", but deleting a file is not part of that transaction, so
-                // pruning first made a failed upgrade destroy the copy the user is told to fall
-                // back on -- and every retry took another one. Once `apply` has returned `Ok`, the
-                // copies below it are genuinely superseded. See `prune_older_backups`.
+                // pruning first would have a failed upgrade destroy the copy the user is told to
+                // fall back on, and every retry take another one. Once `apply` has returned `Ok`,
+                // the copies below it are genuinely superseded. See `prune_older_backups`.
                 if let Some(target) = &backup {
                     prune_older_backups(&database_path, target);
                 }
@@ -384,8 +380,8 @@ impl Store {
 
     /// Run `PRAGMA wal_checkpoint(TRUNCATE)` to flush the SQLite write-ahead log into the main
     /// database file. Called from `meka serve`'s graceful-shutdown path so a `SIGTERM` followed
-    /// by a fresh `meka` process invocation doesn't see a long WAL replay on open. Errors are
-    /// non-fatal: SQLite recovers from an unflushed WAL on next open, so we log and continue.
+    /// by a fresh `meka` process invocation doesn't see a long WAL replay on open. A failure is
+    /// not fatal to the caller: SQLite recovers from an unflushed WAL on next open.
     pub(crate) async fn checkpoint(&self) -> Result<()> {
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
@@ -393,11 +389,12 @@ impl Store {
                 Ok(())
             })
             .await
-            .map_err(|error| MekaError::Database(format!("WAL checkpoint failed: {error}")))
+            .map_err(|error| MekaError::Database(format!("failed to checkpoint the WAL: {error}")))
     }
 }
 
 impl Store {
+    /// The credential tables, on this store's connection.
     pub(crate) fn token_store(&self) -> TokenStore {
         TokenStore {
             connection: Arc::clone(&self.connection),
@@ -406,6 +403,7 @@ impl Store {
         }
     }
 
+    /// The scheduled-jobs table, on this store's connection.
     pub(crate) fn schedule_store(&self) -> crate::store::schedule::ScheduleStore {
         crate::store::schedule::ScheduleStore::new(
             Arc::clone(&self.connection),
@@ -413,6 +411,7 @@ impl Store {
         )
     }
 
+    /// What this handle's scheduler has learned about the jobs in this database.
     pub(crate) fn scheduler_memory(&self) -> &crate::schedule::SchedulerMemory {
         &self.scheduler_memory
     }
@@ -424,6 +423,7 @@ impl Store {
         crate::store::memory::MemoryStore::new(Arc::clone(&self.connection), enabled)
     }
 
+    /// The background-tasks table, on this store's connection.
     pub(crate) fn background_store(&self) -> crate::store::background::BackgroundStore {
         crate::store::background::BackgroundStore::new(Arc::clone(&self.connection))
     }

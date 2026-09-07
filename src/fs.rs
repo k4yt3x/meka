@@ -3,7 +3,7 @@
 //! directory, the skill store and each session hold.
 //!
 //! Three lock shapes live here side by side because three callers grew them separately; they are
-//! one primitive with different waiting policies, and the next step is making that one type.
+//! one primitive with different waiting policies.
 
 use std::{
     fs::{File, OpenOptions},
@@ -16,8 +16,8 @@ use crate::error::{MekaError, Result};
 ///
 /// Returns `path` unchanged when it is not a link, when the link cannot be read, or when the target
 /// is itself a link that leads nowhere useful: every failure mode falls back to writing where the
-/// caller asked, which is the previous behavior. A relative link target is joined onto the link's
-/// own directory, as the OS resolves it.
+/// caller asked. A relative link target is joined onto the link's own directory, as the OS
+/// resolves it.
 ///
 /// Chains are followed to a small depth so a link-to-a-link still lands on the real file, with the
 /// bound there to stop a cycle (`a -> b -> a`) spinning.
@@ -149,7 +149,7 @@ pub(crate) fn open_config_lock_target(directory: &Path) -> std::io::Result<std::
 }
 /// A file, because Windows locks are mandatory rather than advisory and `File::lock` takes the
 /// whole byte range, so a lock on `config.toml` makes it unreadable to the read-modify-write
-/// holding it -- `ERROR_LOCK_VIOLATION` from `read_to_string` on the owning thread. `LockFileEx`
+/// holding it (`ERROR_LOCK_VIOLATION` from `read_to_string` on the owning thread). `LockFileEx`
 /// also rejects a directory handle with `ERROR_INVALID_PARAMETER`, leaving nowhere else to put it.
 #[cfg(windows)]
 pub(crate) fn open_config_lock_target(directory: &Path) -> std::io::Result<std::fs::File> {
@@ -190,22 +190,22 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     //
     // `rename(2)` replaces the directory entry, so renaming over a symlink destroys the link itself
     // rather than updating what it points at. Dotfile managers (stow, chezmoi, yadm) leave
-    // `~/.config/meka/config.toml` as a link into a tracked repo, and one `meka mcp add` turned it
-    // into a plain file: the tracked copy went stale, every later edit diverged from it, and the
-    // next `stow --restow` silently reverted the lot. Resolving first keeps the write on the file
-    // the user actually manages, and the atomicity below is unaffected because the temp file is
-    // then created beside the *target*.
+    // `~/.config/meka/config.toml` as a link into a tracked repo, and one `meka mcp add` would
+    // turn it into a plain file: the tracked copy goes stale, every later edit diverges from it,
+    // and the next `stow --restow` silently reverts the lot. Resolving first keeps the write on
+    // the file the user actually manages, and the atomicity below is unaffected because the temp
+    // file is then created beside the *target*.
     //
     // Only the link itself is resolved, not the whole path: `canonicalize` would also resolve
     // symlinked parent directories, which changes where the temp file lands for no benefit here.
     let resolved = resolve_symlink_target(path);
     // Whether the write is still landing inside meka's own tree. The 0700 tightening below is a
     // statement about a directory meka owns, and following a link takes the write somewhere it does
-    // not: a dotfile manager's `~/dotfiles/config.toml` meant one `meka mcp disable` re-moded the
-    // whole repository directory to 0700 and every unrelated file in it stayed put but newly
-    // hidden -- a permission fact meka never established and cannot restore. Observed.
-    // Consulted only by the Unix mode-tightening branch below; there is no mode to tighten
-    // elsewhere, so computing it on those targets is dead work the compiler rightly flags.
+    // not: with a dotfile manager's `~/dotfiles/config.toml`, one `meka mcp disable` would re-mode
+    // the whole repository directory to 0700, leaving every unrelated file in it newly hidden, a
+    // permission fact meka never established and cannot restore. Consulted only by the Unix
+    // mode-tightening branch below; there is no mode to tighten elsewhere, so computing it on
+    // those targets is dead work the compiler rightly flags.
     #[cfg(unix)]
     let redirected = resolved.as_path() != path;
     let path = resolved.as_path();
@@ -251,13 +251,11 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     })?;
     // Unique per writer, and created exclusively. A fixed `<file>.tmp` is shared by every writer of
     // the same path: both `open(O_TRUNC)` the same inode, both write from offset zero, and whoever
-    // renames last publishes a byte-level splice of two documents as a success. Reproduced -- 4 MiB
-    // of one body with 64 KiB of another laid over its front, renamed into place, `Ok(())` returned
-    // to both. The pid separates processes and the counter separates threads within one;
-    // `create_new` is what makes the pair a guarantee rather than a strong hope.
-    //
-    // `write_file_bytes` in `crate::tools::file` already carried the pid half of this for the same
-    // reason. This is the primitive every *store* writes through, and it had neither half.
+    // renames last publishes a byte-level splice of two documents as a success (4 MiB of one body
+    // with 64 KiB of another laid over its front, renamed into place, `Ok(())` returned to both).
+    // The pid separates processes and the counter separates threads within one; `create_new` is
+    // what makes the pair a guarantee rather than a strong hope. `write_file_bytes` in
+    // `crate::tools::file` carries the same pair for the same reason.
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -296,7 +294,7 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
     // An existing file keeps whatever mode it had, *narrowed* to at most 0600.
     //
     // Two failures meet here and only this rule avoids both. Handing the target the temp's fresh
-    // 0600 unconditionally re-moded a file meka did not create, which is wrong for a `config.toml`
+    // 0600 unconditionally re-modes a file meka did not create, which is wrong for a `config.toml`
     // a dotfile manager owns. But simply carrying the existing mode across is worse: it leaves a
     // hand-written `headers = { Authorization = "Bearer sk-..." }` sitting in a world-readable file
     // after any ordinary `meka mcp` edit, because the write follows the symlink out of meka's 0700
@@ -311,8 +309,7 @@ pub(crate) fn write_file_atomic(path: &Path, content: &str) -> std::io::Result<(
         let narrowed = existing_mode & 0o600;
         if narrowed != existing_mode {
             tracing::warn!(
-                "tightening '{path}' from {existing_mode:o} to {narrowed:o}: meka writes credentials through this path and \
-                 will not leave them group- or world-readable",
+                "tightening '{path}' from {existing_mode:o} to {narrowed:o}; it may hold credentials",
                 path = path.display()
             );
         }
@@ -368,10 +365,10 @@ pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
 pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
-/// Restrict a path's permissions on Unix. Best-effort: if the call fails we log and continue,
-/// because on some mounts (`/tmp` under specific overlay setups, NFS without proper support, etc.)
-/// `chmod` returns `EPERM`/`EROFS` and refusing to open the session is a strictly worse failure
-/// than leaving the file at the umask-derived mode.
+/// Restrict a path's permissions on Unix. Best-effort: a failure is logged, because on some mounts
+/// (`/tmp` under some overlay setups, NFS without proper support) `chmod` returns `EPERM` or
+/// `EROFS`, and refusing to open the store is a strictly worse failure than leaving the file at
+/// the umask-derived mode.
 #[cfg(unix)]
 pub(crate) fn restrict_permissions(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -408,16 +405,15 @@ pub(crate) const STORE_LOCK_FILE: &str = ".meka-store.lock";
 /// `config::open_config_lock_target` gives; Windows alone still needs a file.
 ///
 /// A skill write is read-modify-write: read `SKILL.md`, compose the new contents from what was
-/// read, write it back. Nothing else serializes them across processes. `config.toml` has had
-/// [`crate::config::lock_config_file`] and sessions have `FileLock`; the store an agent writes to
-/// constantly had an in-process mutex at best. Two `meka skill add` runs, or `meka serve` racing a
-/// CLI edit, therefore each read the same file and the loser's change vanished with both reporting
-/// success. Memory needs none of this now: its write is one statement in one transaction, and
-/// SQLite serializes writers across processes.
+/// read, write it back. Nothing else serializes them across processes: `config.toml` has
+/// [`crate::config::lock_config_file`] and sessions have `FileLock`, and without this two
+/// `meka skill add` runs, or `meka serve` racing a CLI edit, each read the same file and the
+/// loser's change vanishes with both reporting success. Memory needs none of this: its write is
+/// one statement in one transaction, and SQLite serializes writers across processes.
 ///
-/// Unique temp names in [`crate::fs::write_file_atomic`] stopped the *splice*, where the
-/// published file was a mixture of two documents. They cannot stop a lost update, because both
-/// writers are behaving correctly at the file level and simply disagree about what was there.
+/// Unique temp names in [`crate::fs::write_file_atomic`] stop the *splice*, where the published
+/// file is a mixture of two documents. They cannot stop a lost update, because both writers are
+/// behaving correctly at the file level and simply disagree about what was there.
 pub(crate) struct StoreLock {
     _lock: crate::fs::PathLock,
 }
@@ -431,11 +427,11 @@ pub(crate) struct StoreLock {
 /// that wants to nest needs the depth counting [`crate::config::ConfigFileLock`] does.
 pub(crate) fn lock_store(root: &std::path::Path) -> std::io::Result<StoreLock> {
     // 0700 straight from `mkdir(2)`, matching [`crate::fs::write_file_atomic`]. A plain
-    // `create_dir_all` takes the umask, and this runs *before* that function on every write path --
-    // and is the only thing that runs at all on a delete-only one, such as `skill_delete` or
-    // `DELETE /v1/skills/{name}` against a store that does not exist yet -- so a first-ever write
-    // left `<config>/skills` at 0755 permanently, where the store's own entry names became
-    // listable to every local user.
+    // `create_dir_all` takes the umask, and this runs *before* that function on every write path
+    // (and is the only thing that runs at all on a delete-only one, such as `skill_delete` or
+    // `DELETE /v1/skills/{name}` against a store that does not exist yet), so a first-ever write
+    // would leave `<config>/skills` at 0755 permanently, with the store's own entry names listable
+    // to every local user.
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -486,13 +482,11 @@ pub(crate) fn reject_symlinked_path(path: &Path, noun: &str) -> std::result::Res
             // config directory is something the person running it should hear about once, since
             // they did not put it there by using meka.
             tracing::warn!(
-                "refusing to write through symlinked {noun} path {path}; a symlink can redirect the write \
-                 out of the store",
+                "refusing to write through the symlinked {noun} path {path}",
                 path = path.display()
             );
             Err(format!(
-                "{} path {} is a symlink; refusing to write through it, because it could leave \
-                 the store meka owns",
+                "{} path {} is a symlink; refusing to write through it",
                 noun,
                 path.display()
             ))
@@ -517,8 +511,8 @@ pub(crate) struct FileLock {
 /// Open `path` (creating it) and take its exclusive `flock`.
 ///
 /// `Ok(None)` means somebody else holds it; an `Err` means the question could not be asked at all
-/// -- an unwritable lock directory, descriptors exhausted -- which is a different answer and
-/// callers treat it differently.
+/// (an unwritable lock directory, descriptors exhausted), which is a different answer and callers
+/// treat it differently.
 ///
 /// A free function rather than a method because two stores need it: [`crate::store::Store`] locks
 /// conversations, [`crate::store::TokenStore`] locks accounts, and both live in the same

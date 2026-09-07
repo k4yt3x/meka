@@ -96,8 +96,6 @@ pub(crate) fn format_todo_state(state: &TodoState) -> String {
         return "(no tasks)\n".to_string();
     }
 
-    // Heading is `TODO: <title>` (defensive fallback when somehow absent), followed by a blank line
-    // and the tasks as a markdown checklist.
     let title = state.title.as_deref().unwrap_or("Tasks");
     let mut output = format!("TODO: {title}\n\n");
 
@@ -119,8 +117,8 @@ pub(crate) fn format_todo_state(state: &TodoState) -> String {
         }
     }
 
-    // Soft-invariant footer: report violations of the "exactly one in_progress" convention without
-    // blocking the call. The model self-corrects on its next update.
+    // The "exactly one in_progress" convention is reported, not enforced: the model corrects it on
+    // its next update, and refusing the call would lose the edit it just made.
     let in_progress: Vec<usize> = state
         .items
         .iter()

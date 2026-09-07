@@ -92,8 +92,8 @@ fn run_add(
     let existing = config::load_config_file_or_err()?;
     if existing.profiles.contains_key(name) {
         anyhow::bail!(
-            "a profile named '{name}' already exists. Use `meka profile set {name} <key> <value>` \
-             to change it, or `meka profile remove {name}` first."
+            "a profile named '{name}' already exists; change it with `meka profile set {name} <key> \
+             <value>`"
         );
     }
 
@@ -103,7 +103,7 @@ fn run_add(
     };
     let Some(account) = existing.accounts.get(&account_name) else {
         anyhow::bail!(
-            "{}. Run `meka account add {account_name}` first.",
+            "{}; create it with `meka account add {account_name}`",
             crate::text::unknown_name("account", &account_name, existing.accounts.keys())
         );
     };
@@ -149,7 +149,7 @@ fn run_add(
 fn prompt_account(config_file: &config::ConfigFile) -> anyhow::Result<String> {
     let names: Vec<&str> = config_file.accounts.keys().map(String::as_str).collect();
     match names.as_slice() {
-        [] => anyhow::bail!("no accounts configured. Run `meka account add <name>` first."),
+        [] => anyhow::bail!("no accounts configured; create one with `meka account add <name>`"),
         [only] => {
             let input = prompt_line(&format!("Account [{only}]: "))?;
             Ok(if input.is_empty() {
@@ -161,7 +161,7 @@ fn prompt_account(config_file: &config::ConfigFile) -> anyhow::Result<String> {
         _ => {
             let input = prompt_line(&format!("Account ({}): ", names.join(", ")))?;
             if input.is_empty() {
-                anyhow::bail!("an account is required; pass --account <name>");
+                anyhow::bail!("an account is required; pass `--account <name>`");
             }
             Ok(input)
         }
@@ -212,9 +212,8 @@ async fn run_remove(name: &str, store: &crate::store::Store) -> anyhow::Result<(
     // and is visible at the default verbosity.
     if was_default && remaining.len() > 1 {
         tracing::warn!(
-            "'{name}' was the default profile, so `default_profile` is now unset and no profile \
-             is picked for a new session. Run `meka profile use <name>` to choose one of: \
-             {remaining}",
+            "'{name}' was the default profile, so `default_profile` is now unset; pick one of \
+             {remaining} with `meka profile use <name>`",
             remaining = remaining.join(", ")
         );
     }
@@ -225,8 +224,8 @@ async fn run_remove(name: &str, store: &crate::store::Store) -> anyhow::Result<(
     match store.count_sessions_on_profile(name).await {
         Ok(0) => {}
         Ok(pinned) => tracing::warn!(
-            "{pinned} session(s) run on '{name}' and will refuse to resume until it is configured \
-             again. Move one with `meka -r <id> --profile <name>`"
+            "{pinned} session(s) run on '{name}' and will refuse to resume; move one with \
+             `meka -r <id> --profile <name>`"
         ),
         // Not worth failing the removal over: the profile is already gone, and this is advisory.
         Err(error) => tracing::warn!("failed to count sessions on '{name}': {error}"),
@@ -291,15 +290,13 @@ fn parse_profile_value(key: &str, value: &str) -> anyhow::Result<toml_edit::Valu
         "max_request_bytes" => integer("max_request_bytes"),
         "redact_thinking" => boolean("redact_thinking"),
         "thinking" => {
-            let mode = value.parse::<crate::config::ThinkingMode>().map_err(|_| {
-                anyhow::anyhow!(
-                    "'{value}' is not a thinking mode. Expected adaptive, budgeted, or off."
-                )
-            })?;
+            let mode = value
+                .parse::<crate::config::ThinkingMode>()
+                .map_err(anyhow::Error::msg)?;
             Ok(toml_edit::Value::from(mode.name()))
         }
         other => anyhow::bail!(
-            "'{}' is not a profile setting. Settable: {}.{}",
+            "'{}' is not a profile setting (settable: {}).{}",
             other,
             SETTABLE_PROFILE_KEYS.join(", "),
             unsettable_key_hint(other)
@@ -315,10 +312,10 @@ fn parse_profile_value(key: &str, value: &str) -> anyhow::Result<toml_edit::Valu
 fn unsettable_key_hint(key: &str) -> String {
     match key {
         "account" => " Changing `account` would move every session on this profile onto another \
-             credential, and possibly another backend; add a profile on that account instead."
+             credential; add a profile on that account instead."
             .to_string(),
         "backend" | "base_url" | "oauth_token_url" | "client_id" | "device_id" => {
-            format!(" `{key}` is an account setting, under [accounts.<name>] in config.toml.")
+            format!(" `{key}` is an account setting, under `[accounts.<name>]`.")
         }
         _ => String::new(),
     }
@@ -425,8 +422,8 @@ fn refuse_an_inert_key(
         return Ok(());
     }
     anyhow::bail!(
-        "profile '{name}' is on account '{account}', whose backend '{backend}' never sends '{key}'. \
-         Nothing was written."
+        "profile '{name}' bills '{account}', a '{backend}' account, which never sends `{key}`; \
+         nothing was written"
     )
 }
 
@@ -440,7 +437,7 @@ fn ensure_settable_key(key: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "'{}' is not a profile setting. Settable: {}.{}",
+        "'{}' is not a profile setting (settable: {}).{}",
         key,
         SETTABLE_PROFILE_KEYS.join(", "),
         unsettable_key_hint(key)
@@ -554,7 +551,6 @@ fn run_list(format: crate::cli::OutputFormat) -> anyhow::Result<()> {
             ]
         })
         .collect();
-    // Requested data goes to stdout via the shared column formatter, matching `meka mcp list`.
     crate::render::write_stdout(crate::text::format_columns(
         &["Name", "Account", "Backend", "Model", "Default"],
         &rows,
@@ -573,8 +569,7 @@ fn report_broken_profiles(config_file: &config::ConfigFile) {
         && !config_file.profiles.contains_key(default)
     {
         crate::streams::write_stderr_line(format!(
-            "`default_profile` names '{}', and {}. Run `meka profile use <name>` to point it at \
-             one of the profiles above.",
+            "`default_profile` names '{}': {}; point it at one with `meka profile use <name>`",
             crate::text::sanitize_for_display(default),
             crate::text::unknown_name(
                 "profile",
@@ -589,7 +584,7 @@ fn report_broken_profiles(config_file: &config::ConfigFile) {
         if !config_file.accounts.contains_key(&profile.account) {
             let account = crate::text::sanitize_for_display(&profile.account);
             crate::streams::write_stderr_line(format!(
-                "profile '{name}': {}. Run `meka account add {account}`.",
+                "profile '{name}': {}; create it with `meka account add {account}`",
                 crate::text::unknown_name("account", &account, config_file.accounts.keys())
             ));
         }
@@ -601,15 +596,12 @@ fn report_broken_profiles(config_file: &config::ConfigFile) {
 /// Narrow a profile's `u64` setting to the `i64` a TOML integer actually is.
 ///
 /// TOML has one integer type and it is signed 64-bit, so a `u64` past `i64::MAX` has no
-/// representation at all. `as i64` wrapped it silently: `profile add x --context-window
-/// 18446744073709551615` wrote `context_window = -1` and exited 0, after which every meka command
-/// refused the file with `invalid value: integer -1, expected u64` -- including the `profile set`
-/// that would have repaired it, leaving `profile remove` or a hand-edit as the only way out.
-/// Refused here, before anything is written.
+/// representation at all; `as i64` would wrap it silently into a file every later command refuses,
+/// the `profile set` that would repair it included.
 fn toml_integer(field: &str, value: u64) -> anyhow::Result<i64> {
     i64::try_from(value).map_err(|_| {
         anyhow::anyhow!(
-            "{} must be at most {}, the largest integer TOML can represent; got {}",
+            "{} must be at most {} (the largest TOML integer), got {}",
             field,
             i64::MAX,
             value
@@ -725,8 +717,8 @@ fn write_profile(
         .is_some()
     {
         anyhow::bail!(
-            "a profile named '{name}' already exists. Use `meka profile set {name} <key> <value>` \
-             to change it, or `meka profile remove {name}` first."
+            "a profile named '{name}' already exists; change it with `meka profile set {name} <key> \
+             <value>`"
         );
     }
     let before = document.to_string();
@@ -782,7 +774,7 @@ fn set_default_profile(name: &str) -> anyhow::Result<()> {
 ///
 /// Only the still-unset ones are named: stating a default for something the flags set would
 /// contradict the file this same command is about to write. Split out from the prompt so the
-/// composition is testable without stdin - the prompt is the one part of `resolve_tuning` a test
+/// composition is testable without stdin: the prompt is the one part of `resolve_tuning` a test
 /// cannot drive.
 fn unset_defaults_summary(
     tuning: &ProfileTuning,
@@ -810,7 +802,7 @@ fn unset_defaults_summary(
 /// The one flag-only setting that is also prompted for, and only in the case that creates it. A
 /// budget means nothing under `adaptive` (the default) or `off`, which send no `budget_tokens` at
 /// all, so asking unconditionally would put a fourth question in front of every user to serve the
-/// one who just answered "budgeted" -- and that user needs it now, because this is where the
+/// one who just answered "budgeted", and that user needs it now, because this is where the
 /// `max_output_tokens` pairing starts to matter.
 ///
 /// Split out from the prompt for the reason [`unset_defaults_summary`] is: the prompt itself is the
@@ -861,8 +853,7 @@ fn resolve_tuning(
     }
     if !dropped.is_empty() {
         tracing::warn!(
-            "ignoring {dropped} for a profile on a '{backend}' account: that backend never sends \
-             the field",
+            "ignoring {dropped}: a '{backend}' account never sends the field",
             dropped = dropped.join(", ")
         );
     }
@@ -875,7 +866,8 @@ fn resolve_tuning(
     if !prompt_yes_no("Configure advanced settings? [y/N]: ")? {
         if let Some(defaults) = unset_defaults_summary(&flags, takes_thinking, effective_window) {
             crate::streams::write_stderr_line(format!(
-                "Using defaults: {defaults}. Change these under [profiles.{profile_name}] in config.toml.",
+                "Using defaults: {defaults}; change one with `meka profile set {profile_name} \
+                 <key> <value>`."
             ));
         }
         return Ok(flags);
@@ -890,11 +882,11 @@ fn resolve_tuning(
                 "" => None,
                 // Parsed through the enum's own `FromStr` rather than a fourth hand-written match,
                 // so this prompt accepts exactly what `--thinking` accepts.
-                other => Some(other.parse::<crate::config::ThinkingMode>().map_err(|_| {
-                    anyhow::anyhow!(
-                        "'{other}' is not a thinking mode. Expected adaptive, budgeted, or off."
-                    )
-                })?),
+                other => Some(
+                    other
+                        .parse::<crate::config::ThinkingMode>()
+                        .map_err(anyhow::Error::msg)?,
+                ),
             }
         }
     };
@@ -1319,7 +1311,7 @@ model = "untouched"
     /// Reached only through `write_profile` and `run_set`, which both touch the real config path,
     /// so nothing exercised it: `cargo mutants` replaced the whole function with `Ok(())` and the
     /// suite stayed green. It is a pure function of the two documents and a name, so it does not
-    /// need the filesystem to be tested -- only to be called.
+    /// need the filesystem to be tested, only to be called.
     #[test]
     fn a_profile_that_could_not_start_is_refused_by_both_write_doors() {
         let good = "[accounts.work]\nbackend = \"anthropic-messages\"\n\n[profiles.work]\naccount = \
@@ -1595,7 +1587,7 @@ account = "work"
     /// These never pass through a prompt, so the writer is the only thing standing between the
     /// flag and the file: a missing `insert` would make `--vision false` exit 0 and change nothing,
     /// and the profile would keep advertising images the model cannot take. The absent half matters
-    /// for the reason the sibling test gives -- an unstated key follows the documented default, and
+    /// for the reason the sibling test gives: an unstated key follows the documented default, and
     /// writing it eagerly would freeze today's default into every profile.
     #[test]
     fn the_flag_only_settings_reach_the_profile_and_only_when_given() {

@@ -269,6 +269,6 @@ Press **Ctrl+C** while the agent is running to interrupt it. Presses escalate:
 
 1. The first press cancels the current turn: the request in flight is dropped and any shell command the turn spawned is killed. Background tasks keep running, because a keystroke aimed at the answer on screen should not lose a twenty-minute build.
 2. A second press during the same turn stops every running background task, records each as canceled, and says how many it stopped.
-3. A third press prints `interrupted`, gives the canceled work up to two seconds to unwind, and exits with status 130.
+3. A third press prints `(interrupted)`, gives the canceled work up to two seconds to unwind, and exits with status 130.
 
 The count starts over with each new turn, so the first press of the next turn cancels that turn whatever happened during the last one. At an idle prompt Ctrl+C clears the line instead.

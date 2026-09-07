@@ -16,9 +16,8 @@ pub(super) fn landlock_probe_from_abi(abi: Option<i32>) -> BackendProbe {
         }
         Some(abi_version) => BackendProbe::Missing {
             reason: format!(
-                "Landlock ABI v{abi_version} is too old to write-protect the filesystem: truncate(2) is \
-                 unmediated below v{MIN_LANDLOCK_ABI} (needs Linux 6.2+), so a command at `read` could still empty \
-                 an existing file",
+                "Landlock ABI v{abi_version} leaves truncate(2) unrestricted; v{MIN_LANDLOCK_ABI} \
+                 (Linux 6.2+) is required",
             ),
         },
         None => BackendProbe::Missing {
@@ -79,7 +78,7 @@ pub(crate) unsafe fn apply_landlock(
     writable: &[std::ffi::CString],
 ) -> Result<(), i32> {
     unsafe {
-        // PR_SET_NO_NEW_PRIVS is required for unprivileged Landlock usage
+        // `PR_SET_NO_NEW_PRIVS` is required for unprivileged Landlock use.
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             return Err(*libc::__errno_location());
         }
@@ -100,7 +99,6 @@ pub(crate) unsafe fn apply_landlock(
             return Err(*libc::__errno_location());
         }
 
-        // Allow read + execute for the entire filesystem
         let root_fd = libc::open(c"/".as_ptr(), libc::O_PATH | libc::O_CLOEXEC);
         if root_fd < 0 {
             // `close(2)` is permitted to set `errno` even on success, so read the failure reason
@@ -132,13 +130,9 @@ pub(crate) unsafe fn apply_landlock(
         }
         libc::close(root_fd);
 
-        // `/dev/null` is writable in every confinement, including read-only.
-        //
-        // The other two Unix backends already do this and say why: the macOS profile calls
-        // `/dev/null` writes "universally legitimate for shell redirects", and Bubblewrap's
-        // `--dev /dev` supplies a writable one. Landlock granted neither, so `cmd 2>/dev/null`
-        // failed with a bare "Permission denied" under this backend alone. That is a redirect
-        // discards output; it is not a write to the machine, and refusing it confines nothing.
+        // `/dev/null` is writable in every confinement, including read-only, as it is under the
+        // macOS profile and Bubblewrap's `--dev /dev`: `cmd 2>/dev/null` discards output rather
+        // than writing to the machine, and refusing it confines nothing.
         let dev_null_fd = libc::open(c"/dev/null".as_ptr(), libc::O_PATH | libc::O_CLOEXEC);
         if dev_null_fd >= 0 {
             let path_beneath = LandlockPathBeneathAttr {
@@ -222,7 +216,7 @@ pub(super) fn handled_access_for_abi(abi_version: i32) -> u64 {
     if abi_version >= 3 {
         access |= LANDLOCK_ACCESS_FS_TRUNCATE;
     }
-    // ABI v4 added network access flags (BIND_TCP, CONNECT_TCP), not filesystem flags
+    // ABI v4 added only network flags.
     if abi_version >= 5 {
         access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
     }
@@ -242,7 +236,6 @@ pub(super) fn scoped_for_abi(abi_version: i32) -> u64 {
         0
     }
 }
-// Landlock constants
 pub(super) const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 pub(super) const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 pub(super) const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
@@ -270,7 +263,6 @@ pub(super) const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 pub(super) const LANDLOCK_ACCESS_FS_RESOLVE_UNIX: u64 = 1 << 16;
 pub(super) const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 pub(super) const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
-// Landlock kernel structs (stack-allocated, no heap)
 #[repr(C)]
 pub(super) struct LandlockRulesetAttr {
     pub(super) handled_access_fs: u64,
@@ -311,11 +303,8 @@ mod tests {
             CString::new(std::os::unix::ffi::OsStrExt::as_bytes(work.as_os_str()))
                 .expect("cstring"),
         ];
-        // The exit code carries the result, so `status.success()` is an assertion rather than a
-        // formality. The script must not end in `; true`, which makes "the confined shell itself
-        // must run" pass whatever happened inside it: a ruleset denying every write and one
-        // allowing every write produce the same success. Only the two `exists()` checks below were
-        // doing any work.
+        // The exit code carries the result: ending the script in `; true` would make a ruleset
+        // denying every write and one allowing every write produce the same success.
         let script = format!(
             "echo in > {}/inside.txt 2>/dev/null || exit 3\n\
              if echo out > {}/escaped.txt 2>/dev/null; then exit 4; fi\n\
@@ -377,11 +366,8 @@ mod tests {
         );
     }
 
-    /// `2>/dev/null` works under Landlock, as it already did under Bubblewrap and Seatbelt.
-    ///
-    /// It did not before: Landlock granted only read and execute on `/`, so the redirect failed
-    /// with a bare "Permission denied" and every `cmd 2>/dev/null` in an agent's shell broke on
-    /// this backend alone. Discarding output is not a write to the machine.
+    /// `2>/dev/null` works under Landlock, as it does under Bubblewrap and Seatbelt: discarding
+    /// output is not a write to the machine.
     #[test]
     fn discarding_output_to_dev_null_is_permitted_in_every_confinement() {
         let Some(abi) = super::landlock_abi().filter(|abi| *abi >= super::MIN_LANDLOCK_ABI) else {
@@ -389,11 +375,8 @@ mod tests {
             return;
         };
 
-        // Both root lists, since the name says "every confinement" and the body tested one.
-        // `&[]` is the `read` level; a real root is `workspace`. `/dev/null` is granted by its own
-        // rule rather than by the roots, so it has to hold under both -- and a rule that
-        // only worked when the root list happened to be empty would pass with a single root
-        // list.
+        // Both root lists: `&[]` is the `read` level, a real root is `workspace`. `/dev/null` is
+        // granted by its own rule rather than by the roots, so it has to hold under both.
         let temp = tempfile::tempdir().expect("tempdir");
         let root = crate::workspace::canonical_for_test(temp.path());
         let workspace_root = [

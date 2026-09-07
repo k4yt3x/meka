@@ -110,9 +110,8 @@ This is the shell's contract, where Ctrl+C signals the foreground process group 
 meka prints what survived so nothing is hidden:
 
 ```text
-Interrupted.
-2 background task(s) still running. Press Ctrl+C again during a turn to stop
-them, or use /tasks.
+(interrupted)
+2 background task(s) still running; stop them with `/tasks cancel --all`.
 ```
 
 A **second** Ctrl+C during the same turn stops them. Between turns, `/tasks cancel --all` is the route.

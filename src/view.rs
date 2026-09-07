@@ -318,7 +318,7 @@ pub(crate) struct GateView {
     pub(crate) check: Option<String>,
     /// `shell` or `tool`.
     pub(crate) kind: String,
-    /// The fire condition, as `changed`, `succeeded`, `matches /…/` or `/pointer not-empty`.
+    /// The fire condition, as `changed`, `succeeded`, `matches /…/` or `/pointer not_empty`.
     pub(crate) when: String,
 }
 

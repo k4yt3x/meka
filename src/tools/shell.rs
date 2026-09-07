@@ -26,10 +26,10 @@ const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Factored out of the spawn so the ordering rule below is testable without a live child. Order is
 /// the whole correctness argument here and it is invisible in the resulting mount namespace: bwrap
 /// applies operations onto the new root in sequence and the last one to touch a path wins, so a
-/// bind placed before the tmpfs masks is silently undone by them. A workspace under `/tmp` -- where
-/// every test fixture and a fair number of real scratch directories live -- would come out
-/// read-only with no error from bwrap, no error from meka, and a level that quietly confines the
-/// shell to nothing.
+/// bind placed before the tmpfs masks is silently undone by them. A workspace under `/tmp` (where
+/// every test fixture and a fair number of real scratch directories live) would come out read-only
+/// with no error from bwrap, no error from meka, and a level that quietly confines the shell to
+/// nothing.
 #[cfg(target_os = "linux")]
 fn bwrap_args(
     writable: &[std::path::PathBuf],
@@ -76,28 +76,23 @@ fn bwrap_args(
 
     // The working directory, read-only, after the masks and before the writable binds.
     //
-    // Without it a session whose cwd is under a masked directory lost the directory entirely, and
+    // Without it a session whose cwd is under a masked directory loses the directory entirely, and
     // bwrap's fallback is silent: `Command::current_dir` chdirs before `execve`, bwrap cannot
-    // re-enter that path inside the new root, and it lands the child in `$HOME` instead. Measured
-    // at `read` with a cwd under `/tmp`: `pwd` reported the user's home directory, `ls .` listed
-    // `.ssh` and `.config`, the workspace was unreachable even by absolute path, and the command
-    // exited 0 with empty stderr. Meanwhile `read_file` and `search_contents` run in-process and
-    // saw the real files, so the model was handed two contradictory views of one session.
+    // re-enter that path inside the new root, and it lands the child in `$HOME` instead, while
+    // `read_file` and `search_contents` run in-process and see the real files.
     //
-    // Read-only because this is the `read`-level fix: a writable root that happens to be the cwd is
-    // bound read-write by the loop below, and a later mount wins.
+    // Read-only because a writable root that happens to be the cwd is bound read-write by the loop
+    // below, and a later mount wins.
     //
-    // Skipped when the cwd *is* a masked directory, or an ancestor of one, because the same
-    // last-mount-wins rule that makes this fix work would otherwise undo every mask above it.
-    // Measured against real bwrap: with the bind unconditional, a session at `/tmp` saw 1330 host
-    // entries instead of 0 and could reach the tmux socket; at `$XDG_RUNTIME_DIR` it reached the
-    // session bus; at `/` it saw 455 host PIDs instead of 4, defeating `--unshare-pid` as well.
-    // That is the escape `is_system_root` exists to prevent, arriving through the one door it does
-    // not guard: it filters the *writable roots*, and the cwd is bound whether or not it is one.
+    // Skipped when the cwd is a masked directory, or an ancestor of one, because the same
+    // last-mount-wins rule would otherwise undo every mask above it: a session at `/tmp` would see
+    // the host's tmux socket, one at `$XDG_RUNTIME_DIR` the session bus, and one at `/` the host's
+    // PIDs. That is the escape `is_system_root` exists to prevent, arriving through the one door it
+    // does not guard: it filters the writable roots, and the cwd is bound whether or not it is one.
     //
     // Nothing is lost by skipping it. `--chdir` below is unconditional, and a masked directory
     // still exists inside the sandbox as the empty tmpfs, so the child lands there and sees what
-    // the mask intends rather than being relocated to `$HOME`. A path merely *under* a mask
+    // the mask intends rather than being relocated to `$HOME`. A path merely under a mask
     // (`/tmp/work`) is not a masked root, so it still gets its bind and still works.
     if !crate::workspace::is_system_root(cwd) {
         args.push("--ro-bind-try".into());
@@ -106,11 +101,11 @@ fn bwrap_args(
     }
 
     for root in writable {
-        // `--bind-try`, not `--bind`. A root is canonicalised when the confinement is resolved and
+        // `--bind-try`, not `--bind`. A root is canonicalized when the confinement is resolved and
         // mounted a moment later; a concurrent `execute_command` running `rm -rf` on it in between
-        // makes plain `--bind` abort the *whole* spawn with a bwrap error the model cannot act on.
-        // Landlock already degrades correctly here -- it skips a root it cannot open rather than
-        // failing the command -- and this is the same rule spelled in bwrap's own vocabulary.
+        // makes plain `--bind` abort the whole spawn with a bwrap error the model cannot act on.
+        // Landlock already degrades the same way (it skips a root it cannot open rather than
+        // failing the command), and this is the same rule spelled in bwrap's own vocabulary.
         args.push("--bind-try".into());
         args.push(root.into());
         args.push(root.into());
@@ -246,28 +241,27 @@ impl Tool for ExecuteCommandTool {
         let sandboxed = confinement.is_sandboxed();
 
         // `[shell].sandbox = false` unconfines every level. That is right for the levels that never
-        // promised a boundary and wrong for `workspace`, whose entire meaning is one. Left alone it
-        // ran the shell with no confinement while the file tools stayed fenced, so a single config
-        // key made the level mean two different things and the weaker meaning was the silent one.
+        // promised a boundary and wrong for every level that did: left alone it would run the shell
+        // with no confinement while the file tools stayed fenced, so one config key would make the
+        // level mean two different things and the weaker meaning would be the silent one.
         //
         // Refused rather than hidden. `required_permission` cannot hide it: `Workspace.allows` is
         // true for everything by design, because scope is meant to be enforced at the door rather
         // than by withholding tools. Refusing at that door is the same shape as the write fence,
-        // and it can say what to do about it where a missing tool could not. Any level that
-        // promises confinement, not just `workspace`.
+        // and it can say what to do about it where a missing tool could not.
         //
-        // `unrestricted` is the only level whose *intent* is `Unconfined`; every other level
-        // reaching an unconfined spawn is a configuration that cannot deliver what the level says.
-        // Keyed on `workspace` alone, the sibling case stayed open: `[tools.tool_permissions]`
-        // overrides a tool's required level with no floor, so `execute_command = "read"` plus
-        // `[shell].sandbox = false` ran a plain `sh -c` at `read` -- with the full parent
-        // environment, since the scrub is gated on `sandboxed` too.
+        // `unrestricted` is the only level whose intent is `Unconfined`; every other level reaching
+        // an unconfined spawn is a configuration that cannot deliver what the level says. Keyed on
+        // `workspace` alone, the sibling case stays open: `[tools.tool_permissions]` overrides a
+        // tool's required level with no floor, so `execute_command = "read"` plus `[shell].sandbox
+        // = false` would run a plain `sh -c` at `read`, with the full parent environment, since the
+        // scrub is gated on `sandboxed` too.
         if permission != Permission::Unrestricted && !sandboxed {
             return Err(MekaError::ToolExecution {
                 tool_name: "execute_command".to_string(),
-                message: "[shell].sandbox = false leaves nothing to confine this command, \
-                          which `workspace` requires. `unrestricted` runs it without a boundary; \
-                          otherwise re-enable [shell].sandbox in the config."
+                message: "`[shell].sandbox = false` leaves nothing to confine this command, which \
+                          every level below `unrestricted` requires; set `[shell].sandbox = true` \
+                          or run at `unrestricted`"
                     .to_string(),
             });
         }
@@ -282,9 +276,8 @@ impl Tool for ExecuteCommandTool {
                 // level whose confinement is `Unconfined` and so never reaches this branch.
                 #[cfg(target_os = "linux")]
                 let message = format!(
-                    "configured sandbox backend ({}) is unavailable: {}. \
-                     `unrestricted` runs shell commands without a sandbox; otherwise \
-                     update [shell].sandbox_backend in the config.",
+                    "configured sandbox backend ({}) is unavailable: {}; set \
+                     `[shell].sandbox_backend` to another backend or run at `unrestricted`",
                     self.sandbox_backend, reason
                 );
                 #[cfg(not(target_os = "linux"))]
@@ -429,10 +422,9 @@ impl Tool for ExecuteCommandTool {
         // Unix: place the child in its own session/process group via `setsid` so timeouts and
         // cancellation can kill the whole tree (including backgrounded grandchildren such as
         // `(sleep 3600 &)`) via `kill(-pgid, …)`. On Linux the Landlock setup runs in the same
-        // closure; `pre_exec` overwrites rather than chains, so we fold both steps into one.
-        // Landlock is applied ONLY for the Landlock capability; under Bubblewrap, the `--ro-bind /`
-        // mount layer already enforces "no writes" and layering both is fragile to test across
-        // kernels.
+        // closure, because `pre_exec` overwrites rather than chains. Landlock is applied only for
+        // the Landlock capability; under Bubblewrap, the `--ro-bind /` mount layer already
+        // enforces "no writes" and layering both is fragile to test across kernels.
         #[cfg(unix)]
         {
             // Built here, in the parent, because `pre_exec` runs after `fork` in a single-threaded
@@ -480,17 +472,12 @@ impl Tool for ExecuteCommandTool {
         }
 
         // Scrub env before spawn so secrets in the parent process (`ANTHROPIC_API_KEY`, `AWS_*`,
-        // `GITHUB_TOKEN`, …) can't ride along into the child at `read`. Sandboxes block writes/IPC
-        // but leave the network open, so leaked env is a live exfil vector under prompt injection.
-        // `ask` and `unrestricted` keep the full parent environment, and for `ask` that is a
-        // deliberate widening rather than a consequence nobody noticed: this predicate is the same
-        // `sandboxed` flag that decides confinement, so unconfining `ask`'s shell also unscrubbed
-        // it. An approved command therefore reads `ANTHROPIC_API_KEY` and every other parent
-        // secret. That is the chosen semantics -- an approved command should reach as far as an
-        // approved `write_file`, environment included -- and it is what the prompt is buying: the
-        // user has seen the command before it runs. It is stated in `docs/book/src/tools/shell.md`
-        // rather than left to be discovered. The Windows sandboxed branch applies the same scrub
-        // inside its own spawn.
+        // `GITHUB_TOKEN`, …) cannot ride along into a confined child. Sandboxes block writes/IPC
+        // but leave the network open, so leaked env is a live exfiltration vector under prompt
+        // injection. Only `unrestricted` keeps the full parent environment, and an approved command
+        // still runs in its level's sandbox with the scrubbed environment, as
+        // `docs/book/src/tools/shell.md` states. The Windows sandboxed branch applies the same
+        // scrub inside its own spawn.
         #[cfg(unix)]
         if sandboxed {
             command_builder.env_clear();
@@ -579,10 +566,10 @@ impl Tool for ExecuteCommandTool {
 }
 
 /// Terminate the child and, on Unix, its entire process group. Called on timeout and on
-/// cancellation. On Unix we rely on the `setsid()` done in `pre_exec`: the child's pid is also its
-/// pgid, so `kill(-pgid, …)` reaches every backgrounded descendant it spawned (e.g. `(sleep 3600
-/// &)` survives a plain `child.kill()` but is caught here). The fallback `child.kill().await` is a
-/// no-op on Unix once the group has been signaled but still the right primitive on Windows.
+/// cancellation. On Unix the `setsid()` done in `pre_exec` makes the child's pid its pgid, so
+/// `kill(-pgid, …)` reaches every backgrounded descendant it spawned (`(sleep 3600 &)` survives a
+/// plain `child.kill()` but is caught here). The fallback `child.kill().await` is a no-op on Unix
+/// once the group has been signaled but still the right primitive on Windows.
 async fn kill_child_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -595,7 +582,7 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
             let term_result = unsafe { libc::kill(-pgid, libc::SIGTERM) };
             if term_result != 0 {
                 let error = std::io::Error::last_os_error();
-                tracing::debug!("libc::kill(-{pgid}, SIGTERM) failed: {error}");
+                tracing::debug!("failed to send SIGTERM to process group {pgid}: {error}");
             }
             // Brief grace period so well-behaved children can shut down cleanly before SIGKILL
             // lands.
@@ -603,7 +590,7 @@ async fn kill_child_tree(child: &mut tokio::process::Child) {
             let kill_result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             if kill_result != 0 {
                 let error = std::io::Error::last_os_error();
-                tracing::debug!("libc::kill(-{pgid}, SIGKILL) failed: {error}");
+                tracing::debug!("failed to send SIGKILL to process group {pgid}: {error}");
             }
         }
     }
@@ -721,8 +708,8 @@ const CAPTURE_RETENTION: std::time::Duration = std::time::Duration::from_secs(24
 ///
 /// Runs on the overflow path rather than on a timer: an overflow is rare, so this costs a directory
 /// read on the one occasion something is about to be written anyway, and a meka that never
-/// overflows never needs the sweep. Every failure is ignored -- a capture that cannot be removed is
-/// not a reason to fail the command whose output is about to be written beside it.
+/// overflows never needs the sweep. No failure is fatal: a capture that cannot be removed is not a
+/// reason to fail the command whose output is about to be written beside it.
 ///
 /// Matches only meka's own names, so a file someone else left in a shared temp directory is not
 /// meka's to delete.
@@ -771,7 +758,7 @@ async fn sweep_stale_captures(directory: &std::path::Path) {
 ///
 /// Sweeps captures older than [`CAPTURE_RETENTION`] on the way past. These files are named in a
 /// tool result the model has already read, so deleting one is deleting something a resumed session
-/// may still refer to -- but they are 8 MiB or more each and nothing else ever removes them, so a
+/// may still refer to, but they are 8 MiB or more each and nothing else ever removes them, so a
 /// machine that runs long builds accumulates them until the disk notices. A day is well past the
 /// point where the conversation that produced one is still acting on it.
 async fn capture_path() -> std::path::PathBuf {
@@ -790,8 +777,7 @@ async fn capture_path() -> std::path::PathBuf {
     if let Err(error) = tokio::fs::create_dir_all(&directory).await {
         let path = directory.display();
         tracing::warn!(
-            "failed to create '{path}' for command output capture ({error}); using the temp \
-             directory"
+            "failed to create the capture directory '{path}': {error}; using the temp directory"
         );
         // Swept too, or a host whose cache directory cannot be created accumulates captures
         // there for good: the retention rule holds for whichever directory the captures land in.
@@ -893,7 +879,7 @@ where
                             // The notice below stops naming this file, so nothing would ever come
                             // back for it, and what it holds is a prefix of a stream that kept
                             // going. Leaving up to `MAX_RESIDENT_OUTPUT_BYTES` of it in the cache
-                            // directory after a write failure -- most often a full disk -- is the
+                            // directory after a write failure (most often a full disk) is the
                             // wrong moment to be untidy.
                             if let Err(error) = tokio::fs::remove_file(&path).await {
                                 let path = path.display();
@@ -913,11 +899,10 @@ where
                             .saturating_sub(trim_front_to(&mut content, OUTPUT_WINDOW_BYTES));
                     }
                     // The one crossing of the ceiling. `head` is taken here, before anything can
-                    // fail, because this is the last moment `content` still starts at byte zero --
-                    // and taking it here is what makes it *the* head. Re-entering this arm later
-                    // (which a `None`-on-failure capture allowed, 8 MiB at a time) overwrote it
-                    // with a mid-stream slice, and a capture that opened on the second attempt then
-                    // held only the bytes from that point on while the notice called it complete.
+                    // fail, because this is the last moment `content` still starts at byte zero.
+                    // Re-entering this arm later would overwrite it with a mid-stream slice, and a
+                    // capture that opened on the second attempt would hold only the bytes from
+                    // that point on while the notice called it complete.
                     Capture::NotNeeded if content.len() > MAX_RESIDENT_OUTPUT_BYTES => {
                         head = content[..OUTPUT_WINDOW_BYTES.min(content.len())].to_vec();
                         let path = capture_path().await;
@@ -1656,10 +1641,9 @@ mod tests {
         assert_eq!(result.text_content().trim(), "hello");
     }
 
-    /// Regression test for the orphaned-grandchild bug: a command that backgrounds a long-running
-    /// helper (`(sleep 30 &)`) must have that helper killed when the tool times out, not outlive
-    /// the agent. The child is placed in its own process group via `setsid` so the tool can signal
-    /// the whole tree via `kill(-pgid, …)`.
+    /// A command that backgrounds a long-running helper (`(sleep 30 &)`) must have that helper
+    /// killed when the tool times out, not outlive the agent. The child is placed in its own
+    /// process group via `setsid` so the tool can signal the whole tree via `kill(-pgid, …)`.
     #[cfg(unix)]
     #[tokio::test]
     async fn execute_command_timeout_kills_grandchild() {
@@ -1719,13 +1703,10 @@ mod tests {
     /// here.
     #[tokio::test]
     async fn workspace_refuses_the_shell_when_the_sandbox_is_disabled() {
-        // Every level that promises confinement, not just `workspace`.
-        //
-        // The guard is keyed on "any level that is not `ask` or `unrestricted`" precisely because
-        // narrowing it to `workspace` alone left a hole: `[tools.tool_permissions] execute_command
-        // = "read"` plus `[shell].sandbox = false` ran a plain `sh -c` at `read`, with the full
-        // parent environment since the scrub is gated on the same flag. This test only ever
-        // exercised `workspace`, so narrowing the guard back survived it.
+        // Every level that promises confinement, not just `workspace`: narrowed to `workspace`
+        // alone, `[tools.tool_permissions] execute_command = "read"` plus `[shell].sandbox = false`
+        // would run a plain `sh -c` at `read`, with the full parent environment since the scrub is
+        // gated on the same flag.
         for level in [Permission::None, Permission::Read, Permission::Workspace] {
             refuses_at(level).await;
         }
@@ -1865,8 +1846,8 @@ mod tests {
         let result = tool
             .execute(
                 // 50 000 "x" characters, in each host shell's own vocabulary. The Unix spelling
-                // is POSIX-portable -- `head` and `tr` rather than bash brace expansion, so it
-                // works under `dash` -- and the Windows one is PowerShell, which is the shell
+                // is POSIX-portable (`head` and `tr` rather than bash brace expansion, so it
+                // works under `dash`) and the Windows one is PowerShell, which is the shell
                 // `execute_command` actually invokes there.
                 serde_json::json!({
                     "command": if cfg!(windows) {
@@ -1892,11 +1873,10 @@ mod tests {
         );
     }
 
-    /// Regression test for the stdout/stderr pipe deadlock on Unix: a command writing far more than
-    /// the OS pipe buffer (~64 KiB on Linux) must complete without blocking. Before draining
-    /// stdout/stderr on dedicated tasks that start *before* `child.wait()`, the child blocked in
-    /// `write()`, `wait()` never returned, and the call hit a spurious timeout with truncated
-    /// output.
+    /// A command writing far more than the OS pipe buffer (~64 KiB on Linux) must complete without
+    /// blocking: unless stdout/stderr are drained on dedicated tasks that start before
+    /// `child.wait()`, the child blocks in `write()`, `wait()` never returns, and the call hits a
+    /// spurious timeout with truncated output.
     #[cfg(unix)]
     #[tokio::test]
     async fn execute_command_large_output_no_deadlock() {
@@ -2404,11 +2384,11 @@ mod tests {
         ///
         /// `read` only when the sandbox is both enabled *and* backed by a working backend;
         /// otherwise `unrestricted`, because a command meka cannot confine is a command only the
-        /// boundary-free level may authorize. The conjunction is the whole rule and flipping it to
-        /// `||` survived the suite: the tool would be offered at `read` with `[shell].sandbox =
-        /// false`, or with the sandbox on but no usable backend. The runtime guard in `execute`
-        /// still refuses the command in both cases, so this is a wrong catalog entry rather than an
-        /// escape -- but the catalog is what the model plans against.
+        /// boundary-free level may authorize. The conjunction is the whole rule: flipped to `||`,
+        /// the tool would be offered at `read` with `[shell].sandbox = false`, or with the sandbox
+        /// on but no usable backend. The runtime guard in `execute` still refuses the command in
+        /// both cases, so this is a wrong catalog entry rather than an escape, but the catalog is
+        /// what the model plans against.
         #[test]
         fn the_shell_needs_unrestricted_whenever_nothing_can_confine_it() {
             use crate::{permission::Permission, sandbox::SandboxCapability, tools::Tool};
@@ -2457,13 +2437,11 @@ mod tests {
 
         /// A cwd that *is* a masked directory must not be bound back over its own mask.
         ///
-        /// The cwd bind and the tmpfs masks obey the same rule -- last mount wins -- so the fix
-        /// that made a masked-directory session usable also handed it the host directory. Measured
-        /// against real bwrap before the guard: a session at `/tmp` saw 1330 host entries instead
-        /// of 0 and could `connect()` the tmux socket, one at `$XDG_RUNTIME_DIR` reached the
-        /// session bus, and one at `/` saw 455 host PIDs instead of 4, which defeats
-        /// `--unshare-pid` as well. A read-only bind does not help, because `connect(2)` on a
-        /// socket inode is not a write.
+        /// The cwd bind and the tmpfs masks obey the same rule (last mount wins), so an
+        /// unconditional bind hands a masked-directory session the host directory: a session at
+        /// `/tmp` could `connect()` the tmux socket, one at `$XDG_RUNTIME_DIR` the session bus, and
+        /// one at `/` would see the host's PIDs, defeating `--unshare-pid` as well. A read-only
+        /// bind does not help, because `connect(2)` on a socket inode is not a write.
         ///
         /// `/` is in the table because it is systemd's default working directory for a daemon, so
         /// `meka serve` under a unit file lands there without anyone choosing it.
@@ -2516,14 +2494,13 @@ mod tests {
         /// The child is told which directory to start in, and can read it.
         ///
         /// bwrap's fallback when it cannot enter the pre-`execve` cwd is silent and lands the child
-        /// in `$HOME`. Confirmed against real bwrap with a cwd under `/tmp`: without these
-        /// two arguments `pwd` reported the user's home directory and the workspace was
-        /// unreachable even by absolute path, with exit 0 and empty stderr; with them `pwd`
-        /// is correct, the file reads, and a write is still refused read-only at `read`.
+        /// in `$HOME`: without these two arguments `pwd` reports the user's home directory and the
+        /// workspace is unreachable even by absolute path, with exit 0 and empty stderr; with them
+        /// `pwd` is correct, the file reads, and a write is still refused read-only at `read`.
         ///
         /// The bind sits after the masks and before the writable binds, so a cwd under `/tmp` is
         /// restored, and a cwd that is also a writable root is upgraded to read-write by the loop
-        /// that follows -- last mount wins.
+        /// that follows: last mount wins.
         #[test]
         #[cfg(target_os = "linux")]
         fn the_child_is_given_a_working_directory_it_can_reach() {
@@ -2611,7 +2588,7 @@ mod tests {
             // The "outside" target lives in `$HOME`, not beside the workspace.
             //
             // A sibling under the tempdir is itself under `/tmp`, which the recipe masks with a
-            // tmpfs, so a write there fails with ENOENT -- the directory does not exist inside the
+            // tmpfs, so a write there fails with ENOENT: the directory does not exist inside the
             // namespace at all. That is not the boundary refusing anything, and it would keep
             // passing with the boundary removed. `$HOME` is present and writable outside the
             // sandbox, so a refusal there is the ruleset's doing.
@@ -2755,11 +2732,10 @@ mod tests {
 
     /// `execute_command` at `workspace`, end to end, on a real Unix sandbox.
     ///
-    /// The Linux dialects are each tested through their *helpers* (`bwrap_args`, `apply_landlock`)
-    /// with a hand-built root list, so nothing exercised the wire between `Confinement` and the
-    /// backend. Cutting it -- `bwrap_args(&[])` and `apply_landlock(abi, &[])` -- left the
-    /// whole suite green while making the workspace shell silently read-only, which is the
-    /// level's central promise. The only end-to-end test of this path was `#[cfg(windows)]`.
+    /// The Linux dialects are each tested through their helpers (`bwrap_args`, `apply_landlock`)
+    /// with a hand-built root list, so nothing else exercises the wire between `Confinement` and
+    /// the backend: cut it (`bwrap_args(&[])`, `apply_landlock(abi, &[])`) and the workspace shell
+    /// is silently read-only, which is the level's central promise.
     #[cfg(unix)]
     mod workspace_shell_boundary {
 
@@ -2769,14 +2745,12 @@ mod tests {
 
         #[tokio::test]
         async fn a_workspace_shell_writes_inside_the_root_and_is_refused_outside() {
-            // Every backend this host can actually run, not just the one `detect()` names.
-            //
-            // `detect()` on Linux only consults `probe_landlock`, so it never returns `Bubblewrap`
-            // -- while production resolves the backend through `resolve_sandbox_backend`, which
+            // Every backend this host can actually run, not just the one `detect()` names:
+            // `detect()` on Linux only consults `probe_landlock`, so it never returns `Bubblewrap`,
+            // while production resolves the backend through `resolve_sandbox_backend`, which
             // auto-prefers Bubblewrap whenever `bwrap` probes OK. Testing only what `detect()`
-            // returns therefore left `Confinement::writable() -> bwrap_args` unexercised end to end
-            // on the backend most hosts actually use: the argv could be cut entirely and this
-            // stayed green.
+            // returns would leave `Confinement::writable() -> bwrap_args` unexercised end to end on
+            // the backend most hosts actually use.
             let mut backends = Vec::new();
             let detected = crate::sandbox::detect();
             if !matches!(detected, crate::sandbox::SandboxCapability::Unavailable) {
@@ -2804,9 +2778,8 @@ mod tests {
         /// auto-prefers Bubblewrap whenever `bwrap` probes OK.
         ///
         /// Split behind a `cfg` rather than pushed inline because `SandboxCapability::Bubblewrap`
-        /// is itself `cfg(target_os = "linux")`: this module is `cfg(all(test, unix))`, so
-        /// naming the variant unconditionally compiled here and failed the macOS build with
-        /// `E0599`, which no amount of local Linux testing could have shown.
+        /// is itself `cfg(target_os = "linux")`: this module is `cfg(all(test, unix))`, so naming
+        /// the variant unconditionally fails the macOS build.
         #[cfg(target_os = "linux")]
         fn a_backend_detect_does_not_name() -> Option<crate::sandbox::SandboxCapability> {
             // Deliberately not `sandbox::bwrap_on_path`, which demands a root-owned binary: this

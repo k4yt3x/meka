@@ -9,9 +9,8 @@
 //! materialization because a rebuild must not be able to reinstate content the provider refuses.
 //!
 //! On disk, events are stored row-per-event in the `messages` table; the encoding lives in
-//! `session.rs`'s `encode_event_for_db` / `decode_event_from_row` helpers, behind the
-//! [`crate::store::Store::save_event`] / [`crate::store::Store::load_events`]
-//! API.
+//! `store::sessions`'s `encode_event_for_db` / `decode_event_from_row` helpers, behind the
+//! [`crate::store::Store::save_event`] / [`crate::store::Store::load_events`] API.
 
 use std::collections::HashSet;
 
@@ -24,7 +23,7 @@ use crate::image::ImageSource;
 /// A tool round trip persists its results as a `User` message too, so role alone does not separate
 /// "somebody asked for something" from "the loop is still running". Shared by
 /// [`Conversation::rewind`], which counts turns backwards, and
-/// [`Conversation::ends_on_a_turn_opening`], which asks whether a turn produced anything at all --
+/// [`Conversation::ends_on_a_turn_opening`], which asks whether a turn produced anything at all:
 /// two callers that must agree on where a turn begins.
 fn opens_turn(message: &Message) -> bool {
     message.role == Role::User
@@ -63,8 +62,8 @@ pub(crate) enum Event {
     },
     /// Replaces the images at `images` with [`IMAGE_REDACTION_PLACEHOLDER`], once, so the body
     /// that fit the request budget is the body every later request sends and the cache prefix
-    /// ahead of the newest turn stops moving. Redacting per request instead moved it on every
-    /// send, since each request re-derived the set from scratch.
+    /// ahead of the newest turn stops moving. Redacting per request instead would move it on every
+    /// send, since each request re-derives the set from scratch.
     ///
     /// Tail-relative like [`Self::Repair`], and for the same reason: the producer,
     /// `Agent::run_turn`, records it before appending the round's own messages, so the view it
@@ -102,6 +101,7 @@ pub(crate) struct Conversation {
 }
 
 impl Conversation {
+    /// An empty log.
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -204,10 +204,12 @@ impl Conversation {
         &self.materialized
     }
 
+    /// How many messages the model is about to be shown.
     pub(crate) fn len(&self) -> usize {
         self.materialized.len()
     }
 
+    /// Whether the model is about to be shown nothing.
     pub(crate) fn is_empty(&self) -> bool {
         self.materialized.is_empty()
     }
@@ -229,7 +231,7 @@ impl Conversation {
     }
 
     /// Whether the log ends with an appended message that opened a turn, i.e. a turn got as far as
-    /// its prompt and no further -- no assistant reply, no tool results.
+    /// its prompt and no further: no assistant reply, no tool results.
     ///
     /// `run_turn` uses this to decide whether a failure is safe to withdraw. Counting messages
     /// would not do: both compaction paths and the `InvalidRequest` repair move `len()` under
@@ -237,7 +239,7 @@ impl Conversation {
     ///
     /// **Both halves are load-bearing, and the event half is the subtle one.** A compaction summary
     /// is itself a plain `User` message, so [`Self::replace_for_compaction`] with an empty tail
-    /// leaves a materialized view whose last entry satisfies [`opens_turn`] -- and withdrawing
+    /// leaves a materialized view whose last entry satisfies [`opens_turn`], and withdrawing
     /// *that* would delete the summary standing in for the whole conversation. Requiring a trailing
     /// [`Event::Append`] says "the message on the end is one somebody appended", which a summary
     /// carried by a `CompactBoundary` is not. [`Self::pop_unsaved`] guards its own removal the same
@@ -448,9 +450,8 @@ impl Conversation {
         }
 
         let mut dropped = Vec::with_capacity(dropped_indices.len());
-        // Walk indices in reverse so each `swap_remove`-style remove doesn't invalidate the rest.
-        // Use `remove` (linear) to preserve ordering; the dropped vector is filled in original
-        // order via a post-sort.
+        // Highest index first, so each removal leaves the earlier indices valid; `remove` keeps
+        // the log's order, and the reverse below restores the dropped messages' own.
         let mut to_remove = dropped_indices;
         to_remove.sort_unstable_by(|a, b| b.cmp(a));
         for index in to_remove {
@@ -479,7 +480,7 @@ impl Conversation {
     }
 }
 
-/// The event a materialised message came from.
+/// The event a materialized message came from.
 #[derive(Debug, Clone, Copy)]
 enum Source {
     Append(usize),
@@ -487,7 +488,7 @@ enum Source {
     Repair(usize),
 }
 
-/// One materialised message and where it came from.
+/// One materialized message and where it came from.
 struct Placed {
     message: Message,
     source: Source,
@@ -497,7 +498,7 @@ struct Placed {
 /// Which compaction a summary stands for, as a view of the log reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionMarker {
-    /// How many materialised messages the boundary recorded replacing.
+    /// How many materialized messages the boundary recorded replacing.
     pub(crate) replaced_count: usize,
     /// Which compaction produced it, counting from 1.
     pub(crate) generation: u64,
@@ -509,9 +510,9 @@ pub(crate) struct CompactionMarker {
 /// The one statement of the rules. A boundary replaces everything before it: its producer,
 /// [`Conversation::replace_for_compaction`], records the whole view as `replaced_count`, but that
 /// number was measured against the view in memory, which a resume that dropped orphans has made
-/// shorter than what the store replays. Truncating by the count left the difference standing
-/// above the summary, and every later compaction widened it. A repair is position-relative by
-/// design, since it replaces a trailing run its producer just appended.
+/// shorter than what the store replays. Truncating by the count would leave the difference
+/// standing above the summary, and every later compaction would widen it. A repair is
+/// position-relative by design, since it replaces a trailing run its producer just appended.
 fn replay<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<Placed>, u64) {
     let mut placed: Vec<Placed> = Vec::new();
     let mut generation: u64 = 0;
@@ -723,10 +724,9 @@ impl<'a> IntoIterator for &'a Conversation {
 /// The check uses the *materialized* view so a `CompactBoundary` between an orphan and its would-be
 /// result correctly counts as orphaned.
 fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
-    // Build (event_index, &Message) pairs in materialization order so we can scan adjacency and
-    // report orphan event indices, not just materialized indices. Skip the "previous Append is
-    // gone" case (the event was truncated by a CompactBoundary) since the materialized view never
-    // sees that orphan.
+    // `(event_index, &Message)` pairs in materialization order, so the adjacency scan can report
+    // event indices rather than materialized ones. An `Append` a `CompactBoundary` truncated
+    // away is not visited, since the materialized view never sees that orphan.
     //
     // The index is `None` for messages that don't come from an `Append` event (a repair's
     // replacement). They still take part in the adjacency scan, since a `tool_result` inside one
@@ -785,12 +785,14 @@ fn orphan_event_indices(events: &[Event]) -> Vec<usize> {
     orphan
 }
 
+/// Who a message is from, as every provider's wire spells it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Role {
     User,
     Assistant,
 }
+/// One item of a tool result: text, or an image the tool produced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolResultContent {
@@ -800,16 +802,12 @@ pub(crate) enum ToolResultContent {
 /// The half of a thinking block meka cannot read, and which provider it belongs to.
 ///
 /// The two backends that emit reasoning hand back different things, and the difference decides both
-/// what may be replayed and what the readable half is worth. Holding them as one nullable
-/// `signature` made wrong states representable, and one of them shipped: `chatgpt-subscription`
-/// stored OpenAI's `encrypted_content` in that field, and resuming such a session under Claude
-/// replayed it verbatim as Claude's `signature`, a blob from the wrong cryptosystem presented as
-/// authentication for text it does not authenticate.
-///
-/// The mirror of that was only ever unreachable by omission: the Responses encoder dropped every
-/// thinking block, so nothing Claude wrote could reach OpenAI. This release starts replaying
-/// reasoning there, which is exactly what would have opened the other direction. Naming the two
-/// shapes makes both a type error instead of a thing to remember.
+/// what may be replayed and what the readable half is worth. Held as one nullable `signature`,
+/// wrong states are representable: a `chatgpt-subscription` session's `encrypted_content` resumed
+/// under Claude is replayed verbatim as Claude's `signature`, a blob from the wrong cryptosystem
+/// presented as authentication for text it does not authenticate, and the other direction opens
+/// the moment the Responses encoder replays reasoning. Naming the two shapes makes both a type
+/// error instead of a thing to remember.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum OpaqueReasoning {
@@ -824,6 +822,7 @@ pub(crate) enum OpaqueReasoning {
         id: Option<String>,
     },
 }
+/// One block of a message, in the shape the session store persists and every provider maps from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ContentBlock {
@@ -884,12 +883,14 @@ impl ContentBlock {
             .join("")
     }
 }
+/// One message of the conversation: who sent it and what it carries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Message {
     pub(crate) role: Role,
     pub(crate) content: Vec<ContentBlock>,
 }
 impl Message {
+    /// A user message carrying only `text`.
     pub(crate) fn user(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
@@ -939,6 +940,7 @@ impl Message {
         }
     }
 
+    /// An assistant message carrying only `text`.
     pub(crate) fn assistant_text(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -1007,7 +1009,7 @@ impl Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptRetention {
     /// Keep it. A human typed it and can see the error, or it carries something that exists nowhere
-    /// else -- a background-task outcome, whose row is stamped `delivered` before the turn starts
+    /// else: a background-task outcome, whose row is stamped `delivered` before the turn starts
     /// and is never handed out again.
     Keep,
     /// Withdraw it. A scheduled job's prompt is regenerated from the job on its next occurrence,
@@ -1016,6 +1018,8 @@ pub(crate) enum PromptRetention {
     /// fire for as long as the outage lasted.
     WithdrawOnFailure,
 }
+/// The whole event log as the Markdown `meka session export` writes, compactions and repairs
+/// marked in place.
 pub(crate) fn format_session_as_markdown(
     session_id: uuid::Uuid,
     events: &[Event],
@@ -1087,6 +1091,7 @@ pub(crate) fn format_session_as_markdown(
 
     output
 }
+/// Append one message to a Markdown export, with tool calls and results in collapsible blocks.
 pub(crate) fn write_message_markdown(
     output: &mut String,
     message: &crate::conversation::Message,
@@ -1096,8 +1101,7 @@ pub(crate) fn write_message_markdown(
 
     match message.role {
         crate::conversation::Role::User => {
-            // A "user" message can be either a plain user turn or a tool_results envelope.
-            // Inspect content blocks rather than role to decide.
+            // A `User` message is either a turn or a tool-results envelope; the blocks say which.
             let has_tool_results = message
                 .content
                 .iter()
@@ -1152,6 +1156,7 @@ pub(crate) fn write_message_markdown(
         }
     }
 }
+/// Replace each `<large-output>` tag with the scratchpad entry it names, where one exists.
 pub(crate) fn resolve_large_output_tags(
     text: &str,
     tool_outputs: &std::collections::HashMap<String, String>,

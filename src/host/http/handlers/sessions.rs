@@ -479,18 +479,16 @@ pub(crate) async fn fork_session(
     {
         let detail = match terms.parent {
             Some(parent) => format!(
-                "session '{id}' is a sub-agent of '{parent}', so a copy of it is another \
-                 sub-agent and this endpoint has no live session to return. Read it with \
-                 `GET /v1/sessions/{id}/messages`, or continue the conversation with \
-                 `agent_followup` from '{parent}'."
+                "session '{id}' is a sub-agent of '{parent}', so a copy of it cannot be driven; \
+                 continue it with `agent_followup` from '{parent}'"
             ),
             // `spawn_terms` rather than the parent link, so this names the id the caller sent even
             // for an imported sub-agent. Keyed on the link alone, that case falls through: the copy
             // is made, `ensure_session_loaded` refuses *it*, and the rollback runs, so the caller
             // gets a 422 naming an id it has never seen, for a row that no longer exists.
             None => format!(
-                "session '{id}' is a sub-agent whose parent is not in this store, so nothing here \
-                 can drive it or a copy of it. Read it with `GET /v1/sessions/{id}/messages`."
+                "session '{id}' is a sub-agent whose parent is not in this store, so neither it \
+                 nor a copy of it can be driven"
             ),
         };
         return Err(ProblemDetail::new(
@@ -634,10 +632,8 @@ pub(crate) async fn fork_session(
                 profile: forked_info.profile,
                 title: forked_info.title,
                 // Read back rather than assumed: forking a sub-agent session keeps it under the
-                // same parent, so the copy is a sibling of the original, not a new root. That
-                // sentence was here before the store did it: the copy took a NULL parent, so this
-                // reported one thing and the store held another, and the difference was a
-                // `sessions:w` holder's way around `crate::host::refuse_a_spawned_session`.
+                // same parent, so the copy is a sibling of the original, not a new root, and a
+                // response that said otherwise would disagree with the store.
                 parent_id: forked_info.parent_id,
             },
             last_turn_at: None,
@@ -854,13 +850,13 @@ pub(crate) async fn get_session(
 /// the re-check below conclusive rather than another sample.
 ///
 /// The reconstruction lock answers for *this* process only, so the session lock is taken too. Every
-/// other writer of `sessions.profile` already holds it -- a CLI resume, `/profile`, ACP's
-/// `session/set_config_option`, and this handler's own resident path, which is resident here and so
-/// holds it through the entry -- which makes "you may move a session's profile only while you own
-/// the session" an invariant rather than a coincidence. Without it, a second `meka serve` on the
-/// same store answered `200` for a session the first one was running: the row moved, `GET
-/// /v1/sessions` on *both* reported the new profile, and the host actually holding the session went
-/// on building requests for the old one until eviction. Reproduced over HTTP against two servers.
+/// other writer of `sessions.profile` already holds it (a CLI resume, `/profile`, ACP's
+/// `session/set_config_option`, and this handler's own resident path, which holds it through the
+/// entry), which makes "you may move a session's profile only while you own the session" an
+/// invariant rather than a coincidence. Without it, a second `meka serve` on the same store
+/// answers `200` for a session the first one is running: the row moves, `GET /v1/sessions` on
+/// *both* reports the new profile, and the host holding the session goes on building requests for
+/// the old one until eviction.
 async fn repin_dormant_session(
     state: &ServerState,
     id: Uuid,
@@ -887,7 +883,7 @@ async fn repin_dormant_session(
                 ErrorKind::SessionLocked,
                 StatusCode::CONFLICT,
                 "another meka process is running this session, so its profile cannot be changed \
-             from here; move it where it is running, or stop that process",
+                 from here",
             )
             .with("session_id", id.to_string()),
             other => ProblemDetail::internal_sanitized("failed to lock session for repin", other)
@@ -971,15 +967,11 @@ pub(crate) async fn patch_session(
         .map_err(|error| ProblemDetail::invalid_body("session patch", error))?;
 
     // Ahead of the dormant fast path below, which is the one branch of this handler that writes a
-    // session row without ever building an agent -- so it is the one branch
+    // session row without ever building an agent, so it is the one branch
     // `crate::host::refuse_a_spawned_session` cannot answer for from inside the builders. A
     // sub-agent is almost never resident (`build_subagent` runs it under its parent's runtime
-    // rather than registering it here), so that branch was where every `PATCH` aimed at a
-    // sub-agent actually landed: it wrote `sessions.profile` on a sub-agent's row and answered
-    // `200`, while the same request against a *resident* session was refused. The write did not
-    // even survive -- the next `agent_followup` records the profile it really ran on, which is
-    // the parent's -- so what a `sessions:w` holder got was a row that disagreed with the
-    // sub-agent until something quietly put it back.
+    // rather than registering it here), so that branch is where every `PATCH` aimed at a
+    // sub-agent lands.
     crate::host::refuse_a_spawned_session(&state.shared.store, Some(id))
         .await
         .map_err(|error| agent_build_problem(id, "failed to read session", error))?;
@@ -1088,10 +1080,8 @@ pub(crate) async fn patch_session(
         new_cwd.filter(|path| entry.cells().cwd.get() != *path);
     // Only whether the *row* already says this, because that is all this decides. The live agent
     // is moved further down regardless, so a `PATCH` naming the profile the row already records is
-    // how a session whose agent and row have come apart is put back together. Gating the swap on
-    // this too made that the one state no request could repair: the retry after a failed `PATCH`
-    // found the row already correct, wrote nothing, swapped nothing, and left every turn running
-    // on the profile the client had just been told it was off.
+    // how a session whose agent and row have come apart is put back together; gating the swap on
+    // this too would make that the one state no request could repair.
     let profile_row_write = match new_profile.as_ref() {
         Some(resolved) => {
             let current = state

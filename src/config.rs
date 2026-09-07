@@ -28,7 +28,7 @@ pub(crate) use profile::{
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
 /// sub-struct; missing sections fall back to `Default`. This is the raw deserialized form;
-/// `resolve_config` merges it with CLI flags and env vars to produce a [`ResolvedConfig`].
+/// [`ResolvedConfig::resolve`] merges it with CLI flags and env vars.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigFile {
@@ -172,7 +172,7 @@ impl ResolvedScheduleConfig {
     /// contributes one fire however long the outage was, so the budget only engages on a real
     /// backlog. What it buys there is interleaving, not throttling: sweeps do not overlap and the
     /// next begins as soon as the last ends, so a backlog produces the same number of turns either
-    /// way -- but another session's due job is reached after five of this one's rather than after
+    /// way, but another session's due job is reached after five of this one's rather than after
     /// all of them.
     const DEFAULT_MAX_CONSECUTIVE_FIRES: usize = 5;
     const DEFAULT_MAX_JOBS: usize = 50;
@@ -297,14 +297,14 @@ pub(crate) struct ToolsConfig {
 ///
 /// Deliberately only the two deny lists. The distinction that decides what belongs here: a
 /// *capability* is something config can genuinely withhold, because a tool the registry never
-/// registered cannot be reached however the parent phrases the task. *Context* -- the memory store,
-/// the instructions file -- cannot be withheld the same way, because a parent holding it can copy
+/// registered cannot be reached however the parent phrases the task. *Context* (the memory store,
+/// the instructions file) cannot be withheld the same way, because a parent holding it can copy
 /// it into the sub-agent's prompt; a config key promising otherwise would read as a boundary while
 /// being none. Context is therefore granted per call by `agent_spawn`, defaulting to nothing, and
 /// has no key here.
 ///
 /// The forgetting failure these lists exist for is real: MCP servers are inherited by default, so a
-/// parent that never considers the question hands a sub-agent every tool it has -- including one
+/// parent that never considers the question hands a sub-agent every tool it has, including one
 /// that messages the user. `agent_spawn`'s `deny_servers` / `deny_tools` union with these, so a
 /// parent can restrict further; there is deliberately no call-site allow-list, which would let a
 /// parent widen what config denied.
@@ -356,12 +356,12 @@ impl MemoryAccess {
             "none" => Ok(Self::None),
             "read" => Ok(Self::Read),
             "write" => Err(
-                "memory = \"write\" is not available to sub-agents. Use \"read\" and record \
-                 anything worth keeping yourself, from the worker's report."
+                "memory = \"write\" is not available to sub-agents; grant \"read\" and record \
+                 anything worth keeping yourself"
                     .to_string(),
             ),
             other => Err(format!(
-                "memory = \"{other}\" is not a valid access level. Use \"none\" or \"read\"."
+                "memory = \"{other}\" is not an access level; use \"none\" or \"read\""
             )),
         }
     }
@@ -390,7 +390,7 @@ impl InstructionAccess {
             "none" => Ok(Self::None),
             "inherit" => Ok(Self::Inherit),
             other => Err(format!(
-                "instructions = \"{other}\" is not a valid value. Use \"none\" or \"inherit\"."
+                "instructions = \"{other}\" is not an instruction grant; use \"none\" or \"inherit\""
             )),
         }
     }
@@ -577,8 +577,7 @@ impl WebClientConfig {
                     Some(v) => Some(v),
                     None => {
                         tracing::warn!(
-                            "ignoring unknown [web].min_tls_version '{raw}' (expected '1.0', \
-                             '1.1', '1.2', or '1.3')"
+                            "ignoring [web].min_tls_version '{raw}'; supported: 1.0, 1.1, 1.2, 1.3"
                         );
                         None
                     }
@@ -791,7 +790,7 @@ impl Backend {
         Self::OpenAiResponses,
     ];
 
-    /// The name a profile's `type` gives this backend.
+    /// The name an account's `backend` gives this backend.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::AnthropicMessages => "anthropic-messages",
@@ -879,8 +878,7 @@ fn warn_about_inert_profile_keys(
         for (key, is_set) in set {
             if is_set && !backend.reads_account_key(key) {
                 tracing::warn!(
-                    "account '{name}' sets `{key}`, which a '{backend}' account never reads; the \
-                     setting has no effect"
+                    "account '{name}' sets `{key}`, which a '{backend}' account never reads"
                 );
             }
         }
@@ -901,8 +899,7 @@ fn warn_about_inert_profile_keys(
         for (key, is_set) in set {
             if is_set && !backend.reads_profile_key(key) {
                 tracing::warn!(
-                    "profile '{name}' sets `{key}`, which its '{backend}' account never sends; \
-                     the setting has no effect"
+                    "profile '{name}' sets `{key}`, which its '{backend}' account never sends"
                 );
             }
         }
@@ -926,7 +923,7 @@ impl std::str::FromStr for Backend {
             .find(|backend| backend.name() == value)
             .ok_or_else(|| {
                 format!(
-                    "'{value}' is not a valid backend. Supported: {}",
+                    "'{value}' is not a backend. Supported: {}",
                     Self::supported()
                 )
             })
@@ -1089,8 +1086,8 @@ pub(crate) struct ProfileSummary {
 }
 
 /// Merged + validated runtime view of [`ConfigFile`], CLI flags, and env vars. This is what the
-/// rest of the binary reads; `ConfigFile` is for deserialization only. Resolution lives in
-/// `resolve_config` (Linux) and the non-Linux variant below it.
+/// rest of the binary reads; `ConfigFile` is for deserialization only. Resolution is
+/// [`ResolvedConfig::resolve`].
 #[derive(Debug)]
 pub(crate) struct ResolvedConfig {
     /// Backend of the selected profile's account; `None` when no profile could be selected or its
@@ -1146,7 +1143,7 @@ pub(crate) struct ResolvedConfig {
     pub(crate) sandbox_backend: Option<SandboxBackend>,
     pub(crate) render_mode: RenderMode,
     pub(crate) tool_params: ToolParams,
-    /// Resolved `[display].max_width`. `None` - the default - follows the terminal.
+    /// Resolved `[display].max_width`. `None`, the default, follows the terminal.
     pub(crate) max_width: Option<usize>,
     pub(crate) context_messages: Option<usize>,
     /// Resolved `[session].retention`. `None`, the default, disables startup cleanup.
@@ -1337,8 +1334,8 @@ pub(crate) fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
         "white" => Style::new().fg(Color::White),
         other => {
             tracing::warn!(
-                "ignoring unknown [display].input_style '{other}' (expected default, none, \
-                 reverse, bold, dim, italic, underline, or a color name)"
+                "ignoring [display].input_style '{other}'; supported: default, none, reverse, \
+                 bold, dim, italic, underline, a color name"
             );
             default_input_style()
         }
@@ -1355,12 +1352,12 @@ pub(crate) fn parse_input_style(raw: &str) -> nu_ansi_term::Style {
 ///   root and warn once per subdirectory on every rediscovery.
 /// - An entry whose `~` cannot be expanded, rather than treating the tilde as a directory name.
 /// - A repeat of an earlier entry, which discovery would otherwise walk twice and then report every
-///   skill in it as shadowed *by itself* -- a warning naming one path twice, which an operator can
+///   skill in it as shadowed *by itself*, a warning naming one path twice, which an operator can
 ///   neither act on nor dismiss.
 /// - meka's own root, for the same reason. It is always scanned first; naming it again adds a
 ///   second pass and the same self-shadowing report.
 ///
-/// Compared as written after expansion, not canonicalised: resolving symlinks would touch the
+/// Compared as written after expansion, not canonicalized: resolving symlinks would touch the
 /// filesystem, and the promise that a configured-but-absent root leaves no trace is worth more than
 /// catching two spellings of one directory. Discovery's own first-wins rule handles that case.
 fn resolve_skills_extra_paths(raw: &[String], native: Option<&Path>) -> Vec<PathBuf> {
@@ -1372,8 +1369,8 @@ fn resolve_skills_extra_paths(raw: &[String], native: Option<&Path>) -> Vec<Path
         }
         let Some(path) = expand_user_path(entry) else {
             tracing::warn!(
-                "[skills] extra_paths entry '{entry}' needs a home directory, and none could be \
-                 determined; skipping it"
+                "ignoring [skills] extra_paths entry '{entry}': no home directory to expand `~` \
+                 into"
             );
             continue;
         };
@@ -1399,7 +1396,7 @@ fn resolve_skills_extra_paths(raw: &[String], native: Option<&Path>) -> Vec<Path
 ///
 /// Every editor of the file reads it, mutates a `toml_edit` document, and writes the whole thing
 /// back. Two of those interleaving means the second write is computed from a snapshot taken before
-/// the first, so the first is silently discarded -- `write_file_atomic` makes each *write* atomic,
+/// the first, so the first is silently discarded; `write_file_atomic` makes each *write* atomic,
 /// which does nothing for a lost update. This is not a hypothetical race between two humans running
 /// CLI commands: an ordinary launch races `meka mcp add`, because `device_id::persist` runs from
 /// `ProviderRegistry::device_id_for` the first time a `claude-subscription` profile that states
@@ -1424,14 +1421,12 @@ pub(crate) enum ConfigFileLock {
 thread_local! {
     /// How many [`ConfigFileLock`]s this thread currently holds.
     ///
-    /// Thread-local while the `flock` underneath it is per open file description, and that pairing
-    /// only holds because no `ConfigFileLock` is ever held across an `.await` on a task that can
-    /// migrate. Every acquisition today runs inside `runtime.block_on` on the main thread, which
-    /// never moves. If one were ever held across an await inside a `tokio::spawn`, the task could
-    /// resume on a different sub-agent and both halves of this would break at once: a nested
-    /// acquisition there would see depth 0 and block on an `flock` this process already holds, and
-    /// the guard would decrement the wrong thread's counter, leaving the original stuck above zero
-    /// so every later acquisition on it silently took no lock at all.
+    /// Thread-local while the `flock` underneath it is per open file description, which only holds
+    /// because no `ConfigFileLock` is held across an `.await` on a task that can migrate. A task
+    /// resuming on another worker thread would break both halves at once: a nested acquisition
+    /// there would see depth 0 and block on an `flock` this process already holds, and the guard
+    /// would decrement the wrong thread's counter, leaving the original stuck above zero so every
+    /// later acquisition on it silently took no lock at all.
     static CONFIG_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1481,7 +1476,7 @@ pub(crate) fn lock_config_file() -> std::io::Result<ConfigFileLock> {
 ///
 /// The line between failing and continuing is whether a command *consults* the parsed config. One
 /// that does can only answer from empty defaults, which reads as fact: `meka profile list`
-/// printing "No profiles configured." over a file full of them. Those callers use
+/// printing "No profiles." over a file full of them. Those callers use
 /// [`load_config_file_or_err`] / [`ResolvedConfig::require_readable_config`].
 ///
 /// Commands that instead edit the raw document through `toml_edit` are unaffected by an unknown key
@@ -1519,8 +1514,7 @@ pub(crate) fn load_config_file() -> (ConfigFile, Option<String>) {
 /// indistinguishable from "your profiles are gone". `meka profile add <existing>` is the sharp
 /// edge: its duplicate guard is the parsed map, so an empty one lets the add through to
 /// `upsert_profile_document`, which replaces the profile's table wholesale and drops every field
-/// the flags didn't set. An unparseable config must not route the user into that ("no profile
-/// named 'work'. Run `meka profile add work` to create it.").
+/// the flags did not set.
 pub(crate) fn load_config_file_or_err() -> crate::error::Result<ConfigFile> {
     let (config_file, error) = load_config_file();
     match error {
@@ -1603,7 +1597,7 @@ fn resolve_permission(
     let env_override = env_permission.and_then(|raw| match raw.parse::<Permission>() {
         Ok(level) => Some(level),
         Err(error) => {
-            tracing::warn!("ignoring invalid MEKA_PERMISSION='{raw}': {error}");
+            tracing::warn!("ignoring MEKA_PERMISSION='{raw}': {error}");
             None
         }
     });
@@ -1676,10 +1670,8 @@ fn parse_render_mode_override(value: &str) -> Option<RenderMode> {
 }
 
 /// Merge `--eager-load-tool SERVER:TOOL` CLI values into the matching server's
-/// [`McpServerConfig::eager_load_tools`] list. Malformed entries and unknown server names warn and
-/// are skipped, same philosophy as `warn_on_stale_tool_config`. Appends to (never replaces) the
-/// configured list, and deduplicates so a CLI flag that overlaps with `config.toml` doesn't grow
-/// the list.
+/// [`McpServerConfig::eager_load_tools`] list. A malformed entry or an unknown server name warns
+/// and is skipped. Appends to the configured list, without repeating an entry already there.
 fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServerConfig]) {
     for raw in raw_pairs {
         let (server_name, tool_name) = match raw.split_once(':') {
@@ -1687,16 +1679,13 @@ fn apply_cli_eager_load_overrides(raw_pairs: &[String], servers: &mut [McpServer
                 let server = server.trim();
                 let tool = tool.trim();
                 if server.is_empty() || tool.is_empty() {
-                    tracing::warn!(
-                        "ignoring --eager-load-tool '{raw}' (expected SERVER:TOOL with both \
-                         parts non-empty)"
-                    );
+                    tracing::warn!("ignoring --eager-load-tool '{raw}': expected SERVER:TOOL");
                     continue;
                 }
                 (server, tool)
             }
             None => {
-                tracing::warn!("ignoring --eager-load-tool '{raw}' (expected SERVER:TOOL format)");
+                tracing::warn!("ignoring --eager-load-tool '{raw}': expected SERVER:TOOL");
                 continue;
             }
         };
@@ -1724,9 +1713,8 @@ impl ResolvedConfig {
         let (config_file, config_error) = load_config_file();
         let accounts = config_file.accounts;
         let profiles = config_file.profiles;
-        // Select the selected profile: `--profile` flag, else `default_profile`, else the sole
-        // profile. Absence / ambiguity / unknown name becomes a deferred error surfaced by
-        // `validate()` so `resolve` stays infallible.
+        // `--profile`, else `default_profile`, else the sole profile. A miss is a deferred error
+        // `validate()` raises, so `resolve` stays infallible.
         let (profile_request, requested_active) = match overrides.profile.clone() {
             Some(name) => (ProfileRequest::Flag, Some(name)),
             None => (
@@ -1831,19 +1819,12 @@ impl ResolvedConfig {
             })
             .collect();
 
-        // Provider config comes from the selected profile (no env tier); the credential is loaded
-        // from the DB in main.rs by `default_profile`. Nothing on the command line rewrites a field
-        // inside the profile: `--profile` selects which one, and `meka profile set` is how a
-        // field changes.
-        //
-        // Resolved through the same [`resolve_profile`] any other profile goes through, so the
-        // process default is not a second, subtly different derivation of the same twelve fields.
-        // The flat fields below are this profile's; a session naming a different one resolves it
-        // again by name. The profile's `device_id` verbatim, never a freshly seeded one. Seeding
-        // writes `config.toml`, and the flat fields below are read only to answer "what would a
-        // brand-new session get"; the provider a session actually runs on is built by
-        // [`crate::provider::ProviderRegistry`], which is where the seed belongs and where it
-        // happens once.
+        // The selected profile's settings, through the same [`resolve_profile`] every other profile
+        // goes through; nothing on the command line rewrites a field inside it. The flat fields
+        // below answer "what would a brand-new session get", and a session naming another profile
+        // resolves it again by name. The account's `device_id` verbatim, never a freshly seeded
+        // one: seeding writes `config.toml`, and belongs in [`crate::provider::ProviderRegistry`],
+        // where it happens once.
         let default_thinking_budget = file_thinking.budget;
         let active_settings = match active.map(|profile| {
             let account = account_for(
@@ -1886,22 +1867,15 @@ impl ResolvedConfig {
         // cannot exceed.
         let schedule = ResolvedScheduleConfig::resolve(config_file.schedule, enabled_permissions);
 
-        // Only probe the sandbox backend when sandboxing is actually enabled. Skipping the probe
-        // for `sandbox = false` saves the smoke-test cost on every invocation of subcommands that
-        // don't touch the shell (`meka session list`, `meka session export`, `meka mcp list`, etc.)
-        // when the user has disabled sandboxing globally. The placeholder probe is never consulted
-        // in that state; the shell tool short-circuits on `sandbox_enabled = false`, and the warn
-        // helper early- returns on `!state.enabled`. Backend precedence: `--sandbox-backend` >
-        // `MEKA_SANDBOX_BACKEND` > `[shell].sandbox_backend`. An explicit value from any tier also
-        // flips `auto_resolved` off, suppressing the "install Bubblewrap" startup warning.
-        let configured_backend = overrides
+        // `--sandbox-backend` > `MEKA_SANDBOX_BACKEND` > `[shell].sandbox_backend`. Not probed
+        // here: the host picks and probes at startup, and only when a shell can run.
+        let sandbox_backend = overrides
             .sandbox_backend
             .or_else(sandbox_backend_override)
             .or(file_shell.sandbox_backend);
-        let sandbox_backend = configured_backend;
 
         // A root that does not resolve contributes nothing to the write boundary, because
-        // `writable_roots` drops what it cannot canonicalise. Silently, until a write is refused
+        // `writable_roots` drops what it cannot canonicalize. Silently, until a write is refused
         // with a boundary the user believed included this path. The path is kept regardless of the
         // warning: a build directory that does not exist yet is a legitimate root, and the boundary
         // is recomputed on every write rather than frozen here.
@@ -2018,12 +1992,12 @@ impl ResolvedConfig {
         }
     }
 
-    /// Refuse to answer from empty defaults when `config.toml` didn't parse.
+    /// Refuse to answer from empty defaults when `config.toml` did not parse.
     ///
     /// For the subcommands that never reach [`Self::validate`] but do read the parsed config:
-    /// `meka mcp list` over a config full of servers would otherwise print "(no MCP servers
-    /// configured)", and `meka mcp get <name>` would say the server doesn't exist. Both are
-    /// indistinguishable from the truthful answer, which is what makes them worth failing on.
+    /// `meka mcp list` over a config full of servers would otherwise print "No MCP servers.", and
+    /// `meka mcp get <name>` would say the server does not exist. Both are indistinguishable from
+    /// the truthful answer, which is what makes them worth failing on.
     pub(crate) fn require_readable_config(&self) -> crate::error::Result<()> {
         match &self.config_error {
             Some(error) => Err(crate::error::MekaError::Config(error.clone())),
@@ -2065,8 +2039,8 @@ impl ResolvedConfig {
         // unrecoverable, so refuse rather than run it once and find out.
         if self.retention.is_some_and(|retention| retention.is_zero()) {
             return Err(crate::error::MekaError::Config(
-                "[session].retention = \"0s\" would delete every session on each startup. \
-                 Remove the key to keep sessions forever, or use `meka session delete --all`."
+                "`[session].retention = \"0s\"` would delete every session on each startup; remove \
+                 the key to keep sessions"
                     .to_string(),
             ));
         }
@@ -2080,15 +2054,15 @@ impl ResolvedConfig {
         ] {
             if timeout.is_some_and(|timeout| timeout.is_zero()) {
                 return Err(crate::error::MekaError::Config(format!(
-                    "[web].{key} = \"0s\" would time out every request before it is sent. Remove \
-                     the key for the default, or set a timeout like \"30s\"."
+                    "`[web].{key} = \"0s\"` would time out every request before it is sent; remove \
+                     the key for the default"
                 )));
             }
         }
         if self.mcp_connect_timeout.is_zero() {
             return Err(crate::error::MekaError::Config(
-                "[mcp].connect_timeout = \"0s\" would time out every server before it connects. \
-                 Remove the key for the default of \"30s\", or set a timeout like \"1m\"."
+                "`[mcp].connect_timeout = \"0s\"` would time out every server before it connects; \
+                 remove the key for the default of \"30s\""
                     .to_string(),
             ));
         }
@@ -2099,8 +2073,7 @@ impl ResolvedConfig {
         ] {
             if limit == 0 {
                 return Err(crate::error::MekaError::Config(format!(
-                    "[mcp].{key} = 0 would connect no server at all. Remove the key for the \
-                     default, or set how many servers may connect at once."
+                    "`[mcp].{key} = 0` would connect no server; remove the key for the default"
                 )));
             }
         }
@@ -2110,16 +2083,16 @@ impl ResolvedConfig {
         // the client's `session/prompt` waiting forever with no response.
         if self.context_messages == Some(0) {
             return Err(crate::error::MekaError::Config(format!(
-                "[session].context_messages = 0 would send no conversation at all. Remove the \
-                     key for the default of {DEFAULT_CONTEXT_MESSAGES}, or set it to the number of messages to keep."
+                "`[session].context_messages = 0` would send no conversation; remove the key for \
+                 the default of {DEFAULT_CONTEXT_MESSAGES}"
             )));
         }
         // `tokio::time::interval` panics on a zero period, so this would be a config value taking
         // the process down rather than a setting behaving oddly.
         if self.schedule.poll_interval.is_zero() {
             return Err(crate::error::MekaError::Config(
-                "[schedule].poll_interval = 0 is not a valid tick. Remove the key for the \
-                 default, or set an interval like \"10s\"."
+                "`[schedule].poll_interval = \"0s\"` would never tick; remove the key for the \
+                 default of \"10s\""
                     .to_string(),
             ));
         }
@@ -2127,22 +2100,22 @@ impl ResolvedConfig {
         // report a broken watcher forever.
         if self.schedule.gate_timeout.is_zero() {
             return Err(crate::error::MekaError::Config(
-                "[schedule].gate_timeout = 0 would time out every gate before it runs. Remove \
-                 the key for the default, or set a budget like \"30s\"."
+                "`[schedule].gate_timeout = \"0s\"` would time out every gate before it runs; \
+                 remove the key for the default of \"30s\""
                     .to_string(),
             ));
         }
         if self.schedule.max_jobs == 0 {
             return Err(crate::error::MekaError::Config(
-                "[schedule].max_jobs = 0 would refuse every job. Set `[schedule] enabled = false` \
-                 to turn scheduling off instead."
+                "`[schedule].max_jobs = 0` would refuse every job; set `[schedule] enabled = \
+                 false` to turn scheduling off"
                     .to_string(),
             ));
         }
         if self.schedule.max_consecutive_fires == 0 {
             return Err(crate::error::MekaError::Config(
-                "[schedule].max_consecutive_fires = 0 would hold every due job over forever. Set \
-                 `[schedule] enabled = false` to turn scheduling off instead."
+                "`[schedule].max_consecutive_fires = 0` would hold every due job over forever; set \
+                 `[schedule] enabled = false` to turn scheduling off"
                     .to_string(),
             ));
         }
@@ -2150,13 +2123,12 @@ impl ResolvedConfig {
         // that expires while a host is still working lets a second host take the same occurrence,
         // which the session lock catches at the cost of a deferral and a re-run gate probe. Checked
         // against `gate_timeout` rather than against a fixed floor because that is the only bound
-        // on the work meka knows -- the turn after it is unbounded, which is why the documentation
+        // on the work meka knows; the turn after it is unbounded, which is why the documentation
         // asks for headroom on top rather than this settling the question.
         if self.schedule.claim_lease <= self.schedule.gate_timeout {
             return Err(crate::error::MekaError::Config(format!(
-                "[schedule].claim_lease ({}) must outlast [schedule].gate_timeout ({}), or a \
-                 host's claim can expire while its own gate is still running. Remove the key for \
-                 the default of \"1h\".",
+                "`[schedule].claim_lease` ({}) must outlast `[schedule].gate_timeout` ({}); remove \
+                 the key for the default of \"1h\"",
                 humantime_serde::re::humantime::format_duration(self.schedule.claim_lease),
                 humantime_serde::re::humantime::format_duration(self.schedule.gate_timeout),
             )));
@@ -2191,15 +2163,14 @@ impl ResolvedConfig {
         }
         if self.backend.is_none() {
             return Err(crate::error::MekaError::Config(
-                "no profile configured. Run `meka account add <name>`, then `meka profile add \
-                 <name>`, to set one up."
+                "no profile configured; run `meka account add <name>`, then `meka profile add \
+                 <name>`"
                     .to_string(),
             ));
         }
         if self.model.is_none() {
             return Err(crate::error::MekaError::Config(format!(
-                "no model configured for profile '{0}'. Run `meka profile set {0} model <model>`, \
-                 or set `model` under [profiles.{0}] in config.toml.",
+                "profile '{0}' names no model; set one with `meka profile set {0} model <model>`",
                 self.default_profile.as_deref().unwrap_or("?"),
             )));
         }
@@ -2781,8 +2752,8 @@ pub(crate) struct ServeConfig {
     /// Whether to serve the Swagger UI and the OpenAPI document at `/v1/docs` and
     /// `/v1/openapi.json`. Default `false`.
     ///
-    /// Off by default because they are unauthenticated -- as are the two health probes, which
-    /// publish nothing -- and what they publish is the shape of every endpoint the deployment
+    /// Off by default because they are unauthenticated (as are the two health probes, which
+    /// publish nothing) and what they publish is the shape of every endpoint the deployment
     /// exposes. That is useful while building a client and pure reconnaissance value once the
     /// deployment is real. Turn it on deliberately, on a deployment where anyone who can reach the
     /// port is entitled to the map.
@@ -2924,7 +2895,7 @@ mod tests {
     /// `extra_paths` resolution drops what discovery cannot use, and says so each time.
     ///
     /// A repeat, or meka's own root listed again, makes discovery walk the directory twice and then
-    /// report every skill in it as shadowed *by itself* -- a warning naming one path twice, which
+    /// report every skill in it as shadowed *by itself*, a warning naming one path twice, which
     /// an operator can neither act on nor dismiss. The empty entry is the dangerous one: it would
     /// expand to `$HOME` and make the whole home directory a skills root.
     #[test]
@@ -3720,7 +3691,7 @@ max_consecutive_fires = 3
         assert!(!schedule.gate_timeout.is_zero());
         assert!(schedule.max_jobs > 0);
         // Pinned to the value rather than to non-zero: both doc pages state 5, and drifting either
-        // way is silent -- large disables the interleaving, 1 serializes every session.
+        // way is silent: large disables the interleaving, 1 serializes every session.
         assert_eq!(schedule.max_consecutive_fires, 5);
     }
 
@@ -4158,9 +4129,9 @@ claim_lease = {lease}
         }
     }
 
-    /// A config that doesn't parse must stop meka, not be swapped for defaults. The old fallback
-    /// meant one mistyped key silently ran the agent with no provider profiles, no MCP servers and
-    /// default permissions, off one warn line among the rest of startup.
+    /// A config that does not parse must stop meka, not be swapped for defaults: one mistyped key
+    /// would otherwise silently run the agent with no profiles, no MCP servers and default
+    /// permissions, off one warn line among the rest of startup.
     #[test]
     fn unparseable_config_is_reported_not_ignored() {
         // `load_config_file` carries the parse failure; `validate` is what turns it into an exit.
@@ -4953,7 +4924,7 @@ thinking = "budgeted"
     /// `flock` is per open file description, so a second `open` in the same process conflicts with
     /// the first exactly as another process would. Nesting is not hypothetical: `meka mcp add` on
     /// an HTTPS URL holds the lock through `run_add` and then calls `persist_auth_block_for`,
-    /// which wants it too. The first version of this lock hung there.
+    /// which wants it too.
     #[tokio::test]
     async fn the_config_lock_can_be_taken_again_by_the_thread_already_holding_it() {
         let _env = CONFIG_DIR_ENV_LOCK.lock().await;
@@ -5002,7 +4973,7 @@ thinking = "budgeted"
 
         unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
         // The directory is the lock, so a command that takes it and then bails writes nothing at
-        // all -- not even an empty `config.toml`.
+        // all, not even an empty `config.toml`.
         assert!(entries.is_empty(), "locking created {entries:?}");
     }
 

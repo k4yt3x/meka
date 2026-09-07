@@ -98,15 +98,13 @@ pub(crate) struct AcpFrontend {
     pub(super) sticky: crate::frontend::StickyApprovals,
     pub(super) client_state: SharedClientState,
     /// Stdio-level "transport is dead" latch, shared across every per-session `AcpFrontend` in the
-    /// process. When `send_notification` fails on any session, we set the latch so every other
+    /// process. When `send_notification` fails on any session, the latch is set so every other
     /// session's agent loop short-circuits on its next iteration instead of burning provider
     /// tokens until its own emit also fails.
     ///
-    /// This is correct *for stdio*: one closed pipe affects every session in the process, so the
-    /// global signal carries no false positives. When a per-session transport (e.g. WebSocket-ACP
-    /// or a TCP-multiplexed successor) lands, this field needs a per-session sibling (read both
-    /// in `client_disconnected()` and OR them) so a single session's drop doesn't take the
-    /// process down with it. Grep for `transport_dead` to find the migration points.
+    /// Process-wide because the transport is: one closed pipe affects every session, so the global
+    /// signal carries no false positives. A per-session transport would need a per-session
+    /// sibling.
     pub(super) transport_dead: Arc<std::sync::atomic::AtomicBool>,
     /// Live context-occupancy counter shared with this session's agent through its
     /// [`crate::session::SessionCells`]; read on every `TokenUsage` event to emit an
@@ -116,10 +114,9 @@ pub(crate) struct AcpFrontend {
     /// publishes into on every provider switch. `0` until the agent is built, which suppresses the
     /// update.
     ///
-    /// Shared rather than pushed. ACP was the one host that kept its own copy and had it re-stored
-    /// by hand from `session/set_config_option`, which meant a mid-turn switch reported occupancy
-    /// measured against the profile the turn was still running on, divided by the window of the
-    /// one it had not moved to yet.
+    /// Shared rather than pushed: a copy re-stored by hand from `session/set_config_option`
+    /// reports a mid-turn switch as occupancy measured against the profile the turn is still
+    /// running on, divided by the window of the one it has not moved to yet.
     pub(super) context_window: Arc<std::sync::atomic::AtomicU64>,
     /// Accumulated live output per in-flight tool call, keyed by `tool_use_id`. ACP replaces a
     /// tool call's whole `content` array on each update rather than appending to it, so the
@@ -314,9 +311,8 @@ impl AcpFrontend {
     /// `session/cancel` is the user pressing stop, and a client is entitled to drop an outstanding
     /// `fs/*` or elicitation request rather than answer it once it has canceled. Without this race
     /// the future never resolves: the prompt returns no `stopReason` at all and every later prompt
-    /// on that session is rejected as "already has a prompt in flight", so one stop wedges the
-    /// session for the life of the process. `request_permission` has always done this; these paths
-    /// were the asymmetry.
+    /// on that session is refused for the one in flight, so one stop wedges the session for the
+    /// life of the process.
     ///
     /// The canceled arm is a [`FrontendError`] rather than a `None` on purpose. Both callers
     /// return `Option<Result<_, FrontendError>>`, where `None` already means "this frontend has no
@@ -368,7 +364,7 @@ impl AcpFrontend {
             .connection
             .send_notification(SessionNotification::new(self.session_id.clone(), update))
         {
-            tracing::debug!("AcpFrontend send_notification failed: {error}");
+            tracing::debug!("failed to send session/update: {error}");
             self.mark_transport_dead();
         }
     }
@@ -728,7 +724,7 @@ impl Frontend for AcpFrontend {
             result = connection.send_request(acp_request).block_task() => match result {
                 Ok(response) => response,
                 Err(error) => {
-                    tracing::debug!("request_permission send_request failed: {error}");
+                    tracing::debug!("failed to send session/request_permission: {error}");
                     // Spec-conformant clients always reply with a `Selected` or `Cancelled`
                     // outcome, so an `Err` here is almost certainly transport-level. Mark the
                     // connection dropped so the agent loop short-circuits on the next pre-iteration
@@ -851,8 +847,7 @@ impl Frontend for AcpFrontend {
             self.emit(FrontendEvent::Notice(
                 crate::frontend::Notice::elicitation_declined(
                     &prompt.server_name,
-                    "its schema uses a field type ACP cannot express, so the client cannot \
-                     render the form",
+                    "its schema uses a field type ACP cannot express",
                 ),
             ))
             .await;
@@ -944,9 +939,7 @@ pub(super) fn sticky_option_label(verb: &str, tool_name: &str) -> String {
 /// it can be exercised without standing up a connection to a client.
 ///
 /// `biased` matters: a turn canceled while the request is already outstanding must lose the race
-/// deterministically, not half the time. The client owes no answer to a request the user withdrew,
-/// and before this every `fs/*` round trip and every elicitation could outlive the stop button
-/// indefinitely.
+/// deterministically, not half the time. The client owes no answer to a request the user withdrew.
 pub(super) async fn race_against_cancellation<T>(
     what: &str,
     cancellation: &CancellationToken,
@@ -1380,7 +1373,7 @@ pub(super) fn send_session_update(
         // Every `session/update` goes out through here, not just `session/load` replay, so name the
         // notification rather than one caller: this is the line to look at when a client reports
         // that updates aren't arriving.
-        tracing::debug!("session/update send_notification failed: {error}");
+        tracing::debug!("failed to send session/update: {error}");
     }
 }
 /// Emit a `session_info_update` carrying the session title exactly once. The title is

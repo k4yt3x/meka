@@ -69,10 +69,8 @@ impl Tool for SkillReadTool {
         let skill = match skills.find(&name) {
             Some(skill) => skill,
             // "No such skill" and "it is right there and meka cannot read it" call for opposite
-            // responses. Collapsed into "not found", a model handed a procedure whose file has a
-            // typo in its frontmatter is told the procedure does not exist, and improvises one.
-            // `memory_read` was changed to stop telling exactly this lie; this is the same fix on
-            // the sibling store.
+            // responses: collapsed into "not found", a model handed a procedure whose file has a
+            // typo in its frontmatter improvises one.
             None => {
                 let hint = match skills.skip_reason(&name) {
                     Some(reason) => format!(
@@ -121,19 +119,16 @@ fn require_root(cache: &SkillCache, tool_name: &str) -> Result<std::path::PathBu
 
 /// Refuse to touch a directory that holds a `SKILL.md` discovery could not parse.
 ///
-/// Absent from the index is not the same as absent from disk. Such a file is skipped, so neither
-/// the model nor this tool can say what is in it, and its only copy is that file. Reporting it as
-/// "not found" while it sits in the skills directory is the confusion [`skills::SkippedSkill`]
-/// exists to prevent, so name the case instead -- and name the *reason*, which the file cannot.
+/// Absent from the index is not the same as absent from disk: such a file is skipped, so neither
+/// the model nor this tool can say what is in it, and its only copy is that file.
 ///
-/// Answered from the index rather than by probing the filesystem. Discovery has already read every
-/// one of these files and recorded why each failed; re-deriving a weaker version of that with a
-/// `is_file()` call could say "not a valid skill" but never why, and gave a second, later answer to
-/// a question already settled.
+/// Answered from the index rather than by probing the filesystem: discovery has already read every
+/// one of these files and recorded why each failed, and an `is_file()` probe could say "not a
+/// valid skill" but never why.
 ///
-/// The remedy is only offered when the file is one `meka skill remove` can reach. For a broken
-/// skill under a read-only `extra_paths` root that command answers "not found", so pointing the
-/// model at it sent the user round a loop; the refusal names the path instead.
+/// The `meka skill remove` remedy is only offered when the file is one that command can reach; for
+/// a broken skill under a read-only `extra_paths` root it answers "not found", so the refusal names
+/// the path instead.
 ///
 /// [`skills::write_skill`] refuses the same case independently; this exists so the refusal arrives
 /// as a readable tool result rather than a tool error, and so `skill_delete` gets it too.
@@ -142,19 +137,14 @@ fn reject_unreadable(
     installed: &skills::SkillIndex,
     native_root: &std::path::Path,
 ) -> Option<ToolOutput> {
-    // A skill that *loaded* is not here, and that is [`skills::SkillIndex`]'s disjointness
-    // invariant rather than a check of this function's own. Without it, a working `deploy` in
-    // meka's store beside a broken `deploy/` in a read-only root would put the name in both
-    // halves, and this would refuse to write a skill sitting in the index, claiming its contents
-    // cannot be shown and offering `meka skill remove deploy`, which reaches the working copy.
-    // Re-checking `find` here would fix this door and leave the other readers of `skipped` to
-    // each remember the same thing.
+    // A skill that loaded is not here, and that is [`skills::SkillIndex`]'s disjointness invariant
+    // rather than a check of this function's own: a working `deploy` in meka's store beside a
+    // broken `deploy/` in a read-only root would otherwise put the name in both halves, and
+    // re-checking `find` here would leave the other readers of `skipped` to each remember it.
     //
     // A bare `skills/<name>/` with no `SKILL.md` is not here either, because discovery skips such a
-    // directory silently rather than recording it: it is a half-finished `meka skill add`, a
-    // partly-copied folder, or the residue of an interrupted write, and `write_skill` should
-    // happily finish it. This comment claimed that was already true for a while when it was not;
-    // `a_directory_with_no_skill_file_is_not_a_broken_skill` is what makes it so.
+    // directory silently rather than recording it: it is a half-finished `meka skill add` or the
+    // residue of an interrupted write, and `write_skill` should finish it.
     let reason = installed.skip_reason(name)?;
     let remedy = match installed.location(name) {
         Some((root, source_dir)) if root != native_root => format!(
@@ -328,11 +318,9 @@ impl Tool for SkillWriteTool {
             tool_name: "skill_write".to_string(),
             message,
         })?;
-        // Omit-to-keep, like `body` and `priority` below. It was required, which forced an agent
-        // refining a stored skill to resend a description it cannot actually see: the only copy in
-        // its context is the `[Skills]` index's, elided to 500 characters. Refining the *body* of a
-        // skill whose description ran to 900 characters therefore rewrote that description as 503
-        // ending in `...`, silently, on a call that never mentioned it.
+        // Omit-to-keep, like `body` and `priority` below: the only copy of a description the agent
+        // can see is the `[Skills]` index's, elided to 500 characters, so requiring it would make a
+        // body-only refinement rewrite a long description as its elision.
         let requested_description = match input.get("description") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => {
@@ -353,10 +341,9 @@ impl Tool for SkillWriteTool {
                 });
             }
         };
-        // A present-but-not-a-string `body` is refused rather than read as absent. `as_str`
-        // returning `None` put `body: ["line one", "line two"]` down the omit-to-keep path, so the
-        // call reported success while storing nothing the caller sent -- and on a *new* skill it
-        // created one with an empty body. `memory_write` hard-errors on exactly this shape.
+        // A present-but-not-a-string `body` is refused rather than read as absent: `as_str` would
+        // put `body: ["line one", "line two"]` down the omit-to-keep path and report success while
+        // storing nothing the caller sent. `memory_write` refuses the same shape.
         let body: Option<String> = match input.get("body") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => Some(text.clone()),
@@ -379,27 +366,21 @@ impl Tool for SkillWriteTool {
         };
 
         let installed = self.skills.current().await;
-        // Omitted means "leave it alone", the rule `PUT /v1/skills` already applies and this tool's
-        // own description promises ("omit body and whatever the skill already documented is kept").
-        // Reading the absence as the default silently demoted a prioritized skill every time the
-        // agent refined its text -- and priority both orders the `[Skills]` index the model reads
-        // and decides which entries the index cap drops, so the demotion can remove it from view.
+        // Omitted means "leave it alone", as `PUT /v1/skills` has it: reading the absence as the
+        // default would demote a prioritized skill every time the agent refined its text, and
+        // priority decides which entries the index cap drops.
         let priority = requested_priority.unwrap_or_else(|| {
             installed
                 .find(&name)
                 .map_or(crate::entry::DEFAULT_PRIORITY, |skill| skill.priority)
         });
         // Unreadable first, because it is the more specific answer: a file that is both foreign and
-        // unparseable needs its parse error named, and `reject_unreadable` carries the read-only
-        // remedy for that case where the plain foreign refusal cannot carry the reason.
+        // unparseable needs its parse error named, which the plain foreign refusal cannot carry.
         //
-        // These two run *before* the description is resolved. Resolving first put an "it does not
-        // exist" refusal in front of them, and `SkillIndex` keeps loaded and skipped skills
-        // disjoint -- so a skill whose `SKILL.md` is present but unparseable is absent from
-        // `installed.find`, and a body-only write to it answered "no skill named 'x' exists, so a
-        // description is required to create it". That is false, it contradicts the ordering this
-        // comment asserts, and the model's natural retry (resend with a description) is the call
-        // that finally surfaces the real parse error.
+        // Both run before the description is resolved: `SkillIndex` keeps loaded and skipped
+        // skills disjoint, so a skill whose `SKILL.md` is present but unparseable is absent from
+        // `installed.find`, and resolving first would answer a body-only write with "no skill
+        // named 'x' exists".
         if let Some(refusal) = reject_unreadable(&name, &installed, &root) {
             return Ok(refusal);
         }
@@ -417,18 +398,12 @@ impl Tool for SkillWriteTool {
         let description = match requested_description {
             Some(description) => description,
             None => match existing {
-                // Truncated to what `write_skill` will accept, because it is being *carried*
-                // rather than authored. `parse_skill_definition` only warns about an over-long
-                // description, so a skill imported from a repository loads with one; handing it
-                // straight back made `write_skill` refuse the write with "description is 1100
-                // characters; the spec allows at most 1024" -- an error about a field the call
-                // never mentioned, on the most obviously correct call the model can make. Before
-                // omit-to-keep existed the agent supplied its own conforming description and the
-                // body landed, so this was a regression in the ordinary path.
-                //
-                // Truncated to the *spec's* 1024, not to the index's 500. Reaching for
-                // `elide_description_for_index` here would cap it at 500 and reintroduce exactly
-                // the silent rewrite omit-to-keep exists to prevent.
+                // Truncated to what `write_skill` will accept, because it is being carried rather
+                // than authored: `parse_skill_definition` only warns about an over-long
+                // description, so a skill imported from a repository loads with one, and handing
+                // it straight back would make `write_skill` refuse over a field the call never
+                // mentioned. Truncated to the spec's 1024, not the index's 500, which would
+                // reintroduce the silent rewrite omit-to-keep exists to prevent.
                 Some(skill) => skill
                     .description
                     .char_indices()
@@ -447,14 +422,9 @@ impl Tool for SkillWriteTool {
                 }
             },
         };
-        // Read before the write, since the write is what makes the file exist: otherwise the
-        // confirmation would claim to have kept the body of a skill that had none.
-        //
-        // Whether there is a body to *keep*, not merely a file: testing existence alone made a
-        // metadata-only update to a body-less skill report ", keeping the existing body" -- a claim
-        // about content that does not exist, on the one line whose whole job is to distinguish a
-        // metadata update from a rewrite. `memory_write` already reads it this way and its comment
-        // describes the same defect.
+        // Read before the write, since the write is what makes the file exist, and whether there is
+        // a body to keep rather than merely a file: the confirmation would otherwise claim to have
+        // kept the body of a skill that had none.
         let kept_existing_body = match existing {
             Some(skill) if body.is_none() => tokio::fs::read_to_string(&skill.body_path)
                 .await
@@ -495,9 +465,8 @@ impl Tool for SkillWriteTool {
             })?
         };
         // The write is only visible to the next `current()` if the cache notices it, and a
-        // `(mtime, size)` snapshot cannot see a same-tick rewrite of the same length. That is
-        // not hypothetical here: the dispatcher flow writes a skill and hands it to
-        // `agent_spawn(skill:)` milliseconds later, in the same turn.
+        // `(mtime, size)` snapshot cannot see a same-tick rewrite of the same length; the
+        // dispatcher flow writes a skill and hands it to `agent_spawn(skill:)` in the same turn.
         self.skills.invalidate().await;
 
         let path = written.body_path.display();
@@ -734,17 +703,13 @@ mod tests {
         SkillCache::for_root(Some(temp.path().to_path_buf()))
     }
 
-    /// A skill from a read-only `extra_paths` root is not the agent's to change: the write would
-    /// land in meka's own store and shadow it, so the tool would report an update that did not
     /// A body-only write reaches a skill whose stored description exceeds the spec cap, and one
     /// whose file is present but unparseable is told so rather than told it does not exist.
     ///
-    /// Both were introduced by the omit-to-keep change. The description resolution sat above the
-    /// two refusal gates, and `SkillIndex` keeps loaded and skipped skills disjoint, so an
-    /// unparseable skill was reported absent -- costing the model a turn and telling it something
-    /// untrue. Separately, `parse_skill_definition` only warns about an over-long description, so a
-    /// skill imported from a repository loads with one; handing that back to `write_skill`
-    /// unchanged made it refuse the write over a field the call never mentioned.
+    /// `SkillIndex` keeps loaded and skipped skills disjoint, so resolving the description above
+    /// the refusal gates would report an unparseable skill absent; and `parse_skill_definition`
+    /// only warns about an over-long description, so handing a stored one back to `write_skill`
+    /// unchanged would refuse the write over a field the call never mentioned.
     #[tokio::test]
     async fn a_body_only_write_survives_an_awkward_stored_description() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -800,11 +765,9 @@ mod tests {
         );
     }
 
-    /// A non-string `body` is refused, not read as "leave it alone".
-    ///
-    /// `as_str` returning `None` put `body: ["a", "b"]` down the omit-to-keep path, so the call
-    /// reported success while storing nothing the caller sent -- and on a new skill it created one
-    /// with an empty body. `memory_write` hard-errors on the same shape.
+    /// A non-string `body` is refused, not read as "leave it alone": `as_str` would put
+    /// `body: ["a", "b"]` down the omit-to-keep path and report success while storing nothing the
+    /// caller sent.
     #[tokio::test]
     async fn a_non_string_body_is_refused_rather_than_treated_as_absent() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -836,11 +799,8 @@ mod tests {
 
     /// An omitted `description` keeps the stored one, and is refused when there is none to keep.
     ///
-    /// Same defect and same shape as `memory_write`'s: the field was required, and the only copy
-    /// of a description an agent can see is the `[Skills]` index's, elided to 500 characters. So
-    /// refining a skill's body forced the model to resend a description it could only reconstruct
-    /// from that elision, and one longer than the cap came back as 503 characters ending in `...`
-    /// with the write reporting success.
+    /// The only copy of a description an agent can see is the `[Skills]` index's, elided to 500
+    /// characters, so requiring the field would make a body-only refinement resend the elision.
     #[tokio::test]
     async fn omitting_a_skill_description_keeps_the_stored_one() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -893,10 +853,7 @@ mod tests {
     }
 
     /// Both write doors refuse a skill that lives in a read-only extra root, and neither writes
-    /// anything anywhere as a side effect.
-    ///
-    /// The refusal is only the visible half. The half worth a test is what must *not* happen to the
-    /// file every other client reads.
+    /// anything anywhere as a side effect, which is the half worth a test.
     #[tokio::test]
     async fn write_and_delete_refuse_a_skill_from_a_read_only_root() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -955,11 +912,10 @@ mod tests {
     /// The read-only rule covers a foreign skill whose `SKILL.md` does not parse, and the refusal
     /// sends the reader to the file rather than to a command that cannot reach it.
     ///
-    /// Both halves were wrong. Every door compared against the *loaded* skills, so an unparseable
-    /// file in an `extra_paths` root was a name nothing had an opinion about and got shadowed
-    /// silently -- the worst case to shadow, since the original is then reported nowhere at all.
-    /// And the refusal that did fire named `meka skill remove`, which answers "not found" for a
-    /// file meka does not own.
+    /// Compared against the loaded skills alone, an unparseable file in an `extra_paths` root is a
+    /// name nothing has an opinion about and gets shadowed silently, the worst case to shadow
+    /// since the original is then reported nowhere; and `meka skill remove` answers "not found"
+    /// for a file meka does not own.
     #[tokio::test]
     async fn a_broken_skill_in_a_read_only_root_is_neither_shadowed_nor_misdirected() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1017,12 +973,9 @@ mod tests {
     /// A name that loaded is writable, whatever a shadowed copy of it elsewhere looks like.
     ///
     /// Roots merge first-wins and the skip list records every failure, so meka's own working
-    /// `deploy` and a broken `deploy/` in a read-only root put one name in both halves of the
-    /// index. `reject_unreadable` answered from the skipped half alone, which refused every write
-    /// and every delete of a skill plainly in the index -- telling the model its contents could not
-    /// be shown, and offering `meka skill remove deploy`, which reaches the working copy. An agent
-    /// that authored a skill could then neither refine nor remove it, for a file in a directory it
-    /// does not own.
+    /// `deploy` and a broken `deploy/` in a read-only root would put one name in both halves of
+    /// the index, and `reject_unreadable` answering from the skipped half alone would refuse every
+    /// write and delete of a skill plainly in the index.
     #[tokio::test]
     async fn a_skill_that_loaded_is_writable_though_a_broken_copy_shadows_it() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1079,13 +1032,9 @@ mod tests {
         assert!(shared.join("deploy").exists(), "left alone elsewhere");
     }
 
-    /// A skill whose file is unreadable is reported as unreadable, not as absent.
-    ///
-    /// The two call for opposite responses. Collapsed into "not found", a model handed a procedure
-    /// with a typo in its frontmatter is told the procedure does not exist, and the reasonable next
-    /// move, improvising its own version, is the worst available one. `memory_read` was changed to
-    /// stop telling this lie; skills kept telling it because discovery computed the reason and then
-    /// threw it away.
+    /// A skill whose file is unreadable is reported as unreadable, not as absent: collapsed into
+    /// "not found", a model handed a procedure with a typo in its frontmatter improvises its own
+    /// version.
     #[tokio::test]
     async fn read_says_a_broken_skill_is_broken_rather_than_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1117,11 +1066,8 @@ mod tests {
         assert!(text.contains("fine"), "{text}");
     }
 
-    /// `skill_write` surfaces the store's refusal of a `metadata` it cannot record in.
-    ///
-    /// Refused rather than written and then explained away, in the model's context, as a rank that
-    /// did not apply "because this skill's 'metadata' is not a map": a sentence about YAML shapes,
-    /// in place of doing what was asked. Refusing says it once, to the party who can fix it.
+    /// `skill_write` surfaces the store's refusal of a `metadata` it cannot record in, rather than
+    /// writing and then explaining to the model why the rank it asked for did not apply.
     #[tokio::test]
     async fn write_surfaces_the_refusal_of_a_metadata_it_cannot_record_in() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1489,12 +1435,9 @@ mod tests {
         assert!(error.to_string().contains("disabled"), "{}", error);
     }
 
-    /// An omitted priority keeps the one the skill already has, matching `PUT /v1/skills` and this
-    /// tool's own "omit body and whatever the skill already documented is kept".
-    ///
-    /// Reading the absence as the default demoted a prioritized skill every time the agent refined
-    /// its text. Priority orders the `[Skills]` index the model reads *and* decides which entries
-    /// the index cap drops, so the demotion can take the skill out of view entirely.
+    /// An omitted priority keeps the one the skill already has, matching `PUT /v1/skills`: reading
+    /// the absence as the default would demote a prioritized skill every time the agent refined
+    /// its text, and priority decides which entries the index cap drops.
     #[tokio::test]
     async fn skill_write_keeps_an_omitted_priority() {
         let temp = tempfile::tempdir().expect("tempdir");

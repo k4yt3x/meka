@@ -1,9 +1,7 @@
-//! `meka session` and `meka history`: the stored-conversation CLI.
+//! `meka session`: the stored-conversation CLI.
 //!
-//! Split out of `main.rs`, which owned every subcommand's implementation alongside the process
-//! wiring and the interactive loop. Nothing here is reachable from a turn: these are the commands a
-//! human runs against conversations that already exist, so they take a [`Store`] and nothing else
-//! of the agent.
+//! Nothing here is reachable from a turn: these are the commands a human runs against conversations
+//! that already exist, so they take a [`Store`] and nothing else of the agent.
 //!
 //! Export and import are the substantial part. The JSON form is versioned
 //! ([`crate::store::export::SESSION_EXPORT_FORMAT_VERSION`]) and carries sub-agent descendants
@@ -23,7 +21,7 @@ const TABLE_WIDTH: usize = 120;
 /// Ceiling on the rendered profile column.
 ///
 /// A profile name is a config key the user chose, so nothing bounds it but this. Wide enough for
-/// the descriptive names people actually use -- `openrouter-anthropic-messages` is 29 -- since a
+/// the descriptive names people actually use (`openrouter-anthropic-messages` is 29), since a
 /// name cut short enough to stop distinguishing two profiles is worse than a shorter preview.
 const PROFILE_TRUNCATE: usize = 32;
 
@@ -57,12 +55,9 @@ pub(crate) async fn fork_session_command(
         forked = forked.id
     );
     // A fork of a sub-agent is a sibling under the same parent, so the copy is a worker too and
-    // `meka -r` refuses it. Printing the resume line anyway would hand the user a command that
-    // answers with a refusal -- the copy is real and readable, but continuing it is the parent's
-    // job, and that is what the hint has to say. A read failure decides only which hint is printed,
-    // so it must not fail a fork that has already landed -- but it must not be silent either: the
-    // fallback prints `meka -r`, which is the wrong advice for a copy of a worker, so a reader of
-    // the logs needs to know the question went unanswered.
+    // `meka -r` refuses it; the hint has to say that continuing it is the parent's job. A read
+    // failure decides only which hint is printed, so it must not fail a fork that has already
+    // landed, but it is logged, because the fallback hint is the wrong advice for a worker's copy.
     let spawned = match store.spawn_terms(forked.id).await {
         Ok(terms) => terms,
         Err(error) => {
@@ -74,16 +69,16 @@ pub(crate) async fn fork_session_command(
     };
     match spawned.map(|terms| terms.parent) {
         Some(Some(parent)) => crate::streams::write_stderr_line(format!(
-            "Forked session. It is a sub-agent of {parent}, so continue it with `agent_followup` \
-             from {parent} rather than `meka -r`."
+            "Forked session; it is a sub-agent of {parent}, so continue it with `agent_followup` \
+             from there."
         )),
-        // A copy of a worker whose parent is not in this store. Still a worker, still not
-        // resumable, and with no id to name; saying so beats printing `meka -r`.
+        // A copy of a worker whose parent is not in this store: still a worker, still not
+        // resumable, and with no id to name.
         Some(None) => crate::streams::write_stderr_line(
-            "Forked session. Its parent is not in this store, so `meka -r` will refuse it.",
+            "Forked session; its parent is not in this store, so it cannot be resumed.",
         ),
         None => crate::streams::write_stderr_line(format!(
-            "Forked session. Resume with: meka -r {}",
+            "Forked session; resume it with `meka -r {}`",
             forked.id
         )),
     }
@@ -150,7 +145,7 @@ pub(crate) async fn run_session_subcommand(
             //
             // Skipped only when every id the user named failed to resolve and no sweep was asked
             // for, because `delete_sessions` would then read the empty list as "no ids given" and
-            // answer `specify one or more session IDs`, which contradicts the command line. With no
+            // answer `specify session ids, ...`, which contradicts the command line. With no
             // ids at all that message is exactly right, so it still goes through.
             if !unresolved.is_empty() && resolved.is_empty() && !*all && older_than_days.is_none() {
                 anyhow::bail!(
@@ -185,7 +180,7 @@ pub(crate) async fn run_session_subcommand(
             // rather than reporting a session it never needed to find. Pinned by
             // `session_rewind_rejects_zero_turns_without_describing_the_conversation`.
             if *turns == 0 {
-                anyhow::bail!("-n must be 1 or more");
+                anyhow::bail!("`-n` must be 1 or more");
             }
             let session_id = store.resolve_session_id(session_id).await?;
             rewind_session_command(store, session_id, *turns).await
@@ -269,7 +264,7 @@ pub(crate) async fn rewind_session_command(
     // Rejected before anything else: `Conversation::rewind(0)` returns `None` unconditionally, so
     // the error below would otherwise say the session has "fewer than 0 turn(s)".
     if turns == 0 {
-        anyhow::bail!("-n must be 1 or more");
+        anyhow::bail!("`-n` must be 1 or more");
     }
     // Held for the whole read-modify-write. A REPL, `meka serve`, or `meka acp` holding this
     // session has its own in-memory conversation that would overwrite the rewind on its next turn.
@@ -288,8 +283,8 @@ pub(crate) async fn rewind_session_command(
 
     tracing::info!("rewound {turns} turn(s) from session {session_id}");
     crate::streams::write_stderr_line(format!(
-        "Rewound {} turn(s); {} message(s) remain. The full history is still in \
-         `meka session export`.",
+        "Rewound {} turn(s); {} message(s) remain, and `meka session export` still shows the \
+         dropped ones.",
         turns,
         conversation.len(),
     ));
@@ -330,8 +325,7 @@ pub(crate) async fn list_sessions(
 
 /// One row per session, separated from printing so the sanitizing can be asserted.
 ///
-/// Both authored cells go through the same helper. The profile used `sanitize_for_display`, which
-/// keeps `\n` and has no cap; the preview had neither and reached the terminal verbatim.
+/// Both authored cells go through the same helper, which drops `\n` and caps in terminal columns.
 fn session_rows(
     sessions: &[crate::store::SessionSummary],
     resolvable: &[String],
@@ -461,7 +455,7 @@ pub(crate) async fn import_session(
     let raw = if input == "-" {
         let mut buffer = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
-            .map_err(|error| anyhow::anyhow!("failed to read standard input: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("failed to read stdin: {error}"))?;
         buffer
     } else {
         std::fs::read_to_string(input)
@@ -482,7 +476,7 @@ pub(crate) async fn import_session(
 
     tracing::info!("imported {count} session(s) as root {root_new_id}");
     crate::streams::write_stderr_line(format!(
-        "Imported {count} session(s). Resume the root with `meka -r {root_new_id}`."
+        "Imported {count} session(s); resume the root with `meka -r {root_new_id}`"
     ));
     // The one line a script reads: the id it can resume.
     crate::render::write_stdout_line(root_new_id)?;
@@ -510,9 +504,7 @@ pub(crate) async fn delete_sessions(
         // Zero would sweep everything, which is `--all` by another name and far too easy to type
         // by accident when you meant "today's".
         if days == 0 {
-            anyhow::bail!(
-                "--older-than-days 0 would delete every session; use --all if you mean that"
-            );
+            anyhow::bail!("`--older-than-days 0` would delete every session; use `--all` for that");
         }
         let sweep = store
             .delete_expired_sessions(std::time::Duration::from_secs(days.saturating_mul(86_400)))
@@ -526,13 +518,13 @@ pub(crate) async fn delete_sessions(
     }
 
     if session_ids.is_empty() {
-        anyhow::bail!("specify one or more session ids, --older-than-days <DAYS>, or --all");
+        anyhow::bail!("specify session ids, `--older-than-days <DAYS>` or `--all`");
     }
 
     let mut deleted = 0u64;
     // Reported at the end rather than returned at the first refusal. Every id the user named is a
     // separate request, and one of them being in use is no reason to leave the rest of the list
-    // untried -- nor to swallow the count of what did go, which returning early also did.
+    // untried, nor to swallow the count of what did go, which returning early also did.
     let mut refused = Vec::new();
     for session_id in session_ids {
         // The refusing door, not the plain one: this is a session this process has never had open,
@@ -543,7 +535,7 @@ pub(crate) async fn delete_sessions(
             Ok(true) => deleted += 1,
             // A refusal like any other: the user named this id and it did not go away, which a
             // script must be able to tell from success. Reachable without a race by naming one
-            // session twice -- a prefix and its full id -- where the second pass finds it gone.
+            // session twice (a prefix and its full id), where the second pass finds it gone.
             Ok(false) => {
                 crate::streams::write_stderr_line(
                     crate::error::MekaError::SessionNotFound(*session_id).to_string(),
@@ -562,7 +554,7 @@ pub(crate) async fn delete_sessions(
     // success. The per-id reasons are already on stderr; this is what a script reads.
     if !refused.is_empty() {
         // Does not name a cause. Every `Err` lands here, and `delete_session_unless_attached`
-        // returns a database error as readily as a lock refusal -- so claiming "another meka has
+        // returns a database error as readily as a lock refusal, so claiming "another meka has
         // them open" would report a full disk as a busy session. The per-id lines above carry the
         // real reason; this is the summary a script reads.
         anyhow::bail!(
@@ -581,7 +573,7 @@ pub(crate) async fn delete_sessions(
 pub(crate) fn report_sessions_left_open(sweep: crate::store::SessionSweep) {
     if sweep.attached_elsewhere > 0 {
         tracing::warn!(
-            "left {attached} session(s) alone: another meka process has them open. Close it and \
+            "left {attached} session(s) alone: another meka process has them open; close it and \
              run this again",
             attached = sweep.attached_elsewhere
         );
@@ -594,8 +586,7 @@ pub(crate) fn report_sessions_left_open(sweep: crate::store::SessionSweep) {
 /// through writing. `Agent::run_turn` persists the user message *eagerly*, before the provider has
 /// answered, so a copy taken mid-turn ends on an unanswered user message: the fork reads `user,
 /// user, assistant` from its first resumed turn onward, and an exported snapshot reproduces that
-/// shape through `meka session import`. Measured 10/10 and 30/30 across two runs -- this is not a
-/// race that sometimes bites, it is what happens every time you fork a session that is thinking.
+/// shape through `meka session import`. It happens every time a session that is thinking is forked.
 ///
 /// `meka session rewind` takes this lock too. Fork probes inside `Store::fork_session_locked`,
 /// where every fork door reaches it; export is the door left here.
@@ -617,8 +608,8 @@ pub(crate) fn hold_still_for_a_copy(
 fn cannot_copy_while_written(error: crate::error::MekaError) -> anyhow::Error {
     match error {
         crate::error::MekaError::SessionLocked(_) => anyhow::anyhow!(
-            "{error}. A conversation cannot be copied while it is being written; close the meka that \
-             has it open and try again"
+            "{error}: a conversation cannot be copied while it is being written; close the meka \
+             that has it open and try again"
         ),
         other => other.into(),
     }
@@ -728,8 +719,8 @@ mod tests {
     }
     /// The profile column takes what real names need, and the preview spends what is left.
     ///
-    /// Profile names are descriptive in practice -- `openrouter-anthropic-messages` is 29 columns
-    /// -- and one cut short enough to stop distinguishing two profiles is worse than a shorter
+    /// Profile names are descriptive in practice (`openrouter-anthropic-messages` is 29 columns),
+    /// and one cut short enough to stop distinguishing two profiles is worse than a shorter
     /// preview. Reserving the ceiling instead would spend that width even on an installation with
     /// one four-character name.
     #[tokio::test]

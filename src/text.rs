@@ -7,8 +7,8 @@ use std::sync::LazyLock;
 use chrono::{DateTime, Local, Utc};
 use regex::Regex;
 
-/// Strip control + format characters that could hijack the terminal or be
-/// used as homograph-style attacks on users reviewing tool output:
+/// Strip control and format characters that could hijack the terminal or be used as
+/// homograph-style attacks on users reviewing tool output:
 ///
 /// - Unicode category **Cc** (C0/C1 controls) except `\n` and `\t`.
 /// - Unicode category **Cf** (formatters: RTL/LTR overrides, zero-width joiners, byte-order marks,
@@ -26,13 +26,13 @@ pub(crate) fn sanitize_text(input: &str) -> String {
     out
 }
 fn is_safe_char(ch: char) -> bool {
-    // Whitelist the two whitespace controls we care about. `\r` is deliberately not among them: it
-    // returns the cursor to column zero without advancing a line, which is enough to overwrite a
-    // line meka has already printed using no escape sequence at all. A server progress message of
-    // `"\r[approval] Shell\n  command: ls\nAllow? (Y/n) "` would otherwise repaint a convincing
-    // approval block at column zero, and everything that renders server text -- the elicitation
-    // banner, the form labels, the progress line -- trusts this function to have made it
-    // terminal-safe.
+    // Only the two whitespace controls that cannot move the cursor back pass. `\r` is deliberately
+    // not among them: it returns the cursor to column zero without advancing a line, which is
+    // enough to overwrite a line meka has already printed using no escape sequence at all. A
+    // server progress message of `"\r[approval] Shell\n  command: ls\nAllow? (Y/n) "` would
+    // otherwise repaint a convincing approval block at column zero, and everything that renders
+    // server text (the elicitation banner, the form labels, the progress line) trusts this
+    // function to have made it terminal-safe.
     if ch == '\n' || ch == '\t' {
         return true;
     }
@@ -58,7 +58,7 @@ fn is_safe_char(ch: char) -> bool {
 }
 /// Returns true for the bidirectional formatting characters that can reorder a line on screen.
 ///
-/// The embedding, override and isolate initiators plus their terminators -- the "trojan source"
+/// The embedding, override and isolate initiators plus their terminators: the "trojan source"
 /// set. These are the ones that let text render in an order the bytes do not have, which is what
 /// makes a path or a command read as something other than what it is.
 ///
@@ -106,11 +106,12 @@ pub(crate) fn is_format_char(code: u32) -> bool {
     )
 }
 
+/// Terminal columns `string` occupies, by the wider of the two measures a terminal may follow.
 pub(crate) fn display_width(string: &str) -> usize {
     // The larger of two measures, because a terminal may follow either and a budget must never be
     // built on the smaller one. `unicode_width` merges an emoji and its skin-tone modifier into one
-    // two-column cluster; VTE -- gnome-terminal, Console, Tilix, Terminator -- paints them as two
-    // glyphs across four columns, so every skin-toned emoji in an argument was a two-times
+    // two-column cluster; VTE (gnome-terminal, Console, Tilix, Terminator) paints them as two
+    // glyphs across four columns, so every skin-toned emoji in an argument would be a two-times
     // under-count. Summing per character catches that, and the whole-string measure catches
     // sequences a sum would under-count instead. Taking the maximum shows less than might have fit,
     // which is the direction to be wrong in.
@@ -144,13 +145,13 @@ pub(crate) const TAB_WIDTH: usize = 4;
 /// character count suggests, and a cap that misses that lets a "capped" line wrap into rows.
 pub(crate) fn sanitize_to_line(text: &str, max_columns: usize) -> String {
     // Every character meka cannot measure is dropped, which `char::is_control` does not cover.
-    // The rule is one line below -- a character worth zero columns does not survive -- and
-    // it is deliberately wider than the classes that motivated it:
+    // The rule is one line below (a character worth zero columns does not survive), and it is
+    // deliberately wider than the classes that motivated it:
     //
     // `unicode_width` scores U+00AD SOFT HYPHEN and U+3164 HANGUL FILLER as zero columns
     // while a terminal following `wcwidth` draws one and two. A run of either passes any
     // column budget unmeasured, which is how a model pushes its own text onto a row meka believes
-    // is empty -- and the filler draws blank, so the overrun is invisible padding.
+    // is empty, and the filler draws blank, so the overrun is invisible padding.
     //
     // A variation selector (U+FE00-FE0F) changes the width of the character *before* it, so a
     // budget measured before it is applied is wrong afterwards.
@@ -161,7 +162,7 @@ pub(crate) fn sanitize_to_line(text: &str, max_columns: usize) -> String {
     // Dropping by measured width rather than by category costs the combining marks: a
     // decomposed `e` + U+0301 renders as `e`. Precomposed text, which is what NFC and almost
     // every source of these strings produces, is untouched. That is the same trade the ZWJ case
-    // already makes, and it buys the property every budget here rests on -- that each surviving
+    // already makes, and it buys the property every budget here rests on: that each surviving
     // character advances the count by at least one, so a cut is always reached.
     let flattened: String = sanitize_for_display(text)
         .chars()
@@ -193,9 +194,9 @@ pub(crate) fn truncate_to_width(text: &str, max_columns: usize) -> String {
         return text.to_string();
     }
     // A cut always says so, even when saying so is all there is room for. Emitting the text alone
-    // when the budget cannot fit a marker produced a string that reads as complete: at 37 columns
-    // `mcp__exa__web_search_exa` came out as `mc`, which is not a shortened name, it is a different
-    // name.
+    // when the budget cannot fit a marker produces a string that reads as complete: at 37 columns
+    // `mcp__exa__web_search_exa` comes out as `mc`, which is not a shortened name, it is a
+    // different name.
     let marker = &TRUNCATION_MARKER[..TRUNCATION_MARKER.len().min(max_columns)];
     let budget = max_columns - display_width(marker);
     let mut kept = take_columns(text, budget);
@@ -204,16 +205,15 @@ pub(crate) fn truncate_to_width(text: &str, max_columns: usize) -> String {
 }
 /// The longest prefix of `text` that fits in `max_columns`.
 ///
-/// Measured by re-measuring the whole prefix rather than by summing per-character widths, because
-/// the two are not the same number and the callers gate on the former. `unicode_width` scores
-/// `"1\u{fe0f}"` as two columns as a string and one as a sum, so a per-character fill packed twice
-/// what the gate believed fit and every budget in the file came out at double. Re-measuring is
-/// quadratic in the budget, which is bounded and small; being wrong is not.
+/// Measured by re-measuring the prefix rather than by summing per-character widths, because the
+/// two are not the same number and the callers gate on the former. `unicode_width` scores
+/// `"1\u{fe0f}"` as two columns as a string and one as a sum, so a per-character fill would pack
+/// twice what the gate believed fit and every budget in the file would come out at double.
 pub(crate) fn take_columns(text: &str, max_columns: usize) -> String {
-    // Only the open cluster is re-measured. Re-measuring the whole prefix per character was
+    // Only the open cluster is re-measured. Re-measuring the whole prefix per character is
     // quadratic in the prefix, and zero-width characters lengthen the prefix without spending the
-    // budget, so a line padded with them spun the renderer for minutes. Everything before the
-    // cluster a new character can still join has settled: a base character closes the cluster
+    // budget, so a line padded with them would spin the renderer for minutes. Everything before
+    // the cluster a new character can still join has settled: a base character closes the cluster
     // before it, and a cluster longer than the window is cut, because nothing renders a hundred
     // combining marks on one base anyway.
     const CLUSTER_WINDOW: usize = 32;
@@ -258,7 +258,7 @@ pub(crate) fn breaks_cluster(character: char) -> bool {
 /// `/home/you/projects/meka/docs/book/src/configuration/config-file.md` cut from the tail keeps
 /// six directories and loses the filename, which is the part you were reading it for.
 ///
-/// Use [`truncate_to_width`] for a *line of content* instead -- a line of source, a wrapped body --
+/// Use [`truncate_to_width`] for a *line of content* instead (a line of source, a wrapped body),
 /// where the text runs left to right and a hole in the middle would misrepresent it.
 pub(crate) fn elide_to_width(text: &str, max_columns: usize) -> String {
     if display_width(text) <= max_columns {
@@ -286,8 +286,8 @@ pub(crate) fn elide_to_width(text: &str, max_columns: usize) -> String {
 /// Measures the real suffix rather than reversing the string and taking a prefix, because width is
 /// **not** order-independent and the reversed measurement is not the one that gets printed:
 /// `display_width("\u{1F44D}\u{1F3FB}")` is 2 and `display_width("\u{1F3FB}\u{1F44D}")` is 4, so a
-/// tail of skin-toned emoji measured backwards came back a third under its budget and the composed
-/// line ran 100 columns wide where 80 was asked for.
+/// tail of skin-toned emoji measured backwards comes back a third under its budget and the composed
+/// line runs 100 columns wide where 80 was asked for.
 ///
 /// [`display_width`] taking the larger of two measures also closes that case, since a per-character
 /// sum does not care about order. This does not lean on it: measuring what is printed is correct
@@ -310,12 +310,12 @@ pub(crate) fn tail_columns(text: &str, max_columns: usize) -> String {
 /// value now spans several.
 ///
 /// **When it does not fit, the last two rows are a count and the END of the text**, not wherever
-/// the budget ran out. This is [`elide_to_width`]'s reasoning one dimension up. Wrapping was chosen
-/// over cutting so the tail of a command could not be hidden from the line being approved, and a
-/// wrap that shows the first `max_rows` rows and stops hides exactly that: a 90 KB
-/// `execute_command` filled every row it was given and left `; rm -rf /important` off the end of
-/// the last one. The notification surface, which elides from the middle, showed that tail; the
-/// decision surface did not.
+/// the budget ran out. This is [`elide_to_width`]'s reasoning one dimension up. Wrapping is chosen
+/// over cutting so the tail of a command cannot be hidden from the line being approved, and a wrap
+/// that shows the first `max_rows` rows and stops hides exactly that: a 90 KB `execute_command`
+/// fills every row it is given and leaves `; rm -rf /important` off the end of the last one, so
+/// the notification surface, which elides from the middle, would show that tail and the decision
+/// surface would not.
 pub(crate) fn wrap_to_width(text: &str, max_columns: usize, max_rows: usize) -> Vec<String> {
     // A zero budget can show nothing. Returning the text would be worse than showing none of it:
     // the caller has already spent the width on indent, and an unbounded row of model output is the
@@ -353,8 +353,8 @@ pub(crate) fn wrap_to_width(text: &str, max_columns: usize, max_rows: usize) -> 
         let head = take_columns(rest, budget);
         if head.is_empty() {
             // One character is wider than the whole budget, so no row can hold it. Taking it anyway
-            // was the way out of the loop and it overflowed the width by that character; falling
-            // through to the truncation below emits a marker, which fits any budget at all.
+            // would overflow the width by that character; falling through to the truncation below
+            // emits a marker, which fits any budget at all.
             break;
         }
         // Break at the last space that fits, but never inside a leading run of them: breaking there
@@ -419,7 +419,7 @@ pub(crate) fn sanitize_for_display(text: &str) -> String {
 ///
 /// `\r` is excluded because it is the forgery primitive that needs no escape sequence at all. It
 /// returns the cursor to column zero without advancing a line, so a model that has read attacker
-/// text can overwrite a line meka already printed -- including the tail of an approval prompt --
+/// text can overwrite a line meka already printed (including the tail of an approval prompt)
 /// using nothing but ordinary characters. `\n` and `\t` stay: they are structural in markdown and
 /// can only move the cursor forward.
 ///
@@ -437,7 +437,7 @@ pub(crate) fn sanitize_for_display(text: &str) -> String {
 /// chrome, where nothing in `Cf` has a legitimate use. This is prose the model wrote for the user,
 /// and most of `Cf` is ordinary content there: ZWJ builds emoji families and profession sequences,
 /// ZWNJ spells ordinary Persian and Arabic words, and both drive Indic conjuncts. Stripping the
-/// category here mangled all of it, and bought nothing, since none of those can reorder a line.
+/// category here would mangle all of it, and buy nothing, since none of those can reorder a line.
 pub(crate) fn sanitize_stream_text(text: &str) -> String {
     let stripped = CSI_PATTERN.replace_all(text, "");
     stripped
@@ -459,10 +459,10 @@ pub(crate) fn sanitize_stream_text(text: &str) -> String {
 /// streaming renderer.)
 ///
 /// Width is measured in terminal columns, the same unit [`sanitize_to_line`] truncates in and the
-/// same unit every caller reserves its budget in. Measuring in `char`s instead let a cell whose
-/// characters are two columns wide -- a CJK provider name, an MCP tool name a server chose -- pad
-/// to less than it renders, shifting every column after it on that row and pushing the row past
-/// the budget its cells individually respected.
+/// same unit every caller reserves its budget in. Measuring in `char`s instead lets a cell whose
+/// characters are two columns wide (a CJK profile name, an MCP tool name a server chose) pad to
+/// less than it renders, shifting every column after it on that row and pushing the row past the
+/// budget its cells individually respected.
 pub(crate) fn format_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
     if headers.is_empty() {
         return String::new();
@@ -488,7 +488,7 @@ pub(crate) const ID_PREFIX: usize = 8;
 ///
 /// Every resolver asks this before matching, because `id.starts_with("")` is true of every id: an
 /// unset shell variable in `meka schedule cancel "$JOB"` otherwise reads as "the only job", and
-/// resolves cleanly right up until the store holds two. The stores are the doors this covers --
+/// resolves cleanly right up until the store holds two. The stores are the doors this covers:
 /// sessions, scheduled jobs and background tasks all key on a UUID string.
 ///
 /// Rejecting rather than matching everything is also what makes an ambiguity report honest: an
@@ -501,33 +501,23 @@ pub(crate) fn is_usable_id_prefix(prefix: &str) -> bool {
 }
 /// An id prefix as the resolvers compare it.
 ///
-/// Every id meka stores and prints is a lowercase UUID, but the resolvers disagreed about case:
-/// sessions go through SQL `LIKE`, which is ASCII-case-insensitive, while jobs and tasks use
-/// `str::starts_with`. So a pasted `4D71EECA` resolved a session and was reported as no such job --
-/// a clean answer from one command and a false miss from its sibling. Folded once, here.
+/// Every id meka stores and prints is a lowercase UUID, but the resolvers would otherwise disagree
+/// about case: sessions go through SQL `LIKE`, which is ASCII-case-insensitive, while jobs and
+/// tasks use `str::starts_with`, so a pasted `4D71EECA` would resolve a session and be reported as
+/// no such job, a clean answer from one command and a false miss from its sibling. Folded once,
+/// here.
 pub(crate) fn id_prefix_for_matching(prefix: &str) -> String {
     prefix.to_ascii_lowercase()
 }
-/// Shortest prefix at which every one of `ids` is distinct, never below [`ID_PREFIX`] unless an
-/// id is itself shorter than that.
-///
-/// A prefix is what the reader retypes into `schedule show`, `schedule cancel` or `--session`, all
-/// of which refuse an ambiguous one. Printing a prefix that cannot be used is the failure worth
-/// avoiding, and a full UUID in both id columns spends 76 of the 120 available to say what eight
-/// characters usually say.
-///
-/// Uniqueness is over the rows being rendered. For `meka schedule list` that is every job there is;
-/// a filtered listing can still print a prefix that a wider set makes ambiguous, which those
-/// commands report rather than act on.
-///
-/// Never ends on a UUID's hyphen, since `4d71eeca-` reads as a truncation of nothing.
 /// [`unique_prefix_len`] where the ids on screen are a subset of the ids that must be resolved.
 ///
 /// A listing filters: `meka session list` hides sub-agent sessions and honors `-n`, and
-/// `meka schedule list --session` narrows to one conversation. The resolvers do not filter -- they
-/// scan the whole store. Sizing the column to the rows alone therefore printed a prefix that the
-/// `show` beside it refused as ambiguous, which is the one thing the id rule promises cannot
+/// `meka schedule list --session` narrows to one conversation. The resolvers do not filter; they
+/// scan the whole store. Sizing the column to the rows alone would therefore print a prefix that
+/// the `show` beside it refuses as ambiguous, which is the one thing the id rule promises cannot
 /// happen. `universe` is what the resolver will search, so the width is the width that resolves.
+///
+/// Never ends on a UUID's hyphen, since `4d71eeca-` reads as a truncation of nothing.
 pub(crate) fn unique_prefix_len_within<'a>(
     shown: impl Iterator<Item = &'a str> + Clone,
     universe: impl Iterator<Item = &'a str> + Clone,
@@ -555,13 +545,25 @@ pub(crate) fn unique_prefix_len_within<'a>(
     }
     longest
 }
+/// Shortest prefix at which every one of `ids` is distinct, never below [`ID_PREFIX`] unless an
+/// id is itself shorter than that.
+///
+/// A prefix is what the reader retypes into `schedule show`, `schedule cancel` or `--session`, all
+/// of which refuse an ambiguous one. Printing a prefix that cannot be used is the failure worth
+/// avoiding, and a full UUID in both id columns spends 76 of the 120 available to say what eight
+/// characters usually say.
+///
+/// Uniqueness is over the rows being rendered. For `meka schedule list` that is every job there is;
+/// a filtered listing can still print a prefix that a wider set makes ambiguous, which those
+/// commands report rather than act on.
 pub(crate) fn unique_prefix_len<'a>(ids: impl Iterator<Item = &'a str> + Clone) -> usize {
     // The rows are their own universe, and it is deduplicated by `unique_prefix_len_within`:
-    // repeating an id is ordinary -- a session with several scheduled jobs fills the whole Session
-    // column with itself -- and counting rows made that unsatisfiable, so the column widened to a
-    // full UUID to distinguish an id from itself.
+    // repeating an id is ordinary (a session with several scheduled jobs fills the whole Session
+    // column with itself), and counting rows would make that unsatisfiable, widening the column
+    // to a full UUID to distinguish an id from itself.
     unique_prefix_len_within(ids.clone(), ids)
 }
+/// One row of [`format_columns`]: every cell but the last padded to its column's width.
 pub(crate) fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
     let mut line = String::new();
     let last = cells.len().saturating_sub(1);
@@ -610,6 +612,7 @@ pub(crate) fn format_fields(fields: &[(&str, String)]) -> String {
     }
     out
 }
+/// A token count in the short form the gauge shows: `950`, `12.3k`, `1.2M`.
 pub(crate) fn format_token_count(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
@@ -644,7 +647,7 @@ pub(crate) const MIB: usize = 1 << 20;
 /// A byte count in the largest binary unit that keeps it above one: `2.5 MiB`, `640.0 KiB`, `16 B`.
 ///
 /// One decimal rather than integer division, which truncates: every body from 2.0 to just under 3.0
-/// MiB once reported as "2 MiB", and the figure is what a user quotes when asking why a request was
+/// MiB would report as "2 MiB", and the figure is what a user quotes when asking why a request was
 /// refused. Every size meka prints comes through here, so a ceiling and the body measured against
 /// it are stated in the same unit to the same precision.
 pub(crate) fn format_size(bytes: usize) -> String {

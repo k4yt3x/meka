@@ -12,7 +12,7 @@ The config file is optional. If it does not exist, meka silently skips it.
 
 meka refuses unknown keys: a typo (`contex_window`) or a removed key (`reasoning_effort`) fails the load with an error naming the offending key, rather than being silently ignored. Fix or remove the key to continue.
 
-The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable`, `meka account remove` and `meka profile remove` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "No MCP servers configured." over a file full of them is indistinguishable from the truth.
+The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable`, `meka account remove` and `meka profile remove` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "No MCP servers." over a file full of them is indistinguishable from the truth.
 
 Those editors only reach the keys they own, so a bad key anywhere else (`[session]`, `[permissions]`, a top-level typo, a raw syntax error) has to be fixed in an editor. The error names the file, line, column, and offending key.
 
@@ -1364,7 +1364,7 @@ The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's bui
 | `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
 | `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `workspace`, `unrestricted`; any other value is refused at startup, naming the line. |
 
-Stale entries (a name that doesn't match any built-in) emit a `warn!` at startup. meka still starts; the warning just flags a likely typo or a tool the binary renamed.
+Stale entries (a name that matches no built-in) emit a `warn!` at startup. meka still starts; the warning just flags a likely typo or a tool the binary renamed.
 
 Restrict a session to read-only inspection:
 ```toml

@@ -21,10 +21,8 @@ pub(crate) fn expand_user_path(target: &str) -> Option<PathBuf> {
     {
         // `is_separator`, not a literal `"~/"`. On Windows both `/` and `\` separate, and `~\` is
         // the spelling a user reaches for there because that is what PowerShell's own tilde
-        // expansion produces. Matching only `~/` left `~\projects` unexpanded, so it became a
-        // literal relative directory of that name and `/cd` reported the tilde back at the user as
-        // though it were a folder. `[skills] extra_paths` took the same spelling and resolved to a
-        // root that never existed.
+        // expansion produces. Matched on `~/` only, `~\projects` stays a literal relative
+        // directory of that name.
         dirs::home_dir().map(|home| home.join(rest))
     } else {
         Some(PathBuf::from(target))
@@ -39,11 +37,11 @@ pub(crate) fn meka_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MEKA_CONFIG_DIR") {
         let path = PathBuf::from(dir);
         // An empty value reads as unset rather than as the current directory. `MEKA_CONFIG_DIR=`
-        // in a shell profile, or an exported-but-unset variable in a systemd unit, made meka load
-        // `./config.toml` from whatever directory it happened to start in -- and then spawn that
-        // file's MCP servers. A relative value has the same shape of problem: which config you get
-        // depends on your cwd. `MEKA_DATA_DIR` refuses both for the same reasons, and more
-        // sharply: `meka.db` holds every provider credential.
+        // in a shell profile, or an exported-but-unset variable in a systemd unit, would otherwise
+        // load `./config.toml` from whatever directory meka started in, and spawn that file's MCP
+        // servers. A relative value has the same shape of problem: which config you get depends on
+        // your cwd. `MEKA_DATA_DIR` refuses both for the same reasons, and more sharply: `meka.db`
+        // holds every provider credential.
         if path.as_os_str().is_empty() {
             // `warn!`, not `debug!`: an override the user set and meka did not honor is exactly
             // the recoverable-fallback case, and the environment-variable documentation says a
@@ -51,8 +49,7 @@ pub(crate) fn meka_config_dir() -> Option<PathBuf> {
             tracing::warn!("MEKA_CONFIG_DIR is empty; using the platform config directory");
         } else if !path.is_absolute() {
             tracing::warn!(
-                "MEKA_CONFIG_DIR '{path}' is not an absolute path; ignoring it and using the platform \
-                 config directory",
+                "MEKA_CONFIG_DIR '{path}' is not absolute; using the platform config directory",
                 path = path.display()
             );
         } else {
@@ -81,10 +78,12 @@ pub(crate) fn command_output_dir() -> PathBuf {
         .or_else(|| dirs::cache_dir().map(|directory| directory.join("meka")))
         .unwrap_or_else(std::env::temp_dir)
 }
+/// `config.toml`'s path, under [`meka_config_dir`].
 pub(crate) fn config_file_path() -> Option<PathBuf> {
     meka_config_dir().map(|dir| dir.join("config.toml"))
 }
 
+/// The skills directory meka itself manages, under [`meka_config_dir`].
 pub(crate) fn skills_dir() -> Option<PathBuf> {
     crate::paths::meka_config_dir().map(|dir| dir.join("skills"))
 }
@@ -117,8 +116,7 @@ fn data_dir_override() -> Option<PathBuf> {
         return Some(path);
     }
     tracing::warn!(
-        "MEKA_DATA_DIR '{path}' is not an absolute path; ignoring it and using the platform data \
-         directory",
+        "MEKA_DATA_DIR '{path}' is not absolute; using the platform data directory",
         path = path.display()
     );
     None

@@ -1,9 +1,8 @@
 //! The per-session workspace: where relative paths resolve from, and which roots a search sweeps.
 //!
 //! Its own module rather than a corner of `agent.rs` because every file-touching tool needs it and
-//! nothing here needs an `Agent`. Living in `agent.rs` made `tools` depend on `agent` for a path
-//! join, which is a cycle between the two largest modules in the tree and the reason a reader
-//! looking for "how does `read_file` resolve a relative path" ended up in the turn loop.
+//! nothing here needs an `Agent`: in `agent.rs` it would make `tools` depend on `agent` for a path
+//! join, a cycle between the two largest modules in the tree.
 
 use std::{
     path::{Path, PathBuf},
@@ -94,7 +93,7 @@ impl SharedRoots {
 /// and the shell's working directory regardless of what this returns.
 ///
 /// Paths are compared as given. A symlink pointing at another root, or a path containing `..`, is
-/// not detected; canonicalising to catch those would resolve symlinked roots to targets the client
+/// not detected; canonicalizing to catch those would resolve symlinked roots to targets the client
 /// never named, which is a worse trade than an occasional duplicate.
 pub(crate) fn search_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
     retain_broadest(std::iter::once(cwd.get()).chain(roots.get()))
@@ -135,13 +134,13 @@ fn retain_broadest(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 /// tools and the shell cannot disagree about where a write may land.
 ///
 /// Roots come back **canonical**, with symlinks resolved, which is what makes the containment check
-/// meaningful: the target of a write is canonicalised too, so a symlink planted inside the
+/// meaningful: the target of a write is canonicalized too, so a symlink planted inside the
 /// workspace and pointing out of it (`<root>/escape -> /etc`) resolves to `/etc/...` and fails the
 /// prefix test. It also states the boundary in the filesystem's own terms, which is what the kernel
 /// backends match on.
 ///
 /// A root that does not resolve is **dropped**, not passed through. A path that cannot be
-/// canonicalised does not exist yet, and a boundary naming a directory that is not there should
+/// canonicalized does not exist yet, and a boundary naming a directory that is not there should
 /// permit nothing rather than permit a name that something could later be created at.
 ///
 /// Empty is a meaningful answer and means "no write may land anywhere", which is what every caller
@@ -175,28 +174,26 @@ pub(crate) fn usable_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Path
 ///
 /// **Not a directory.** Landlock's `PATH_BENEATH` rule is rejected with `EINVAL` when the parent is
 /// a regular file and the rule carries directory-class rights, which meka's full handled-access
-/// mask does. `apply_landlock` then fails inside `pre_exec`, so *every* shell command in the
-/// session dies with `Invalid argument` -- not just a write to that root. The other three backends
-/// accept a file root and quietly do something different with it, so this is also the sharpest
-/// cross-backend divergence there is. `--writable-root ./notes.md` was enough to trigger it.
+/// mask does. `apply_landlock` then fails inside `pre_exec`, so every shell command in the
+/// session dies with `Invalid argument`, not just a write to that root. The other three backends
+/// accept a file root and quietly do something different with it.
 ///
-/// **A system directory that Bubblewrap masks.** The bwrap backend binds each root *after* its
-/// tmpfs masks so a root under `/tmp` survives, and later mounts win -- which means a root at or
-/// above a masked path un-masks it. Those masks are not about the filesystem: they exist to put the
-/// D-Bus and systemd-user sockets out of reach. `--writable-root /run/user/1000` therefore hands
-/// back the session bus, and `systemd-run --user` writes anywhere; a root of `/` additionally
-/// un-masks `/proc` and `/dev`, defeating the PID namespace. None of these are workspaces, and
-/// every backend is degraded by them, so they are refused rather than special-cased per backend.
+/// **A system directory that Bubblewrap masks.** The bwrap backend binds each root after its tmpfs
+/// masks so a root under `/tmp` survives, and later mounts win, so a root at or above a masked path
+/// un-masks it. Those masks exist to put the D-Bus and systemd-user sockets out of reach:
+/// `--writable-root /run/user/1000` would hand back the session bus, and a root of `/` would
+/// un-mask `/proc` and `/dev`, defeating the PID namespace. None of these are workspaces, and every
+/// backend is degraded by them, so they are refused rather than special-cased per backend.
 fn is_usable_root(path: &Path) -> bool {
     let displayed = path.display();
     if !path.is_dir() {
-        tracing::warn!("workspace root {displayed} is not a directory; ignoring it");
+        tracing::warn!("workspace root '{displayed}' is not a directory; ignoring it");
         return false;
     }
     if is_system_root(path) {
         tracing::warn!(
-            "refusing {displayed} as a workspace root: the sandbox masks system directories, so \
-             binding one back would undo that. Name a project directory instead"
+            "refusing workspace root '{displayed}': the sandbox masks system directories; name a \
+             project directory instead"
         );
         return false;
     }
@@ -213,8 +210,8 @@ fn is_usable_root(path: &Path) -> bool {
 /// someone set `XDG_RUNTIME_DIR=$HOME/.xdg`; a root at `$HOME` then hands the session bus socket
 /// back to a confined shell, which is exactly what the masks exist to prevent.
 ///
-/// A root *under* a masked path is fine and is deliberately allowed -- the bind restores only that
-/// subdirectory, not the masked directory itself -- except for the two socket trees below, which
+/// A root under a masked path is fine and is deliberately allowed (the bind restores only that
+/// subdirectory, not the masked directory itself), except for the two socket trees below, which
 /// are refused as whole subtrees because everything in them is the kind of socket being hidden.
 ///
 /// The list below is the authority. `/tmp` and `/var/tmp` are in it: "they hold no IPC socket
@@ -230,7 +227,7 @@ pub(crate) fn is_system_root(path: &Path) -> bool {
 /// target under them whatever roots the session holds. The shell's environment is already scrubbed
 /// because a leaked secret plus the open network is a live exfiltration vector under prompt
 /// injection; the same secrets sit in `meka.db` at a path any shell can guess, so leaving the disk
-/// door open while guarding the environment one guarded nothing. Canonicalised where they exist,
+/// door open while guarding the environment one guarded nothing. Canonicalized where they exist,
 /// so a symlinked home matches the path the kernel reports; deduplicated because the capture
 /// directory usually sits under the data directory.
 pub(crate) fn private_directories() -> Vec<PathBuf> {
@@ -354,10 +351,9 @@ fn is_masked_root(path: &Path, private: &[PathBuf]) -> bool {
             "/run",
             "/tmp",
             "/var/tmp",
-            // The same two directories as macOS canonicalises them. `/tmp` and `/var` are symlinks
-            // into `/private` there, and a root is canonicalised before it reaches here, so the
-            // literals above are matched against a path that never has that spelling: `/tmp` was
-            // accepted as a writable root on macOS while being refused on Linux. Harmless on
+            // The same two directories as macOS canonicalizes them. `/tmp` and `/var` are symlinks
+            // into `/private` there, and a root is canonicalized before it reaches here, so the
+            // literals above are matched against a path that never has that spelling. Harmless on
             // Linux, where nothing resolves to either.
             "/private/tmp",
             "/private/var/tmp",
@@ -383,9 +379,8 @@ fn is_masked_root(path: &Path, private: &[PathBuf]) -> bool {
             && !runtime.is_empty()
             && let Ok(runtime) = std::fs::canonicalize(&runtime)
             // Both directions, and the ancestor half is the one that matters: this directory is
-            // often under `$HOME`, so a root at `$HOME` -- or the far more ordinary `cd ~` -- put
-            // the session bus back within reach of a confined shell. Measured by connecting to a
-            // socket under a simulated `$XDG_RUNTIME_DIR` from inside bwrap with an ancestor root.
+            // often under `$HOME`, so a root at `$HOME` (or the far more ordinary `cd ~`) would
+            // put the session bus back within reach of a confined shell.
             && (path.starts_with(&runtime) || runtime.starts_with(path))
         {
             return true;
@@ -405,9 +400,8 @@ pub(crate) static RUNTIME_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex:
 ///
 /// Invisible on Unix and load-bearing on Windows. `canonicalize` returns `\\?\C:\ws` while a cwd
 /// from `current_dir` and a path the model wrote are both spelled `C:\ws`, and the former never
-/// prefix-matches the latter. The fence therefore refused every write *inside* the workspace while
-/// still refusing the ones outside it, which reads as a working boundary from every angle except
-/// the one that matters. Only a live Windows turn surfaced it.
+/// prefix-matches the latter, so without this the fence would refuse every write inside the
+/// workspace while still refusing the ones outside it.
 ///
 /// Verbatim UNC paths are deliberately left alone: a network share cannot be a workspace root
 /// anyway, because meka has to own the directory to grant on it.
@@ -499,7 +493,7 @@ pub(crate) fn is_within_roots(path: &std::path::Path, roots: &[PathBuf]) -> bool
 /// The filesystem cannot help for the case this exists for: a `write_file` naming a path that does
 /// not exist yet, which is most of them. `canonicalize` fails on a missing path, so the only way to
 /// judge `<root>/../../etc/passwd` *before* creating anything is to resolve the components as
-/// text. It is not a substitute for canonicalisation, which still runs afterwards to catch the
+/// text. It is not a substitute for canonicalization, which still runs afterwards to catch the
 /// symlinked ancestor this pass cannot see.
 fn normalize_lexically(path: &std::path::Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -521,10 +515,10 @@ fn normalize_lexically(path: &std::path::Path) -> PathBuf {
 /// registry: a sub-agent and its parent hold different `ToolRegistry` instances but write the
 /// same disk, and a per-registry lock would let exactly the pair that shares a workspace race.
 /// The session materials carry the host's handle to every registry built for it. Keyed on the
-/// canonicalised path so two spellings of one file take the same lock.
+/// canonicalized path so two spellings of one file take the same lock.
 ///
-/// The map is a `std::sync::Mutex` holding only `Arc` clones -- no `.await` happens inside it, so
-/// it never blocks the runtime -- while the per-path lock is a `tokio::sync::Mutex`, since it is
+/// The map is a `std::sync::Mutex` holding only `Arc` clones (no `.await` happens inside it, so
+/// it never blocks the runtime), while the per-path lock is a `tokio::sync::Mutex`, since it is
 /// held across the read/modify/write awaits.
 #[derive(Clone, Default)]
 pub(crate) struct WriteLocks {
@@ -596,12 +590,11 @@ impl WriteScope {
             return Some(Vec::new());
         }
         match self.permission.get() {
-            // Only the level that *disclaims* a boundary is exempt. Written as an allow-list
-            // rather than `Workspace => Some(..), _ => None`, because that catch-all failed open:
-            // it exempted `none` and `read` too, on the reasoning that they never reach a write
-            // door. They normally do not -- but `[tools.tool_permissions]` overrides a tool's
-            // required level with no floor, so `write_file = "read"` dispatches the tool at `read`
-            // and the fence then waved it through with no boundary at all.
+            // Only the level that disclaims a boundary is exempt. Written as an allow-list rather
+            // than `Workspace => Some(..), _ => None`, because that catch-all fails open: `none`
+            // and `read` normally never reach a write door, but `[tools.tool_permissions]`
+            // overrides a tool's required level with no floor, so `write_file = "read"` dispatches
+            // the tool at `read` and the fence must still confine it.
             //
             // At `none` and `read` this yields the workspace roots rather than nothing, which is a
             // deliberate difference from `Confinement::resolve`, whose catch-all is `ReadOnly` and
@@ -750,14 +743,13 @@ pub(crate) fn glob_roots(cwd: &SharedCwd, roots: &SharedRoots) -> Vec<PathBuf> {
     kept
 }
 
-/// Canonicalise a path the way meka does, for tests that compare against meka's own output.
+/// Canonicalize a path the way meka does, for tests that compare against meka's own output.
 ///
 /// `std::fs::canonicalize` hands back a `\\?\`-prefixed path on Windows, and every production
-/// caller runs the result through [`strip_verbatim`]. A test that skips that step is asserting
-/// against the one spelling meka never produces -- and it passes everywhere `strip_verbatim` is the
-/// identity, so the failure is Windows-only and invisible until something runs there. Five tests
-/// reached the tree with that shape at once, which is why this is a named helper rather than a
-/// `.map(strip_verbatim)` a future test can forget.
+/// caller runs the result through [`strip_verbatim`]. A test that skips that step asserts against
+/// the one spelling meka never produces, and passes everywhere `strip_verbatim` is the identity, so
+/// the failure is Windows-only. A named helper rather than a `.map(strip_verbatim)` a test can
+/// forget.
 #[cfg(test)]
 pub(crate) fn canonical_for_test(path: impl AsRef<std::path::Path>) -> PathBuf {
     std::fs::canonicalize(path.as_ref())
@@ -972,10 +964,10 @@ mod tests {
     /// not inside it once resolved.
     ///
     /// Named for what it actually checks. `is_within_roots` is a component-wise prefix test and
-    /// deliberately does no symlink resolution of its own -- `normalize_lexically` is documented as
-    /// not touching them -- so the resolution this depends on happens in the caller
+    /// deliberately does no symlink resolution of its own (`normalize_lexically` is documented as
+    /// not touching them), so the resolution this depends on happens in the caller
     /// (`resolve_write_target`, via `resolve_existing_prefix`). The fixture stands in for that
-    /// caller by canonicalising before it asks.
+    /// caller by canonicalizing before it asks.
     ///
     /// This layer does not resolve the link: feeding it the *spelled* path returns `true`, and the
     /// reason that is safe is that no caller ever does.
@@ -1041,10 +1033,10 @@ mod tests {
 
     /// A canonical root and an as-spelled target inside it agree, despite Windows' verbatim prefix.
     ///
-    /// The regression this guards shipped once and was invisible to every Linux test:
-    /// `canonicalize` hands back `\\?\C:\ws`, the fence checks a target spelled `C:\ws\f.txt`
-    /// against it, and `starts_with` says no. Writes *outside* were still refused, so the
-    /// boundary looked correct while refusing everything the level exists to allow.
+    /// Invisible to every Linux test: `canonicalize` hands back `\\?\C:\ws`, the fence checks a
+    /// target spelled `C:\ws\f.txt` against it, and `starts_with` says no. Writes outside would
+    /// still be refused, so the boundary would look correct while refusing everything the level
+    /// exists to allow.
     #[test]
     #[cfg(windows)]
     fn a_verbatim_root_admits_an_as_spelled_path_inside_it() {
@@ -1092,12 +1084,12 @@ mod tests {
 
     /// A file is not a workspace root, and neither is a masked system directory.
     ///
-    /// Both refusals exist because a backend cannot express the boundary otherwise, and both were
+    /// Both refusals exist because a backend cannot express the boundary otherwise, and both are
     /// reachable from `--writable-root` or an ACP client. A file root makes Landlock reject its own
-    /// rule with `EINVAL` inside `pre_exec`, which kills *every* shell command in the session
-    /// rather than just a write to that root. A root at or above one of Bubblewrap's tmpfs masks
-    /// un-masks it, and those masks are what keep the D-Bus and systemd sockets out of reach -- so
-    /// `--writable-root /run/user/1000` turned a workspace grant into `systemd-run --user`.
+    /// rule with `EINVAL` inside `pre_exec`, which kills every shell command in the session rather
+    /// than just a write to that root. A root at or above one of Bubblewrap's tmpfs masks un-masks
+    /// it, and those masks are what keep the D-Bus and systemd sockets out of reach, so
+    /// `--writable-root /run/user/1000` would turn a workspace grant into `systemd-run --user`.
     #[test]
     fn writable_roots_refuses_a_file_and_a_masked_system_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1129,11 +1121,6 @@ mod tests {
     }
 
     /// A runtime directory named only by `$XDG_RUNTIME_DIR` is refused in both directions.
-    ///
-    /// The whole environment branch had no test: deleting the `!` from its `is_empty` guard, which
-    /// disables it outright, left the suite green. What covered the socket tree was the `/run/user`
-    /// literal beside it, and only because the developer's own runtime directory happens to live
-    /// there.
     ///
     /// The ancestor direction is the half that matters. `$XDG_RUNTIME_DIR` sits under `$HOME` on
     /// WSL and on minimal window managers, so an ordinary `cd ~` names an ancestor of the session
@@ -1183,13 +1170,9 @@ mod tests {
     /// A root *above* a masked directory un-masks it just as surely as a root *at* it.
     ///
     /// bwrap binds each root after its tmpfs masks and the later mount wins, so `--writable-root
-    /// /var` restores the host's world-writable `/var/tmp` inside the sandbox. Measured: a confined
-    /// shell with that root wrote a file to `/var/tmp` and it appeared on the host, where the same
-    /// write with a root elsewhere landed in the ephemeral tmpfs.
-    ///
-    /// The doc on `is_usable_root` said "at or above" from the start; only "at" was implemented,
-    /// and the gap is reachable without any exotic setup -- `$XDG_RUNTIME_DIR` sits under `$HOME`
-    /// on WSL and on minimal window managers, so an ordinary `cd ~` handed the session bus back.
+    /// /var` would restore the host's world-writable `/var/tmp` inside the sandbox. The gap is
+    /// reachable without any exotic setup: `$XDG_RUNTIME_DIR` sits under `$HOME` on WSL and on
+    /// minimal window managers, so an ordinary `cd ~` would hand the session bus back.
     #[test]
     #[cfg(unix)]
     fn a_root_above_a_masked_directory_is_refused_too() {
@@ -1238,9 +1221,8 @@ mod tests {
         }
         // The session's socket tree stays refused as a whole, with or without the variable set,
         // because every path in it is the kind of socket the masks exist to hide. The uid is one
-        // that cannot be this process's own: with the developer's real `XDG_RUNTIME_DIR` pointing
-        // at `/run/user/<their uid>`, asserting on that path passed through the *environment*
-        // branch below and left this literal one unguarded, which a mutation caught.
+        // that cannot be this process's own: asserting on the developer's real `XDG_RUNTIME_DIR`
+        // would pass through the environment branch below and leave this literal one unguarded.
         assert!(is_system_root(Path::new("/run/user/99999")));
         assert!(is_system_root(Path::new("/run/user/99999/bus")));
 
@@ -1252,13 +1234,10 @@ mod tests {
         assert!(usable_roots([PathBuf::from("/tmp")]).is_empty());
     }
 
-    /// The closed fallback actually admits nothing, including under the working directory.
-    ///
-    /// It did not. `deny_all` was built at `Workspace` with an empty root list, and
-    /// `writable_roots` unconditionally folds in the cwd -- so the scope a registry falls back to
-    /// when it cannot tell whether a boundary applies granted the entire working tree. A doc
-    /// saying "admits nothing" and an accessor named `deny_all` would both be wrong about the same
-    /// object. Unreachable in production, which is exactly why nothing would notice.
+    /// The closed fallback admits nothing, including under the working directory: `writable_roots`
+    /// unconditionally folds in the cwd, so a `deny_all` built at `Workspace` with an empty root
+    /// list would grant the entire working tree. Unreachable in production, which is exactly why
+    /// nothing would notice.
     #[test]
     fn deny_all_admits_nothing_not_even_the_cwd() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1280,9 +1259,8 @@ mod tests {
 
     /// Which levels confine, spelled out for all four.
     ///
-    /// Spelled out because a `_ => None` arm once stood here and exempted `none` and `read` along
-    /// with the level it meant, and `[tools.tool_permissions]` can dispatch a write tool at either
-    /// of those.
+    /// Spelled out because a `_ => None` arm would exempt `none` and `read` along with the level it
+    /// meant, and `[tools.tool_permissions]` can dispatch a write tool at either of those.
     #[test]
     fn only_unrestricted_disclaims_a_write_boundary() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1337,8 +1315,8 @@ mod tests {
     ///
     /// `admit` is reached with a path that does not exist yet on every `write_file` to a new file,
     /// so `canonicalize` cannot answer and the only defense is resolving the components as text
-    /// first. Without that, `starts_with` is component-wise and answers *yes* for
-    /// `<root>/../../etc/passwd`, because the literal path really does begin with `<root>` -- so
+    /// first. Without that, `starts_with` is component-wise and answers yes for
+    /// `<root>/../../etc/passwd`, because the literal path really does begin with `<root>`, so
     /// the escape is admitted by the check written to refuse it.
     ///
     /// Both halves are asserted. The refusal alone would still pass against an implementation that
@@ -1390,12 +1368,9 @@ mod tests {
 
         assert!(writable_roots(&shared(&missing), &roots_for_test()).is_empty());
 
-        // Against a *populated* root set, which is what makes this an independent check.
-        //
-        // Run against the roots this same call has just proved empty, `is_within_roots` is `.any()`
-        // over `&[]`: false for every input, and true of the function no matter what it does. Only
-        // an `is_within_roots` that always returned `true` could fail it. The comment above it
-        // described a fix that had not been made.
+        // Against a populated root set, which is what makes this an independent check: run
+        // against the roots this same call has just proved empty, `is_within_roots` is `.any()`
+        // over `&[]`, false for every input no matter what the function does.
         let real = base.join("real");
         std::fs::create_dir(&real).expect("real root");
         let roots = writable_roots(&shared(&real), &roots_for_test());

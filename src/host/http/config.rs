@@ -19,13 +19,9 @@ const DEFAULT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// The path is dropped because it frequently *is* the secret (Slack, Discord, and every other
 /// "unguessable URL" webhook). Enough to tell two endpoints apart; not enough to call one.
 ///
-/// Parsed rather than split on `"://"` and `'/'`. Splitting only ever removed the *path*, and a
-/// URL has three other places to keep a secret: a query (`?token=…`, which survived intact because
-/// a URL with no path has no `/` to split on), a fragment, and userinfo (`user:pass@host`, which
-/// was returned verbatim as part of the host). Every one of those reached a `warn!` that runs at
-/// default verbosity, on the line whose own comment calls it the one that gets pasted into an issue
-/// tracker. Reconstructing from the parsed components keeps only what is named here, so a component
-/// nobody thought of cannot ride along.
+/// Parsed rather than split on `"://"` and `'/'`: a URL has three other places to keep a secret (a
+/// query, a fragment, and userinfo), and reconstructing from the parsed components keeps only what
+/// is named here, so a component nobody thought of cannot ride along.
 pub(crate) fn webhook_host(url: &str) -> String {
     let Ok(parsed) = url::Url::parse(url) else {
         return "<malformed>".to_string();
@@ -133,8 +129,7 @@ impl ResolvedWebhook {
             // not fire. Rejected rather than treated as absent: reaching here means the operator
             // meant to sign, and an env var that resolved to empty is the likeliest cause.
             return Err(format!(
-                "[serve.webhooks] entry for '{url}' has an empty `secret`; omit the field to send \
-                 unsigned deliveries, or supply a non-empty key"
+                "[serve.webhooks] entry for '{url}' has an empty `secret`; set it to a key"
             ));
         }
         if raw.timeout == Some(std::time::Duration::ZERO) {
@@ -142,7 +137,7 @@ impl ResolvedWebhook {
             // whole retry schedule and the only symptom is a warn per event with no hint why.
             return Err(format!(
                 "[serve.webhooks] entry for '{url}' has `timeout = \"0s\"`, which fails every \
-                 delivery before it is sent. Omit the field for the default ({}).",
+                 delivery; omit the field for the default ({})",
                 humantime_serde::re::humantime::format_duration(DEFAULT_WEBHOOK_TIMEOUT)
             ));
         }
@@ -230,21 +225,19 @@ impl ResolvedServeConfig {
         // and `meka serve` cannot come to disagree about what a deployment configured to withhold
         // withholds.
         let relay_provider_errors = crate::host::relay_provider_errors(Some(&raw));
-        // Reject zero-value `max_*` knobs at config time:
-        //   - `max_concurrent_turns = 0` would 429 every turn
-        //   - `max_body_bytes = 0` would 413 every request
-        // Operators wanting "unbounded" omit the field instead.
+        // A zero `max_*` is refused at config time: it would 429 every turn or 413 every request,
+        // and "unbounded" is spelled by omitting the field.
         if let Some(0) = raw.max_concurrent_turns {
             return Err(
-                "[serve] `max_concurrent_turns = 0` would block every turn. Omit the field \
-                 to disable the cap, or set a positive integer."
+                "[serve] `max_concurrent_turns = 0` would refuse every turn; omit the field to \
+                 disable the cap"
                     .into(),
             );
         }
         if let Some(0) = raw.max_body_bytes {
             return Err(format!(
-                "[serve] `max_body_bytes = 0` would reject every request body. Omit the field to \
-                 use the default ({}), or set a positive integer.",
+                "[serve] `max_body_bytes = 0` would refuse every request body; omit the field for \
+                 the default ({})",
                 crate::text::format_size(DEFAULT_MAX_BODY_BYTES)
             ));
         }
@@ -254,8 +247,8 @@ impl ResolvedServeConfig {
             // lock is held until the process exits. `[schedule].poll_interval` guards the same
             // shape for the same reason.
             return Err(format!(
-                "[serve] `gc_scan_interval = \"0s\"` would stop the session GC from ever running. \
-                 Omit the field for the default ({}), or set a positive duration.",
+                "[serve] `gc_scan_interval = \"0s\"` would stop the session GC from ever running; \
+                 omit the field for the default ({})",
                 humantime_serde::re::humantime::format_duration(DEFAULT_GC_SCAN_INTERVAL)
             ));
         }
@@ -278,8 +271,7 @@ impl ResolvedServeConfig {
                     // operator may well paste elsewhere, and for a Slack- or Discord-style
                     // endpoint the URL path *is* the credential. The full URL is at `info`.
                     endpoint = %webhook_host(&webhook.url),
-                    "webhook has no `secret`; deliveries are unsigned and a receiver cannot \
-                     tell them apart from anything else that can reach it",
+                    "webhook has no `secret`, so its deliveries are unsigned",
                 );
             }
             if webhook.url.starts_with("http://") {
@@ -356,9 +348,8 @@ impl ResolvedServeToken {
         })
     }
 }
-/// Log a warning if `path` is readable by group or others on Unix. No-op on non-Unix.
-/// Matches the advisory guidance ("chmod 0600 recommended") without
-/// refusing to start; the file has already been read successfully, so we just nudge.
+/// Warn when `path` is readable by group or others on Unix; a no-op elsewhere. A warning rather
+/// than a refusal, since the file has already been read.
 fn warn_if_world_readable(path: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -367,8 +358,8 @@ fn warn_if_world_readable(path: &std::path::Path) {
             let mode = metadata.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
                 tracing::warn!(
-                    "[serve.tokens] token_file '{path}' has permissions {mode:04o}; recommend \
-                     chmod 0600 to prevent other users from reading the bearer token",
+                    "[serve.tokens] token_file '{path}' has permissions {mode:04o}; run `chmod 0600` \
+                     on it",
                     path = path.display(),
                 );
             }
@@ -386,10 +377,9 @@ mod tests {
 
     /// The webhook redactor keeps the scheme, host and port, and nothing else.
     ///
-    /// Every case below is one a splitting implementation let through, and each reached a `warn!`
+    /// Every case below is one a splitting implementation lets through, and each reaches a `warn!`
     /// at default verbosity. The query one is the sharpest: a webhook URL with no path has no `/`
-    /// to split on, so `?token=…` was reproduced in full by the function whose entire job is to
-    /// remove the secret.
+    /// to split on.
     #[test]
     fn webhook_host_keeps_only_the_origin() {
         for (url, expected) in [

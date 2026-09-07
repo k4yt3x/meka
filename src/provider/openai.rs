@@ -1,4 +1,4 @@
-//! OpenAI-flavoured providers.
+//! The OpenAI backends.
 //!
 //! Three live here, across two protocols. OpenAI serves both, which is why the backend names say
 //! which one rather than naming the vendor twice:

@@ -6,19 +6,19 @@
 //! and a priority, rendered into a per-turn index the model reads. That is why
 //! [`normalize_description`], [`parse_priority`] and [`validate_entry_name`] live here.
 //!
-//! What they no longer share is storage. Memories are rows, so [`crate::fs::lock_store`],
-//! [`crate::fs::reject_symlinked_path`] and [`check_case_collision`] are the skill store's alone --
+//! What they do not share is storage. Memories are rows, so [`crate::fs::lock_store`],
+//! [`crate::fs::reject_symlinked_path`] and [`check_case_collision`] are the skill store's alone:
 //! a `UNIQUE COLLATE NOCASE` column and a transaction do all three jobs on the database side.
-//! [`split_frontmatter`] and [`yaml_scalar`] survive for skills, and for `meka memory export`,
-//! which is now the only place memory touches YAML at all.
+//! [`split_frontmatter`] and [`yaml_scalar`] serve skills, and `meka memory export`, which is the
+//! only place memory touches YAML at all.
 
 /// Split a file into (frontmatter, body) if it starts with a `---` fence. Returns None when no
 /// valid frontmatter block is present.
 ///
-/// The closing fence may end the file. Requiring a newline after it meant a `SKILL.md` written by
-/// any editor that does not add a trailing newline -- and by any other client following the same
-/// spec -- was reported as "missing YAML frontmatter", naming the one thing the file plainly had.
-/// The body in that case is empty, which the callers already handle.
+/// The closing fence may end the file. Requiring a newline after it would report a `SKILL.md`
+/// written by any editor that does not add a trailing newline (and by any other client following
+/// the same spec) as "missing YAML frontmatter", naming the one thing the file plainly has. The
+/// body in that case is empty, which the callers already handle.
 ///
 /// A fence is a whole line, so `----` and `--- x` are not closing fences and the search continues
 /// past them.
@@ -66,7 +66,7 @@ pub(crate) fn split_frontmatter<'a>(content: &'a str) -> Option<(&'a str, &'a st
 ///
 /// **Safe only for a value that has already been normalized to one line.** It escapes `\` and `"`
 /// and quotes on a fixed character list, which is not the same thing as knowing when YAML needs
-/// quoting; skills moved to a real serializer after hand-rolled quoting lost content on a newline
+/// quoting; skills use a real serializer, because hand-rolled quoting loses content on a newline
 /// in a `license` and on a metadata *key* containing one.
 ///
 /// Its remaining caller is `crate::memory::render_memory`, the export renderer, which passes three
@@ -76,14 +76,14 @@ pub(crate) fn split_frontmatter<'a>(content: &'a str) -> Option<(&'a str, &'a st
 /// newline. (`priority` is a `u8` and never reaches here.)
 ///
 /// That list is the safety argument, so a *fifth* kind of value invalidates it. Anything free-form
-/// -- anything that could arrive holding a newline -- needs the serializer, not this.
+/// (anything that could arrive holding a newline) needs the serializer, not this.
 pub(crate) fn yaml_scalar(text: &str) -> String {
-    // The leading set is every YAML indicator character, `[`, `{`, `]`, `}` and `,` included. They
-    // were missing, and a description beginning `[` produced a file with an unterminated flow
-    // sequence: `meka memory export` reported success, and reading it back then refused that one
-    // file and moved on, so a backup silently lost a memory. `null`, `true`, `~` and anything
-    // numeric are quoted for the adjacent reason -- unquoted they come back as a type rather
-    // than a string, so meka and every real YAML tool disagree about the same file.
+    // The leading set is every YAML indicator character, `[`, `{`, `]`, `}` and `,` included:
+    // unquoted, a description beginning `[` produces a file with an unterminated flow sequence,
+    // which `meka memory export` reports as success and a read back then refuses, so a backup
+    // silently loses a memory. `null`, `true`, `~` and anything numeric are quoted for the
+    // adjacent reason: unquoted they come back as a type rather than a string, so meka and every
+    // real YAML tool disagree about the same file.
     let looks_typed = matches!(
         text.to_ascii_lowercase().as_str(),
         "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
@@ -109,10 +109,9 @@ pub(crate) fn yaml_scalar(text: &str) -> String {
 /// Serializes tests that set `$EDITOR` / `$VISUAL`, which are process-global.
 ///
 /// The same shape as [`crate::config::CONFIG_DIR_ENV_LOCK`], and separate from it because the two
-/// never need to be held together. Exists because `meka memory edit` had no test at all until its
-/// scratch-file handling destroyed a user's edit twice.
-/// `unix` as well as `test`: every test that takes it drives a real `$EDITOR` through a shell
-/// script, so all three are `#[cfg(unix)]` and the lock has nobody to serialize elsewhere.
+/// never need to be held together. `unix` as well as `test`: every test that takes it drives a
+/// real `$EDITOR` through a shell script, so all three are `#[cfg(unix)]` and the lock has nobody
+/// to serialize elsewhere.
 #[cfg(all(test, unix))]
 pub(crate) static EDITOR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -125,9 +124,8 @@ pub(crate) static EDITOR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::
 /// - `$EDITOR` is conventionally a command *line*, so `code --wait`, `emacsclient -nw` and `subl
 ///   -w` are ordinary settings that `Command::new(whole_string)` looks up as a binary literally
 ///   called `code --wait`.
-/// - An editor whose path contains a space is equally ordinary, and splitting alone turned `/opt/my
-///   editor/bin/ed` into a missing binary called `/opt/my`. That worked before this helper existed,
-///   so splitting unconditionally was a regression for `meka skill add --edit`.
+/// - An editor whose path contains a space is equally ordinary, and splitting alone turns `/opt/my
+///   editor/bin/ed` into a missing binary called `/opt/my`.
 ///
 /// Deliberately not a shell: a value holding a quote, a `;` or a `$` must not come to mean
 /// something the user did not write.
@@ -173,11 +171,11 @@ const MAX_DESCRIPTION_CHARS: usize = 500;
 
 /// Make a description read from disk safe to render, whoever wrote the file.
 ///
-/// The write path normalizes through [`normalize_description`]; the read path did not, so a file
-/// authored by anything other than meka reached the `[Skills]` / `[Memory]` index verbatim. That
-/// index is prose the model reads every turn, so an embedded newline let a description open what
-/// looks like a new section, and a control character could reach the terminal that renders it.
-/// Applying the same normalization on the way in makes the file's provenance stop mattering.
+/// The write path normalizes through [`normalize_description`]; without the same normalization on
+/// the way in, a file authored by anything other than meka reaches the `[Skills]` / `[Memory]`
+/// index verbatim. That index is prose the model reads every turn, so an embedded newline lets a
+/// description open what looks like a new section, and a control character reaches the terminal
+/// that renders it. Normalizing on the way in makes the file's provenance stop mattering.
 pub(crate) fn sanitize_stored_description(description: &str) -> String {
     normalize_description(&crate::text::sanitize_text(description))
 }
@@ -186,8 +184,8 @@ pub(crate) fn sanitize_stored_description(description: &str) -> String {
 ///
 /// Length is bounded here and not in [`sanitize_stored_description`], because that one runs at
 /// parse time and its result is the only copy of the description the process holds. Truncating
-/// there was destructive: an imported skill whose `description:` runs to 900 characters -- ordinary
-/// in the Agent Skills ecosystem -- was silently rewritten to 500 plus an ellipsis by the next
+/// there is destructive: an imported skill whose `description:` runs to 900 characters (ordinary
+/// in the Agent Skills ecosystem) would be silently rewritten to 500 plus an ellipsis by the next
 /// `skill_write` / `memory_write` that touched the file, with nothing said at any verbosity. The
 /// index still needs the bound so one pathological entry cannot crowd out the rest; it just belongs
 /// on the render path, where being lossy costs nothing.
@@ -202,7 +200,9 @@ pub(crate) fn elide_description_for_index(description: &str) -> String {
 /// [`MAX_PRIORITY`], so an unranked entry sorts below deliberate standing rules and above
 /// deliberate noise.
 pub(crate) const DEFAULT_PRIORITY: u8 = 5;
+/// The most important an entry can be: a standing rule.
 pub(crate) const MIN_PRIORITY: u8 = 0;
+/// The least important an entry can be.
 pub(crate) const MAX_PRIORITY: u8 = 9;
 
 /// Clamp a frontmatter `priority` into [`MIN_PRIORITY`] ..= [`MAX_PRIORITY`], defaulting to
@@ -232,7 +232,7 @@ pub(crate) const MAX_ENTRY_NAME_CHARS: usize = 64;
 ///
 /// [`validate_entry_name`] is a write-door rule: it decides what may enter a store, and rejecting
 /// everything outside `[A-Za-z0-9_-]` is what makes a name safe to put in a path or a prompt.
-/// Applied to a lookup it decides something else entirely -- what may be *found* -- and there it
+/// Applied to a lookup it decides something else entirely (what may be *found*), and there it
 /// wedges. A row whose name reached the column past the tools is listed to the model in the
 /// `[Memory]` index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and
 /// `DELETE /v1/memory/{name}` alike, while `meka memory export` refuses the whole run on its
@@ -241,19 +241,14 @@ pub(crate) const MAX_ENTRY_NAME_CHARS: usize = 64;
 ///
 /// There is deliberately no length cap, so no stored name can be beyond reach.
 ///
-/// The cost being bounded is `memory_read`'s miss path: it loads the index and runs an edit
+/// The cost worth bounding is `memory_read`'s miss path: it loads the index and runs an edit
 /// distance per stored name, synchronously on a runtime worker with the cancellation token ignored,
-/// which for a 200,000-character argument against 20,000 memories takes tens of seconds. Refusing
-/// the argument did bound that, and re-created the exact wedge this function exists to end one
-/// length short: a row whose name ran past 64 characters was listed to the model in the `[Memory]`
-/// index and then refused by `memory_read`, `memory_delete`, `meka memory remove` and `DELETE
-/// /v1/memory/{name}` alike, while `meka memory export` refused the whole store on its account and
-/// told the reader to run `meka memory remove`, which refused it too.
-///
-/// The cost is bounded where it is actually incurred instead. [`crate::tools::did_you_mean_hint`]
+/// which for a 200,000-character argument against 20,000 memories takes tens of seconds. A length
+/// cap here would bound that and re-create the exact wedge this function exists to end, one length
+/// short. The cost is bounded where it is incurred instead: [`crate::tools::did_you_mean_hint`]
 /// skips any candidate whose length differs from the argument by more than the edit threshold,
-/// which no distance calculation can bridge, so a pathological argument now costs one pass over
-/// itself rather than one matrix per stored name.
+/// which no distance calculation can bridge, so a pathological argument costs one pass over itself
+/// rather than one matrix per stored name.
 pub(crate) fn validate_lookup_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{noun} name cannot be empty"));
@@ -272,7 +267,7 @@ pub(crate) fn validate_lookup_name(name: &str, noun: &str) -> Result<(), String>
 ///
 /// This is the *write* rule, and the character class is the whole of why it is safe to put a name
 /// that passed it into a path. A caller that only needs to find a row wants
-/// [`validate_lookup_name`], which shares neither the character class nor a length bound -- and
+/// [`validate_lookup_name`], which shares neither the character class nor a length bound, and
 /// must never be mistaken for this one.
 pub(crate) fn validate_entry_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -314,9 +309,9 @@ pub(crate) fn validate_entry_name(name: &str, noun: &str) -> Result<(), String> 
 /// with an error naming none of this, and the same store then works on Linux and not on Windows.
 /// Applied on every platform so a store stays portable rather than valid only where it was written.
 ///
-/// Shared by both stores rather than spelled out in each, which is what it was: the list is a fact
-/// about Windows, and two copies of a fact drift. `kind` is the noun for what the name becomes
-/// there -- a memory is a file, a skill is a directory.
+/// Shared by both stores rather than spelled out in each: the list is a fact about Windows, and
+/// two copies of a fact drift. `kind` is the noun for what the name becomes there; a memory is a
+/// file, a skill is a directory.
 pub(crate) fn reject_windows_reserved(name: &str, noun: &str, kind: &str) -> Result<(), String> {
     const WINDOWS_RESERVED: &[&str] = &[
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -346,8 +341,8 @@ pub(crate) fn check_case_collision<'a>(
 ) -> Result<(), String> {
     match existing.find(|other| *other != name && other.eq_ignore_ascii_case(name)) {
         Some(other) => Err(format!(
-            "{noun} name '{name}' differs from the existing '{other}' only by case, which is the same file on \
-             macOS and Windows; pick a distinct name or edit '{other}'"
+            "{noun} name '{name}' differs from the existing '{other}' only by case, which is the same \
+             file on macOS and Windows; pick a distinct name"
         )),
         None => Ok(()),
     }

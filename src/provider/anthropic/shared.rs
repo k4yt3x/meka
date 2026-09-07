@@ -59,17 +59,15 @@ pub(super) const MAX_REQUEST_BYTES: usize = 30 * crate::text::MIB;
 
 // The redaction itself, its stopping point and the refusal live in `crate::provider::budget`, since
 // every backend applies them; the constant above is the Anthropic default ceiling they run against.
-// The redaction tests stayed beside the downscale tests they were written with, hence the test-only
-// import.
+// The redaction tests live beside the downscale tests, hence the test-only import.
 pub(super) use crate::provider::budget::serialize_body;
 #[cfg(test)]
 pub(super) use crate::provider::budget::{IMAGE_REDACTION_PLACEHOLDER, redact_oldest_images};
 
 /// Anthropic accepts up to 8000 px per axis on a *single*-image request, but rejects anything over
-/// 2000 px on either axis once the request contains more than one image. We always downscale to fit
-/// so a session can freely accumulate images without tripping the multi-image cap. This is enforced
-/// at the Claude provider layer only; non-Claude providers don't need it (and shouldn't pay the
-/// resize cost).
+/// 2000 px on either axis once the request contains more than one image. Every image is downscaled
+/// to fit so a session can freely accumulate images without tripping the multi-image cap. Enforced
+/// by the Claude backends only; the others need not pay the resize cost.
 pub(super) const MAX_IMAGE_DIMENSION_PX: u32 = 2000;
 
 /// Extract a `TokenUsage` from an Anthropic `usage` object. Used by both the non-streaming response
@@ -119,6 +117,7 @@ fn parse_model_version(model: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Whether a model name is in the Haiku family.
 pub(super) fn model_is_haiku(model: &str) -> bool {
     model.to_ascii_lowercase().contains("haiku")
 }
@@ -265,7 +264,7 @@ pub(super) const DEFAULT_EFFORT: &str = "high";
 /// unrecognized model here is one *newer* than the list, which Claude Code sends the beta to, and
 /// withholding it would silently drop the mid-conversation system messages meka relies on. It is
 /// safe only because this gate has exactly one caller, `claude-subscription`, whose endpoint is
-/// always Anthropic's -- so an unrecognized name there is necessarily a real Claude. Do not reach
+/// always Anthropic's, so an unrecognized name there is necessarily a real Claude. Do not reach
 /// for it from a backend a `base_url` can point anywhere.
 pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
@@ -289,8 +288,8 @@ pub(super) fn model_supports_mid_conversation_system(model: &str) -> bool {
 /// The name of an SSE frame: the `type` the data names, else the `event:` line.
 ///
 /// Anthropic sends both and they agree. A gateway that forwards the data and drops the `event:`
-/// line leaves `eventsource-stream` reporting `message`, and dispatching on that alone discarded
-/// every frame of a good turn. The Responses driver keys the same way for the same reason.
+/// line leaves `eventsource-stream` reporting `message`, and dispatching on that alone would
+/// discard every frame of a good turn. The Responses driver keys the same way for the same reason.
 fn claude_frame_name<'a>(data: &'a serde_json::Value, event_name: &'a str) -> &'a str {
     data.get("type")
         .and_then(|value| value.as_str())
@@ -334,6 +333,8 @@ fn claude_image_block(source: &crate::image::ImageSource) -> serde_json::Value {
     }
 }
 
+/// The conversation as the `messages` array of a Claude request, with the cache breakpoint on its
+/// last block.
 pub(super) fn convert_messages_to_claude_content(
     messages: &[Message],
     breakpoint: CacheBreakpoint,
@@ -392,7 +393,7 @@ pub(super) fn convert_messages_to_claude_content(
                         }
                         // Only a signature belongs on this wire. A `Sealed` block reaches here
                         // when a session recorded against the Responses API is resumed under
-                        // Claude, and its encrypted content is not a Claude signature -- so the
+                        // Claude, and its encrypted content is not a Claude signature, so the
                         // block goes out unsigned rather than carrying a foreign blob.
                         ContentBlock::Thinking { thinking, opaque } => {
                             let mut obj = serde_json::json!({
@@ -448,9 +449,9 @@ pub(super) fn convert_messages_to_claude_content(
         }
     }
 
-    // After the strip, not before it: attached to the last block first, the breakpoint went out
-    // on a trailing thinking block and left with it, so a conversation ending on one carried no
-    // breakpoint at all and re-billed its whole prefix at the write tier.
+    // After the strip, not before it: attached to the last block first, the breakpoint would go
+    // out on a trailing thinking block and leave with it, so a conversation ending on one would
+    // carry no breakpoint at all and re-bill its whole prefix at the write tier.
     if let Some(last) = claude_messages.last_mut()
         && let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut())
         && let Some(block) = content.last_mut().and_then(|b| b.as_object_mut())
@@ -461,6 +462,7 @@ pub(super) fn convert_messages_to_claude_content(
     claude_messages
 }
 
+/// The tool definitions as the `tools` array of a Claude request.
 pub(super) fn convert_tools_to_claude_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
     // No per-tool `cache_control`: Claude Code's captured CLI wire leaves tools unmarked, and the
     // rolling last-message breakpoint already caches the tools+system prefix cumulatively, so the
@@ -477,6 +479,7 @@ pub(super) fn convert_tools_to_claude_tools(tools: &[ToolDefinition]) -> Vec<ser
         .collect()
 }
 
+/// A Claude `stop_reason` as meka's own.
 pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
     match reason {
         "end_turn" => StopReason::EndTurn,
@@ -497,6 +500,7 @@ pub(super) fn parse_claude_stop_reason(reason: &str) -> StopReason {
     }
 }
 
+/// The assistant message, stop reason and usage out of a non-streaming Claude response.
 pub(super) fn parse_non_streaming_response(
     response: &serde_json::Value,
 ) -> Result<(Message, StopReason, TokenUsage)> {
@@ -597,11 +601,14 @@ pub(super) fn parse_non_streaming_response(
 /// once, patches the attestation into the serialized body, and remembers the response's request id.
 #[async_trait::async_trait]
 pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync {
+    /// The HTTP client every request goes through.
     fn client(&self) -> &reqwest::Client;
+    /// The URL a completion is posted to.
     fn endpoint(&self) -> String;
     /// Largest request body this backend sends before redacting old images: the profile's
     /// `max_request_bytes`, else [`MAX_REQUEST_BYTES`].
     fn max_request_bytes(&self) -> usize;
+    /// The request body for one completion, before serialization.
     fn request_body(
         &self,
         system_prompt: &str,
@@ -624,6 +631,8 @@ pub(super) trait ClaudeBackend: crate::oauth::RefreshesCredential + Send + Sync 
         stream: bool,
         thinking: ThinkingOverride,
     ) -> Result<reqwest::RequestBuilder>;
+    /// Record the response's request id where the next request can name it; a no-op for a backend
+    /// whose wire carries none.
     fn remember_request_id(
         &self,
         _attribution: &crate::provider::Attribution,
@@ -776,6 +785,7 @@ pub(super) async fn stream<B: ClaudeBackend>(
     drive_claude_sse_stream(response, event_sender, cancellation).await
 }
 
+/// Read a Claude SSE response to its end, forwarding each event on the channel.
 pub(super) async fn drive_claude_sse_stream(
     response: reqwest::Response,
     event_sender: mpsc::Sender<StreamEvent>,
@@ -794,9 +804,9 @@ pub(super) async fn drive_claude_sse_stream(
         End::Finished | End::ReceiverGone => Ok(()),
         // The byte stream ending is not the same as the message ending.
         //
-        // An intermediary -- a gateway named by `base_url`, a CDN edge, a load balancer closing an
-        // idle connection -- can terminate a chunked response cleanly mid-message. Treating that as
-        // success handed the agent a half-written answer with `stop_reason` left at its `EndTurn`
+        // An intermediary (a gateway named by `base_url`, a CDN edge, a load balancer closing an
+        // idle connection) can terminate a chunked response cleanly mid-message. Treating that as
+        // success hands the agent a half-written answer with `stop_reason` left at its `EndTurn`
         // default: no error, so no retry, and nothing to distinguish a truncated reply from a
         // complete one. Worse mid-tool-call, where the accumulated call is dropped entirely because
         // `ToolUseEnd` never arrives. Reporting it as a `StreamError` routes it to the same retry
@@ -1008,7 +1018,6 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     // becomes `{}`. Arguments that arrived but do not parse are a
                     // different thing entirely, and are rejected rather than
                     // replaced.
-                    //
                     let event = crate::provider::tool_use_event(
                         self.current_tool_id.clone(),
                         self.current_tool_name.clone(),
@@ -1039,12 +1048,12 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                     delta.get("stop_reason").and_then(|reason| reason.as_str())
                 {
                     // The stop reason is what ends a message; `message_stop` is
-                    // the framing around it. Requiring the frame made meka
+                    // the framing around it. Requiring the frame would make meka
                     // strictly less tolerant than the wire format needs: a gateway
                     // named by `base_url` that forwards the deltas and closes
-                    // without the final event delivered a complete answer, and
-                    // every turn through it failed. What the check is actually for
-                    // -- a cut mid-`content_block_delta` -- never gets this far.
+                    // without the final event delivers a complete answer, and
+                    // every turn through it would fail. What the check is for (a
+                    // cut mid-`content_block_delta`) never gets this far.
                     self.saw_terminal_event = true;
                     let stop_reason = parse_claude_stop_reason(stop_reason_str);
                     if event_sender
@@ -1102,19 +1111,13 @@ impl crate::provider::sse::Protocol for ClaudeStream {
     }
 }
 
-/// Walk `messages` and downscale any `ToolResultContent::Image` whose pixel dimensions exceed
-/// [`MAX_IMAGE_DIMENSION_PX`] on either axis. The body bytes (base64) for those images are replaced
-/// with a re-encoded PNG that fits within the cap; smaller images are left alone. Returns
-/// `Cow::Borrowed` when no work was needed.
-///
-/// Anthropic-specific: the 2000 px cap only matters for Anthropic's multi-image requests; this
-/// helper is intentionally not applied to non-Claude providers. Decode/resize cost is incurred per
-/// turn for each oversized image, but typical sessions have few oversized images, and the cheap
-/// [`crate::image::read_image_dimensions`] header read short-circuits the common case.
+/// Two independently-salted hashes plus the source length. See [`downscale_cache_key`].
+type DownscaleCacheKey = (u64, u64, usize);
+
 /// Downscaled payloads, keyed by a hash of the base64 they were made from.
 ///
 /// The same oversized image rides in the conversation on *every* turn, and without this each turn
-/// decoded it, resized it and re-encoded a PNG again -- identical work for an identical result,
+/// decodes it, resizes it and re-encodes a PNG again, identical work for an identical result,
 /// inside the request-building path. A 4000x3000 screenshot costs tens of milliseconds a turn that
 /// way, and a session that pasted three of them pays it three times over for as long as they stay
 /// in the window.
@@ -1126,9 +1129,6 @@ impl crate::provider::sse::Protocol for ClaudeStream {
 ///
 /// Cleared wholesale when full rather than evicted one at a time: the working set is the images in
 /// one conversation, so either they all fit or the conversation has moved on.
-/// Two independently-salted hashes plus the source length. See [`downscale_cache_key`].
-type DownscaleCacheKey = (u64, u64, usize);
-
 static DOWNSCALE_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<DownscaleCacheKey, String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -1139,10 +1139,10 @@ const DOWNSCALE_CACHE_ENTRIES: usize = 16;
 
 fn downscale_cache_key(source_base64: &str) -> DownscaleCacheKey {
     use std::hash::{Hash, Hasher};
-    // Two independently-seeded hashes plus the length. A single 64-bit hash keyed a *whole image*
-    // on one collision: two different screenshots landing on the same bucket would have served the
+    // Two independently-seeded hashes plus the length. A single 64-bit hash keys a *whole image*
+    // on one collision: two different screenshots landing on the same bucket would serve the
     // wrong one to the model, silently, with the right length. 128 bits of discriminator puts that
-    // past the point where it can happen by accident, which is the only way it can happen here --
+    // past the point where it can happen by accident, which is the only way it can happen here:
     // both inputs are already in this process's memory, so there is no attacker to defend against.
     // The salt must be a constant, not a fresh `RandomState`: the key has to be reproducible
     // between the `put` and the `get` that follows it, and a per-call seed makes every lookup miss.
@@ -1171,6 +1171,15 @@ fn downscale_cache_put(source_base64: &str, downscaled_base64: &str) {
     );
 }
 
+/// Walk `messages` and downscale any image whose pixel dimensions exceed
+/// [`MAX_IMAGE_DIMENSION_PX`] on either axis. The body bytes (base64) for those images are replaced
+/// with a re-encoded PNG that fits within the cap; smaller images are left alone. Returns
+/// `Cow::Borrowed` when no work was needed.
+///
+/// Anthropic-specific: the 2000 px cap only matters for Anthropic's multi-image requests, so the
+/// other backends do not run it. Decode and resize cost is incurred per turn for each oversized
+/// image, but typical sessions have few, and the cheap [`crate::image::read_image_dimensions`]
+/// header read short-circuits the common case.
 pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Message]> {
     use base64::Engine;
     use image::ImageFormat;
@@ -1233,9 +1242,9 @@ pub(super) fn downscale_oversized_images(messages: &[Message]) -> Cow<'_, [Messa
         }
     }
 
-    // First pass: detect whether any image - tool-result OR input (`ContentBlock::Image`) - needs
-    // downscaling. Cheap header read; if nothing's oversized, skip the clone+rewrite and return
-    // Cow::Borrowed.
+    // First pass: whether any image, tool-result or input (`ContentBlock::Image`), needs
+    // downscaling. A cheap header read; when nothing is oversized the clone and rewrite are
+    // skipped.
     let needs_work = messages.iter().any(|message| {
         message.content.iter().any(|block| match block {
             ContentBlock::ToolResult { content, .. } => content.iter().any(

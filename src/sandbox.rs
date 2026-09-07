@@ -42,12 +42,12 @@ pub(crate) fn capability_from_probe(probe: &BackendProbe) -> SandboxCapability {
 
 /// What a single `execute_command` call runs under.
 ///
-/// Three states rather than the boolean this replaced, because `workspace` is neither of the two
-/// the boolean could express: it is not unconfined, and it is not read-only. Folding it into either
+/// Three states rather than a boolean, because `workspace` is neither of the two a boolean could
+/// express: it is not unconfined, and it is not read-only. Folding it into either
 /// one fails in a direction that matters. Treated as unconfined, the shell ignores the boundary the
 /// file tools enforce; treated as read-only, the level promises writes it never delivers.
 ///
-/// A boolean also hid the asymmetry that made this dangerous: the *absence* of confinement is the
+/// A boolean also hides the asymmetry that makes this dangerous: the absence of confinement is the
 /// permissive state, so any code path that forgets a case fails open. An enum makes each case one
 /// the compiler asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,8 +171,8 @@ pub(crate) fn resolve_sandbox_backend(
     configured: Option<SandboxBackend>,
 ) -> (SandboxBackend, bool, BackendProbe) {
     // Probe Bubblewrap only when its result is load-bearing for the resolution: either the user
-    // pinned it explicitly, or no value was configured (so we need the probe to decide whether to
-    // auto-pick it). When the user pinned Landlock, the Bubblewrap smoke test would be pure waste
+    // pinned it explicitly, or no value was configured (so the probe decides whether to auto-pick
+    // it). When the user pinned Landlock, the Bubblewrap smoke test would be pure waste
     // (~500 ms on every meka start).
     let (backend, auto_resolved, cached_bubblewrap_probe) = match configured {
         Some(explicit) => (explicit, false, None),
@@ -198,8 +198,7 @@ pub(crate) fn resolve_sandbox_backend(
 /// Non-Linux platforms have a single platform-native sandbox (`sandbox-exec` on macOS,
 /// Low-integrity on Windows, nothing elsewhere). `[shell].sandbox_backend` is documented as
 /// Linux-only and is ignored here: the resolved capability comes from [`detect`] and is surfaced
-/// through the same `BackendProbe::Ok` envelope so the downstream wiring in `src/main.rs` doesn't
-/// need a platform branch.
+/// through the same `BackendProbe::Ok` envelope so the downstream wiring needs no platform branch.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn resolve_sandbox_backend(
     _configured: Option<SandboxBackend>,
@@ -330,11 +329,11 @@ pub(crate) enum WarnContext {
 /// Emit any relevant sandbox warnings for the configured backend state.
 ///
 /// * **Warn 1** (backend unavailable): probe failed and `sandbox = true`. Shell commands at `read`
-///   will hard-error at use time, so we tell the user up front. Re-emitted at every lifecycle
+///   will hard-error at use time, so the user is told up front. Re-emitted at every lifecycle
 ///   boundary.
-/// * **Warn 2** (could be stronger): the user has not pinned a backend and we auto-resolved to
-///   landlock because bubblewrap wasn't usable. Nudges them once toward installing bwrap, with an
-///   explicit escape hatch (pin landlock to suppress). Startup only.
+/// * **Warn 2** (could be stronger): the user has not pinned a backend and the backend
+///   auto-resolved to landlock because bubblewrap was not usable. Nudges them once toward
+///   installing bwrap, with an explicit escape hatch (pin landlock to suppress). Startup only.
 pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
     if !state.enabled {
         return;
@@ -367,14 +366,12 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
     #[cfg(target_os = "linux")]
     {
         if let Some(reason) = backend_unavailable_reason(&state.probe) {
-            // We deliberately don't suggest a specific alternative backend here; the "other"
-            // backend might also be unavailable on this host (kernel without Landlock, bwrap not
-            // installed, etc.).
+            // No specific alternative backend is suggested: the other one may also be unavailable
+            // on this host (a kernel without Landlock, bwrap not installed).
             let backend = state.backend;
             tracing::warn!(
                 "read-level sandbox unavailable: {reason} (configured: {backend}); shell commands \
-                 at `read` will fail until [shell].sandbox_backend names a usable backend, or \
-                 sandboxing is disabled"
+                 at `read` fail until `[shell].sandbox_backend` names a usable backend"
             );
             return;
         }
@@ -384,8 +381,8 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             && matches!(state.backend, crate::config::SandboxBackend::Landlock)
         {
             tracing::warn!(
-                "using Landlock for sandbox; install Bubblewrap for stronger protection, or pin \
-                 [shell].sandbox_backend = \"landlock\" to suppress this warning"
+                "using Landlock for the sandbox; install Bubblewrap for stronger protection, or set \
+                 `[shell].sandbox_backend = \"landlock\"` to silence this"
             );
         }
 
@@ -426,8 +423,8 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             // Deliberately does not name Bubblewrap as the remedy. Measured: bwrap masks four
             // directories and unmounts nothing else, and it never unshares the network namespace,
             // so a socket in the abstract namespace or under `$HOME` stays reachable from inside
-            // it. On this axis Landlock at v9 is the *stronger* backend, and sending a user to
-            // install bwrap to close these channels sent them the wrong way.
+            // it. On this axis Landlock at v9 is the stronger backend, and sending a user to
+            // install bwrap to close these channels would send them the wrong way.
             let missing = missing.join(", ");
             tracing::warn!(
                 "Landlock ABI v{abi_version} write-protects the filesystem but does not restrict \
@@ -462,8 +459,8 @@ pub(crate) fn backend_unavailable_reason(probe: &BackendProbe) -> Option<String>
 }
 
 /// Probe a specific sandbox backend. Linux-only: the `SandboxBackend` enum represents
-/// Linux-specific backends, and non-Linux platforms route through `detect()` in
-/// `src/config.rs::resolve_sandbox_backend` instead.
+/// Linux-specific backends, and non-Linux platforms route through `detect()` in the non-Linux
+/// `resolve_sandbox_backend` instead.
 #[cfg(target_os = "linux")]
 pub(crate) fn probe_backend(backend: crate::config::SandboxBackend) -> BackendProbe {
     match backend {
@@ -473,8 +470,8 @@ pub(crate) fn probe_backend(backend: crate::config::SandboxBackend) -> BackendPr
 }
 
 /// Test-only "what's the strongest sandbox available right now?" entry point. Production code
-/// consults [`crate::config::ResolvedConfig::backend_probe`] instead; tests reach for whatever
-/// capability the host happens to support.
+/// takes the backend `ResolvedConfig` settled from `[shell].sandbox_backend`, `--sandbox-backend`
+/// and `MEKA_SANDBOX_BACKEND`; tests reach for whatever capability the host happens to support.
 #[cfg(any(test, not(target_os = "linux")))]
 pub(crate) fn detect() -> SandboxCapability {
     #[cfg(target_os = "linux")]
@@ -510,11 +507,10 @@ pub(crate) fn detect() -> SandboxCapability {
 /// Guarded on the language mode, and belt-and-braces wrapped in `try`/`catch`, because a
 /// `WRITE_RESTRICTED` token puts PowerShell into **ConstrainedLanguage** mode, where setting a
 /// property on a non-core type is refused: "Property setting is supported only on core types in
-/// this language mode." Unguarded, that error was printed to stderr ahead of *every* shell command
-/// at `workspace` permission on Windows, which the model reads as the command having failed.
-/// Measured on Windows 11 10.0.26200: `unrestricted` and `read` both report `FullLanguage`, and
-/// only the restricted token constrains it, so this is a cost of the workspace boundary rather than
-/// a property of the host.
+/// this language mode." Unguarded, that error is printed to stderr ahead of every shell command at
+/// `workspace` on Windows, which the model reads as the command having failed. `unrestricted` and
+/// `read` both report `FullLanguage`, and only the restricted token constrains it, so this is a
+/// cost of the workspace boundary rather than a property of the host.
 ///
 /// Skipping it means output at `workspace` is decoded with the host's legacy code page, so
 /// non-ASCII may be mangled there. A wrong character beats an error on every line, and there is no
@@ -612,8 +608,8 @@ pub(crate) fn quote_command_arg(arg: &str) -> String {
 /// should switch to `unrestricted` (trusted-operation path; no scrubbing applies).
 ///
 /// **Windows** uses a heuristic deny-list ([`is_sensitive_env_name`]) because PowerShell pulls in a
-/// long tail of system vars (`PSModulePath`, `APPDATA`, `ProgramFiles`, etc.) that don't fit a tidy
-/// allow-list; an allow-list version was tried first and broke core cmdlets.
+/// long tail of system vars (`PSModulePath`, `APPDATA`, `ProgramFiles`, etc.) that do not fit a
+/// tidy allow-list; an allow-list breaks core cmdlets.
 pub(crate) fn sandbox_child_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     std::env::vars_os()
         .filter(|(name_os, _)| match name_os.to_str() {
@@ -751,16 +747,13 @@ pub(crate) fn is_sensitive_env_name(name: &str) -> bool {
         "KUBECONFIG",
         "GNUPGHOME",
         "NETRC",
-        // Code-execution vectors, which the Unix allow-list refuses by name and this arm did not.
-        // The two arms are supposed to implement one policy, and a test on the Unix side names
-        // exactly these while the Windows side let all of them through.
-        //
-        // They are not credentials; they are ways to make an ordinary command run something else.
-        // `NODE_OPTIONS` takes `--require`, `PYTHONPATH` / `NODE_PATH` prepend an import path, and
-        // `PIP_INDEX_URL` redirects where a package is fetched from. The values come from meka's
-        // own parent environment, so this is not an escalation the agent can drive -- but the
-        // sandboxed child is exactly the place where "the same command, quietly doing something
-        // else" is worth refusing.
+        // Code-execution vectors, which the Unix allow-list refuses by name, and the two arms
+        // implement one policy. They are not credentials; they are ways to make an ordinary
+        // command run something else: `NODE_OPTIONS` takes `--require`, `PYTHONPATH` /
+        // `NODE_PATH` prepend an import path, and `PIP_INDEX_URL` redirects where a package is
+        // fetched from. The values come from meka's own parent environment, so this is not an
+        // escalation the agent can drive, but the sandboxed child is exactly the place where "the
+        // same command, quietly doing something else" is worth refusing.
         "NODE_OPTIONS",
         "NODE_PATH",
         "PYTHONPATH",
@@ -841,10 +834,9 @@ mod tests {
 
     /// The Landlock masks are pinned per ABI, bit for bit.
     ///
-    /// These two functions are the whole of what meka asks the kernel to police, and they were the
-    /// least guarded code in the module: a mutation sweep flipped 34 operators across them without
-    /// a single test noticing. The end-to-end boundary test only catches the subset that stops a
-    /// *write*, and it cannot catch the rest, because `&` binds tighter than `|` in Rust: flipping
+    /// These two functions are the whole of what meka asks the kernel to police. The end-to-end
+    /// boundary test only catches the subset that stops a write, and it cannot catch the rest,
+    /// because `&` binds tighter than `|` in Rust: flipping
     /// a middle operator drops only the two adjacent bits and leaves the write flags standing.
     /// Losing `MAKE_SOCK` and `MAKE_FIFO` that way would let a confined shell create a socket or a
     /// fifo outside its roots while every existing assertion still passed.
@@ -904,11 +896,12 @@ mod tests {
 
     /// A `bwrap` the user can replace is not a sandbox, and must be refused.
     ///
-    /// `bwrap_on_path` walked `$PATH` and took the first executable named `bwrap`. Every ordinary
-    /// desktop has several user-writable directories ahead of `/usr/bin` -- `~/.local/bin`, a cargo
-    /// or go bin dir, a toolchain shim dir -- so a six-line script that `exec`s its final argument
-    /// turned every `read` and `workspace` shell command into an unconfined one. The smoke test
-    /// could not catch it, because `bwrap <flags> /bin/true` is exactly what such a shim satisfies.
+    /// Every ordinary desktop has several user-writable directories ahead of `/usr/bin`
+    /// (`~/.local/bin`, a cargo or go bin dir, a toolchain shim dir), so a `bwrap_on_path` that
+    /// took the first executable named `bwrap` would let a six-line script that `exec`s its final
+    /// argument turn every `read` and `workspace` shell command into an unconfined one. The smoke
+    /// test cannot catch it, because `bwrap <flags> /bin/true` is exactly what such a shim
+    /// satisfies.
     ///
     /// Asserted on the predicate rather than by planting a real shim, because the interesting half
     /// (a root-owned binary in a root-owned directory) cannot be constructed in a test without
@@ -937,9 +930,8 @@ mod tests {
     /// Trust needs *both* the binary and its directory, and the mixed cases are the whole point.
     ///
     /// Asserting the two ends only (both trusted, neither trusted) leaves the conjunction free:
-    /// `&&` and `||` agree whenever their operands agree, so a mutation to `||` survived every test
-    /// in the suite. `||` is precisely the bug this check was added to fix, since it re-admits a
-    /// root-owned binary sitting in a directory the user can write.
+    /// `&&` and `||` agree whenever their operands agree, and `||` re-admits a root-owned binary
+    /// sitting in a directory the user can write.
     ///
     /// The mixed pairs are built from paths that exist on any Linux host rather than by planting
     /// files, because the trusted half cannot be created without root.
@@ -973,7 +965,7 @@ mod tests {
 
     /// Only an executable regular file is a candidate.
     ///
-    /// Both halves were mutable: dropping the `is_file` conjunct admits a directory named `bwrap`,
+    /// Both halves matter: dropping the `is_file` conjunct admits a directory named `bwrap`,
     /// and flipping the mode test to `== 0` admits only *non*-executable files, which quietly makes
     /// bubblewrap undiscoverable on every host and silently downgrades the backend.
     #[test]
@@ -1002,15 +994,11 @@ mod tests {
     /// Between ABI 3 and 9 the filesystem is genuinely write-protected but the later mitigations
     /// are absent, and the warning naming them is the only way a user learns which.
     ///
-    /// Nothing asserted it: delete the whole block and every suite stayed green, leaving a host
-    /// that believes `read` restricts more than the running kernel actually does. Driven through
-    /// a subscriber pinned to `WARN` because that is the default floor, so this also fails if the
-    /// level is dropped to `info` where `-v` would be needed to see it.
+    /// Without the block a host believes `read` restricts more than the running kernel actually
+    /// does. Driven through a subscriber pinned to `WARN` because that is the default floor, so
+    /// this also fails if the level is dropped to `info` where `-v` would be needed to see it.
     ///
-    /// Linux-gated because [`super::SandboxCapability::Landlock`] is: without this the test breaks
-    /// the macOS and Windows halves of CI's lint and test matrix, which is exactly the
-    /// platform-only compile error that matrix exists to catch and that cannot be reproduced on a
-    /// Linux workstation.
+    /// Linux-gated because [`super::SandboxCapability::Landlock`] is.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_landlock_abi_below_9_names_the_mitigations_it_does_not_provide() {
@@ -1340,7 +1328,7 @@ mod tests {
     ///
     /// This is the whole reason roots travel out of band: a directory called `it's "here"` or one
     /// ending in a backslash would otherwise have to survive SBPL string quoting, and getting that
-    /// wrong does not fail loudly -- it changes which subpath the rule matches. The assertion that
+    /// wrong does not fail loudly: it changes which subpath the rule matches. The assertion that
     /// no root's text appears in the profile body is the one that would catch a future rewrite
     /// deciding interpolation is simpler. The private denies come after the write allows: SBPL
     /// takes the last matching rule, so a root that contains meka's store must not win over the
@@ -1603,8 +1591,8 @@ mod tests {
     #[test]
     fn probe_backend_landlock_returns_known_variant() {
         // Smoke test: confirms the probe runs without panicking on whatever kernel this build host
-        // has. We can't assert which specific variant comes back because CI may have an older
-        // kernel where Landlock is unavailable.
+        // has. Which variant comes back cannot be asserted because CI may have an older kernel
+        // where Landlock is unavailable.
         let probe = probe_backend(crate::config::SandboxBackend::Landlock);
         assert!(matches!(
             probe,
@@ -1645,9 +1633,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         // Through `strip_verbatim`, because that is what `writable_roots` does and this asserts
         // equality against its output. Bare `canonicalize` returns a `\\?\`-prefixed path on
-        // Windows, so the expectation was the one spelling production never produces and this test
-        // failed on Windows alone -- the same prefix that reached the prompt, the model and the
-        // database before `/cd` was taught to strip it.
+        // Windows, so the expectation would be the one spelling production never produces and this
+        // test would fail on Windows alone.
         let base = crate::workspace::canonical_for_test(temp.path());
         let cwd = workspace::SharedCwd::new(base.clone());
         let scope = workspace::WriteScope::confined(vec![base.clone()]);
@@ -1671,7 +1658,7 @@ mod tests {
         );
     }
 
-    /// `[shell].sandbox = false` disables confinement at every level, as it always has.
+    /// `[shell].sandbox = false` disables confinement at every level.
     #[test]
     fn disabling_the_sandbox_unconfines_every_level() {
         let cwd = workspace::cwd_for_test();

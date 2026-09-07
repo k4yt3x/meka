@@ -1,9 +1,8 @@
 //! What every host does when the scheduler fires a job or the background poller finds finished
 //! work: find the session, take its runtime, publish a token, fold undelivered outcomes into the
-//! prompt, run the turn, and report. The three hosts once carried three copies of this loop that
-//! agreed on most of it and disagreed, silently, on the rest: whether an ungated job waits behind a
-//! turn, whether a canceled fire counts as failed, which host announced outcomes and when. One
-//! driver, with the differences asked through [`HostHooks`].
+//! prompt, run the turn, and report. One driver, so the hosts cannot disagree on whether an ungated
+//! job waits behind a turn, whether a canceled fire counts as failed, or who announces outcomes and
+//! when; what differs is asked through [`HostHooks`].
 
 use std::ops::ControlFlow;
 
@@ -150,8 +149,8 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     let busy = entry.mark_busy();
     if let Err(error) = hooks.prepare(&entry).await {
         tracing::warn!(
-            "job {job_id} did not run: its session's recorded profile could not be resolved. Fix the \
-             profile, or move the session with `meka -r <id> --profile <name>`: {error}"
+            "scheduled job {job_id} did not run: its session's profile did not resolve; move the \
+             session with `meka -r <id> --profile <name>`: {error}"
         );
         return FireOutcome::Unrunnable;
     }
@@ -256,8 +255,8 @@ where
         }
         if let Err(error) = hooks.prepare(&entry).await {
             tracing::warn!(
-                "holding a background outcome report for session {session_id}: its recorded profile could \
-                 not be resolved. It is retried on the next sweep: {error}"
+                "holding a background outcome report for session {session_id} until its profile \
+                 resolves: {error}"
             );
             continue;
         }
@@ -338,16 +337,14 @@ pub(crate) async fn a_turn_can_carry_them(agent: &crate::agent::Agent) -> bool {
 }
 #[cfg(test)]
 mod tests {
-    /// Asserted against the source, and honestly weaker than a behavioral test: nothing in the
-    /// suite drives background-outcome delivery through this driver, which a mutation sweep once
-    /// confirmed for the ACP copy by replacing it with `()` and staying green. Until that coverage
-    /// exists this is what stands between a future edit and a silent regression, so it checks
-    /// *order* rather than mere presence.
+    /// Asserted against the source, and weaker than a behavioral test: nothing in the suite drives
+    /// background-outcome delivery through this driver, so this checks *order* rather than mere
+    /// presence.
     ///
     /// What it defends: `list_undelivered_background_tasks` filters on `delivered_at IS NULL`, so a
-    /// stamped batch has no re-delivery path. Stamping first meant a provider lookup that came back
-    /// `SQLITE_BUSY` -- an ordinary occurrence with a second meka process on the store -- destroyed
-    /// a report the user was waiting on, with one `warn!` and nothing else.
+    /// stamped batch has no re-delivery path. Stamping first lets a provider lookup that comes back
+    /// `SQLITE_BUSY`, an ordinary occurrence with a second meka process on the store, destroy a
+    /// report the user was waiting on, with one `warn!` and nothing else.
     #[test]
     fn a_background_outcome_is_stamped_only_once_its_turn_can_run() {
         let source = include_str!("scheduler.rs");

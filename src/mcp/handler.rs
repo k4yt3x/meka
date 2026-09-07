@@ -63,9 +63,9 @@ impl MekaClientHandler {
 }
 
 impl ClientHandler for MekaClientHandler {
-    /// What the `initialize` request says about this client. Left to rmcp's default, it named the
-    /// SDK as the client, floated the protocol version with the SDK's release, and declared no
-    /// capabilities at all, so a server that checks before it elicits never did.
+    /// What the `initialize` request says about this client. Left to rmcp's default, it names the
+    /// SDK as the client, floats the protocol version with the SDK's release, and declares no
+    /// capabilities at all, so a server that checks before it elicits never does.
     fn get_info(&self) -> rmcp::model::ClientInfo {
         use rmcp::model::{
             ClientCapabilities, ElicitationCapability, FormElicitationCapability, Implementation,
@@ -236,25 +236,22 @@ impl ClientHandler for MekaClientHandler {
                 message,
             };
 
-            // Correlate the elicitation back to the in-flight call's frontend via the per-server
-            // lookup on the progress registry. When no call from `server` is in flight (the server
-            // elicited outside of a tool call, or the progress guard already dropped), there's no
-            // human to ask, and declining is the safe answer.
+            // The frontend is the in-flight call's, found through the progress registry. With no
+            // call from `server` in flight (the server elicited outside a tool call, or the
+            // progress guard already dropped) there is no human to ask, and declining is the safe
+            // answer.
             let frontend = context.progress.find_frontend_for_server(server.as_ref());
             let Some(frontend) = frontend else {
                 tracing::warn!(
-                    "MCP server '{server}' requested elicitation but no in-flight call's frontend was \
-                     registered; declining"
+                    "MCP server '{server}' requested elicitation with no tool call in flight; declining"
                 );
                 return Ok(ElicitationResponse::Decline.into_result());
             };
 
-            // User-response timeout so a distracted user can't stall an MCP tool call forever;
-            // sixty seconds is the elicitation deadline in its own right (an approval prompt waits
-            // longer, since the turn is already paused on it). Elicitations are MCP *requests*, so
-            // a `Decline` response IS how the server learns the user didn't answer; no separate
-            // `notifications/canceled` is appropriate here (cancellation notifications are for
-            // long-running requests we started, not for server-initiated elicitations).
+            // Bounded so an unanswered prompt cannot stall an MCP tool call forever; an approval
+            // prompt waits longer because the turn is already paused on it. An elicitation is an
+            // MCP *request*, so a `Decline` is how the server learns the user did not answer;
+            // `notifications/cancelled` is for requests meka started.
             const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
             let response = match tokio::time::timeout(
                 ELICITATION_TIMEOUT,
@@ -325,9 +322,7 @@ fn parse_tool_call_timeout(raw: Option<&str>) -> std::time::Duration {
             DEFAULT
         }
         Err(error) => {
-            tracing::warn!(
-                "ignoring MEKA_MCP_TOOL_TIMEOUT='{raw}': {error} (expected a duration like \"10m\")"
-            );
+            tracing::warn!("ignoring MEKA_MCP_TOOL_TIMEOUT='{raw}': {error}");
             DEFAULT
         }
     }
@@ -533,41 +528,32 @@ impl McpTool {
 }
 
 /// Map MCP `CallToolResult.content` items to meka's provider-layer `ToolResultContent` blocks. Text
-/// stays text; images pass through as multimodal blocks so providers like Claude and GPT-4o can see
-/// them; audio, embedded resources, and resource links collapse to informative text placeholders
-/// (no provider accepts them as tool-result blocks yet).
+/// stays text and images pass through as image blocks; audio, embedded resources and resource
+/// links collapse to text placeholders, because no provider accepts them as tool-result blocks.
 pub(crate) fn convert_tool_result_content(
     items: &[rmcp::model::ContentBlock],
 ) -> Vec<crate::conversation::ToolResultContent> {
     use crate::{conversation::ToolResultContent, image::ImageSource};
 
-    // The one unbounded thing a server controls in a tool result. Images have had a ceiling since
-    // they were added; text was appended until the server stopped sending, and every byte then went
-    // into the session and back to the provider on every subsequent turn. Generous enough that no
-    // real result reaches it: four megabytes is roughly a million tokens.
+    // The one unbounded thing a server controls in a tool result: every byte of text goes into
+    // the session and back to the provider on every later turn. Generous enough that no real
+    // result reaches it; four megabytes is roughly a million tokens.
     //
-    // Past it the excess is *dropped*, not spilled, which is a knowingly weaker guarantee than the
-    // one `tools::shell` gives: an overflowing command writes every byte to a file and hands the
-    // model its path. Two things stand in the way of matching it here. This function is a pure
-    // transform over content blocks with no session to spill into, and
-    // `scratchpad::persist_oversized_results` -- which would preserve the rest -- runs on the
-    // `ToolOutput` *after* `execute` returns, so it never sees what was cut. Closing the gap means
-    // threading the scratchpad through the conversion, and is worth doing when a real server is
-    // observed hitting four megabytes; none has been. The loss is disclosed either way, which is
-    // the property that actually matters: the model is told the result was cut rather than
-    // answering from a silent truncation.
+    // Past it the excess is *dropped*, not spilled, which is a weaker guarantee than the one
+    // `tools::shell` gives. This function is a pure transform over content blocks with no session
+    // to spill into, and `scratchpad::persist_oversized_results` runs on the `ToolOutput` *after*
+    // `execute` returns, so it never sees what was cut. Threading the scratchpad through the
+    // conversion is worth doing once a real server is observed hitting four megabytes. The loss
+    // is disclosed either way, so the model never answers from a silent truncation.
     const MAX_MCP_TEXT_BYTES: usize = 4 * crate::text::MIB;
 
     let mut blocks: Vec<ToolResultContent> = Vec::new();
     let mut text_buffer = String::new();
     let mut text_dropped: usize = 0;
-    // Counted across the whole result, not per buffer.
-    //
-    // Compared against `text_buffer.len()` alone the ceiling misses what has already been flushed:
-    // the accepted-image arm calls `flush_text`, which `mem::take`s the buffer. A result shaped
-    // `[4 MiB text][small PNG][4 MiB text][PNG]...` therefore passed the guard on every round
-    // and the cap bounded nothing: the resident total is the sum of the flushed blocks, which
-    // is what the model is sent.
+    // Counted across the whole result, not per buffer: the accepted-image arm calls `flush_text`,
+    // which `mem::take`s the buffer, so a ceiling compared against `text_buffer.len()` alone lets
+    // a result shaped `[4 MiB text][small PNG][4 MiB text][PNG]...` pass on every round. The
+    // resident total is the sum of the flushed blocks, which is what the model is sent.
     let mut text_kept: usize = 0;
 
     let flush_text = |buffer: &mut String, out: &mut Vec<ToolResultContent>| {

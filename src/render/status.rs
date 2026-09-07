@@ -7,11 +7,9 @@ use crate::streams::{write_stderr, write_stderr_line};
 pub(crate) fn render_session_id(label: &str, id: &str) {
     write_stderr_line(format!("{label}: {id}").with(Color::DarkGrey));
 }
-/// Print a one-line per-turn token-usage summary to stderr in dark gray, preceded by a blank line
-/// so it visually separates from the agent's response. Format: `[in 12.3k / cache hit 96% / out
-/// 1.2k]`. The "in" column is the total of all three input-token tiers (live, cache-write,
-/// cache-read); the cache-hit % is `cache_read / total_in`. Numbers below 1k show as raw counts,
-/// below 1M as `Nk`, and otherwise as `NM`, each with one decimal.
+/// The per-turn token-usage line, `[in 12.3k / cache hit 96% / out 1.2k]`, dimmed and preceded by
+/// a blank line. `in` is the total of all three input-token tiers (live, cache-write, cache-read),
+/// and the hit rate is `cache_read / in`.
 pub(crate) fn render_token_usage(usage: &crate::stats::TokenUsage) {
     let total_in = usage
         .input_tokens
@@ -64,9 +62,8 @@ pub(crate) fn format_session_status(
     let mut out = String::new();
     // Ordered like the profile these lines are resolved from: the account and its backend first,
     // then the model, then the model-tied knobs in the order `[profiles.<name>]` declares them
-    // (`context_window`, `effort`, `thinking`). Reading the block next to the config it came from
-    // is the whole point of this command, and the two disagreeing on order made that harder than
-    // it needed to be. The cumulative counters follow, and answer a different question.
+    // (`context_window`, `effort`, `thinking`), so the block reads beside the config it came from.
+    // The cumulative counters follow, and answer a different question.
     match (model.profile, model.account, model.backend) {
         (Some(profile), Some(account), Some(backend)) => {
             out.push_str(&format!(
@@ -268,40 +265,23 @@ pub(crate) struct MissingSessionProfile<'a> {
     /// The configured profile to suggest moving to.
     pub(crate) move_to: &'a str,
 }
-/// Print the provider-setup hint shown when the agent fails to initialize. Centralized so the
-/// wording stays in sync everywhere.
+/// The one-line hint under the error printed when the agent fails to build.
 ///
-/// **One line, because the error printed above it has already said everything else.**
-/// `config::require_profile` names the profile the row wants, lists the configured ones, and
-/// tells the reader to restore it or move off it. The session id is the single fact it cannot
+/// One line, because the error above it has already said everything else. When the session's own
+/// profile is what could not be resolved, the session id is the single fact that error cannot
 /// reach, and `-r <id> --profile <name>` is the only command that rewrites a row's binding, so
-/// that is what this adds. Two further lines are deliberately absent. `Run meka profile list to
-/// see configured profiles` restates what that error has just listed, and `Or bring the profile
-/// back: meka profile add <recorded> --account ... --model ...` *invents the profile's account and
-/// model*. meka never saw the deleted profile; it may have been `openai-responses` on another model
-/// entirely, and running that line would create a different profile under the name the session
-/// wants. A wrong command is worse than no command.
+/// that is what this adds. No line suggests recreating the missing profile: meka never saw it, so
+/// any account or model it named would be invented.
 ///
 /// `None` says nothing about *why* setup failed: the caller prints the error first, and it is as
-/// often a configured profile missing its credential as no profile at all. That case names no
-/// profile in its example either, because a literal name reads as a fact about the user's config
-/// rather than as a placeholder: `work` was hardcoded, so a user missing `ghost` was told to add
-/// `work`, and a user who already had a `work` profile was told to add one that existed. The type
-/// and model there are safe where the interpolated ones were not, because the line is labeled
-/// `Example:` and describes nothing that exists.
+/// often a configured profile missing its credential as no profile at all.
 pub(crate) fn render_profile_setup_hint(missing: Option<MissingSessionProfile<'_>>) {
     match missing {
         Some(missing) => write_stderr_line(format!(
-            "Move this session onto a configured profile: meka -r {} --profile {}",
+            "Move this session onto a configured profile: `meka -r {} --profile {}`",
             missing.session_id, missing.move_to
         )),
-        None => {
-            write_stderr_line(
-                "Example: meka account add work --backend claude-subscription, then meka profile \
-                 add work --account work --model claude-opus-5",
-            );
-            write_stderr_line("Run `meka profile list` to see configured profiles.");
-        }
+        None => write_stderr_line("Run `meka profile list` to see the configured profiles."),
     }
 }
 
@@ -347,9 +327,7 @@ mod tests {
     }
 
     /// The resolved-profile lines come in the order `[profiles.<name>]` declares the same fields,
-    /// so the block and the config it was resolved from can be read side by side. Nothing enforced
-    /// that before, and the two had already drifted: `Model` sat above `Provider`, and `Context`
-    /// sat down among the cumulative counters rather than with the window it reports.
+    /// so the block and the config it was resolved from can be read side by side.
     #[test]
     fn the_status_block_follows_the_profile_field_order() {
         use crate::config::ThinkingMode;
@@ -377,7 +355,7 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                // `type`, `model`, `context_window`, `effort`, `thinking` -- the profile's own
+                // `account`, `model`, `context_window`, `effort`, `thinking`: the profile's own
                 // order, for the fields that come from it.
                 "Profile",
                 "Model",

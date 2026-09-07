@@ -164,7 +164,7 @@ The default is empty. `~/.agents/skills` has emerged as a cross-client conventio
 
 **Precedence.** meka's own store is searched first, then each `extra_paths` entry in order. When two directories hold the same skill name, the first wins and the shadowed one is logged.
 
-**Writes never follow.** `skill_write`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only root, they refuse and say where it lives, because writing would create a second copy that shadows the original instead of changing it. Edit that file directly, or pick a different name. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
+**Writes never follow.** `skill_write`, `skill_delete`, `meka skill add`, `meka skill remove`, `PUT /v1/skills/{name}` and `DELETE /v1/skills/{name}` all target meka's own store. Asked to write a name that resolves to a skill in a read-only root, they refuse, because writing would create a second copy that shadows the original instead of changing it; the refusal says to edit or remove it where it lives, and the CLI names the directory. This holds whether or not the file there is valid: a directory whose `SKILL.md` does not parse still claims that name, and shadowing a broken skill is the case worth refusing hardest, since nothing then reports the original at all.
 
 There is deliberately no automatic project-level scan. meka does not treat the working directory as trusted anywhere else either, and a cloned repository that could silently add instructions to the agent's context would be exactly that. Name a project's skills directory in `extra_paths` if you want it read.
 
@@ -201,7 +201,7 @@ The list is sent once, not on every turn. Adding, editing, or removing a skill m
 A skill directory that could not be loaded is named there too, with the reason:
 
 ```
-1 directory in your skills path could not be loaded, so it is not in the index above and cannot be invoked:
+1 directory in your skills path could not be loaded, so it is unavailable and cannot be invoked:
 
 - **deploy-kubernetes**: invalid frontmatter: mapping values are not allowed here
 ```

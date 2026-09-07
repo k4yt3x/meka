@@ -8,7 +8,7 @@ The store under `MEKA_DATA_DIR` runs in WAL mode, so the most recent writes, inc
 migration, can sit in `meka.db-wal` beside `meka.db` until SQLite checkpoints them. A copy that
 takes `meka.db` alone can therefore carry a schema version its tables have not caught up with.
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
-and `-shm` companions with the file, or run `PRAGMA wal_checkpoint(TRUNCATE)` on the source first.
+and `-shm` companions with the file.
 
 ## 0.45 to 0.46
 
@@ -42,7 +42,7 @@ lists for anything you automated.
 2. **Install 0.46 and launch it once.** The store migrates on that open, behind an automatic copy
    beside it named for the schema version it came from (`meka.db.v9.bak` for a store 0.45 left),
    in ten ledger steps. The first creates the REPL's `prompt_history` table where a store lacks
-   one, a no-op otherwise. The other eight: `sessions.provider` becomes `sessions.profile`, and
+   one, a no-op otherwise. The other nine: `sessions.provider` becomes `sessions.profile`, and
    `provider_credentials` becomes `account_credentials`, keyed by account, both renames of what
    was always there; an `approvals` column is added, every `ask` session becomes `none` with it
    on, and a root session that never recorded a level (one an ACP client created) adopts
@@ -50,9 +50,10 @@ lists for anything you automated.
    `turn_context` block; every image's bytes move out of its message row into `blobs`, leaving
    a reference; every column and index takes one naming rule, with the JSON in two of them
    following suit; a `repair` row's own thinking blocks take that rule's tag too, which the
-   step before it passed over; and a root session still without a level after all that takes
-   `[permissions].default`, which reaches a store that 0.46.0 migrated while its config could not
-   be read. Four of these walk every message row, so a store with years of
+   step before it passed over; a root session still without a level after all that takes
+   `[permissions].default`, and a launch that cannot read the file refuses here rather than
+   skipping the stamp; and a stopped task's stored status is spelled `canceled`. Four of these
+   walk every message row, so a store with years of
    image-heavy sessions takes a moment on that first launch and grows a copy of the same size
    beside it. A store restored from a `.dump` replays the whole ledger, and if no default profile
    can be resolved when it does, the frozen 0.44 step warns with its old `--provider` advice; read
@@ -64,9 +65,7 @@ edit it through `toml_edit` (`meka account remove`, `meka profile remove`, `meka
 the ones that read the store alone still run. The store migrates on that launch only if no step
 needs the file. A root session that never recorded a level needs `[permissions].default` from it,
 and a migration that cannot read the file refuses and rolls back rather than stamping nothing, so
-the store keeps its 0.45 shape until the launch after the script has run. 0.46.0 did the opposite,
-stamping no such row and never returning to it; a store it migrated that way gets the level on the
-first launch of this release that can read the file.
+the store keeps its 0.45 shape until the launch after the script has run.
 
 ### What the script converts
 
@@ -180,6 +179,8 @@ key whose value is not a whole number is left under its old name and reported, w
   `never`.
 - **Skills you wrote** that name a renamed tool parameter (next table) or the old `[ask]` prompt
   must be edited by hand; meka does not rewrite skill files.
+- **A gate's pointer test is `not_empty`** (was `not-empty`) in `schedule_create`, `POST
+  /v1/sessions/{id}/schedule` and `meka schedule add`; stored jobs are converted by the store.
 - **`canceled`, one `l`, on every wire meka owns.** Match `turn.canceled` as the SSE terminal event,
   `https://meka.so/errors/turn-canceled` as the problem `type`, and `status == "canceled"` in task
   views (`GET /v1/sessions/{id}/tasks`, `DELETE .../tasks/{task_id}`), `task_list` output and
@@ -242,8 +243,8 @@ cannot be read; fix the file and start meka again. The store is unchanged
 The parse error itself is a warning just above it, naming the key and the line:
 
 ```console
-WARN meka: config.toml could not be read, so this run cannot say which profile anything should
-adopt: configuration error: failed to parse …/config.toml: TOML parse error at line 12, column 1
+WARN meka: failed to read config.toml, so no profile can be adopted for older sessions:
+configuration error: failed to parse …/config.toml: TOML parse error at line 12, column 1
    |
 12 | auth_token = "…"
    | ^^^^^^^^^^

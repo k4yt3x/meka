@@ -14,8 +14,6 @@
 //! The event-based shape mirrors ACP's `session/update` notification: one channel for every kind
 //! of agent-emitted output, discriminated by the [`FrontendEvent`] variant.
 
-// `PathBuf` is consumed only by the `#[cfg(test)] mod testing` block below; gating its import
-// keeps non-test builds warning-clean.
 #[cfg(test)]
 use std::path::PathBuf;
 use std::{
@@ -1011,15 +1009,9 @@ mod tests {
         assert!(matches!(events[2], FrontendEvent::TurnFinished));
     }
 
-    /// Locks in the contract for the `display_summary` field on
-    /// [`FrontendEvent::ToolCallStarted`]: the agent loop is expected to pre-resolve the primary
-    /// argument via [`crate::tools::resolve_primary_param`] and ship the resulting `String` (or
-    /// `None`) on the event. Frontends rely on this so they never need the tool's JSON Schema
-    /// themselves.
-    ///
-    /// This test exercises both the helper that the agent calls and the event shape that carries
-    /// the result, so a future refactor that changes either side is caught here. End-to-end
-    /// emission from `Agent::run_turn` is covered by `tests/acp.rs`.
+    /// The agent pre-resolves the primary argument through [`crate::tools::resolve_primary_param`]
+    /// and ships it on [`FrontendEvent::ToolCallStarted`], so no frontend needs the tool's JSON
+    /// Schema. End-to-end emission from `Agent::run_turn` is covered by `tests/acp.rs`.
     #[tokio::test]
     async fn tool_call_started_carries_resolved_display_summary() {
         let recorder = RecordingFrontend::new();
@@ -1252,9 +1244,8 @@ mod tests {
     }
 
     /// Notices are the one event that *does* forward through `PermissionForwardingFrontend`. Image
-    /// redaction during a sub-agent's provider call is a side-effect the *user* needs to see; the
-    /// sub-agent's report has no place to surface it, and silent redaction without operator
-    /// awareness is exactly the bypass this whole refactor is meant to close.
+    /// redaction during a sub-agent's provider call is a side effect the user needs to see, and the
+    /// sub-agent's report has no place to surface it.
     #[tokio::test]
     async fn permission_forwarding_frontend_forwards_notice() {
         let recorder = Arc::new(RecordingFrontend::new());

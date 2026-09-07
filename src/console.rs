@@ -19,11 +19,10 @@
 //! on, which is what stops a scheduler wake that finds nothing to run from leaving a second prompt
 //! behind.
 //!
-//! [`RowState`] is the fact none of the previous code tracked: a blank line only makes a gap when
-//! the cursor is at column zero. Two writers park it mid-row deliberately (the thinking indicator
-//! and the MCP progress line), and reedline leaves a drawn prompt behind when it breaks out for a
-//! wake. Before this existed each of those was compensated for by hand at the sites someone
-//! remembered, and a blank printed anywhere else was silently spent terminating the row instead.
+//! [`RowState`] exists because a blank line only makes a gap when the cursor is at column zero. Two
+//! writers park it mid-row deliberately (the thinking indicator and the MCP progress line), and
+//! reedline leaves a drawn prompt behind when it breaks out for a wake; a blank printed over either
+//! is spent terminating the row instead.
 
 use std::io::Write;
 
@@ -191,10 +190,9 @@ pub(crate) fn step(state: State, spacing: Spacing, action: Action) -> (Emit, Sta
             next.pending_after_blank = true;
             next.opened_against = follows;
             next.printed = false;
-            // Unconditional, and the fix for a bug that survived because it looked like a tidy
-            // guard: this records "a prompt is what came last", which is true whether or not a
-            // blank followed it. Gating it on `newline_after_prompt` left the next episode reading
-            // the previous one's final block and printing the separator the setting had disabled.
+            // Unconditional: this records "a prompt is what came last", which is true whether or
+            // not a blank followed it. Gated on `newline_after_prompt`, the next episode reads the
+            // previous one's final block and prints the separator the setting disabled.
             next.spacing.after_prompt();
             (Emit::NOTHING, next)
         }

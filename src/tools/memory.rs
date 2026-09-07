@@ -10,13 +10,11 @@
 //! is not a path, so it is not a file-write primitive, but it is what `meka memory export` turns
 //! into a file name and it is text the model reads in every turn's index.
 //!
-//! The doors that only *look a name up* -- `memory_read` and `memory_delete` -- check
+//! The doors that only look a name up (`memory_read` and `memory_delete`) check
 //! [`crate::memory::validate_memory_lookup`] instead, which requires only that the name is not
-//! empty. It bounded length too, until that turned out to re-create this same wedge one length
-//! short; the cost that bound existed for is bounded in `did_you_mean_hint` now. Applying the write
-//! rule to them meant a row that reached the column past the tools was listed to the model in the
-//! `[Memory]` index and then refused by every door that could have opened or removed it, with `meka
-//! memory export` refusing the whole store on its account.
+//! empty: applying the write rule to them would leave a row that reached the column past the tools
+//! listed to the model in the `[Memory]` index and refused by every door that could open or remove
+//! it. The cost a length bound would have capped is bounded in `did_you_mean_hint` instead.
 
 use std::sync::Arc;
 
@@ -118,15 +116,14 @@ impl Tool for MemoryWriteTool {
             tool_name: "memory_write".to_string(),
             message,
         })?;
-        // Omit-to-keep, like `body`, `tags` and `priority`. It was required, which forced an agent
-        // refining a stored note to resend a description it cannot actually see: the only copy in
-        // its context is the index's, elided to 500 characters. So refining the *body* of a memory
-        // whose description ran to 900 characters rewrote that description as 503 ending in `...`,
-        // silently, on a call that never mentioned it. The store resolves the absence in SQL, and
-        // refuses it when the write would create the memory rather than update one.
+        // Omit-to-keep, like `body`, `tags` and `priority`: the only copy of a description the
+        // agent can see is the index's, elided to 500 characters, so requiring it would make a
+        // body-only refinement rewrite a long description as its elision. The store resolves the
+        // absence in SQL, and refuses it when the write would create the memory rather than update
+        // one.
         //
         // A present-but-not-a-string `description` is refused rather than read as absent, for the
-        // reason spelled out on `body` below.
+        // reason given on `body` below.
         let description = match input.get("description") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => {
@@ -138,9 +135,9 @@ impl Tool for MemoryWriteTool {
                             .to_string(),
                     });
                 }
-                // Whitespace is not the same question as "renders as nothing". Format characters
-                // are not whitespace, so a description of three zero-width spaces got past every
-                // write door and then rendered as blank in the index the model reads every turn.
+                // Whitespace is not the same question as "renders as nothing": format characters
+                // are not whitespace, so three zero-width spaces would pass and render as blank in
+                // the index the model reads every turn.
                 if !memory::description_says_something(text) {
                     return Err(MekaError::ToolExecution {
                         tool_name: "memory_write".to_string(),
@@ -158,16 +155,14 @@ impl Tool for MemoryWriteTool {
                 });
             }
         };
-        // An absent `body` means "leave it alone", not "make it empty". The schema has always
-        // marked the field optional, so the call that changes only a priority is one the tool
-        // invites -- and rendering the absence as `""` made that call silently delete everything
-        // the memory said. `Some("")` is still an explicit request to clear it.
+        // An absent `body` means "leave it alone", not "make it empty": the schema marks the field
+        // optional, so the call that changes only a priority is one the tool invites, and rendering
+        // the absence as `""` would silently delete everything the memory said. `Some("")` is still
+        // an explicit request to clear it.
         //
-        // A present-but-not-a-string `body` is refused rather than read as absent. `as_str`
-        // returning `None` put `["line one", "line two"]` down the omit-to-keep path, so a new
-        // memory was created with an empty body and reported as a plain success -- the model
-        // believes it saved text that is not stored. `priority` in this same handler already
-        // hard-errors on exactly this shape.
+        // A present-but-not-a-string `body` is refused rather than read as absent: `as_str` would
+        // put `["line one", "line two"]` down the omit-to-keep path and report success while
+        // storing nothing the caller sent.
         let body = match input.get("body") {
             None | Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(text)) => Some(text.clone()),
@@ -181,10 +176,9 @@ impl Tool for MemoryWriteTool {
         // Same omit-to-keep rule as `body`, for the same reason: a call that changes only a
         // description would otherwise strip labels it never mentioned. `[]` still clears them.
         //
-        // And the same refusal, for a sharper version of the same reason: `filter_map` dropped
-        // every non-string element silently, so `tags: [1, 2]` collapsed to `[]` -- which *is* the
-        // documented "clear them" signal. A malformed argument therefore erased labels the caller
-        // never asked to remove, and the confirmation did not mention tags at all.
+        // And the same refusal, for a sharper version of the same reason: dropping non-string
+        // elements would collapse `tags: [1, 2]` to `[]`, which is the documented "clear them"
+        // signal.
         let tags: Option<Vec<String>> = match input.get("tags") {
             Some(serde_json::Value::Array(values)) => {
                 let mut collected = Vec::with_capacity(values.len());
@@ -214,10 +208,9 @@ impl Tool for MemoryWriteTool {
         // and a human reads the error and retypes, where a model spends a turn on it. Read as
         // `i64` so a negative clamps to 0 instead of failing the `as_u64` cast outright.
         //
-        // `None` means "leave it alone", which the upsert resolves in SQL. Reading the absence as
-        // the default demoted a priority-0 standing directive to an ordinary note every time the
-        // agent reworded it -- taking it out of the always-in-context tier on the call whose
-        // purpose was to keep it accurate, and saying nothing.
+        // `None` means "leave it alone", which the upsert resolves in SQL: reading the absence as
+        // the default would demote a priority-0 standing directive every time the agent reworded
+        // it.
         let priority = match input.get("priority") {
             Some(serde_json::Value::Null) | None => None,
             Some(value) => {
@@ -230,8 +223,8 @@ impl Tool for MemoryWriteTool {
         };
 
         // Held from here until after the write, so a second `memory_write` issued in the same turn
-        // queues behind this one rather than racing it. Not for the write's sake -- the upsert is
-        // one transaction -- but for the near-duplicate check below, which is a read.
+        // queues behind this one rather than racing it. Not for the write's sake (the upsert is
+        // one transaction) but for the near-duplicate check below, which is a read.
         let _duplicate_guard = self.memories.lock_duplicate_check().await;
 
         // Normalized before the write so the doors agree on what a tag is: `Infra` and ` infra `
@@ -244,12 +237,9 @@ impl Tool for MemoryWriteTool {
             None => None,
         };
 
-        // Read before the write, since the write is what creates the row. Without this the
-        // confirmation would claim to have kept the body of a memory that had none, on the very
-        // call that created it. Whether there is a body to *keep*, not merely a row: testing
-        // existence alone made an update to a body-less memory report ", keeping the existing
-        // body" -- a claim about content that does not exist, on the one line whose whole job is
-        // to distinguish a metadata update from a rewrite.
+        // Read before the write, since the write is what creates the row, and whether there is a
+        // body to keep rather than merely a row: the confirmation would otherwise claim to have
+        // kept the body of a memory that had none.
         let kept_existing_body = body.is_none()
             && self
                 .memories
@@ -260,12 +250,8 @@ impl Tool for MemoryWriteTool {
                 .is_some_and(|existing| !existing.trim().is_empty());
 
         // Also before the write, so the incoming description is compared against the store as it
-        // was rather than against itself.
-        //
-        // Only when one was given. A write that omits the description is not proposing any text to
-        // be a near-duplicate of, and running the check against the stored description would match
-        // the memory against itself and report every such update as a duplicate of the note it is
-        // updating.
+        // was rather than against itself, and only when one was given: checking the stored
+        // description would report every omit-to-keep update as a duplicate of itself.
         let duplicate = match description.as_deref() {
             Some(description) => self.near_duplicate_of(name, description).await,
             None => None,
@@ -279,9 +265,8 @@ impl Tool for MemoryWriteTool {
             .write(WriteRequest {
                 name: name.to_string(),
                 // Normalized to one line here rather than only at `PUT /v1/memory`, so all three
-                // write doors store the same thing. `meka memory export` normalizes on the way
-                // out, so a description holding a newline came back collapsed after a round trip
-                // and the docs' "byte-exact" claim was false for exactly the doors an agent uses.
+                // write doors store what `meka memory export` writes and a round trip is
+                // byte-exact.
                 description: description
                     .as_deref()
                     .map(crate::entry::normalize_description),
@@ -296,11 +281,9 @@ impl Tool for MemoryWriteTool {
         tracing::info!("saved memory '{name}'");
         Ok(ToolOutput::text(
             format!(
-                // Not "it will appear in your memory index from the next turn on", which was an
-                // unconditional promise the index cannot keep: it renders a prefix of at most 200
-                // entries under an 8 KB budget, so in the store this change is sized for a new
-                // low-priority note sorts behind everything and is listed nowhere. Search reaches
-                // it at any store size, which is the guarantee actually on offer.
+                // Not "it will appear in your memory index", a promise the index cannot keep: it
+                // renders a capped prefix, so a new low-priority note in a large store is listed
+                // nowhere. Search reaches it at any store size.
                 "Saved memory '{}' (priority {}){}. It is in your memory store from the next turn \
                  on, and `memory_search` will find it whatever the index has room to list.{}",
                 written.name,
@@ -336,9 +319,7 @@ impl MemoryWriteTool {
     ///
     /// Advisory. It never blocks and never rewrites: this is the agent's decision to make, and the
     /// only failure worth preventing is the silent one where a store accumulates a hundred
-    /// near-copies because nothing ever pointed out the ninety-nine. Mem0 resolves the same
-    /// problem with a background model deciding ADD versus UPDATE; handing the observation to the
-    /// agent that is already holding the context is cheaper and better informed.
+    /// near-copies because nothing ever pointed out the ninety-nine.
     async fn near_duplicate_of(&self, name: &str, description: &str) -> Option<String> {
         // The cheap disqualifier first: a two-word description shares words with everything.
         let incoming = Terms::parse(&[description.to_string()]);
@@ -357,12 +338,10 @@ impl MemoryWriteTool {
             .hits;
 
         for hit in hits {
-            // Rewriting a memory under its own name is an update, which is the thing this is
-            // trying to encourage, not a duplicate. Compared case-insensitively because the column
-            // is: writing `POLICY` over an existing `policy` updates that one row, and a
-            // case-sensitive check then reported the row it had just written as a near-copy and
-            // told the model to `memory_delete` it -- which, resolving NOCASE, would have deleted
-            // the memory rather than a duplicate of it.
+            // Rewriting a memory under its own name is an update, not a duplicate. Compared
+            // case-insensitively because the column is: writing `POLICY` over an existing `policy`
+            // updates that one row, and a case-sensitive check would report the row it had just
+            // written as a near-copy and tell the model to `memory_delete` it.
             if hit.name.eq_ignore_ascii_case(name) {
                 continue;
             }
@@ -419,12 +398,8 @@ impl Tool for MemoryReadTool {
     ) -> Result<ToolOutput> {
         let name = require_str(&input, "name", "memory_read")?;
         let name = name.as_str();
-        // Validated here as at every other door, which the module doc has always claimed and this
-        // one did not do. Two things follow from the omission: an invalid name was reported as
-        // merely absent, and the miss path below loads the whole index and runs an edit distance
-        // per stored name with no bound on the argument -- measured at 11 s for a 200,000-character
-        // name against 200 memories, and 48 s against 20,000, synchronously on a runtime worker
-        // with the cancellation token ignored. Capping the name at 64 characters closes that.
+        // Validated here as at every other door: an invalid name would otherwise be reported as
+        // merely absent.
         memory::validate_memory_lookup(name).map_err(|message| MekaError::ToolExecution {
             tool_name: "memory_read".to_string(),
             message,
@@ -459,8 +434,8 @@ impl Tool for MemoryReadTool {
             }
         };
 
-        // Counted here and nowhere else. A search hit is weaker evidence -- the model saw a line,
-        // not the note -- and an operator reading through the HTTP API is not the agent recalling
+        // Counted here and nowhere else. A search hit is weaker evidence (the model saw a line,
+        // not the note) and an operator reading through the HTTP API is not the agent recalling
         // anything, so neither moves the ranking the agent gets. Best-effort: a counter that fails
         // to increment must not fail the read.
         if let Err(error) = self.memories.record_read(&entry.name).await {
@@ -472,17 +447,13 @@ impl Tool for MemoryReadTool {
         // observation, and detail that was true months ago is exactly what gets asserted as
         // current fact without a nudge.
         let age = memory::render_age(entry.recorded_at, std::time::SystemTime::now());
-        // Bounded, and said when it is. This was the one memory render with no ceiling on it, so a
-        // 200 KB note arrived whole into the window -- and the two search tiers both go to the
-        // trouble of excerpting precisely so this call is the deliberate way to spend that. A cut
-        // the reader is not told about is the worse half: a truncated note reads as a complete one
-        // whose author simply stopped.
+        // Bounded, and said when it is: a truncated note the reader is not told about reads as a
+        // complete one whose author simply stopped.
         let body = memory::render_for_model(entry.body.as_deref().unwrap_or_default());
         let body = body.trim();
         let rendered = match body.chars().count() {
-            // Not an error and not silence. A memory whose whole content is its description is a
-            // normal thing to write; rendering nothing after the header left the model to read the
-            // gap as a failed load and call again.
+            // Not an error and not silence: a memory whose whole content is its description is a
+            // normal thing to write, and nothing after the header reads as a failed load.
             0 => "(no body: this memory's description is all of it)".to_string(),
             length if length > READ_BODY_MAX_CHARS => format!(
                 "{}\n\n[Body truncated: {} of {} characters shown.]",
@@ -523,9 +494,9 @@ const INLINE_BODY_MAX_CHARS: usize = 800;
 /// Ceiling on a body `memory_read` renders.
 ///
 /// Generous, because this call is how the agent deliberately spends context on one note and a
-/// bound that fights that is worse than none. It exists because *no* bound at all was the one
-/// unbudgeted memory render: both search tiers excerpt so that this is the considered way to load a
-/// note in full, and a 200 KB body reaching the window through it undid the whole arrangement.
+/// bound that fights that is worse than none; but both search tiers excerpt so that this is the
+/// considered way to load a note in full, and a 200 KB body reaching the window through it would
+/// undo the arrangement.
 const READ_BODY_MAX_CHARS: usize = 16_000;
 
 /// Ceiling on the whole rendered result, inlined bodies included.
@@ -547,11 +518,10 @@ const DUPLICATE_MIN_TERMS: usize = 3;
 /// Largest edit distance the last-resort tier accepts between a query term and a word in a
 /// memory's name or description.
 ///
-/// Two for anything five characters or longer, because the most common typo is a *transposition*
-/// (`Tokoy` for `Tokyo`) and Levenshtein charges two for one. A threshold of one -- which is what
-/// scaling by length alone gives a five-letter word, and what [`crate::tools::did_you_mean_hint`]
-/// uses for tool names -- misses the single most likely way a remembered word comes out wrong.
-/// Short words stay at one, where two edits would match almost anything.
+/// Two for anything five characters or longer, because the most common typo is a transposition
+/// (`Tokoy` for `Tokyo`) and Levenshtein charges two for one; a threshold of one, which is what
+/// [`crate::tools::did_you_mean_hint`] uses for tool names, misses it. Short words stay at one,
+/// where two edits would match almost anything.
 fn fuzzy_threshold(term: &str) -> usize {
     let length = term.chars().count();
     if length < 5 {
@@ -604,10 +574,8 @@ impl MemorySearchTool {
     /// on a query that was otherwise going to return an empty result.
     ///
     /// Names and descriptions only, because that is all the index carries. Substring matching,
-    /// which needs the *body* too, is [`crate::store::memory::MemoryStore::substring_search`] and
-    /// runs as its own tier ahead of this one: doing it here read the body of no memory at all,
-    /// so a CJK note was found by a word in its description and invisible by a word in its
-    /// text.
+    /// which needs the body too, is [`crate::store::memory::MemoryStore::substring_search`] and
+    /// runs as its own tier ahead of this one.
     fn fuzzy_by_spelling(
         index: &[memory::Memory],
         terms: &[String],
@@ -619,27 +587,21 @@ impl MemorySearchTool {
             let mut best = usize::MAX;
             for term in terms {
                 let threshold = fuzzy_threshold(term);
-                // Hoisted: this is invariant across the word loop, and the pre-filter below exists
-                // precisely to be O(1) per pair. Computing it inside cost ~13x on the path whose
-                // own comment cites 14 s and 93 s measurements.
+                // Hoisted: invariant across the word loop, and the pre-filter below exists to be
+                // O(1) per pair.
                 let term_chars = term.chars().count();
                 for word in haystack.split(|c: char| !c.is_alphanumeric() && c != '_') {
                     if word.is_empty() {
                         continue;
                     }
                     // Two strings whose lengths differ by more than the threshold cannot be
-                    // within it, so this rejects them without building the matrix. Without it a
-                    // pasted blob -- a stack trace, base64, a URL, exactly what produces an
-                    // all-tiers miss and reaches this code -- cost 14 s against 200 memories and
-                    // 93 s against 20,000, on a runtime worker, uncancelable.
+                    // within it, so this rejects them without building the matrix: a pasted blob
+                    // (a stack trace, base64, a URL) is exactly what reaches this code, and a
+                    // matrix per stored name would run for minutes on a runtime worker.
                     //
-                    // Counted in *characters*, because `fuzzy_threshold` and `edit_distance` both
-                    // are. Comparing `len()` measured bytes against a character threshold, which
-                    // is the same number only for ASCII: for any other script the filter threw
-                    // away candidates that were inside the threshold. `東京都` against a stored
-                    // `東京` is one edit apart and three bytes apart, so a store holding it
-                    // answered "No memories matched" where the same shape in Latin script found
-                    // its near-miss.
+                    // Counted in characters, because `fuzzy_threshold` and `edit_distance` both
+                    // are; `len()` measures bytes, which is the same number only for ASCII, and
+                    // `東京都` against a stored `東京` is one edit and three bytes apart.
                     if term_chars.abs_diff(word.chars().count()) > threshold {
                         continue;
                     }
@@ -659,10 +621,8 @@ impl MemorySearchTool {
                 .then_with(|| left.1.name.cmp(&right.1.name))
         });
         // Returned alongside the cut list, because everything past `limit` is something the caller
-        // is not being shown. Truncating and saying nothing reads as "this is the whole candidate
-        // set", which is the failure the ranked tier's own "N further" line exists to prevent --
-        // and it matters more here, where the tie-break is alphabetical and forty candidates can
-        // sit at one distance.
+        // is not being shown, and it matters more here than in the ranked tier: the tie-break is
+        // alphabetical and forty candidates can sit at one distance.
         let candidates = scored.len();
         scored.truncate(limit);
         (scored, candidates)
@@ -713,12 +673,10 @@ impl Tool for MemorySearchTool {
         _context: crate::tools::ToolContext,
     ) -> Result<ToolOutput> {
         // A bare string where an array is declared is a mistake models make constantly, and the
-        // recovery is free. Rejecting it would cost a turn to say something the tool could simply
-        // have understood. Two distinct failures, two distinct messages. "Missing" is for a
-        // parameter that is not there or is the wrong type; a parameter that *is* there but yields
-        // nothing searchable is a different mistake and needs a different fix, and reporting it as
-        // missing sends the caller looking for a bug in how it built the call rather than at what
-        // it asked for.
+        // recovery is free. "Missing" is for a parameter that is not there or is the wrong type; a
+        // parameter that is there but yields nothing searchable is a different mistake with a
+        // different fix, and reporting it as missing sends the caller looking for a bug in how it
+        // built the call.
         let queries: Option<Vec<String>> = match input.get("queries") {
             Some(serde_json::Value::String(single)) => Some(vec![single.clone()]),
             Some(serde_json::Value::Array(values)) => Some(
@@ -735,11 +693,9 @@ impl Tool for MemorySearchTool {
                 message: "missing 'queries' parameter".to_string(),
             });
         };
-        // Coerced rather than ignored. `as_u64` alone returned `None` for `"3"`, `3.0` and `-1`
-        // alike, and `unwrap_or` then silently substituted 10: the model asked for three results,
-        // got ten, and nothing in the output said the parameter had been discarded. The same
-        // handler already goes out of its way to accept a bare string where `queries` declares an
-        // array, so meeting a numeric string here is the consistent behavior, not a new leniency.
+        // Coerced rather than ignored: `as_u64` alone answers `None` for `"3"`, `3.0` and `-1`
+        // alike, and a silent default would give ten results to a call that asked for three. The
+        // same handler accepts a bare string where `queries` declares an array.
         let limit = match input.get("limit") {
             None | Some(serde_json::Value::Null) => DEFAULT_SEARCH_LIMIT,
             Some(value) => {
@@ -860,10 +816,9 @@ fn render_hits(
             memory::render_age(hit.recorded, now),
             hit.read_count
         ));
-        // Elided, like every other rendered description. Descriptions are deliberately unbounded
-        // at parse time, and the always-emit-the-first-entry rule below then lets one memory spend
-        // the whole turn's budget on its description alone -- measured at 100 KB from a 6 KB
-        // ceiling. `render_fuzzy` and the `[Memory]` index both already guard this.
+        // Elided, like every other rendered description: descriptions are unbounded at parse time,
+        // and the always-emit-the-first-entry rule below would otherwise let one memory spend the
+        // whole turn's budget on its description alone.
         entry.push_str(&format!(
             "  {}\n",
             crate::entry::elide_description_for_index(&memory::render_description_for_model(
@@ -876,10 +831,9 @@ fn render_hits(
             // one call instead of a search plus a `memory_read` per hit. Otherwise the excerpt
             // around the match, which is what a follow-up read is for.
             //
-            // The excerpt is clipped as well as excerpted. `snippet()` bounds by *tokens*, not
-            // bytes, and `unicode61` makes a whole CJK paragraph -- or a base64 blob, or one
-            // unbroken path -- a single token, so the "excerpt" came back as the entire column: a
-            // 200 KB body arrived whole through the branch that exists to avoid sending it.
+            // The excerpt is clipped as well as excerpted: `snippet()` bounds by tokens, not
+            // bytes, and `unicode61` makes a whole CJK paragraph, a base64 blob or one unbroken
+            // path a single token, so the "excerpt" can be the entire column.
             let rendered = if body.chars().count() <= INLINE_BODY_MAX_CHARS {
                 memory::render_for_model(body)
             } else {
@@ -912,24 +866,19 @@ fn render_hits(
     // understate the remainder by exactly the amount `limit` removed.
     let hidden = results.matched.saturating_sub(shown);
     if hidden > 0 {
+        // Hedged for the same reason the header is: `matched` is capped at the candidate pool, so
+        // once the pool is full this number is a floor, not a count.
+        //
+        // The remedy names the constraint that bound, and only one that can work: a `limit` above
+        // the maximum is clamped on the way in, so "raise `limit`" at the ceiling, or when the
+        // byte budget did the cutting, returns the identical result.
         out.push_str(&format!(
-            "{}{hidden} further match(es) not shown here{}\n", /* Hedged for the same reason the
-                                                                * header is. `matched` is capped
-                                                                * at the candidate pool, // so
-                                                                * once the pool is full this
-                                                                * number is a floor, not a
-                                                                * count: a store of ten */
-            // thousand reported "197 further" when nine thousand seven hundred were hidden.
+            "{}{hidden} further match(es) not shown here{}\n",
             if results.pool_exhausted {
                 "at least "
             } else {
                 ""
-            }, // Naming the constraint that actually bound, and only offering a remedy that can
-            // work. "raise `limit`" was printed when the byte budget had done the cutting, and
-            // again when `limit` was already at `MAX_SEARCH_LIMIT` -- both times handing the model
-            // a remedy that provably returns the identical result. A `limit` above the maximum is
-            // clamped on the way in, so a caller who asked for 100 and got 25 is in the second
-            // case without having done anything wrong.
+            },
             if budget_bound {
                 "; the result hit its size limit, so narrow the query."
             } else if limit >= MAX_SEARCH_LIMIT {
@@ -953,9 +902,9 @@ fn render_fuzzy(
     let mut out = String::from(Tier::Fuzzy.preamble());
     let mut rendered_count = 0;
     for (shown, (_, entry)) in scored.iter().enumerate() {
-        // Budgeted like `render_hits`, and elided like every other index line. Descriptions are
+        // Budgeted like `render_hits`, and elided like every other index line: descriptions are
         // not bounded at parse time, and this is the tier that is explicitly "candidates, not
-        // answers" -- spending the turn's context on a guess is the wrong way round.
+        // answers".
         let line = format!(
             "- **{}** (p{}, recorded {}, read {}x): {}\n",
             entry.name,
@@ -972,10 +921,9 @@ fn render_fuzzy(
         out.push_str(&line);
         rendered_count += 1;
     }
-    // This tier truncated in two places -- `limit` in `fuzzy_by_spelling` and the byte budget
-    // above -- and said neither, so forty candidates at the same edit distance rendered nineteen
-    // and read as the whole set. The tie-break past `limit` is alphabetical, which is arbitrary
-    // enough that not saying so is the difference between a shortlist and a wrong answer.
+    // This tier truncates in two places (`limit` in `fuzzy_by_spelling` and the byte budget
+    // above), and the tie-break past `limit` is alphabetical, which is arbitrary enough that not
+    // saying so is the difference between a shortlist and a wrong answer.
     let hidden = candidates.saturating_sub(rendered_count);
     if hidden > 0 {
         out.push_str(&format!(
@@ -1114,32 +1062,17 @@ mod tests {
             message.contains("description is required to create it"),
             "creating without a description must say which case this is: {message}"
         );
-        // The shape, not just the substring. Carried on a `rusqlite::Error::InvalidParameterName`
-        // the model receives `database error: failed to write memory: Error("Invalid parameter
-        // name: no memory named ...")`, a user-input mistake dressed as a database fault, with a
-        // prefix inviting a retry under a different `name`. The substring assertion above passed
-        // the whole time.
+        // The shape, not just the substring: carried on a `rusqlite::Error::InvalidParameterName`
+        // the model would receive a user-input mistake dressed as a database fault.
         assert!(
             !message.contains("database error") && !message.contains("Invalid parameter name"),
             "a missing description is a refusal, not a database fault: {message}"
         );
     }
 
-    /// The spelling tier's length pre-filter counts characters, as the distance it guards does.
-    ///
-    /// An omitted `description` keeps the stored one, and is refused when there is none to keep.
-    ///
-    /// The field was required, and the only copy of a description an agent can see is the index's,
-    /// elided to 500 characters. So the ordinary act of refining a note -- rewriting its body,
-    /// changing its priority -- forced the model to resend a description it could only reconstruct
-    /// from that elision, and a description longer than the cap came back as 503 characters ending
-    /// in `...`. Nothing reported it: the write succeeded and the confirmation named the memory.
-    /// It compared `term.len()` -- bytes -- against a threshold `fuzzy_threshold` and
-    /// `edit_distance` both express in characters. The two are the same number only for ASCII, so
-    /// for every other script the filter discarded candidates that were inside the threshold and
-    /// the tier answered "No memories matched". `東京都` is one edit from a stored `東京` and three
-    /// bytes from it; the Latin-script shape of the same query found its near-miss all along,
-    /// which is what made this invisible.
+    /// The spelling tier's length pre-filter counts characters, as the distance it guards does:
+    /// bytes and characters are the same number only for ASCII, and `東京都` is one edit from a
+    /// stored `東京` and three bytes from it.
     #[tokio::test]
     async fn the_spelling_tier_measures_a_near_miss_in_characters_not_bytes() {
         let memories = store().await;
@@ -1186,13 +1119,9 @@ mod tests {
         );
     }
 
-    /// A description made only of formatting characters is not a description.
-    ///
-    /// Every write door asked `trim().is_empty()`, which is a question about whitespace; zero-width
-    /// spaces are not whitespace. Three of them were accepted, reported as a plain success, and
-    /// then rendered as nothing at all -- `- **name** (p5, today): ` in the index the model reads
-    /// every turn, a blank cell in `meka memory list`, a blank line in `memory_search`. The model
-    /// is told it saved a note that says nothing.
+    /// A description made only of formatting characters is not a description: `trim().is_empty()`
+    /// is a question about whitespace, and zero-width spaces are not whitespace, so three of them
+    /// would be stored and render as nothing in the index the model reads every turn.
     #[tokio::test]
     async fn a_description_of_only_formatting_characters_is_refused() {
         let memories = store().await;
@@ -1217,20 +1146,10 @@ mod tests {
         );
     }
 
-    /// `memory_read` opens a row whose name meka's own write door would have refused -- for its
-    /// character class *or* its length.
-    ///
-    /// The write rule is not this door's business, and applying it here wedged the store. A row
-    /// whose name reached the column past the tools is listed to the model in the `[Memory]` index
-    /// every turn, and was then refused by `memory_read`, `memory_delete`, `meka memory remove`
-    /// and `DELETE /v1/memory/{name}` alike, while `meka memory export` refused the whole store on
-    /// its account -- and the remedy that refusal printed validated the name too, so it failed
-    /// identically. Nothing meka shipped could open or remove it.
-    ///
-    /// The character class went first. The 64-character cap stayed behind, bounding the miss
-    /// path's edit-distance cost by refusing the argument, and re-created the same wedge one
-    /// length short: a name of 65 characters was equally beyond reach. The cost is bounded in
-    /// `did_you_mean_hint` now, so this door applies no write rule at all.
+    /// `memory_read` opens a row whose name meka's own write door would have refused, for its
+    /// character class or its length: a row that reached the column past the tools is listed to
+    /// the model in the `[Memory]` index every turn, and applying the write rule here would leave
+    /// nothing meka ships able to open or remove it.
     #[tokio::test]
     async fn memory_read_opens_a_name_its_write_door_would_have_refused() {
         let memories = store().await;
@@ -1293,11 +1212,8 @@ mod tests {
         );
     }
 
-    /// `memory_write` stores a one-line description, as the CLI and the HTTP door do.
-    ///
-    /// Only `PUT /v1/memory` normalized, so a model that put a newline in a description -- which
-    /// nothing stops it doing -- had it stored verbatim, and `meka memory export` then wrote it
-    /// collapsed. The round trip changed the text for the one door an agent actually uses.
+    /// `memory_write` stores a one-line description, as the CLI and the HTTP door do, so an
+    /// export round trip is byte-exact for the one door an agent uses.
     #[tokio::test]
     async fn a_written_description_is_stored_as_one_line() {
         let memories = store().await;
@@ -1456,12 +1372,10 @@ mod tests {
         assert!(text.contains("ordinary line"), "{text:?}");
     }
 
-    /// Writing under a differently-cased name is an update, not a near-duplicate.
-    ///
-    /// `name` is `UNIQUE COLLATE NOCASE`, so `POLICY` over an existing `policy` updates that one
-    /// row. A case-sensitive duplicate check then reported the row it had just written as a
-    /// near-copy and told the model to `memory_delete` it -- and delete resolves NOCASE, so
-    /// following that advice would have destroyed the memory rather than a duplicate of it.
+    /// Writing under a differently-cased name is an update, not a near-duplicate: `name` is
+    /// `UNIQUE COLLATE NOCASE`, so `POLICY` over an existing `policy` updates that one row, and a
+    /// case-sensitive duplicate check would tell the model to `memory_delete` the row it had just
+    /// written.
     #[tokio::test]
     async fn a_differently_cased_rewrite_is_not_reported_as_its_own_duplicate() {
         let memories = store().await;
@@ -1503,12 +1417,9 @@ mod tests {
         );
     }
 
-    /// Every path that puts a description in front of the model sanitizes it.
-    ///
-    /// `Hit` is built straight from the columns rather than through the store's row reader, so
-    /// `memory_search` was the one door where a description reached the model unfiltered -- and a
-    /// description is exactly the field a row written past the tools carries verbatim. The index,
-    /// the search tiers and the spelling tier are three separate renderers, each needing its own
+    /// Every path that puts a description in front of the model sanitizes it: `Hit` is built
+    /// straight from the columns rather than through the store's row reader, and the index, the
+    /// search tiers and the spelling tier are three separate renderers, each needing its own
     /// guard.
     #[tokio::test]
     async fn no_render_path_lets_an_unsanitized_description_reach_the_model() {
@@ -1595,10 +1506,8 @@ mod tests {
         assert!(text.contains("not live state"), "{text}");
     }
 
-    /// The tools run at `Permission::Read`, so a name that escapes its store would be an
-    /// arbitrary-file write available at `read`. A priority must land on the same value
-    /// whichever door it came through. `as_u64` rejects a negative outright where the frontmatter
-    /// path clamps it to 0.
+    /// A priority must land on the same value whichever door it came through: `as_u64` would
+    /// reject a negative outright where the frontmatter path clamps it to 0.
     #[tokio::test]
     async fn write_clamps_priority_like_the_file_path() {
         let memories = store().await;
@@ -1664,8 +1573,7 @@ mod tests {
     ///
     /// This door is the reason the lookup/write split exists: a name meka would not write must
     /// still be removable, or the row is unreachable through every door at once and only raw
-    /// `sqlite3` gets it out. The character class went first; the 64-character cap stayed and left
-    /// the same wedge one length short, which is what this now covers.
+    /// `sqlite3` gets it out.
     #[tokio::test]
     async fn memory_delete_removes_a_name_its_write_door_would_have_refused() {
         let memories = store().await;
@@ -1767,7 +1675,7 @@ mod tests {
             memories: memories.clone(),
         };
         // "verbosity" is in no file; "terse" is. Supplying both finds it, and supplying only the
-        // wrong one does not -- which is exactly why the parameter is a list.
+        // wrong one does not, which is why the parameter is a list.
         let hit = search
             .execute(
                 serde_json::json!({"queries": ["verbosity", "terse", "brevity"]}),
@@ -1797,11 +1705,9 @@ mod tests {
         );
     }
 
-    /// Every remedy the search offers has to be one that can work.
-    ///
-    /// "raise `limit`" was printed when `limit` was already at [`MAX_SEARCH_LIMIT`], and a caller
-    /// who asked for more than that is clamped on the way in -- so the model was handed an action
-    /// that provably returns the identical result, and a model that follows instructions takes it.
+    /// Every remedy the search offers has to be one that can work: a caller who asked for more
+    /// than [`MAX_SEARCH_LIMIT`] is clamped on the way in, so "raise `limit`" would hand the model
+    /// an action that provably returns the identical result.
     #[tokio::test]
     async fn a_capped_search_does_not_advise_raising_a_limit_that_is_already_at_its_maximum() {
         let memories = store().await;
@@ -1856,10 +1762,9 @@ mod tests {
         );
     }
 
-    /// `memory_read` is the one memory render with no ceiling on it, which is the whole reason both
-    /// search tiers excerpt: this call is meant to be the deliberate way to spend context on a
-    /// note. Unbounded, a 200 KB body arrived whole. A cut nobody is told about is the worse half:
-    /// a truncated note reads as a complete one whose author stopped writing.
+    /// `memory_read` is the deliberate way to spend context on a note, so its ceiling is generous,
+    /// but a 200 KB body must not arrive whole, and a cut nobody is told about reads as a complete
+    /// note whose author stopped writing.
     #[tokio::test]
     async fn memory_read_bounds_a_long_body_and_says_when_there_is_none() {
         let memories = store().await;
@@ -1921,10 +1826,8 @@ mod tests {
         );
     }
 
-    /// A result cut down to `limit` has to say how much it is not showing. Reporting the rendered
-    /// count as the total reads as "this is everything that matched", which is how a full store
-    /// becomes a confidently incomplete answer -- the same failure the `[Memory]` index's "N more"
-    /// line exists to prevent, and the search tool had it.
+    /// A result cut down to `limit` has to say how much it is not showing: reporting the rendered
+    /// count as the total reads as "this is everything that matched".
     #[tokio::test]
     async fn search_reports_matches_it_did_not_show() {
         let memories = store().await;
@@ -2146,8 +2049,7 @@ mod tests {
 
         // Take the agent's advice, then update the survivor. Rewriting a memory under its own
         // name is the thing the note asks for, so it must not then accuse the call of duplicating
-        // itself -- which is a different check from "no duplicate exists", and the one that would
-        // make the warning fire on every single update.
+        // itself, which would make the warning fire on every update.
         MemoryDeleteTool {
             memories: memories.clone(),
         }
@@ -2177,12 +2079,9 @@ mod tests {
     }
 
     /// A model emits several tool calls in one message and meka runs them concurrently, so two
-    /// `memory_write`s in one turn both read the store *before* either lands: each sees no
-    /// duplicate, and the check that exists to catch exactly this reports nothing.
-    ///
-    /// Found live, writing two identically-described memories in one turn. Not a rare shape: a
-    /// compaction checkpoint saves several memories at once, which is when near-copies are most
-    /// likely. Remove the write lock and this fails.
+    /// `memory_write`s in one turn would both read the store before either lands and each see no
+    /// duplicate. A compaction checkpoint saves several memories at once, which is when
+    /// near-copies are most likely. Remove the write lock and this fails.
     #[tokio::test]
     async fn concurrent_writes_in_one_turn_still_notice_a_duplicate() {
         let memories = store().await;
@@ -2265,8 +2164,7 @@ mod tests {
         .expect("delete");
 
         // Written again under the same name: the counter is a column on the row, so it went with
-        // it. When it lived in a second table keyed by name, the new memory inherited the old
-        // one's standing.
+        // it; in a second table keyed by name, the new memory would inherit the old one's standing.
         MemoryWriteTool {
             memories: memories.clone(),
         }
@@ -2318,13 +2216,10 @@ mod tests {
         );
     }
 
-    /// A query that is a longer derived form than the stored word must still reach it.
-    ///
-    /// Found live: a model searched `deployment` against a memory tagged `deploy` whose body says
-    /// `Deploys`, and got "No memories matched" -- then said it did not believe the result, which
-    /// was the correct call. Every tier missed. SQLite's porter strips `-s`/`-ing`/`-ed` but not
-    /// `-ment`; `deployment*` puts the star on the wrong end; `LIKE '%deployment%'` cannot match a
-    /// shorter word; and the edit distance is 4 against a threshold of 3.
+    /// A query that is a longer derived form than the stored word must still reach it: for
+    /// `deployment` against `deploy`, SQLite's porter strips `-s`/`-ing`/`-ed` but not `-ment`,
+    /// `deployment*` puts the star on the wrong end, `LIKE '%deployment%'` cannot match a shorter
+    /// word, and the edit distance is 4 against a threshold of 3.
     #[tokio::test]
     async fn a_query_longer_than_the_stored_word_still_finds_it() {
         let memories = store().await;
@@ -2368,9 +2263,7 @@ mod tests {
     ///
     /// `unicode61` splits only on non-alphanumerics, so a contiguous CJK run is one token: `深圳`
     /// matches neither exactly nor by prefix against a body containing it, and edit distance is far
-    /// past threshold. The regex `memory_search` this replaced matched every line of the file,
-    /// bodies included, so without the substring tier this is a plain regression -- and the earlier
-    /// rescue covered names and descriptions only, which is the half a `Memory` happens to carry.
+    /// past threshold. Only the substring tier, which reads bodies, can reach it.
     #[tokio::test]
     async fn a_phrase_inside_a_cjk_body_is_still_found() {
         let memories = store().await;
@@ -2409,9 +2302,6 @@ mod tests {
 
     /// A `limit` the model spelled as a string or a float is honored, and one that is neither a
     /// number nor a numeric string is refused rather than silently replaced by the default.
-    ///
-    /// `as_u64` returned `None` for `"3"`, `3.0` and `-1` alike and `unwrap_or` substituted 10: the
-    /// call asked for three results, received ten, and nothing in the output said so.
     #[tokio::test]
     async fn a_limit_of_the_wrong_type_is_coerced_or_refused_never_ignored() {
         let memories = store().await;
@@ -2461,12 +2351,9 @@ mod tests {
         assert!(error.to_string().contains("'limit'"), "{error}");
     }
 
-    /// A malformed `tags` or `body` argument is refused rather than read as a request to clear.
-    ///
-    /// `filter_map` dropped every non-string element, so `tags: [1, 2]` collapsed to `[]` -- which
-    /// *is* the documented "clear them" signal, so a malformed argument erased labels the caller
-    /// never mentioned. `body: ["a", "b"]` fell down the omit-to-keep path and wrote an empty body
-    /// while reporting plain success.
+    /// A malformed `tags` or `body` argument is refused rather than read as a request to clear:
+    /// dropping non-string elements would collapse `tags: [1, 2]` to `[]`, the documented "clear
+    /// them" signal, and `body: ["a", "b"]` would fall down the omit-to-keep path.
     #[tokio::test]
     async fn a_malformed_tags_or_body_argument_is_refused_not_read_as_a_clear() {
         let memories = store().await;
@@ -2514,11 +2401,7 @@ mod tests {
     }
 
     /// The two truncation lines have to name the constraint that actually bound, and hedge a count
-    /// that is a floor.
-    ///
-    /// "raise `limit`" was printed even when `limit` was already at its maximum and the byte budget
-    /// had done the cutting, which hands the model a remedy that provably returns the identical
-    /// result. Verified through the byte budget, which is the reachable half of the pair.
+    /// that is a floor. Verified through the byte budget, which is the reachable half of the pair.
     #[tokio::test]
     async fn a_truncated_result_names_the_limit_that_actually_bound() {
         let memories = store().await;
@@ -2561,11 +2444,9 @@ mod tests {
         );
     }
 
-    /// One memory with a pathological description or body cannot spend the whole result budget.
-    ///
-    /// The always-emit-the-first-entry rule exists so a single oversized memory stays visible; it
-    /// was instead the hole an unbounded one passed through. `snippet()` bounds by *tokens*, and a
-    /// body that is one token comes back whole -- measured at 200 KB from a 6 KB ceiling.
+    /// One memory with a pathological description or body cannot spend the whole result budget:
+    /// the always-emit-the-first-entry rule exists so a single oversized memory stays visible, and
+    /// `snippet()` bounds by tokens, so a body that is one token comes back whole.
     #[tokio::test]
     async fn one_oversized_memory_cannot_blow_the_result_budget() {
         let memories = store().await;

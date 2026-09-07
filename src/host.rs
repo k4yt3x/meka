@@ -8,8 +8,6 @@ pub(crate) mod acp;
 mod assembly;
 #[cfg(feature = "serve")]
 pub(crate) mod http;
-/// Without `serve`, only the `[serve]` config types: `config.toml` is one file, and a build that
-/// cannot run the server still has to parse a config that describes one.
 pub(crate) mod oneshot;
 pub(crate) mod repl;
 pub(crate) mod scheduler;
@@ -63,7 +61,7 @@ pub(crate) async fn build_skill_prompt(
     };
     Ok(Some(combined))
 }
-/// Delete the sessions `[session].retention_days` has expired, sparing any another process holds.
+/// Delete the sessions `[session].retention` has expired, sparing any another process holds.
 ///
 /// Opt-in only, and never by size. Conversation history is not reproducible, and a byte budget is
 /// unpredictable in a way a time window is not: which sessions it takes depends on the total

@@ -3,10 +3,8 @@
 
 use super::*;
 
-/// Constructs a concrete [`Provider`] for any [`Backend`] from a bag of provider-specific
-/// settings. Each setter documents which provider(s) consume it; unused
-/// settings are silently ignored by providers that don't need them. The only required inputs are
-/// the provider name, the credential, and the model; everything else has a sensible default.
+/// Builds the [`Provider`] a [`Backend`] names. Each setter documents which backends read it; the
+/// others ignore it.
 pub(crate) struct ProviderBuilder {
     pub(super) backend: Backend,
     pub(super) credential: AuthCredential,
@@ -144,9 +142,8 @@ impl ProviderBuilder {
                     AuthCredential::ApiKey(key) => key.clone(),
                     AuthCredential::OAuthToken { .. } => {
                         return Err(MekaError::Config(
-                            "provider 'openai-responses' requires an API key, not an OAuth token. \
-                             Use 'chatgpt-subscription' to bill a ChatGPT subscription over the \
-                             same protocol."
+                            "backend 'openai-responses' takes an API key, not an OAuth token; use \
+                             'chatgpt-subscription' to bill a subscription"
                                 .to_string(),
                         ));
                     }
@@ -158,9 +155,8 @@ impl ProviderBuilder {
                     AuthCredential::ApiKey(key) => key.clone(),
                     AuthCredential::OAuthToken { .. } => {
                         return Err(MekaError::Config(
-                            "provider 'openai-chat-completions' requires an API key, not an OAuth \
-                             token. Use 'chatgpt-subscription' to bill a ChatGPT subscription; it \
-                             speaks Responses rather than Chat Completions."
+                            "backend 'openai-chat-completions' takes an API key, not an OAuth \
+                             token; use 'chatgpt-subscription' to bill a subscription"
                                 .to_string(),
                         ));
                     }
@@ -172,8 +168,8 @@ impl ProviderBuilder {
                     AuthCredential::ApiKey(key) => key.clone(),
                     AuthCredential::OAuthToken { .. } => {
                         return Err(MekaError::Config(
-                            "provider 'anthropic-messages' requires an API key, not an OAuth \
-                             token. Use 'claude-subscription' to bill a Claude subscription."
+                            "backend 'anthropic-messages' takes an API key, not an OAuth token; use \
+                             'claude-subscription' to bill a subscription"
                                 .to_string(),
                         ));
                     }
@@ -183,8 +179,8 @@ impl ProviderBuilder {
             Backend::ClaudeSubscription => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
                     return Err(MekaError::Config(
-                        "provider 'claude-subscription' requires an OAuth token, not an API key. \
-                         Use 'anthropic-messages' to bill an Anthropic API key."
+                        "backend 'claude-subscription' takes an OAuth token, not an API key; use \
+                         'anthropic-messages' to bill an API key"
                             .to_string(),
                     ));
                 }
@@ -193,9 +189,8 @@ impl ProviderBuilder {
             Backend::ChatGptSubscription => {
                 if matches!(self.credential, AuthCredential::ApiKey(_)) {
                     return Err(MekaError::Config(
-                        "provider 'chatgpt-subscription' requires an OAuth token, not an API key. \
-                         Use 'openai-responses' for the same protocol with an API key, or \
-                         'openai-chat-completions' for an endpoint that serves only that."
+                        "backend 'chatgpt-subscription' takes an OAuth token, not an API key; use \
+                         'openai-responses' to bill an API key"
                             .to_string(),
                     ));
                 }
@@ -227,7 +222,7 @@ pub(super) struct ProviderKey {
 /// The credential is a *tag* rather than part of [`ProviderKey`] because it is the one input to a
 /// build that supersedes its predecessor rather than distinguishing a sibling. Keyed, every
 /// rotation would mint an entry and none would ever be dropped, so a long-lived `meka serve`
-/// against an OAuth profile -- which rewrites the credential on every token refresh -- would
+/// against an OAuth profile (which rewrites the credential on every token refresh) would
 /// accumulate one `reqwest` client and its connection pool per hour, forever. Tagged, there is
 /// exactly one entry per key and a rotation replaces it.
 ///
@@ -254,9 +249,8 @@ pub(super) struct CachedProvider {
 }
 /// Providers, built on demand for whichever profile is asked for and kept for reuse.
 ///
-/// A single `Arc<dyn Provider>` built once at startup cannot serve sessions on different profiles.
-/// That was right while the profile was a property of the process; it is wrong now that a session
-/// records the one it runs with, because two sessions in one `meka serve` may name different
+/// A single `Arc<dyn Provider>` built once at startup cannot serve sessions on different profiles:
+/// a session records the one it runs with, and two sessions in one `meka serve` may name different
 /// profiles and both have to work.
 ///
 /// Reuse is the reason this caches rather than building per turn: an `Arc<dyn Provider>` owns a
@@ -295,8 +289,8 @@ pub(crate) struct ProviderRegistry {
     ///
     /// `claude-subscription` mints one and writes it into `config.toml` when the account states
     /// none, and `accounts` above is a snapshot taken when this was built, so a resolver reached
-    /// per request never saw the value it had just persisted. It minted another, and rewrote the
-    /// config, on every session create, context poll and status query -- for an identifier whose
+    /// per request never sees the value it just persisted: it mints another, and rewrites the
+    /// config, on every session create, context poll and status query, for an identifier whose
     /// entire purpose is to stay the same. Lazy rather than filled in `new` so an account this
     /// process never uses is never seeded.
     pub(super) device_ids: std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -304,9 +298,8 @@ pub(crate) struct ProviderRegistry {
     pub(super) built: std::sync::Mutex<std::collections::HashMap<ProviderKey, CachedProvider>>,
     /// Debug-only: a scripted provider that stands in for every profile.
     ///
-    /// Set by the three hosts when `MEKA_MOCK_PROVIDER=1`, replacing the older arrangement where
-    /// each rebuilt its shared state around a mock. One override here covers every profile, which
-    /// is what a harness driving a session on any profile actually wants.
+    /// Set by the three hosts when `MEKA_MOCK_PROVIDER=1`. One override here covers every profile,
+    /// which is what a harness driving a session on any profile wants.
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
     pub(super) scripted: std::sync::Mutex<Option<Arc<dyn Provider>>>,
 }
@@ -325,11 +318,6 @@ impl ProviderRegistry {
         }
     }
 
-    /// Resolve a profile by name without building anything.
-    ///
-    /// Refuses by name rather than falling back to the default. A recorded profile that is no
-    /// longer configured is the user's to fix, and quietly running the conversation somewhere else
-    /// is the failure this whole arrangement exists to prevent.
     /// Resolve every `claude-subscription` account's device id ahead of the first ask, on a
     /// blocking thread.
     ///
@@ -382,7 +370,9 @@ impl ProviderRegistry {
     }
 
     /// The settings of the profile a session's row names, refused by name when `config.toml` no
-    /// longer has it: a session runs on the profile it recorded, never on the default in its place.
+    /// longer has it: a session runs on the profile it recorded, never on the default in its place,
+    /// because quietly running the conversation somewhere else is the failure this arrangement
+    /// exists to prevent.
     pub(crate) fn settings(&self, profile: &str) -> Result<crate::config::ProfileSettings> {
         let configured = crate::config::require_profile(profile, &self.profiles)?;
         let account = crate::config::account_for(profile, configured, &self.accounts)
@@ -428,9 +418,8 @@ impl ProviderRegistry {
     /// built from.
     ///
     /// Both, because the caller wants both and resolving is not free: it reads the profile and
-    /// looks up a device id. Returning only the provider meant [`resolved_profile`]
-    /// resolved a second time to learn the window and the vision flag that this call had just
-    /// computed and thrown away.
+    /// looks up a device id. Returning only the provider would have [`resolved_profile`] resolve a
+    /// second time to learn the window and the vision flag this call already computed.
     pub(crate) async fn resolve(
         &self,
         profile: &str,
@@ -462,10 +451,10 @@ impl ProviderRegistry {
             thinking: settings.thinking,
         };
         // Pulled and compared rather than pushed, because the writer that supersedes a credential
-        // is usually a *different process* -- `meka account login work` run against a
-        // store a `meka serve` is already using -- and no invalidation hook can reach
-        // across that. Without it, a rotation was invisible for the life of the process:
-        // every later build served the provider holding the revoked key.
+        // is usually a *different process* (`meka account login work` run against a store a
+        // `meka serve` is already using) and no invalidation hook can reach across that. Without
+        // the comparison a rotation is invisible for the life of the process, and every later
+        // build serves the provider holding the revoked key.
         let credential_version = self
             .token_store
             .account_credential_version(&settings.account)
@@ -480,7 +469,7 @@ impl ProviderRegistry {
         let credential = self.credential_for(&settings.account).await?;
         let model = settings.model.clone().ok_or_else(|| {
             MekaError::Config(format!(
-                "profile '{profile}' names no model. Set `model` on [profiles.{profile}]"
+                "profile '{profile}' names no model; set `model` in `[profiles.{profile}]`"
             ))
         })?;
         let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
@@ -505,9 +494,9 @@ impl ProviderRegistry {
                     provider: Arc::clone(&provider),
                 });
                 // Whoever got here first wins, and a loser drops its own build rather than
-                // replacing a provider another turn may already be using -- unless
-                // what is there was built from a credential that has since been
-                // superseded, which is the case this call exists to serve.
+                // replacing a provider another turn may already be using, unless what is there
+                // was built from a credential that has since been superseded, which is the case
+                // this call exists to serve.
                 //
                 // Two builds spanning two rotations can land out of order and leave the older one
                 // cached. That converges rather than sticking: the tag records which credential the
@@ -537,8 +526,7 @@ impl ProviderRegistry {
         match self.token_store.load_account_credential(account).await? {
             Some(credential) => Ok(credential),
             None => Err(MekaError::Config(format!(
-                "account '{account}' has no stored credential. Run `meka account login {account}` to \
-                 authenticate."
+                "account '{account}' has no stored credential; run `meka account login {account}`"
             ))),
         }
     }
@@ -551,7 +539,7 @@ impl ProviderRegistry {
         }
     }
 }
-/// A session's profile profile, resolved into everything that follows from it.
+/// A session's profile, resolved into everything that follows from it.
 ///
 /// One struct with one producer ([`resolved_profile`]) because these are not independent facts:
 /// they all come from the same profile and its account, and a caller that took the provider and
@@ -659,10 +647,9 @@ pub(crate) async fn recorded_profile_is_gone(
 /// Turn a session's profile into the provider it names and the per-profile facts that come with it.
 ///
 /// The one producer of [`ResolvedProfile`], so building a session and moving one mid-conversation
-/// cannot disagree about what a profile means. Before this existed, the window and the vision flag
-/// were read once per process from the *default* profile: a session pinned to a 32k profile gauged
-/// itself against the default's window, so auto-compaction never fired and the provider rejected
-/// the turn instead.
+/// cannot disagree about what a profile means. Read once per process from the *default* profile
+/// instead, a session pinned to a 32k profile gauges itself against the default's window, so
+/// auto-compaction never fires and the provider rejects the turn.
 pub(crate) async fn resolved_profile(
     providers: &ProviderRegistry,
     profile: String,
@@ -680,8 +667,8 @@ pub(crate) async fn resolved_profile(
 /// A session's context window, answered without building its provider.
 ///
 /// For a host that reports occupancy without reaching through the runtime mutex an in-flight turn
-/// is holding. Same source, so the reported window is
-/// the one the agent gauges against.
+/// is holding. Same source, so the reported window is the one the agent gauges against.
+///
 /// `None` for a profile that cannot resolve, which is not the same as the documented default: that
 /// session's next turn is going to be refused by name, and answering `1000000` beside a refusal
 /// invites a client to divide by a number meka has no reason to believe.
@@ -713,12 +700,11 @@ pub(crate) struct PublishedProfile {
 }
 impl PublishedProfile {
     /// `window` is supplied rather than made here, for the reason
-    /// [`crate::session::SessionCells`] gives about its `context_tokens`: a frontend gauge -- the
-    /// REPL prompt indicator, ACP's `usage_update` -- is built before the agent exists and has to
-    /// hold the same cell. Made internally, each host kept a second copy and
-    /// re-stored it by hand beside every `set_provider` call, which is four hand-written pairs
-    /// enforcing what one handle can. The caller's seed value is irrelevant; this overwrites
-    /// it.
+    /// [`crate::session::SessionCells`] gives about its `context_tokens`: a frontend gauge (the
+    /// REPL prompt indicator, ACP's `usage_update`) is built before the agent exists and has to
+    /// hold the same cell. Made internally, each host would keep a second copy and re-store it by
+    /// hand beside every `set_provider` call. The caller's seed value is irrelevant; this
+    /// overwrites it.
     ///
     /// Two hosts pass a throwaway instead. `serve`'s `SessionEntry` is built *after* the agent, so
     /// it goes the other way and reads the window back out of the agent's cells; `--oneshot`

@@ -1,7 +1,5 @@
-//! Handlers for the `meka skill <subcommand>` CLI: list, get, show, add, remove. Mirrors the
-//! structure of [`crate::cli::mcp`]: each handler returns `Result<()>`, prints parseable data to
-//! stdout (the user requested it; pipes / scripts read from there) and lifecycle / diagnostic
-//! messages via `tracing` per the project's logging guidelines.
+//! `meka skill`: list, get, show, add, remove. Parseable data goes to stdout and lifecycle and
+//! diagnostics go through `tracing`, as in [`crate::cli::mcp`].
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -14,10 +12,8 @@ use crate::{
 const DESCRIPTION_TRUNCATE: usize = 40;
 
 /// Attribution is free text from a file meka may not have written, and
-/// [`crate::text::format_columns`] pads every column to its widest cell. One skill crediting
-/// "Anthropic (claude-security plugin), ported to meka" therefore indents `Pri`, `External` and
-/// `Description` by fifty characters on *every* row, which is what makes the untruncated version a
-/// layout bug rather than a long cell.
+/// [`crate::text::format_columns`] pads every column to its widest cell, so one long author would
+/// indent every later column on every row.
 const AUTHOR_TRUNCATE: usize = 20;
 
 /// Argument bag for [`run_add`]. Borrowed so callers don't have to clone every field out of the
@@ -126,12 +122,10 @@ fn render_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool
     crate::text::format_columns(&headers, &rows)
 }
 
-/// `meka skill get <name>`: dump frontmatter as `key: value` lines.
+/// `meka skill get <name>`: the frontmatter as `key: value` lines.
 ///
-/// Every key the file carries, not only the ones meka models. The unmodeled ones are exactly what
-/// this change went to trouble to *preserve* across a rewrite, so leaving them out of the command
-/// that exists to show a skill made the preservation invisible: the only way to see a `when_to_use`
-/// was to read `SKILL.md`, which is the thing this saves you from.
+/// Every key the file carries, not only the ones meka models: the unmodeled ones are preserved
+/// across a rewrite, and this is the command that shows they were.
 pub(crate) fn run_get(
     name: &str,
     roots: &[std::path::PathBuf],
@@ -236,17 +230,14 @@ fn prepare_add(
 ) -> Result<(std::path::PathBuf, String)> {
     skills::validate_skill_name(args.name).map_err(MekaError::Config)?;
 
-    // Resolved once and joined from, rather than asked for three times over. The three answers were
-    // always the same directory, but each carried its own error path for the case where it is not
-    // there, which is three chances to disagree about what this command does with no config dir.
+    // Resolved once and joined from, so there is one answer for a missing config directory.
     let native_root = crate::paths::skills_dir()
         .ok_or_else(|| MekaError::Config("failed to determine the config directory".to_string()))?;
     let dir = native_root.join(args.name);
 
-    // The same refusal the agent tools and `PUT /v1/skills` apply, from the same function, because
-    // five hand-written copies of one rule had one shared blind spot: each compared against the
-    // *loaded* skills, so a broken `SKILL.md` in a read-only root was a name the store had no
-    // opinion about and got shadowed without a word.
+    // The same refusal the agent tools and `PUT /v1/skills` apply, from the same function: a copy
+    // that compared against the *loaded* skills would let a broken `SKILL.md` in a read-only root
+    // be shadowed without a word.
     if let Some(refusal) = skills::refuse_foreign_write(
         &skills::discover_skills_in_roots(roots),
         args.name,
@@ -257,16 +248,11 @@ fn prepare_add(
 
     if dir.exists() && !args.force {
         return Err(MekaError::Config(format!(
-            "skill '{}' already exists at {}; pass --force to overwrite",
+            "skill '{}' already exists at {}; pass `--force` to overwrite",
             args.name,
             dir.display()
         )));
     }
-
-    // Everything that can refuse is above the line; everything that mutates is below it. `--force`
-    // deletes the whole directory, bundled scripts and all, so *any* later failure would leave the
-    // user with an empty directory and an error, having lost a skill that was fine a moment ago.
-    // The split is structural rather than a matter of remembering.
 
     // On a case-insensitive filesystem `Deploy` and `deploy` are one directory, so creating the
     // second silently edits the first; on a case-sensitive one they are two skills the model cannot
@@ -283,9 +269,8 @@ fn prepare_add(
     }
 
     // `remove_dir_all` does not follow a link, so a symlinked entry would lose the link and keep
-    // whatever it pointed at. `delete_skill` and `write_skill` both refuse this; the CLI was the
-    // one door that did not, which made `--force` and `remove` quietly destroy an artifact the user
-    // planted deliberately.
+    // whatever it pointed at. `delete_skill` and `write_skill` refuse this too, so `--force` cannot
+    // quietly destroy an artifact the user planted deliberately.
     crate::fs::reject_symlinked_path(&dir, "skill").map_err(MekaError::Config)?;
 
     let body = build_skill_body(args)?;
@@ -308,21 +293,16 @@ fn prepare_add(
             skills::MAX_DESCRIPTION_CHARS
         )));
     }
-    // `name` is required by the spec, and every *other* write door satisfies it by construction:
-    // they render `name:` from the directory. This one copies bytes, so it was the single door that
-    // could install a skill the reference validator rejects for a missing required field -- and it
-    // did, silently, because meka reads identity from the directory and so never missed the key.
+    // `name` is required by the spec, and every *other* write door renders `name:` from the
+    // directory. This one copies bytes, and meka reads identity from the directory, so nothing
+    // else would miss the key. A mismatched `name` is `parse_skill_definition`'s to refuse, above.
     //
-    // A mismatched `name` needs no check here: `parse_skill_definition` refuses that above, so a
-    // branch for it would be unreachable.
-    //
-    // Deliberately narrow. A top-level `when_to_use` from a Claude Code skill is a key the spec
-    // does not define and meka *preserves* on purpose, so refusing the file over it would
-    // contradict the rest of the design. A missing required field is not that.
+    // Deliberately narrow: a key the spec does not define, such as a Claude Code `when_to_use`, is
+    // preserved on purpose, and a missing required field is not that.
     if !parsed.conformance.declares_name {
         return Err(MekaError::Config(format!(
-            "{} declares no 'name', which the Agent Skills spec requires. Add `name: {}` to its \
-             frontmatter.",
+            "{} declares no `name`, which the Agent Skills spec requires; add `name: {}` to its \
+             frontmatter",
             args.from_file
                 .map(display_path)
                 .unwrap_or_else(|| "the file".to_string()),
@@ -388,8 +368,7 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
         // the exit code says success.
         kept.sort();
         crate::render::render_hint(&format!(
-            "the skill was written, but removing these files from the previous version failed: \
-             {}",
+            "the skill was written; failed to remove {} from the previous version",
             kept.join(", ")
         ));
     }
@@ -403,7 +382,7 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
     // holding it across an interactive session blocked every other meka skill write in every other
     // process for as long as the editor stayed open, and made a concurrent `PUT /v1/skills` wait
     // 16 seconds. `lock_store`'s own justification for blocking rather than failing is that "the
-    // contended window is one small file write" -- which is only true if this drop happens.
+    // contended window is one small file write", which is only true if this drop happens.
     drop(_store_lock);
 
     if args.edit {
@@ -415,10 +394,10 @@ pub(crate) async fn run_add(args: AddArgs<'_>, roots: &[std::path::PathBuf]) -> 
                 MekaError::Config(format!("failed to launch your editor: {error}"))
             })?;
             if !status.success() {
-                tracing::warn!("your editor exited abnormally: {status}");
+                tracing::warn!("your editor exited with {status}");
             }
         } else {
-            tracing::warn!("--edit was requested but neither $VISUAL nor $EDITOR is set; skipping");
+            tracing::warn!("ignoring `--edit`: neither `$VISUAL` nor `$EDITOR` is set");
         }
     }
 
@@ -433,7 +412,7 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
         // here would leave the skill at the default with no indication the flag did nothing.
         if args.description.is_some() {
             return Err(MekaError::Config(
-                "--from-file is mutually exclusive with --description".to_string(),
+                "`--from-file` cannot be combined with `--description`".to_string(),
             ));
         }
         for (flag, given) in [
@@ -442,7 +421,7 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
         ] {
             if given {
                 return Err(MekaError::Config(format!(
-                    "--from-file is mutually exclusive with {flag}; set that key in the file instead"
+                    "`--from-file` cannot be combined with `{flag}`; set the key in the file"
                 )));
             }
         }
@@ -452,14 +431,12 @@ fn build_skill_body(args: &AddArgs<'_>) -> Result<String> {
         Ok(content)
     } else {
         let description = args.description.ok_or_else(|| {
-            MekaError::Config(
-                "--description is required (or pass --from-file to copy a template)".to_string(),
-            )
+            MekaError::Config("`--description` is required without `--from-file`".to_string())
         })?;
         let priority = args.priority.unwrap_or(crate::entry::DEFAULT_PRIORITY);
         if priority > crate::entry::MAX_PRIORITY {
             return Err(MekaError::Config(format!(
-                "--priority must be between {} and {}",
+                "`--priority` must be between {} and {}",
                 crate::entry::MIN_PRIORITY,
                 crate::entry::MAX_PRIORITY
             )));
@@ -493,7 +470,7 @@ pub(crate) async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Resu
     let dir = native_root.join(name);
     if !dir.exists() {
         return Err(MekaError::Config(format!(
-            "skill '{}' not found at {}",
+            "no skill named '{}' in {}",
             name,
             dir.display()
         )));
@@ -513,7 +490,7 @@ pub(crate) async fn run_remove(name: &str, roots: &[std::path::PathBuf]) -> Resu
         std::fs::remove_dir_all(&target)
     })
     .await
-    .map_err(|error| MekaError::Config(format!("remove task failed: {error}")))?
+    .map_err(|error| MekaError::Config(format!("failed to run the removal: {error}")))?
     .map_err(|error| MekaError::Config(format!("failed to remove {}: {}", dir.display(), error)))?;
     tracing::info!("removed skill '{name}'");
     Ok(())
@@ -531,13 +508,13 @@ fn parse_metadata(pairs: &[String]) -> Result<BTreeMap<String, String>> {
     for pair in pairs {
         let Some((key, value)) = pair.split_once('=') else {
             return Err(MekaError::Config(format!(
-                "--metadata expects key=value, got '{pair}'"
+                "`--metadata` takes KEY=VALUE, got '{pair}'"
             )));
         };
         let key = key.trim();
         if key.is_empty() {
             return Err(MekaError::Config(format!(
-                "--metadata key cannot be empty in '{pair}'"
+                "`--metadata` entry '{pair}' has an empty key"
             )));
         }
         metadata.insert(key.to_string(), value.to_string());
@@ -558,7 +535,7 @@ fn display_metadata(value: Option<&str>) -> String {
 ///
 /// A path is not meka's own text. Its leaf is a directory name chosen by whoever installed the
 /// skill, so it can carry a newline, a terminal escape or a bidi override, and both callers write
-/// it straight to a terminal -- one of them into a column table.
+/// it straight to a terminal, one of them into a column table.
 fn display_path(path: &Path) -> String {
     crate::entry::sanitize_stored_description(&path.display().to_string())
 }
@@ -661,8 +638,7 @@ mod tests {
     async fn isolate_config_dir(temp: &tempfile::TempDir) -> ConfigDirGuard {
         let guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
         // SAFETY: the mutex makes this access exclusive across tests in this process; no other code
-        // reads the var while the lock is held. Matches the env-var override at
-        // `src/config.rs:462-467`.
+        // reads the var while the lock is held.
         unsafe { std::env::set_var("MEKA_CONFIG_DIR", temp.path()) };
         ConfigDirGuard(guard)
     }
@@ -745,8 +721,8 @@ mod tests {
     ///
     /// Refused by `parse_skill_definition`, which every write door goes through, rather than by a
     /// rule of this command's own, which would be unreachable behind it. What this pins is that
-    /// `--from-file` -- the one door that copies bytes instead of rendering `name:` from the
-    /// directory -- is still held to it.
+    /// `--from-file` (the one door that copies bytes instead of rendering `name:` from the
+    /// directory) is still held to it.
     #[tokio::test]
     async fn add_from_file_refuses_a_name_that_disagrees_with_the_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -791,7 +767,7 @@ mod tests {
 
     /// `--from-file` may not install a skill that declares no `name` at all.
     ///
-    /// The spec makes `name` required, and every other write door satisfies that by construction --
+    /// The spec makes `name` required, and every other write door satisfies that by construction:
     /// they render `name:` from the directory. This one copies bytes, and meka reads identity from
     /// the directory, so a missing key cost nothing *here* and produced a file `skills-ref
     /// validate` rejects for a missing required field. meka's own store is the one place its
@@ -813,7 +789,7 @@ mod tests {
         args.from_file = Some(&template);
         let error = run_add(args, &roots).await.expect_err("must be refused");
         let message = format!("{error}");
-        assert!(message.contains("declares no 'name'"), "{message}");
+        assert!(message.contains("declares no `name`"), "{message}");
         assert!(
             message.contains("name: nameless"),
             "the refusal must say what to add: {message}"
@@ -928,7 +904,7 @@ mod tests {
         let err = run_add(args, &crate::paths::skill_roots(&[]))
             .await
             .expect_err("should reject");
-        assert!(format!("{err}").contains("mutually exclusive"));
+        assert!(format!("{err}").contains("cannot be combined"));
     }
 
     #[tokio::test]
@@ -948,7 +924,7 @@ mod tests {
         let err = run_add(args, &crate::paths::skill_roots(&[]))
             .await
             .expect_err("should reject");
-        assert!(format!("{err}").contains("--description is required"));
+        assert!(format!("{err}").contains("is required"));
     }
 
     /// A refused `--force` must leave the existing skill alone.
@@ -1030,7 +1006,7 @@ mod tests {
         // Only representable on a case-sensitive filesystem. Windows and a default macOS volume
         // fold the two names onto one directory, so `create_dir_all` would silently reopen the
         // skill's own directory and the `SKILL.md` written below would overwrite the very file this
-        // test asserts survives -- a fixture that destroys its own subject and then fails on the
+        // test asserts survives, a fixture that destroys its own subject and then fails on the
         // missing refusal. Probed rather than `cfg!`-gated, because the answer is a property of the
         // volume rather than of the operating system.
         let case_sensitive = {
@@ -1121,7 +1097,7 @@ mod tests {
     ///
     /// Both halves were untested, and the second was wrong: the check read the *loaded* skills, so
     /// a broken `SKILL.md` in an `extra_paths` root was a name nothing had an opinion about. The
-    /// add went through, meka's own store won precedence forever after, and nothing said a word --
+    /// add went through, meka's own store won precedence forever after, and nothing said a word,
     /// which is the worst case to shadow silently, because the original is not reported anywhere
     /// either.
     #[tokio::test]
@@ -1165,7 +1141,7 @@ mod tests {
     /// The same rule on the delete door, for a foreign file that does not parse.
     ///
     /// `run_remove` compared against the loaded skills too, so this answered "not found at
-    /// <meka's own store>" -- pointing at a directory that was never the one holding the file.
+    /// <meka's own store>", pointing at a directory that was never the one holding the file.
     #[tokio::test]
     async fn removing_a_broken_skill_in_a_read_only_root_names_where_it_lives() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1186,7 +1162,7 @@ mod tests {
                 .await
                 .expect_err("must refuse a foreign skill")
         );
-        assert!(message.contains("does not delete files there"), "{message}");
+        assert!(message.contains("remove it where it lives"), "{message}");
         assert!(
             message.contains(&shared.join("wrecked").display().to_string()),
             "{message}"
@@ -1218,7 +1194,7 @@ mod tests {
             run_get("wrecked", &roots, crate::cli::OutputFormat::Plain).expect_err("must fail")
         );
         assert!(
-            broken.contains("could not be read"),
+            broken.contains("failed to load"),
             "a present-but-unparseable file must not read as absent: {broken}"
         );
         assert!(broken.contains("invalid frontmatter"), "{broken}");
@@ -1268,7 +1244,7 @@ mod tests {
         let err = run_remove("ghost", &crate::paths::skill_roots(&[]))
             .await
             .expect_err("should error");
-        assert!(format!("{err}").contains("not found"));
+        assert!(format!("{err}").contains("no skill named"));
     }
 
     #[tokio::test]
@@ -1430,7 +1406,7 @@ mod tests {
     /// The `--paths` column is a path, and a path's leaf is a directory name someone else chose.
     ///
     /// Every other cell went through the sanitizer and this one did not, so a directory whose name
-    /// carried a newline split its row in two -- in a table this module's own docs advertise as
+    /// carried a newline split its row in two, in a table this module's own docs advertise as
     /// pipeable, which makes the extra line a fabricated record rather than a smudge.
     #[test]
     fn the_paths_column_cannot_fabricate_a_row() {

@@ -18,12 +18,11 @@ use crate::{
 /// Default cap for regex-search-mode hits; shared by `read_file` and `scratchpad_read`.
 pub(super) const MAX_SEARCH_MATCHES: usize = 100;
 
-/// Wall-clock ceiling on one filesystem walk (`find_files`, `search_contents`). A walk rooted high
-/// in the tree visits millions of directories -- `/proc` and `/sys` alone are effectively
-/// unbounded -- and the result caps bound only what is *returned*, not what is *examined*, so
-/// without a ceiling a single over-broad call runs until the filesystem is exhausted. Sized well
-/// above any plausible repository-scoped search and well below the point where an unattended run
-/// looks hung.
+/// Wall-clock ceiling on one filesystem walk (`find_files`, `search_contents`). The result caps
+/// bound only what is returned, not what is examined, and a walk rooted high in the tree (`/proc`
+/// and `/sys` alone are effectively unbounded) would otherwise run until the filesystem is
+/// exhausted. Sized well above any plausible repository-scoped search and well below the point
+/// where an unattended run looks hung.
 const WALK_TIME_BUDGET: Duration = Duration::from_secs(60);
 
 /// Why a walk stopped before it ran out of tree.
@@ -140,19 +139,8 @@ pub(super) fn compile_user_regex(pattern: &str, tool_name: &str) -> Result<regex
         })
 }
 
-/// Resolve the path the LLM provided to a canonical absolute path, with all symlink components
-/// pre-resolved. Used by file tools to close a TOCTOU window where a symlink in the supplied path
-/// could be swapped between the permission check and the actual I/O. Callers should use the
-/// returned `PathBuf` for every subsequent filesystem operation; never re-open the original raw
-/// string.
-///
-/// Errors when the path cannot be resolved (target missing, parent not a directory, permission
-/// denied, etc.). For `write_file` where the target file may not exist yet, callers must
-/// canonicalize the *parent* directory (which they create first) and re-join the filename. Falling
-/// back to the raw path on failure would leave `..`/symlink components in parent directories
-/// unresolved, defeating the TOCTOU protection. Refuse a read inside meka's own directories below
-/// `unrestricted`. `canonical` must be canonical, which every caller has from
-/// [`canonicalize_for_tool`].
+/// Refuse a read inside meka's own directories below `unrestricted`. `canonical` must be
+/// canonical, which every caller has from [`canonicalize_for_tool`].
 pub(super) fn refuse_private_read(
     tool_name: &str,
     site: &crate::session::ToolSite,
@@ -167,20 +155,19 @@ pub(super) fn refuse_private_read(
     }
 }
 
+/// Resolve the path the model provided to a canonical absolute path, with every symlink component
+/// resolved, so a symlink cannot be swapped between the permission check and the I/O. Callers use
+/// the returned path for every later filesystem operation, never the raw string.
+///
+/// Errors when the path cannot be resolved rather than falling back to the raw path, which would
+/// leave `..` and symlink components unresolved. A `write_file` target may not exist yet, so its
+/// callers canonicalize the parent directory and re-join the file name.
 pub(super) async fn canonicalize_for_tool(tool_name: &str, path: &Path) -> Result<PathBuf> {
     tokio::fs::canonicalize(path)
         .await
-        // Stripped, because this path is compared and keyed against paths produced elsewhere and
-        // Windows' `canonicalize` returns the one spelling nothing else uses.
-        //
-        // Three things went wrong at once, all Windows-only. `WriteScope::admit` matched this
-        // `\\?\C:\ws\f.txt` against roots that `writable_roots` had already stripped to
-        // `C:\ws`, so `starts_with` said no and *every* `edit_file` inside the workspace was
-        // refused while writes outside stayed refused too -- the boundary looked right and allowed
-        // nothing. The read tracker and the per-path write lock key on this value while
-        // `resolve_write_target` strips, so `write_file` and `edit_file` took different locks for
-        // one file and recorded different freshness keys for it. Normalizing once, here, is what
-        // makes every door agree; `strip_verbatim` is the identity everywhere else.
+        // Windows' `canonicalize` returns the `\\?\` spelling, and this path is compared and keyed
+        // against paths produced elsewhere (`WriteScope::admit`, the read tracker, the per-path
+        // write lock) that were stripped; `strip_verbatim` is the identity everywhere else.
         .map(crate::workspace::strip_verbatim)
         .map_err(|error| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
@@ -212,13 +199,8 @@ pub(super) fn search_lines(content: &str, pattern: &str, tool_name: &str) -> Res
     }
 
     let total_matches = if matches.len() >= MAX_SEARCH_MATCHES {
-        // Count the whole document rather than resuming after the cap.
-        //
-        // The previous form skipped `matches.len()` *lines* to account for `matches.len()`
-        // *matches*, so every match on a line past that index was counted twice: a 200-line file
-        // with a hit on every even line reported "showing first 100 of 150" when all 100 matches
-        // were already shown. The model then believed half the hits were hidden. Counting from the
-        // start is O(n) either way and cannot double-count.
+        // Count the whole document rather than resuming after the cap: skipping `matches.len()`
+        // lines to account for that many matches double-counts every hit past that index.
         content.lines().filter(|line| re.is_match(line)).count()
     } else {
         matches.len()
@@ -321,9 +303,8 @@ mod tests {
             .await
             .expect("canonicalize");
         assert_eq!(canonical, crate::workspace::canonical_for_test(&file_path));
-        // And specifically *not* the raw spelling, which is the whole reason this function is not
-        // a bare `canonicalize`: every other door in the tree normalizes, so one that did not
-        // handed back a key nothing else could match.
+        // And specifically not the raw spelling: every other door in the tree normalizes, so one
+        // that did not would hand back a key nothing else could match.
         assert!(
             !canonical.to_string_lossy().starts_with(r"\\?\"),
             "the verbatim prefix must not survive: {}",

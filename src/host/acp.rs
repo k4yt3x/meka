@@ -287,20 +287,14 @@ pub(crate) async fn run_acp(
                         .close(Some(SessionCloseCapabilities::new()));
                     // meka accepts `text`, `resource_link`, and embedded `resource` (@-mention)
                     // blocks in `session/prompt`, so `embedded_context` is advertised true. `image`
-                    // follows the process default profile's `vision` flag (default true; set false
-                    // for a text-only model); a session on another profile answers for itself at
-                    // `session/prompt`. `audio` stays false. Each field is set explicitly so the
-                    // contract is visible in the initialize response and a future SDK default
-                    // change can't quietly flip it.
+                    // follows the process default profile's `vision` flag; a session on another
+                    // profile answers for itself at `session/prompt`. `audio` stays false. Each
+                    // field is set explicitly so the contract is visible in the initialize response
+                    // and a future SDK default change cannot quietly flip it.
                     //
-                    // `mcp_capabilities` is intentionally omitted:
-                    // meka sources MCP servers from its own config
-                    // file and does not yet connect to servers passed
-                    // through `session/new`'s `mcpServers` array.
-                    // Advertising `{ http: true, sse: true }` while
-                    // ignoring client-provided servers was misleading;
-                    // the marker is dropped until client-MCP
-                    // support lands.
+                    // `mcp_capabilities` is omitted: meka sources MCP servers from its own config
+                    // file and ignores `session/new`'s `mcpServers`, so advertising `{ http: true,
+                    // sse: true }` would be false.
                     let capabilities = AgentCapabilities::new()
                         .load_session(true)
                         .session_capabilities(session_caps)
@@ -321,12 +315,9 @@ pub(crate) async fn run_acp(
                              specify a supported version",
                         ));
                     }
-                    // Negotiate the protocol version per the ACP spec:
-                    // respond with the requested version if we
-                    // support it, otherwise pin to the latest stable
-                    // version we know about. A naive echo lets a
-                    // future client think we support a version we
-                    // haven't shipped yet.
+                    // The requested version when this build supports it, otherwise the latest it
+                    // knows: a plain echo tells a newer client that meka speaks a version it does
+                    // not.
                     let negotiated = std::cmp::min(
                         request.protocol_version,
                         agent_client_protocol::schema::ProtocolVersion::LATEST,
@@ -458,8 +449,8 @@ pub(crate) async fn run_acp(
                     if !request.mcp_servers.is_empty() {
                         let provided = request.mcp_servers.len();
                         tracing::warn!(
-                            "session/new: client provided {provided} mcpServers, ignored \
-                             (config-driven MCP servers are still active)"
+                            "session/new: ignoring {provided} client-provided mcpServers; MCP \
+                             servers come from config.toml"
                         );
                     }
 
@@ -687,12 +678,11 @@ mod tests {
 
     /// What an editor may read of a failed turn, per class.
     ///
-    /// Every one of these reached the client verbatim through the `other` arm's `Display`, because
-    /// "the caller can act on it" and "meka wrote the sentence" were the same question there. They
-    /// are not: an upstream body names the *operator's* account with the provider, an MCP
-    /// connector's reason has carried a spawn command line and its path, a `Database` error names
-    /// the store, and an installation fault names a file in someone else's `config.toml`. The HTTP
-    /// host answers all four the same way; this is the same policy on the other wire.
+    /// "The caller can act on it" and "meka wrote the sentence" are not the same question: an
+    /// upstream body names the *operator's* account with the provider, an MCP connector's reason
+    /// can carry a spawn command line and its path, a `Database` error names the store, and an
+    /// installation fault names a file in someone else's `config.toml`. The HTTP host answers all
+    /// four the same way; this is the same policy on the other wire.
     ///
     /// Relaying is asked for throughout, so nothing here passes merely because the switch is off.
     #[test]
@@ -733,8 +723,8 @@ mod tests {
     /// they do.
     ///
     /// The same switch, the same bound and the same withheld sentence as the HTTP host, because
-    /// the text is the same text: `meka acp` published it unconditionally while a deployment that
-    /// had turned relaying off believed it was withheld everywhere.
+    /// the text is the same text, and a deployment that turns relaying off expects it withheld
+    /// everywhere.
     #[test]
     fn the_upstream_body_travels_over_acp_only_when_the_operator_asked_for_it() {
         let leaky = "{\"account_uuid\":\"acct-0f3c\",\"message\":\"quota exceeded\"}";
@@ -796,13 +786,9 @@ mod tests {
         assert!(data.contains("max_request_bytes"), "{data}");
     }
 
-    /// A sticky permission option must name the tool it actually covers.
-    ///
-    /// This ships as a `**Breaking:**` changelog line and had no test: the whole point of the
-    /// relabel is that the option is keyed on the tool name and applies for the rest of the
-    /// session, while the prompt beside it names one specific command. Reverting to a bare "Always
-    /// allow" left every suite green, which is exactly how an affordance drifts back out of step
-    /// with its semantics.
+    /// A sticky permission option must name the tool it actually covers: the option is keyed on
+    /// the tool name and applies for the rest of the session, while the prompt beside it names one
+    /// specific command.
     #[test]
     fn a_sticky_permission_option_names_the_tool_it_covers() {
         assert_eq!(
@@ -1663,7 +1649,7 @@ mod tests {
             .expect_err("should error");
         let message = err.to_string();
         assert!(
-            message.contains("could not be read"),
+            message.contains("failed to load"),
             "a file that is right there is not an unknown skill: {message}"
         );
         assert!(message.contains("frontmatter"), "{message}");

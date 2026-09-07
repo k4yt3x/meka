@@ -5,6 +5,7 @@
 
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+/// Lock `mutex`, recovering the value if a previous holder panicked.
 #[track_caller]
 pub(crate) fn lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
     match mutex.lock() {
@@ -19,6 +20,7 @@ pub(crate) fn lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
     }
 }
 
+/// Take `rwlock` for reading, recovering the value if a previous holder panicked.
 #[track_caller]
 pub(crate) fn read<'a, T>(rwlock: &'a RwLock<T>) -> RwLockReadGuard<'a, T> {
     match rwlock.read() {
@@ -33,6 +35,7 @@ pub(crate) fn read<'a, T>(rwlock: &'a RwLock<T>) -> RwLockReadGuard<'a, T> {
     }
 }
 
+/// Take `rwlock` for writing, recovering the value if a previous holder panicked.
 #[track_caller]
 pub(crate) fn write<'a, T>(rwlock: &'a RwLock<T>) -> RwLockWriteGuard<'a, T> {
     match rwlock.write() {

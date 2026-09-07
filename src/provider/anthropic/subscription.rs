@@ -36,6 +36,7 @@ use crate::{
 /// Claude Code system prompt prefix.
 const CC_SYSTEM_PROMPT_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+/// The `claude-subscription` backend: one profile's model and the OAuth credential it bills.
 pub(crate) struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
@@ -71,7 +72,7 @@ pub(crate) struct ClaudeSubscriptionProvider {
     rejected_access_token: std::sync::Mutex<Option<String>>,
     /// The settled `output_config.effort` for the request body, resolved once at construction: the
     /// profile's value if it set one, otherwise [`DEFAULT_EFFORT`]. `None` only where the model
-    /// takes no effort at all, and then the `effort-2025-11-24` beta is withheld too -- both read
+    /// takes no effort at all, and then the `effort-2025-11-24` beta is withheld too: both read
     /// this one slot, so they stay in lockstep the way Claude Code's `KHE` keeps them.
     resolved_effort: Option<String>,
     /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
@@ -84,6 +85,7 @@ pub(crate) struct ClaudeSubscriptionProvider {
 }
 
 impl ClaudeSubscriptionProvider {
+    /// Build from a profile's settings, whose credential the builder has checked is an OAuth one.
     pub(crate) fn new(settings: crate::provider::ProviderBuilder) -> Result<Self> {
         let credential_key = settings.credential_key_or_default();
         let crate::provider::ProviderBuilder {
@@ -171,9 +173,9 @@ impl ClaudeSubscriptionProvider {
     /// first-party OAuth subscriber, opus-5 with tools and thinking, twelve betas in this
     /// order.
     ///
-    /// `has_tools` gates `advanced-tool-use-2025-11-20`. Claude Code's own gate is narrower -- it
-    /// sends that beta when its *tool search* is active rather than merely when tools are present
-    /// -- but tool search is on for every agentic CLI turn, so the wire is the same, and meka has
+    /// `has_tools` gates `advanced-tool-use-2025-11-20`. Claude Code's own gate is narrower (it
+    /// sends that beta when its *tool search* is active rather than merely when tools are present),
+    /// but tool search is on for every agentic CLI turn, so the wire is the same, and meka has
     /// tools on every turn anyway.
     ///
     /// No `context-1m-2025-08-07`: Claude Code stopped sending it after 2.1.185. On the current 1M
@@ -182,7 +184,7 @@ impl ClaudeSubscriptionProvider {
     ///
     /// `fallback-credit-2026-06-01` is sent unconditionally. Claude Code latches it whenever a
     /// model is visible in its UI, which is every interactive turn, and it only advertises that the
-    /// server may answer with a fallback credit -- meka sends no `fallbacks` or
+    /// server may answer with a fallback credit; meka sends no `fallbacks` or
     /// `fallback_credit_token` of its own, exactly like the captured turns that carry the beta.
     ///
     /// `redact-thinking-2026-02-12` is sent by default (matching Claude Code) for capable models;
@@ -243,11 +245,11 @@ impl ClaudeSubscriptionProvider {
     /// it and finds the winner's fresh token. Exactly one refresh API call fires under
     /// contention and both callers return a valid token.
     ///
-    /// The gate is what makes that true. Using the `credential` write lock as the gate instead --
-    /// which is what this did -- meant every *reader* queued behind the refresh too, so a provider
-    /// endpoint that accepted the connection and then went silent wedged every session in the
-    /// process, not just the one refreshing. A stalled refresh now blocks only another refresh, and
-    /// the bounded HTTP timeout ends even that.
+    /// The gate is what makes that true. With the `credential` write lock as the gate instead,
+    /// every *reader* queues behind the refresh too, so a provider endpoint that accepts the
+    /// connection and then goes silent wedges every session in the process, not just the one
+    /// refreshing. A stalled refresh blocks only another refresh, and the bounded HTTP timeout
+    /// ends even that.
     async fn ensure_valid_credential(&self) -> Result<(&'static str, String)> {
         // Compared, not consumed: the rejection stands until a refresh replaces the token it
         // names, so a second request carrying the same refused bearer refreshes too instead of
@@ -295,18 +297,18 @@ impl ClaudeSubscriptionProvider {
             None => None,
         };
 
-        // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
-        // refresh, and a sibling meka process (or `meka mcp login` flow) may have rotated ours
-        // since startup. Without this re-read we'd POST a stale refresh_token and the OAuth
-        // provider would reject it with `invalid_grant`.
+        // Re-read the latest credential from the store. Refresh tokens rotate on each successful
+        // refresh, and a sibling meka process may have rotated this one since startup; without
+        // the re-read a stale refresh token is posted and the issuer rejects it with
+        // `invalid_grant`.
         //
         // The store call is awaited with no credential lock held, and the result installed under a
         // write lock that spans an assignment and nothing else.
         //
         // Installed only when it is at least as new as what memory holds. The row is behind in one
-        // case, a refresh in this process whose persist failed: adopting it spent a refresh token
-        // the issuer had already retired while the live one sat here. The row's version is kept
-        // either way: the refresh below replaces the row on it, so a stale row catches up.
+        // case, a refresh in this process whose persist failed: adopting it would spend a refresh
+        // token the issuer has already retired while the live one sits here. The row's version is
+        // kept either way: the refresh below replaces the row on it, so a stale row catches up.
         let mut observed_version = None;
         if let Some(store) = &self.token_store {
             match store
@@ -368,8 +370,8 @@ impl ClaudeSubscriptionProvider {
             AuthCredential::ApiKey(_) => (None, None),
         };
 
-        // With nothing to refresh with, a rejected or expired token has one remedy, and this is
-        // the one exit from the refresh path that did not name it.
+        // With nothing to refresh with, a rejected or expired token has one remedy, which every
+        // exit from the refresh path names.
         let Some(refresh_token) = refresh_token else {
             return Err(crate::oauth::with_login_remedy(
                 MekaError::Provider(
@@ -383,7 +385,7 @@ impl ClaudeSubscriptionProvider {
             .refresh_oauth_token(&refresh_token, prior_account_id)
             .await?;
 
-        // A refresh rotates the refresh token, so the one in the database is now dead -- but only
+        // A refresh rotates the refresh token, so the one in the database is now dead, but only
         // if the database still holds the one this was derived from. Where it does not, what comes
         // back is the newer credential to use instead of this one.
         let new_credential = match &self.token_store {
@@ -403,12 +405,12 @@ impl ClaudeSubscriptionProvider {
         // row has moved past hands back what the row holds instead, and the check at the top of
         // this function saw the credential as it was on entry.
         //
-        // Unreachable as things stand -- `store_refreshed_credential` adopts only a credential of
+        // Unreachable as things stand (`store_refreshed_credential` adopts only a credential of
         // the same kind this refresh was derived from, and that is an `OAuthToken` on every path
-        // that reaches here -- and kept for what it costs if that stops being true: `auth_header`
+        // that reaches here), and kept for what it costs if that stops being true: `auth_header`
         // would otherwise put an API key in an `x-api-key` header on a subscription endpoint that
         // does not take one, which is the shape this backend refuses outright a hundred lines
-        // above. The Codex provider has the same guard; the asymmetry was the oversight.
+        // above. The Codex provider has the same guard.
         let AuthCredential::OAuthToken { .. } = &new_credential else {
             return Err(MekaError::Provider(
                 "claude-subscription requires an OAuth token, not an API key".to_string(),
@@ -438,7 +440,7 @@ impl ClaudeSubscriptionProvider {
 
     /// GET one of the OAuth account endpoints (usage, profile, history) as text.
     ///
-    /// The three shared everything but the path and the word in their error messages, and each
+    /// The three share everything but the path and the word in their error messages, and each
     /// needs the same one retry after a 401 that a completion gets. `what` names the call in the
     /// transport and read errors, which is how a user tells a usage probe from a profile read.
     async fn fetch_oauth_endpoint(&self, path: &str, what: &str) -> Result<String> {
@@ -519,18 +521,18 @@ impl ClaudeSubscriptionProvider {
             .await?;
 
         // An absent or nonsensical `expires_in` gets the assumed lifetime rather than `None` or
-        // "never". `None` reads as due, so a token whose issuer never states an expiry sent every
-        // later request back through this whole path, rotating the refresh token each time. And a
-        // far-future stamp pins whatever the issuer actually minted for the rest of the process:
-        // the 401 that would correct it forces one refresh, but a bounded guess is what makes that
-        // the exception rather than the only path off a dead token.
+        // "never". `None` reads as due, so a token whose issuer never states an expiry would send
+        // every later request back through this whole path, rotating the refresh token each time.
+        // And a far-future stamp pins whatever the issuer actually minted for the rest of the
+        // process: the 401 that would correct it forces one refresh, but a bounded guess is what
+        // makes that the exception rather than the only path off a dead token.
         let now = crate::oauth::now_epoch_millis();
         let expires_at = Some(data.expires_in.map_or_else(
             || crate::oauth::oauth_assumed_expiry(now),
             |seconds| {
                 // `try_from` rather than `as`: the cast wraps, and it happens *before* the
-                // `checked_mul` that was supposed to make this saturating, so an `expires_in` past
-                // `i64::MAX` produced a negative and landed the expiry in the past -- the exact
+                // `checked_mul` that makes this saturating, so an `expires_in` past `i64::MAX`
+                // would produce a negative and land the expiry in the past, the exact
                 // refresh-every-request loop the comment above says this avoids.
                 i64::try_from(seconds)
                     .ok()
@@ -548,7 +550,7 @@ impl ClaudeSubscriptionProvider {
                 .refresh_token
                 .or_else(|| Some(refresh_token.to_string())),
             expires_at,
-            // Prefer the freshly returned account, but never blank an account we already know.
+            // The freshly returned account wins, but an account already known is never blanked.
             account_id: data
                 .account
                 .map(|account| account.uuid)
@@ -556,6 +558,8 @@ impl ClaudeSubscriptionProvider {
         })
     }
 
+    /// The request body in Claude Code's key order, carrying the `cch=00000` placeholder that
+    /// [`attestation::patch_request_body`] fills after serialization.
     pub(super) fn build_request_body(
         &self,
         system_prompt: &str,
@@ -591,12 +595,11 @@ impl ClaudeSubscriptionProvider {
 
         if !system_prompt.is_empty() {
             let billing_header = attestation::generate_billing_header(messages, attribution);
-            // Matches recent Claude Code wire shape: only the user system prompt carries
-            // `cache_control`. Billing header and identity prefix are unmarked; the source's
-            // Billing header and identity prefix are unmarked, and the `1h` ttl is what an OAuth
-            // subscriber's turn carries.
-            // `scope: "global"` mirrors the captured CLI breakpoint (the
-            // `prompt-caching-scope-2026-01-05` beta), sharing the cached prefix across sessions.
+            // Matches Claude Code's wire shape: only the user system prompt carries
+            // `cache_control`, the billing header and identity prefix are unmarked, and the `1h`
+            // ttl is what an OAuth subscriber's turn carries. `scope: "global"` mirrors the
+            // captured CLI breakpoint (the `prompt-caching-scope-2026-01-05` beta), sharing the
+            // cached prefix across sessions.
             body.insert(
                 "system".to_string(),
                 serde_json::json!([
@@ -840,9 +843,9 @@ impl Provider for ClaudeSubscriptionProvider {
     }
 }
 
-/// Subset of Anthropic's `GET /api/oauth/usage` body that we render. The live response carries many
-/// more (feature-flagged, mostly-null) buckets plus a newer `limits[]` array; we deserialize only
-/// the stable flat windows and ignore the rest.
+/// The subset of Anthropic's `GET /api/oauth/usage` body that is rendered. The live response
+/// carries many more (feature-flagged, mostly-null) buckets plus a newer `limits[]` array; only the
+/// stable flat windows are deserialized and the rest is ignored.
 #[derive(Deserialize)]
 struct OAuthUsageResponse {
     five_hour: Option<OAuthRateLimit>,
@@ -892,7 +895,7 @@ impl OAuthUsageResponse {
 /// `cc_prev_req`.
 ///
 /// Called the moment the response head arrives rather than after the body is read, because on the
-/// streaming path the body outlives this function by the whole length of the turn -- and because
+/// streaming path the body outlives this function by the whole length of the turn, and because
 /// Claude Code stamps the id onto the assistant message as soon as the request resolves, error or
 /// not. A response with no `request-id` (a proxy that drops it) simply leaves the previous value in
 /// place, which is what Claude Code's "last assistant message that has one" does too.
@@ -944,7 +947,8 @@ fn push_oauth_window(windows: &mut Vec<UsageWindow>, label: &str, limit: Option<
     }
 }
 
-/// Subset of `GET /api/oauth/profile` we render. Verified live against a `claude_max` account.
+/// The subset of `GET /api/oauth/profile` that is rendered. Verified live against a `claude_max`
+/// account.
 #[derive(Deserialize)]
 struct OAuthProfileResponse {
     account: Option<OAuthProfileAccount>,

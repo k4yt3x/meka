@@ -116,8 +116,7 @@ async fn stale_read_complaint(
             })
         }
         // Said out loud at debug level rather than merely returning: a check that quietly declines
-        // to run looks exactly like a check that ran and passed, and this whole comparison was
-        // broken for a release by precisely that.
+        // to run looks exactly like a check that ran and passed.
         mismatched => {
             let path = canonical.display();
             tracing::debug!(
@@ -151,20 +150,19 @@ async fn open_read_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
 ///
 /// This is what the kernel will do when the path is finally opened, computed ahead of time so the
 /// boundary check and the syscall agree about which file is meant. Walking forward rather than
-/// canonicalising the whole path matters because the target usually does not exist yet, and
+/// canonicalizing the whole path matters because the target usually does not exist yet, and
 /// `canonicalize` fails outright on a missing tail.
 ///
 /// `..` pops the *resolved* accumulator, not the spelling, which is the whole point: `<root>/L/..`
 /// where `L` is a symlink lands where the kernel lands, not where the text suggests.
 ///
-/// What this closes is the *deterministic* escape: a symlink already planted on the path resolves
+/// What this closes is the deterministic escape: a symlink already planted on the path resolves
 /// here and is caught by the boundary check that follows. What it does not close is the race, since
-/// a component verified here can be swapped for a symlink before the open. Closing that needs the
-/// walk to hold a directory descriptor and issue the write through `openat`/`renameat` against the
-/// inode it verified, on every platform, which is a different piece of machinery from a path
-/// function. The sandbox is documented as defense against an agent damaging user data by accident
-/// rather than as an adversarial boundary, and winning this race requires a *concurrent* writer
-/// deliberately planting the symlink mid-call, so the residual is
+/// a component verified here can be swapped for a symlink before the open; closing that needs the
+/// walk to hold a directory descriptor and write through `openat`/`renameat`. The sandbox is
+/// documented as defense against an agent damaging user data by accident rather than as an
+/// adversarial boundary, and winning this race requires a concurrent writer deliberately planting
+/// the symlink mid-call, so the residual is accepted.
 async fn resolve_existing_prefix(path: &Path) -> std::path::PathBuf {
     use std::path::Component;
 
@@ -194,12 +192,10 @@ async fn resolve_existing_prefix(path: &Path) -> std::path::PathBuf {
 
 /// Resolve `path` to the file a write will land on, and take that file's write lock.
 ///
-/// Shared by `write_file` and `scratchpad_save_file` because they must agree on both answers. They
-/// did not: `scratchpad_save_file` carried its own copy of the path resolution and then called
-/// [`write_file_bytes`] directly, so the two took no lock in common. Both are dispatched
-/// concurrently from one assistant message and both compute a temp path from the same target, so a
-/// `write_file` and a `scratchpad_save_file` naming one file could interleave their write-then-
-/// rename and publish a spliced result.
+/// Shared by `write_file` and `scratchpad_save_file` because they must agree on both answers: both
+/// are dispatched concurrently from one assistant message and both compute a temp path from the
+/// same target, so two copies of the resolution taking no lock in common could interleave their
+/// write-then-rename and publish a spliced result.
 ///
 /// The parent is created and canonicalized first, so the final open is pinned to a directory whose
 /// symlinks are already resolved and a swap of some ancestor cannot redirect it. The full path is
@@ -216,22 +212,16 @@ pub(super) async fn resolve_write_target(
 ) -> Result<(std::path::PathBuf, tokio::sync::OwnedMutexGuard<()>)> {
     let file_path = crate::workspace::resolve_against_cwd(cwd, path);
 
-    // Every component that *exists* is resolved before the boundary is judged.
-    //
-    // Judging the lexical form was not enough, and the gap was not theoretical. `admit` normalizes
-    // `.` and `..` as text while `create_dir_all` hands the path to the kernel, which follows
-    // symlinks. Plant `<root>/L -> /` with the sandboxed shell -- `MAKE_SYM` is granted beneath
-    // every workspace root -- and `write_file("<root>/L/home/you/.config/systemd/user/x")`
-    // normalizes to a path inside the root, passes, and then creates that entire directory chain
-    // at the real `/home/you/...`. The second, canonical `admit` refuses the *file*, so nothing is
-    // written; but arbitrary directory creation outside the boundary is still the enforcing code
-    // performing the escape it exists to prevent, with no race required.
-    //
-    // Resolving first closes it: after this, the existing prefix contains no unresolved symlink,
+    // Every component that exists is resolved before the boundary is judged. Judging the lexical
+    // form alone is not enough: `admit` normalizes `.` and `..` as text while `create_dir_all`
+    // hands the path to the kernel, which follows symlinks, so with `<root>/L -> /` (`MAKE_SYM` is
+    // granted beneath every workspace root) a write to `<root>/L/home/you/.config/x` would pass
+    // and create that entire directory chain at the real `/home/you/...` before the canonical
+    // `admit` refused the file. After this, the existing prefix contains no unresolved symlink,
     // and the components that do not exist yet cannot contain one either.
     let file_path = resolve_existing_prefix(&file_path).await;
 
-    // Judged *before* `create_dir_all` below. Left until after canonicalisation, a refused write to
+    // Judged before `create_dir_all` below. Left until after canonicalization, a refused write to
     // `/etc/foo/bar/baz.txt` would already have created `/etc/foo/bar` on its way to being refused.
     if let Err(refusal) = scope.admit(cwd, &file_path) {
         return Err(MekaError::ToolExecution {
@@ -267,28 +257,19 @@ pub(super) async fn resolve_write_target(
     let joined = canonical_parent.join(file_name);
     let target = match tokio::fs::canonicalize(&joined).await {
         // Stripped, because the two arms must produce one spelling and the second cannot be
-        // verbatim: `joined` is built from an already-stripped `canonical_parent`. Without this the
-        // path a write is keyed on depended on whether the file *already existed*, so on Windows an
-        // overwrite took a different per-path lock and read a different freshness stamp than a
-        // create of the same file -- and neither matched what `read_file` had recorded.
+        // verbatim: `joined` is built from an already-stripped `canonical_parent`. Otherwise the
+        // path a write is keyed on would depend on whether the file already existed, and on Windows
+        // an overwrite would take a different per-path lock and freshness stamp than a create.
         Ok(resolved) => crate::workspace::strip_verbatim(resolved),
         Err(_not_yet_a_file) => joined,
     };
 
     // Judged again on the resolved target, as defense in depth against the interval between the
-    // two resolutions.
-    //
-    // Not, any longer, the check that catches `<root>/link-to-etc/passwd`:
-    // `resolve_existing_prefix` above runs *before* the first `admit`, so a symlinked ancestor
-    // is already resolved out of the root and refused there. What is left for this one is a
-    // swap in between -- the target's parent replaced with a symlink after the first pass
-    // resolved it and before the write -- which no deterministic test can stage, so nothing in
-    // the suite fails when this is deleted. It is kept because the cost is one comparison and
-    // the window is real; it is documented this way so the next reader does not go looking for
-    // the test that proves it.
-    //
-    // The same `target` is what the caller writes to and what the lock is keyed on, so there is no
-    // window between what *this* judged and what is used.
+    // two resolutions: `resolve_existing_prefix` above runs before the first `admit`, so what is
+    // left for this one is the target's parent replaced with a symlink after the first pass
+    // resolved it and before the write, which no deterministic test can stage. The same `target`
+    // is what the caller writes to and what the lock is keyed on, so there is no window between
+    // what this judged and what is used.
     if let Err(refusal) = scope.admit(cwd, &target) {
         return Err(MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
@@ -296,14 +277,11 @@ pub(super) async fn resolve_write_target(
         });
     }
 
-    // A directory target is refused here, before any writer sees it.
-    //
-    // `is_within_roots` admits a path equal to a root, deliberately -- but `write_file_bytes` puts
-    // its temp file at `path.with_file_name(..)`, and for a root that is a *sibling of the root*,
-    // outside the boundary. `write_file({path: ".", force: true})` therefore wrote and `sync_all`ed
-    // the model's content one level above the workspace before the `rename` failed with `EISDIR`
-    // and the cleanup removed it: content outside the boundary, surviving a crash in that window.
-    // Refusing the target is also just correct, since no write to a directory can succeed.
+    // A directory target is refused here, before any writer sees it: `is_within_roots` admits a
+    // path equal to a root, deliberately, but `write_file_bytes` puts its temp file at
+    // `path.with_file_name(..)`, which for a root is a sibling of the root, outside the boundary,
+    // and `write_file({path: ".", force: true})` would write the model's content there before the
+    // `rename` failed with `EISDIR`.
     if tokio::fs::metadata(&target)
         .await
         .is_ok_and(|metadata| metadata.is_dir())
@@ -332,10 +310,9 @@ const DEFAULT_LINE_LIMIT: usize = 2000;
 
 /// Read a file's bytes, bounded by [`MAX_READ_FILE_BYTES`] exactly as the text path is.
 ///
-/// The image branch of `read_file` selects on the *extension* alone, so a 3 GB `.tga` of non-image
-/// data reached an unbounded `read_to_end` here, went fully resident, and only then failed
-/// `classify_bytes` and fell through to the text read -- which applies the ceiling the image path
-/// had already blown past. Same limit, same reason, on the sibling that missed it.
+/// The image branch of `read_file` selects on the extension alone, so a 3 GB `.tga` of non-image
+/// data would otherwise go fully resident here before failing `classify_bytes` and falling through
+/// to the text read that applies the ceiling.
 pub(super) async fn read_file_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = open_read_nofollow(path).await?;
     let mut buffer = Vec::new();
@@ -394,7 +371,7 @@ fn render_windowed_read(
     if shown_lines == 0 {
         // Two different facts, and reporting the ceiling as the other misdescribes the file. A
         // minified JSON blob or a base64 capture is one enormous line, so the window is empty
-        // because that single line does not fit, not because the offset ran off the end -- and
+        // because that single line does not fit, not because the offset ran off the end, and
         // answering "offset 0 is past the end of a file which has 1 line" is both
         // self-contradictory and reads as "unreadable" when the truth is "ask for it differently".
         if cut_by_ceiling {
@@ -443,12 +420,9 @@ fn render_windowed_read(
 /// Returns the window, the file's total line count, and whether the window itself was cut short by
 /// the residency ceiling.
 ///
-/// The ceiling bounds what this *keeps*, not how large a file it will look at, and that difference
-/// is the point. Applying it to the file's size instead made a capture larger than the ceiling
-/// unreadable by any means -- while `execute_command`'s own spill notice was telling the model the
-/// file was "still reachable with `read_file`", and the shell docs said so too. A window is a
-/// bounded amount of memory whatever the file's size, so refusing one bought nothing and cost the
-/// model the only route to its own captured output.
+/// The ceiling bounds what this keeps, not how large a file it will look at: `execute_command`'s
+/// spill notice tells the model a capture larger than the ceiling is still reachable with
+/// `read_file`, and a window is a bounded amount of memory whatever the file's size.
 async fn read_file_window(
     path: &Path,
     offset: usize,
@@ -484,11 +458,9 @@ async fn read_file_window(
 /// Replace `path`'s contents atomically: write a sibling temp file, fsync it, then rename over the
 /// target.
 ///
-/// The previous shape opened the target with `truncate(true)` and streamed the new bytes in, so the
-/// window between the truncate and the last write had the file at zero length with the original
-/// content existing nowhere. A full disk, a kill, or a power loss in that window destroyed the
-/// user's file and left `edit_file` reporting `No space left on device` about content that had been
-/// in memory a microsecond earlier.
+/// Opening the target with `truncate(true)` and streaming the new bytes in would leave a window
+/// with the file at zero length and the original content existing nowhere, so a full disk, a kill,
+/// or a power loss there would destroy the user's file.
 ///
 /// Rename preserves the `O_NOFOLLOW` guarantee rather than weakening it: `rename(2)` acts on the
 /// directory entry, so a symlink swapped in at the final component is *replaced*, not written
@@ -504,24 +476,15 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("file"));
 
-    // Carry the target's mode across the rename.
-    //
-    // `rename(2)` replaces the inode, so the new file keeps the *temp* file's permissions, which
-    // the exclusive create below leaves at `0o666 & ~umask` -- typically 0644. Before this function
-    // wrote through a temp file it opened the target in place, so the mode was preserved for free.
-    // Without this, `edit_file` on a 0600 secret returns it world-readable and reports success, and
-    // on a 0755 script returns it non-executable. `crate::fs::write_file_atomic` sets its temp mode
+    // Carry the target's mode across the rename: `rename(2)` replaces the inode, so the new file
+    // would otherwise keep the temp file's permissions, `0o666 & ~umask`, and `edit_file` on a 0600
+    // secret would return it world-readable. `crate::fs::write_file_atomic` sets its temp mode
     // explicitly for the same reason.
     //
     // Read before the write so a concurrent chmod loses the race rather than being half-applied.
     // A target that does not exist yet has no mode to carry; the umask default is correct there.
-    //
-    // There is no Windows arm, and that asymmetry is a known gap rather than an oversight: a target
-    // carrying an explicit DACL comes back after an `edit_file` with whatever its directory hands
-    // out by inheritance. Closing it means `ReplaceFileW`, which preserves the replaced file's ACL,
-    // streams and attributes by design, in place of the rename -- with a fallback to rename for the
-    // create case, since it requires the target to exist. That is a Win32 call this function does
-    // not otherwise need, so it is deliberately left for the change that can test it on Windows.
+    // The Windows half is `ReplaceFileW` in `publish_temp_file`, which keeps the replaced file's
+    // ACL.
     #[cfg(unix)]
     let existing_mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -531,24 +494,18 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
             .map(|metadata| metadata.permissions().mode())
     };
 
-    // Unique per writer, and created exclusively.
-    //
-    // The name was built from `to_string_lossy`, so two files in one directory whose names differ
-    // only outside UTF-8 collapsed to a single temp path. The per-path lock does not save them: it
-    // keys on the canonical target, which for those two is distinct, so both writers truncate the
-    // same inode from offset zero and the renames publish a splice of two documents while both
-    // calls return `Ok(())`. `crate::fs::write_file_atomic` documents that exact failure as
-    // reproduced, and names this function as having carried only the pid half of the guard.
+    // Unique per writer, and created exclusively. The name keeps the target's bytes rather than
+    // going through `to_string_lossy`, or two files whose names differ only outside UTF-8 would
+    // share one temp path while the per-path lock, keyed on the canonical target, kept them apart.
     //
     // The pid separates processes and the counter separates threads within one. `create_new`
-    // refuses an existing file, which includes a symlink planted at the name, so it subsumes the
-    // `O_NOFOLLOW` the previous open needed here.
+    // refuses an existing file, which includes a symlink planted at the name, so it subsumes
+    // `O_NOFOLLOW` here.
     //
     // Bounded, because the retry is for a collision that cannot recur: the counter advances on
-    // every attempt, so a second collision needs a *second* stale file sitting at the next name
-    // too. An unbounded `loop` here would instead spin forever against a filesystem that answers
-    // `AlreadyExists` unconditionally, holding the per-path write lock while it did, and a hung
-    // write with no error is worse than a reported one.
+    // every attempt, so a second collision needs a second stale file sitting at the next name too,
+    // whereas an unbounded loop would spin forever against a filesystem that answers
+    // `AlreadyExists` unconditionally, holding the per-path write lock while it did.
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     const TEMP_NAME_ATTEMPTS: u32 = 16;
     let mut collision = None;
@@ -585,15 +542,9 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
     };
 
     let write_result = async {
-        // Born at the target's mode, not merely renamed into it.
-        //
-        // The mode was applied to the temp file after `sync_all`, which is early enough that the
-        // *published* path is never wrong -- but the temp file itself sits in the target's own
-        // directory holding the full plaintext, and until that call it is `0o666 & ~umask`, i.e.
-        // 0644 by default. Editing a 0600 secret in a 0755 directory therefore left its contents
-        // world-readable for the whole write plus an fsync. Narrowing first and keeping the
-        // post-write call means the window never opens, whichever order the filesystem completes
-        // in.
+        // Born at the target's mode, not merely renamed into it: the temp file sits in the
+        // target's own directory holding the full plaintext, so applying the mode only after
+        // `sync_all` would leave a 0600 secret world-readable for the whole write plus an fsync.
         #[cfg(unix)]
         if let Some(mode) = existing_mode {
             use std::os::unix::fs::PermissionsExt;
@@ -604,18 +555,15 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
         file.flush().await?;
         // Durability before visibility: without this the rename can be recorded while the data is
         // still only in the page cache, so a crash leaves an intact directory entry pointing at an
-        // empty or partial file -- the exact loss this function exists to prevent.
+        // empty or partial file, the exact loss this function exists to prevent.
         file.sync_all().await
     }
     .await;
 
-    // Closed before the target is touched, not merely dropped at the end of the function.
-    //
-    // `rename` does not care that the source is still open, and for a long time nothing here did.
-    // `ReplaceFileW` does: it opens the replacement itself, and a handle meka was still holding
-    // came back as `ERROR_SHARING_VIOLATION` on the first Windows machine that ran it, reported to
-    // the model as "the process cannot access the file". The data is already `sync_all`ed at this
-    // point, so there is nothing left to lose by closing.
+    // Closed before the target is touched, not merely dropped at the end of the function:
+    // `ReplaceFileW` opens the replacement itself, and a handle still held here comes back as
+    // `ERROR_SHARING_VIOLATION`. The data is already `sync_all`ed, so there is nothing left to
+    // lose by closing.
     drop(file);
 
     if let Err(error) = write_result {
@@ -663,7 +611,7 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
     .await;
     if let Err(error) = synced {
         let path = path.display();
-        tracing::warn!("failed to run the directory sync for '{path}': {error}");
+        tracing::warn!("failed to sync the directory of '{path}': {error}");
     }
 
     Ok(())
@@ -671,13 +619,10 @@ pub(super) async fn write_file_bytes(path: &Path, bytes: &[u8]) -> std::io::Resu
 
 /// Put the finished temp file in the target's place.
 ///
-/// A plain rename everywhere except Windows-with-an-existing-target, where it is `ReplaceFileW`.
-/// The two are the same operation with one difference that matters: rename installs a *new* file,
-/// so the published path carries whatever the directory hands out by inheritance, while
-/// `ReplaceFileW` is documented to keep the replaced file's ACL, attributes and alternate streams.
-/// Without it, `edit_file` on a file its owner had deliberately locked down returned it readable by
-/// whoever the parent directory says, and reported success. This is the Windows half of the mode
-/// carry a few lines above, which has been done on Unix since this function grew a temp file.
+/// A plain rename everywhere except Windows-with-an-existing-target, where it is `ReplaceFileW`:
+/// rename installs a new file, so the published path would carry whatever the directory hands out
+/// by inheritance, while `ReplaceFileW` is documented to keep the replaced file's ACL, attributes
+/// and alternate streams. This is the Windows half of the mode carry above.
 #[cfg(windows)]
 async fn publish_temp_over(temp_path: &Path, path: &Path) -> std::io::Result<()> {
     // `ReplaceFileW` requires the target to exist; a create has no ACL to preserve, so a rename is
@@ -751,10 +696,8 @@ async fn publish_temp_over(temp_path: &Path, path: &Path) -> std::io::Result<()>
 /// The `\\?\` prefix is what lifts the 260-character `MAX_PATH` limit, and it has to be put back
 /// here because `canonicalize_for_tool` deliberately strips it: every other consumer of that path
 /// is `std`, which re-adds the prefix itself when it converts a long absolute path for the same
-/// Win32 layer. A hand-rolled conversion that skipped this step made `ReplaceFileW` fail with
-/// `ERROR_PATH_NOT_FOUND` on any target deeper than `MAX_PATH`, while the create arm -- a plain
-/// `rename`, and so `std`'s conversion -- kept working. The result was a write tool that could make
-/// a deep file but never edit it.
+/// Win32 layer, and without it `ReplaceFileW` fails with `ERROR_PATH_NOT_FOUND` on any target
+/// deeper than `MAX_PATH`.
 ///
 /// Prefixing is safe because every path reaching here is already canonical: `\\?\` disables the
 /// normalization Win32 would otherwise apply, so a `.` or `..` component would survive into the
@@ -861,7 +804,7 @@ async fn local_old_text(target: &Path) -> std::result::Result<Option<String>, st
 }
 
 /// Read a file off the local filesystem, reporting failures as `tool_name`'s error with the path
-/// the caller supplied rather than the canonicalised one.
+/// the caller supplied rather than the canonicalized one.
 async fn read_local_text(canonical: &Path, tool_name: &str, path: &str) -> Result<String> {
     read_file_to_string(canonical)
         .await
@@ -1093,18 +1036,14 @@ impl Tool for ReadFileTool {
         // Text reads delegate to the editor when it offers `fs.read_text_file`, so the model is
         // shown the document the editor will apply an edit against rather than the bytes under it.
         //
-        // Including a regex read. There is no `fs/*` analog for searching, but none is needed:
-        // fetch the file through the same route and filter it here. Routing this one locally
-        // instead searched the disk while `edit_file` went on to edit the buffer, and stamped the
-        // read in terms `edit_file`'s freshness check could not compare against that buffer, so on
-        // the common find-then-edit path the check silently skipped. Image reads stay local: they
-        // are bytes, not text, and nothing edits them. The delegate is asked for the whole
-        // document, never a window, and the windowing below is applied to what it returns. Asking
-        // it for the window directly cost two things: the freshness stamp recorded the *slice*, so
-        // every later `edit_file` compared it against the whole buffer and reported a false
-        // "changed in the editor"; and a cut at exactly `limit` lines was indistinguishable from a
-        // file that happened to end there, so it was returned with no truncation notice at all. The
-        // local route reads the whole file too, so the two now agree on both.
+        // Including a regex read: there is no `fs/*` analog for searching, so the file is fetched
+        // through the same route and filtered here, or a find-then-edit would search the disk while
+        // `edit_file` edited the buffer, with a stamp the freshness check cannot compare. Image
+        // reads stay local: they are bytes, not text, and nothing edits them. The delegate is asked
+        // for the whole document, never a window, and the windowing below is applied to what it
+        // returns: a stamp of the slice would make every later `edit_file` report a false change,
+        // and a cut at exactly `limit` lines would be indistinguishable from a file that ends
+        // there.
         let delegated = match context
             .frontend
             .delegate_fs_read(&canonical, None, None)
@@ -1113,8 +1052,8 @@ impl Tool for ReadFileTool {
             Delegation::Served(content) => Some(content),
             // The client will not serve this path, so it holds no buffer for it either: the local
             // bytes are not a degraded substitute for the delegate's view, they are the same view.
-            // Fall through and read them, rather than turning a readable file into a tool error --
-            // which is what made skills, prompts, and configuration unreadable under ACP.
+            // Fall through and read them, rather than turning a readable file (a skill, a prompt,
+            // a configuration file outside the project) into a tool error.
             Delegation::Failed(error) if error.is_unservable_path() => {
                 let path = canonical.display();
                 tracing::debug!(
@@ -1204,7 +1143,7 @@ impl Tool for ReadFileTool {
         // A read that shows the whole file returns it verbatim, because the windowing below is also
         // a normalization: `lines()` drops `\r` and `join("\n")` drops the trailing newline. The
         // model then copies an `old_string` out of LF text and `edit_file` cannot find it in the
-        // CRLF file it is actually editing -- a "not found" whose cause is invisible in both the
+        // CRLF file it is actually editing, a "not found" whose cause is invisible in both the
         // read and the edit. Windowed reads still normalize; there is no way to slice lines and
         // keep their terminators without deciding which one each line ended with.
         if effective_offset == 0 && total_lines <= effective_limit {
@@ -1227,7 +1166,7 @@ impl Tool for ReadFileTool {
         // the failure the `find_files` / `search_contents` disclosures exist to prevent; a
         // definitive-sounding answer drawn from a silent truncation is worse than an error.
         let shown_lines = result.lines().count();
-        // An offset past the end returns nothing, and nothing reads as "the file is empty" -- which
+        // An offset past the end returns nothing, and nothing reads as "the file is empty", which
         // is a different fact, and the one the model will act on. Say which it is.
         if shown_lines == 0 && effective_offset >= total_lines {
             return Ok(ToolOutput::text(
@@ -1390,7 +1329,7 @@ impl Tool for EditFileTool {
 
         // On the canonical path, which is also the one every branch below reads and writes, so a
         // symlink out of the workspace is judged by where it lands rather than where it is named.
-        // `edit_file` needs no lexical pre-pass: the target must already exist, so canonicalisation
+        // `edit_file` needs no lexical pre-pass: the target must already exist, so canonicalization
         // cannot fail open the way it would for a create.
         if let Err(refusal) = self.scope.admit(&self.site.cwd, &canonical) {
             return Ok(ToolOutput::text(refusal, true));
@@ -1402,9 +1341,9 @@ impl Tool for EditFileTool {
         // agent dispatches all the tool calls in one assistant message concurrently
         // (`futures::future::join_all`). Two `edit_file` calls on one file therefore both read the
         // original, both pass the freshness gate (the tracker stamp is still the pre-edit one for
-        // both), and the second write silently discards the first -- while *both* results report
-        // success and show a context snippet proving the change landed. The freshness machinery
-        // cannot catch this on its own: it compares against a stamp taken before either write.
+        // both), and the second write silently discards the first while both results report
+        // success. The freshness machinery cannot catch this on its own: it compares against a
+        // stamp taken before either write.
         let _write_guard = self.scope.lock_path(&canonical).await;
 
         // Bound the guard to a `let` rather than matching on it directly: a temporary in a match
@@ -1689,16 +1628,14 @@ impl Tool for WriteFileTool {
         // conservative: a truly-empty existing file still loses `old_text`, but the diff content is
         // identical either way.
         //
-        // The probe also picks the route for the write, the same way `edit_file`'s pre-read does,
-        // and for a reason worth recording: a client may report an unservable path on a *read* but
-        // not on a write. Zed does exactly this -- its `read_text_file` maps a path outside the
-        // open project to `ResourceNotFound`, while its `write_text_file` returns a generic error
-        // for the same path. Routing the write on its own error code would therefore never
-        // recognize the case it exists for. The read is the reliable signal, and it is unambiguous
-        // there: a file that does not exist *yet* inside the project still maps to a project path,
-        // so it comes back as `Ok("")` rather than as not-found. Set by the degraded-probe arm
-        // below: the write still goes to the delegate, but the `old_text` meka reasons from came
-        // off disk.
+        // The probe also picks the route for the write, the same way `edit_file`'s pre-read does:
+        // a client may report an unservable path on a read but not on a write (Zed's
+        // `read_text_file` maps a path outside the open project to `ResourceNotFound` while its
+        // `write_text_file` returns a generic error), so routing the write on its own error code
+        // would never recognize the case. The read is unambiguous: a file that does not exist yet
+        // inside the project still maps to a project path, so it comes back as `Ok("")` rather
+        // than as not-found. `degraded_pre_read` is set by the arm below: the write still goes to
+        // the delegate, but the `old_text` meka reasons from came off disk.
         let mut degraded_pre_read = false;
         let (old_text, route) = match context.frontend.delegate_fs_read(&target, None, None).await {
             Delegation::Served(text) => {
@@ -1723,21 +1660,12 @@ impl Tool for WriteFileTool {
                 return Err(MekaError::Interrupted);
             }
             // The client did not disown the path, it just failed this probe. The write still goes
-            // to it; only the `old_text` is degraded.
-            //
-            // The route here labels where `old_text` *came from*, and it came from disk. Labeling
-            // it `Delegated` was not merely informational, because `stale_read_complaint` reads the
-            // route to decide which fingerprint to compare: it took the delegated arm and matched a
-            // disk hash against one recorded from the editor's buffer. With an unsaved change open
-            // those never agree, so the write was refused with "file changed in the editor after
-            // you read it. Someone edited the buffer, or the editor reloaded the file" -- when
-            // nobody had. Worse, the advice was a dead end: re-reading re-stamps from the buffer,
-            // the next probe degrades to disk again, and the comparison fails identically. Only
-            // `force` got through.
-            //
-            // So the route stays `Delegated` -- the write really does go to the client, and the
-            // disclosure has to say so -- and the staleness check is told separately, through
-            // `degraded_pre_read`, that the text it is judging came from disk.
+            // to it; only the `old_text` is degraded. The route stays `Delegated` (the write really
+            // does go to the client, and the disclosure has to say so) and the staleness check is
+            // told separately, through `degraded_pre_read`, that the text it is judging came from
+            // disk: `stale_read_complaint` picks its fingerprint by that, and matching a disk hash
+            // against one recorded from the editor's buffer would refuse every write over an
+            // unsaved change with advice (re-read) that cannot clear it.
             Delegation::Failed(error) => {
                 let path = target.display();
                 tracing::debug!(
@@ -1771,14 +1699,10 @@ impl Tool for WriteFileTool {
             }
         };
 
-        // Refuse to clobber a file that changed since the agent last read it.
-        //
-        // `edit_file` has always done this; `write_file` consulted the read tracker only to
-        // *insert* into it, never to check. So the model reading `config.toml`, the user
-        // editing and saving it, and the model then writing the whole file back from its
-        // now-stale copy overwrote the user's change with no error, no warning and no
-        // re-read prompt -- while the identical change routed through `edit_file` would
-        // have been refused. Creating a new file stays unguarded (there is nothing to
+        // Refuse to clobber a file that changed since the agent last read it, as `edit_file`
+        // does: the model reading `config.toml`, the user editing and saving it, and the model
+        // then writing the whole file back from its stale copy would otherwise overwrite the
+        // user's change with no error. Creating a new file stays unguarded (there is nothing to
         // lose), and `force` is the same escape hatch.
         if !force && let Some(existing) = old_text.as_deref() {
             let recorded = self.read_tracker.read().await.get(&target).copied();
@@ -2017,7 +1941,7 @@ mod tests {
     /// The lost-edit test above passes with the path lock removed, because the freshness check
     /// catches the interleaving it happens to produce: the first write lands before the second
     /// read, so the second edit is refused as stale. The freshness check cannot catch the other
-    /// one, where both edits read and both pass the gate before either writes -- the recorded
+    /// one, where both edits read and both pass the gate before either writes: the recorded
     /// stamp is the pre-edit one for both, so both are judged fresh and the second write
     /// discards the first. Only the lock closes that, so pin the lock rather than the symptom:
     /// while one edit is inside the tool body, no second edit may enter it.
@@ -2150,13 +2074,10 @@ mod tests {
         assert!(result.text_content().contains("line3"));
     }
 
-    /// The regression the whole image path exists to prevent, at the door it comes through.
-    ///
-    /// A truncated PNG keeps a perfect 8-byte signature, so it sniffed as a clean pass-through and
-    /// was base64'd into the conversation. It then failed inside the provider's decoder, in a
-    /// `tool_result` already committed to the session, which failed every later turn as well; the
-    /// gateway reported that as `500`, so meka re-sent it twice and kept it. An error here costs
-    /// the model one tool call and nothing else.
+    /// A truncated PNG keeps a perfect 8-byte signature, so it sniffs as a clean pass-through;
+    /// base64'd into the conversation it would fail inside the provider's decoder, in a
+    /// `tool_result` already committed to the session, and fail every later turn as well. An error
+    /// here costs the model one tool call and nothing else.
     #[tokio::test]
     async fn read_file_refuses_an_image_that_does_not_decode() {
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -2194,9 +2115,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_falls_back_when_client_cannot_serve_path() {
-        // A delegate failure must not abort the read. Editors serve `fs/read_text_file` only for
-        // the project they have open, so every skill, prompt, and config file read under ACP became
-        // a hard tool error -- with the file sitting right there, readable.
+        // A delegate failure must not abort the read: editors serve `fs/read_text_file` only for
+        // the project they have open, so every skill, prompt, and config file read under ACP would
+        // become a hard tool error with the file sitting right there, readable.
         let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
         let file_path = temp_dir.path().join("outside-the-project.md");
         std::fs::write(&file_path, "on-disk contents\n").expect("failed to write");
@@ -2497,8 +2418,8 @@ mod tests {
             .expect("should return Ok");
         assert!(!first.is_error, "{}", first.text_content());
 
-        // The user saves. The document the editor serves is unchanged -- it already held the
-        // agent's edit -- so nothing the agent was shown has moved; only the bytes on disk.
+        // The user saves. The document the editor serves is unchanged (it already held the
+        // agent's edit), so nothing the agent was shown has moved; only the bytes on disk.
         std::fs::write(&file_path, "something else entirely\n").expect("save");
 
         let second = tool
@@ -2525,10 +2446,9 @@ mod tests {
     /// A regex read is a read, so it has to leave the tracker in the same terms as any other.
     ///
     /// Routing locally on the grounds that searching has no `fs/*` call of its own breaks the
-    /// find-then-edit path -- grep for the anchor, then edit it, the most ordinary thing the agent
-    /// does -- by searching the disk while the edit goes to the buffer, and recording a stamp the
-    /// freshness check cannot compare against that buffer. The check does not fail loudly in that
-    /// state; it declines to run.
+    /// find-then-edit path (grep for the anchor, then edit it) by searching the disk while the
+    /// edit goes to the buffer, and recording a stamp the freshness check cannot compare against
+    /// that buffer. The check does not fail loudly in that state; it declines to run.
     #[tokio::test]
     async fn a_delegated_regex_read_searches_and_stamps_the_editors_copy() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -2595,13 +2515,13 @@ mod tests {
         assert!(result.text_content().contains("changed in the editor"));
     }
 
-    /// The other half, and the half whose absence let a broken check ship: an editor-hosted file
-    /// whose *document* changes between the read and the edit must be refused.
+    /// The other half: an editor-hosted file whose document changes between the read and the edit
+    /// must be refused.
     ///
     /// This is the ordinary case, not an exotic one. An editor serves its copy of every file it
     /// owns, saved or not, so under ACP essentially every project file is read through the
-    /// delegate. Exempting that route from freshness checking altogether -- which is what comparing
-    /// it against the disk and then giving up amounts to -- switches the protection off for the
+    /// delegate. Exempting that route from freshness checking altogether (which is what comparing
+    /// it against the disk and then giving up amounts to) switches the protection off for the
     /// whole project, and nothing that only tests the no-false-alarm direction can see it.
     ///
     /// The replacement text is still present in the new document, so a `not found` rejection cannot
@@ -2703,7 +2623,7 @@ mod tests {
     async fn edit_file_discloses_local_write_when_client_cannot_write() {
         // A client may advertise `fs.readTextFile` without `fs.writeTextFile`: it reads for us but
         // expects us to do the write. The edit is then computed from its buffer and lands on disk,
-        // so the file it is showing the user now differs from what is stored -- which the result
+        // so the file it is showing the user now differs from what is stored, which the result
         // has to say, even though the read was delegated.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("open.md");
@@ -2911,23 +2831,17 @@ mod tests {
         );
     }
 
-    /// A transient delegate read failure must not become an unfixable staleness refusal.
-    ///
-    /// The degraded arm paired *disk* bytes with a `Delegated` route, and `stale_read_complaint`
-    /// reads the route to pick which fingerprint to compare -- so it matched a disk hash against
-    /// one recorded from the editor's buffer. With an unsaved change open those never agree, and
-    /// the write was refused with "changed in the editor after you read it. Someone edited the
-    /// buffer, or the editor reloaded the file" when nobody had.
-    ///
-    /// The advice was a dead end too: re-reading re-stamps from the buffer, the next probe degrades
-    /// to disk again, and the comparison fails identically. Only `force` got through.
+    /// A transient delegate read failure must not become an unfixable staleness refusal: the
+    /// degraded arm pairs disk bytes with a `Delegated` route, and matching a disk hash against
+    /// one recorded from the editor's buffer would refuse every write over an unsaved change with
+    /// advice (re-read) that re-stamps from the buffer and fails identically next time.
     #[tokio::test]
     async fn a_degraded_pre_read_is_not_reported_as_an_editor_edit() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("owned.txt");
         std::fs::write(&file_path, "on disk\n").expect("seed the file");
 
-        // The read is stamped from the client's *buffer*, which differs from disk -- an ordinary
+        // The read is stamped from the client's buffer, which differs from disk: an ordinary
         // unsaved change.
         let tracker = tracker_for_test();
         let read = ReadFileTool {
@@ -3090,8 +3004,8 @@ mod tests {
         );
     }
 
-    /// `read_file` has the mildest consequence of the three -- a stale view rather than a lost
-    /// edit -- and the same rule: a withdrawn question is not answered from somewhere else.
+    /// `read_file` has the mildest consequence of the three (a stale view rather than a lost
+    /// edit) and the same rule: a withdrawn question is not answered from somewhere else.
     #[tokio::test]
     async fn read_file_canceled_delegate_does_not_read_disk() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3142,10 +3056,9 @@ mod tests {
 
         assert!(!result.is_error);
         let body = result.text_content();
-        // The window's *shape*, not just its vocabulary. Asserting `contains("line1")` and
+        // The window's shape, not just its vocabulary: asserting `contains("line1")` and
         // `contains("line2")` separately passes just as happily on `"\nline1line2"`, which is what
-        // the separator logic produces when its emptiness check is inverted -- every windowed read
-        // collapsing into one run-on line went unnoticed by the whole suite.
+        // the separator logic produces when its emptiness check is inverted.
         assert!(
             body.contains("line1\nline2"),
             "the window must keep its line breaks: {body:?}"
@@ -3186,13 +3099,11 @@ mod tests {
 
     /// `write_file` through a symlink must name the same file `read_file` and `edit_file` name.
     ///
-    /// All three canonicalize. Canonicalizing only the parent and re-joining the filename, as
-    /// `write_file` could, gives a symlinked final component a path the other two never use. Three
-    /// things followed from that one mismatch: the freshness check looked up a tracker key nothing
-    /// writes and so never fired, `edit_file` and `write_file` on the one file took different
-    /// per-path locks and stopped being serialized against each other, and the write itself landed
-    /// on the link rather than through it -- replacing a dotfile-managed symlink with a regular
-    /// file and leaving the file the model had just read untouched.
+    /// All three canonicalize. Canonicalizing only the parent and re-joining the filename gives a
+    /// symlinked final component a path the other two never use: the freshness check would look
+    /// up a tracker key nothing writes, `edit_file` and `write_file` on the one file would take
+    /// different per-path locks, and the write itself would land on the link rather than through
+    /// it, replacing a dotfile-managed symlink with a regular file.
     #[cfg(unix)]
     #[tokio::test]
     async fn write_file_follows_a_symlink_to_the_file_it_read() {
@@ -3246,9 +3157,9 @@ mod tests {
         );
     }
 
-    /// The staleness guard has to fire for a symlinked path too, which is the concrete loss the
-    /// key mismatch caused: `read_file` stamped the canonical name, `write_file` looked up the
-    /// link's, missed, and clobbered whatever the user had saved in between.
+    /// The staleness guard has to fire for a symlinked path too: with `read_file` stamping the
+    /// canonical name and `write_file` looking up the link's, the write would clobber whatever the
+    /// user had saved in between.
     #[cfg(unix)]
     #[tokio::test]
     async fn write_file_refuses_a_stale_write_through_a_symlink() {
@@ -3293,7 +3204,7 @@ mod tests {
     ///
     /// Refusing a symlinked target here would make Windows the one platform where `write_file` and
     /// `edit_file` disagree about whether a link can be written at all. The guard still stands one
-    /// level up, in the canonicalisation that resolves the target before the write, which is where
+    /// level up, in the canonicalization that resolves the target before the write, which is where
     /// a swap is a redirection rather than the user's own indirection.
     #[cfg(windows)]
     #[tokio::test]
@@ -3345,8 +3256,8 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_after_write_no_force_needed() {
-        // Regression: `write_file` should mark the target as read so a follow-up `edit_file`
-        // doesn't require `force: true`.
+        // `write_file` marks the target as read so a follow-up `edit_file` does not require
+        // `force: true`.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let file_path = temp_dir.path().join("write_then_edit.txt");
         let tracker = tracker_for_test();
@@ -3818,14 +3729,12 @@ mod tests {
 
     /// The image path is bounded by the same ceiling the text path is.
     ///
-    /// `read_file` picks the image branch on the *extension* alone, so a large file that merely
-    /// ends `.tga` reached an unbounded `read_to_end`, went fully resident, and only then
-    /// failed the byte sniff and fell through to the text read that would have refused it.
+    /// `read_file` picks the image branch on the extension alone, so a large file that merely ends
+    /// `.tga` must not reach an unbounded `read_to_end` before the byte sniff fails.
     /// `execute_command` spills output past 8 MiB to a capture file and tells the model the whole
-    /// thing is "still reachable with `read_file`" -- and the shell docs promise the same. A
-    /// residency ceiling applied to the file's *size* rather than to what a read *keeps* broke that
-    /// promise for exactly the files it was written about: a runaway build log could be captured
-    /// and then read by nothing.
+    /// thing is still reachable with `read_file`, so a residency ceiling applied to the file's size
+    /// rather than to what a read keeps would break that promise for exactly the files it was
+    /// written about.
     #[tokio::test]
     async fn a_capture_past_the_ceiling_is_still_readable_a_window_at_a_time() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3859,10 +3768,9 @@ mod tests {
 
         assert!(!result.is_error, "{}", result.text_content());
         let shown = result.text_content();
-        // The two lines have to arrive as two *lines*. Asserting each substring separately says
-        // nothing about the separator between them, and inverting the emptiness check that emits it
-        // concatenates the whole window into one run-on line -- which the whole suite passed over,
-        // while handing the model output it cannot use.
+        // The two lines have to arrive as two lines: asserting each substring separately says
+        // nothing about the separator between them, and inverting the emptiness check that emits
+        // it concatenates the whole window into one run-on line.
         assert!(
             shown.contains(&format!("line 3 {filler}\nline 4 {filler}")),
             "the requested window must keep its line breaks: {}",
@@ -3928,10 +3836,10 @@ mod tests {
 
     /// A target that exists but cannot be re-read is refused, not overwritten blind.
     ///
-    /// `local_old_text` mapped every read failure except `NotFound` to `None`, and the staleness
-    /// guard runs only on `Some` -- so a file holding invalid UTF-8, or one past the 16 MiB
-    /// ceiling, skipped the check entirely. `edit_file` refuses when it cannot verify; this is
-    /// the same posture, and `force` remains the way through.
+    /// The staleness guard runs only on `Some`, so a `local_old_text` that mapped every read
+    /// failure except `NotFound` to `None` would skip it for a file holding invalid UTF-8, or one
+    /// past the 16 MiB ceiling. `edit_file` refuses when it cannot verify; this is the same
+    /// posture, and `force` remains the way through.
     #[tokio::test]
     async fn write_file_refuses_a_target_it_cannot_re_read() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3979,13 +3887,12 @@ mod tests {
         );
     }
 
-    /// Carrying the mode across the rename fixes the *published* file, but the temp file it is
+    /// Carrying the mode across the rename fixes the published file, but the temp file it is
     /// renamed from sits in the target's own directory holding the entire plaintext, and is born
-    /// at `0o666 & ~umask`. Applying the mode only after the write therefore leaves a 0600 secret
-    /// world-readable on disk for the length of the write plus an fsync -- a window nothing else
-    /// in this suite looks at, because every other assertion is about the file that survives.
-    /// Watch the directory during the write instead: no temp file may hold bytes at a wider mode
-    /// than the target it will replace.
+    /// at `0o666 & ~umask`. Applying the mode only after the write would leave a 0600 secret
+    /// world-readable on disk for the length of the write plus an fsync, a window nothing else in
+    /// this suite looks at. Watch the directory during the write instead: no temp file may hold
+    /// bytes at a wider mode than the target it will replace.
     ///
     /// Under a umask tight enough that the temp file is born narrow (0077, say) there is no
     /// window to catch and this passes on any implementation, which is correct rather than
@@ -4052,12 +3959,11 @@ mod tests {
 
     /// A symlinked ancestor cannot make the fence create directories outside the boundary.
     ///
-    /// The escape this guards was deterministic and needed no race. `admit` normalized `.` and
-    /// `..` as text while `create_dir_all` handed the path to the kernel, which follows symlinks:
-    /// with `<root>/L -> <outside>`, a write to `<root>/L/../deep/nested/f.txt` normalized to a
-    /// path inside the root, passed the pre-check, and then created the whole chain at `<outside>`.
-    /// The canonical pass refused the file afterwards, so nothing was written -- which is exactly
-    /// what made it easy to miss.
+    /// The escape this guards is deterministic and needs no race: `admit` normalizes `.` and `..`
+    /// as text while `create_dir_all` hands the path to the kernel, which follows symlinks, so
+    /// with `<root>/L -> <outside>` a write to `<root>/L/../deep/nested/f.txt` would pass the
+    /// lexical pre-check and create the whole chain at `<outside>` before the canonical pass
+    /// refused the file.
     ///
     /// The pre-existing symlink test names `work/link/f.txt`, whose parent already exists, so
     /// `create_dir_all` is a no-op there and it never exercised this.
@@ -4097,11 +4003,10 @@ mod tests {
 
     /// Two names that differ only outside UTF-8 get two temp files, not one.
     ///
-    /// The temp name was derived from `to_string_lossy`, so `a\xFE.txt` and `a\xFF.txt` both became
-    /// `.a\u{FFFD}.txt.meka-tmp-<pid>`. Nothing upstream catches it: the per-path lock keys on the
-    /// canonical target, which for these two is genuinely distinct, so both writers reached the
-    /// same temp inode and the renames published a splice of the two payloads while both calls
-    /// returned `Ok(())`. The payloads here differ in length so a splice cannot pass as either one.
+    /// A temp name derived from `to_string_lossy` would make `a\xFE.txt` and `a\xFF.txt` both
+    /// `.a\u{FFFD}.txt.meka-tmp-<pid>`, and nothing upstream catches it: the per-path lock keys on
+    /// the canonical target, which for these two is genuinely distinct. The payloads here differ
+    /// in length so a splice cannot pass as either one.
     ///
     /// This guards the outcome, not one line: the faithful `OsString` name and the per-attempt
     /// counter each prevent the collision on their own, so reverting either alone still passes.
@@ -4138,9 +4043,8 @@ mod tests {
         assert_eq!(std::fs::read(&second).expect("read second"), short);
     }
 
-    /// A write must not loosen a file's permissions. `rename(2)` replaces the inode, so the mode
-    /// has to be carried across deliberately; before the atomic-write change it survived for free
-    /// because the target was opened in place.
+    /// A write must not loosen a file's permissions: `rename(2)` replaces the inode, so the mode
+    /// has to be carried across deliberately.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_write_preserves_the_modes_of_the_file_it_replaces() {
@@ -4444,10 +4348,10 @@ mod tests {
         assert!(!result.is_error);
     }
 
-    /// Regression test for the canonicalize/open TOCTOU fix: edit_file must honor the canonical
-    /// path, not re-interpret the raw argument after the tracker check. Simulated here by
-    /// read-tracking the resolved file, then swapping the symlink's target between read and edit.
-    /// The edit must land on the original canonical file, never the new target.
+    /// `edit_file` must honor the canonical path, not re-interpret the raw argument after the
+    /// tracker check: the resolved file is read-tracked, then the symlink's target is swapped
+    /// between read and edit, and the edit must land on the original canonical file, never the
+    /// new target.
     #[cfg(unix)]
     #[tokio::test]
     async fn edit_file_symlink_swap_lands_on_canonical() {
@@ -4665,7 +4569,7 @@ mod tests {
     }
 
     /// An offset past the end of the file returns nothing, and nothing is indistinguishable from
-    /// an empty file -- a different fact, and the one the model goes on to act on.
+    /// an empty file, a different fact, and the one the model goes on to act on.
     #[tokio::test]
     async fn read_file_past_the_end_says_so_rather_than_returning_nothing() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -4692,14 +4596,10 @@ mod tests {
         );
     }
 
-    /// The reported total has to be the real one.
-    ///
-    /// The old count resumed the scan by skipping `matches.len()` *lines* to account for
-    /// `matches.len()` *matches*, so every hit past that index was counted twice. A file where
-    /// every line matches cannot show it -- lines and matches coincide, so both forms agree -- and
-    /// that is exactly the file the cap test above writes, which is why the bug survived a test
-    /// named for the behavior it broke. A sparse file separates them: 100 hits shown out of 100,
-    /// which a total derived from the shown lines would report as 150.
+    /// The reported total has to be the real one. A file where every line matches cannot show a
+    /// double count (lines and matches coincide), which is the file the cap test above writes; a
+    /// sparse file separates them: 100 hits shown out of 100, which a count resumed by skipping
+    /// `matches.len()` lines would report as 150.
     #[tokio::test]
     async fn read_file_regex_reports_the_real_total_on_a_sparse_file() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -5038,7 +4938,7 @@ mod tests {
 
     /// The refusal must land *before* `create_dir_all`.
     ///
-    /// Reached only after canonicalisation, the check would run after the parents are already made.
+    /// Reached only after canonicalization, the check would run after the parents are already made.
     /// A refused write to a deep path outside the boundary would then have created that whole chain
     /// of directories on its way to being refused, which is the enforcing code performing the write
     /// it exists to prevent.
@@ -5068,7 +4968,7 @@ mod tests {
         );
     }
 
-    /// A `..` escape is caught by the lexical pass, before anything exists to canonicalise.
+    /// A `..` escape is caught by the lexical pass, before anything exists to canonicalize.
     #[tokio::test]
     async fn a_parent_traversal_out_of_the_workspace_is_refused() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5098,10 +4998,10 @@ mod tests {
     /// A symlink inside the workspace pointing out of it is refused on the canonical pass.
     ///
     /// The lexical pass cannot see this one: `<root>/link/f.txt` is textually inside the root. Only
-    /// canonicalising the resolved parent reveals that the bytes would land elsewhere.
+    /// canonicalizing the resolved parent reveals that the bytes would land elsewhere.
     #[tokio::test]
     #[cfg(unix)]
-    async fn a_symlinked_escape_is_refused_after_canonicalisation() {
+    async fn a_symlinked_escape_is_refused_after_canonicalization() {
         let temp = tempfile::tempdir().expect("tempdir");
         let base = crate::workspace::canonical_for_test(temp.path());
         let work = base.join("work");
@@ -5147,12 +5047,11 @@ mod tests {
     /// A path past `MAX_PATH` still resolves, writes and reads back after the verbatim prefix is
     /// stripped.
     ///
-    /// This is the risk that came with normalizing `canonicalize_for_tool`: on Windows the `\\?\`
-    /// prefix is what lets a path exceed 260 characters, and removing it from a value that later
-    /// reaches an `open` could turn every deep path into a failure. It does not, because Rust's std
-    /// re-adds the prefix itself when it converts a long absolute path for the Win32 call -- but
-    /// that is a property of the standard library rather than of this code, so it is measured here
-    /// instead of assumed.
+    /// On Windows the `\\?\` prefix is what lets a path exceed 260 characters, and
+    /// `canonicalize_for_tool` strips it; deep paths still work because Rust's std re-adds the
+    /// prefix itself when it converts a long absolute path for the Win32 call, but that is a
+    /// property of the standard library rather than of this code, so it is measured here instead
+    /// of assumed.
     #[cfg(windows)]
     #[tokio::test]
     async fn a_path_past_max_path_survives_having_its_verbatim_prefix_stripped() {
@@ -5257,11 +5156,10 @@ mod tests {
     /// A write whose target *is* a workspace root does not put its temp file outside the boundary.
     ///
     /// `is_within_roots` admits a path equal to a root on purpose, and `write_file_bytes` names its
-    /// temp file with `with_file_name` -- which for a root is a sibling of the root, one level
-    /// *above* the workspace. Without it, `write_file({path: ".", force: true})` creates, writes
-    /// and `sync_all`s the model's content before the rename fails with `EISDIR`. The content was
-    /// removed by the error path, but it existed on disk outside the boundary, and a crash in that
-    /// window leaves it.
+    /// temp file with `with_file_name`, which for a root is a sibling of the root, one level above
+    /// the workspace. Without the refusal, `write_file({path: ".", force: true})` creates, writes
+    /// and `sync_all`s the model's content there before the rename fails with `EISDIR`, and a
+    /// crash in that window leaves it.
     #[tokio::test]
     async fn a_write_to_a_directory_never_puts_its_temp_file_outside_the_boundary() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5299,9 +5197,8 @@ mod tests {
     /// `write_file` honors the scope it was **built with**, driven through the tool.
     ///
     /// Every other fence test in this module calls `resolve_write_target` directly, so replacing
-    /// `&self.scope` with an unconfined one in `WriteFileTool::execute` left the whole suite green.
-    /// That is the same gap `an_edit_outside_the_workspace_is_refused` was written to close for
-    /// `edit_file`, and the reasoning was never applied in the other direction.
+    /// `&self.scope` with an unconfined one in `WriteFileTool::execute` would leave them green, as
+    /// `an_edit_outside_the_workspace_is_refused` guards for `edit_file`.
     #[tokio::test]
     async fn a_write_through_the_tool_honors_the_scope_it_was_built_with() {
         let temp = tempfile::tempdir().expect("tempdir");

@@ -4,13 +4,10 @@
 //! variants need something only the host loop has: the live `Agent`, the conversation, the session
 //! id that `/fork` moves. Those are forwarded and answered here.
 //!
-//! **One owner, checked by the compiler.** Split across a hand-written list of variants in
-//! `repl.rs` and a `match` in `main.rs` ending in `_ => {}`, the two have to agree with nothing
-//! making them. They agreed, but nothing made them: adding a variant to the forwarding list and
-//! forgetting the match produced a command that was sent, silently did nothing, and still got its
-//! episode brackets -- a blank-line sandwich around no output, which is exactly what
-//! `Console::announce_foreign_output` warns against three lines above that match.
-//! [`SlashCommand::answered_by`] is now exhaustive and so is [`answer`], so a new variant fails to
+//! **One owner, checked by the compiler.** A hand-written forwarding list and a `match` ending in
+//! `_ => {}` have to agree with nothing making them: a variant added to one and forgotten in the
+//! other is sent, silently does nothing, and still gets its episode brackets around no output.
+//! [`SlashCommand::answered_by`] and [`answer`] are both exhaustive, so a new variant fails to
 //! compile in both places.
 
 use std::sync::Arc;
@@ -140,10 +137,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     } else {
                         agent.reset_conversation_markers().await;
                         with_console(console, |console| {
-                            console.hint(&format!(
-                                "Rewound {turns} turn(s). The model no longer sees them; \
-                             `meka session export` still does.",
-                            ))
+                            console.hint(&format!("Rewound {turns} turn(s)."))
                         });
                     }
                 }
@@ -278,7 +272,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             args,
         } => 'prompt: {
             let Some(manager) = mcp_manager.as_ref() else {
-                crate::streams::write_stderr_line("No MCP servers configured.");
+                crate::streams::write_stderr_line("No MCP servers.");
                 break 'prompt;
             };
             let entry = manager.server_entry(&server);
@@ -353,7 +347,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         // straight to a fresh prompt, which reads as "the command
                         // did nothing" rather than "the prompt was empty".
                         crate::streams::write_stderr_line(format!(
-                            "'{server}:{prompt_name}' rendered an empty prompt; nothing to send."
+                            "'{server}:{prompt_name}' rendered an empty prompt."
                         ));
                     } else {
                         let Ok(input) = crate::agent::TurnInput::from_parts(user_input, Vec::new())
@@ -559,7 +553,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         SlashCommand::Usage => match agent.fetch_usage().await {
             Ok(Some(usage)) => render::render_account_usage(&usage),
             Ok(None) => with_console(console, |console| {
-                console.hint("Account usage isn't available for this backend.")
+                console.hint("Account usage is not available for this backend.")
             }),
             Err(error) => with_console(console, |console| console.error(&error)),
         },
@@ -749,11 +743,8 @@ pub(crate) enum Answerer {
 impl SlashCommand {
     /// Which side answers this command.
     ///
-    /// Exhaustive, and that is the whole point. A hand-written list of variants in the forwarding
-    /// arm plus a `match` in the host loop ending in `_ => {}` have to agree, with nothing making
-    /// them. A variant added to the forwarding list and forgotten in the host was sent, silently
-    /// did nothing, and still got its episode brackets -- a blank line either side of no output.
-    /// Both sides now read this, so a new variant fails to compile until both have been considered.
+    /// Exhaustive, and both sides read it, so a new variant fails to compile until both have been
+    /// considered; see the module docs.
     pub(crate) fn answered_by(&self) -> Answerer {
         match self {
             SlashCommand::Cd { .. } => Answerer::Repl,

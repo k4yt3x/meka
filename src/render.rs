@@ -615,10 +615,8 @@ impl StreamingRenderer {
     ///
     /// Code blocks are pulled out and rendered by [`render_code_block_to_string`], the same
     /// syntect-backed renderer the `syntect` mode uses, because termimad paints a block in one flat
-    /// color with no regard for its language. Segmenting on fences also fixes a bug the previous
-    /// paragraph-splitting loop had: it broke on every `\n\n` with no fence guard, so a code block
-    /// containing a blank line was cut in half and each half handed to termimad separately, which
-    /// left the fence unbalanced.
+    /// color with no regard for its language. Segmenting on fences rather than on `\n\n` is what
+    /// keeps a block containing a blank line whole.
     fn flush_termimad(&mut self) -> io::Result<()> {
         let output = self.take_termimad_output();
         if !output.is_empty() {
@@ -635,10 +633,9 @@ impl StreamingRenderer {
         self.buffer = normalize_spacing(&self.buffer, !self.code_block_lines.is_empty());
 
         // Every iteration below either stops or strictly consumes from the buffer, so the loop
-        // terminates. This tracks that invariant rather than trusting it: the cost of getting it
-        // wrong is a frozen REPL, and it has been wrong once already (a partial-looking table row
-        // ahead of a fence was handed back to the buffer, leaving the loop where it started).
-        // Stopping early is harmless, since `finish` drains whatever is left.
+        // terminates. This tracks that invariant rather than trusting it, because the cost of
+        // getting it wrong is a frozen REPL. Stopping early is harmless, since `finish` drains
+        // whatever is left.
         let mut buffered_before = usize::MAX;
 
         loop {
@@ -893,7 +890,6 @@ fn normalize_spacing(text: &str, starts_inside_fence: bool) -> String {
         }
     }
 
-    // Preserve trailing newline if the original had one
     let mut output = result.join("\n");
     if text.ends_with('\n') {
         output.push('\n');
@@ -1098,8 +1094,8 @@ fn highlight_with_syntax(text: &str, syntax: &SyntaxReference) -> String {
                 out.push_str(&as_24_bit_terminal_escaped(&ranges[..], false));
             }
             Err(error) => {
-                // On parse error, fall back to plain text so we never lose content.
-                tracing::debug!("syntect highlight failed: {error}");
+                // Plain text rather than nothing, so a grammar failure never loses content.
+                tracing::debug!("failed to highlight a line: {error}");
                 out.push_str(line);
             }
         }
@@ -1148,10 +1144,9 @@ fn syntax_for_language(lang: Option<&str>) -> &'static SyntaxReference {
 
 /// Render a fenced code block to ANSI-highlighted text. `lines` is
 /// `[opening_fence, body…, closing_fence?]` (the closing fence is absent when the stream ended
-/// mid-block). The fence lines keep the Markdown coloring they've always had; the body is
-/// highlighted with the block's own language grammar (falling back to plain text for an
-/// absent/unknown tag). Every line ends in a single `\n`, matching the prior `join("\n")` +
-/// `println!()` output.
+/// mid-block). The fence lines keep the Markdown coloring; the body is highlighted with the block's
+/// own language grammar, falling back to plain text for an absent or unknown tag. Every line ends
+/// in a single `\n`.
 fn render_code_block_to_string(lines: &[String]) -> String {
     let Some((opening, rest)) = lines.split_first() else {
         return String::new();
@@ -1222,7 +1217,7 @@ fn format_table(lines: &[String]) -> Vec<String> {
         }
     }
 
-    // Ensure minimum width of 3 for separator dashes
+    // A markdown delimiter cell is at least three dashes.
     for width in &mut column_widths {
         *width = (*width).max(3);
     }
@@ -3556,12 +3551,9 @@ mod tests {
         );
     }
 
-    /// `unicode_width` scores a string and the sum of its characters differently: `"1\u{fe0f}"` is
-    /// two columns as a string and one as a sum. Filling by the sum while gating on the string
-    /// packed twice what fit, and every budget in the file came out at double.
-    /// A line padded with zero-width characters is wrapped in time linear in its length. The old
-    /// loop re-measured the whole prefix per character, so a thinking line of two hundred thousand
-    /// zero-width spaces, or one base with that many combining marks, held the REPL for minutes.
+    /// A line padded with zero-width characters is wrapped in time linear in its length. A loop
+    /// that re-measures the whole prefix per character holds the REPL for minutes on a thinking
+    /// line of two hundred thousand zero-width spaces, or one base with that many combining marks.
     #[test]
     fn wrapping_a_zero_width_flood_is_linear() {
         let flood = format!("{}x", "\u{200B}".repeat(200_000));
@@ -3622,9 +3614,8 @@ mod tests {
     /// that composes a line from model output.
     ///
     /// Individual budget tests each pin one number and none of them catches a line that overflows
-    /// because two capped parts were concatenated, or because chrome was added after the cut. Three
-    /// separate rounds of review found exactly that class of bug, so it gets a test that states the
-    /// invariant rather than an instance of it.
+    /// because two capped parts were concatenated, or because chrome was added after the cut, so
+    /// this states the invariant rather than an instance of it.
     #[test]
     fn no_composed_line_ever_exceeds_the_width_it_was_given() {
         use crate::todo::{TodoItem, TodoStatus};
@@ -4010,8 +4001,7 @@ mod tests {
             // The worst case needs the huge argument to be the one that *crosses* the line, so the
             // block must be one row short of its gate when that argument is reached. Padding past
             // the gate instead drops the huge one by name and never renders it, which is a block of
-            // `block_rows` and proves nothing -- as this test did until its own mutation check
-            // survived.
+            // `block_rows` and proves nothing.
             let mut fields = serde_json::Map::new();
             for index in 0..limits.block_rows - 1 {
                 fields.insert(format!("a{index:04}"), serde_json::json!("v"));
@@ -4160,8 +4150,8 @@ mod tests {
         assert!(super::display_width(&fitted) <= 60);
         let line = super::tool_indicator_line(&zalgo, &serde_json::json!({}), None, 80);
         assert!(super::display_width(&line) <= 80);
-        // Generous by three orders of magnitude against the quadratic version, which took minutes
-        // in this build. A wall-clock assertion is crude, but the property *is* about time.
+        // Generous by three orders of magnitude against a quadratic loop. A wall-clock assertion is
+        // crude, but the property *is* about time.
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "took {:?}",
@@ -4489,8 +4479,8 @@ mod tests {
     /// `path:` in a `full` block keeps its filename rather than six directories.
     #[test]
     fn a_long_path_value_in_a_block_keeps_its_filename() {
-        // At a width that actually cuts. Rendered at `TEST_WIDTH` the 66-column path fits whole, so
-        // the assertions held for any implementation at all and the mutation survived.
+        // At a width that actually cuts: rendered at `TEST_WIDTH` the 66-column path fits whole,
+        // and the assertions hold for any implementation at all.
         let rendered = super::render_tool_params(
             &serde_json::json!({
                 "path": "/home/you/projects/meka/docs/book/src/configuration/config-file.md"
@@ -4875,7 +4865,7 @@ mod tests {
 
     /// The theme's markdown rules are nested selectors (`text.html.markdown markup.raw.inline`),
     /// so resolving an element scope on its own silently yields the default foreground. Inline code
-    /// is the one that exposes this, and it regressed exactly this way during development.
+    /// is the one that exposes this.
     #[test]
     fn inline_code_resolves_through_the_markdown_context() {
         let rendered = termimad_render("uses `inline_code` here\n");
@@ -4982,9 +4972,8 @@ mod tests {
         );
     }
 
-    /// Regression guard: the previous flush split the buffer on every `\n\n` with no fence guard,
-    /// so a code block containing a blank line was cut in half and each half rendered separately,
-    /// leaving the fence unbalanced.
+    /// A code block containing a blank line must not be split at the `\n\n`, or each half renders
+    /// separately with an unbalanced fence.
     #[test]
     fn code_block_containing_a_blank_line_survives() {
         let rendered = termimad_render("```rust\nfn a() {}\n\nfn b() {}\n```\n\nafter\n");

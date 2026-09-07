@@ -41,10 +41,9 @@ pub(crate) struct ServerState {
     pub(crate) reconstruction_locks: super::reattach::ReconstructionLocks,
 }
 
-/// Per-session map entry. Most mutable state lives behind nested locks so cancel / permission /
-/// close handlers can act without waiting on the runtime mutex an in-flight turn holds.
 /// One session `meka serve` holds open: the shared [`ResidentSession`] plus what only the HTTP
-/// host tracks. Derefs to the resident part.
+/// host tracks. Derefs to the resident part. Mutable state lives behind nested locks so the cancel,
+/// permission and close handlers can act without waiting on the mutex an in-flight turn holds.
 #[derive(Clone)]
 pub(crate) struct SessionEntry {
     pub(crate) resident: ResidentSession,

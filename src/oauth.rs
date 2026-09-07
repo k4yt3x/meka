@@ -18,11 +18,11 @@ const OAUTH_REFRESH_SKEW: Duration = Duration::from_secs(5 * 60);
 /// How long a refreshed access token is assumed to last when its issuer states no expiry.
 ///
 /// An *unlabeled stored* credential being due is right: refreshing it is how it becomes labeled.
-/// An unlabeled credential coming back *from that refresh* is a different thing -- the issuer
-/// answered and still said nothing -- and treating it the same way put every subsequent request
-/// back on the slow path: the credential write lock, a database re-read, and a full OAuth round
-/// trip that rotates the refresh token, all serialized behind one another. Assuming a short life
-/// bounds the staleness without the storm, and a token that dies sooner is corrected by its 401.
+/// An unlabeled credential coming back *from that refresh* is a different thing (the issuer
+/// answered and still said nothing), and treating it the same way puts every subsequent request
+/// on the slow path: the credential write lock, a database re-read, and a full OAuth round trip
+/// that rotates the refresh token, all serialized behind one another. Assuming a short life bounds
+/// the staleness without the storm, and a token that dies sooner is corrected by its 401.
 const OAUTH_ASSUMED_LIFETIME: Duration = Duration::from_secs(60 * 60);
 /// `duration` after an epoch-milliseconds instant, saturating. The credential rows store expiry as
 /// epoch milliseconds, which is the one place a `Duration` here meets an integer.
@@ -36,9 +36,9 @@ pub(crate) fn oauth_assumed_expiry(now_millis: i64) -> i64 {
 /// Whether an OAuth access token should be refreshed before the next request.
 ///
 /// `expires_at: None` means the issuer did not say when the token expires, which is not a promise
-/// that it never will. Reading it that way turned an unlabeled token into a 401 on every request
-/// with no refresh ever attempted. It is treated as due, but only when there is a refresh token to
-/// act on: without one, the only thing left is to send it and let the 401 speak.
+/// that it never will. Read that way, an unlabeled token is a 401 on every request with no refresh
+/// ever attempted. It is treated as due, but only when there is a refresh token to act on: without
+/// one, the only thing left is to send it and let the 401 speak.
 ///
 /// The refresh paths stamp [`oauth_assumed_expiry`] rather than handing `None` straight back, so
 /// "due" here stays a one-shot rather than a per-request loop.
@@ -160,7 +160,7 @@ pub(crate) fn now_epoch_millis() -> i64 {
 /// And it has to be *live*. The winner may have stored a token and then sat idle past its
 /// lifetime, so adopting on write order alone would authenticate this very request with a token
 /// that is already dead, having thrown away the good one this refresh just minted. Neither
-/// outcome writes to the row -- what it holds is not this process's to change -- so the only
+/// outcome writes to the row (what it holds is not this process's to change), so the only
 /// question is which token to spend the turn on.
 pub(crate) fn is_worth_adopting(refreshed: &AuthCredential, current: &AuthCredential) -> bool {
     match (refreshed, current) {
@@ -183,7 +183,7 @@ pub(crate) fn is_worth_adopting(refreshed: &AuthCredential, current: &AuthCreden
 /// It is older in one case, a refresh in this process whose persist failed, and installing it
 /// spent a refresh token the issuer had already retired (`invalid_grant`) while the live one sat in
 /// memory. Judged by expiry because that is the one field every refresh advances; an unknown
-/// expiry on either side defers to the row, as before.
+/// expiry on either side defers to the row.
 pub(crate) fn row_is_at_least_as_new(memory: &AuthCredential, row: &AuthCredential) -> bool {
     match (memory, row) {
         (
@@ -248,7 +248,7 @@ pub(crate) async fn await_credential_lock(
 /// per-request `timeout` runs from the start of connecting, not from the request being sent, so a
 /// value under 30 seconds would abandon a connection this same client is still willing to spend 30
 /// seconds establishing. The two numbers being equal means a slow connect can consume the whole
-/// refresh budget, which is the correct precedence -- the total is what bounds the user's wait.
+/// refresh budget, which is the correct precedence: the total is what bounds the user's wait.
 pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Everything an OAuth refresh-token exchange needs, named rather than positional.
 ///
@@ -267,24 +267,18 @@ pub(crate) struct RefreshExchange<'a> {
     /// The account whose credential this is, named in the error so a user knows which one to log
     /// back in to.
     pub(crate) account: &'a str,
-    /// The call site's own description of the request, in the voice that site has always used
-    /// ("OAuth token refresh", "Codex OAuth token refresh"), so its messages do not all read
-    /// alike.
+    /// The call site's own description of the request ("OAuth token refresh", "Codex OAuth token
+    /// refresh"), so its messages do not all read alike.
     pub(crate) context: &'a str,
 }
 /// Spend a refresh token at an issuer's token endpoint and hand back its decoded response.
 ///
-/// One copy of a branch both subscription backends would otherwise keep their own version of. The
-/// shape was identical -- POST the grant, classify the answer, decode the payload -- and only the
-/// payload differs, so the generic parameter is exactly the part that was ever really different:
-/// Claude's issuer states `expires_in` and an account uuid, ChatGPT's states neither and has to be
-/// read out of the JWTs.
-///
-/// The duplication was not theoretical. A mutation sweep deleted the `!` from the Codex copy's `if
-/// !status.is_success()` and no test noticed, because the Claude copy was the one under test; two
-/// hand-written copies of a classification means two chances to get it wrong and two places to
-/// remember when it changes. Both call sites keep their own test even so, since each still has to
-/// prove it reaches this function at all.
+/// One copy for both subscription backends: POST the grant, classify the answer, decode the
+/// payload. Only the payload differs (Claude's issuer states `expires_in` and an account uuid,
+/// ChatGPT's states neither and has to be read out of the JWTs), so that is the generic parameter.
+/// Two hand-written copies of a classification are two chances to get it wrong and two places to
+/// remember when it changes. Both call sites keep a test of their own even so, since each still
+/// has to prove it reaches this function at all.
 ///
 /// Errors are classified where they belong rather than here: a call that got no answer through
 /// [`crate::error::provider_transport_error`], and an answered one through
@@ -355,8 +349,8 @@ pub(crate) async fn exchange_refresh_token<T: serde::de::DeserializeOwned>(
 /// Persist a refreshed credential, and answer with the one that should actually be used.
 ///
 /// A refresh is derived from the credential it read, so it may only replace *that* credential.
-/// Where the row has moved on -- another process refreshed first, or a `meka account login`
-/// completed while this round trip was in flight -- the stored value is newer than what this
+/// Where the row has moved on (another process refreshed first, or a `meka account login`
+/// completed while this round trip was in flight) the stored value is newer than what this
 /// refresh produced, and adopting it is both correct and what keeps the issuer's live token and the
 /// database in agreement. A blind upsert leaves them disagreeing silently, and the symptom arrives
 /// at the *next* launch as `invalid_grant` with nothing naming the cause.
@@ -380,16 +374,15 @@ pub(crate) async fn store_refreshed_credential(
             Ok(Some(version)) => version,
             Ok(None) => {
                 tracing::warn!(
-                    "'{account}' has no stored credential any more, so the refreshed token was not \
+                    "'{account}' no longer has a stored credential; the refreshed token was not \
                      persisted"
                 );
                 return refreshed;
             }
             Err(error) => {
                 tracing::warn!(
-                    "failed to read the stored credential's version for '{account}' ({error}); this session \
-                     continues, but the stored token is now stale and the next launch will need \
-                     `meka account login`"
+                    "failed to read the stored credential's version for '{account}': {error}; the \
+                     stored token is now stale and the next launch will need `meka account login`"
                 );
                 return refreshed;
             }
@@ -413,8 +406,8 @@ pub(crate) async fn store_refreshed_credential(
         }
         Ok(crate::store::CredentialWrite::Superseded(_)) => {
             tracing::warn!(
-                "'{account}' was written by something else during this refresh and what it holds now \
-                 cannot authenticate this session; continuing on the token just minted"
+                "'{account}' was rewritten during this refresh with a credential this session cannot \
+                 use; continuing on the refreshed token"
             );
             refreshed
         }
@@ -423,20 +416,20 @@ pub(crate) async fn store_refreshed_credential(
         // this process finishes its turn on what it has and the next launch asks for a login.
         Ok(crate::store::CredentialWrite::Gone) => {
             tracing::warn!(
-                "'{account}' has no stored credential any more, so the refreshed token was not persisted"
+                "'{account}' no longer has a stored credential; the refreshed token was not persisted"
             );
             refreshed
         }
         Err(error) => {
             tracing::warn!(
-                "failed to persist the refreshed token for '{account}' ({error}); this session continues, but \
-                 the stored token is now stale and the next launch will need \
-                 `meka account login`"
+                "failed to persist the refreshed token for '{account}': {error}; the stored token is \
+                 now stale and the next launch will need `meka account login`"
             );
             refreshed
         }
     }
 }
+/// A PKCE verifier and its S256 challenge, for a login's authorization request.
 pub(crate) fn generate_pkce_pair() -> (String, String) {
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
@@ -445,6 +438,7 @@ pub(crate) fn generate_pkce_pair() -> (String, String) {
     let code_challenge = URL_SAFE_NO_PAD.encode(digest);
     (code_verifier, code_challenge)
 }
+/// A fresh `state` value for a login's authorization request.
 pub(crate) fn generate_state() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);

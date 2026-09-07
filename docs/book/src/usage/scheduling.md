@@ -74,7 +74,7 @@ schedule_create(
   every: "1m",
   gate: {
     check: { tool: "mcp__mekabridge__unseen", arguments: {} },
-    when: { at: "/chats", is: "not-empty" }
+    when: { at: "/chats", is: "not_empty" }
   },
   prompt: "There are unseen chats. Read them and reply if anything needs an answer."
 )
@@ -92,7 +92,7 @@ carrying on with authority nobody granted it.
 | `"changed"` (default) | the whole result differs from the previous evaluation |
 | `"succeeded"` | the command exits 0, or the tool call did not return an error |
 | `{ matches: "<regex>" }` | the result matches the pattern |
-| `{ at: "<json pointer>", is: "not-empty" \| "empty" \| "changed" }` | the pointed-at value satisfies the test |
+| `{ at: "<json pointer>", is: "not_empty" \| "empty" \| "changed" }` | the pointed-at value satisfies the test |
 
 One trap in the `"succeeded"` row: most MCP tools never set an error, so it is true on every
 evaluation and the job fires every interval. It earns its place on a *shell* gate, where the exit
@@ -266,8 +266,8 @@ lose them. What happens to jobs whose time passed while meka was down depends on
 That collapsing is per job. A session with several jobs all due at once still wakes to a turn each,
 and a sweep runs at most `[schedule] max_consecutive_fires` (5 by default) of any **one session's**
 jobs before moving on. The rest keep their occurrence and their gate baseline and are taken by the
-next sweep, most-overdue first, so nothing is lost and nothing starves. A job held over runs no gate,
-so holding one over is nearly free; the sweep still evaluates whether the job is one it can run.
+next sweep, most-overdue first, so nothing is lost and nothing starves. A job held over runs no gate
+and is not claimed, so holding one over is free.
 
 **What this does and does not do.** It bounds a *batch*, not a total: forty due jobs still produce
 forty turns, and they are not spaced out: a sweep that ran long leaves the next one already due.

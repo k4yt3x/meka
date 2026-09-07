@@ -58,7 +58,7 @@ pub(super) async fn decode_acp_image(
     let mime_type = image.mime_type.clone();
     tokio::task::spawn_blocking(move || crate::image::decode_base64_image(&data, &mime_type))
         .await
-        .map_err(|error| format!("image decode task failed: {error}"))?
+        .map_err(|error| format!("failed to decode the image: {error}"))?
 }
 
 /// If `prompt_text` is a [`crate::host::COMMANDS`] invocation, render its output; otherwise `None`
@@ -88,8 +88,8 @@ pub(super) async fn try_local_command(
 pub(super) async fn build_usage_text(agent: &crate::agent::Agent) -> String {
     match agent.fetch_usage().await {
         Ok(Some(usage)) => crate::render::format_account_usage(&usage),
-        Ok(None) => "Account usage isn't available for this backend.".to_string(),
-        Err(error) => format!("Error fetching usage: {error}"),
+        Ok(None) => "Account usage is not available for this backend.".to_string(),
+        Err(error) => format!("failed to fetch usage: {error}"),
     }
 }
 /// Plain-text `/status` output: the block the REPL prints, from [`crate::host::format_status`],
@@ -111,11 +111,11 @@ pub(super) fn build_status_text(
 /// Plain-text `/mcp` output: each configured MCP server and its live connection state.
 pub(super) async fn build_mcp_list_text(shared: &crate::host::SharedDeps) -> String {
     let Some(manager) = shared.mcp_manager.as_ref() else {
-        return "No MCP servers configured.".to_string();
+        return "No MCP servers.".to_string();
     };
     let names = manager.server_names();
     if names.is_empty() {
-        return "No MCP servers configured.".to_string();
+        return "No MCP servers.".to_string();
     }
     let mut out = String::from("MCP servers\n");
     for name in names {
@@ -228,8 +228,7 @@ pub(super) fn split_acp_slash(prompt_text: &str) -> Option<(String, String)> {
 /// - `/<skill-name>` matching an installed skill: returns `extra\n\n{body}` where `body` is
 ///   [`crate::skills::load_skill_body`]'s output (the skill's base-directory header followed by its
 ///   body verbatim). Empty `extra` collapses to just `body`. Same composition the REPL's
-///   `SlashCommand::SkillInvoke` handler uses; named rather than cited by line, because a line
-///   number is a cross-reference that rots on the next edit and this one already had.
+///   `SlashCommand::SkillInvoke` handler uses.
 /// - `/<name>` with a syntactically valid skill name but no installed skill of that name:
 ///   `SkillNotFound`. The caller sends the original text to the model rather than failing the
 ///   prompt, because `/usr local lib` parses the same way.
@@ -409,7 +408,7 @@ pub(super) async fn run_prompt_turn(
     if has_images && !entry.accepts_images() {
         return responder.respond_with_error(invalid_params_error(
             "image content blocks require a profile with vision enabled; set `vision = true` under \
-             `[profiles.<name>]` or send text only",
+             `[profiles.<name>]`",
         ));
     }
 
@@ -533,10 +532,9 @@ pub(super) async fn run_prompt_turn(
                 StopReason::Cancelled
             } else {
                 // Through the one classifier, which decides what of a failed turn an editor may
-                // read. Formatted here instead, every variant's `Display` went out verbatim: an
-                // upstream body naming the operator's account regardless of
-                // `relay_provider_errors`, an MCP connector's spawn command line, and a
-                // `Database` error naming the store's path.
+                // read; a `Display` formatted here would carry an upstream body naming the
+                // operator's account, an MCP connector's spawn command line, or a `Database`
+                // error naming the store's path.
                 return responder.respond_with_error(acp_error_for(
                     &error,
                     state.shared.relay_provider_errors(),

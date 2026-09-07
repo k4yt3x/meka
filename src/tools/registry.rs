@@ -66,15 +66,11 @@ pub(crate) fn requested_tool_names(input: &serde_json::Value) -> Vec<String> {
 /// carried is recorded here. Harmless: a name with no registry entry matches nothing when the
 /// active set is assembled (see [`ToolRegistry::definitions_active_with_loaded`]).
 ///
-/// **Test-only, and compiled out otherwise, because the answer it gives is not the one production
-/// wants.** A materialized slice shows only the `load_tool` exchanges still standing in the current
-/// view, and two ordinary things take them out of it: a compaction replaces everything before its
-/// boundary with a summary that names nothing, and `DegradeTier::ToolExchanges` empties a refused
-/// call in place. Both leave a load that really happened invisible here.
-/// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`] reads the log instead and so
-/// survives both, which is why every production caller uses it. Keeping this one available to tests
-/// that hold a plain `Vec<Message>` is fine; `#[cfg(test)]` is what stops it drifting back into a
-/// live path, which is how the compaction snapshot came to be built from it.
+/// Test-only, because the answer it gives is not the one production wants: a materialized slice
+/// shows only the `load_tool` exchanges still standing in the current view, and a compaction or a
+/// `DegradeTier::ToolExchanges` repair takes them out of it.
+/// [`crate::tools::load_tool::extract_loaded_tool_names_from_events`] reads the log instead. The
+/// `#[cfg(test)]` is what stops this drifting back into a live path.
 #[cfg(test)]
 pub(crate) fn extract_loaded_tool_names(messages: &[Message]) -> HashSet<String> {
     let mut pending: HashMap<String, Vec<String>> = HashMap::new();
@@ -181,7 +177,7 @@ pub(crate) fn server_of_tool(tool_name: &str) -> Option<&str> {
 }
 /// The MCP resource and prompt meta-tools, which `mcp_resources::register_all` registers directly
 /// rather than through `register_builtin`. Deniable via `disabled_tools`, but deliberately outside
-/// `allowed_tools` -- see [`BuiltinToolFilter::denies`].
+/// `allowed_tools`; see [`BuiltinToolFilter::denies`].
 pub(crate) const MCP_META_TOOL_NAMES: &[&str] = &[
     "mcp_prompt_get",
     "mcp_prompt_list",
@@ -285,17 +281,15 @@ pub(crate) fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
             if !known.contains(name.as_str()) {
                 let hint = builtin_name_hint(name);
                 tracing::warn!(
-                    "[tools].allowed_tools entry '{name}' doesn't match any built-in tool.{hint}"
+                    "`[tools].allowed_tools` entry '{name}' matches no built-in tool.{hint}"
                 );
             } else if MCP_META_TOOL_NAMES.contains(&name.as_str()) {
                 // These register outside the allow-list (see
-                // `ToolRegistry::admits_infrastructure`), so naming one here is inert. Worth
-                // saying: the entry looks like it is keeping the tool, and before the meta-tools
-                // were listed in `BUILTIN_TOOL_NAMES` at all this case at least warned as
-                // unrecognized.
+                // `ToolRegistry::admits_infrastructure`), so naming one here is inert while
+                // looking like it keeps the tool.
                 tracing::warn!(
-                    "[tools].allowed_tools entry '{name}' has no effect; the MCP meta-tools bypass \
-                     the allow-list, so use [tools].disabled_tools to remove one"
+                    "`[tools].allowed_tools` entry '{name}' has no effect; name it in \
+                     `[tools].disabled_tools` to remove it"
                 );
             }
         }
@@ -304,7 +298,7 @@ pub(crate) fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
         if !known.contains(name.as_str()) {
             let hint = builtin_name_hint(name);
             tracing::warn!(
-                "[tools].disabled_tools entry '{name}' doesn't match any built-in tool.{hint}"
+                "`[tools].disabled_tools` entry '{name}' matches no built-in tool.{hint}"
             );
         }
     }
@@ -312,7 +306,7 @@ pub(crate) fn warn_on_stale_builtin_tool_config(filter: &BuiltinToolFilter) {
         if !known.contains(name.as_str()) {
             let hint = builtin_name_hint(name);
             tracing::warn!(
-                "[tools.tool_permissions] entry '{name}' doesn't match any built-in tool.{hint}"
+                "`[tools.tool_permissions]` entry '{name}' matches no built-in tool.{hint}"
             );
         }
     }
@@ -341,7 +335,7 @@ pub(crate) fn warn_on_stale_subagent_config(denials: &ToolDenials, configured_se
     for name in denials.server_list() {
         if !servers.contains(name.as_str()) {
             tracing::warn!(
-                "[subagents].disabled_servers entry '{name}' doesn't match any configured MCP server"
+                "`[subagents].disabled_servers` entry '{name}' matches no configured MCP server"
             );
         }
     }
@@ -354,8 +348,8 @@ pub(crate) fn warn_on_stale_subagent_config(denials: &ToolDenials, configured_se
             continue;
         }
         tracing::warn!(
-            "[subagents].disabled_tools entry '{name}' matches no built-in tool and no configured MCP \
-             server"
+            "`[subagents].disabled_tools` entry '{name}' matches no built-in tool and no configured \
+             MCP server"
         );
     }
 }
@@ -443,10 +437,6 @@ impl ToolRegistry {
     /// register them first and only then run the session-scoped pass, so the fallback is
     /// unreachable there; it fails closed so that a registry which cannot tell whether a boundary
     /// applies refuses rather than assumes.
-    ///
-    /// Named for what it returns. The previous name promised an *unconfined* scope, the opposite of
-    /// what the body does, sitting in the one place a reader auditing for fail-open behavior would
-    /// look first.
     pub(super) fn write_scope_or_deny_all(&self) -> crate::workspace::WriteScope {
         crate::sync::read(&self.write_scope)
             .clone()
@@ -463,18 +453,14 @@ impl ToolRegistry {
     /// Whether this registry will accept a tool by that name: it has to pass both the `[tools]`
     /// filter and the sub-agent deny list.
     ///
-    /// The single predicate behind [`Self::register_builtin`] *and* the two paths that call
+    /// The single predicate behind [`Self::register_builtin`] and the two paths that call
     /// [`Self::register`] directly ([`mcp_resources::register_all`] and
-    /// [`subagent::register_subagent_tools`]). Those two exist because their tools are built from
-    /// collaborators the generic builder doesn't have, and routing them past `register_builtin`
-    /// routes them past the filters with it: naming an MCP meta-tool or `agent_spawn` in a deny
-    /// list would then do nothing at all. Any future direct registration should come through here
-    /// too.
+    /// [`subagent::register_subagent_tools`]), whose tools are built from collaborators the generic
+    /// builder does not have; routing them past `register_builtin` would route them past the
+    /// filters with it. Any future direct registration should come through here too.
     pub(crate) fn admits(&self, name: &str) -> bool {
         if !self.builtin_filter.admits(name) {
-            tracing::info!(
-                "skipping tool '{name}' (excluded by [tools].allowed_tools/disabled_tools)"
-            );
+            tracing::info!("skipping tool '{name}': excluded by `[tools]`");
             return false;
         }
         self.not_denied(name)
@@ -486,7 +472,7 @@ impl ToolRegistry {
     /// [`BuiltinToolFilter::denies`] for why widening it now would break working configs.
     pub(crate) fn admits_infrastructure(&self, name: &str) -> bool {
         if self.builtin_filter.denies(name) {
-            tracing::info!("skipping tool '{name}' (disabled by [tools].disabled_tools)");
+            tracing::info!("skipping tool '{name}': disabled by `[tools].disabled_tools`");
             return false;
         }
         self.not_denied(name)
@@ -494,7 +480,7 @@ impl ToolRegistry {
 
     pub(super) fn not_denied(&self, name: &str) -> bool {
         if self.denials.denies_tool(name) {
-            tracing::info!("skipping tool '{name}' for sub-agent (denied by config)");
+            tracing::info!("skipping tool '{name}' for sub-agent: denied by config");
             return false;
         }
         true
@@ -513,8 +499,6 @@ impl ToolRegistry {
     }
 
     /// Register a tool. Returns an error if another tool with the same name is already registered.
-    /// Callers that know the tool is unique (e.g. core builtins) may `.expect()` the result; MCP
-    /// registration should log and continue so one bad server can't break startup.
     pub(crate) fn register(&self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.definition().name;
         let mut tools = crate::sync::write(&self.tools);
@@ -841,15 +825,14 @@ impl ToolRegistry {
         }
         #[allow(
             clippy::expect_used,
-            reason = "a collision means two builtins share a name, a bug the first build must surface rather than drop the second registration"
+            reason = "two builtins sharing a name is a bug the first build must surface"
         )]
         self.register(tool).expect("builtin tool name collision");
     }
 
     /// Register the session-scoped tools (load_tool, skill_*, render_image, todo, scratchpad_*) on
     /// the registry. Shared between [`Self::build_default`] and [`Self::build_for_subagent`] so
-    /// adding a new such tool to the parent automatically gives it to sub-agents too. Todo-list
-    /// rendering is the [`crate::frontend::Frontend`]'s concern now, not the tool's.
+    /// adding a new such tool to the parent automatically gives it to sub-agents too.
     ///
     /// `parent_session_id` + `inherited_scratchpad_names` configure read-only scratchpad
     /// inheritance for sub-agents. Both are `None`/empty on the root agent's registry, so no
@@ -906,10 +889,8 @@ impl ToolRegistry {
         // `memory_access` is how much of that store the agent in front of us may reach.
         if memories.enabled() && memory_access != crate::config::MemoryAccess::None {
             // Registration order is the order the tools reach the provider, and the tool array
-            // heads the prompt-cache prefix. Interleaving the gates rather than grouping them
-            // keeps a full-access agent's order identical to what it was before the levels
-            // existed, so no existing installation pays a cache miss for a set that did not
-            // actually change.
+            // heads the prompt-cache prefix, so the gates are interleaved rather than grouped to
+            // keep a full-access agent's order stable.
             if memory_access == crate::config::MemoryAccess::Write {
                 self.register_builtin(Arc::new(memory::MemoryWriteTool {
                     memories: memories.clone(),
@@ -1152,19 +1133,19 @@ impl ToolRegistry {
     ///
     /// Nothing session-scoped is registered: a gate is a predicate, and `memory_*` / `skill_*` /
     /// `todo` are not questions about the world. What it does get is the read-only built-ins a
-    /// watcher wants -- `read_file`, `fetch_url`, `search_web` -- built against the *job's* cwd
-    /// rather than the host process's, for the same reason a shell gate runs there.
+    /// watcher wants (`read_file`, `fetch_url`, `search_web`), built against the job's cwd rather
+    /// than the host process's, for the same reason a shell gate runs there.
     ///
     /// Construction is allocation only, no I/O, so a caller may build one per evaluation.
     /// `SilentFrontend` because nobody is watching a scheduled fire, and empty roots.
     ///
     /// Empty roots is not the same as nowhere: `WriteScope::confined_to` at `read` still admits the
-    /// job's own directory. A gate may only call a tool that *resolves* to `read`, and nothing meka
-    /// ships writes at that level -- but `tool_permissions` can lower one that does, and it then
-    /// writes under the session's cwd, unattended, for as long as the job exists. That is the
-    /// operator's own instruction being honored rather than a hole, and it is why this does not
-    /// claim writes are impossible. `execute_command` is the one tool that cannot be opened this
-    /// way, since it re-derives its own confinement rather than trusting the level.
+    /// job's own directory. A gate may only call a tool that resolves to `read`, and nothing meka
+    /// ships writes at that level, but `tool_permissions` can lower one that does, and it then
+    /// writes under the session's cwd, unattended, for as long as the job exists: the operator's
+    /// own instruction, which is why this does not claim writes are impossible. `execute_command`
+    /// cannot be opened this way, since it re-derives its own confinement rather than trusting
+    /// the level.
     pub(crate) fn for_gate(core: &CoreMaterials, site: crate::session::ToolSite) -> Result<Self> {
         let registry = Self::new_with_filter(core.builtin_filter.clone());
         registry.register_core_tools(core, site)?;
@@ -1243,14 +1224,10 @@ mod tests {
         },
     };
 
-    /// The shell tool the production builder hands out writes into the **process-wide** grant
-    /// ledger, not one of its own.
-    ///
-    /// `WindowsGrants` is a singleton because a sub-agent finishing its task must not revoke ACEs
-    /// the parent is still writing through. `register_core_tools` clones `process_grants()` to get
-    /// that, but every Windows test built its tool by hand with a fresh `WindowsGrants::default()`,
-    /// so the clone was untested: replace it with a default and the suite stays green while each
-    /// tool gets a private ledger again, restoring the bug the singleton was introduced to fix.
+    /// The shell tool the production builder hands out writes into the process-wide grant ledger,
+    /// not one of its own: `WindowsGrants` is a singleton because a sub-agent finishing its task
+    /// must not revoke ACEs the parent is still writing through, and every other Windows test
+    /// builds its tool by hand with a fresh `WindowsGrants::default()`.
     ///
     /// Asserted behaviorally rather than by identity because `ToolRegistry` hands back
     /// `Arc<dyn Tool>` with no downcast: run a real confined command through the registry's own
@@ -1320,18 +1297,13 @@ mod tests {
         );
     }
 
-    /// The registry's write boundary is bound to the **session's own** permission cell, so moving
-    /// that cell moves the boundary.
-    ///
-    /// Nothing tested this wire, and cutting it -- building the shared `WriteScope` from a
-    /// permanently-`Unrestricted` handle instead of `shared_permission` -- left the whole suite
-    /// green. That single edit severs the session's level from `write_file`, `edit_file`,
-    /// `scratchpad_save_file` *and* `execute_command` at once, which makes `workspace` completely
-    /// inert in production while reporting success on every write. It fails **open**, silently, and
-    /// it is one line.
+    /// The registry's write boundary is bound to the session's own permission cell, so moving that
+    /// cell moves the boundary. Building the shared `WriteScope` from a permanently-`Unrestricted`
+    /// handle instead would sever the session's level from `write_file`, `edit_file`,
+    /// `scratchpad_save_file` and `execute_command` at once, failing open in one line.
     ///
     /// Driven through the production builder and the real tool rather than through the helpers,
-    /// because the helpers are what the cut edit leaves working.
+    /// because the helpers are what that edit leaves working.
     #[tokio::test]
     async fn the_write_boundary_follows_the_session_permission_cell() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1860,15 +1832,10 @@ mod tests {
         ]);
     }
 
-    /// The active tool set is **byte-identical at every permission level**, which is what lets the
-    /// Claude prompt-cache prefix survive a mid-session Shift+Tab.
-    ///
-    /// This is the property `Permission::allows` is shaped around: `Workspace` and `Unrestricted`
-    /// are deliberately equal there, and scope is enforced at the write door instead of by hiding
-    /// tools. The test that carried this name did not mention permission at all -- it called
-    /// `definitions_active(&[])` twice and compared the two results, which is `a == a` and holds
-    /// even if the function returns an empty vector. Making the registry's tools array depend on
-    /// the level again would not have failed it.
+    /// The active tool set is byte-identical at every permission level, which is what lets the
+    /// Claude prompt-cache prefix survive a mid-session Shift+Tab. This is the property
+    /// `Permission::allows` is shaped around: `Workspace` and `Unrestricted` are deliberately equal
+    /// there, and scope is enforced at the write door instead of by hiding tools.
     ///
     /// Compares the serialized definitions rather than the names, because "byte-identical" is the
     /// actual claim: a description or a schema that varied by level would break the cache just as
@@ -2037,9 +2004,8 @@ mod tests {
 
     #[tokio::test]
     async fn scratchpad_tools_default_to_active() {
-        // Regression: feedback agents kept tripping on the asymmetry where scratchpad_write was
-        // active but _read/_edit/_list/_delete were deferred behind load_tool. All five must ship
-        // default now.
+        // Every scratchpad tool ships active: an asymmetry where `scratchpad_write` is active but
+        // its siblings are deferred behind `load_tool` trips agents up.
         let registry = tool_registry_for_test().await;
         let entries = registry.tool_catalog();
         for name in [
@@ -2475,9 +2441,9 @@ mod tests {
     }
 
     /// `[subagents]` restricts sub-agents, not the agent doing the delegating. The root registry's
-    /// own denial set is empty, so `admits` is what keeps `disabled_tools = ["agent_spawn"]` --
-    /// the natural way to write "sub-agents may not spawn sub-agents" -- from deleting the root
-    /// agent's ability to delegate at all.
+    /// own denial set is empty, so `admits` is what keeps `disabled_tools = ["agent_spawn"]` (the
+    /// natural way to write "sub-agents may not spawn sub-agents") from deleting the root agent's
+    /// ability to delegate at all.
     #[tokio::test]
     async fn registry_admits_is_answered_by_the_registry_not_the_config() {
         let root =
@@ -2495,8 +2461,7 @@ mod tests {
     }
 
     /// The MCP meta-tools are registered outside `register_builtin`, so `admits` is the only thing
-    /// standing between them and a deny list that names them. Before it, `disabled_tools =
-    /// ["mcp_resource_read"]` was accepted and silently did nothing.
+    /// standing between them and a deny list that names them.
     #[tokio::test]
     async fn registry_admits_covers_the_directly_registered_tools() {
         let registry = subagent_registry(

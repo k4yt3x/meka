@@ -171,17 +171,12 @@ pub(crate) async fn persist_oversized_results(
                     }
 
                     counter += 1;
-                    // Unique for the life of the session, not just within this call.
-                    //
-                    // `counter` restarts at zero on every invocation -- this runs once per
-                    // assistant message -- so the name was `<tool>_1` for the first oversized
-                    // result of *every* turn. `save_scratchpad_entry` is `INSERT OR REPLACE` keyed
-                    // on `(session, name)`, so turn 3's 150 KB command output silently overwrote
-                    // turn 1's, and the model reading back the handle it was given in turn 1 got
-                    // turn 3's bytes with no error and no size complaint. MCP tools were worse:
-                    // their hint is a stable `mcp_<server>_<tool>`, so every large fetch from one
-                    // server collapsed onto one name. The `tool_use_id` is provider-generated and
-                    // unique per call, which is exactly the scope the name needs.
+                    // Unique for the life of the session, not just within this call: `counter`
+                    // restarts at zero on every invocation (this runs once per assistant message)
+                    // and `save_scratchpad_entry` is `INSERT OR REPLACE` keyed on `(session,
+                    // name)`, so a name built from the counter alone would let a later turn's
+                    // spill silently replace an earlier one under the handle the model still
+                    // holds. The `tool_use_id` is provider-generated and unique per call.
                     let name = format!("{}_{}_{}", base_name, short_call_id(tool_use_id), counter);
 
                     store.save_scratchpad_entry(session_id, &name, text).await?;
@@ -822,7 +817,7 @@ impl Tool for ScratchpadMergeTool {
 
         // Resolve each source. Inheritance-aware: child first, then parent if the name is
         // allowlisted; same fallback path as ScratchpadReadTool. Any missing source aborts the
-        // merge so we never partially write the target.
+        // merge, so the target is never partially written.
         let mut loaded: Vec<(String, String)> = Vec::with_capacity(sources.len());
         for name in &sources {
             let mut content = self.store.load_scratchpad_entry(session_id, name).await?;
@@ -1141,10 +1136,9 @@ impl Tool for ScratchpadLoadFileTool {
             super::util::canonicalize_for_tool("scratchpad_load_file", &resolved).await?;
         super::util::refuse_private_read("scratchpad_load_file", &self.site, &canonical)?;
 
-        // We read the file as raw bytes (rather than directly as a String) so that on a UTF-8
-        // failure we can run a single content sniff and tell the model what kind of binary it just
-        // tried to load. The happy path then incurs one extra allocation; for the sizes this tool
-        // is meant for (tens of MB), that's negligible.
+        // Raw bytes rather than a `String`, so a UTF-8 failure can be sniffed once and the model
+        // told what kind of binary it tried to load. The happy path pays one extra allocation,
+        // negligible at the sizes this tool is meant for.
         let bytes = super::file::read_file_bytes(&canonical)
             .await
             .map_err(|error| MekaError::ToolExecution {
@@ -1196,10 +1190,9 @@ pub(super) struct ScratchpadSaveFileTool {
     /// The same tracker `write_file` and `edit_file` stamp.
     ///
     /// This tool is described to the model as the scratchpad's `write_file`, and it lands bytes at
-    /// a path the user named -- so it has to leave the same record. Without it the tracker still
-    /// held the pre-save stamp, and the next `write_file` or `edit_file` on that path was refused
-    /// with "Something else wrote to it (a shell command, another agent, or the user)". The writer
-    /// was meka, one call earlier.
+    /// a path the user named, so it has to leave the same record: otherwise the tracker keeps the
+    /// pre-save stamp and the next `write_file` or `edit_file` on that path is refused as if
+    /// something else had written it.
     pub(crate) read_tracker: crate::tools::ReadTracker,
 }
 
@@ -1291,28 +1284,23 @@ impl Tool for ScratchpadSaveFileTool {
         )
         .await?;
 
-        // Asked *under* the write lock, so the answer is still true when the write happens.
-        //
-        // This tool reads as the scratchpad's `write_file` and its description says so, but it had
-        // none of that tool's protections: no read of the target, so no staleness check to fail; no
-        // `force`, so nothing to bypass and nothing to consult; and a confirmation that named the
-        // bytes written while never mentioning the bytes replaced. A path the model named by
-        // mistake was gone with a success message on top of it. `force` is the same escape hatch
-        // `write_file` and `edit_file` offer, spelled the same way.
+        // Asked under the write lock, so the answer is still true when the write happens. This
+        // tool reads as the scratchpad's `write_file`, so it refuses to replace an existing file
+        // the same way, and `force` is the same escape hatch, spelled the same way.
         let force = input
             .get("force")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         // "Cannot tell" is not "does not exist": a target that is there but cannot be stat'ed (a
-        // symlink loop, an I/O error) was written over without `force` and reported as a plain
-        // save. `write_file` refuses the same case with the same escape hatch.
+        // symlink loop, an I/O error) must not be written over without `force`. `write_file`
+        // refuses the same case with the same escape hatch.
         let replaced = match tokio::fs::metadata(&target).await {
             Ok(meta) => Some(meta.len()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) if force => {
                 let path = target.display();
                 tracing::debug!(
-                    "scratchpad_save_file: failed to read '{path}' ({error}); force was set, \
+                    "scratchpad_save_file: failed to stat '{path}' ({error}); `force` is set, \
                      writing anyway"
                 );
                 None
@@ -1403,12 +1391,11 @@ mod tests {
 
     /// `scratchpad_save_file` is fenced by the scope it was built with, and stamps the tracker.
     ///
-    /// Two gaps in one place. Every other test here builds the tool with
-    /// `WriteScope::unconfined()`, so replacing `&self.scope` with a fresh unconfined scope left
-    /// the suite green -- and this tool is described to the model as the scratchpad's `write_file`,
-    /// so that is a full write door outside the boundary at `workspace`. Separately it never
-    /// recorded its write, so the next `write_file`/`edit_file` on the same path was refused with
-    /// "Something else wrote to it", blaming a shell command or the user for meka's own bytes.
+    /// Every other test here builds the tool with `WriteScope::unconfined()`, so replacing
+    /// `&self.scope` with a fresh unconfined scope would leave them green, and this tool is
+    /// described to the model as the scratchpad's `write_file`, so that would be a full write door
+    /// outside the boundary at `workspace`. A save that is not recorded makes the next
+    /// `write_file`/`edit_file` on the same path refuse meka's own bytes as someone else's.
     #[tokio::test]
     async fn saving_a_file_is_fenced_by_its_scope_and_records_the_write() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1534,10 +1521,9 @@ mod tests {
         assert_eq!(loaded, Some(large_text));
     }
 
-    /// The counter restarts on every call, so a name built from it alone repeated across turns --
-    /// and `save_scratchpad_entry` is `INSERT OR REPLACE`, so the later spill silently destroyed
-    /// the earlier one. The model still held the first handle from its conversation and would
-    /// read back the *second* result under it, with nothing to signal the substitution.
+    /// The counter restarts on every call, so a name built from it alone repeats across turns, and
+    /// `save_scratchpad_entry` is `INSERT OR REPLACE`, so the later spill would silently destroy
+    /// the earlier one while the model still held the first handle.
     #[tokio::test]
     async fn spilled_outputs_from_different_calls_do_not_overwrite_each_other() {
         let manager = Store::for_test().await;
@@ -1744,9 +1730,9 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_scratchpad_ignores_non_scratchpad_keys() {
-        // Regression test for the `render_image` clobber bug: when a tool uses `from_scratchpad`
-        // (as an input-source param) instead of `scratchpad` (the output-destination convention),
-        // the agent-layer save must not touch the pre-existing scratchpad entry.
+        // When a tool uses `from_scratchpad` (an input-source parameter) rather than `scratchpad`
+        // (the output-destination convention), the agent-layer save must not touch the
+        // pre-existing scratchpad entry.
         let manager = Store::for_test().await;
         let session_id = manager
             .create_session(None, "test-profile".to_string())
@@ -3010,8 +2996,8 @@ mod tests {
 
     #[tokio::test]
     async fn scratchpad_load_file_resolves_relative_path_against_cwd() {
-        // Regression: a relative path must resolve against the session cwd (like `read_file`), not
-        // the process cwd, so `scratchpad_load_file` tracks `/cd`.
+        // A relative path resolves against the session cwd (like `read_file`), not the process
+        // cwd, so `scratchpad_load_file` tracks `/cd`.
         let manager = Store::for_test().await;
         let session_id = manager
             .create_session(None, "test-profile".to_string())
@@ -3050,7 +3036,7 @@ mod tests {
     }
 
     /// A target that exists but cannot be stat'ed is refused without `force`. Read as absent, a
-    /// symlink loop at the path was written over and the save reported as a plain success.
+    /// symlink loop at the path would be written over and the save reported as a plain success.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_target_that_cannot_be_read_is_not_treated_as_absent() {
@@ -3097,7 +3083,7 @@ mod tests {
 
     #[tokio::test]
     async fn scratchpad_save_file_resolves_relative_path_against_cwd() {
-        // Regression: a relative save path must land under the session cwd, not the process cwd.
+        // A relative save path lands under the session cwd, not the process cwd.
         let manager = Store::for_test().await;
         let session_id = manager
             .create_session(None, "test-profile".to_string())
@@ -3139,11 +3125,10 @@ mod tests {
 
     /// `scratchpad_save_file` has to take the same per-path write lock `write_file` does.
     ///
-    /// It carried its own copy of the path resolution and then called `write_file_bytes` directly,
-    /// so the two shared no lock at all. Both are dispatched concurrently from one assistant
-    /// message and both write through a temp file derived from the target, so two calls naming one
-    /// path could interleave their write-then-rename and publish a spliced file. Asserted by
-    /// holding the file tool's lock and showing the save cannot proceed behind it.
+    /// Both are dispatched concurrently from one assistant message and both write through a temp
+    /// file derived from the target, so two calls naming one path with no lock in common could
+    /// interleave their write-then-rename and publish a spliced file. Asserted by holding the file
+    /// tool's lock and showing the save cannot proceed behind it.
     #[tokio::test]
     async fn scratchpad_save_file_contends_with_write_file_for_the_same_path() {
         let manager = Store::for_test().await;
@@ -3218,11 +3203,8 @@ mod tests {
     /// Saving over a file that already exists is refused, and the confirmation says what it
     /// replaced when `force` allows it.
     ///
-    /// This tool reads as the scratchpad's `write_file` and its description says so, but it had
-    /// none of that tool's protections: no read of the target, so no staleness check to fail; no
-    /// `force`, so nothing to consult; and a confirmation naming the bytes written while never
-    /// mentioning the bytes replaced. A path the model named by mistake was gone with a success
-    /// message on top of it.
+    /// This tool reads as the scratchpad's `write_file`, so a path the model named by mistake must
+    /// not be gone with a success message on top of it.
     #[tokio::test]
     async fn scratchpad_save_file_refuses_to_replace_an_existing_file() {
         let manager = Store::for_test().await;

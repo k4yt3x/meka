@@ -271,7 +271,7 @@ pub(crate) fn plan_import(
             (None, None) => {
                 return Err(crate::error::MekaError::Usage(format!(
                     "session {} in the archive records no permission level, and no default could \
-                     be read from config.toml to give it one",
+                     be read from `config.toml`",
                     session.id
                 )));
             }
@@ -289,13 +289,12 @@ pub(crate) fn plan_import(
             profile: if session.profile.is_empty() {
                 // Refused rather than left blank. A session with no profile cannot run, so
                 // importing one is writing a row whose only future is a refusal the user has to
-                // work backwards from -- and it would put a state into the store that no other
+                // work backwards from, and it would put a state into the store that no other
                 // door can produce, which every reader would then have to know about.
                 let Some(default_profile) = default_profile else {
                     return Err(crate::error::MekaError::Usage(
-                        "this archive names no profile, and no default is configured to give it \
-                         one. Run `meka profile use <name>`, or import with `meka --profile <name> \
-                         session import`"
+                        "this archive names no profile and no default profile is configured; import \
+                         it with `meka --profile <name> session import`"
                             .to_string(),
                     ));
                 };

@@ -255,7 +255,7 @@ pub(crate) fn account_for<'a>(
         let refusal = crate::text::unknown_name("account", &profile.account, accounts.keys());
         if accounts.is_empty() {
             format!(
-                "profile '{profile_name}': {refusal}. Run `meka account add {}`",
+                "profile '{profile_name}': {refusal}; create it with `meka account add {}`",
                 profile.account
             )
         } else {
@@ -287,14 +287,10 @@ pub(crate) fn resolve_profile(
 ) -> std::result::Result<ProfileSettings, String> {
     // The one place an account's `backend` is read as a `Backend`, so every later reader holds the
     // enum.
-    let backend = account.backend.parse::<Backend>().map_err(|_| {
-        format!(
-            "account '{}' has unknown backend '{}'. Supported backends: {}",
-            profile.account,
-            account.backend,
-            Backend::supported(),
-        )
-    })?;
+    let backend = account
+        .backend
+        .parse::<Backend>()
+        .map_err(|error| format!("account '{}': {error}", profile.account))?;
     Ok(ProfileSettings {
         account: profile.account.clone(),
         backend,
@@ -385,13 +381,12 @@ pub(crate) fn select_profile(
             Err(refusal) => (
                 None,
                 Some(format!(
-                    "{refusal}. {}",
+                    "{refusal}; {}",
                     match (source, profiles.is_empty()) {
-                        (_, true) => "Run `meka profile add <name>`.",
-                        (ProfileRequest::Flag, false) => "Pass a configured name to `--profile`.",
+                        (_, true) => "create one with `meka profile add <name>`",
+                        (ProfileRequest::Flag, false) => "pass a configured name to `--profile`",
                         (ProfileRequest::DefaultProfile, false) =>
-                            "Fix `default_profile` in config.toml, or run `meka profile use \
-                             <name>`.",
+                            "point `default_profile` at one with `meka profile use <name>`",
                     }
                 )),
             ),
@@ -400,8 +395,8 @@ pub(crate) fn select_profile(
             0 => (
                 None,
                 Some(
-                    "no profile configured. Run `meka account add <name>`, then `meka profile add \
-                     <name>`, to set one up."
+                    "no profile configured; run `meka account add <name>`, then `meka profile add \
+                     <name>`"
                         .to_string(),
                 ),
             ),
@@ -413,8 +408,8 @@ pub(crate) fn select_profile(
             _ => (
                 None,
                 Some(format!(
-                    "multiple profiles configured ({}); run `meka profile use <name>` to pick a \
-                     default, or pass `--profile <name>`.",
+                    "multiple profiles configured ({}) and no `default_profile`; pick one with \
+                     `meka profile use <name>`",
                     profiles.keys().cloned().collect::<Vec<_>>().join(", ")
                 )),
             ),
@@ -454,15 +449,15 @@ pub(crate) fn validate_max_output_tokens(
         // have been inherited from. Both fix the refusal; only one of them leaves every other
         // profile budgeting against what it did before.
         return Err(crate::error::MekaError::Config(format!(
-            "profile '{profile}': max_output_tokens ({max_output}) must exceed the thinking budget ({thinking_budget}) for an \
-             Anthropic Messages profile with thinking = \"budgeted\"; under [profiles.{profile}], raise \
-             max_output_tokens or set a lower thinking_budget.",
+            "profile '{profile}': `max_output_tokens` ({max_output}) must exceed the thinking \
+             budget ({thinking_budget}) under `thinking = \"budgeted\"`; raise `max_output_tokens` \
+             under `[profiles.{profile}]`",
         )));
     }
     Ok(())
 }
 /// Stable per-device identity for `claude-subscription` (embedded in `metadata.user_id`). Other
-/// backends get an empty string; we don't write a stub config file just to hold an unused value.
+/// backends get an empty string, so no stub config file is written for an unused value.
 pub(crate) mod device_id {
     use std::path::Path;
 
@@ -481,8 +476,7 @@ pub(crate) mod device_id {
             return String::new();
         }
 
-        // A configured value (the account's `device_id`, already deserialized for us) wins; no
-        // need to re-read the file for it.
+        // The account's `device_id`, already deserialized, wins.
         if let Some(id) = configured
             && !id.is_empty()
         {
@@ -495,8 +489,7 @@ pub(crate) mod device_id {
         };
         tracing::info!("seeded claude-subscription device_id from {source}");
 
-        // Persist into the account's table. Skip quietly when we can't locate the config path or
-        // the account name; the id is still returned and used for this run, just not saved.
+        // With no config path or account name the id is still used for this run, just not saved.
         if let (Some(account), Some(path)) = (account_name, config_file_path())
             && let Err(error) = persist(&path, account, &id)
         {
@@ -563,9 +556,8 @@ pub(crate) mod device_id {
             .parse()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
 
-        // The account's table already exists (it's how the profile was resolved); update its
-        // `device_id` in place. Bail quietly rather than synthesize a malformed inline table if the
-        // structure isn't what we expect.
+        // The account's table already exists, since the profile was resolved through it; a shape
+        // that does not match is left alone rather than rewritten.
         let Some(item) = document
             .get_mut("accounts")
             .and_then(|accounts| accounts.get_mut(account))
@@ -966,7 +958,7 @@ mod tests {
     ///
     /// The comments are the point, not decoration. Sorting moves whole entries, and `toml_edit`
     /// hangs a whole-line comment off the *following* key's `leaf_decor` and a trailing one off the
-    /// value - so if either were held somewhere else, sorting would silently re-attach a user's
+    /// value, so if either were held somewhere else, sorting would silently re-attach a user's
     /// explanation to a different setting. That is a worse failure than the disorder it fixes,
     /// because the file still parses and still reads as if it meant something.
     #[test]

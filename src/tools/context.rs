@@ -1,9 +1,9 @@
 //! The `context_*` tools: the agent managing its own context window.
 //!
-//! Deliberately a separate family from `conversation_*`, which reads the *archive* - the full
-//! on-disk log, including turns compaction removed from the window entirely. These three act on the
-//! live window instead. The two families sort adjacently (`cont` precedes `conv`), so the split
-//! costs nothing in the catalog while keeping each name honest about what it touches.
+//! A separate family from `conversation_*`, which reads the archive (the full on-disk log,
+//! including turns compaction removed from the window entirely); these three act on the live
+//! window. The two families sort adjacently (`cont` precedes `conv`), so the split costs nothing
+//! in the catalog.
 //!
 //! `context_check` exists because the pushed `[Context budget]` block
 //! ([`crate::prompt::ContextBudget`]) is rendered once per turn, into the user message at turn

@@ -57,10 +57,7 @@ pub(crate) async fn run_serve(
         serve.bind = bind_override;
     }
     if serve.tokens.is_empty() {
-        anyhow::bail!(
-            "[serve] is configured but has no tokens; add at least one `[[serve.tokens]]` \
-             entry with `scopes` so callers can authenticate"
-        );
+        anyhow::bail!("[serve] has no tokens; add a `[[serve.tokens]]` entry with `scopes`");
     }
     for token in &serve.tokens {
         if matches!(token.source, crate::host::http::config::TokenSource::Inline) {
@@ -114,14 +111,14 @@ pub(crate) async fn run_serve(
     let local = listener.local_addr()?;
     tracing::info!("listening on {local}");
 
-    // The timeout wraps only the post-signal drain, not the entire serve future.
-    // Wrapping the whole future would start the timer at construction, causing the
-    // server to exit after `shutdown_drain_timeout` of total uptime.
+    // The timeout wraps only the post-signal drain, not the entire serve future: wrapping the whole
+    // future would start the timer at construction and exit the server after
+    // `shutdown_drain_timeout` of total uptime.
     let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
     let serve_future = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            // Signal-watch + drain orchestration runs outside this closure so the
-            // timeout can wrap it independently of the accept loop's lifetime.
+            // The signal watch and the drain run outside this closure so the timeout can wrap
+            // them independently of the accept loop's lifetime.
             if drain_rx.await.is_err() {
                 tracing::trace!("the drain signal was dropped before it fired");
             }
@@ -139,10 +136,8 @@ pub(crate) async fn run_serve(
     // The drain waits for the turns as well as for the accept loop. A turn runs on a task the
     // handler spawns rather than inside the handler itself, and `stream_reattach_grace` exists to
     // keep one running with no client attached, so axum's graceful shutdown finds no in-flight
-    // request to wait for and returns while the work is still going. Awaiting only that was
-    // therefore a drain in name: `handlers::turn` documents at length what a turn dropped
-    // mid-flight costs (an orphaned process group, an assistant `tool_use` whose result never
-    // lands), and every one of those was still on the table at shutdown.
+    // request to wait for and returns while the work is still going; `handlers::turn` documents
+    // what a turn dropped mid-flight costs.
     let drain_result = tokio::time::timeout(shutdown_drain_timeout, async {
         let (join_result, ()) = tokio::join!(serve_handle, wait_for_turns_to_unwind(&state));
         join_result
@@ -160,10 +155,10 @@ pub(crate) async fn run_serve(
         manager.shutdown_within(crate::mcp::SHUTDOWN_BUDGET).await;
     }
 
-    // Flush the SQLite WAL before exit so a quick restart doesn't pay WAL-replay cost.
-    // Best-effort, SQLite recovers from an unflushed WAL automatically.
+    // Flush the SQLite WAL before exit so a quick restart does not pay the replay cost.
+    // Best-effort: SQLite recovers from an unflushed WAL on its own.
     if let Err(error) = state.shared.store.checkpoint().await {
-        tracing::warn!("WAL checkpoint on shutdown failed: {error}");
+        tracing::warn!("failed to checkpoint the WAL on shutdown: {error}");
     } else {
         tracing::info!("WAL checkpoint complete");
     }
@@ -187,10 +182,10 @@ pub(crate) async fn run_serve(
 
 /// Fire every session's cancellation token during a graceful drain.
 ///
-/// This is now the only thing that stops an in-flight turn on shutdown. The streaming handler does
-/// not watch `state.shutdown` in its own `select!`, which would be redundant with this. The turn
-/// task still reads the shutdown token, but only to label its terminal event `server_shutdown`
-/// rather than `client`.
+/// The only thing that stops an in-flight turn on shutdown. The streaming handler does not watch
+/// `state.shutdown` in its own `select!`, which would be redundant with this. The turn task still
+/// reads the shutdown token, but only to label its terminal event `server_shutdown` rather than
+/// `client`.
 async fn drain_active_sessions(state: &ServerState) {
     let sessions = state.sessions.read().await;
     for entry in sessions.values() {
@@ -345,9 +340,8 @@ fn build_router(state: ServerState, auth: AuthRegistry, max_body_bytes: usize) -
         .merge(documentation)
         // `RequestBodyLimitLayer` is the only authority on body size. Without disabling axum's
         // own default, the `Bytes` extractor every handler uses applies a 2 MiB cap of its own, so
-        // any `max_body_bytes` above that was silently inert -- and the 413 this middleware
-        // rewrites would name a limit that had not fired. The docs tell operators to raise
-        // `max_body_bytes` for multi-image turns, which only works now.
+        // any `max_body_bytes` above that is silently inert and the 413 this middleware rewrites
+        // names a limit that did not fire.
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(max_body_bytes))
         .layer(middleware::from_fn_with_state(
@@ -457,14 +451,11 @@ async fn inject_problem_instance(
         return response;
     }
     let (mut parts, body) = response.into_parts();
-    // Strip the stale Content-Length so hyper recomputes it for the rewritten body,
-    // which is longer than the original due to the injected `instance` field.
+    // Strip the stale Content-Length so hyper recomputes it for the rewritten body, which is longer
+    // than the original by the injected `instance` field.
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    // Problem Details are sub-KB in practice; the 64 KB cap is a safety net.
-    // On failure (body exceeds the limit or the stream errors), we return
-    // the status + headers with an empty body; the original stream is already
-    // consumed and can't be replayed. This is acceptable because meka never
-    // produces a Problem Detail anywhere near this size.
+    // Problem Details are sub-KB in practice; the cap is a safety net. On failure the status and
+    // headers go out with an empty body, since the original stream is already consumed.
     const PROBLEM_DETAIL_BUFFER_LIMIT: usize = 64 * crate::text::KIB;
     let bytes = match axum::body::to_bytes(body, PROBLEM_DETAIL_BUFFER_LIMIT).await {
         Ok(bytes) => bytes,

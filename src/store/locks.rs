@@ -7,9 +7,8 @@ use super::*;
 ///
 /// On-disk databases keep a `locks/` directory beside the database file, which must outlive the
 /// process; in-memory ones get a per-`open()` temp directory instead, so that concurrent tests
-/// can't sweep each other's lock files through [`Store::prune_orphan_lock_files`]. That
-/// isolation is worth keeping, but without this guard each `open()` left an empty directory in
-/// the system temp dir forever.
+/// can't sweep each other's lock files through [`Store::prune_orphan_lock_files`]. Without this
+/// guard each `open()` leaves an empty directory in the system temp dir forever.
 pub(super) struct EphemeralLockDir(pub(super) PathBuf);
 impl Drop for EphemeralLockDir {
     fn drop(&mut self) {
@@ -27,7 +26,7 @@ impl Drop for EphemeralLockDir {
 /// Where a session's lock lives while a host and its agent both need to reach it.
 ///
 /// The lock has to be taken the instant the row exists, and for a session the agent creates that
-/// instant is inside `Agent::run_turn_retaining` -- seconds or minutes before the host gets control
+/// instant is inside `Agent::run_turn_retaining`, seconds or minutes before the host gets control
 /// back. Claiming it afterwards leaves a fresh session unlocked for the whole of its first turn, so
 /// a second `meka` invocation attaches to it and interleaves its own messages into the same
 /// conversation.
@@ -108,7 +107,7 @@ impl Store {
             Ok(entries) => entries,
             Err(error) => {
                 tracing::debug!(
-                    "lock-file prune: cannot read {lock_dir}: {error}",
+                    "lock-file prune: failed to read {lock_dir}: {error}",
                     lock_dir = self.lock_dir.display()
                 );
                 return;
@@ -136,7 +135,7 @@ impl Store {
                 continue;
             };
             // `schema.lock` shares this directory and is not a session's. It survives the UUID
-            // check below by accident -- "schema" does not parse as one -- and the accident is
+            // check below by accident ("schema" does not parse as one), and the accident is
             // worth not relying on: unlinking a file does not release a held `flock`, so a swept
             // schema lock would let the next process create a different inode, and both would enter
             // `memory::store`'s FTS-trigger reconciliation believing they held it, each deciding
@@ -170,7 +169,7 @@ impl Store {
             drop(claim);
             if let Err(error) = std::fs::remove_file(&path) {
                 tracing::debug!(
-                    "lock-file prune: cannot remove {path}: {error}",
+                    "lock-file prune: failed to remove {path}: {error}",
                     path = path.display()
                 );
             }

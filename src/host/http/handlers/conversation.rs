@@ -457,12 +457,8 @@ pub(crate) async fn rewind(
         ));
     }
 
-    // Acquired under the sessions read-lock, the way `submit_turn` does it (see the note there).
-    // `DELETE`'s write-lock blocks behind any reader, so taking the guard inside the read lock is
-    // what makes DELETE's own `in_flight` re-check see this operation. Acquiring it after the lock
-    // is dropped would let a concurrent DELETE remove the row and the map entry first, leaving
-    // this to run a multi-minute checkpoint against a session that no longer exists and to persist
-    // a boundary event for it.
+    // Acquired under the sessions read-lock, for the reason `compact` gives: DELETE's `in_flight`
+    // re-check has to see this operation, or the rewind lands on a session that no longer exists.
     let (entry, _in_flight) = {
         let map = state.sessions.read().await;
         match map.get(&id).cloned() {
@@ -738,7 +734,7 @@ fn store_too_large(count: usize) -> ProblemDetail {
         StatusCode::UNPROCESSABLE_ENTITY,
         format!(
             "session export contains {} sessions, more than the {} this server imports in one \
-             request; import it with `meka session import`, which has no such limit",
+             request; import it with `meka session import`",
             count,
             crate::store::export::MAX_IMPORT_SESSIONS
         ),
@@ -824,8 +820,7 @@ mod tests {
     /// session.
     ///
     /// `tests/serve.rs`'s `a_sub_agent_transcript_can_be_rewound_over_http` covers what is
-    /// reachable, that the sub-agent's log really shrinks. It does not cover this: deleting the
-    /// `lock_session` call outright left all 3056 tests green.
+    /// reachable, that the sub-agent's log really shrinks; it cannot see the lock.
     #[test]
     fn the_dormant_rewind_serializes_against_reconstruction() {
         crate::host::http::reattach::assert_dormant_fast_path_is_serialized(

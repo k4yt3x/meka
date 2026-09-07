@@ -32,10 +32,7 @@ from pathlib import Path
 try:
     import tomlkit
 except ImportError:  # pragma: no cover - the whole point is to say so
-    sys.exit(
-        "this script needs the `tomlkit` package (`pip install tomlkit`); the standard library "
-        "can read TOML but not write it back with its comments"
-    )
+    sys.exit("this script needs `tomlkit`; install it with `pip install tomlkit`")
 
 ACCOUNT_KEYS = ("backend", "base_url", "oauth_token_url", "client_id", "device_id")
 # Per table: old key -> (new key, unit suffix for an integer that becomes a duration string, or
@@ -143,7 +140,7 @@ def rename_keys(table, section: str, report: Report):
             # where meka refuses it by name rather than reading it as something else.
             rebuilt.add(key, item)
             report.warn(
-                f"[{section}].{old} is not a whole number; it was left as is and meka will refuse it"
+                f"[{section}].{old} is not a whole number; left as is, and meka will refuse it"
             )
     return rebuilt
 
@@ -157,7 +154,7 @@ def convert(document: tomlkit.TOMLDocument, report: Report) -> tuple[tomlkit.TOM
         if "accounts" in document or "profiles" in document:
             raise Refused(
                 "this file has [providers] beside [accounts] or [profiles]; finish the split by "
-                "hand, then run the script again for the rest"
+                "hand first"
             )
         accounts = tomlkit.table(is_super_table=True)
         profiles = tomlkit.table(is_super_table=True)
@@ -177,8 +174,8 @@ def convert(document: tomlkit.TOMLDocument, report: Report) -> tuple[tomlkit.TOM
                     # by name at load, which is a better outcome than a setting vanishing.
                     profile.add(key, value)
                     report.warn(
-                        f"[providers.{name}] has a key meka 0.46 does not know, `{key}`; it was "
-                        f"carried into [profiles.{name}] and meka will refuse it there"
+                        f"[providers.{name}].{key} is not a key meka 0.46 knows; carried into "
+                        f"[profiles.{name}], where meka will refuse it"
                     )
             if "backend" not in account:
                 report.warn(f"[providers.{name}] states no `type`; the account has no backend")
@@ -405,7 +402,7 @@ def main() -> int:
         tofile=f"{path} (0.46)",
     )
     sys.stdout.writelines(diff)
-    print(f"\ndry run; rerun with --apply to write {path}")
+    print(f"\ndry run; rerun with `--apply` to write {path}")
     return 0
 
 

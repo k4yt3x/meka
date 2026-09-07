@@ -168,7 +168,7 @@ impl GatePredicate {
         value: Option<&serde_json::Value>,
     ) -> std::result::Result<Self, String> {
         const EXPECTED: &str = "expected \"changed\", \"succeeded\", {\"matches\": \"<regex>\"} or \
-                                {\"at\": \"<json pointer>\", \"is\": \"not-empty\"|\"empty\"|\"changed\"}";
+                                {\"at\": \"<json pointer>\", \"is\": \"not_empty\"|\"empty\"|\"changed\"}";
 
         let Some(value) = value.filter(|value| !value.is_null()) else {
             return Ok(Self::Changed);
@@ -187,8 +187,8 @@ impl GatePredicate {
             return Err(format!("`when` is not a condition; {EXPECTED}"));
         };
         // Refused rather than resolved, exactly as `check` refuses naming both `command` and
-        // `tool`. Taking `matches` and ignoring `at` gave the model a gate watching something it
-        // did not ask for, silently, at both creation doors -- and the two halves of a `when` that
+        // `tool`. Taking `matches` and ignoring `at` would give the model a gate watching something
+        // it did not ask for, silently, at both creation doors, and the two halves of a `when` that
         // names both are usually meant as *different* conditions, so neither reading is safe.
         if object.contains_key("matches") && object.contains_key("at") {
             return Err(format!(
@@ -217,12 +217,12 @@ impl GatePredicate {
                 ));
             }
             let is = match object.get("is").and_then(|value| value.as_str()) {
-                Some("not-empty") | None => PointerTest::NotEmpty,
+                Some("not_empty") | None => PointerTest::NotEmpty,
                 Some("empty") => PointerTest::Empty,
                 Some("changed") => PointerTest::Changed,
                 Some(other) => {
                     return Err(format!(
-                        "unknown `when.is` '{other}'; expected 'not-empty', 'empty' or 'changed'"
+                        "unknown `when.is` '{other}'; expected 'not_empty', 'empty' or 'changed'"
                     ));
                 }
             };
@@ -241,7 +241,7 @@ impl GatePredicate {
             Self::Succeeded => "succeeded".to_string(),
             Self::Matches { pattern } => format!("matches /{pattern}/"),
             Self::At { pointer, is } => format!("{} {}", pointer, match is {
-                PointerTest::NotEmpty => "not-empty",
+                PointerTest::NotEmpty => "not_empty",
                 PointerTest::Empty => "empty",
                 PointerTest::Changed => "changed",
             }),
@@ -367,43 +367,26 @@ pub(crate) struct ProbeOutcome {
 impl ProbeOutcome {
     /// Assemble a result, parsing before truncating.
     ///
-    /// The order is the point. `text` is capped at [`GATE_OUTPUT_LIMIT`] and gains a truncation
+    /// The order is the point: `text` is capped at [`GATE_OUTPUT_LIMIT`] and gains a truncation
     /// marker, and [`crate::scheduler::pointed_at`] falls back to parsing that text whenever there
-    /// is no structured value -- which is the path every shell probe takes, and every MCP
-    /// server that returns its JSON as text content, which is most of them. A document over the
-    /// cap therefore never parsed again, so an `at` gate over it failed permanently with "the
-    /// probe did not return JSON". It did; meka truncated it.
-    ///
-    /// Parsing `raw` and keeping the result means the cap goes on being what it is for -- bounding
-    /// what a runaway probe can push into the turn's context -- without deciding what the gate is
-    /// allowed to judge.
+    /// is no structured value, which is the path every shell probe and most MCP servers take, so a
+    /// document over the cap would never parse again. Parsing `raw` keeps the cap bounding what a
+    /// runaway probe can push into the turn's context without deciding what the gate may judge.
     pub(crate) fn new(raw: &str, structured: Option<serde_json::Value>, succeeded: bool) -> Self {
-        // Applied to a value the caller already parsed, not only to the fallback below. An MCP
-        // server's `structuredContent` arrives as a `Value` and took the `or_else` branch's cap
-        // with it -- which is to say the cap covered shell probes and text-only servers, and
-        // missed the path the feature was built for.
-        //
-        // Serializing to measure looks circular and is not: it happens once, here, against a
-        // predicate that would otherwise re-serialize the same value on every evaluation
-        // (`canonical_json(...).to_string()` in the `At` arm). What this cannot do is un-receive
-        // the value: the MCP layer parsed it before meka saw it, so the peak allocation has
-        // already been paid. The bound is on what meka keeps and keeps re-doing.
+        // Applied to a value the caller already parsed, not only to the fallback below: an MCP
+        // server's `structuredContent` arrives as a `Value`. Serializing to measure happens once,
+        // here, against a predicate that would otherwise re-serialize the same value on every
+        // evaluation; the MCP layer parsed it before meka saw it, so the bound is on what meka
+        // keeps and keeps re-doing.
         let structured = structured.filter(|value| {
             serde_json::to_string(value).is_ok_and(|rendered| rendered.len() <= GATE_PARSE_LIMIT)
         });
         let structured = structured.or_else(|| {
-            // Bounded separately from the display cap, because relaxing that cap quietly removed
-            // the only bound on this. `text` is capped so a runaway probe cannot push the prompt
-            // over the context window; parsing what the cap had already trimmed *also* meant every
-            // allocation downstream was bounded by 8 KiB. Parsing `raw` instead is what makes a
-            // large result readable, and it hands a probe that returns hundreds of megabytes a
-            // `Value` several times that size -- built, and for a pointer predicate re-serialized
-            // whole, on the scheduler's own task, on every evaluation.
-            //
-            // A megabyte covers any result a gate has business judging while keeping the cost of
-            // a hostile or runaway one flat. Past it there is no structured value, so a pointer
-            // predicate declines and says the probe did not return JSON, which is the same answer
-            // it gives for a result it genuinely cannot read.
+            // Bounded separately from the display cap: parsing `raw` is what makes a large result
+            // readable, and it would hand a probe that returns hundreds of megabytes a `Value`
+            // several times that size, re-serialized whole on the scheduler's own task on every
+            // evaluation. Past the limit there is no structured value, so a pointer predicate
+            // declines with the same answer it gives for a result it cannot read.
             (raw.len() <= GATE_PARSE_LIMIT)
                 .then(|| serde_json::from_str::<serde_json::Value>(raw.trim()).ok())
                 .flatten()
@@ -417,9 +400,8 @@ impl ProbeOutcome {
 }
 /// Why a gate may not run at a given level.
 ///
-/// One type so the doors that ask -- `schedule_create`, `POST /v1/sessions/{id}/schedule`, and the
-/// fire-time re-check in [`crate::scheduler::prepare`] -- give the same answer for the same state.
-/// Phrased separately at each door, one of them ends up naming a level that does not exist.
+/// One type so the doors that ask (`schedule_create`, `POST /v1/sessions/{id}/schedule`, and the
+/// fire-time re-check in [`crate::scheduler::prepare`]) give the same answer for the same state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GateRefusal {
     /// A shell gate is a bare `sh -c` on a timer with nobody watching.
@@ -441,27 +423,24 @@ impl GateRefusal {
         match self {
             Self::ShellNeedsUnrestricted => format!(
                 "a gate command runs unattended with no sandbox, so it needs `unrestricted` \
-                 (currently {level})"
+                 (currently `{level}`)"
             ),
-            // Deliberately not "right now". That reads as transient, and the common cause is not:
-            // a name that does not exist, or a session-scoped tool a gate could never reach, is
-            // permanent, and a model told "right now" will keep the job and wait. The
-            // genuinely-transient case is a server still connecting, which the reporting surfaces
-            // decline to mention at all until it settles.
+            // Deliberately not "right now": that reads as transient, and the common cause (a name
+            // that does not exist, or a session-scoped tool a gate could never reach) is permanent.
+            // The genuinely transient case is a server still connecting, which the reporting
+            // surfaces decline to mention until it settles.
             Self::ToolUnavailable => format!(
-                "no gate tool named '{}'. A gate can call a read-only tool that does not depend on \
-                 the session (an MCP tool, or one of `read_file`, `find_files`, \
-                 `search_contents`, `fetch_url`, `search_web`, and `execute_command` where a \
-                 sandbox is available), or the server providing it is not connected",
+                "no gate tool named '{}': a gate may call only a read-only tool that does not \
+                 depend on the session, and its server must be connected",
                 probe.summary()
             ),
             Self::ToolNotReadOnly(required) => format!(
-                "gate tool '{}' requires '{}'; a gate may only call a tool that needs `read` or less",
+                "gate tool '{}' requires `{}`; a gate may only call a tool that needs `read` or less",
                 probe.summary(),
                 required
             ),
             Self::SessionBelowTool => format!(
-                "gate tool '{}' needs `read` (currently '{}')",
+                "gate tool '{}' needs `read` (currently `{}`)",
                 probe.summary(),
                 level
             ),
@@ -509,14 +488,11 @@ pub(crate) fn gate_probe_is_authorized(
 /// Why `gate` will not fire right now, and the level that answer was reached at.
 ///
 /// One function for three readers: the fire door in [`crate::scheduler::prepare`], the
-/// `[Scheduled]` index the model sees every turn, and `schedule_list`. Before this the fire door
-/// was the only one that asked, so a held-back job was reported to the operator's log and to nobody
-/// else: the model saw a job that looked healthy, could not tell a gate that had said "no" from one
-/// that was never consulted, and had nothing to act on. It can cancel a job it cannot fire, so the
-/// asymmetry was worth closing.
+/// `[Scheduled]` index the model sees every turn, and `schedule_list`, so a held-back job reaches
+/// the model, which can cancel a job it cannot fire, and not only the operator's log.
 ///
 /// The live level is tried first because it is the one that can be put back. A refusal that only
-/// the *recorded* level produces means a row nothing can currently restore, which is a different
+/// the recorded level produces means a row nothing can currently restore, which is a different
 /// thing to say.
 pub(crate) fn gate_withheld_reason(
     gate: &Gate,
@@ -552,8 +528,8 @@ pub(crate) trait GateTools: Send + Sync + std::fmt::Debug {
     /// healthy job as dead and then announces it alive again a turn later, which is worse than
     /// saying nothing for the second it takes.
     ///
-    /// Defaulted to `false` so a dispatcher with no notion of connecting -- every test stub, and
-    /// any future non-MCP one -- keeps the plain behavior.
+    /// Defaulted to `false` so a dispatcher with no notion of connecting (every test stub, and any
+    /// future non-MCP one) keeps the plain behavior.
     fn is_still_connecting(&self, _name: &str) -> bool {
         false
     }
@@ -607,9 +583,9 @@ mod tests {
 
     /// A pointer into something that is not a JSON document is an error, not an answer.
     ///
-    /// The process ran fine, so this is not a spawn failure -- but the predicate describes a shape
+    /// The process ran fine, so this is not a spawn failure, but the predicate describes a shape
     /// the result does not have, so nothing was measured. Declining silently is survivable for
-    /// `not-empty` and ruinous for `empty`: a missing value reads as empty, so a server that starts
+    /// `not_empty` and ruinous for `empty`: a missing value reads as empty, so a server that starts
     /// returning prose or an error string would fire the job every interval, indefinitely. Both
     /// directions are covered here because the asymmetry is the point.
     #[test]
@@ -696,8 +672,8 @@ mod tests {
     /// late.
     #[test]
     fn the_request_parsers_refuse_what_they_cannot_answer() {
-        // Naming both halves of a `when` is an ambiguity, not a precedence question. Resolving it
-        // to `matches` gave the model a gate watching something it did not ask for.
+        // Naming both halves of a `when` is an ambiguity, not a precedence question: resolving it
+        // to `matches` would give the model a gate watching something it did not ask for.
         let both = serde_json::json!({"matches": "x", "at": "/y", "is": "changed"});
         let error = GatePredicate::parse_request(Some(&both))
             .expect_err("`when` naming both is refused, as `check` naming both is");
@@ -738,7 +714,7 @@ mod tests {
     ///
     /// Between process start and `Connected`, and again on every reconnect, the tool is absent from
     /// the snapshot. Marking that in the model's `[Scheduled]` block says a healthy job is dead and
-    /// then announces it alive a turn later -- churn the model may act on. Authority is unchanged:
+    /// then announces it alive a turn later, churn the model may act on. Authority is unchanged:
     /// the fire door still declines, because the probe genuinely cannot run.
     #[test]
     fn a_gate_whose_server_is_still_connecting_is_not_reported_as_dead() {
@@ -785,9 +761,9 @@ mod tests {
         );
     }
 
-    /// The point of the whole permission split. A read-only tool call is not a bare `sh -c`, so
-    /// holding it to `unrestricted` would leave gating unavailable to everyone below it -- which,
-    /// with `workspace` now the default rung, is most people.
+    /// The point of the whole permission split: a read-only tool call is not a bare `sh -c`, so
+    /// holding it to `unrestricted` would leave gating unavailable to everyone below it, which at
+    /// the default `workspace` is most people.
     #[test]
     fn a_read_only_tool_gate_is_allowed_at_read() {
         let tools = FixedTools(Some(crate::permission::Permission::Read));
@@ -801,9 +777,9 @@ mod tests {
         );
     }
 
-    /// The user's second scenario: a tool that resolved to `read` when the job was written but
-    /// resolves higher today. Re-resolving at fire time is what catches it; trusting the level
-    /// recorded at creation would keep calling it.
+    /// A tool that resolved to `read` when the job was written but resolves higher today.
+    /// Re-resolving at fire time is what catches it; trusting the level recorded at creation would
+    /// keep calling it.
     #[test]
     fn a_tool_that_now_resolves_above_read_stops_being_a_gate() {
         let tools = FixedTools(Some(crate::permission::Permission::Unrestricted));
@@ -829,7 +805,7 @@ mod tests {
         );
     }
 
-    /// The user's first scenario, for the tool half: the session dropped below what the tool needs.
+    /// The session dropped below what the tool needs.
     #[test]
     fn a_tool_gate_stops_once_the_session_falls_below_read() {
         let tools = FixedTools(Some(crate::permission::Permission::Read));
@@ -903,8 +879,7 @@ mod tests {
     /// The model almost always authors a gate right after verifying the same command through
     /// `execute_command`, which runs in the session cwd. Under a `meka serve` unit the host process
     /// sits somewhere else entirely (`/`, or wherever systemd put it), so a gate that ignores the
-    /// session cwd silently stops matching the command the user watched succeed. Nothing caught
-    /// this: the `cwd` argument threads all the way through `prepare` with no assertion on it.
+    /// session cwd silently stops matching the command the user watched succeed.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_gate_runs_in_its_sessions_directory() {

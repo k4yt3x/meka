@@ -255,8 +255,7 @@ pub(crate) fn render_error(error: &dyn std::fmt::Display) {
 }
 /// The heading above a block of command output, in the color every other one uses.
 ///
-/// Exists so the color is decided once. `Session status` had it inline, and the second heading to
-/// want it would otherwise have copied the constant rather than the convention.
+/// Exists so the color is decided once rather than copied per heading.
 pub(crate) fn render_heading(heading: &str) {
     write_stderr_line(heading.with(Color::Cyan));
 }
@@ -291,8 +290,8 @@ pub(crate) fn render_annotation(note: &str) {
 ///
 /// Only one global can be installed, so a second copy of this helper does not merely duplicate
 /// code: the loser's `set_global_default` fails, its buffer is never written to, and its tests
-/// break. `src/skills.rs` and `src/schedule.rs` each grew their own and collided exactly that way.
-/// The buffer stays thread-local, which is what keeps concurrent tests out of each other's output.
+/// break. The buffer stays thread-local, which is what keeps concurrent tests out of each other's
+/// output.
 #[cfg(test)]
 pub(crate) mod log_capture {
     use std::{cell::RefCell, io, sync::OnceLock};
@@ -373,12 +372,10 @@ pub(crate) mod log_capture {
     /// filter over the text. A multi-line event keeps its continuation lines with the line that
     /// names the level.
     ///
-    /// Matched as that leading token and not with `contains`, which is a trap this got wrong
-    /// first time: `contains` finds a level name anywhere in the line, including inside the
-    /// *message*, and returns the first candidate in the array rather than the line's real level.
-    /// A `WARN` about a gate watching a log -- `grep ERROR ...`, the example the docs themselves
-    /// use -- was filed as ERROR and dropped, so an assertion counting warnings silently
-    /// undercounted.
+    /// Matched as that leading token and not with `contains`, which finds a level name anywhere in
+    /// the line, including inside the *message*: a `WARN` about a gate watching a log (`grep ERROR
+    /// ...`) would be filed as ERROR and dropped, and an assertion counting warnings would silently
+    /// undercount.
     fn at_level(level: &str) -> String {
         let mut kept = String::new();
         let mut keeping = false;
@@ -400,12 +397,9 @@ pub(crate) mod log_capture {
 mod tests {
     use super::*;
 
-    /// A level name inside a *message* must not be mistaken for the line's level.
-    ///
-    /// `at_level` matched with `contains` and returned the first candidate in its array, so a
-    /// `WARN` whose text mentioned "ERROR" was filed as ERROR and dropped. A gate watching a log
-    /// (`grep ERROR ...`, the docs' own example) puts exactly that into a warning, and every
-    /// assertion built on `warnings()` would have undercounted in silence.
+    /// A level name inside a *message* must not be mistaken for the line's level: a gate watching
+    /// a log (`grep ERROR ...`) puts exactly that into a warning, and every assertion built on
+    /// `warnings()` would undercount in silence.
     #[test]
     fn log_capture_files_a_line_by_its_level_not_by_its_message() {
         log_capture::start();

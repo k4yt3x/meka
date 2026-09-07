@@ -348,7 +348,7 @@ pub(crate) struct AgentOptions {
 
 /// A compaction the agent asked for, parked until the loop reaches a point that can run it.
 ///
-/// Tools hold no `&mut Conversation` - the agent loop owns it for the duration of the turn - so
+/// Tools hold no `&mut Conversation` (the agent loop owns it for the duration of the turn), so
 /// `context_compact` cannot compact where it stands. It records the request here and the tool loop
 /// drains it once the batch's results are in, which is what lets the turn carry on against the
 /// summary instead of ending at the request. A turn that fails before reaching that point leaves
@@ -717,9 +717,8 @@ mod tests {
     /// One id being refused must not cost the user the rest of the list.
     ///
     /// Each id on the command line is a separate request, and a session another meka has open is a
-    /// refusal about that one. Returning at the first refusal skipped every id after it -- and
-    /// swallowed the count of what *had* been deleted on the way, so the run reported nothing at
-    /// all about work it had actually done.
+    /// refusal about that one. Returning at the first refusal would skip every id after it and
+    /// swallow the count of what had been deleted on the way.
     #[tokio::test]
     async fn a_refused_session_does_not_abandon_the_rest_of_the_list() {
         let manager = Store::for_test().await;
@@ -752,13 +751,9 @@ mod tests {
     }
 
     /// `/fork` must own the copy's lock before the REPL lets go of the one it is holding. That
-    /// ordering is now structural rather than tested: [`fork_and_lock`] is handed no lock, so it
-    /// has no way to release the caller's, and the caller can only give its up by assigning the
-    /// returned one over it.
-    ///
-    /// What this pins is the pair of facts that make the structure sound: the returned lock is
-    /// genuinely held on the copy (not a stale handle the REPL would rely on), and the source's
-    /// lock is untouched, so the failure path really is "stay put".
+    /// ordering is structural: [`fork_and_lock`] is handed no lock, so it has no way to release
+    /// the caller's. This pins the pair of facts that make the structure sound: the returned lock
+    /// is genuinely held on the copy, and the source's lock is untouched.
     #[tokio::test]
     async fn fork_and_lock_holds_both_locks_at_the_handoff() {
         let manager = Store::for_test().await;
@@ -886,13 +881,9 @@ mod tests {
         );
     }
 
-    /// An archive naming no profile, imported where nothing can supply one, is refused.
-    ///
-    /// The alternative was writing the profile empty, which is the only way a session with no
-    /// provider could enter the store other than through the ledger. That row cannot run, its
-    /// refusal arrives whenever the user next resumes it, and its existence forced every reader to
-    /// know about a state nothing else produces. Refusing keeps the invariant every other door
-    /// already holds to: a session that exists names a profile that resolved when it was written.
+    /// An archive naming no profile, imported where nothing can supply one, is refused: a row with
+    /// an empty profile cannot run, and its existence would force every reader to know about a
+    /// state nothing else produces.
     #[test]
     fn an_archive_with_no_profile_is_refused_when_nothing_can_supply_one() {
         let json = serde_json::json!({
@@ -987,9 +978,8 @@ mod tests {
         assert_eq!(records[0].profile, "work");
     }
 
-    /// Regression: import restored the export's `updated_at`, and retention GC deletes by that
-    /// column when `[session].retention_days` is set, so restoring an archive older than that was
-    /// undone by the next launch before anyone could resume it.
+    /// Retention GC deletes by `updated_at` when `[session].retention_days` is set, so an import
+    /// that restored the export's value would be undone by the next launch.
     #[tokio::test]
     async fn import_survives_retention_gc() {
         let manager = Store::for_test().await;

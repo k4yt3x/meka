@@ -36,7 +36,7 @@ fn compute_fingerprint(message_text: &str, version: &str) -> String {
     let input = format!("{FINGERPRINT_SALT}{chars}{version}");
     let hash = Sha256::digest(input.as_bytes());
     // Match Claude Code's `SHA256(...)[:3]`: take the first 3 hex chars of the byte-by-byte
-    // 2-digit-hex encoding. Two bytes give us 4 chars, enough to slice 3 and drop the rest.
+    // 2-digit-hex encoding. Two bytes give 4 chars, enough to slice 3 and drop the rest.
     let hex: String = hash
         .iter()
         .take(2)
@@ -59,11 +59,10 @@ fn extract_first_user_message_text(messages: &[Message]) -> String {
     String::new()
 }
 
-/// Computes the fingerprint from the first user message. Matches Claude
-/// Code's `Kph`, which reads `$HE` (the first non-meta user message) and hashes it with `zzl`:
-/// the fingerprint varies per conversation but is stable across all turns
-/// of the same conversation since the first user message text doesn't
-/// change.
+/// Computes the fingerprint from the first user message. Matches Claude Code's `Kph`, which reads
+/// `$HE` (the first non-meta user message) and hashes it with `zzl`: the fingerprint varies per
+/// conversation but is stable across all turns of the same conversation, since the first user
+/// message text doesn't change.
 fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
     let first_message_text = extract_first_user_message_text(messages);
     compute_fingerprint(&first_message_text, CC_VERSION)
@@ -346,8 +345,8 @@ fn digits_end(body: &[u8], mut i: usize) -> usize {
 /// therefore invisible to it.
 ///
 /// That is the whole point. The body puts `messages` ahead of `system`, matching Claude Code's key
-/// order, so a conversation that quotes a billing header -- which is exactly what a session about
-/// this code does -- would otherwise let a message win the search and take the attestation with it.
+/// order, so a conversation that quotes a billing header (which is exactly what a session about
+/// this code does) would otherwise let a message win the search and take the attestation with it.
 fn top_level_system_value(body: &[u8]) -> Option<usize> {
     let mut i = body.iter().position(|byte| !byte.is_ascii_whitespace())?;
     if body.get(i) != Some(&b'{') {
@@ -475,12 +474,11 @@ fn stainless_os() -> &'static str {
 /// **`Connection: keep-alive` is deliberately absent, though the capture shows it.** It is one of
 /// the connection-specific header fields HTTP/2 forbids (RFC 9113 §8.2.2), and a peer that receives
 /// one must treat the message as malformed and reset the stream with `PROTOCOL_ERROR`. Setting it
-/// here achieved nothing either way: hyper strips it on the h2 path, so it never went on the wire.
-/// It does so silently in this build -- the `warn!` beside the strip is behind hyper's `tracing`
-/// feature, which nothing here enables and which needs a `--cfg hyper_unstable_tracing` besides --
-/// so nothing would have said so. Whatever made the capture show it is a property of how the
-/// capture was taken rather than of what this endpoint receives, so do not re-add it by diffing
-/// against that capture.
+/// here would achieve nothing either way: hyper strips it on the h2 path, silently in this build
+/// (the `warn!` beside the strip is behind hyper's `tracing` feature, which nothing here enables
+/// and which needs a `--cfg hyper_unstable_tracing` besides), so it never goes on the wire.
+/// Whatever made the capture show it is a property of how the capture was taken rather than of
+/// what this endpoint receives, so do not re-add it by diffing against that capture.
 pub(super) fn apply_headers(
     request: reqwest::RequestBuilder,
     auth_header_name: &str,

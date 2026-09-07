@@ -137,12 +137,9 @@ impl Agent {
         prompt_id: Option<Uuid>,
         cancellation: CancellationToken,
     ) -> crate::tools::ToolOutput {
-        // If the stream layer couldn't parse this tool call's JSON arguments, it marked the input
-        // with a sentinel. Bail out with an error so the model sees the parse failure instead of us
-        // silently invoking the tool on a default-filled object.
         let Some(tool) = self.tool_registry.get(name) else {
             // A tool from a server that never connected was never registered, so it lands here.
-            // Saying "unknown" would be false - it exists and is unreachable - and would teach the
+            // Saying "unknown" would be false (it exists and is unreachable) and would teach the
             // agent to stop asking for a capability that may be seconds from returning.
             //
             // Asks the registry rather than `self.mcp_manager`: a sub-agent has no manager of its
@@ -182,8 +179,8 @@ impl Agent {
             return *refusal;
         }
         // Scope the id across both dispatch paths, so a tool that has to correlate itself with the
-        // client's view of this call -- `agent_spawn`, routing its sub-agent's activity back into
-        // the tool call already on screen -- can read it without every other tool's signature
+        // client's view of this call (`agent_spawn`, routing its sub-agent's activity back into
+        // the tool call already on screen) can read it without every other tool's signature
         // growing a parameter it ignores.
         //
         // The session id rides alongside for the same reason, so an MCP `tools/call` can name the
@@ -242,10 +239,8 @@ impl Agent {
     ///
     /// Deferred tools are dispatchable whether or not the model loaded them (see
     /// [`Self::resolve_and_execute_tool`]), and a model that never loaded one has only ever seen
-    /// the truncated one-line summary from `[Tool discovery]`. That is how a `send_file` call
-    /// landed every image as a download attachment for want of an `as_photo` flag nothing had
-    /// mentioned: the call succeeded, so there was no error to read, and the wrong default was
-    /// invisible.
+    /// the truncated one-line summary from `[Tool discovery]`, so a call that succeeds on a
+    /// silently wrong default has no error to read.
     ///
     /// Emitted at most once per tool per process. The result stays in the conversation, so
     /// repeating it buys nothing and costs context on every subsequent call.
@@ -563,8 +558,7 @@ async fn record_background_outcome(
         return;
     };
     tracing::warn!(
-        "background task {task_id} finished but its outcome could not be recorded; marking it \
-         failed: {error}"
+        "background task {task_id} finished but failed to record it; marking it failed: {error}"
     );
     let failure = format!("The tool finished, but its result could not be recorded: {error}");
     if let Err(error) = background
@@ -577,7 +571,7 @@ async fn record_background_outcome(
         .await
     {
         tracing::error!(
-            "background task {task_id} could not be marked failed either; its row stays `running` \
+            "background task {task_id} failed to be marked failed either; its row stays `running` \
              until the next session open sweeps it: {error}"
         );
     }
@@ -605,13 +599,12 @@ pub(super) enum Admission {
 ///
 /// `unconfinable` is the door `Permission::allows` cannot provide for a tool meka cannot confine.
 /// `allows` treats `workspace` and `unrestricted` as equal on purpose, so a tool requiring
-/// `unrestricted` dispatches at `workspace` with no prompt. Every built-in that matters has its own
-/// door downstream: the write fence, or `execute_command`'s refusal when it cannot be sandboxed. An
-/// MCP adapter has neither. The call is forwarded to an unsandboxed server process, so `workspace`
-/// was promising a boundary that nothing applied. Such a call is a question when approvals are on
-/// and a refusal otherwise, the way the shell refuses when its sandbox is unavailable, and for the
-/// same reason: half a boundary reported as a whole one is worse than an error saying so. Only
-/// `workspace` promises a boundary it might fail to apply, so only there does the flag matter.
+/// `unrestricted` dispatches at `workspace` with no prompt; every built-in that matters has its
+/// own door downstream (the write fence, or `execute_command`'s refusal when it cannot be
+/// sandboxed), and an MCP adapter has neither. Such a call is a question when approvals are on and
+/// a refusal otherwise, the way the shell refuses when its sandbox is unavailable: half a boundary
+/// reported as a whole one is worse than an error saying so. Only `workspace` promises a boundary
+/// it might fail to apply, so only there does the flag matter.
 pub(super) fn admit_tool_call(
     name: &str,
     required: crate::permission::Permission,
@@ -659,9 +652,8 @@ mod tests {
     };
 
     /// The prompt claims to show every argument the call was made with. `background` is taken out
-    /// of the arguments before dispatch, so without this it was the one argument a user could
-    /// not see -- and it is the one that decides whether the call keeps running after the turn
-    /// ends.
+    /// of the arguments before dispatch, so without this it would be the one argument a user could
+    /// not see, and it is the one that decides whether the call keeps running after the turn ends.
     #[test]
     fn a_detaching_call_says_so_at_the_prompt() {
         let input = serde_json::json!({"command": "sleep 600"});
@@ -764,11 +756,10 @@ mod tests {
     /// A tool that runs outside any confinement meka can apply is refused at `workspace`, for
     /// every requirement above it, not only for `Unrestricted`.
     ///
-    /// The gate had no test at all: deleting it left the whole suite green, and it fails **open**,
-    /// because `resolve_tool_permission`'s fallback for an unannotated MCP tool is `Unrestricted`
-    /// and `Workspace.allows(Unrestricted)` is `true` by design. It is keyed on `is_within` rather
-    /// than on a literal pair of rungs, so a comparison naming one rung cannot stand in for the
-    /// order.
+    /// Deleting the gate fails open, because `resolve_tool_permission`'s fallback for an
+    /// unannotated MCP tool is `Unrestricted` and `Workspace.allows(Unrestricted)` is `true` by
+    /// design. It is keyed on `is_within` rather than on a literal pair of rungs, so a comparison
+    /// naming one rung cannot stand in for the order.
     ///
     /// The two controls matter as much as the refusals. A confinable tool with the same requirement
     /// must still dispatch, or the gate is just a permission check; and a requirement the level
@@ -883,8 +874,8 @@ mod tests {
     }
 
     /// A detached call the background machinery would refuse is refused before anyone is asked
-    /// to approve it. With the switch on and the ceiling at zero, the prompt put a question to the
-    /// user whose answer could not matter: the call was refused the moment they said yes.
+    /// to approve it: with the switch on and the ceiling at zero, the prompt would put a question
+    /// to the user whose answer could not matter.
     #[tokio::test]
     async fn a_detached_call_that_cannot_start_is_refused_before_approval_is_asked() {
         use crate::provider::mock::MockProvider;

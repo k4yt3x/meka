@@ -22,9 +22,8 @@ pub(crate) fn build_stdio_command(command_str: &str, args: &[String]) -> Command
             || lower.ends_with(".bat")
             || lower.ends_with(".ps1");
         if is_shim {
-            // `cmd /c <command> <args...>`: Windows wraps argument quoting. We don't try to
-            // shell-quote the args; the `Command` API does the OS-appropriate escaping via
-            // CreateProcess's lpCommandLine.
+            // The args are not shell-quoted here: `Command` escapes them for CreateProcess's
+            // lpCommandLine itself.
             let mut cmd = Command::new("cmd");
             cmd.arg("/c").arg(command_str).args(args);
             return cmd;
@@ -51,7 +50,7 @@ pub(super) fn build_http_transport_config(
         .as_deref()
         .ok_or_else(|| MekaError::McpConnection {
             server_name: server_name.to_string(),
-            message: "http transport requires 'url' field".to_string(),
+            message: "http transport requires `url`".to_string(),
         })?;
 
     let mut transport_config =
@@ -111,8 +110,7 @@ fn run_headers_helper(
         message,
     };
 
-    // Resolve the script path. If it's relative and doesn't exist as-is, try resolving against the
-    // meka config directory for safety (same place config.toml lives).
+    // A relative script that does not exist as-is is looked for beside `config.toml`.
     let script_path = std::path::Path::new(script);
     let resolved: std::path::PathBuf = if script_path.is_absolute() || script_path.exists() {
         script_path.to_path_buf()
@@ -135,11 +133,12 @@ fn run_headers_helper(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
-        connection_error(format!("headers_helper '{script}' spawn failed: {error}"))
+        connection_error(format!(
+            "failed to spawn `headers_helper` '{script}': {error}"
+        ))
     })?;
 
-    // Poll for exit with a 15-second budget. std::process::Child doesn't expose a blocking
-    // wait_timeout, so loop on try_wait with a short sleep.
+    // `std::process::Child` has no `wait_timeout`, so the budget is a `try_wait` loop.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let status = loop {
         match child.try_wait() {
@@ -150,21 +149,21 @@ fn run_headers_helper(
                         tracing::debug!("failed to kill the headers helper: {error}");
                     }
                     return Err(connection_error(format!(
-                        "headers_helper '{script}' timed out after 15s"
+                        "`headers_helper` '{script}' timed out after 15s"
                     )));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
                 return Err(connection_error(format!(
-                    "headers_helper '{script}' wait failed: {error}"
+                    "failed to wait for `headers_helper` '{script}': {error}"
                 )));
             }
         }
     };
 
-    // Caps on how much helper output we're willing to buffer. stdout is the header list (rarely
-    // more than a few KiB); stderr is surfaced verbatim in the error message so keep it tight.
+    // stdout is the header list, rarely more than a few KiB; stderr is repeated verbatim in the
+    // error message, so it is kept tight.
     const MAX_HELPER_STDOUT_BYTES: u64 = 64 * crate::text::KIB as u64;
     const MAX_HELPER_STDERR_BYTES: u64 = 4 * crate::text::KIB as u64;
 
@@ -181,7 +180,7 @@ fn run_headers_helper(
         }
         let stderr_text = String::from_utf8_lossy(&stderr_buffer);
         return Err(connection_error(format!(
-            "headers_helper '{}' exited with status {}: {}",
+            "`headers_helper` '{}' exited with status {}: {}",
             script,
             status.code().unwrap_or(-1),
             stderr_text.trim()
@@ -195,14 +194,15 @@ fn run_headers_helper(
             .read_to_end(&mut stdout_buffer)
             .map_err(|error| {
                 connection_error(format!(
-                    "headers_helper '{script}' stdout read failed: {error}"
+                    "failed to read `headers_helper` '{script}' stdout: {error}"
                 ))
             })?;
     }
     let stdout = String::from_utf8_lossy(&stdout_buffer);
 
-    parse_header_lines(&stdout)
-        .map_err(|message| connection_error(format!("headers_helper '{script}' output: {message}")))
+    parse_header_lines(&stdout).map_err(|message| {
+        connection_error(format!("`headers_helper` '{script}' output: {message}"))
+    })
 }
 
 fn parse_header_lines(

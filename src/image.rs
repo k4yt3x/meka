@@ -96,7 +96,7 @@ const MAX_DECODE_ALLOC_BYTES: usize = 128 * crate::text::MIB;
 /// Decode image bytes under [`MAX_DECODE_ALLOC_BYTES`].
 ///
 /// The ceiling gets its own message. Hitting it says the image is *large*, not damaged, and the
-/// conversion path has no choice but to fail either way -- but telling somebody their file failed
+/// conversion path has no choice but to fail either way, but telling somebody their file failed
 /// to decode when it is merely a 6400x6400 TIFF sends them to re-export a file that was never
 /// broken. The pass-through path treats the same condition as a pass (see
 /// [`refuse_if_undecodable`]), so the two only diverge on what they can *do*, never on what they
@@ -108,9 +108,8 @@ fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<image::Dynami
     reader.limits(limits);
     reader.decode().map_err(|error| match error {
         image::ImageError::Limits(_) => format!(
-            "{:?} image is too large to convert: decoding it would need more than {}, which is \
-             meka's per-image ceiling. Convert or downscale it first, or supply it in a format \
-             that needs no conversion (png, jpeg, gif, webp, bmp).",
+            "{:?} image is too large to convert: decoding it would need more than {}; downscale \
+             it first",
             format,
             crate::text::format_size(MAX_DECODE_ALLOC_BYTES)
         ),
@@ -130,8 +129,8 @@ fn decode_with_limits(bytes: &[u8], format: ImageFormat) -> Result<image::Dynami
 /// are then forwarded; the provider does its own decoding either way. Refusing outright would
 /// instead reject legitimate images, because the ceiling is a pixel count rather than a file size:
 /// a 6000x6000 screenshot compresses to a few hundred kilobytes and is well inside every provider's
-/// dimension cap, but decodes to 137 MB. The failures this function exists to catch -- truncation,
-/// a corrupt header, a wrong CRC -- all arrive as [`image::ImageError::Decoding`] and are refused.
+/// dimension cap, but decodes to 137 MB. The failures this function exists to catch (truncation,
+/// a corrupt header, a wrong CRC) all arrive as [`image::ImageError::Decoding`] and are refused.
 fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String> {
     if format == ImageFormat::Jpeg {
         return refuse_undecodable_jpeg(bytes);
@@ -165,13 +164,13 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
 /// refuses the valid files that carry bytes after it.
 ///
 /// The header is read first so this can honor [`MAX_DECODE_ALLOC_BYTES`] the way every other
-/// format does. Two things forced it, and taking the defaults got both wrong:
+/// format does, and the decoder's defaults get two things wrong:
 ///
 /// `DecoderOptions::default()` caps each axis at 16384 and enforces that in frame-header parsing,
 /// independently of strict mode. A 1080x20000 full-page mobile screenshot is a few hundred
-/// kilobytes, sniffs clean, decodes fine under `image`, and was refused here as "failed to decode"
-/// with a message telling the *user* to call `set_limits`. Raising the axis caps to JPEG's own
-/// format maximum removes a refusal that was never about the image being broken.
+/// kilobytes, sniffs clean, decodes fine under `image`, and would be refused here as "failed to
+/// decode" with a message telling the *user* to call `set_limits`. Raising the axis caps to JPEG's
+/// own format maximum removes a refusal that is never about the image being broken.
 ///
 /// Those same caps then permit 16384x16384x3, about 805 MB, against a ceiling of 128 MiB.
 /// `output_buffer_size` is computed from the frame header and allocated in one go, so it is the
@@ -246,8 +245,8 @@ pub(crate) fn downscale_to_dim_cap(
     max_dim: u32,
 ) -> Result<Vec<u8>, String> {
     // Ask the header first. An image already inside the cap needs no work at all, and decoding it
-    // only to re-encode the same pixels was the common case: every request re-decoded every
-    // attached image, most of which were never oversized.
+    // only to re-encode the same pixels is the common case: every request would re-decode every
+    // attached image, most of which are never oversized.
     if let Ok((width, height)) = read_image_dimensions(bytes, source)
         && width <= max_dim
         && height <= max_dim
@@ -270,11 +269,10 @@ pub(crate) fn downscale_to_dim_cap(
 }
 
 /// Run the classification pipeline end-to-end: reject what does not decode, pass through native
-/// formats, convert the rest to PNG, enforce the byte cap. Provider-agnostic. Does NOT enforce
-/// per-axis pixel limits (Anthropic's 2000 px multi-image cap is enforced separately at the Claude
-/// provider layer in
-/// `src/provider/anthropic/shared.rs`, so OpenAI providers don't pay for it). Returns `(media_type,
-/// bytes)`.
+/// formats, convert the rest to PNG, enforce the byte cap. Provider-agnostic, so it enforces no
+/// per-axis pixel limit: Anthropic's 2000 px multi-image cap is enforced in
+/// `src/provider/anthropic/shared.rs`, where the OpenAI backends do not pay for it. Returns
+/// `(media_type, bytes)`.
 ///
 /// `hint` is what the *source* claimed the format was (a filename extension, an HTTP
 /// `Content-Type`, an MCP server's `mime_type`, a client's declared MIME). It is only consulted
@@ -287,7 +285,7 @@ pub(crate) fn downscale_to_dim_cap(
 /// The decode check answers that same question one step further in. A correctly labeled image
 /// whose payload is truncated or corrupt is refused for the same reason a mislabeled one is: it
 /// lands in a committed `tool_result` and fails every later request. Worse, the refusal need not
-/// arrive as a 400 -- a gateway that reports its decoder's exception as a 500 reads to
+/// arrive as a 400: a gateway that reports its decoder's exception as a 500 reads to
 /// [`crate::error::provider_http_error`] as transient, so the request is retried unchanged rather
 /// than repaired, and the session ends the turn unusable.
 pub(crate) fn prepare_image_payload(
@@ -310,9 +308,9 @@ pub(crate) fn prepare_image_payload(
             }
             // Decoded and thrown away, purely to learn whether it decodes at all. A signature is
             // not a decode: `guess_format` reads eight bytes, so a PNG truncated mid-IDAT and a PNG
-            // whose IHDR is zeroed both classify as clean pass-throughs and travel to the provider
-            // as `image/png`. `Convert` has always decoded, which meant a broken TIFF was caught
-            // and a broken PNG was not -- safety by accident of which formats need transcoding.
+            // whose IHDR is zeroed both classify as clean pass-throughs and would travel to the
+            // provider as `image/png`, while `Convert` decodes anyway and catches a broken TIFF:
+            // safety by accident of which formats need transcoding.
             refuse_if_undecodable(bytes, format)?;
             Ok((format.to_mime_type(), bytes.to_vec()))
         }
@@ -410,6 +408,7 @@ pub(crate) enum ImageSource {
 }
 
 impl ImageSource {
+    /// The MIME type the image is declared as, wherever its bytes are.
     pub(crate) fn media_type(&self) -> &str {
         match self {
             Self::Base64 { media_type, .. } | Self::Blob { media_type, .. } => media_type,

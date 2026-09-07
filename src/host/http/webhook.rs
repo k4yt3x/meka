@@ -2,9 +2,8 @@
 //!
 //! Everything else in the HTTP API answers a question a client asked. This is the one direction
 //! that has to work when nobody is asking: a scheduled job fires at 3am and a background task
-//! finishes twenty minutes after the turn that started it, and until now the only trace either left
-//! was rows in SQLite that something had to poll to discover. [`crate::host::http::schedule`] has
-//! said for a while that this is where a push API hooks in.
+//! finishes twenty minutes after the turn that started it, and without a push the only trace either
+//! leaves is rows in SQLite that something has to poll to discover.
 //!
 //! Two decisions shape the whole module.
 //!
@@ -161,10 +160,9 @@ impl WebhookDispatcher {
             Err(error) => {
                 tracing::warn!("failed to stamp background outcomes as announced: {error}");
                 // The caller has to hold the batch. Delivering it anyway would stamp
-                // `delivered_at`, and the announce pool requires that to be NULL -- so one
+                // `delivered_at`, and the announce pool requires that to be NULL, so one
                 // `SQLITE_BUSY`, an ordinary thing with two meka processes on a store, would cost
-                // the webhook permanently. The delivered claim already fails this way; so does
-                // this now.
+                // the webhook permanently. The delivered claim fails the same way.
                 return Announced::Failed;
             }
         };

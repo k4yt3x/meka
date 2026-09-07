@@ -63,9 +63,8 @@ pub(super) struct ThinkingIndicator {
 /// What closing out the thinking indicator means for a given event.
 ///
 /// A pure decision, separated from `emit` so it can be asserted over every [`FrontendEvent`]
-/// variant. The three bugs this indicator shipped with all lived in that dispatch, and its
-/// catch-all silently absorbs any variant added later -- a test that enumerates the alternatives is
-/// the only thing that makes a wrong default visible.
+/// variant: a catch-all in that dispatch silently absorbs any variant added later, and a test that
+/// enumerates the alternatives is the only thing that makes a wrong default visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IndicatorAction {
     /// Leave the line open: the indicator is redrawing itself.
@@ -78,9 +77,9 @@ pub(super) enum IndicatorAction {
     /// Forget the indicator without writing anything.
     ///
     /// Reached only when a turn ended mid-block without closing it, which today means an interrupt:
-    /// a stream error emits [`FrontendEvent::ThinkingEnded`] and so commits. The interrupt notice
-    /// opens with a newline (`"\nInterrupted."`), which has already terminated the indicator's line
-    /// by the time the next turn starts, so committing another one here would leave a stray blank.
+    /// a stream error emits [`FrontendEvent::ThinkingEnded`] and so commits. The `(interrupted)`
+    /// annotation has already replaced the indicator's row by the time the next turn starts, so
+    /// committing here would write a stray newline.
     Drop,
 }
 /// Exhaustive on purpose. A catch-all absorbs a new variant into `Commit` silently, which is right
@@ -381,16 +380,15 @@ impl Frontend for ReplFrontend {
             .await;
             return PermissionOutcome::Deny;
         }
-        // Raced against the turn's own stop, as the other two frontends race it. Without this a
-        // Ctrl+C at the prompt did nothing visible, and the next keystroke -- usually Enter, which
-        // reads as allow -- approved the call the user had just tried to stop. The REPL thread is
-        // blocked in `read_line`; dropping the receiver is what tells it to discard the answer.
+        // Raced against the turn's own stop, as the other two frontends race it: otherwise a Ctrl+C
+        // at the prompt does nothing visible, and the next keystroke, usually the Enter that reads
+        // as allow, approves the call the user has just tried to stop. The REPL thread is blocked
+        // in `read_line`; dropping the receiver is what tells it to discard the answer.
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
                 crate::streams::write_stderr_line(
-                    "(the turn was stopped; this approval is withdrawn. Press Enter to clear the \
-                     prompt.)",
+                    "(the turn was stopped and this approval withdrawn; press Enter to clear the prompt)",
                 );
                 PermissionOutcome::Canceled
             }
@@ -699,8 +697,7 @@ mod tests {
 
     /// The same for the tool-approval half: a one-shot run with approvals on refuses every tool
     /// that needs approval, and without a line per refusal the run is indistinguishable from a
-    /// model that simply chose not to use its tools, which is what sent someone debugging the
-    /// prompt instead of the flag.
+    /// model that simply chose not to use its tools.
     ///
     /// `Deny`, not `Canceled`: nothing stopped the turn, the call was refused, and the tool result
     /// the model reads should say which.

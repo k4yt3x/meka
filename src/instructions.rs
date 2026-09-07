@@ -9,21 +9,17 @@
 //! concatenated in lexical order so a large set can be split (`00-style.md`, `10-security.md`, …).
 //! The directory wins when both exist.
 //!
-//! Unlike skills and memory this is read **once**, at startup, and lands in the system prompt
-//! rather than the per-turn `<context>` block. That is deliberate and follows from size: the system
-//! prompt is the cached prefix, so a large instruction set is billed once and re-read from cache on
-//! every later turn. Re-reading it per turn would either invalidate that prefix whenever the file
-//! changed or push the text into the conversation, where it would compete with actual context. The
-//! cost is that edits take effect on the next run -- which for `meka serve` and `meka acp` means
-//! the next *restart*, since one process serves every session. Documented for users at
-//! `docs/book/src/configuration/overview.md` § "When edits take effect", beside the same caveat
-//! about `config.toml`.
+//! Unlike skills and memory this is read once, at startup, and lands in the system prompt rather
+//! than the per-turn `<context>` block: the system prompt is the cached prefix, so a large
+//! instruction set is billed once, whereas re-reading it per turn would either invalidate that
+//! prefix whenever the file changed or push the text into the conversation. The cost is that edits
+//! take effect on the next run, which for `meka serve` and `meka acp` means the next restart.
 
 use std::path::{Path, PathBuf};
 
 /// Ceiling above which an instruction set is reported as suspiciously large. Not enforced: a big
 /// preamble can be exactly what the user wants, and it is cached, so this warns rather than
-/// truncates. Roughly 8k tokens, which is a noticeable slice of even a large window.
+/// truncates.
 const LARGE_INSTRUCTIONS_TOKENS: u64 = 8_000;
 
 /// Cap on how many `*.md` files one `instructions/` directory contributes, mirroring
@@ -235,39 +231,33 @@ fn read_file(path: &Path) -> Option<String> {
 
 /// Report an instruction set large enough that the user should know it is there. Silent otherwise.
 ///
-/// It rides the cached system-prompt prefix so the ongoing cost is small, but it still occupies
-/// window that the conversation can't use, and a set this size is usually a surprise (a whole
-/// document pasted in, or a directory pointed somewhere unintended) rather than a decision.
+/// It rides the cached prefix so the ongoing cost is small, but it still occupies window the
+/// conversation cannot use, and a set this size is usually a directory pointed somewhere
+/// unintended rather than a decision.
 pub(crate) fn warn_if_large(instructions: &Instructions) {
     let estimate = crate::tokens::estimate_text(&instructions.text);
     if estimate > LARGE_INSTRUCTIONS_TOKENS {
         let source = &instructions.source;
-        tracing::warn!(
-            "instructions from {source} are large (~{estimate} tokens); they occupy that much of \
-             every request's context window"
-        );
+        tracing::warn!("instructions from {source} are large (~{estimate} tokens)");
     }
+}
+
+/// [`resolve`] over the persistent tiers only, for `meka instructions show`: a per-run
+/// `--instructions` is not part of what a standalone query is asking about.
+pub(crate) fn resolve_for_display() -> crate::error::Result<Option<Instructions>> {
+    resolve(None)
 }
 
 /// Resolve the user's standing instructions across the tiers that can carry them, most specific
 /// first: `--instructions`, then `MEKA_INSTRUCTIONS`, then `MEKA_INSTRUCTIONS_FILE`, then the
 /// conventional path under the config directory.
 ///
-/// Inline and file are two *transports* for one setting rather than two ways of saying the same
-/// thing, which is why both survive. Which is natural follows from the channel: a filesystem
-/// channel (the config directory) points at content, while a string channel (argv, environment)
-/// carries it. Demanding a file from the latter can be impossible, not merely inconvenient: the
-/// `mekabox` wrapper mounts the host config directory read-only and then overrides the instructions
-/// for the container, which it can do with one `-e` and could not do at all if a path were the only
-/// accepted form.
+/// Inline and file are two transports for one setting, and the string channels (argv, environment)
+/// cannot always point at a file: the `mekabox` wrapper mounts the host config directory read-only
+/// and overrides the instructions for the container with one `-e`.
 ///
-/// Setting both environment variables is refused rather than silently resolved. There is no reading
-/// under which someone meant both, so picking one would just hide the mistake until the agent
-/// behaved unexpectedly. [`resolve`] over the persistent tiers only, for `meka instructions show`.
-/// A per-run `--instructions` isn't part of what a standalone query is asking about.
-pub(crate) fn resolve_for_display() -> crate::error::Result<Option<Instructions>> {
-    resolve(None)
-}
+/// Setting both environment variables is refused rather than silently resolved: there is no reading
+/// under which someone meant both, so picking one would hide the mistake.
 pub(crate) fn resolve(flag: Option<&str>) -> crate::error::Result<Option<Instructions>> {
     if let Some(text) = flag {
         let text = text.trim();
@@ -281,9 +271,7 @@ pub(crate) fn resolve(flag: Option<&str>) -> crate::error::Result<Option<Instruc
     let from_file = std::env::var("MEKA_INSTRUCTIONS_FILE").ok();
     if inline.is_some() && from_file.is_some() {
         return Err(crate::error::MekaError::Config(
-            "MEKA_INSTRUCTIONS and MEKA_INSTRUCTIONS_FILE are both set; keep one. The first \
-             carries the text itself, the second a path to it."
-                .to_string(),
+            "`MEKA_INSTRUCTIONS` and `MEKA_INSTRUCTIONS_FILE` are both set; unset one".to_string(),
         ));
     }
 

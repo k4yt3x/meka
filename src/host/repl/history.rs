@@ -153,7 +153,7 @@ fn construct_entry(id: Option<HistoryItemId>, command_line: String) -> HistoryIt
 /// enabled here), so wrap database failures through `std::io::Error` instead, and log the real
 /// error since the wrapped message isn't surfaced to the user.
 fn to_reedline_error(error: crate::error::MekaError) -> ReedlineError {
-    tracing::warn!("prompt history database error: {error}");
+    tracing::warn!("failed to access the prompt history: {error}");
     ReedlineError::from(std::io::Error::other(error))
 }
 

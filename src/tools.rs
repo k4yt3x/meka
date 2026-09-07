@@ -201,23 +201,13 @@ pub(crate) fn take_background_flag(
     (serde_json::Value::Object(object), detach)
 }
 
-/// Splice `background` into one tool's schema.
-///
-/// Done here, on the definitions handed to the provider, rather than declared per-tool the way
-/// `scratchpad` is. One insertion point instead of seven, config-gated in one place, and it reaches
-/// MCP tools too, which matters because a slow MCP call is exactly the kind worth detaching.
-///
-/// That last part is a deliberate exception to passing an MCP server's `input_schema` through
-/// verbatim (see `crate::mcp`): the property is meka's own, and `Agent::resolve_and_execute_tool`
-/// strips it from the arguments before the adapter forwards them, so no server ever sees a key it
-/// did not advertise. What every door does with a call's arguments before a tool sees them, so no
-/// door can forget a step. A call the provider rejected (see
-/// [`crate::provider::finalize_tool_arguments`]) is refused with its reason. Meka's own parameters
-/// are type-checked, because a wrong type read as absent would be a silent no-op the model has no
-/// way to notice: a detach that quietly blocked, or output it asked to keep that was never kept.
-/// And `background` is taken out, since it is spliced into the schema by the registry and consumed
-/// by the dispatcher: no tool, least of all a remote MCP server, should see a key it never
-/// advertised. A tool that declares `background` itself keeps its argument.
+/// What every door does with a call's arguments before a tool sees them, so no door can forget a
+/// step. A call the provider rejected (see [`crate::provider::finalize_tool_arguments`]) is refused
+/// with its reason. Meka's own parameters are type-checked, because a wrong type read as absent
+/// would be a silent no-op the model has no way to notice. And `background` is taken out, since it
+/// is spliced into the schema by the registry and consumed by the dispatcher, so no tool, least of
+/// all a remote MCP server, sees a key it never advertised; a tool that declares `background`
+/// itself keeps its argument.
 ///
 /// Returns the arguments the tool receives and whether the call asked to detach; the error is the
 /// output the model reads instead.
@@ -263,6 +253,14 @@ pub(crate) fn detachable(name: &str) -> bool {
     name != "context_compact"
 }
 
+/// Splice `background` into one tool's schema.
+///
+/// Done here, on the definitions handed to the provider, rather than declared per-tool the way
+/// `scratchpad` is: one insertion point, config-gated in one place, and it reaches MCP tools too,
+/// which matters because a slow MCP call is exactly the kind worth detaching. That is a deliberate
+/// exception to passing an MCP server's `input_schema` through verbatim (see `crate::mcp`): the
+/// property is meka's own, and [`take_background_flag`] strips it before the adapter forwards the
+/// arguments.
 fn offer_background(parameters: &mut serde_json::Value) {
     let Some(object) = parameters.as_object_mut() else {
         return;
@@ -275,9 +273,7 @@ fn offer_background(parameters: &mut serde_json::Value) {
     else {
         return;
     };
-    // Never shadow a real parameter. A server that already advertises `background` owns the name,
-    // and silently overwriting its meaning would be a far worse bug than losing the feature on that
-    // one tool.
+    // Never shadow a real parameter: a server that already advertises `background` owns the name.
     if properties.contains_key(BACKGROUND_PARAMETER) {
         return;
     }
@@ -411,11 +407,10 @@ pub(crate) fn schema_disagreement(
 /// on the final `__` segment is tried first and wins outright; distance is only the fallback for
 /// genuine typos.
 ///
-/// A bare noun that has since become a family prefix is matched the same way, and for the same
-/// reason. When `skill` grew into `skill_read` / `skill_write` / …, distance alone stopped finding
-/// it: the threshold scales with the *typed* name, so a five-character needle allows one edit while
-/// the answer is five away. A resumed session reaching for the old name would have got a bare
-/// unknown-tool error, silently, which is exactly the case a rename most needs to cover.
+/// A bare noun that has since become a family prefix (`skill` for `skill_read` / `skill_write`)
+/// is matched the same way: the threshold scales with the typed name, so a five-character needle
+/// allows one edit while the answer is five away, and a resumed session reaching for the old name
+/// is exactly the case a rename most needs to cover.
 pub(crate) fn did_you_mean_hint<'a>(
     target: &str,
     candidates: impl Iterator<Item = &'a str>,
@@ -440,20 +435,12 @@ pub(crate) fn did_you_mean_hint<'a>(
             continue;
         }
         // Two strings whose lengths differ by more than the threshold cannot be within it, so
-        // this rejects them without building the matrix. The same guard the memory search tier
-        // carries, and for the same measurement: an unbounded argument ran an edit distance per
-        // stored name at 11 s for 200,000 characters against 200 memories and 48 s against 20,000,
-        // synchronously on a runtime worker with the cancellation token ignored.
+        // this rejects them without building the matrix: an unbounded argument would otherwise
+        // run a matrix per stored name, synchronously on a runtime worker. This is what lets the
+        // lookup doors accept any name the column holds rather than capping length.
         //
-        // Counted in *characters*, because `threshold` and `edit_distance` both are; comparing
-        // `len()` would measure bytes and silently discard non-ASCII candidates that are inside
-        // the threshold.
-        //
-        // This is what lets `validate_lookup_name` stop capping length. That cap bounded the cost
-        // by refusing the argument, which also refused every stored name past 64 characters -- so
-        // a row written straight to the column was listed to the model and then unremovable by
-        // anything meka ships, with `meka memory export` refusing the whole store on its account
-        // and naming `meka memory remove` as the remedy, which refused it too.
+        // Counted in characters, because `threshold` and `edit_distance` both are; `len()` would
+        // measure bytes and silently discard non-ASCII candidates inside the threshold.
         if needle_chars.abs_diff(lowered.chars().count()) > threshold {
             continue;
         }
@@ -467,10 +454,9 @@ pub(crate) fn did_you_mean_hint<'a>(
         by_distance.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
         by_distance.into_iter().map(|(_, name)| name).collect()
     } else {
-        // Destructive members last, then alphabetical. A whole family can exceed `MAX_SUGGESTIONS`,
-        // and plain alphabetical order put `skill_delete` first and dropped `skill_write` for a
-        // model reaching for the renamed `skill`. Leading a retry with the destructive verb is the
-        // one ordering worth ruling out.
+        // Destructive members last, then alphabetical: a whole family can exceed
+        // `MAX_SUGGESTIONS`, and leading a retry with the destructive verb is the one ordering
+        // worth ruling out.
         by_segment.sort_unstable_by_key(|name| (is_destructive(name), *name));
         by_segment
     };
@@ -496,9 +482,7 @@ fn is_destructive(name: &str) -> bool {
 ///
 /// The distinction is the whole point of the length band in [`did_you_mean_hint`] and it is not
 /// observable any other way: skipping costs work, not output, and a counter placed in the caller's
-/// iterator increments before the band is consulted. That is what the previous version of
-/// `a_pathological_name_does_not_run_a_distance_matrix_per_candidate` did, which made its assertion
-/// true whether or not the band existed.
+/// iterator increments before the band is consulted.
 #[cfg(test)]
 pub(crate) static EDIT_DISTANCE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -538,13 +522,10 @@ pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
 /// What a file looked like when a tool last read it, so a later `edit_file` can tell "you never
 /// read this" from "this moved under you".
 ///
-/// Metadata rather than a content hash: both fields come off the `stat` the read already performs,
-/// so recording them is free, and any edit that changes a file changes at least one of them in
-/// practice. A hash would be exact but would mean re-reading every file on every edit.
-/// Compared against whatever the *same source* says at edit time, which is the whole reason this is
-/// an enum. A file read through an editor's hosted filesystem and a file read off the disk are two
-/// different documents that happen to share a path, and checking one against the other produces a
-/// false alarm every time the user saves.
+/// Compared against whatever the same source says at edit time, which is why this is an enum: a
+/// file read through an editor's hosted filesystem and a file read off the disk are two different
+/// documents that happen to share a path, and checking one against the other produces a false
+/// alarm every time the user saves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadStamp {
     /// Read from the filesystem. Metadata rather than a content hash: both fields come off the
@@ -619,8 +600,8 @@ pub(crate) struct ToolOutput {
     ///
     /// Set from MCP's `structuredContent`. That value is *also* rendered into `content` as a
     /// fenced JSON block so the model can reason over it, but that rendering is a presentation
-    /// choice and the format string is free to change. Anything evaluating a result -- a
-    /// scheduled job's gate predicate is the one caller today -- must read this field rather
+    /// choice and the format string is free to change. Anything evaluating a result (a
+    /// scheduled job's gate predicate is the one caller today) must read this field rather
     /// than parse the markdown back out, or a readability tweak to the block silently changes
     /// what the predicate decides.
     ///
@@ -663,9 +644,6 @@ impl ToolOutput {
     }
 }
 
-/// A callable tool surfaced to the model. Built-in tools live under `src/tools/`; MCP tools are
-/// wrapped at registration time. Implementors must be safe to invoke concurrently; the dispatch
-/// loop runs all tool calls in a single assistant message in parallel via `join_all`.
 /// What a tool call knows about the session it runs in, handed to [`Tool::execute`] by whoever
 /// dispatches it. One per call, and the only way a tool learns any of it: the inline dispatch,
 /// the background spawn, the checkpoint turn and a gate probe each build one, so a tool cannot
@@ -701,6 +679,9 @@ impl ToolContext {
     }
 }
 
+/// A callable tool surfaced to the model. Built-in tools live under `src/tools/`; MCP tools are
+/// wrapped at registration time. Implementors must be safe to invoke concurrently; the dispatch
+/// loop runs all tool calls in a single assistant message in parallel via `join_all`.
 #[async_trait]
 pub(crate) trait Tool: Send + Sync {
     /// Schema surfaced to the model (name + description + JSON-schema for parameters). Called once
@@ -713,11 +694,11 @@ pub(crate) trait Tool: Send + Sync {
     ///
     /// True only for MCP adapters today: the call is forwarded to a server meka spawned but does
     /// not sandbox, so no boundary meka can express reaches it. The dispatch gate needs this
-    /// because `Permission::allows` deliberately treats `Workspace` and `Unrestricted` as
-    /// equal -- scope is meant to be enforced at the write door, and the tools array must stay
-    /// byte-identical across level toggles for the prompt cache. That works for built-ins, which
-    /// have a door; an MCP adapter has none, so `Workspace.allows(Unrestricted)` being `true` let
-    /// an unannotated tool write anywhere from inside the confined level, unprompted.
+    /// because `Permission::allows` deliberately treats `Workspace` and `Unrestricted` as equal
+    /// (scope is enforced at the write door, and the tools array must stay byte-identical across
+    /// level toggles for the prompt cache), which works for built-ins, which have a door; an MCP
+    /// adapter has none, so `Workspace.allows(Unrestricted)` alone would let an unannotated tool
+    /// write anywhere from inside the confined level.
     fn runs_outside_confinement(&self) -> bool {
         false
     }
@@ -755,12 +736,8 @@ pub(crate) fn resolve_primary_param(
 /// The label a tool indicator shows for a built-in.
 ///
 /// One entry per name in [`BUILTIN_TOOL_NAMES`], in PascalCase, enforced by
-/// `every_builtin_tool_has_a_display_name`. Both halves of that are the point. The table had
-/// drifted into three styles at once, and whole families were absent: `skill_search` rendered as
-/// "Search skills" in the same transcript where its sibling `memory_search` rendered raw, because
-/// the memory family was never added. AGENTS.md already requires updating this table when a tool is
-/// *renamed*; nothing said anything about adding one, so every tool added after the table was
-/// written fell through to `other` and nothing noticed.
+/// `every_builtin_tool_has_a_display_name`: a hand-maintained table drifts into several styles and
+/// misses whole families, and a tool added without an entry falls through to `other` unnoticed.
 pub(crate) fn tool_display_name(name: &str) -> &str {
     match name {
         "agent_delete" => "AgentDelete",
@@ -817,12 +794,10 @@ pub(crate) fn tool_display_name(name: &str) -> &str {
 }
 /// Whether [`builtin_primary_param`] answers for `name` given an input shaped like `parameters`.
 ///
-/// The probe is built from the tool's own declared properties, not from a fixed list of keys, and
-/// that is the whole point. A rule keyed to a parameter the tool does not declare - a typo, or a
-/// parameter renamed long afterwards - satisfies a hand-written probe happily while returning
-/// `None` for every real call, and the tool silently goes back to rendering bare. Renaming
-/// `schedule_cancel`'s `id` to `job_id` failed only that tool's own two behavioral tests; nothing
-/// anywhere said the indicator had lost its argument.
+/// The probe is built from the tool's own declared properties, not from a fixed list of keys: a
+/// rule keyed to a parameter the tool does not declare (a typo, or a parameter renamed long
+/// afterwards) satisfies a hand-written probe while returning `None` for every real call, and the
+/// tool silently goes back to rendering bare.
 ///
 /// Drives `every_tool_with_arguments_can_show_a_primary_param`, below.
 #[cfg(test)]
@@ -862,12 +837,10 @@ pub(crate) const BUILTINS_WITHOUT_ARGUMENTS: &[&str] = &[
 ];
 /// The argument a tool-call indicator shows next to the tool's name.
 ///
-/// One rule per name in [`BUILTIN_TOOL_NAMES`] that takes an argument, the complement
-/// of `BUILTINS_WITHOUT_ARGUMENTS`. Covering every one of them is what the map is *for*, not a
-/// convenience: [`resolve_primary_param`]'s other half needs the tool's JSON Schema, and replayed
-/// history has none, so a built-in missing from here renders bare in `/history` having rendered
-/// fully live. `schedule_cancel` shipped that way, replaying as `[tool ScheduleCancel]` with no
-/// word of which job was canceled.
+/// One rule per name in [`BUILTIN_TOOL_NAMES`] that takes an argument, the complement of
+/// `BUILTINS_WITHOUT_ARGUMENTS`. Covering every one of them is what the map is for:
+/// [`resolve_primary_param`]'s other half needs the tool's JSON Schema, and replayed history has
+/// none, so a built-in missing from here renders bare in `/history` having rendered fully live.
 fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String> {
     // `render_image` accepts either `from_scratchpad` or inline `base64`. Show the scratchpad name
     // when present; for inline base64 the payload is opaque so there's nothing useful to display.
@@ -960,9 +933,8 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         _ => return None,
     };
     // Coerced rather than read as a string: `load_tool` takes a name or a list of them,
-    // `memory_search` takes a list of phrasings, and `conversation_read` takes a number. Reading
-    // only `as_str` returned `None` for all three, which sent the live path to the schema fallback
-    // -- where the same value went through this very function -- and left the replayed line bare.
+    // `memory_search` takes a list of phrasings, and `conversation_read` takes a number, and
+    // `as_str` alone would leave all three replaying bare.
     input.get(key).and_then(coerce_display_value)
 }
 /// Fallback for tools not covered by the built-in map (MCP tools, dynamically-registered tools,
@@ -1056,8 +1028,8 @@ mod tests {
     use crate::store::Store;
 
     /// The one tool that cannot detach is refused where the flag is consumed, not only left out
-    /// of the schema: a model that generalizes `background` to it got a detached compaction that
-    /// fired against a later turn.
+    /// of the schema: a model that generalizes `background` to it would get a detached compaction
+    /// that fires against a later turn.
     #[test]
     fn context_compact_cannot_be_detached() {
         let schema = serde_json::json!({"type": "object", "properties": {"instructions": {"type": "string"}}});
@@ -1079,18 +1051,12 @@ mod tests {
         assert!(detach);
     }
 
-    /// A pathological argument costs one pass over itself, not one distance matrix per candidate.
+    /// A pathological argument costs one pass over itself, not one distance matrix per candidate,
+    /// which is what lets the lookup doors accept any name the column holds rather than capping
+    /// length.
     ///
-    /// This is what replaced the length cap on `validate_lookup_name`. That cap bounded the cost by
-    /// refusing the argument outright, and in doing so refused every *stored* name past 64
-    /// characters too -- leaving a row meka listed to the model every turn that nothing it shipped
-    /// could open or remove. Bounding the work here instead lets the lookup doors accept any name
-    /// the column holds.
-    ///
-    /// Counted, not timed. A wall-clock bound measures the machine as much as the code: it would
-    /// eventually flake on a loaded CI runner, and a flake and a real regression look identical.
-    /// The candidate iterator reports how many names were actually inspected, which is the property
-    /// the skip exists to hold and is the same on every host.
+    /// Counted, not timed: a wall-clock bound measures the machine as much as the code, and a
+    /// flake on a loaded CI runner and a real regression look identical.
     #[test]
     fn a_pathological_name_does_not_run_a_distance_matrix_per_candidate() {
         use std::sync::atomic::Ordering;
@@ -1098,9 +1064,9 @@ mod tests {
         let candidates: Vec<String> = (0..500).map(|index| format!("memory-{index}")).collect();
         let needle = "x".repeat(200_000);
 
-        // Counted at the callee, not in the caller's iterator. Every candidate is still *visited*
-        // -- the band is inside the loop -- so counting visits answers a question nothing was
-        // asking, and it answers it identically whether or not the band is there.
+        // Counted at the callee, not in the caller's iterator: every candidate is still visited
+        // (the band is inside the loop), so counting visits answers identically whether or not the
+        // band is there.
         EDIT_DISTANCE_CALLS.store(0, Ordering::Relaxed);
         let hint = did_you_mean_hint(&needle, candidates.iter().map(String::as_str));
         let built = EDIT_DISTANCE_CALLS.load(Ordering::Relaxed);
@@ -1149,25 +1115,15 @@ mod tests {
     /// Every built-in that takes a meaningful argument must be able to show one in the tool-call
     /// indicator, and must still be able to when the tool's schema next changes.
     ///
-    /// Three failure modes, each of which has actually happened here:
-    ///
-    /// - **No rule at all.** `resolve_primary_param` consults the built-in map, then the tool's
-    ///   JSON Schema. Replayed history has no schema, so a built-in absent from the map renders
-    ///   bare in `/history` having rendered fully live: nineteen of them did, including
-    ///   `schedule_cancel`, which replayed without saying which job it canceled.
-    /// - **No rule and no `required`.** Then even the live line has nothing to reach for.
-    ///   `task_cancel` shipped that way, and `context_compact` after it.
-    /// - **A rule that has gone stale.** The map is keyed by tool name and names a parameter by
-    ///   string, so renaming that parameter silently breaks it. Renaming `schedule_cancel`'s `id`
-    ///   to `job_id` fails the schedule tool's own two tests and nothing else, and updating those
-    ///   two - the obvious thing to do next - leaves the indicator quietly bare again. This is why
-    ///   the probe is built from each tool's declared properties rather than from a fixed list.
+    /// Three failure modes: no rule at all (replayed history has no schema, so the built-in
+    /// renders bare in `/history`); no rule and no `required` (even the live line has nothing to
+    /// reach for); and a rule that has gone stale, because the map names a parameter by string and
+    /// renaming that parameter silently breaks it, which is why the probe is built from each
+    /// tool's declared properties rather than from a fixed list.
     ///
     /// The sweep is over the whole registry rather than `BUILTIN_TOOL_NAMES` so that each name
     /// arrives with its real schema, and it asserts at the end that it saw every name, because a
-    /// family missing from the registry is exactly how the first two went unnoticed: the previous
-    /// version of this test could not build `context_*`, `agent_*` or the MCP meta-tools and
-    /// therefore never examined eleven of the tools it was written to protect.
+    /// family missing from the registry would otherwise go unexamined.
     #[tokio::test]
     async fn every_tool_with_arguments_can_show_a_primary_param() {
         // meka's own universal parameters. A tool whose schema is only these takes no argument of
@@ -1396,8 +1352,8 @@ mod tests {
         })
     }
 
-    /// The regression in full: a call that succeeds, takes a silently wrong default, and until now
-    /// said nothing about the flag that would have fixed it.
+    /// A call that succeeds, takes a silently wrong default, and has to be told about the flag
+    /// that would have fixed it.
     #[test]
     fn schema_disagreement_names_the_unused_parameter() {
         let input = serde_json::json!({"conversation": "telegram:1", "path": "/tmp/a.png"});
@@ -2000,9 +1956,8 @@ mod tests {
         }
     }
 
-    /// Guards against a regression where parallel tool dispatch is replaced by sequential
-    /// `.await`-in-a-loop. Two tools each sleep ~200 ms; the total wall-clock must be much less
-    /// than the sum.
+    /// Two tools each sleep ~200 ms; the total wall-clock must be much less than the sum, or
+    /// dispatch has become sequential.
     #[tokio::test]
     async fn parallel_dispatch_runs_tools_concurrently() {
         let registry = ToolRegistry::new_with_filter(BuiltinToolFilter::default());
@@ -2122,17 +2077,10 @@ mod tests {
         }
     }
 
-    /// Every built-in has a label, and every label is spelled the same way.
-    ///
-    /// The table this guards is hand-maintained and had gone stale in both directions at once: the
-    /// whole `memory_*` family, all four later `scratchpad_*` tools, `schedule_*`, `task_*`,
-    /// `load_tool`, `conversation_*` and the MCP meta-tools fell through to the raw name, while
-    /// three `skill_*` entries used sentence case. A live transcript showed `[tool Search
-    /// skills(...)]` one line above `[tool memory_search(...)]`.
-    ///
-    /// Asserting the style as well as the presence is what makes the test worth having: a mapping
-    /// added as `"memory_search" => "Search memories"` satisfies "has an entry" and reintroduces
-    /// exactly the inconsistency this exists to stop.
+    /// Every built-in has a label, and every label is spelled the same way. Asserting the style as
+    /// well as the presence is what makes the test worth having: a mapping added as
+    /// `"memory_search" => "Search memories"` satisfies "has an entry" and reintroduces exactly
+    /// the inconsistency this exists to stop.
     #[test]
     fn every_builtin_tool_has_a_display_name() {
         let missing: Vec<&str> = crate::tools::BUILTIN_TOOL_NAMES
@@ -2300,9 +2248,8 @@ mod tests {
         );
     }
 
-    /// `context_compact` declares no `required`, so like `task_cancel` before it the schema
-    /// fallback had nothing to reach for and the call rendered bare on every surface, not just
-    /// replay.
+    /// `context_compact` declares no `required`, so like `task_cancel` the schema fallback has
+    /// nothing to reach for and the call would render bare on every surface, not just replay.
     #[test]
     fn builtin_primary_param_context_compact() {
         assert_eq!(

@@ -384,9 +384,7 @@ mod tests {
             .find(|line| line.contains(task.short_id()))
             .unwrap_or_else(|| panic!("no row for the task: {text}"));
         assert!(row.contains("failed"), "{row}");
-        // The `Status` column is the single place a task's state is stated. An elapsed time
-        // labeled "running for" beside a `failed` badge read as a contradiction and invited the
-        // agent to keep waiting on work that had already stopped.
+        // The `Status` column is the single place a task's state is stated.
         assert!(!row.contains("running"), "{row}");
     }
 

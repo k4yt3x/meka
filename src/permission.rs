@@ -74,6 +74,7 @@ impl Permission {
             .join(", ")
     }
 
+    /// The level after this one in cycle order, wrapping from `unrestricted` to `none`.
     pub(crate) fn cycle_next(self) -> Permission {
         match self {
             Permission::None => Permission::Read,
@@ -128,8 +129,8 @@ impl Permission {
     ///
     /// The ladder is a total order, so this is `self <= parent`; it is kept as a named predicate
     /// because every door that bounds a sub-agent asks the question in these words, and a
-    /// comparison operator at each of them is what let the answer drift when the ladder was not
-    /// total.
+    /// comparison operator at each of them is what would let the answer drift if the ladder were
+    /// ever not total.
     pub(crate) fn is_within(self, parent: Permission) -> bool {
         self <= parent
     }
@@ -144,14 +145,14 @@ impl Permission {
     ///
     /// `Workspace` does not pass, tempting as it is on the reasoning that it is *safer* than the
     /// top rung. That is true of `execute_command`, which `workspace` confines, and false of a
-    /// gate, which bypasses every backend. The result was a one-call escape: at `workspace`, a
-    /// single `schedule_create` with a `gate` ran arbitrary commands outside the boundary within
+    /// gate, which bypasses every backend. Passing it is a one-call escape: at `workspace`, a
+    /// single `schedule_create` with a `gate` runs arbitrary commands outside the boundary within
     /// one poll interval, no race and no user interaction, while `execute_command` at the same
-    /// level was confined and is refused outright when it cannot be. The interactive shell must not
+    /// level is confined and is refused outright when it cannot be. The interactive shell must not
     /// have a higher bar than the unattended one.
     ///
-    /// A named predicate rather than a `matches!` repeated at each door, because the four sites had
-    /// already drifted into phrasing the same rule three different ways.
+    /// A named predicate rather than a `matches!` repeated at each door, so the four sites cannot
+    /// drift into phrasing the same rule different ways.
     pub(crate) fn allows_unattended_shell(self) -> bool {
         matches!(self, Permission::Unrestricted)
     }
@@ -162,7 +163,7 @@ impl Permission {
     /// reads nothing, acts on nothing, and cannot even cancel the job that woke it. Registration is
     /// permission-independent, so the model does see the job in `[Scheduled]` and is offered
     /// `schedule_cancel`; the refusal happens at dispatch, which leaves it able to describe its
-    /// predicament and unable to do anything about it. An `every = "5s"` job on such a session was
+    /// predicament and unable to do anything about it. An `every = "5s"` job on such a session is
     /// a turn's worth of tokens every five seconds, forever, stoppable only by an operator.
     ///
     /// Distinct from [`Self::allows_unattended_shell`], which asks what a *gate* may run. This asks
@@ -249,7 +250,7 @@ pub(crate) fn parse_recorded_permission(
         Ok(permission) => Some(permission),
         Err(error) => {
             tracing::warn!(
-                "{subject} records permission '{raw}', which is not one meka recognizes ({error}); \
+                "{subject} records permission level '{raw}', which meka does not recognize ({error}); \
                  the row is read as recording no level"
             );
             None
@@ -295,6 +296,7 @@ impl EnabledPermissions {
         if bits == 0 { None } else { Some(Self { bits }) }
     }
 
+    /// Whether `permission` is in the set.
     pub(crate) fn is_enabled(self, permission: Permission) -> bool {
         self.bits & (1 << (permission as u8)) != 0
     }
@@ -308,6 +310,7 @@ impl EnabledPermissions {
 
     /// Lowest-discriminant enabled level. Every constructor ([`Self::from_levels`] returns `None`
     /// on empty input, [`Self::DEFAULT`] is non-empty by definition) refuses an empty set, so
+    /// there is always one.
     #[allow(
         clippy::expect_used,
         reason = "the constructor refuses an empty set, so `iter().next()` is always `Some`"
@@ -374,12 +377,11 @@ pub(crate) struct SharedPermission {
     /// within *both* this and `inner`, so a parent downgrade takes effect on the sub-agent's very
     /// next tool call.
     ///
-    /// Without it the clamp happened only at spawn: `shared_permission` built a fresh `AtomicU8`
-    /// from a snapshot of the parent's level, and nothing propagated afterwards. A user who
-    /// pressed Shift+Tab to `none` to stop a runaway sub-agent saw the prompt indicator change
-    /// and the parent's next call denied, while the sub-agent kept writing files and running
-    /// unsandboxed commands to completion -- and `permissions.md` presents cycling the parent
-    /// as the way to restrict sub-agents.
+    /// Without it the clamp happens only at spawn, from a snapshot of the parent's level, and
+    /// nothing propagates afterwards: a user who presses Shift+Tab to `none` to stop a runaway
+    /// sub-agent sees the prompt indicator change and the parent's next call denied, while the
+    /// sub-agent keeps writing files and running unsandboxed commands to completion, and
+    /// `permissions.md` presents cycling the parent as the way to restrict sub-agents.
     ceiling: Option<Arc<AtomicU8>>,
     /// Whether a call needing more than the level is submitted for approval rather than refused.
     ///
@@ -391,6 +393,7 @@ pub(crate) struct SharedPermission {
 }
 
 impl SharedPermission {
+    /// A root handle at `initial`, with approvals off.
     pub(crate) fn new(initial: Permission, enabled: EnabledPermissions) -> Self {
         Self {
             inner: Arc::new(AtomicU8::new(initial as u8)),
@@ -442,10 +445,12 @@ impl SharedPermission {
         }
     }
 
+    /// The levels this handle may be set to.
     pub(crate) fn enabled(&self) -> EnabledPermissions {
         self.enabled
     }
 
+    /// The level in force right now, bounded by the parent's for a sub-agent.
     pub(crate) fn get(&self) -> Permission {
         let own = Self::decode(self.inner.load(Ordering::Relaxed));
         match &self.ceiling {
@@ -460,6 +465,7 @@ impl SharedPermission {
         self.approvals.load(Ordering::Relaxed)
     }
 
+    /// Turn the approvals switch on or off.
     pub(crate) fn set_approvals(&self, approvals: bool) {
         self.approvals.store(approvals, Ordering::Relaxed);
     }

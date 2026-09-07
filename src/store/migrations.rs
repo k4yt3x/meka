@@ -122,11 +122,10 @@ impl Context {
     /// What a caller hands over when `config.toml` could not be parsed or read.
     ///
     /// Deliberately still openable: a store already at head runs no step that consults this, so the
-    /// commands that exist to *repair* an unreadable config -- `meka mcp remove`, `meka account
+    /// commands that exist to *repair* an unreadable config (`meka mcp remove`, `meka account
     /// remove`, `meka profile remove`, which edit the raw document through `toml_edit` and never
-    /// parse it -- keep working.
-    /// Only a store that would actually adopt a profile, or stamp a level on a root row, is
-    /// refused.
+    /// parse it) keep working. Only a store that would actually adopt a profile, or stamp a level
+    /// on a root row, is refused.
     pub(crate) fn on_unreadable_config() -> Self {
         Self {
             default_provider: String::new(),
@@ -283,8 +282,7 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
     if stored > head {
         return Err(MekaError::Database(format!(
             "{} is at schema version {} and this meka only knows {}, so it was written by a newer \
-             release. Nothing has been changed. Upgrade meka, or point MEKA_DATA_DIR at a \
-             different store",
+             release. Nothing has been changed. Upgrade meka",
             store_name(connection),
             stored,
             head
@@ -311,9 +309,8 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
         if fingerprint != HEAD_SCHEMA_FINGERPRINT {
             return Err(MekaError::Database(format!(
                 "{} is stamped at schema version {} but its tables do not have that version's \
-                 shape. If this store was copied from another machine or directory, copy its \
-                 `-wal` and `-shm` companions with it, or run `PRAGMA wal_checkpoint(TRUNCATE)` \
-                 on the source first. Nothing has been changed",
+                 shape. If it was copied from another machine or directory, copy its `-wal` and \
+                 `-shm` companions with it. Nothing has been changed",
                 store_name(connection),
                 head
             )));
@@ -424,15 +421,15 @@ const RETIRED_INITIALIZED_FLAG: u32 = 1;
 /// Foreign keys are suspended for the duration, and this is the reason the two halves are split
 /// across two functions. `PRAGMA foreign_keys` is a **no-op inside a transaction**, so it has to be
 /// set before `BEGIN`, which the transaction-owning half cannot do. SQLite's documented procedure
-/// for the table changes `ALTER TABLE` cannot express -- changing a column's type, adding or
-/// removing `NOT NULL`, changing a default, dropping a constraint -- is to build a new table, copy,
+/// for the table changes `ALTER TABLE` cannot express (changing a column's type, adding or
+/// removing `NOT NULL`, changing a default, dropping a constraint) is to build a new table, copy,
 /// drop the old, and rename, and it requires enforcement off. With it on, `DROP TABLE sessions`
 /// cascades through `messages`, `tool_outputs`, `scheduled_jobs` and `background_tasks`, deleting
-/// the entire conversation history inside a transaction that then commits successfully. Measured:
-/// one child row before, zero after, with the pragma reading `1` throughout because the attempt to
-/// turn it off was ignored. `PRAGMA defer_foreign_keys` does not help.
+/// the entire conversation history inside a transaction that then commits successfully, with the
+/// pragma reading `1` throughout because the attempt to turn it off inside the transaction is
+/// ignored. `PRAGMA defer_foreign_keys` does not help.
 ///
-/// Neither shipped step rebuilds a table, so this changes nothing today. It is here now because
+/// No shipped step rebuilds a table, so this changes nothing today. It is here now because
 /// `apply`'s transaction boundary is itself a shipped decision: the first migration that needs a
 /// rebuild would otherwise have to change it, and would probably not notice why it had to.
 /// [`apply_steps`] runs `foreign_key_check` before committing, since nothing was enforcing
@@ -459,9 +456,8 @@ pub(crate) fn apply(
 ///
 /// Separated from [`apply`] so the property can be tested rather than argued for. The thing that
 /// has to be true is "a step that rebuilds a table does not cascade-delete its children", and no
-/// shipped migration rebuilds one, so with the suspension inlined there was nothing a test could
-/// reach: the mutation sweep could only confirm the *count* was read, never that the guard worked.
-/// A closure lets a test hand in the rebuild that does not exist in `MIGRATIONS`.
+/// shipped migration rebuilds one, so with the suspension inlined there is nothing a test can
+/// reach. A closure lets a test hand in the rebuild that does not exist in `MIGRATIONS`.
 ///
 /// The restore is not optional and not best-effort. This connection goes on to serve the whole
 /// process, and every write after this point expects enforcement to be live; a failure to put it
@@ -486,19 +482,18 @@ fn with_foreign_keys_suspended<T>(
     let outcome = work(connection);
     let restored = connection.execute_batch("PRAGMA foreign_keys = ON;");
     // Said out loud even when the migration is the thing that failed. Returning only the migration
-    // error is right -- it is the more useful message and the reason the caller is unwinding -- but
+    // error is right (it is the more useful message and the reason the caller is unwinding), but
     // dropping this one silently would hide that the connection is now unsafe as well.
     if let Err(error) = &restored {
         tracing::error!(
-            "failed to re-enable foreign keys after the schema migration: {error}. Restart meka \
-             rather than continuing with enforcement off"
+            "failed to re-enable foreign keys after the schema migration: {error}; restart meka"
         );
     }
     let outcome = outcome?;
     restored.map_err(|error| {
         MekaError::Database(format!(
             "the schema migration committed but failed to re-enable foreign keys on this \
-             connection: {error}. Restart meka rather than continuing with enforcement off"
+             connection: {error}; restart meka"
         ))
     })?;
     Ok(outcome)
@@ -553,8 +548,8 @@ fn apply_steps(
     }
     if dangling_before > 0 {
         tracing::warn!(
-            "this store already carried {dangling_before} row(s) referring to a parent that is not there. The \
-             migration did not add to them and has not removed them"
+            "this store already carried {dangling_before} row(s) referring to a parent that is not \
+             there; the migration left them as they were"
         );
     }
     set_user_version(&transaction, plan.head)?;
@@ -645,8 +640,7 @@ fn store_name(connection: &rusqlite::Connection) -> &str {
 /// statements in autocommit, so a first run of any pre-0.43 release interrupted partway leaves
 /// exactly this state, with `background_tasks` and the memory tables likeliest because they were
 /// last. Without the check such a store is stamped at head with a table still missing, which
-/// nothing will ever revisit; measured, `meka session list` succeeded and left it that way.
-/// Refusing names what is wrong instead.
+/// nothing will ever revisit. Refusing names what is wrong instead.
 fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     // Not a meka store: an empty file, or one carrying tables meka did not write. Nothing to carry
     // forward either way, so build the schema alongside whatever is already there, which is what
@@ -699,8 +693,8 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
     if !missing.is_empty() {
         return Err(MekaError::Database(format!(
             "{} is missing {}, which every release from 0.42 creates, so it was probably left \
-             half-built by an interrupted first run. Nothing has been changed. Restore it from a \
-             backup, or move it aside and let meka build a new one",
+             half-built by an interrupted first run. Nothing has been changed. Move it aside and \
+             let meka build a new one",
             store_name(connection),
             missing.join(", ")
         )));
@@ -765,7 +759,7 @@ fn table_columns(connection: &rusqlite::Connection, table: &str) -> Result<Vec<S
 /// The FTS *triggers* are deliberately absent. `crate::store::memory`'s `sync_triggers` owns their
 /// creation and reconciles them on every open, and a `CREATE TRIGGER IF NOT EXISTS` here would put
 /// a trigger that had gone missing back before that comparison could notice, which is a silent
-/// index desync that module documents having reproduced.
+/// index desync.
 const BASELINE_0_42: &str = "
     CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
@@ -2504,7 +2498,10 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-        let production = include_str!("migrations.rs")
+        // A Windows checkout may carry CRLF line endings; the digest is of the text, not of how
+        // git stored it, so every platform hashes the same bytes.
+        let source = include_str!("migrations.rs").replace("\r\n", "\n");
+        let production = source
             .split("\nmod tests {")
             .next()
             .expect("splitting always yields a first part");
@@ -2547,7 +2544,7 @@ mod tests {
     /// scanned region to nothing and pass vacuously.
     #[test]
     fn no_migration_calls_meka_s_own_code() {
-        let source = include_str!("migrations.rs");
+        let source = include_str!("migrations.rs").replace("\r\n", "\n");
         // `"\nmod tests {"` rather than `"mod tests {"`: the module is declared at column zero, so
         // this cannot be truncated by a doc comment that happens to contain the literal. The
         // unanchored form could be, and the sanity check below would not have noticed, because it

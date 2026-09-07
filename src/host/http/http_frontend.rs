@@ -298,17 +298,11 @@ impl HttpFrontend {
                 };
 
                 // Deliver first, and only record the sticky decision if the waiter actually took
-                // it.
-                //
-                // `request_permission` resolves through a `tokio::select!`, so its
-                // `oneshot::Receiver` is already dropped once the approval timeout
-                // expires, the turn is canceled, or the SSE client disconnects.
-                // Recording before the send meant a reply that lost that race was
-                // reported to the caller as `404 request-not-found` -- the tool call denied, the
-                // client told nothing was resolved -- while the tool had nonetheless been written
-                // into `always_allowed` for the rest of the session, silently
-                // short-circuiting every later call to it with no prompt and no SSE
-                // event. An answer nobody received must not grant anything.
+                // it. `request_permission` resolves through a `tokio::select!`, so its
+                // `oneshot::Receiver` is already dropped once the approval timeout expires, the
+                // turn is canceled, or the SSE client disconnects; a reply that loses that race
+                // is reported to the caller as `404 request-not-found`, and an answer nobody
+                // received must not grant anything.
                 let delivered = pending.sender.send(outcome).is_ok();
                 if delivered {
                     match resolution {
@@ -604,9 +598,8 @@ impl Frontend for HttpFrontend {
             // Blocking mode: no SSE channel to ask through. Auto-deny and surface the
             // misconfiguration signal in the response so the operator notices.
             self.record_warn_notice(format!(
-                "Permission for '{}' auto-denied: approvals are on and stream=false has no channel \
-                 to approve on. Use stream=true, raise the session's permission, or turn approvals \
-                 off.",
+                "Permission for '{}' auto-denied: a blocking turn has no channel to approve on; \
+                 use `stream: true`",
                 request.tool_name
             ))
             .await;
@@ -618,8 +611,8 @@ impl Frontend for HttpFrontend {
             // burn the full timeout and deny anyway; do it now and say why.
             self.record_warn_notice(format!(
                 "Permission for '{}' auto-denied: the session declared \
-                 supports_permission_prompts=false, so there is no channel to approve on. Set \
-                 permission=workspace or permission=unrestricted.",
+                 supports_permission_prompts=false; raise its permission with \
+                 `PATCH /v1/sessions/{{id}}`",
                 request.tool_name
             ))
             .await;
@@ -811,10 +804,9 @@ mod tests {
     /// The SSE stream task cancels the turn when a consumer lags, and must not do so
     /// unconditionally: turn events are a broadcast, so a re-attached client or a second consumer
     /// is a separate receiver, and one slow reader would kill the turn out from under the client
-    /// that is keeping up. The guard is `subscriber_count() <= 1`, and reverting it left all four
-    /// suites green. This pins the count's semantics, including the part the guard depends on --
-    /// that the lagging receiver, which is about to be dropped, is still included while it lives,
-    /// which is why the threshold is `<= 1` rather than `== 0`.
+    /// that is keeping up. The guard is `subscriber_count() <= 1`. This pins the count's semantics,
+    /// including the part the guard depends on: the lagging receiver, which is about to be dropped,
+    /// is still included while it lives, which is why the threshold is `<= 1` rather than `== 0`.
     #[tokio::test]
     async fn subscriber_count_sees_every_live_consumer_of_a_turn() {
         let frontend = HttpFrontend::new();
@@ -1095,21 +1087,13 @@ mod tests {
         assert_eq!(event.event_type, super::SseEventType::ThinkingDelta);
     }
 
-    /// When the SSE consumer disconnects (all broadcast receivers dropped) while
-    /// `request_permission` is parked, the permission wait should resolve to `Canceled`
-    /// within `DISCONNECT_POLL_INTERVAL` instead of blocking until the approval timeout.
-    ///
-    /// Zero grace, so this tests the resolution path rather than the reconnect window;
-    /// `client_disconnected_waits_out_the_reattach_grace` covers the window itself.
     /// A reply that loses the race must grant nothing.
     ///
     /// `resolve_permission` answers the HTTP caller `404 request-not-found` when the waiter has
-    /// already gone -- canceled, timed out, or disconnected. Recording the sticky decision
-    /// *before* the send meant that same call still wrote the tool into `always_allowed` for
-    /// the rest of the session: the caller was told nothing was resolved, the tool call was
-    /// denied, and every later call to that tool was silently approved with no prompt and no
-    /// SSE event. Ordering the record after a successful delivery is the whole fix, and nothing
-    /// pinned it.
+    /// already gone (canceled, timed out, or disconnected). Recording the sticky decision before
+    /// the send would still write the tool into `always_allowed` for the rest of the session: the
+    /// caller told nothing was resolved, the tool call denied, and every later call to that tool
+    /// silently approved with no prompt and no SSE event.
     #[tokio::test]
     async fn a_reply_that_arrives_too_late_grants_nothing() {
         let frontend = Arc::new(HttpFrontend::new());

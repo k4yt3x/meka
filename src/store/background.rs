@@ -11,6 +11,7 @@ pub(crate) struct BackgroundStore {
     pub(crate) connection: std::sync::Arc<tokio_rusqlite::Connection>,
 }
 impl BackgroundStore {
+    /// A handle on the table over `connection`.
     pub(crate) fn new(connection: std::sync::Arc<tokio_rusqlite::Connection>) -> Self {
         Self { connection }
     }
@@ -109,8 +110,8 @@ impl BackgroundStore {
     ///
     /// This and [`Self::mark_background_tasks_delivered`] are two statements, not one transaction,
     /// so two processes that both list before either marks would each render the same outcome. That
-    /// is currently unreachable -- delivery only happens inside a session, and a session is held by
-    /// one process at a time from the moment its row exists -- so the pair rests on the session
+    /// is currently unreachable (delivery only happens inside a session, and a session is held by
+    /// one process at a time from the moment its row exists), so the pair rests on the session
     /// lock rather than on its own atomicity. Anything that ever lets two hosts open one
     /// session at once has to make this a transaction first.
     pub(crate) async fn list_undelivered_background_tasks(
@@ -132,7 +133,6 @@ impl BackgroundStore {
     /// Called *before* the turn runs: an outcome that reliably wedges the process would otherwise
     /// be redelivered on every restart, turning one bad result into a boot loop. Losing one report
     /// is the cheaper failure.
-    ///
     ///
     /// [`crate::store::schedule::ScheduleStore::complete_claim`] writes *after* the turn, because a
     /// lease plus an attempt ceiling gives it the same boot-loop protection without paying an
@@ -268,9 +268,8 @@ impl BackgroundStore {
     /// Resolve a full or unique-prefix task id within a session. An ambiguous prefix is an error
     /// rather than an arbitrary pick, matching
     /// [`crate::store::schedule::ScheduleStore::cancel_scheduled_job`] in behavior and in error
-    /// variant. That one returned `Database` for the identical condition, so the two `serve`
-    /// endpoints answered different HTTP statuses for the same mistake; both now use `Config`,
-    /// which reaches the caller as a 422.
+    /// variant, so the two `serve` endpoints answer the same HTTP status (422) for the same
+    /// mistake.
     pub(crate) async fn resolve_background_task(
         &self,
         session_id: Uuid,
@@ -360,6 +359,7 @@ pub(crate) struct BackgroundTaskRow {
     pub(crate) delivered_at: Option<String>,
 }
 impl BackgroundTaskRow {
+    /// The row as a [`BackgroundTask`], or what about it did not parse.
     pub(crate) fn decode(self) -> std::result::Result<BackgroundTask, String> {
         let parse_time =
             |text: &str| -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
@@ -416,8 +416,8 @@ impl TaskStatus {
     /// Whether a finished task should wake a host, or wait for the next turn to carry it.
     ///
     /// Every terminal outcome is delivered; this decides only whether delivering it is worth a turn
-    /// nobody asked for. A cancellation is always somebody's deliberate act -- `/tasks cancel`, the
-    /// `task_cancel` tool, a second Ctrl+C, `POST .../cancel` -- so the one party who would learn
+    /// nobody asked for. A cancellation is always somebody's deliberate act (`/tasks cancel`, the
+    /// `task_cancel` tool, a second Ctrl+C, `POST .../cancel`), so the one party who would learn
     /// something from the turn already knows, and a command whose whole purpose is to stop work
     /// would be starting some. The outcome still reaches the model, on the next turn there is.
     ///
@@ -448,6 +448,7 @@ impl TaskStatus {
             .join(", ")
     }
 
+    /// Whether the task has ended, whichever way.
     pub(crate) fn is_terminal(self) -> bool {
         !matches!(self, Self::Running)
     }

@@ -25,10 +25,8 @@ where
         // reading the next UTF-8 scalar and pushing the whole codepoint. Byte-level `as char` would
         // mangle multi-byte sequences (e.g. `café` → `cafÃ©`).
         if bytes[i] != b'$' || i + 1 >= bytes.len() || bytes[i + 1] != b'{' {
-            // SAFETY: `input` is a valid &str, so slicing from a byte index that is a char boundary
-            // yields a valid &str. `i` is always on a char boundary because we advance by
-            // `ch.len_utf8()` below or jump to `end + 1` (the byte after a `}`, ASCII, always a
-            // boundary).
+            // `i` is always on a char boundary: it advances by `ch.len_utf8()` or to the byte
+            // after an ASCII `}`.
             let rest = &input[i..];
             #[allow(
                 clippy::expect_used,
@@ -73,11 +71,6 @@ where
     (out, missing)
 }
 
-/// Walk every expandable string inside `config` and apply [`expand_env_vars`] using the process
-/// environment.
-///
-/// Returns the list of missing variable names (deduplicated, in first-seen order) so the caller can
-/// surface a single warning per startup.
 /// What `${VAR}` expansion could not resolve in a server's config.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Unresolved {
@@ -90,6 +83,8 @@ pub(crate) struct Unresolved {
     pub(crate) in_secret_bearing_fields: bool,
 }
 
+/// Walk every expandable string inside `config` and apply [`expand_env_vars`] with the process
+/// environment.
 pub(crate) fn expand_server_config(config: &mut McpServerConfig) -> Unresolved {
     let mut unresolved = Unresolved::default();
     let mut record = |missing: Vec<String>, secret_bearing: bool| {
@@ -140,7 +135,7 @@ pub(crate) fn expand_server_config(config: &mut McpServerConfig) -> Unresolved {
         }
         *headers = new_headers;
     }
-    // The helper is a command line like `command`, and was the one field the walk skipped.
+    // The helper is a command line like `command`.
     if let Some(helper) = &config.headers_helper {
         let (expanded, missing) = expand_env_vars(helper, lookup);
         record(missing, false);

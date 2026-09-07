@@ -105,10 +105,10 @@ pub(crate) async fn fork_and_lock(
 }
 /// Retire whatever the previous owner left running, for a process that has just taken this session.
 ///
-/// Every path that hydrates a conversation has to call this, not just the CLI resume that first
-/// needed it: `meka serve` reattaching an evicted session, and ACP's `session/load`,
-/// `session/resume` and `session/fork`, all take the same lease and all inherit the same wreckage.
-/// Missing one does not merely skip a report, it strands the row:
+/// Every path that hydrates a conversation has to call this: the CLI resume, `meka serve`
+/// reattaching an evicted session, and ACP's `session/load`, `session/resume` and `session/fork`
+/// all take the same lease and inherit the same wreckage. Missing one does not merely skip a
+/// report, it strands the row:
 /// `list_undelivered_background_tasks` ignores `running`, so the outcome is never delivered, while
 /// `list_running_background_tasks` keeps injecting the dead task into `[Background]` on every later
 /// turn, telling the model not to restart work that died days ago.
@@ -313,8 +313,7 @@ pub(crate) struct Sessions<K, E>(Arc<tokio::sync::RwLock<std::collections::HashM
 /// turn's token: canceling something already finished, reporting success, and leaving the new turn
 /// untouched. Every cancel bumps the epoch; a turn samples it when admitted and, on publishing,
 /// cancels itself if the epoch moved. Between turns the cell is empty, so a cancel then fires
-/// nothing and says so. The three hosts once solved the same race three ways: this epoch, a
-/// generation counter armed by pending-prompt counts, and a process-wide relay.
+/// nothing and says so.
 #[derive(Clone, Default)]
 pub(crate) struct CancelCell {
     token: Arc<std::sync::RwLock<Option<tokio_util::sync::CancellationToken>>>,
@@ -390,8 +389,8 @@ impl ResidentSession {
 
     /// Let the session go: stop the turn in flight, stop the detached work it started, and stop
     /// the MCP manager fanning tool updates into a registry nobody reads. One routine for every
-    /// way a session leaves a host, because each host once had its own and they disagreed on which
-    /// of the three to do. Returns how many background tasks were signaled.
+    /// way a session leaves a host, so no host can skip one of the three. Returns how many
+    /// background tasks were signaled.
     ///
     /// Does not wait for the turn to unwind: a host that must (ACP's `session/close`, whose caller
     /// is off the dispatch loop) waits on [`Self::conversation`] first, and a host draining at

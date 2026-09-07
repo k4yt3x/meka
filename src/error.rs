@@ -220,8 +220,8 @@ const _: () = assert!(
 /// being appended to it. Added on top, a body a few bytes over the cap came back larger than it
 /// went in, while telling the reader it had been shortened.
 ///
-/// Cuts on a character boundary. Multi-byte text is ordinary here -- a provider error in Japanese,
-/// an emoji in a proxy's HTML page -- and slicing mid-codepoint panics.
+/// Cuts on a character boundary. Multi-byte text is ordinary here (a provider error in Japanese,
+/// an emoji in a proxy's HTML page) and slicing mid-codepoint panics.
 pub(crate) fn bounded_upstream_body(message: &str) -> String {
     if message.len() <= RELAYED_BODY_CAP {
         return message.to_string();
@@ -271,7 +271,7 @@ pub(crate) enum ProviderRequest {
 /// degrade-and-retry once), and everything else to [`MekaError::Provider`]. Anthropic returns HTTP
 /// 400 `invalid_request_error` with "prompt is too long"; OpenAI returns 400
 /// `context_length_exceeded` (or 413). The overflow check is matched on the body, because a bare
-/// 400 is shared with many unrelated errors -- but only on a status that could *be* an overflow:
+/// 400 is shared with many unrelated errors, but only on a status that could *be* an overflow:
 /// never a 5xx, never a 429, and unconditionally on a 413. See the comment on `overflow` below for
 /// why the status is the half worth trusting when the two disagree.
 ///
@@ -372,26 +372,6 @@ pub(crate) fn provider_transport_error(
     }
 }
 
-/// Classify an OAuth token exchange the authorization server *answered*, whether by rejecting it or
-/// by returning a success meka failed to read back.
-///
-/// A refresh consumes its request: under RFC 9700 rotation the refresh token is single-use, so once
-/// the server has read it, it is spent and its replacement is in a response meka may not be
-/// holding. Sending it again is a replay, and §4.14.2 has the server revoke the whole token family
-/// on one, which costs a browser login rather than a round trip. So the split is by what the answer
-/// implies about the token, not by whether one arrived: a 429 was refused before the grant was
-/// read and a 5xx usually means the server is unwell rather than that the grant is bad, so both
-/// retry in the ordinary way; that accepts the issuer that rotates and *then* fails. Everything
-/// else is terminal *and says how to recover*, because the user of a dead grant is otherwise handed
-/// `OAuth token refresh failed (400): {"error":"invalid_grant"}` with no hint that a login is the
-/// remedy. A success whose body cannot be decoded is terminal too: the server accepted the token,
-/// so it is certainly spent.
-///
-/// A transport failure stays with [`provider_transport_error`]: the token's fate is unknown, and a
-/// token spent without meka seeing the replacement is already dead, so retrying is right when the
-/// request never landed and no worse than inaction when it did. Not [`provider_http_error`] with
-/// [`ProviderRequest::Auxiliary`] either: that one sniffs the body for the model's context-window
-/// phrases first, which is meaningless from a token endpoint, and has no remedy to attach.
 /// A mid-stream error event, classified by the code the backend put on it. The codes each backend
 /// documents as transient are retryable; anything else, including a code this build does not know,
 /// is permanent, so a real problem surfaces at once instead of burning the retry budget first.
@@ -449,6 +429,24 @@ pub(crate) fn provider_stream_error_object(
     provider_stream_error(code, message)
 }
 
+/// Classify an OAuth token exchange the authorization server *answered*, whether by rejecting it or
+/// by returning a success meka failed to read back.
+///
+/// A refresh consumes its request: under RFC 9700 rotation the refresh token is single-use, so once
+/// the server has read it, it is spent and its replacement is in a response meka may not be
+/// holding. Sending it again is a replay, and §4.14.2 has the server revoke the whole token family
+/// on one, which costs a browser login rather than a round trip. So the split is by what the answer
+/// implies about the token, not by whether one arrived: a 429 was refused before the grant was
+/// read and a 5xx usually means the server is unwell rather than that the grant is bad, so both
+/// retry in the ordinary way; that accepts the issuer that rotates and *then* fails. Everything
+/// else is terminal and names the login that recovers it. A success whose body cannot be decoded
+/// is terminal too: the server accepted the token, so it is certainly spent.
+///
+/// A transport failure stays with [`provider_transport_error`]: the token's fate is unknown, and a
+/// token spent without meka seeing the replacement is already dead, so retrying is right when the
+/// request never landed and no worse than inaction when it did. Not [`provider_http_error`] with
+/// [`ProviderRequest::Auxiliary`] either: that one sniffs the body for context-window phrases,
+/// which is meaningless from a token endpoint, and has no remedy to attach.
 pub(crate) fn oauth_refresh_error(
     context: &str,
     status: reqwest::StatusCode,
@@ -487,9 +485,8 @@ pub(crate) fn render_error_body(body: &str) -> &str {
 }
 
 /// Parse the `Retry-After` response header as a whole number of seconds. Only the delta-seconds
-/// form is handled (what every provider we talk to actually sends); the less common HTTP-date form
-/// is ignored (returns `None`, falling back to computed backoff) rather than pulling in a date
-/// parser for a form we've never observed in practice.
+/// form is read; the HTTP-date form yields `None`, and so the computed backoff, rather than
+/// pulling in a date parser for a form no provider has been seen to send.
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)
@@ -516,10 +513,10 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Format a [`reqwest::Error`] together with its full source chain.
 ///
-/// reqwest's outer Display string ("error sending request for url …") usually hides the actual
-/// cause (TCP reset, HTTP/2 GOAWAY, TLS handshake failure, connect timeout, DNS resolution failure,
-/// …). Walking [`std::error::Error::source`] surfaces the underlying reason inline, so users (and
-/// bug reports) see what actually broke instead of reqwest's generic wrapper.
+/// reqwest's outer Display string ("error sending request for url …") hides the cause (TCP reset,
+/// HTTP/2 GOAWAY, TLS handshake failure, connect timeout, DNS failure). Walking
+/// [`std::error::Error::source`] puts that cause inline, so the user sees what broke instead of
+/// reqwest's wrapper.
 ///
 /// A provider call that failed in transit reaches it through [`provider_transport_error`] rather
 /// than directly, so that formatting the cause and deciding whether the failure is worth retrying
@@ -860,11 +857,10 @@ mod tests {
     /// the conversation. That is coherent for a completion and nonsense for a usage or identity
     /// probe, which carries no turn content at all.
     ///
-    /// It was reachable before `ProviderRequest` existed: every probe called this function, so a
-    /// 400 from a `/usage` endpoint produced `InvalidRequest`. Nothing acted on it only because no
-    /// probe is called from inside `run_turn` today. Wiring one in later -- a pre-flight quota
-    /// check, a context-window lookup -- would have made a usage endpoint's 400 silently delete a
-    /// user's attachments, with nothing in the message to suggest why.
+    /// Without the `request` parameter every probe answered 400 with `InvalidRequest`, and only
+    /// the absence of a probe inside `run_turn` kept a usage endpoint's 400 from silently deleting
+    /// a user's attachments. A pre-flight quota check or context-window lookup added later would
+    /// have done exactly that.
     #[test]
     fn only_a_completion_can_ask_the_agent_loop_to_degrade_its_content() {
         for status in [
@@ -1009,16 +1005,13 @@ mod tests {
     /// A timeout is retryable, and the predicate that once excluded it could not tell it apart.
     ///
     /// The exclusion was `is_timeout() && !is_connect()`, read as "delivered, so possibly already
-    /// generating". This asserts the two halves of why that was wrong. A server that accepts and
-    /// then says nothing does produce that pattern -- so far so good -- but the pattern does not
-    /// mean what it appeared to: `is_timeout` matches any `io::ErrorKind::TimedOut` anywhere in the
-    /// source chain, so a write that times out on a pooled connection matches it too, having
-    /// delivered nothing. Whether meka retries cannot rest on it.
+    /// generating". A server that accepts and then says nothing does produce that pattern, but
+    /// `is_timeout` matches any `io::ErrorKind::TimedOut` anywhere in the source chain, so a write
+    /// that times out on a pooled connection matches it too, having delivered nothing. Whether
+    /// meka retries cannot rest on it.
     ///
-    /// Loopback only, deliberately. The earlier version of this test reached for a blackholed
-    /// TEST-NET-3 address to provoke a connect timeout, which needs a default route that silently
-    /// drops packets: offline CI and `--network=none` answer `ENETUNREACH` immediately instead, and
-    /// the assertion failed. A test of a classifier has no business needing the internet.
+    /// Loopback only: a blackholed TEST-NET-3 address needs a default route that silently drops
+    /// packets, and offline CI or `--network=none` answers `ENETUNREACH` at once instead.
     #[tokio::test]
     async fn a_timeout_is_retryable_whichever_half_of_the_call_it_lands_in() {
         // Accepts the connection, then never answers.
@@ -1061,8 +1054,8 @@ mod tests {
     ///
     /// This is the classifier's half of the contract only: it asserts that whatever the third
     /// argument holds survives into the error, whichever `reqwest::Error` it is paired with. The
-    /// read sites' half -- that each of them passes the `Retry-After` it parsed rather than `None`
-    /// -- is asserted at a real site by
+    /// read sites' half (that each of them passes the `Retry-After` it parsed rather than `None`)
+    /// is asserted at a real site by
     /// `provider::anthropic::messages::tests::a_truncated_body_keeps_the_rate_limit_hint`, because
     /// nothing here can see whether a site called this function with the hint or without it.
     ///
@@ -1277,10 +1270,9 @@ mod tests {
     ///
     /// Consulting the body before the status classifies a 500 mentioning the context window as an
     /// overflow. The body is not meka's to trust that far. A server that fails while echoing the
-    /// request back -- which this module's own callers record as real behavior -- turned a
-    /// transient 500 into an emergency compaction, so a turn whose text merely discussed
-    /// `context_length_exceeded` had its context destroyed to answer a blip, and skipped both the
-    /// retry and the outage reprieve on the way.
+    /// request back (which providers do) turns a transient 500 into an emergency compaction, so a
+    /// turn whose text merely discussed `context_length_exceeded` has its context destroyed to
+    /// answer a blip, and skips both the retry and the outage reprieve on the way.
     ///
     /// Both arms, because a rule that stopped reading the body at all would silently break the
     /// 400-shaped overflow every backend actually sends.

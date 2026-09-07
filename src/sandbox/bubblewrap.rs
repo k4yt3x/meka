@@ -71,28 +71,17 @@ pub(super) fn trusted_to_confine(candidate: &std::path::Path, directory: &std::p
 }
 /// Look up `bwrap` on `$PATH`, accepting only a binary that the user cannot replace.
 ///
-/// The plain `$PATH` walk was an unconfinement primitive. `$PATH` on an ordinary desktop holds
-/// several directories the user can write -- `~/.local/bin`, a cargo or go bin dir, a toolchain
-/// shim dir -- and every one of them precedes `/usr/bin`. A `bwrap` planted in any of them is
-/// executed verbatim by the spawn path, so a six-line shell script that `exec`s its final argument
-/// turns every `read` and `workspace` shell command into an unconfined one. Nothing noticed:
-/// [`smoke_test_bwrap`] runs `bwrap <flags> /bin/true`, which a shim satisfies by construction, so
-/// the probe reported `Ok` and both the startup warning and the lazy hard-error gate stayed quiet.
-/// Demonstrated end to end -- a confined command wrote outside every root and the file landed on
-/// the host, where real `bwrap` refuses the same argv.
-///
-/// It is a persistence primitive rather than a one-shot: one turn at `unrestricted`, one approved
-/// `ask` command, or any post-install hook buys unconfined shells in every later session,
-/// including the sessions a user opens at `read` precisely because they do not trust the turn.
-///
-/// `macos_impl` has hardcoded `/usr/bin/sandbox-exec` since it was written, with a comment naming
-/// this exact attack. Linux is the backend meka auto-prefers, and it was the one searching `$PATH`.
+/// A plain `$PATH` walk is a persistence primitive: `$PATH` on an ordinary desktop holds several
+/// directories the user can write (`~/.local/bin`, a cargo or go bin dir) ahead of `/usr/bin`, a
+/// `bwrap` planted in one is executed verbatim by the spawn path, and a shim that `exec`s its final
+/// argument passes [`smoke_test_bwrap`] by construction. One turn at `unrestricted` would then buy
+/// unconfined shells in every later session, including the ones opened at `read` because the user
+/// does not trust the turn.
 ///
 /// Checking ownership rather than hardcoding a list keeps the distributions that put it elsewhere
-/// working -- NixOS serves it out of a root-owned `/nix/store` path, which passes -- while refusing
-/// anything under a directory the user can write. A rejected candidate is `warn!`ed rather than
-/// skipped silently, because "bubblewrap is installed but meka fell back to Landlock" is otherwise
-/// indistinguishable from "bubblewrap is not installed".
+/// working (NixOS serves it out of a root-owned `/nix/store` path). A rejected candidate is
+/// `warn!`ed rather than skipped silently, because "bubblewrap is installed but meka fell back to
+/// Landlock" is otherwise indistinguishable from "bubblewrap is not installed".
 pub(super) fn bwrap_on_path() -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -109,7 +98,7 @@ pub(super) fn bwrap_on_path() -> Option<std::path::PathBuf> {
         let path = candidate.display();
         tracing::warn!(
             "ignoring {path} for sandboxing: it or its directory is writable by someone other \
-             than root, so it cannot be trusted to confine anything"
+             than root"
         );
     }
     None
@@ -150,26 +139,18 @@ pub(super) fn smoke_test_bwrap(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
 
-    // Arm the parent-death signal here rather than leaving it to `--die-with-parent`.
-    //
-    // Measured, because the obvious reading is wrong in both directions. bwrap's own flag *does*
-    // handle a `meka` that is SIGKILLed outright: kill the parent a second after spawning and the
-    // sandbox goes with it. What it cannot cover is the window before bwrap reaches its own
-    // `prctl`, several syscalls into a startup that includes a user-namespace handshake with its
-    // child -- and a `bwrap` found parked for eleven days on this machine was blocked in exactly
-    // that handshake, `read()`ing its sync eventfd, reparented to init with the flag in its argv.
-    // Arming in `pre_exec` covers the child from before `execve`, which is the earliest point that
-    // exists.
+    // Arm the parent-death signal here rather than leaving it to `--die-with-parent`: that flag
+    // cannot cover the window before bwrap reaches its own `prctl`, which includes a user-namespace
+    // handshake with its child that a dying parent leaves it blocked in. Arming in `pre_exec`
+    // covers the child from before `execve`.
     //
     // The `getppid` re-read is what makes it a guarantee rather than a smaller window: the signal
-    // only fires on a death that happens *after* the `prctl`, so a parent that died between fork
-    // and this line would never deliver it. Reading the parent back afterwards catches that and
-    // exits instead.
+    // only fires on a death after the `prctl`, so a parent that died between fork and this line
+    // would never deliver it.
     //
-    // `PR_SET_PDEATHSIG` tracks the parent *thread*, not the process, which is safe here only
-    // because the caller blocks in the poll loop below for the child's whole life: the thread that
-    // spawned it cannot retire while the child still matters. Do not lift this onto a spawn whose
-    // child outlives the call.
+    // `PR_SET_PDEATHSIG` tracks the parent thread, not the process, which is safe here only because
+    // the caller blocks in the poll loop below for the child's whole life. Do not lift this onto a
+    // spawn whose child outlives the call.
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: the closure runs after `fork` in the child and calls only async-signal-safe
     // functions (`prctl`, `getppid`, `_exit`), allocating nothing.
@@ -198,14 +179,14 @@ pub(super) fn smoke_test_bwrap(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Drain stderr non-blocking. The grandchild is gone so nothing else will write; any
-                // data already buffered is all we'll get.
+                // Drain stderr non-blocking: the child is gone, so what is buffered is all there
+                // is.
                 let stderr = match child.stderr.take() {
                     Some(mut handle) => {
                         let fd = handle.as_raw_fd();
-                        // SAFETY: fcntl with F_GETFL/F_SETFL on a valid open file descriptor;
-                        // failure is fine and just means we'll attempt a regular read that may
-                        // block briefly on a closed pipe.
+                        // SAFETY: fcntl with F_GETFL/F_SETFL on a valid open file descriptor.
+                        // Failure only means a regular read, which may block briefly on a closed
+                        // pipe.
                         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
                         if flags >= 0 {
                             unsafe {
@@ -265,9 +246,8 @@ pub(super) fn smoke_test_bwrap(
         }
     }
 }
-/// Best-effort cleanup of a stuck smoke-test child: kill it and reap its status so we don't leave a
-/// zombie. Errors are logged at debug level only; by this point the smoke test has already failed
-/// and the caller is about to return a higher-priority error reason.
+/// Kill a stuck smoke-test child and reap it, so it does not linger as a zombie. Errors are
+/// `debug!` only: the smoke test has already failed and the caller is about to report why.
 pub(super) fn reap_smoke_test_child(child: &mut std::process::Child) {
     if let Err(error) = child.kill() {
         tracing::debug!("bwrap smoke test: failed to kill stuck child: {error}");

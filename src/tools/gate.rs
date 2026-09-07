@@ -54,12 +54,9 @@ impl GateToolset {
     /// `unrestricted`, so handing this registry that level would turn the one read-level tool that
     /// runs arbitrary code into an unsandboxed command on a timer.
     ///
-    /// Called at the point of use rather than stored on the struct, which is the only reason that
-    /// sentence is reliable. It *was* a field, set once in [`Self::new`] -- and raising that one
-    /// initializer to `Unrestricted` left all 2735 tests green, because every test built the struct
-    /// by literal and supplied the field itself. One of them supplied `Unrestricted`. A value that
-    /// nothing reads back cannot be asserted; a value that is derived where it is needed cannot be
-    /// wrong.
+    /// Derived at the point of use rather than stored on the struct: every test builds the struct
+    /// by literal and supplies its own fields, so a stored value could be raised to `Unrestricted`
+    /// without any test noticing.
     pub(super) fn dispatch_permission() -> crate::permission::SharedPermission {
         crate::permission::SharedPermission::new(
             crate::permission::Permission::Read,
@@ -120,19 +117,13 @@ impl crate::schedule::GateTools for GateToolset {
             self.resolution_registry().get(name)?.required_permission()
         };
         // Then the operator's override, in the same order dispatch applies it
-        // (`ToolRegistry::required_permission_for`).
+        // (`ToolRegistry::required_permission_for`): the tool alone answers its hardcoded level,
+        // and a `tool_permissions` entry that raised a tool out of reach in conversation must not
+        // leave it admitted as a gate. Applied by name rather than by family because dispatch
+        // consults the map for every registered name, MCP tools included.
         //
-        // Asking the *tool* returned the hardcoded level and ignored the operator entirely:
-        // `tool_permissions = { fetch_url = "unrestricted" }` left `fetch_url` unreachable in
-        // conversation at `read` and still admitted it as a gate, to be run unattended on a timer.
-        // Applied by name rather than by family, because dispatch is: the map is consulted for
-        // every registered name, so an entry naming an MCP tool takes effect there whatever the
-        // documentation says it is for, and a door that skipped it would disagree with the door
-        // that runs the call.
-        //
-        // Requiring the tool to exist first is what keeps this from failing open. Dispatch resolves
-        // the tool before the level too; asking the map alone admitted a probe whose name matched
-        // nothing at all, if a stale `tool_permissions` entry happened to give it `read`.
+        // Requiring the tool to exist first is what keeps this from failing open: the map alone
+        // would admit a probe that matches nothing, if a stale entry happened to give it `read`.
         Some(
             self.core
                 .builtin_filter
@@ -223,12 +214,10 @@ mod tests {
 
     /// A gate resolves a built-in through the registry, so `[tools] tool_permissions` applies.
     ///
-    /// The gate door asked the *tool* what it required, which is the hardcoded value; the override
-    /// lives on the registry and the tool object knows nothing about it. An operator who put
-    /// `fetch_url` out of reach at `read` therefore still had it admitted as a gate probe, to be
-    /// run unattended on a timer -- the exact case `gate_probe_is_authorized`'s doc claims is
-    /// caught. Every other tool-gate test drives a stub resolver and cannot see this: replacing
-    /// `GateToolset::resolve`'s body with `Some(Permission::Read)` leaves them all green.
+    /// The override lives on the registry and the tool object knows nothing about it, so asking
+    /// the tool admits a probe the operator put out of reach. Every other tool-gate test drives a
+    /// stub resolver and cannot see this: replacing `GateToolset::resolve`'s body with
+    /// `Some(Permission::Read)` leaves them all green.
     #[test]
     fn a_gate_resolves_a_builtin_through_the_registry_so_overrides_apply() {
         let toolset = |overrides: HashMap<String, Permission>| GateToolset {
@@ -285,10 +274,9 @@ mod tests {
     /// A gate's tool call goes all the way through: registry, dispatch, flatten, and the success
     /// flag the `succeeded` predicate reads.
     ///
-    /// Nothing exercised `GateToolset::call` at all -- every tool-gate test drives a stub -- so a
-    /// mutation sweep could empty `flatten_tool_text` or invert `!output.is_error` and stay green.
-    /// The first silently blanks every tool probe's result, which makes a `changed` gate fire once
-    /// and then never again; the second inverts what `succeeded` means.
+    /// Every other tool-gate test drives a stub, so without this a mutation sweep could empty
+    /// `flatten_tool_text` (every `changed` gate fires once and never again) or invert
+    /// `!output.is_error` and stay green.
     #[tokio::test]
     async fn a_gate_tool_call_returns_the_tools_text_and_its_success() {
         use crate::schedule::GateTools;
@@ -403,7 +391,7 @@ mod tests {
         assert!(
             crate::schedule::gate_probe_is_authorized(&probe, Permission::Read, Some(&sandboxed))
                 .is_ok(),
-            "so a gate at `read` may call it -- the door this test exists to bound"
+            "so a gate at `read` may call it, the door this test exists to bound"
         );
         assert_eq!(
             GateToolset::dispatch_permission().get(),

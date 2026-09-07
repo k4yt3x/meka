@@ -23,14 +23,14 @@ pub(crate) struct AccountUsage {
 /// Effort is a request parameter the *provider* owns: leaving the field off is not a degraded
 /// setting, it is how you ask for the provider's own default. meka therefore sends it only when the
 /// profile asks for one. A configured value is passed through verbatim (trimmed + lowercased) and
-/// is **absolute** - never clamped, never dropped, whatever model it is aimed at; the user owns
+/// is **absolute**: never clamped, never dropped, whatever model it is aimed at; the user owns
 /// correctness for their model and endpoint. A blank value (empty or whitespace-only) reads as
 /// unset.
 ///
 /// meka deliberately picks no default of its own. It cannot know what tiers a given endpoint
-/// implements - `anthropic-messages` and `openai-chat-completions` reach any compatible server,
-/// including local ones serving weights that never had an effort knob - and a tier the backend does
-/// not implement is a rejected request rather than a graceful ignore.
+/// implements (`anthropic-messages` and `openai-chat-completions` reach any compatible server,
+/// including local ones serving weights that never had an effort knob), and a tier the backend
+/// does not implement is a rejected request rather than a graceful ignore.
 pub(crate) fn resolve_effort_level(configured: Option<&str>) -> Option<String> {
     configured
         .map(str::trim)
@@ -101,6 +101,7 @@ pub(crate) struct DailyUsage {
     pub(crate) date: String,
     pub(crate) tokens: i64,
 }
+/// A tool as every backend advertises it to the model: name, description and JSON schema.
 #[derive(Debug, Clone, Serialize, Default)]
 pub(crate) struct ToolDefinition {
     pub(crate) name: String,

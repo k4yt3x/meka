@@ -111,21 +111,16 @@ pub(crate) async fn refuse_a_spawned_session(
         return Ok(());
     };
     let door = match parent {
-        Some(parent) => format!(
-            "is a sub-agent of session {parent}, and only its parent can apply the terms it runs \
-             under. Continue it with `agent_followup` from session {parent}"
-        ),
+        Some(parent) => {
+            format!("is a sub-agent of session {parent}; continue it with `agent_followup` there")
+        }
         // An imported sub-agent whose parent did not come with it. There is no session to point at,
         // so say what it is rather than naming a door that is not there.
-        None => "is a sub-agent whose parent is not in this store, so nothing here can \
-                 reconstruct the tools and permission it ran with"
-            .to_string(),
+        None => {
+            "is a sub-agent whose parent is not in this store, so it cannot be driven".to_string()
+        }
     };
-    Err(crate::error::MekaError::SessionNotDrivable(format!(
-        "session {session_id} {door}. Reading it is unaffected: `meka session export` and the \
-         HTTP read endpoints still serve it."
-    ))
-    .into())
+    Err(crate::error::MekaError::SessionNotDrivable(format!("session {session_id} {door}")).into())
 }
 /// Build the process-wide [`SharedDeps`] for `meka acp`. Sets up the provider, MCP wiring, skill
 /// cache, sandbox capability probe, and the shared `agent_options` template. Each ACP session later
@@ -139,7 +134,6 @@ pub(crate) async fn build_shared_deps(
     config.validate()?;
     let default_profile = config.default_profile.clone();
 
-    // The counters the registry's backends record image redactions into. Process-wide, because
     // Nothing is built here. The registry resolves a profile and loads its credential when a
     // session first asks, because which profiles this process will need is a property of the
     // sessions it ends up serving rather than of its configuration.
@@ -156,7 +150,7 @@ pub(crate) async fn build_shared_deps(
     #[cfg(any(debug_assertions, feature = "mock-provider"))]
     if std::env::var("MEKA_MOCK_PROVIDER").as_deref() == Ok("1") {
         let rounds = crate::provider::mock::load_script_from_env()
-            .map_err(|error| anyhow::anyhow!("load mock provider script: {error}"))?
+            .map_err(|error| anyhow::anyhow!("failed to load the mock provider script: {error}"))?
             .unwrap_or_default();
         tracing::info!("MEKA_MOCK_PROVIDER=1: using scripted mock provider");
         providers.install_scripted(Arc::new(crate::provider::mock::MockProvider::from_rounds(
@@ -166,11 +160,9 @@ pub(crate) async fn build_shared_deps(
 
     // Built once here and dropped, because what it produces is a refusal rather than a client:
     // every registry builds its own from the same `[web]` settings, and the one thing no session
-    // can do is fail the *process* before it exists. Without this, a `ca_cert_file` that is not
-    // there or a proxy URL that is not one surfaced on the first turn, per session, as whatever
-    // that host reports a registry failure as -- which on `serve` was a 422 handing the operator's
-    // path to a remote caller. `MekaError::Installation` is what keeps it off the wire when it
-    // does arrive there; this is what makes it arrive at the terminal instead.
+    // can do is fail the *process* before it exists. Otherwise a `ca_cert_file` that is not there
+    // or a proxy URL that is not one surfaces on the first turn, per session, as whatever that host
+    // reports a registry failure as, which on `serve` hands the operator's path to a remote caller.
     crate::tools::build_web_client(&config.web_client)?;
 
     // Detection, not configuration: which backend this machine can run is probed once here, and
@@ -505,8 +497,7 @@ pub(crate) async fn report_background_survivors(agent: &Agent) {
     let running = agent.background_tasks().running_count_all().await;
     if running > 0 {
         crate::streams::write_stderr_line(format!(
-            "{running} background task(s) still running. Press Ctrl+C again during a turn to stop them, \
-             or run /tasks cancel --all."
+            "{running} background task(s) still running; stop them with `/tasks cancel --all`."
         ));
     }
 }
@@ -600,13 +591,10 @@ pub(crate) async fn resolve_session_resume(
         return Ok(fresh());
     };
 
-    // Before the lock, the repin and the permission write, which is the whole reason it is here
-    // rather than only at the two call sites below. Refusing *after* this function returns covers
-    // `--profile`, computed here and committed there, and misses `--permission`, which this
-    // function commits itself a few lines down. A run that declines to touch a session was
-    // rewriting its recorded level on the way to saying so, and that value is what `session list
-    // --include-children`, `GET /v1/sessions/{id}` and `session export` all report the sub-agent as
-    // having run at.
+    // Before the lock, the repin and the permission write. Refusing *after* this function returns
+    // covers `--profile`, computed here and committed there, and misses `--permission`, which is
+    // committed a few lines down: a run that declines to touch a session would rewrite its recorded
+    // level on the way to saying so.
     refuse_a_spawned_session(store, Some(id)).await?;
 
     // Locked, then read, so the row this run resumes from is the one it now owns.
@@ -694,10 +682,9 @@ pub(crate) async fn record_session_cwd(
 ///
 /// A session's directory is its own, so a resume reopens it rather than adopting whatever shell
 /// started the process. At `workspace` that directory is also the writable boundary, and taking the
-/// shell's instead would silently widen it -- resume a project session from `$HOME` and the whole
+/// shell's instead would silently widen it: resume a project session from `$HOME` and the whole
 /// home directory becomes writable, with a scheduled job able to fire before the user can react.
-/// `meka serve` already reads the column this way (`crate::host::http::reattach`); the REPL and
-/// `--oneshot` were the two that did not.
+/// `meka serve` reads the column the same way (`crate::host::http::reattach`).
 ///
 /// The launch directory is the fallback for two cases, both of which have to keep the run going:
 /// a row that carries no directory (`meka session import` stores an archive's value verbatim, and
@@ -817,7 +804,9 @@ pub(crate) async fn hydrate_conversation(
                 }
             })
             .collect();
-        tracing::warn!("dropping assistant message with orphaned tool_use IDs: {tool_use_ids:?}");
+        tracing::warn!(
+            "dropping an assistant message with orphaned tool_use ids: {tool_use_ids:?}"
+        );
     }
 
     // Materializing the log also replaces images whose bytes contradict their declared media type.

@@ -712,9 +712,8 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
         configured_profiles,
         console,
     } = launch;
-    // Install reedline's `ExternalPrinter` on the process-global tracing writer BEFORE the first
-    // `read_line()`. From this point on, log lines (including async MCP-connect warnings that fire
-    // while the REPL is starting) print *above* the live prompt instead of being overwritten by
+    // Before the first `read_line()`: from here on, log lines (including MCP-connect warnings that
+    // fire while the REPL is starting) print above the live prompt instead of being overwritten by
     // reedline's redraw.
     let printer = ExternalPrinter::default();
     RELAY.install(printer.clone());
@@ -732,12 +731,12 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
         }
     });
 
-    // Checked once per prompt, not per keystroke, and re-read only when the files have actually
-    // moved. Frozen at construction it was simply wrong under `[skills] agent_managed`, where
-    // `skill_write` and `skill_delete` move the set mid-session; re-discovered unconditionally it
-    // parsed every `SKILL.md` before drawing every prompt and reprinted the unloadable-skill
-    // warnings with it. `SkillNameWatch` is the stat-and-compare `SkillCache` makes on the agent
-    // side, for a caller that cannot await it.
+    // Checked once per prompt, not per keystroke, and re-read only when the files have moved.
+    // Frozen at construction the list is wrong under `[skills] agent_managed`, where `skill_write`
+    // and `skill_delete` move the set mid-session; re-discovered unconditionally it parses every
+    // `SKILL.md` before every prompt and reprints the unloadable-skill warnings with it.
+    // `SkillNameWatch` is the stat-and-compare `SkillCache` makes on the agent side, for a caller
+    // that cannot await it.
     let skill_names = Arc::new(std::sync::RwLock::new(Vec::new()));
     let refresh_skill_names = {
         let skill_names = Arc::clone(&skill_names);
@@ -793,13 +792,7 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
     }
 
     loop {
-        // reedline drains the relay's `ExternalPrinter` only inside `read_line()`. Flag that window
-        // so log lines route through the printer (cleanly above the live prompt) while it's active
-        // and go straight to stderr otherwise (e.g. during a turn), surfacing immediately instead
-        // of buffering until the turn ends and the next prompt is drawn.
-        // Between turns, so a skill the agent has just written or deleted is what Tab offers. Once
-        // per prompt is the right cadence for the stat pass, and it happens while the user has not
-        // started typing; the parse behind it only runs when the stats have moved.
+        // Between turns, so a skill the agent has just written or deleted is what Tab offers.
         refresh_skill_names();
         // The one place an episode can end before a prompt, which is what makes the bracket
         // impossible to skip: no `continue`, `break` or dispatch arm below reaches the next prompt
@@ -807,6 +800,9 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
         with_console(&console, |console| {
             console.close_episode(crate::console::Neighbor::Prompt)
         });
+        // reedline drains the relay's `ExternalPrinter` only inside `read_line()`, so log lines
+        // route through the printer while it runs and go straight to stderr otherwise, surfacing
+        // during a turn instead of buffering until the next prompt is drawn.
         RELAY.set_at_prompt(true);
         let signal = editor.read_line(&prompt);
         RELAY.set_at_prompt(false);
@@ -880,12 +876,6 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
                             match argument {
                                 None => {
                                     let current = crate::sync::read(&current_profile).clone();
-                                    // One profile per line rather than a comma-joined run of
-                                    // names. The list grows with every account and endpoint a
-                                    // user adds, and a single line stops fitting long before it
-                                    // stops being worth reading. The `name (backend)` shape is
-                                    // the one `/status` already uses for the same pair.
-                                    //
                                     // The profile this session runs on first, then every profile
                                     // there is. One per line rather than a comma-joined run of
                                     // names: the list grows with every account and endpoint a user
@@ -1011,8 +1001,7 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
                                 Some(other) => {
                                     with_console(&console, |console| {
                                         console.error(&format!(
-                                            "'{other}' is not a setting; use `/approvals on` or \
-                                             `/approvals off`"
+                                            "'{other}' is not a setting: `/approvals` takes on or off"
                                         ))
                                     });
                                 }
@@ -1059,7 +1048,7 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
                         }
                         None => {
                             // Not the `unknown_name` template: listing every slash command on one
-                            // line is noise, and `/help` already is the list (k4yt3x's call).
+                            // line is noise, and `/help` already is the list.
                             with_console(&console, |console| {
                                 console.line(&format!(
                                     "Unknown command: {trimmed}. Type /help for available commands."
@@ -1162,7 +1151,7 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
                 break;
             }
             Err(error) => {
-                tracing::error!("readline error: {error}");
+                tracing::error!("failed to read the prompt: {error}");
                 if input_sender.send(ReplEvent::Exit).is_err() {
                     tracing::trace!("REPL event receiver already dropped");
                 }
@@ -1172,18 +1161,17 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
     }
 }
 
-/// Wait for the agent to signal it is done, while also handling tool approval requests that arrive
-/// while approvals are on.
-///
-/// `false` means the agent side is gone, and every caller leaves the shell on it. It is said out
-/// loud rather than returned quietly because the alternative, seen live, is a shell that accepts
-/// `/profile` and `/session` and answers neither: everything those commands do happens on the
-/// agent's side of this channel, so without a word here the user is left typing into something that
-/// ignores them.
 /// A change the editor thread applied to its cells but has nobody to hand to the row writer.
 fn warn_unrecorded(what: &str) {
     tracing::warn!("failed to record {what} for the session: the agent loop has exited");
 }
+/// Wait for the agent to signal it is done, answering the approval, elicitation and progress
+/// events that arrive meanwhile.
+///
+/// `false` means the agent side is gone, and every caller leaves the shell on it. It is said out
+/// loud rather than returned quietly because everything `/profile` and `/session` do happens on
+/// the agent's side of this channel, so without a word here the user is left typing into a shell
+/// that ignores them.
 pub(super) fn wait_for_agent(
     agent_event_receiver: &std::sync::mpsc::Receiver<AgentToReplEvent>,
     console: &Mutex<crate::console::Console>,
@@ -1213,10 +1201,8 @@ pub(super) fn wait_for_agent(
 /// One-line status overwrite on stderr for a running MCP tool.
 ///
 /// Drawn through the console as a transient row, because it is: the line carries no newline and the
-/// text is the server's, so the next thing meka prints has to replace it rather than continue it.
-/// Before the console tracked that, whatever printed next spent its own blank line terminating this
-/// row -- most visibly the blank before the prompt, at the end of a turn whose last act was an MCP
-/// call.
+/// text is the server's, so the next thing meka prints has to replace it rather than continue it,
+/// and a blank line printed over it would be spent terminating the row instead.
 pub(super) fn render_progress_update(
     update: &crate::frontend::ProgressUpdate,
     console: &Mutex<crate::console::Console>,
@@ -1247,8 +1233,7 @@ pub(super) fn format_progress_update(update: &crate::frontend::ProgressUpdate) -
     // Flattened, not merely sanitized. `sanitize_text` deliberately keeps `\n`, and both of these
     // are server-controlled: `tool_name` is the raw name the server advertised (only the namespaced
     // form goes through `normalize_server_name`). A tool called "x\n[approval]
-    // execute_command\n..." would otherwise open new rows inside meka's own chrome, which is
-    // the forgery the message half of this line was already fixed for.
+    // execute_command\n..." would otherwise open new rows inside meka's own chrome.
     let server = crate::text::sanitize_to_line(&update.server_name, usize::MAX);
     let tool = crate::text::sanitize_to_line(&update.tool_name, usize::MAX);
     let counter = match update.total {

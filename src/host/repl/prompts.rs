@@ -18,14 +18,12 @@ pub(super) fn handle_elicitation_prompt(
     console: &Mutex<crate::console::Console>,
 ) {
     // Announced like the approval prompt, so the row a server's progress line parked the cursor on
-    // is settled before meka's own chrome starts. Without it the form's first line continued that
-    // row, which is the forgery `render::begin_own_line` exists to prevent, and the elicitation
-    // prompt was the one door that never called it.
+    // is settled before meka's own chrome starts; otherwise the form's first line continues that
+    // row, which is the forgery `render::begin_own_line` exists to prevent.
     with_console(console, |console| console.announce_foreign_output());
     // Same reason the approval prompt drains: `read_line` reads a buffer the tty has been filling
-    // throughout the turn, so a line the user typed in answer to something else -- or to a prompt a
-    // server forged -- would be consumed the instant this one is drawn. The approval prompt got
-    // this; the elicitation prompt, which reads the same buffer, did not.
+    // throughout the turn, so a line the user typed in answer to something else, or to a prompt a
+    // server forged, would be consumed the instant this one is drawn.
     drain_pending_stdin();
     let response = resolve_elicitation(&prompt, || {
         use std::io::Write;
@@ -214,7 +212,7 @@ pub(super) fn approval_prompt_lines(
 /// every later call to the tool this session, the way ACP's and HTTP's sticky options do.
 pub(super) const APPROVAL_QUESTION: &str = "Allow? (Y/n/always/never) ";
 /// Shown when the answer is none of the four, before asking again.
-pub(super) const APPROVAL_RETRY: &str = "Please answer y, n, always or never.";
+pub(super) const APPROVAL_RETRY: &str = "Answer y, n, always or never.";
 /// Shown when the answers run out without one that parses.
 pub(super) const APPROVAL_GIVE_UP: &str = "No answer; denying.";
 /// How many unrecognized answers to take before denying.
@@ -350,11 +348,7 @@ pub(super) fn drain_pending_stdin() {
     unsafe { libc::fcntl(fd, libc::F_SETFL, previous) };
 }
 /// The Windows counterpart. `FlushConsoleInputBuffer` discards everything queued on the console
-/// input handle, which is exactly what the Unix path achieves by reading until `EAGAIN`.
-///
-/// This was a no-op, so the keystroke-at-a-forged-prompt hole the Unix path closes stayed open on
-/// Windows: a model that had read attacker text could paint a convincing approval block, and the
-/// `y` the user typed at it was still sitting in the buffer when the real prompt was drawn.
+/// input handle, which is what the Unix path achieves by reading until `EAGAIN`.
 ///
 /// A non-console stdin (a pipe, a redirect) has no input buffer to flush and the call fails; that
 /// is not an error worth reporting, because a caller feeding meka from a pipe is not a user who
@@ -397,8 +391,7 @@ pub(super) fn handle_approval_request(
     // An MCP progress line parks the cursor mid-row with no newline, and its text comes from the
     // server. Without settling the row first the prompt's first line continues it, so
     // `[approval] Shell` reads as the tail of a string meka does not control, at the one prompt
-    // where that matters most. The console owns that rule now, for every writer rather than the
-    // two that remembered.
+    // where that matters most.
     with_console(console, |console| console.announce_foreign_output());
     for line in approval_prompt_lines(
         &request.tool_name,
@@ -770,8 +763,7 @@ mod tests {
 
     /// The invariant `src/render.rs` states for its own block, checked on the lines this module
     /// composes: the `[approval]` header is built here, from a model-supplied name, and nothing
-    /// else held it to a width. Deleting the header's budget went unnoticed because no test
-    /// measured it.
+    /// else holds it to a width.
     #[test]
     fn no_line_of_an_approval_prompt_exceeds_its_width() {
         let long_name = format!("mcp__server__{}", "a_very_long_tool_name".repeat(20));

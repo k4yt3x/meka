@@ -11,6 +11,7 @@ pub(crate) struct ScheduleStore {
     memory: std::sync::Arc<SchedulerMemory>,
 }
 impl ScheduleStore {
+    /// A handle on the table over `connection`, sharing the scheduler's memory of held jobs.
     pub(crate) fn new(
         connection: std::sync::Arc<tokio_rusqlite::Connection>,
         memory: std::sync::Arc<SchedulerMemory>,
@@ -210,8 +211,8 @@ impl ScheduleStore {
         // The listing above and the `DELETE` below are two statements, and a scheduler sweep can
         // retire the row between them: a one-shot's occurrence retires it, and a session deleted
         // elsewhere takes its jobs with it through the foreign key. Reporting the id regardless
-        // told the agent "Canceled job abc12345" about a job this call did not cancel, which is
-        // the same sentence it gets when it did -- and there is no way to tell them apart
+        // tells the agent "Canceled job abc12345" about a job this call did not cancel, which is
+        // the same sentence it gets when it did, and there is no way to tell them apart
         // afterwards, because both end with no such row.
         match self.delete_scheduled_job(&id).await? {
             true => Ok(Some(id)),
@@ -229,7 +230,7 @@ impl ScheduleStore {
         // otherwise only cleared when a job is *authorized* again. A job canceled while declined
         // therefore left its id there for the life of a `meka serve`. Forgetting here keeps the
         // memory bounded by the jobs that exist rather than by every job that ever did. This is
-        // not the only `DELETE` -- `retire_unclaimed` and `complete_claim` have their own -- but
+        // not the only `DELETE` (`retire_unclaimed` and `complete_claim` have their own), but
         // both of those forget the job themselves, on the path that reaches them.
         self.memory.forget(id);
         let id = id.to_string();
@@ -338,15 +339,14 @@ impl ScheduleStore {
 
     /// Finish the occurrence: the turn was delivered, so advance the schedule or retire the job.
     ///
-    /// `next_fire_at` is `Some` for a job that lives on and `None` for one whose moment is spent --
-    /// a one-shot, or a cron pattern with nothing left in range -- which is the only place a
+    /// `next_fire_at` is `Some` for a job that lives on and `None` for one whose moment is spent (a
+    /// one-shot, or a cron pattern with nothing left in range), which is the only place a
     /// scheduled job is deleted by the scheduler rather than by a person.
     ///
-    /// Written *after* delivery. That ordering existed so a prompt which reliably crashed the
-    /// process could not be re-selected on every restart, at the price of losing the occurrence to
-    /// any crash at all. The lease's `attempts` counter takes over that job and does it better: a
-    /// crash now costs a retry rather than the occurrence, and a job that crashes repeatedly is
-    /// parked instead of looping.
+    /// Written *after* delivery. Written before, a prompt that reliably crashes the process would
+    /// still not be re-selected on every restart, because the lease's `attempts` counter parks a
+    /// job that crashes repeatedly; written after, a crash costs a retry rather than the
+    /// occurrence.
     ///
     /// `fired_at` is `None` for an occurrence that was *considered* rather than delivered, which is
     /// what a gate saying no amounts to. `last_fired_at` means a turn happened: recording one for
@@ -390,7 +390,7 @@ impl ScheduleStore {
                     return Ok(ClaimClosed::Yes);
                 }
                 // Both statements are scoped to this owner's lease, so a zero count says only "no
-                // row carrying my claim" -- which has two causes that mean opposite things. Asked
+                // row carrying my claim", which has two causes that mean opposite things. Asked
                 // here, on the failure path only, because the answer decides whether the caller
                 // has a problem or has merely been canceled.
                 let still_there: bool = connection.query_row(
@@ -477,7 +477,7 @@ impl ScheduleStore {
     /// Matching nothing is ordinary here and is not reported: another host advanced the same
     /// occurrence first, or took it while this one was deciding, and either way the occurrence has
     /// moved off the value this host read. That is why this returns `()` where
-    /// [`Self::retire_unclaimed`] returns `bool` -- there, whether *this* call was the one that
+    /// [`Self::retire_unclaimed`] returns `bool`: there, whether *this* call was the one that
     /// removed the row decides who announces it.
     pub(crate) async fn advance_unclaimed(
         &self,
@@ -519,7 +519,7 @@ pub(crate) enum ClaimClosed {
     /// Written. The occurrence is spent.
     Yes,
     /// The row is gone: the job was canceled, or its session deleted, while the turn ran. Nothing
-    /// is wrong -- there is no occurrence left to close, and a cancellation is meant to win.
+    /// is wrong: there is no occurrence left to close, and a cancellation is meant to win.
     /// `schedule_cancel` is offered to the model in the same breath as `schedule_create`, so a job
     /// that fires, decides it is finished and cancels itself lands here every time.
     RowGone,
@@ -533,12 +533,12 @@ pub(crate) enum ClaimClosed {
 ///
 /// One definition because two are what a stale lease exploits. This clause and `claimed_by IS NULL`
 /// look interchangeable and are not: nothing clears `claimed_by` except a release, a completion or
-/// a fresh claim, so a host that dies holding a lease leaves it set for good. The due query and
-/// [`ScheduleStore::claim_occurrence`] used the expiry; [`ScheduleStore::retire_unclaimed`] and
-/// [`ScheduleStore::advance_unclaimed`] used the column, which are the two paths that move an
-/// occurrence *without* taking a lease. A row with an expired lease was therefore handed out on
-/// every sweep and was invisible to both, so a one-shot past its grace period was never retired,
-/// never fired and never logged, and a recurring job refused before its claim never advanced.
+/// a fresh claim, so a host that dies holding a lease leaves it set for good. With the due query
+/// and [`ScheduleStore::claim_occurrence`] on the expiry but [`ScheduleStore::retire_unclaimed`]
+/// and [`ScheduleStore::advance_unclaimed`] (the two paths that move an occurrence *without*
+/// taking a lease) on the column, a row with an expired lease is handed out on every sweep and
+/// invisible to both, so a one-shot past its grace period is never retired, never fired and never
+/// logged, and a recurring job refused before its claim never advances.
 pub(crate) fn no_live_claim(now: &str) -> String {
     format!("(claimed_by IS NULL OR claim_expires_at IS NULL OR claim_expires_at < {now})")
 }
@@ -547,7 +547,7 @@ pub(crate) fn no_live_claim(now: &str) -> String {
 /// Textual equality is the fast path and is what matches in practice: every writer renders the
 /// column with `DateTime::<Utc>::to_rfc3339`, and re-rendering a value parsed back out of it
 /// reproduces the same bytes. The `julianday` arm is there so a row that reached the database any
-/// other way -- a hand-edited timestamp, a `Z` suffix, a non-UTC offset -- is still claimable
+/// other way (a hand-edited timestamp, a `Z` suffix, a non-UTC offset) is still claimable
 /// rather than silently unclaimable forever, which is the shape this failure would take: the
 /// compare-and-swap would match nothing, on every sweep, and the job would simply never fire again
 /// with nothing logged. `julianday` returns `NULL` for anything it cannot parse and `NULL = NULL`
@@ -573,6 +573,7 @@ pub(crate) struct ScheduledJobRow {
     pub(crate) attempts: u32,
 }
 impl ScheduledJobRow {
+    /// The row as a [`ScheduledJob`], or what about it did not parse.
     pub(crate) fn decode(self) -> std::result::Result<ScheduledJob, String> {
         let parse_time =
             |text: &str| -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
@@ -596,7 +597,7 @@ impl ScheduledJobRow {
                 // Through `parse_recorded_permission` like the five session-row readers, so the
                 // *unreadable* case is heard rather than folded into the absent one. Without the
                 // warning the only clue is a later message saying the gate was authorized at
-                // `none` -- naming a level the job was never created at.
+                // `none`, naming a level the job was never created at.
                 crate::permission::parse_recorded_permission(
                     self.gate_permission.as_deref(),
                     &format_args!("the gate on job {}", self.id),

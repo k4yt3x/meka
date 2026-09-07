@@ -59,8 +59,8 @@ const COLUMN_BODY: i64 = 3;
 
 /// `bm25` weights, one per indexed column: name, description, tags, body.
 ///
-/// A hit on the *name* is close to an exact-recall event -- the model half-remembered what it
-/// called the note -- so it outranks everything. The description is the one line the model wrote to
+/// A hit on the *name* is close to an exact-recall event (the model half-remembered what it
+/// called the note), so it outranks everything. The description is the one line the model wrote to
 /// stand on its own in the index, which makes it a better signal than prose buried in a body.
 const WEIGHT_NAME: f64 = 10.0;
 const WEIGHT_DESCRIPTION: f64 = 3.0;
@@ -110,7 +110,7 @@ const PREFIX_MIN_CHARS: usize = 4;
 ///
 /// The substring tier builds one `OR` clause per term against four columns, and SQLite caps an
 /// expression tree at depth 1000; the full-text tiers OR the same terms into one `MATCH`. Far more
-/// than any real question needs -- the tool asks for synonyms, not for a document -- and low enough
+/// than any real question needs (the tool asks for synonyms, not for a document) and low enough
 /// that pasting five paragraphs in as a "query" degrades to searching its first hundred words
 /// rather than erroring.
 const MAX_TERMS: usize = 100;
@@ -128,8 +128,8 @@ const SUBSTRING_SNIPPET_CHARS: usize = 160;
 /// token so `MATCH` cannot reach it, where the match sits wherever the author put it.
 ///
 /// A quarter of the window leads the match, so what comes back reads as an excerpt rather than as
-/// a fragment starting mid-word. When no term is in the body -- the row matched on its name,
-/// description or tags -- the opening is the honest answer and there is nothing to center on.
+/// a fragment starting mid-word. When no term is in the body (the row matched on its name,
+/// description or tags) the opening is the honest answer and there is nothing to center on.
 ///
 /// Case-insensitively, and specifically *ASCII* case-insensitively, because that is what SQLite's
 /// `LIKE` did to select this row. Anything else would look for a match the query never made.
@@ -137,13 +137,12 @@ fn excerpt_around_a_match(body: &str, terms: &[String], chars: usize) -> String 
     // The first term that hits, not the earliest hit among all of them: both satisfy the contract,
     // and only one of them stops scanning.
     //
-    // Every term is tried, with no cap. A cap was here briefly and was a mistake: `Terms::parse`
-    // preserves query order across all `queries` entries, so three phrasings ending in the one
-    // non-ASCII word put that word past any small ceiling -- and a row whose body is entirely CJK
-    // reaches this tier precisely because no full-text tier can see it, matches on `LIKE`, and
-    // then got an excerpt from the body's opening under a preamble asserting it contained the
-    // term. The cost the cap was buying back is real but bounded by `MAX_TERMS`, and it is the
-    // wrong thing to spend a false statement on.
+    // Every term is tried, with no cap. `Terms::parse` preserves query order across all `queries`
+    // entries, so three phrasings ending in the one non-ASCII word put that word past any small
+    // ceiling, and a row whose body is entirely CJK reaches this tier precisely because no
+    // full-text tier can see it, matches on `LIKE`, and would then get an excerpt from the body's
+    // opening under a preamble asserting it contained the term. The cost is bounded by
+    // `MAX_TERMS`, and a false statement is the wrong thing to spend it on.
     let found = terms
         .iter()
         .find_map(|term| find_ignoring_ascii_case(body, term));
@@ -161,7 +160,7 @@ fn excerpt_around_a_match(body: &str, terms: &[String], chars: usize) -> String 
 /// Byte-wise rather than lowercasing the haystack, because the haystack is a whole memory body and
 /// this runs once per candidate row: a store of 200 KB notes would otherwise allocate a second copy
 /// of each one to answer a question about a 160-character window. The boundary check is what keeps
-/// the offset sliceable -- an ASCII needle cannot match inside a multi-byte character, but a
+/// the offset sliceable: an ASCII needle cannot match inside a multi-byte character, but a
 /// non-ASCII one can start part-way through.
 fn find_ignoring_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
     let (hay, need) = (haystack.as_bytes(), needle.as_bytes());
@@ -245,9 +244,9 @@ const TRIGGER_DEFINITIONS: [(&str, &str); 3] = [
     ),
     (
         // Gated on the indexed columns actually changing. `record_read` bumps `read_count` on
-        // every `memory_read`, and an ungated trigger answered that by deleting and re-inserting
-        // all four columns -- two full posting-list rewrites of a body that had not changed, on
-        // the one operation a large memory performs most often.
+        // every `memory_read`, and an ungated trigger would answer that by deleting and
+        // re-inserting all four columns: two full posting-list rewrites of a body that has not
+        // changed, on the one operation a large memory performs most often.
         //
         // Every indexed column has to appear in the `WHEN` or an edit to the one left out stops
         // reaching the index. `id` is deliberately absent: it is the `content_rowid`, and the
@@ -258,7 +257,7 @@ const TRIGGER_DEFINITIONS: [(&str, &str); 3] = [
         // live guarantee, and worth saying so: `unicode61` folds case when it tokenizes, so
         // `Policy` and `policy` produce identical index entries and skipping the re-index for a
         // case-only change is currently unobservable through search or `integrity-check`. It stays
-        // because the comparison should follow the *content*, not the tokenizer's opinion of it --
+        // because the comparison should follow the *content*, not the tokenizer's opinion of it:
         // a future tokenizer change, or a case-sensitive column added beside this one, would make
         // the difference real, and nothing would fail in between.
         "memories_au",
@@ -281,12 +280,10 @@ const TRIGGER_DEFINITIONS: [(&str, &str); 3] = [
 ///
 /// **`sqlite_master.sql` is not the statement as submitted.** SQLite removes `IF NOT EXISTS` and
 /// drops the trailing `;`, so comparing a [`TRIGGER_DEFINITIONS`] literal against it directly never
-/// matched -- not on a stale store, not on a fresh one, in no database state whatsoever. That made
-/// [`sync_triggers`]'s early return dead code and turned every single process open into three
-/// dropped triggers, three recreated ones and a full `'rebuild'` of the index. Measured on a
-/// 20,000-memory store: 306 ms for `meka memory get <name>`, a point lookup, against 3 ms for a
-/// command that never opens the store. Two independent reviews found it the same way, which is
-/// what a claim with no test behind it is worth.
+/// matches, in no database state whatsoever. That makes [`sync_triggers`]'s early return dead code
+/// and turns every process open into three dropped triggers, three recreated ones and a full
+/// `'rebuild'` of the index: measured on a 20,000-memory store, 306 ms for `meka memory get
+/// <name>`, a point lookup, against 3 ms for a command that never opens the store.
 fn canonical_trigger_sql(sql: &str) -> String {
     // Whitespace is collapsed as well: this file's indentation is not something a definition should
     // be considered stale over.
@@ -352,7 +349,7 @@ fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     // transaction takes its write lock on the first write rather than at `BEGIN`, and under WAL
     // that upgrade can return `SQLITE_BUSY` without consulting the busy handler at all. This one
     // drops three triggers and rebuilds the whole index, so the process it would lose to is a
-    // `meka serve` mid-write -- not another process's schema work, which the schema `flock`
+    // `meka serve` mid-write, not another process's schema work, which the schema `flock`
     // already excludes. Rare path, clean rollback, and no reason to differ from its sibling.
     let transaction =
         rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
@@ -364,7 +361,7 @@ fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     }
     // The index cannot be trusted once a definition has changed: whatever the old triggers did, or
     // failed to do, is already in it. A rebuild is one pass over the table and the only thing that
-    // makes the new definitions true of the rows already there -- and it commits with them, or not
+    // makes the new definitions true of the rows already there, and it commits with them, or not
     // at all.
     transaction.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")?;
     transaction.commit()?;
@@ -374,8 +371,8 @@ fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
 /// How many documents the table holds and how many the index believes it holds, read together.
 ///
 /// One statement, so both counts come from one snapshot. As two `query_row` calls in autocommit
-/// mode they straddled any concurrent commit, which is a spurious disagreement on a healthy store
-/// -- and this number decides whether to rebuild.
+/// mode they would straddle any concurrent commit, which is a spurious disagreement on a healthy
+/// store, and this number decides whether to rebuild.
 fn document_counts(connection: &rusqlite::Connection) -> rusqlite::Result<(i64, i64)> {
     connection.query_row(
         // `memories_fts_docsize` holds one row per *indexed* document, so it counts what the index
@@ -391,7 +388,7 @@ fn document_counts(connection: &rusqlite::Connection) -> rusqlite::Result<(i64, 
 /// The index is derived and disposable, so a disagreement has exactly one correct response and no
 /// reason to wait for a human to run `meka memory verify`. This catches the case [`sync_triggers`]
 /// cannot: a `memories_fts` dropped and recreated empty by a partial restore, which is otherwise
-/// silent and permanent -- search simply stops finding things.
+/// silent and permanent: search simply stops finding things.
 ///
 /// Cheap enough to run unconditionally: measured at 20,000 memories, the two counts are 0.27 ms and
 /// 0.11 ms, against 280 ms for the rebuild that only a genuinely broken store pays.
@@ -404,8 +401,7 @@ fn repair_a_desynced_index(connection: &rusqlite::Connection) -> rusqlite::Resul
         return Ok(());
     }
     tracing::warn!(
-        "the memory search index holds {indexed} documents but the store holds {stored}; rebuilding it from \
-         the store. No memory is lost: the index is derived."
+        "the memory search index holds {indexed} documents but the store holds {stored}; rebuilding it"
     );
     connection.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
 }
@@ -448,6 +444,7 @@ impl Terms {
         Self(terms)
     }
 
+    /// Whether the query reduced to no terms at all.
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -468,13 +465,12 @@ impl Terms {
 
     /// Prefix expressions with each term shortened by one more character each time, longest first.
     ///
-    /// The prefix tier only ever worked in one direction: `Tok*` reaches `Tokyo` because the stored
-    /// word is the longer one. The symmetric case is just as ordinary and nothing covered it -- a
-    /// live model searched `deployment` against a memory tagged `deploy` whose body says `Deploys`,
-    /// and got "No memories matched". Every tier missed it: SQLite's porter strips `-s`, `-ing` and
-    /// `-ed` but not `-ment`, `deployment*` does not match `deploy` because the star is on the
-    /// wrong end, `LIKE '%deployment%'` cannot match a shorter word, and the edit distance is 4
-    /// against a threshold of 3. The model said it did not believe the empty result; it was right.
+    /// The plain prefix tier only works in one direction: `Tok*` reaches `Tokyo` because the
+    /// stored word is the longer one. The symmetric case is just as ordinary: `deployment`
+    /// searched against a memory tagged `deploy` whose body says `Deploys` is missed by every
+    /// other tier, because SQLite's porter strips `-s`, `-ing` and `-ed` but not `-ment`,
+    /// `deployment*` does not match `deploy` with the star on the wrong end, `LIKE '%deployment%'`
+    /// cannot match a shorter word, and the edit distance is 4 against a threshold of 3.
     ///
     /// Progressive rather than one fixed cut, because the ending's length is not fixed either:
     /// `deployment` needs four characters off and `deployments` five. Longest prefix first, so the
@@ -618,11 +614,10 @@ pub(crate) struct WriteRequest {
     /// `None` means "keep what is stored", exactly as it does for the three fields below.
     ///
     /// Required only when the write creates the memory, which [`MemoryStore::write`] checks inside
-    /// its own transaction. Before this the field was a plain `String`, so a caller refining a
-    /// stored note had to resend the description -- and the only copy an agent can see is the
-    /// index's, elided to 500 characters. Refining the body of a memory whose description ran to
-    /// 900 characters therefore rewrote it as 503 ending in `...`, silently, on a call that did
-    /// not mean to touch it.
+    /// its own transaction. As a plain `String`, a caller refining a stored note would have to
+    /// resend the description, and the only copy an agent can see is the index's, elided to 500
+    /// characters: refining the body of a memory whose description ran to 900 characters would
+    /// rewrite it as 503 ending in `...`, silently, on a call that did not mean to touch it.
     pub(crate) description: Option<String>,
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) body: Option<String>,
@@ -649,13 +644,12 @@ pub(crate) enum BodyWrite {
 /// that does not is a silent field swap, and every one of these columns is a string or a number
 /// that would survive being put in the wrong slot.
 ///
-/// **This returns what is stored, byte for byte.** Sanitizing here instead was silent data loss:
+/// **This returns what is stored, byte for byte.** Sanitizing here instead is silent data loss:
 /// `meka memory edit` reads a body, hands it to `$EDITOR` and writes back what comes out, so a
-/// read that stripped format characters made an edit to one unrelated word destroy every
-/// zero-width joiner in the note -- the one holding an emoji sequence together, the one a Persian
-/// word needs -- and `meka memory show` then displayed the already-stripped text, so nothing
-/// revealed the loss. The skill store had exactly this defect, and it is in this changelog as
-/// fixed.
+/// read that strips format characters makes an edit to one unrelated word destroy every
+/// zero-width joiner in the note (the one holding an emoji sequence together, the one a Persian
+/// word needs), and `meka memory show` then displays the already-stripped text, so nothing
+/// reveals the loss.
 ///
 /// Sanitization belongs at the render boundary instead, and the rule is that a path which
 /// *displays* text sanitizes while a path which *round-trips* it does not. See
@@ -681,21 +675,21 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
 /// Reduce a stored tag to the characters a tag is allowed to hold.
 ///
 /// The same shape as [`clamp_priority`] and [`clamp_read_count`], and against the same threat: a
-/// row that reached this table without going through meka's write doors. Tags were the one field
-/// with no such guard, and unlike the others they are *rendered* -- into the tag histogram and the
-/// world-state diff, both of which reach the model's context and the operator's terminal.
-/// `split_whitespace` already stops a newline, but an ANSI escape, a bidi override or a zero-width
-/// character is not whitespace and went through untouched.
+/// row that reached this table without going through meka's write doors. Unlike the others, tags
+/// are *rendered*, into the tag histogram and the world-state diff, both of which reach the
+/// model's context and the operator's terminal. `split_whitespace` already stops a newline, but an
+/// ANSI escape, a bidi override or a zero-width character is not whitespace and goes through
+/// untouched.
 ///
-/// All-or-nothing, against the write door's own rule. Filtering character by character was worse
-/// than refusing, because for the most likely input it did not remove an odd character -- it
-/// silently produced a *different, entirely plausible* tag. A stored `Infra` came back as `nfra`:
-/// still a valid tag, still rendered without complaint, and wrong. `Q3-2026` became `3-2026`.
+/// All-or-nothing, against the write door's own rule. Filtering character by character is worse
+/// than refusing, because for the most likely input it does not remove an odd character; it
+/// silently produces a *different, entirely plausible* tag. A stored `Infra` comes back as `nfra`:
+/// still a valid tag, still rendered without complaint, and wrong. `Q3-2026` becomes `3-2026`.
 /// Nothing in the histogram or the diff marks a tag as altered, so the corruption is invisible at
 /// every surface that displays it.
 ///
 /// The predicate is [`crate::memory::validate_tag`] itself rather than a second character list, so
-/// what a read keeps is exactly what a write would have accepted -- one rule in one place. That
+/// what a read keeps is exactly what a write would have accepted, one rule in one place. That
 /// also settles the uppercase case the same way the write door does: `validate_tag` *refuses*
 /// `Infra` rather than lowercasing it, so a read that folded case would be inventing a third
 /// policy. The tag drops, and the caller filters the empty string out, which keeps a nameless entry
@@ -743,8 +737,8 @@ pub(crate) struct MemoryStore {
     ///
     /// Deliberately separate from [`Self::connection`], because they answer different questions.
     /// A store with no database is an *empty* store and its `memory_*` tools still belong in the
-    /// registry -- conflating the two made `meka tools list` hide tools a real session would have
-    /// had. A *disabled* store is one whose tools are not registered and whose `[Memory]` section
+    /// registry; conflating the two makes `meka tools list` hide tools a real session would have.
+    /// A *disabled* store is one whose tools are not registered and whose `[Memory]` section
     /// never renders, but which the CLI and the HTTP API still read and write, because those are
     /// the operator rather than the agent.
     enabled: bool,
@@ -990,11 +984,10 @@ impl MemoryStore {
                 // IMMEDIATE, not the `transaction()` default of DEFERRED. A deferred
                 // transaction takes a read snapshot first and upgrades on the write; under WAL,
                 // if another connection committed in between, SQLite returns `SQLITE_BUSY`
-                // *without invoking the busy handler*, so the 5s `busy_timeout` set in
-                // `Store` is inert on exactly this path. Measured before the change: 3-4
-                // of 24 concurrent cross-process `meka memory add` runs failed outright with
-                // "database is locked", while the same load in one process was clean. Taking the
-                // write lock up front is what lets the handler wait.
+                // *without invoking the busy handler*, so the 5s `busy_timeout` set in `Store` is
+                // inert on exactly this path and concurrent cross-process `meka memory add` runs
+                // fail outright with "database is locked". Taking the write lock up front is what
+                // lets the handler wait.
                 let transaction = connection
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 // Asked inside the transaction, so "does this row exist" cannot go stale before
@@ -1012,8 +1005,8 @@ impl MemoryStore {
                         //
                         // Not `InvalidParameterName`, whose `Display` is "Invalid parameter name:
                         // {name}". Wrapped by `tokio_rusqlite` and then by `MekaError::Database`,
-                        // the model received `database error: failed to write memory:
-                        // Error("Invalid parameter name: no memory named 'x' exists...")` -- a
+                        // the model would receive `database error: failed to write memory:
+                        // Error("Invalid parameter name: no memory named 'x' exists...")`, a
                         // user-input mistake dressed as a database fault, with a prefix inviting a
                         // retry under a different `name`.
                         return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -1022,8 +1015,8 @@ impl MemoryStore {
                 transaction.execute(
                     // `COALESCE(?2, '')` in the VALUES clause, not a bare `?2`: SQLite checks
                     // `NOT NULL` while attempting the insert, before it notices the uniqueness
-                    // conflict that would route to DO UPDATE, so an omitted description failed the
-                    // constraint instead of reaching the `COALESCE` below. The `''` is never
+                    // conflict that would route to DO UPDATE, so an omitted description would fail
+                    // the constraint instead of reaching the `COALESCE` below. The `''` is never
                     // stored, because the only path that inserts rather than updates is one the
                     // existence check above already required a description for.
                     "INSERT INTO memories
@@ -1073,17 +1066,15 @@ impl MemoryStore {
     /// Replace one memory's body and nothing else, provided it still holds `expected`.
     ///
     /// Separate from [`Self::write`] because `meka memory edit` reads a body, hands it to
-    /// `$EDITOR`, and comes back whenever the user saves -- minutes later, on a store an agent may
-    /// have written to meanwhile. Going back through `write` meant sending the *description* read
-    /// before the editor opened, so an edit to the body silently reverted a description the agent
-    /// had changed in between. Measured: the agent's reworded description and an appended line both
-    /// vanished, with both commands reporting success.
+    /// `$EDITOR`, and comes back whenever the user saves, minutes later, on a store an agent may
+    /// have written to meanwhile. Going back through `write` would send the *description* read
+    /// before the editor opened, so an edit to the body would silently revert a description the
+    /// agent changed in between.
     ///
-    /// One `UPDATE` naming one column fixed that for every *other* column, and left the body itself
-    /// an unlocked read-modify-write across a window bounded only by how long somebody leaves an
-    /// editor open. Measured, with the editor held for four seconds: the agent wrote "WHAT THE
-    /// AGENT LEARNED" and the store ended up holding the pre-editor text plus the human's line,
-    /// with both commands reporting success and nothing said.
+    /// One `UPDATE` naming one column protects every *other* column, and leaves the body itself an
+    /// unlocked read-modify-write across a window bounded only by how long somebody leaves an
+    /// editor open: the agent's appended line would be replaced by the pre-editor text plus the
+    /// human's, with both commands reporting success and nothing said.
     ///
     /// So the `WHERE` carries the body that was read, which makes this a compare-and-swap and the
     /// lost update unrepresentable. Deliberately not a lock: an editor may stay open for an hour,
@@ -1093,7 +1084,7 @@ impl MemoryStore {
     /// does not still have their text in the editor's buffer: `meka memory edit` waits for the
     /// editor to *exit*. A CLI that deletes its scratch file before calling this therefore destroys
     /// the user's work on a refused save, not the agent's. See [`crate::cli::memory::run_edit`],
-    /// which now keeps the file and names it.
+    /// which keeps the file and names it.
     pub(crate) async fn write_body(
         &self,
         name: &str,
@@ -1134,8 +1125,8 @@ impl MemoryStore {
     /// Delete one memory. `false` when there was none by that name.
     ///
     /// The triggers take its FTS rows and the row itself carries its own read counts away, so
-    /// there is nothing else to clean up and no orphan class to prune. Both were real bugs when
-    /// the counters lived in a second table keyed by name.
+    /// there is nothing else to clean up and no orphan class to prune; a second table keyed by
+    /// name would leave both.
     pub(crate) async fn delete(&self, name: &str) -> Result<bool> {
         let name = name.to_string();
         self.writable()?
@@ -1221,7 +1212,7 @@ impl MemoryStore {
         hits.sort_by(|left, right| right.score.total_cmp(&left.score));
         // Counted before the cut, because the caller has to be able to say how much it is *not*
         // showing. Reporting the truncated length as the total reads as "this is everything that
-        // matched", which turns a full store into a confidently incomplete answer -- the same
+        // matched", which turns a full store into a confidently incomplete answer, the same
         // failure the `[Memory]` index's "N more" line exists to prevent.
         let matched = hits.len();
         let pool_exhausted = matched >= CANDIDATE_POOL;
@@ -1238,13 +1229,12 @@ impl MemoryStore {
     /// The tokenizer's blind spot, closed. `unicode61` splits only on non-alphanumerics, so a
     /// contiguous CJK run is one token: a memory whose body says `办公室在深圳南山区的科技园` is
     /// not found by `深圳` at the exact tier, nor at the prefix tier (the run does not *start*
-    /// with it), nor by edit distance. The regex `memory_search` this replaced matched every one
-    /// of those, so without this the change is a plain regression for any script the tokenizer
-    /// does not segment.
+    /// with it), nor by edit distance, so without this tier any script the tokenizer does not
+    /// segment is unsearchable.
     ///
     /// A `LIKE` scan rather than a second tokenizer: it runs only after full-text matching found
     /// nothing at all, so its cost is paid on a query that was otherwise going to answer "no
-    /// memories matched" -- and unlike choosing a different tokenizer it cannot change what the
+    /// memories matched", and unlike choosing a different tokenizer it cannot change what the
     /// exact tier does.
     pub(crate) async fn substring_search(
         &self,
@@ -1294,10 +1284,9 @@ impl MemoryStore {
                     //
                     // Ordered before the cut, unlike the `MATCH` tiers, which cut by `bm25`. Every
                     // row here matched literally, so there is no relevance to grade and the
-                    // importance weights *are* the ranking -- applying them after an arbitrary
-                    // window meant a store of 260 filler notes hid the priority-0 standing
-                    // directive that was the only real answer, behind five six-year-old p9 rows
-                    // labeled "most relevant first".
+                    // importance weights *are* the ranking; applied after an arbitrary window, a
+                    // store of filler notes hides the priority-0 standing directive that is the
+                    // only real answer behind old p9 rows labeled "most relevant first".
                     "SELECT name, description, body, priority, created_at, read_count
                      FROM memories
                      WHERE {clause}
@@ -1318,10 +1307,10 @@ impl MemoryStore {
                         // There is no `snippet()` outside a `MATCH`, so the window is chosen
                         // here. It has to contain the match: the renderer presents this under a
                         // preamble saying the text contains the search term, and the body's
-                        // *opening* satisfies that only by accident. It reliably failed for the
-                        // case this tier exists for -- a long CJK body, which `unicode61` makes
+                        // *opening* satisfies that only by accident, reliably failing for the
+                        // case this tier exists for (a long CJK body, which `unicode61` makes
                         // one token, so `MATCH` never sees it and the literal scan is the only
-                        // thing that finds it -- where the match is as likely to be at the end as
+                        // thing that finds it), where the match is as likely to be at the end as
                         // anywhere.
                         snippet: excerpt_around_a_match(
                             &body,
@@ -1334,7 +1323,7 @@ impl MemoryStore {
                         read_count: clamp_read_count(row.get(5)?),
                         // No bm25 here: every row matched literally, so there is no relevance to
                         // grade and the importance weights decide the order on their own. Written
-                        // in bm25's own sign convention -- negative, more-negative-is-better -- so
+                        // in bm25's own sign convention (negative, more-negative-is-better), so
                         // `Ranking::score` negates it to 1.0 exactly as it does a MATCH hit.
                         score: -1.0,
                     })
@@ -1363,13 +1352,13 @@ impl MemoryStore {
 
     /// Note that the agent opened this memory. Feeds [`Ranking::usage_weight`].
     ///
-    /// Only `memory_read` calls this. A search hit is weaker evidence -- the model saw a line, not
-    /// the note -- and an operator reading through the HTTP API is not the agent recalling
+    /// Only `memory_read` calls this. A search hit is weaker evidence (the model saw a line, not
+    /// the note), and an operator reading through the HTTP API is not the agent recalling
     /// anything, so neither should move the ranking the agent gets.
     ///
     /// One statement against the row itself. A second table keyed by name produces two separate
     /// defects: counters outliving the memory they describe, and counters destroyed when a memory
-    /// is briefly unreadable. Neither is expressible now.
+    /// is briefly unreadable. Neither is expressible here.
     pub(crate) async fn record_read(&self, name: &str) -> Result<()> {
         let name = name.to_string();
         let now = crate::memory::render_recorded(SystemTime::now());
@@ -1391,8 +1380,8 @@ impl MemoryStore {
     }
 
     /// Rows in the FTS index's shadow storage. Test-only, and the one way to observe that a
-    /// `read_count` bump did *no* index work rather than deleting and re-inserting the same terms
-    /// -- which is correct but costs two full posting-list rewrites of an unchanged body.
+    /// `read_count` bump did *no* index work rather than deleting and re-inserting the same terms,
+    /// which is correct but costs two full posting-list rewrites of an unchanged body.
     #[cfg(test)]
     pub(crate) async fn index_segment_count(&self) -> Result<i64> {
         self.writable()?
@@ -1414,7 +1403,7 @@ impl MemoryStore {
     /// index. Every documented argument form behaves the same. So the count comparison below is
     /// what actually catches a trigger that stopped firing.
     ///
-    /// What neither can see is a *changed* document whose update trigger did not fire -- the
+    /// What neither can see is a *changed* document whose update trigger did not fire: the
     /// counts still match, and only searching for the new text reveals it. That is why the caller
     /// is told to rebuild rather than reassured: [`Self::rebuild_index`] is one pass over the
     /// table and is the only certainty available.
@@ -1445,8 +1434,8 @@ impl MemoryStore {
     /// Regenerate the FTS index from the table it mirrors.
     ///
     /// What makes the index disposable in practice rather than in principle: `integrity_check`
-    /// can say the two disagree, and this is the answer. Cheap enough to run by hand at any size
-    /// -- it is one pass over `memories`.
+    /// can say the two disagree, and this is the answer. Cheap enough to run by hand at any size:
+    /// it is one pass over `memories`.
     pub(crate) async fn rebuild_index(&self) -> Result<()> {
         self.writable()?
             .call(|connection| -> rusqlite::Result<_> {

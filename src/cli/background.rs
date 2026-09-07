@@ -9,12 +9,8 @@ use crate::{
     store::{Store, background::TaskStatus},
 };
 
-/// What [`render`] aims to fit in.
-///
-/// Six columns of independent ceilings reached about 138 with an ordinary tool name, and nothing
-/// capped the tool at all: an MCP name is chosen by the server, so a long one pushed every column
-/// after it off the screen. The id takes whatever distinguishes it, the fixed columns take theirs,
-/// and the two authored cells split what is left.
+/// What [`render`] aims to fit in: the id takes whatever distinguishes it, the fixed columns take
+/// theirs, and the two authored cells split what is left.
 const TABLE_WIDTH: usize = 120;
 
 /// Ceiling on the tool name. Server-chosen, so nothing else bounds it.
@@ -51,8 +47,8 @@ fn render(tasks: Vec<crate::store::background::BackgroundTask>) -> Result<()> {
 
 /// One row per task, separated from printing so the widths and the sanitizing can be asserted.
 ///
-/// `What` and `Result` both carry text meka did not write -- a command line the model composed, and
-/// an excerpt of whatever that command printed -- so both go through
+/// `What` and `Result` both carry text meka did not write (a command line the model composed, and
+/// an excerpt of whatever that command printed), so both go through
 /// [`crate::text::sanitize_to_line`], which caps in terminal columns rather than characters.
 fn task_rows(tasks: &[crate::store::background::BackgroundTask]) -> Vec<Vec<String>> {
     let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
@@ -238,13 +234,11 @@ pub(crate) async fn cancel(
     Ok(vec![task.id])
 }
 
-/// How long a task ran, or has been running. How long a task ran, in a cell the table can budget
-/// for.
+/// How long a task ran, or has been running, in a cell the table can budget for.
 ///
-/// `humantime` spells a duration in full -- `3years 4months 16days 17h 28m 57s` is 33 columns --
-/// and nothing bounds how long a task has been running: an `interrupted` row from a session
-/// resumed months later renders exactly that, and the two authored columns have floors, so the row
-/// simply overran. The two coarsest units are what a reader takes from this cell anyway.
+/// `humantime` spells a duration in full (`3years 4months 16days 17h 28m 57s` is 33 columns) and
+/// nothing bounds how long a task has been running, so the two coarsest units are kept: they are
+/// what a reader takes from this cell anyway.
 fn format_elapsed(task: &crate::store::background::BackgroundTask) -> String {
     let seconds = task.elapsed().num_seconds().max(0) as u64;
     let spelled =
@@ -258,8 +252,8 @@ fn format_elapsed(task: &crate::store::background::BackgroundTask) -> String {
 }
 
 /// Collapse runs of whitespace, for legibility rather than safety: a command line and a build-log
-/// excerpt both wrap. `sanitize_to_line` is what makes the cell safe, and it is not a substitute --
-/// `\u{1b}` is not whitespace, so this alone leaves an escape intact.
+/// excerpt both wrap. `sanitize_to_line` is what makes the cell safe; `\u{1b}` is not whitespace,
+/// so this alone leaves an escape intact.
 fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -293,7 +287,7 @@ mod tests {
         let rendered = show_lines(&task);
         // The outcome is indented under `result:` rather than being a field of its own, and
         // `result:` carries no value to line anything up against. A value may hold colons of its
-        // own -- both timestamps do -- so the label's is the first one.
+        // own (both timestamps do), so the label's is the first one.
         let columns: Vec<(usize, &str)> = rendered
             .lines()
             .filter(|line| !line.starts_with(' '))
@@ -410,10 +404,9 @@ mod tests {
 
     /// `/tasks cancel ""` must not stop the only running task.
     ///
-    /// `id.starts_with("")` is true of every id, so an unset variable resolved to whichever task
-    /// happened to be alone and canceled it -- while reading as correct, because the ambiguity
-    /// error only appears once a second task exists. `--all` is the way to mean all of them, and it
-    /// is spelled.
+    /// `id.starts_with("")` is true of every id, so an unset variable would resolve to whichever
+    /// task happened to be alone and cancel it, and the ambiguity error only appears once a second
+    /// task exists. `--all` is the way to mean all of them.
     #[tokio::test]
     async fn canceling_an_empty_prefix_stops_nothing() {
         let (manager, session) = manager_with_session().await;
@@ -490,8 +483,8 @@ mod tests {
 
     /// The table has a budget, and both cells that carry authored text respect it.
     ///
-    /// Six independent ceilings reached about 138, and `tool_name` had none at all -- an MCP server
-    /// chooses that name, so a long one pushed every later column off the screen.
+    /// `tool_name` is chosen by an MCP server, so nothing else bounds it, and a long one would push
+    /// every later column off the screen.
     #[test]
     fn the_task_table_fits_its_budget_and_sanitizes_what_it_did_not_write() {
         let task = BackgroundTask {

@@ -245,8 +245,8 @@ pub(crate) async fn run_oneshot(
     // rather than against the configured default.
     if start_approvals && start_permission != crate::permission::Permission::Unrestricted {
         tracing::warn!(
-            "approvals are on but one-shot mode has no interactive prompt: every tool that needs \
-             approval will be denied. Raise --permission to what the run needs, or drop --oneshot."
+            "approvals are on but a one-shot run has no prompt to ask at, so every call above the \
+             level is refused; run at the `--permission` the run needs"
         );
     }
 
@@ -330,14 +330,12 @@ pub(crate) async fn run_oneshot(
         let outstanding = agent.background_tasks().running_count(id).await;
         if outstanding > 0 {
             tracing::info!(
-                "waiting for {outstanding} background task(s) before exiting; a one-shot run has no later \
-                 turn to report them in"
+                "waiting for {outstanding} background task(s) before exiting; a one-shot run has no \
+                 later turn to report them in"
             );
-            // Interruptible. A one-shot has no REPL loop and no per-turn signal listener by this
-            // point, so an unbounded await here made the process ignore Ctrl+C entirely whenever a
-            // background task never finished. Racing the signal keeps the documented "wait for
-            // outstanding work" behavior while leaving the user a way out; the outcomes collected
-            // just below still report whatever did finish.
+            // Raced against Ctrl+C: a one-shot has no REPL loop and no per-turn signal listener by
+            // this point, so an unbounded await would ignore the key for as long as a task ran. The
+            // outcomes collected just below still report whatever did finish.
             let tasks = agent.background_tasks();
             tokio::select! {
                 _ = tasks.wait_for_session(id) => {}

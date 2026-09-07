@@ -84,13 +84,19 @@ assumption is the entire return, and it is lost the moment a second place tolera
 
 ## Changelog
 
-- Update `CHANGELOG.md` for every meaningful change, under `[Unreleased]`.
-- [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/). Only Added, Changed, Deprecated,
-  Removed, Fixed and Security, grouped by type.
+- Update `CHANGELOG.md` for every change a user can notice, under `[Unreleased]`.
+- [Keep a Changelog 2.0.0](https://keepachangelog.com/en/2.0.0/): only Added, Changed, Deprecated,
+  Removed, Fixed and Security, in that order, grouped by type.
 - `Fixed` = the behavior was wrong. `Changed` = it worked as intended and now works differently.
-- Around 100 characters per entry.
+  `Security` = a vulnerability closed or an advisory answered, led by its CVE or RUSTSEC id;
+  hardening that closes no known hole is `Changed`.
+- The changelog is written for end users and integrators: what they will see, break on, or must do,
+  in plain present tense. No internal names, module paths, test names or contributor notes; those
+  belong in `docs/book/src/internals.md` and the commit message.
+- One line per entry, under 100 characters. A change that needs more is two entries, or the docs
+  hold the detail and the entry names the page. Trivial changes are compacted into one line or
+  left out.
 - Breaking changes get an inline `**Breaking:**` prefix inside their type, not a separate section.
-- Lead a `Security` entry with its CVE id when one exists.
 
 ## Prose style
 
@@ -218,6 +224,10 @@ One word per concept, everywhere it is written or read:
 - An empty list says "No <nouns>." on stderr. A status line that is a full sentence ends in a
   period ("Connected to 'exa'."); one that ends in a value, id or path does not ("Profile set
   to: work").
+- A message the user reads (error, warning, notice, hint, help) says what happened and, when there
+  is exactly one, the remedy: no examples, no alternatives, no explanation of internals, no
+  second sentence that restates the first. One sentence where one suffices. A printed line stays
+  within 120 columns where its content allows, so it fits a terminal without wrapping.
 
 ## Output: prints vs. tracing
 

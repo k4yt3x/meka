@@ -56,7 +56,7 @@ pub(crate) enum MockEvent {
         estimated_tokens: Option<u64>,
     },
     /// Caps an in-flight thinking block. `opaque` carries whichever wire shape the script is
-    /// standing in for -- a Claude signature, or a Responses reasoning item's sealed content. The
+    /// standing in for: a Claude signature, or a Responses reasoning item's sealed content. The
     /// agent treats it as pass-through (see [`crate::frontend::FrontendEvent::ThinkingBlock`]), so
     /// a script sets it to check that the turn it records can be replayed. Defaulted so existing
     /// scripts keep loading.
@@ -231,6 +231,7 @@ impl MockProvider {
         crate::sync::lock(&self.completions).clone()
     }
 
+    /// A provider that replays `rounds`, one per call, and answers nothing once they are spent.
     pub(crate) fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into()),

@@ -34,7 +34,7 @@ pub(crate) enum End {
     /// message is the protocol's to say: one that has already seen a stop reason is complete.
     Ended,
     /// The caller left. There is no half-written answer for anyone to act on, so this is not a
-    /// failure; reporting it as one sent an abandoned turn back through the retry path.
+    /// failure; reported as one, an abandoned turn goes back through the retry path.
     ReceiverGone,
 }
 
@@ -94,8 +94,8 @@ pub(crate) async fn drive<P: Protocol>(
             }
             event = tokio::time::timeout(STREAM_IDLE_TIMEOUT, event_stream.next()) => {
                 // Bounds silence, not the turn: a model still emitting deltas resets this on every
-                // one. Without it a connection that died without an RST left the turn parked on a
-                // socket that would never speak again, for as long as the process ran.
+                // one. Without it a connection that dies without an RST leaves the turn parked on
+                // a socket that will never speak again, for as long as the process runs.
                 let Ok(event) = event else {
                     let message = format!(
                         "idle timeout waiting for a {what} SSE event after {}s",

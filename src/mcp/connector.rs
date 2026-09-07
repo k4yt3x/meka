@@ -193,10 +193,9 @@ fn is_repeat_failure(state: &ServerState, cause: &str) -> bool {
 /// Record a failed connect on `entry`, announcing it only when it tells the user something new.
 ///
 /// A server that is down stays down, and [`retry_until_connected`] keeps trying every five minutes
-/// for the life of the process. Logging each attempt at `warn!` meant a missing binary or an
-/// unreachable endpoint printed forever, on top of an idle REPL prompt, long after the user had
-/// read the message the first time. The first failure - and any *change* of cause - is worth
-/// saying; a repeat of the same one is not.
+/// for the life of the process. Logged at `warn!` on every attempt, a missing binary or an
+/// unreachable endpoint prints forever, on top of an idle REPL prompt. The first failure, and any
+/// *change* of cause, is worth saying; a repeat of the same one is not.
 async fn record_connect_failure(entry: &Arc<ServerEntry>, server_name: &str, cause: String) {
     let repeat = {
         let state = entry.state.read().await;
@@ -217,6 +216,7 @@ async fn record_connect_failure(entry: &Arc<ServerEntry>, server_name: &str, cau
 /// capture instructions, discover + register tools into the registry, and flip the entry's state to
 /// `Connected` on success or `Failed` on error. Never panics; errors are logged and reflected in
 /// [`ServerState::Failed`] so the turn gate can surface them.
+///
 /// **Precondition:** the caller holds `entry.reconnect_lock`, or is the initial sweep in
 /// [`run_connector`], which owns every `Pending` entry outright. Two concurrent calls against one
 /// entry spawn two transports and let the loser's `record_connect_failure` overwrite the winner's
@@ -237,10 +237,9 @@ pub(crate) async fn connect_one(
         return;
     }
 
-    // connect_server's future can be `!Send` for OAuth-authenticated servers (rmcp 1.5 holds a
-    // `form_urlencoded::Serializer` across an await in its auth module, whose `Option<&dyn Fn(&str)
-    // -> Cow<[u8]>>` closure slot is not `Sync`). Drive it on a `spawn_blocking` thread using the
-    // outer runtime's `Handle`, the same approach `reconnect` uses.
+    // `connect_server`'s future is `!Send` for an OAuth-authenticated server (rmcp's auth module
+    // holds a `!Sync` closure slot across an await), so it is driven on a `spawn_blocking` thread
+    // with the outer runtime's `Handle`, as `reconnect` does.
     let handle = tokio::runtime::Handle::current();
     let entry_for_connect = Arc::clone(&entry);
     let server_name_for_task = server_name.clone();
@@ -287,8 +286,6 @@ pub(crate) async fn connect_one(
 
     tracing::info!("connected to MCP server '{server_name}'");
 
-    // rmcp 2.1: `peer_info()` returns `Option<Arc<InitializeResult>>` (owned) rather than a borrow,
-    // so the instructions string is cloned out of the `Arc`.
     entry.record_instructions(
         connected
             .peer()
@@ -303,8 +300,8 @@ pub(crate) async fn connect_one(
         service: Arc::clone(&service_arc),
     };
 
-    // Discover + register tools. Any error here doesn't undo the Connected state. The server is
-    // reachable, just its tool list failed. Surface it as a warn and leave tool set empty.
+    // A failure here does not undo `Connected`: the server is reachable, only its tool list
+    // failed, so it is warned about and the tool set left empty.
     //
     // Bounded by the same `connect_timeout` as the connect itself: `tools/list` is a request to the
     // server just made, and unbounded, a server that accepts the connection and then never answers
@@ -334,7 +331,7 @@ pub(crate) async fn connect_one(
 
 /// Fetch `list_tools` from a just-connected server and route the resulting adapters through
 /// [`McpClientManager::register_server_tools`], which records which of them ship deferred and
-/// carries both facts to every registry -- the ones attached now and the ones that attach later.
+/// carries both facts to every registry, the ones attached now and the ones that attach later.
 async fn discover_and_register_tools(
     entry: &Arc<ServerEntry>,
     mcp_default_permission: Option<Permission>,
@@ -468,8 +465,8 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
     // Split into lines by hand rather than with `BufReader::lines`, which grows one `String` until
     // it finds a newline: a child that emits none hands meka an unbounded allocation fed by a pipe
     // it controls. Splitting here caps what one line may cost without capping how much the child
-    // may log over its life, which a `take` on the whole stream would have done -- and a full pipe
-    // blocks the child rather than meka.
+    // may log over its life, which a `take` on the whole stream would do, and a full pipe blocks
+    // the child rather than meka.
     const MAX_STDERR_LINE_BYTES: usize = 4096;
 
     fn emit(server_name: &str, line: &[u8], overlong: bool) {
@@ -520,7 +517,7 @@ fn forward_child_stderr(server_name: String, stderr: tokio::process::ChildStderr
 ///
 /// rmcp consults the authorization flow only when the transport carries no `auth_header`, so
 /// passing both would send the static bearer on every request and leave the token the flow obtained
-/// unused -- a server that fails while holding a valid credential. `mcp add` and `mcp login` both
+/// unused: a server that fails while holding a valid credential. `mcp add` and `mcp login` both
 /// refuse to *create* that pairing, but `config.toml` is a supported surface: adding an `[auth]`
 /// block by hand to a server that already has a stored bearer reaches it without passing either
 /// door. This is the point where the ambiguity would do harm, so it is resolved here, in favor of
@@ -537,9 +534,8 @@ fn bearer_for_transport(
     match (bearer, auth) {
         (Some(_), Some(_)) => {
             tracing::warn!(
-                "server '{server_name}' has both a stored bearer and an [auth] block; ignoring the bearer and \
-                 authenticating through the block. Run `meka mcp logout {server_name}` to drop the bearer, or \
-                 remove the [auth] block to use it"
+                "MCP server '{server_name}' has both a stored bearer and an `[auth]` block; using the \
+                 block. Run `meka mcp logout {server_name}` to drop the bearer"
             );
             None
         }
@@ -570,7 +566,7 @@ pub(super) async fn connect_server(
                     .as_deref()
                     .ok_or_else(|| MekaError::McpConnection {
                         server_name: server_name.to_string(),
-                        message: "stdio transport requires 'command' field".to_string(),
+                        message: "stdio transport requires `command`".to_string(),
                     })?;
 
             let args_vec: Vec<String> = config.args.clone().unwrap_or_default();
@@ -591,27 +587,16 @@ pub(super) async fn connect_server(
                 command.envs(env);
             }
 
-            // No bound on an incoming line, and rmcp 3.1 offers no way to set one here.
+            // No bound on an incoming line: rmcp 3.1's `TokioChildProcess` builds its transport
+            // with no seam to configure, and that transport's `receive` reads until newline into
+            // an unbounded `Vec` (`JsonRpcMessageCodec::max_length` applies to the write side
+            // only). Bounding it means spawning the child and building the transport here, which
+            // also means reimplementing the `ChildWithCleanup` drop guard that kills the child;
+            // getting that wrong is worse than the exposure, which is a buggy server the user chose
+            // to run rather than a hostile one. Revisit when rmcp exposes the read length.
             //
-            // `TokioChildProcess` builds an `AsyncRwTransport` internally with no seam to
-            // configure, and that transport's `receive` does its own `read_until(b'\n')` into an
-            // unbounded `Vec` -- it never consults `JsonRpcMessageCodec::max_length`, which is the
-            // only length knob the crate exposes and applies to the *write* side. So a stdio server
-            // that emits no newline grows one buffer until the process dies.
-            //
-            // Left as is deliberately. Bounding it means spawning the child and constructing the
-            // transport here, which also means reimplementing `ChildWithCleanup` -- the drop guard
-            // that kills the child rather than leaving a zombie. Getting that wrong is a worse
-            // failure than the one being fixed, and the exposure is narrow: a stdio server is a
-            // program the user configured and chose to run, already executing arbitrary code, so
-            // this bounds a *buggy* server rather than a hostile one. Revisit when rmcp exposes the
-            // read length.
-            //
-            // rmcp's `TokioChildProcess::new` leaves the child's stderr inherited, so an MCP server
-            // that logs to stderr (many `tracing`/`log`-based servers do) writes straight onto
-            // meka's terminal and corrupts the REPL display. Pipe it and drain it into our own
-            // tracing stream instead: quiet by default, visible under `-v` / `RUST_LOG`, and
-            // attributed to the server rather than mixed into the live prompt.
+            // Stderr is piped rather than inherited because an MCP server that logs to stderr
+            // would otherwise write straight onto meka's terminal and corrupt the REPL display.
             let (transport, stderr) = rmcp::transport::TokioChildProcess::builder(command)
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -643,12 +628,12 @@ pub(super) async fn connect_server(
                 .as_deref()
                 .ok_or_else(|| MekaError::McpConnection {
                     server_name: server_name.to_string(),
-                    message: "http transport requires 'url' field".to_string(),
+                    message: "http transport requires `url`".to_string(),
                 })?;
 
             // The server's static bearer, if it has one. Absent for a server that authenticates
             // through a flow instead, and absent when this host has no store at all (the mock
-            // harness), which is the same "send no Authorization header" as before.
+            // harness); either way no Authorization header is sent.
             let bearer = match token_store {
                 Some(store) => {
                     store

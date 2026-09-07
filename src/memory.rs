@@ -7,7 +7,7 @@
 //! and the motivating deployment is a single always-on session reachable over chat, where the agent
 //! is closer to a person than to a checkout.
 //!
-//! This module owns the vocabulary -- what a [`Memory`] is, what names and tags are legal, how an
+//! This module owns the vocabulary: what a [`Memory`] is, what names and tags are legal, how an
 //! age is rendered, and how a memory is written out for `meka memory export`. Storage and retrieval
 //! are [`crate::store::memory`], which is the source of truth.
 //!
@@ -30,7 +30,7 @@ use std::{
 
 // Re-exported rather than referenced through `crate::entry` at each use site: priority is part
 // of the memory store's public vocabulary (`meka memory add --priority`, the `memory_write`
-// schema), and the constants moved there only so `skills` could share the same scale.
+// schema), and the constants live there only so `skills` can share the same scale.
 pub(crate) use crate::entry::{
     DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY, normalize_description,
 };
@@ -81,7 +81,7 @@ pub(crate) struct Memory {
 ///
 /// Zero, not the 0-1 band `memory_write` calls "standing directives". For a standing rule the body
 /// *is* the rule, and leaving it behind a tool call the model may never make is the gap this
-/// closes -- but inlining two whole bands doubles the chance of blowing the budget and pushing the
+/// closes, but inlining two whole bands doubles the chance of blowing the budget and pushing the
 /// index itself out, so the always-in-context tier is deliberately the narrower one.
 pub(crate) const INLINE_BODY_PRIORITY_MAX: u8 = 0;
 
@@ -180,9 +180,8 @@ pub(crate) fn memory_file_in(root: &Path, name: &str) -> PathBuf {
 /// Validate that `name` is a safe prompt-embeddable memory identifier. See [`validate_entry_name`]
 /// for the rules.
 ///
-/// Still load-bearing after the move off the filesystem, for two reasons that outlived it: a name
-/// is what `meka memory export` turns into a file name, and it is text the model reads in every
-/// turn's index.
+/// Load-bearing for two reasons: a name is what `meka memory export` turns into a file name, and
+/// it is text the model reads in every turn's index.
 pub(crate) fn validate_memory_name(name: &str) -> Result<(), String> {
     validate_entry_name(name, "memory")
 }
@@ -205,9 +204,9 @@ pub(crate) fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
 
 /// The header an exported memory file carries.
 ///
-/// A struct rather than four positional arguments, mirroring the same simplification
-/// `render_skill_file` received: `render_memory("x", 5, None, &[], body)` is unreadable at the call
-/// site and silently accepts a swapped pair.
+/// A struct rather than four positional arguments, as `render_skill_file` takes:
+/// `render_memory("x", 5, None, &[], body)` is unreadable at the call site and silently accepts a
+/// swapped pair.
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryFrontmatter {
     pub(crate) description: String,
@@ -218,7 +217,7 @@ pub(crate) struct MemoryFrontmatter {
     /// How many times the memory has been read, emitted only when non-zero.
     ///
     /// Not content but usage: what the agent has *done* with the note. It rides along in an export
-    /// because it is the one value the rest of the file cannot reconstruct -- descriptions, bodies
+    /// because it is the one value the rest of the file cannot reconstruct: descriptions, bodies
     /// and dates are all there, but a store restored with every counter at zero has silently lost
     /// each memory's accumulated ranking weight. A reader that does not model the key ignores it,
     /// as it ignores any other it does not model.
@@ -238,10 +237,9 @@ pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> Stri
     out.push_str("---\n");
     // Only the characters YAML genuinely cannot carry are dropped. A C0 or C1 control inside a
     // double-quoted scalar is outside YAML's `c-printable` production, so an export holding one is
-    // a file no parser will read. `sanitize_stored_description` was used here at first and went
-    // further than that argument: it also strips the whole `Cf` category, so a Persian description
-    // came back a different word after a backup -- a read that sanitizes, written to a persistent
-    // store, which is the class this whole change closed for bodies.
+    // a file no parser will read. `sanitize_stored_description` would go further than that
+    // argument: it also strips the whole `Cf` category, so a Persian description would come back
+    // a different word after a backup, a read that sanitizes written to a persistent store.
     out.push_str(&format!(
         "description: {}\n",
         yaml_scalar(&normalize_description(&yaml_printable(
@@ -272,9 +270,9 @@ pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> Stri
         out.push_str(&format!("tags: [{}]\n", quoted.join(", ")));
     }
     // The body verbatim between one separator newline and one terminator newline, both added
-    // unconditionally. Trimming leading newlines and appending a terminator only when one was
-    // missing made the framing ambiguous, so a reader could not tell padding from content: a
-    // body of `b` came back `\nb`, and one ending `\r` came back ending `\r\n`. Adding exactly one
+    // unconditionally. Trimming leading newlines and appending a terminator only when one is
+    // missing makes the framing ambiguous, so a reader cannot tell padding from content: a body
+    // of `b` comes back `\nb`, and one ending `\r` comes back ending `\r\n`. Adding exactly one
     // of each, always, is what makes the round trip exact for every body including an empty one.
     out.push_str("---\n\n");
     out.push_str(body);
@@ -300,12 +298,12 @@ fn yaml_printable(text: &str) -> String {
 
 /// Whether a description will still say something by the time the model reads it.
 ///
-/// Every write door asked `trim().is_empty()`, which is a question about whitespace. Format
-/// characters -- zero-width spaces, joiners, bidi controls -- are not whitespace, so three of them
-/// passed as a description and then rendered as nothing: a blank cell in `meka memory list`, a
-/// blank line in `memory_search`, and `- **name** (p5, today): ` in the index the model reads every
-/// turn. [`render_description_for_model`] strips exactly that class at the render boundary, so
-/// asking it is asking the question the store actually has.
+/// `trim().is_empty()` is a question about whitespace. Format characters (zero-width spaces,
+/// joiners, bidi controls) are not whitespace, so three of them pass as a description and then
+/// render as nothing: a blank cell in `meka memory list`, a blank line in `memory_search`, and
+/// `- **name** (p5, today): ` in the index the model reads every turn.
+/// [`render_description_for_model`] strips exactly that class at the render boundary, so asking
+/// it is asking the question the store actually has.
 ///
 /// Distinct from [`description_survives_export`], which asks whether YAML can carry the text. A
 /// description can fail either check independently.
@@ -316,10 +314,9 @@ pub(crate) fn description_says_something(description: &str) -> bool {
 /// Whether a description would still say something once written to an export file.
 ///
 /// [`render_memory`] drops what YAML cannot carry, and a description made only of such characters
-/// becomes `description: ""` -- which reads back as no description at all,
-/// losing the memory through the one path that is supposed to preserve it. `meka memory export`
-/// asks this before it writes anything, and refuses the whole run rather than write a file that
-/// would come back empty.
+/// becomes `description: ""`, which reads back as no description at all, losing the memory through
+/// the one path that is supposed to preserve it. `meka memory export` asks this before it writes
+/// anything, and refuses the whole run rather than write a file that would come back empty.
 ///
 /// Distinct from [`description_says_something`], which asks whether the *model* would see anything.
 /// A description can fail either check independently: YAML carries a zero-width space fine, and the
@@ -348,7 +345,7 @@ pub(crate) fn export_memory(memory: &Memory) -> String {
 ///
 /// The store returns bytes (see `crate::store::memory::row_to_memory`), because `meka memory edit`
 /// round-trips a body through `$EDITOR` and a read that stripped characters would destroy them
-/// permanently. Neutralising therefore happens here, at each boundary where the text is *displayed*
+/// permanently. Neutralizing therefore happens here, at each boundary where the text is *displayed*
 /// rather than carried: the `[Memory]` index and its standing band, `memory_read`, both search
 /// renderers, a sub-agent's index, and the `meka memory` listing.
 ///

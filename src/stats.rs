@@ -20,6 +20,7 @@ pub(crate) struct Redaction {
     pub(crate) positions: Vec<crate::image::RedactedImage>,
 }
 
+/// A session's lifetime counters, updated by the agent as turns complete.
 #[derive(Debug, Default)]
 pub(crate) struct SessionStats {
     turns: AtomicU64,
@@ -65,7 +66,7 @@ impl SessionStats {
     /// Separate from [`Self::record_turn`] only because that also increments the turn counter, and
     /// a compaction is not a turn the user asked for. The tokens are real spend and belong in the
     /// totals regardless: compaction is the most expensive thing meka does without being asked,
-    /// and leaving it out made `/status` disagree with the provider's bill by exactly the amount
+    /// and leaving it out makes `/status` disagree with the provider's bill by exactly the amount
     /// the user would most want explained.
     pub(crate) fn record_untracked_tokens(&self, usage: &TokenUsage) {
         self.input_tokens.fetch_add(usage.input_tokens, Relaxed);
@@ -83,6 +84,7 @@ impl SessionStats {
         self.redacted_bytes.fetch_add(redaction.bytes, Relaxed);
     }
 
+    /// The counters as plain numbers, for display and for the store.
     pub(crate) fn snapshot(&self) -> SessionStatsSnapshot {
         SessionStatsSnapshot {
             turns: self.turns.load(Relaxed),
@@ -97,6 +99,7 @@ impl SessionStats {
     }
 }
 
+/// [`SessionStats`] at one instant, as the session row persists them.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionStatsSnapshot {
     pub(crate) turns: u64,
@@ -130,6 +133,7 @@ impl SessionStatsSnapshot {
     }
 }
 
+/// What one provider response reported spending.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct TokenUsage {
     pub(crate) input_tokens: u64,

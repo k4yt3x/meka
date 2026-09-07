@@ -279,7 +279,7 @@ from. The same two answers are ACP's **Always allow** / **Always deny** options 
 `allow_always` / `deny_always` outcomes.
 
 Only `y`, `yes`, `n`, `no`, `always`, `never` (any case) and a bare Enter mean anything. Anything
-else is not an answer, so meka says `Please answer y, n, always or never.` and asks again rather
+else is not an answer, so meka says `Answer y, n, always or never.` and asks again rather
 than guessing; after three unanswered attempts it denies. Ending the input (Ctrl+D, or a redirected
 stdin running out) also denies, since nobody is there to approve.
 
@@ -289,8 +289,8 @@ that was refused without asking: on stderr in the REPL and one-shot paths, in `n
 surfaces. Without it a run whose every gated call was refused reads as a model that chose not to
 use its tools.
 
-Ctrl+C does not dismiss the prompt: it cancels the turn, but the prompt is still waiting to be
-answered, and the next Enter answers it. Use `n` or Ctrl+D to get out of one.
+Ctrl+C at the prompt cancels the turn and withdraws the approval; meka says so, and the prompt
+line stays until the next Enter, which clears it rather than answering it.
 
 This is useful when you want the agent to be able to try things but want to review each action that
 goes beyond the level before it executes.

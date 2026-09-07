@@ -154,13 +154,9 @@ pub(crate) const SANDBOX_PROFILE_READONLY: &str = r#"
 
 ; Outbound BSD sockets (curl, http clients, etc.)
 ;
-; Outbound only. This carried `(allow network-bind (local ip "*:0"))` and the matching
-; `network-inbound`, vendored from Codex, and a current macOS rejects `"*:0"` outright:
-; `sandbox-exec: invalid port in network address`. That is a *parse* failure, so the whole profile
-; is refused and every read-level command exits 65 rather than running confined -- the level was
-; entirely broken on macOS, not merely narrowed. Dropped rather than respelled because the right
-; spelling cannot be confirmed without a macOS host, and because the read level's stated network need is
-; outbound (`curl http://x | pdftotext`); nothing in it binds a listening socket.
+; Outbound only. Codex's `(allow network-bind (local ip "*:0"))` and the matching `network-inbound`
+; are left out: a current macOS rejects `"*:0"` as a parse error, which refuses the whole profile,
+; and nothing at the read level binds a listening socket.
 (allow network-outbound)
 
 ; Services needed for hostname lookup, TLS trust evaluation, proxy config.
@@ -191,12 +187,9 @@ pub(crate) const SANDBOX_PROFILE_READONLY: &str = r#"
 /// quote or a backslash would otherwise either break the profile or, worse, change what it matches.
 /// A parameter is passed out of band and needs no quoting at all.
 ///
-/// Compiled on every platform, and gated only at the call site in `tools::shell`. Nothing in here
-/// touches a macOS API: it builds a string and a list of `OsString`s. Gating the function meant no
-/// local target compiled it and no test ran it, so the one piece of macOS logic meka could check
-/// anywhere was the one piece nothing checked. `sandbox-exec` itself stays macOS-only and stays
-/// genuinely unverified; this at least shrinks that to the exec call. Same `cfg_attr` shape as
-/// `POWERSHELL_UTF8_PRELUDE` above.
+/// Compiled on every platform, and gated only at the call site in `tools::shell`: nothing in here
+/// touches a macOS API, and gating the function would leave the one piece of macOS logic meka can
+/// check on any host unchecked. `sandbox-exec` itself stays macOS-only and unverified elsewhere.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(dead_code, reason = "called only on macOS; the tests run everywhere")

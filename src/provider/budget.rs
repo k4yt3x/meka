@@ -6,7 +6,7 @@
 //! Anthropic backends run this against a default ceiling, Anthropic's cap less headroom; the OpenAI
 //! backends run it only when the profile states one, because their endpoints' caps are the
 //! endpoints' own facts and meka will not guess at a number it would then send against. Without
-//! this on those backends, a window that had accumulated a few image reads shipped a body of tens
+//! this on those backends, a window that has accumulated a few image reads ships a body of tens
 //! of megabytes on every turn with nothing to say so.
 
 use std::borrow::Cow;
@@ -32,6 +32,7 @@ pub(super) fn redaction_target(max_request_bytes: usize) -> usize {
 
 pub(super) use crate::conversation::IMAGE_REDACTION_PLACEHOLDER;
 
+/// The request body as the bytes that go on the wire, which is what the budget measures.
 pub(super) fn serialize_body(body: &serde_json::Value) -> Result<String> {
     serde_json::to_string(body)
         .map_err(|error| MekaError::Provider(format!("failed to serialize body: {error}")))
@@ -150,24 +151,23 @@ where
     let body_json = build(redacted.as_ref())?;
 
     // `RequestTooLarge`, meka's own refusal: the request never left the process, so publishing it
-    // as a provider failure told a caller to look in the server log for a provider response that
-    // does not exist. Not `Provider` either, and for a reason the turn depends on: the refusal is
-    // deterministic on the body and about its newest content, since every older image was just
-    // redacted, which is exactly what the turn's degrade-and-retry exists to strip. As `Provider`
-    // it read as an outage, nothing was degraded, and the session stayed unusable until a rewind
-    // because every later request carried the same attachments.
+    // as a provider failure would tell a caller to look in the server log for a provider response
+    // that does not exist. Not `Provider` either, and for a reason the turn depends on: the
+    // refusal is deterministic on the body and about its newest content, since every older image
+    // was just redacted, which is exactly what the turn's degrade-and-retry exists to strip. As
+    // `Provider` it would read as an outage, nothing would be degraded, and the session would stay
+    // unusable until a rewind because every later request carries the same attachments.
     if body_json.len() > max_request_bytes {
         return Err(MekaError::RequestTooLarge(format!(
-            "request body is {} after redacting old tool-result images; this profile's ceiling is \
-             {} (`max_request_bytes`). Run /compact, remove large attachments from the most recent \
-             turn, or split the work across smaller turns.",
+            "request body is {} after redacting old tool-result images, over this profile's \
+             `max_request_bytes` of {}; run `/compact`",
             crate::text::format_size(body_json.len()),
             crate::text::format_size(max_request_bytes),
         )));
     }
 
     let notice_text = format!(
-        "Redacted {} old image{} (~{} freed); recorded, so later requests send the same body.",
+        "Redacted {} old image{} (~{} freed).",
         stats.images_redacted,
         if stats.images_redacted == 1 { "" } else { "s" },
         crate::text::format_size(stats.bytes_freed),

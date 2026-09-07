@@ -86,10 +86,9 @@ impl AuthRegistry {
     }
 
     /// Constant-time lookup. Iterates every configured token even on early match so a timing
-    /// observer can't distinguish "matched index 0" from "matched index N" (or "no match"). The
-    /// catch: with N tokens configured and constant-time compare, each request costs
-    /// `O(N * token_length)` work. That's fine for realistic deployments (a handful of tokens);
-    /// if you ever want hundreds, switch to a salted-hash lookup table.
+    /// observer cannot distinguish "matched index 0" from "matched index N" (or "no match"). Each
+    /// request therefore costs `O(N * token_length)`, which is fine for the handful of tokens a
+    /// deployment configures.
     pub(crate) fn lookup(&self, presented: &str) -> Option<Principal> {
         let presented = presented.as_bytes();
         let mut matched: Option<&Principal> = None;
@@ -177,10 +176,8 @@ fn extract_bearer(headers: &HeaderMap) -> Result<String, ProblemDetail> {
             "Authorization header is not a valid ASCII string",
         )
     })?;
-    // RFC 7235 §2.1 says the auth-scheme is case-insensitive ("Bearer" / "bearer" / "BEARER" all
-    // match). The scheme name must be followed by at least one whitespace character before the
-    // token. We accept any leading whitespace before the scheme too; clients shouldn't send it,
-    // but tolerating it is the kind thing.
+    // RFC 7235 §2.1 says the auth-scheme is case-insensitive and must be followed by at least one
+    // whitespace character before the token. Leading whitespace before the scheme is tolerated.
     let trimmed = value.trim_start();
     let token = trimmed
         .get(..6)

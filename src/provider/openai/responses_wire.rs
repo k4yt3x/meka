@@ -9,8 +9,8 @@
 //! Nothing here may assume which endpoint is on the other end. `store: false` is set
 //! unconditionally because meka replays the whole conversation every turn and never uses
 //! server-side state, which also happens to be all the stateless implementations (Ollama, vLLM)
-//! support. Anything that *is* endpoint-specific -- the encrypted-reasoning `include`, auth
-//! headers, the URL -- belongs to the backend, not here.
+//! support. Anything that *is* endpoint-specific (the encrypted-reasoning `include`, auth
+//! headers, the URL) belongs to the backend, not here.
 //!
 //! The on-the-wire request shape is documented at
 //! <https://platform.openai.com/docs/guides/function-calling?api-mode=responses>. Verified against
@@ -37,8 +37,8 @@ use crate::{
 /// `function_call_output`).
 ///
 /// The result carries only what every Responses implementation understands. A backend that knows
-/// more about its own endpoint adds to it afterwards -- see
-/// [`include_encrypted_reasoning`], which only `chatgpt-subscription` applies.
+/// more about its own endpoint adds to it afterwards; see [`include_encrypted_reasoning`], which
+/// only `chatgpt-subscription` applies.
 pub(super) fn build_request_body(
     model: &str,
     system_prompt: &str,
@@ -128,7 +128,7 @@ pub(super) fn include_encrypted_reasoning(body: &mut serde_json::Value) {
 /// The encoder is protocol-level and replays sealed reasoning for any backend, which is right for
 /// the protocol and wrong for one endpoint: `openai-responses` never asks for encrypted reasoning,
 /// so the only way its history holds any is a session recorded under `chatgpt-subscription` and
-/// resumed against a `base_url` -- Ollama, vLLM, LM Studio, OpenRouter. Replaying it there ships
+/// resumed against a `base_url` (Ollama, vLLM, LM Studio, OpenRouter). Replaying it there ships
 /// ChatGPT's sealed blob and `rs_...` id to a third party that cannot decrypt it and may reject the
 /// item shape outright.
 ///
@@ -162,15 +162,13 @@ pub(super) fn request_reasoning_summary(body: &mut serde_json::Value) {
 }
 
 /// Build the `output` field of a `function_call_output` item from a slice of `ToolResultContent`.
-/// The Responses API accepts either a plain string OR an array of `input_text` / `input_image` /
+/// The Responses API accepts either a plain string or an array of `input_text` / `input_image` /
 /// `input_file` content items (per OpenAI's docs: "For functions that return images or files, you
-/// can pass an array of image or file objects instead of a string."). We emit the array form when
-/// at least one image is present to preserve image data; otherwise we collapse to a string for the
-/// simpler wire shape.
+/// can pass an array of image or file objects instead of a string."). The array form is emitted
+/// when at least one image is present, to preserve it; otherwise the simpler string.
 ///
-/// Sent unconditionally. Non-vision models will return a clear API error rather than us trying to
-/// detect model capabilities client-side. Mirrors our Claude path, which also sends images without
-/// a model gate.
+/// Sent unconditionally: a non-vision model returns a clear API error, which beats guessing at
+/// model capabilities client-side. The Claude path also sends images without a model gate.
 fn build_tool_result_output(content: &[ToolResultContent]) -> serde_json::Value {
     let has_image = content
         .iter()
@@ -260,8 +258,7 @@ fn encode_user_message(message: &Message, input: &mut Vec<serde_json::Value>) {
 /// Order is load-bearing here in a way it is not for the user encoder. A `reasoning` item must be
 /// followed by the output that reasoning produced, or the API rejects the whole request: `Item
 /// '<id>' of type 'reasoning' was provided without its required following item`. Emitting all the
-/// text first and then all the calls, as this did before reasoning was replayed at all, breaks that
-/// pairing as soon as a turn thinks twice.
+/// text first and then all the calls breaks that pairing as soon as a turn thinks twice.
 fn encode_assistant_message(message: &Message, input: &mut Vec<serde_json::Value>) {
     let mut pending_text = String::new();
 
@@ -329,7 +326,7 @@ fn flush_assistant_text(pending: &mut String, input: &mut Vec<serde_json::Value>
 /// but keeps its thinking, and a rewind can cut anywhere.
 ///
 /// Only output counts, so a run of reasoning items is carried by whatever follows the run rather
-/// than by each other -- which is the order the server produced them in, and so the order they may
+/// than by each other, which is the order the server produced them in, and so the order they may
 /// be replayed in. What this refuses is a turn that ends in reasoning with no output at all.
 fn an_emitted_item_follows(content: &[ContentBlock], index: usize) -> bool {
     content.iter().skip(index + 1).any(|block| match block {
@@ -382,8 +379,8 @@ fn encode_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
 }
 
 /// Mutable state threaded through SSE event processing. Tracks the in-flight tool call's
-/// accumulated arguments so we can return a parsed `ToolUseEnd` even if the server elides the final
-/// `arguments` field.
+/// accumulated arguments so a parsed `ToolUseEnd` can be returned even if the server elides the
+/// final `arguments` field.
 #[derive(Default)]
 pub(super) struct SseState {
     active_tool_call: Option<ActiveToolCall>,
@@ -402,23 +399,23 @@ struct ActiveToolCall {
     arguments_buffer: String,
 }
 
-/// Pure SSE-event handler. Inspects the named event + parsed JSON payload, updates `state`, and
-/// returns the meka-level [`StreamEvent`]s to forward to the agent. Returns `Err` when the server
-/// reports a fatal stream error; the driver propagates this back to the caller.
 /// Which Responses frame this is: the payload's `type`, falling back to the SSE `event:` line.
 ///
 /// The payload field is the spec's discriminator and is always present; the `event:` line is an
-/// optional convenience only some servers set. Reading the event name alone worked while ChatGPT
-/// and OpenAI -- which send both -- were the only endpoints meka reached, and broke the moment an
-/// API-key backend could point anywhere: OpenRouter streams bare `data:` frames, so every frame
-/// looked unhandled and a perfectly good turn died with "stream ended before a terminal response
-/// event". The fallback keeps working for any server that names the event but omits `type`.
+/// optional convenience only some servers set. ChatGPT and OpenAI send both, but an API-key
+/// backend can point anywhere, and OpenRouter streams bare `data:` frames: read from the event
+/// name alone, every one of its frames looks unhandled and a perfectly good turn dies with "stream
+/// ended before a terminal response event". The fallback keeps working for any server that names
+/// the event but omits `type`.
 fn frame_name<'a>(data: &'a serde_json::Value, event_name: &'a str) -> &'a str {
     data.get("type")
         .and_then(|value| value.as_str())
         .unwrap_or(event_name)
 }
 
+/// Pure SSE-event handler. Inspects the named event and parsed JSON payload, updates `state`, and
+/// returns the meka-level [`StreamEvent`]s to forward to the agent. Returns `Err` when the server
+/// reports a fatal stream error; the driver propagates this back to the caller.
 pub(super) fn process_event(
     event_name: &str,
     data: &serde_json::Value,
@@ -508,7 +505,7 @@ pub(super) fn process_event(
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
                     .to_string();
-                // Prefer the final `arguments` string from the item over our accumulated buffer;
+                // The final `arguments` string from the item wins over the accumulated buffer;
                 // the server may normalize it.
                 let arguments_str = item
                     .get("arguments")
@@ -531,10 +528,10 @@ pub(super) fn process_event(
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 // Deliberately not gated on that. `encrypted_content` is what the next request
-                // replays, and it arrives whether or not summaries were requested -- so gating its
-                // capture on visible text silently threw the reasoning chain away for exactly the
-                // configuration that asked for it. An item with neither is worth nothing to either
-                // the reader or the next turn, so it makes no block.
+                // replays, and it arrives whether or not summaries were requested, so gating its
+                // capture on visible text would silently throw the reasoning chain away for
+                // exactly the configuration that asked for it. An item with neither is worth
+                // nothing to either the reader or the next turn, so it makes no block.
                 if showed_its_reasoning || encrypted_content.is_some() {
                     let id = item
                         .get("id")
@@ -597,8 +594,8 @@ pub(super) fn process_event(
         }
 
         // The stream's own top-level error frame, distinct from `response.failed`: the request
-        // died rather than the response. Unhandled, it fell into the catch-all and the turn was
-        // reported as a stream that ended early, retried twice against an error that repeats.
+        // died rather than the response. Unhandled, it would fall into the catch-all and the turn
+        // be reported as a stream that ended early, retried twice against an error that repeats.
         "error" => {
             state.finished = true;
             return Err(crate::error::provider_stream_error_object(
@@ -618,7 +615,7 @@ pub(super) fn process_event(
             // The output cap is a stop reason, not a failure: the two sibling protocols report it
             // as `MaxTokens` and commit the message, and the agent labels the turn so the user
             // sees a truncated answer rather than an error. Reported as an error, a
-            // `max_output_tokens` profile lost every answer that reached it, whole on the blocking
+            // `max_output_tokens` profile loses every answer that reaches it, whole on the blocking
             // path. Anything else (a content filter, an unknown reason) is deterministic on the
             // request and ends the turn; never retryable.
             if reason == "max_output_tokens" {
@@ -673,8 +670,11 @@ fn parse_response_status(status: &str) -> StopReason {
 /// request is authenticated, and whether a rejected credential can be refreshed for one more try.
 #[async_trait::async_trait]
 pub(super) trait ResponsesBackend: crate::oauth::RefreshesCredential + Send + Sync {
+    /// The HTTP client every request goes through.
     fn client(&self) -> &reqwest::Client;
+    /// The URL a completion is posted to.
     fn endpoint(&self) -> String;
+    /// The request body for one completion, before serialization.
     fn request_body(
         &self,
         system_prompt: &str,
@@ -800,10 +800,10 @@ pub(super) async fn drive_responses_sse_stream(
     {
         End::Finished | End::ReceiverGone => Ok(()),
         // The stream ended without `response.completed`, `response.failed` or
-        // `response.incomplete`. Falling through here committed a truncated turn as a complete one:
-        // the agent saw whatever text had arrived, wrote it to the conversation, and moved on, with
-        // the retry path never consulted. A connection cut mid-response is exactly what that path
-        // exists for.
+        // `response.incomplete`. Falling through here would commit a truncated turn as a complete
+        // one: the agent would see whatever text had arrived, write it to the conversation, and
+        // move on, with the retry path never consulted. A connection cut mid-response is exactly
+        // what that path exists for.
         End::Ended => Err(crate::provider::sse::stream_error(
             &event_sender,
             "the Responses stream ended before a terminal response event".to_string(),

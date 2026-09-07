@@ -35,8 +35,7 @@ pub(crate) static INTERRUPT_RELAY: std::sync::LazyLock<InterruptRelay> =
     });
 /// Grace given to background tasks on the press that leaves. Long enough for a child to die and its
 /// row to be written, short enough that a user who has pressed Ctrl+C three times is not made to
-/// wait: the alternative was `exit` on the spot, which orphaned the process group and left the row
-/// reading `running` forever -- the exact loss the REPL's own exit drain was added to prevent.
+/// wait: `exit` on the spot orphans the process group and leaves the row reading `running`.
 pub(crate) const INTERRUPT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// What the nth Ctrl+C means.
 ///
@@ -172,6 +171,11 @@ pub(crate) fn reset_interrupt_escalation() {
         .store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Run a `/compact` with Ctrl+C wired to a fresh cancellation token.
+///
+/// Compaction is not a turn, but it makes provider calls and can block on an approval prompt, so
+/// it needs a signal source for the reason [`run_turn_interruptible`] gives: a bare token silently
+/// swallows Ctrl+C.
 pub(crate) async fn compact_interruptible(
     cancel: &crate::host::CancelCell,
     admission: crate::host::Admission,
@@ -296,23 +300,14 @@ pub(crate) fn close_console_episode(console: &std::sync::Mutex<crate::console::C
 /// Closes the run's last episode however its host leaves, on the failing paths as much as the
 /// ordinary one.
 ///
-/// Exactly one of those paths has anything to close today: `repl_handle.await?`, which returns only
-/// on a `JoinError` and so means the REPL thread panicked, possibly mid-wake with the prompt it
-/// broke out of still drawn and a partial answer still buffered. Every other early exit either
-/// streams nothing or reports through `console.error`, which flushes and settles the row on its way
-/// past, leaving this nothing to do. So it is insurance against the next exit that streams before
-/// it fails, put where those paths converge rather than at each of them, because a close written at
-/// a door is a close the next `return Err` forgets.
+/// A `Drop` where the early exits converge rather than a close at each of them, because a close
+/// written at a door is a close the next `return Err` forgets. The path that needs it today is
+/// `repl_handle.await?`, which returns only when the REPL thread panicked, possibly mid-wake with
+/// the prompt it broke out of still drawn and a partial answer still buffered.
 ///
-/// Nothing proves it is installed. Delete either construction and the whole suite stays green,
-/// because reaching that one live path needs a REPL thread made to panic behind a terminal;
-/// `the_last_episode_closes_however_the_host_leaves` pins the `Drop` and not the two call sites.
-///
-/// Closing twice is closing once, so this composes with rather than replaces the explicit closes.
-/// Three of the four have to stay where they are: ahead of the session lock being released, after
-/// the shutdown notice, and ahead of everything a one-shot run still prints once its turn is over.
-/// Only the one on `run_oneshot`'s failing arm is this guard's job now, and it is kept because it
-/// says at the site what the guard says at a distance.
+/// Closing twice is closing once, so this composes with the explicit closes rather than replacing
+/// them: those sit ahead of the session lock being released, after the shutdown notice, and ahead
+/// of everything a one-shot run still prints once its turn is over.
 pub(crate) struct LastEpisode(pub(crate) Arc<std::sync::Mutex<crate::console::Console>>);
 impl Drop for LastEpisode {
     fn drop(&mut self) {

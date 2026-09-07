@@ -121,14 +121,12 @@ async fn refuse_subagent_session(
     };
     let detail = match terms.parent {
         Some(parent) => format!(
-            "session '{session_id}' is a sub-agent of '{parent}', and its approval prompts are \
-             parked on that session. Answer them at \
-             `POST /v1/sessions/{parent}/responses/{{request_id}}` instead."
+            "session '{session_id}' is a sub-agent of '{parent}'; answer its prompts at \
+             `POST /v1/sessions/{parent}/responses/{{request_id}}`"
         ),
         None => format!(
-            "session '{session_id}' carries the terms another session spawned it under, so it is \
-             a sub-agent's conversation and never has a prompt of its own to answer. Its parent \
-             is not in this store."
+            "session '{session_id}' is a sub-agent whose parent is not in this store, so it has no \
+             prompt of its own to answer"
         ),
     };
     Ok(Some(

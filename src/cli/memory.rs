@@ -192,7 +192,7 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
     }
     if store.get(args.name).await?.is_some() && !args.force {
         return Err(MekaError::Config(format!(
-            "memory '{}' already exists; pass --force to overwrite",
+            "memory '{}' already exists; pass `--force` to overwrite",
             args.name
         )));
     }
@@ -200,7 +200,7 @@ pub(crate) async fn run_add(store: &MemoryStore, args: AddArgs<'_>) -> Result<()
     let body = match (args.body, args.from_file) {
         (Some(_), Some(_)) => {
             return Err(MekaError::Config(
-                "pass either --body or --from-file, not both".to_string(),
+                "`--body` cannot be combined with `--from-file`".to_string(),
             ));
         }
         (Some(body), None) => Some(body.to_string()),
@@ -295,15 +295,13 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
         }
     };
     if edited == original {
-        // The body is unchanged, which is not a failure -- but the *directory* may still hold work.
+        // The body is unchanged, which is not a failure, but the *directory* may still hold work:
         // `:saveas other.md` then `:wq` writes the buffer beside the scratch file and leaves the
-        // scratch file exactly as found, so this branch is reached with the user's writing sitting
-        // right there. It discarded unconditionally, which deleted that writing and exited 0 with
-        // nothing said. Measured through the real binary.
+        // scratch file exactly as found.
         match unstored_work(&directory, &scratch, &original) {
             Some(kept) => tracing::warn!(
-                "memory '{name}' is unchanged, but your editor left something else in {kept}; \
-                 that file is not a memory and nothing has read it",
+                "memory '{name}' is unchanged; your editor left other files in {kept}, which \
+                 nothing has read",
                 kept = kept.display()
             ),
             None => {
@@ -315,16 +313,12 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
     }
 
     // The body alone, through a door that names one column, and only if the stored text is still
-    // the text the editor was handed. Going through `write` would send back the description read
-    // *before* the editor opened, so a body edit reverted whatever the agent changed while the user
-    // was typing; naming one column fixed that for every column except the one being written, and
-    // the body stayed an unlocked read-modify-write across a window as long as the editing session.
-    // Measured: the agent's write vanished under the human's, both reporting success.
+    // the text the editor was handed: `write` would send back the description read before the
+    // editor opened, and an unconditional body write would overwrite whatever the agent wrote while
+    // the user was typing, both reporting success.
     //
-    // The scratch directory is removed *after* this, not before. Removing it first meant a refused
-    // save destroyed the only copy of what the user had just typed: `edit_in` waits for the editor
-    // to exit, so there is no buffer to recover from, and the refusal that was supposed to be the
-    // safe answer lost ten minutes of someone's writing instead of one agent write.
+    // The scratch directory is removed *after* this, not before: `edit_in` waits for the editor to
+    // exit, so on a refused save the scratch file is the only copy of what the user typed.
     match store.write_body(&entry.name, &original, edited).await {
         Ok(crate::store::memory::BodyWrite::Saved) => {
             discard_scratch(&directory);
@@ -344,8 +338,8 @@ pub(crate) async fn run_edit(store: &MemoryStore, name: &str) -> Result<()> {
             &scratch,
             &original,
             format!(
-                "memory '{name}' was rewritten while the editor was open, so saving would have \
-                 discarded that. `meka memory show {name}` prints the current body"
+                "memory '{name}' was rewritten while the editor was open; `meka memory show {name}` \
+                 prints the current body"
             ),
         )),
         Err(error) => Err(unsaved_edit(
@@ -369,20 +363,16 @@ fn discard_scratch(directory: &Path) {
 
 /// Report a failure that leaves edited text unsaved, naming where that text is.
 ///
-/// The scratch directory is deliberately kept when it holds writing the store does not have.
-/// Removing it on every failure is right for the privacy of a note nobody edited and wrong for
-/// everything else: a save refused because the memory moved underneath would destroy the user's
-/// work outright, and tell them to "re-apply your change" to text that exists nowhere.
-/// Keeping a 0600 file in a 0700 directory is the same protection it had while the editor was open,
-/// and naming it is what stops that from being a copy left in `/tmp` quietly.
+/// The scratch directory is kept when it holds writing the store does not have: removing it on
+/// every failure is right for the privacy of a note nobody edited and wrong for a save refused
+/// because the memory moved underneath, where the scratch file is the only copy of the user's work.
+/// A 0600 file in a 0700 directory is the protection it had while the editor was open, and naming
+/// it is what stops it being a copy quietly left in `/tmp`.
 ///
-/// The decision is made on the **directory's contents against `original`**, not on whether the
-/// scratch file exists. Both simpler tests were wrong in opposite directions. `edit_in` writes the
-/// scratch file *before* launching the editor, so "the file exists" is true even when `$EDITOR` was
-/// a typo or the user quit with `:cq` -- which left a permanent plaintext copy of a private note in
-/// `/tmp` and claimed an edit had been lost that was never made. And an editor told to `:saveas`
-/// under another name leaves the user's hour of work in the directory with the scratch file gone,
-/// which "the file exists" reads as nothing to keep and deletes.
+/// Decided on the directory's contents against `original`, not on whether the scratch file exists:
+/// `edit_in` writes the scratch file before launching the editor, so it exists even when `$EDITOR`
+/// was a typo or the user quit with `:cq`, and an editor told to `:saveas` under another name
+/// leaves the work in the directory with the scratch file gone.
 fn unsaved_edit(directory: &Path, scratch: &Path, original: &str, reason: String) -> MekaError {
     let Some(kept) = unstored_work(directory, scratch, original) else {
         discard_scratch(directory);
@@ -405,9 +395,8 @@ fn unsaved_edit(directory: &Path, scratch: &Path, original: &str, reason: String
 /// - **Anything that cannot be read counts as worth keeping**, including a directory this function
 ///   cannot enumerate. This is the last chance to preserve the text, and falling through to
 ///   "nothing to keep" is the one direction that cannot be undone.
-/// - **Only regular files are read.** `read_to_string` on a FIFO blocks for ever -- `meka memory
-///   edit` hung until it was killed -- and on a 2 GB file it reads the lot into memory, measured at
-///   1.9 GB resident. Anything that is not a plain file is kept without being read.
+/// - **Only regular files are read.** `read_to_string` on a FIFO blocks forever, and on a 2 GB file
+///   it reads the lot into memory. Anything that is not a plain file is kept without being read.
 /// - **The length is checked before the contents.** A file of a different length cannot equal the
 ///   stored body, which skips the read for every real edit.
 fn unstored_work(directory: &Path, scratch: &Path, original: &str) -> Option<PathBuf> {
@@ -432,8 +421,8 @@ fn unstored_work(directory: &Path, scratch: &Path, original: &str) -> Option<Pat
     match differing.as_slice() {
         [] => None,
         // The scratch file and nothing else: name the file. Anything else means the work is
-        // somewhere the user chose, so name the directory -- naming the scratch file then sent them
-        // to the one file that does *not* hold what they wrote.
+        // somewhere the user chose, so name the directory; the scratch file is then the one file
+        // that does *not* hold what they wrote.
         [only] if only == scratch => Some(scratch.to_path_buf()),
         _ => Some(directory.to_path_buf()),
     }
@@ -455,13 +444,8 @@ fn reason_of(error: MekaError) -> String {
 /// Split out so [`run_edit`] decides what happens to the scratch directory, which depends on
 /// whether the text in it made it to the store.
 fn edit_in(scratch: &Path, original: &str) -> Result<String> {
-    let mut command = crate::entry::editor_command(scratch).ok_or_else(|| {
-        MekaError::Config(
-            "set $EDITOR or $VISUAL to edit a memory body, or use `meka memory add <name> --force \
-             --body ...`"
-                .to_string(),
-        )
-    })?;
+    let mut command = crate::entry::editor_command(scratch)
+        .ok_or_else(|| MekaError::Config("no editor: set `$VISUAL` or `$EDITOR`".to_string()))?;
     // 0600, and `create_new` so an existing path is never written through. See the directory mode
     // in `run_edit`: this is somebody's note landing in a world-readable `/tmp`.
     let mut options = std::fs::OpenOptions::new();
@@ -496,7 +480,7 @@ pub(crate) async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
     // written is what left a row nothing meka ships could remove.
     memory::validate_memory_lookup(name).map_err(MekaError::Config)?;
     if !store.delete(name).await? {
-        return Err(MekaError::Config(format!("memory '{name}' not found")));
+        return Err(MekaError::Config(format!("no memory named '{name}'")));
     }
     tracing::info!("removed memory '{name}'");
     Ok(())
@@ -513,7 +497,7 @@ pub(crate) async fn run_remove(store: &MemoryStore, name: &str) -> Result<()> {
 pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<()> {
     let memories = store.export_all().await?;
     if memories.is_empty() {
-        crate::streams::write_stderr_line("No memories saved; nothing to export.");
+        crate::streams::write_stderr_line("No memories to export.");
         return Ok(());
     }
 
@@ -522,8 +506,7 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
         Ok(mut entries) => {
             if entries.next().is_some() {
                 return Err(MekaError::Config(format!(
-                    "{} is not empty; an export is a snapshot, so point --dir at a new or empty \
-                     directory",
+                    "{} is not empty; point `--dir` at a new or empty directory",
                     directory.display()
                 )));
             }
@@ -539,25 +522,23 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
     }
 
     // Every memory checked before a single file is written, both for a name a filesystem cannot
-    // take and for a description the file cannot carry. This is the one place a name becomes a
-    // path, and a row can carry one meka's own write doors would have refused: anything writing
-    // straight to the column can land a `nul.md` or a `-old.md`. Validating inside the loop
-    // half-wrote the export and then aborted, and the retry hit "directory is not empty", which
-    // names neither the cause nor the remedy.
+    // take and for a description the file cannot carry: this is the one place a name becomes a
+    // path, and a row can carry one meka's own write doors would have refused, since anything
+    // writing straight to the column can land a `nul.md` or a `-old.md`.
     let unusable: Vec<String> = memories
         .iter()
         .filter_map(|memory| {
             if let Err(reason) = memory::validate_memory_name(&memory.name) {
                 return Some(format!("{} ({})", memory.name, reason));
             }
-            // A description of nothing but control characters survives the write door -- they are
-            // not whitespace, so `trim().is_empty()` says it is a description -- and leaves the
-            // file with `description: ""`, which reads back as having none. That is a memory lost
+            // A description of nothing but control characters survives the write door (they are
+            // not whitespace, so `trim().is_empty()` says it is a description) and leaves the file
+            // with `description: ""`, which reads back as having none. That is a memory lost
             // through a backup, so the export refuses instead.
             if !memory::description_survives_export(&memory.description) {
                 return Some(format!(
-                    "{} (its description is made only of characters YAML cannot carry, so the \
-                     file would have none and it would not read back)",
+                    "{} (its description has no character YAML can carry, so it would not read \
+                     back)",
                     memory.name
                 ));
             }
@@ -566,13 +547,12 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
         .collect();
     if !unusable.is_empty() {
         return Err(MekaError::Config(format!(
-            "nothing exported: {} memor{} cannot be written out ({}). A bad description is fixable \
-             with `meka memory add <name> --force --description ...`; a bad name is not, so remove \
-             {} with `meka memory remove <name>`.",
+            "nothing exported: {} memor{} cannot be written out ({}); fix a description with \
+             `meka memory add <name> --force --description <text>` and remove a bad name with \
+             `meka memory remove <name>`",
             unusable.len(),
             if unusable.len() == 1 { "y" } else { "ies" },
             unusable.join(", "),
-            if unusable.len() == 1 { "it" } else { "them" },
         )));
     }
 
@@ -584,35 +564,30 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
         create_private_export_dir(directory)?;
     }
 
-    // Through `write_file_atomic`, for the two properties `std::fs::write` does not have. It
-    // creates the file at 0600 inside a 0700 directory: an export is somebody's private notes, the
-    // database it came from is 0600, and at the default umask this wrote the lot at 0644 for every
-    // local user to read. And it `fsync`s before renaming into place, so "exported N memories"
-    // survives a power loss -- which for the one command whose whole job is to be a backup is not a
-    // detail.
+    // Through `write_file_atomic`, for two properties `std::fs::write` lacks: the file is created
+    // at 0600 inside a 0700 directory, as private as the database it came from, and it `fsync`s
+    // before renaming into place, so "exported N memories" survives a power loss.
     //
-    // It also tightens an *existing* target directory to 0700. Deliberate, and documented in the
-    // memory guide rather than left to be discovered: the directory has to be empty for the export
-    // to start, so nothing else of the user's lives there, and the alternative is publishing the
-    // contents of a 0600 database.
+    // It also tightens an *existing* target directory to 0700, which the memory guide documents:
+    // the directory has to be empty for the export to start, so nothing else of the user's lives
+    // there.
     let mut written: Vec<PathBuf> = Vec::with_capacity(memories.len());
     for memory in &memories {
         let path = memory::memory_file_in(directory, &memory.name);
         if let Err(error) = crate::fs::write_file_atomic(&path, &memory::export_memory(memory)) {
-            // A truncated export is worse than none: it is a syntactically valid store that
-            // restores a fraction of the memories and reports success, and the retry answers "is
-            // not empty" rather than naming the cause. Measured at 3,719 of 20,001 files left
-            // behind when the directory filled up.
+            // A truncated export is worse than none: it is a valid store that restores a fraction
+            // of the memories and reports success, and the retry answers "is not empty" rather
+            // than naming the cause.
             let remaining = remove_partial_export(&written, directory, created_directory);
             return Err(MekaError::Config(format!(
-                "failed to write {}: {}. Nothing was exported{}.",
+                "failed to write {}: {}; nothing was exported{}",
                 path.display(),
                 error,
                 match (written.len(), remaining) {
                     (0, _) => String::new(),
-                    (_, 0) => "; the files already written were removed".to_string(),
+                    (_, 0) => " and the files already written were removed".to_string(),
                     (total, remaining) => format!(
-                        "; removing {remaining} of the {total} files already written failed, so \
+                        ", but removing {remaining} of the {total} files already written failed; \
                          clear {} before retrying",
                         directory.display()
                     ),
@@ -634,13 +609,10 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
 /// `create_dir_all` followed by a `chmod` would leave the directory world-readable for the window
 /// in between, which is the whole of the export for a fast enough reader.
 ///
-/// **The leaf is created non-recursively**, so `AlreadyExists` still means something. Creating it
-/// recursively made `create_dir_all` succeed on a directory another export had just made, so two
-/// runs into the same new path both believed they owned it: they interleaved their files into one
-/// directory holding a merge of two stores, and when either failed its cleanup unlinked the other's
-/// files and reported "Nothing was exported" while the other reported success. Measured at 3 of 25
-/// races. Parents are still created recursively -- the race that matters is over the leaf, which is
-/// the directory this function's caller will later delete.
+/// The leaf is created non-recursively, so `AlreadyExists` still means something: two exports into
+/// the same new path would otherwise both believe they owned it, interleave their files, and let
+/// either one's cleanup unlink the other's. Parents are still created recursively, because the
+/// race that matters is over the leaf, which is the directory the caller may later delete.
 fn create_private_export_dir(directory: &Path) -> Result<()> {
     // `mut` earns its keep only where the mode is set; elsewhere the binding is never written.
     #[cfg_attr(not(unix), allow(unused_mut))]
@@ -668,8 +640,7 @@ fn create_private_export_dir(directory: &Path) -> Result<()> {
     builder.create(directory).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             return MekaError::Config(format!(
-                "{} exists after all; something created it while this export was starting, so \
-                 point --dir somewhere else",
+                "{} was created while this export was starting; point `--dir` somewhere else",
                 directory.display()
             ));
         }
@@ -710,9 +681,8 @@ fn remove_partial_export(written: &[PathBuf], directory: &Path, created_director
 
 /// `meka memory verify [--rebuild]`: check the search index against the table, and repair it.
 ///
-/// The index is derived and disposable, but a desync is silent by nature, so the check has to be
-/// reachable without a raw `sqlite3` incantation. A desync is silent by nature -- searches simply
-/// stop finding things -- so the check has to be reachable.
+/// The index is derived and disposable, but a desync is silent by nature (searches simply stop
+/// finding things), so the check has to be reachable without a raw `sqlite3` incantation.
 pub(crate) async fn run_verify(store: &MemoryStore, rebuild: bool) -> Result<()> {
     if rebuild {
         store.rebuild_index().await?;
@@ -729,15 +699,13 @@ pub(crate) async fn run_verify(store: &MemoryStore, rebuild: bool) -> Result<()>
             // leaves the structure sound and the counts equal. Claiming a guarantee the check
             // does not give is the failure this whole subsystem is written against.
             tracing::info!(
-                "the memory search index is structurally sound and holds every stored memory; a \
-                 document changed while its trigger was not firing is not detectable, so rebuild \
-                 if search is missing something you know is there"
+                "the memory search index is sound and holds every stored memory; a stale entry is \
+                 not detectable, so pass `--rebuild` if search misses a note you know is there"
             );
             Ok(())
         }
         Err(error) => Err(MekaError::Config(format!(
-            "{error}. Run `meka memory verify --rebuild` to regenerate it from the store; no \
-             memory is lost either way, because the index is derived."
+            "{error}; regenerate it with `meka memory verify --rebuild`"
         ))),
     }
 }
@@ -751,7 +719,7 @@ async fn require_memory(store: &MemoryStore, name: &str) -> Result<memory::Memor
     store
         .get(name)
         .await?
-        .ok_or_else(|| MekaError::Config(format!("memory '{name}' not found")))
+        .ok_or_else(|| MekaError::Config(format!("no memory named '{name}'")))
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -883,7 +851,7 @@ mod tests {
     /// The CLI stores a one-line description, as the other two write doors do.
     ///
     /// `PUT /v1/memory` normalized and this did not, so a description written here kept its
-    /// newlines -- and `meka memory export` normalizes on the way out, which made the round trip
+    /// newlines, and `meka memory export` normalizes on the way out, which made the round trip
     /// change the stored text for the door most likely to be handed a multi-line shell string.
     #[tokio::test]
     async fn add_stores_a_one_line_description() {
@@ -1011,11 +979,11 @@ mod tests {
     /// `$VISUAL` is cleared as well as set, because `crate::entry::editor_command` prefers it: a
     /// developer with `VISUAL=nvim` exported ran these tests against their own editor, which failed
     /// the assertions or blocked on an interactive process. And the restore is in `Drop` rather
-    /// than at the end of the test body, because `tokio::sync::Mutex` does not poison -- an
-    /// assertion failure left `$EDITOR` pointing into a deleted temp directory for every test that
-    /// ran afterwards. Gated with the tests that use it: every consumer is `#[cfg(unix)]`, because
-    /// they drive a real `$EDITOR` through a shell script. Leaving the helper ungated made the
-    /// Windows build warn about three items nothing there can reach.
+    /// than at the end of the test body, because `tokio::sync::Mutex` does not poison, so an
+    /// assertion failure would leave `$EDITOR` pointing into a deleted temp directory for every
+    /// test that ran afterwards. Gated with the tests that use it: every consumer is
+    /// `#[cfg(unix)]`, because they drive a real `$EDITOR` through a shell script. Leaving the
+    /// helper ungated made the Windows build warn about three items nothing there can reach.
     #[cfg(unix)]
     struct EditorEnv {
         editor: Option<std::ffi::OsString>,
@@ -1065,8 +1033,8 @@ mod tests {
     /// exit, so there is no buffer to recover from either.
     // `multi_thread`, because `edit_in` blocks on `Command::status`. On the default single-threaded
     // runtime that call freezes the whole runtime, so the "concurrent" write below only landed
-    // *after* the editor exited and the conflict this test exists to create never happened -- the
-    // test passed a save it should have refused.
+    // *after* the editor exited and the conflict this test exists to create never happened, and
+    // the test passed a save it should have refused.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_edit_that_cannot_save_keeps_what_the_user_typed() {
@@ -1319,7 +1287,7 @@ mod tests {
     ///
     /// Anything writing straight to the column can land a name `validate_entry_name` would have
     /// refused, such as `nul.md`; `meka memory export` then wrote some files, hit that row, and
-    /// aborted -- and the retry answered "directory is not empty", naming neither the cause nor
+    /// aborted, and the retry answered "directory is not empty", naming neither the cause nor
     /// the remedy. Checked as a set, before anything is written.
     #[tokio::test]
     async fn an_unexportable_name_stops_the_export_before_it_writes_anything() {
@@ -1366,7 +1334,7 @@ mod tests {
     /// `std::fs::write` and `create_dir_all` take the umask, which at the default 022 published
     /// every memory body at 0644 inside a 0755 directory. The database is 0600, and `run_edit` two
     /// functions above goes to the trouble of 0700/0600 for a scratch file that exists for the
-    /// length of an editing session -- while the command whose whole job is to be a backup
+    /// length of an editing session, while the command whose whole job is to be a backup
     /// published the lot.
     #[cfg(unix)]
     #[tokio::test]
@@ -1395,11 +1363,11 @@ mod tests {
         assert_eq!(file_mode, 0o600, "and so must every memory in it");
     }
 
-    /// A description the file cannot carry stops the export, rather than writing a file the
+    /// A description the file cannot carry stops the export, rather than writing a file that
     /// cannot be read back.
     ///
     /// `require_str` only refuses a description that is blank after `trim`, and a control character
-    /// is not whitespace -- so `\u{1}` is a description at every write door and nothing at all once
+    /// is not whitespace, so `\u{1}` is a description at every write door and nothing at all once
     /// `render_memory` has dropped what YAML cannot represent. The file then says `description:
     /// ""`, and that reads back as having none: a note lost through the one path that exists to
     /// preserve it.
@@ -1441,8 +1409,8 @@ mod tests {
     /// An export that cannot create its directory says so, and creates nothing.
     ///
     /// The reachable half of the failure path. A mid-loop write failure cannot be arranged
-    /// deterministically -- the directory has to be empty for the export to start, so there is
-    /// nothing to plant that would fail on the second file rather than the first -- which is why
+    /// deterministically (the directory has to be empty for the export to start, so there is
+    /// nothing to plant that would fail on the second file rather than the first), which is why
     /// the cleanup itself is unit-tested in
     /// [`a_partial_export_is_removed_without_touching_what_it_did_not_write`] instead.
     #[cfg(unix)]

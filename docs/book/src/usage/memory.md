@@ -66,7 +66,7 @@ The index is capped at 8 KiB and 200 entries. When more memories exist than fit,
 
 ```
 4910 more memories not shown here, most common tags infra (820), people (611),
-decisions (405): use `memory_search` to find them.
+decisions (405); use `memory_search` to find them.
 ```
 
 A bare count is not a usable signal once it runs to thousands: it says something is missing without saying what. The tag distribution is something the agent can turn into a query, which is most of what tags are for.
@@ -127,10 +127,10 @@ meka memory verify --rebuild    # regenerate it from the table
 
 ```
 Saved memory 'alice-tz' (priority 5). It is in your memory store from the next
-turn on, and memory_search will find it whatever the index has room to list.
+turn on, and `memory_search` will find it whatever the index has room to list.
 
 Note: 'alice-timezone' already says something very similar. If this is the same
-fact, call memory_write on 'alice-timezone' instead and delete 'alice-tz' -- two
+fact, call memory_write on 'alice-timezone' instead and delete 'alice-tz'. Two
 near-copies both stay in the index for ever and neither supersedes the other.
 ```
 

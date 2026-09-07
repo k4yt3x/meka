@@ -40,13 +40,13 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
             // The readable half only, which is the whole cost under `Signed` and an under-read
             // under `Sealed`: there the text is a summary and the reasoning is the sealed blob
             // beside it, replayed on every later request and billed as the reasoning tokens it
-            // decrypts to -- a figure its base64 length does not give (measured: 2572 bytes
+            // decrypts to, a figure its base64 length does not give (measured: 2572 bytes
             // decrypting to ~491 tokens, where this estimator's bytes-per-token would say 643).
             // Counting it would be guesswork about the provider's side, so the gap is deliberate,
             // in the same direction as the tool schemas this already omits. Three of the four
             // callers correct against the provider's reported usage on the next response;
             // `compute_compaction_split` does not, so a reasoning-heavy tail is kept larger than
-            // its budget rather than smaller -- the safe direction, but not a free one.
+            // its budget rather than smaller: the safe direction, but not a free one.
             ContentBlock::Thinking { thinking, .. } => estimate_text(thinking),
             // Same shape, same reasoning: opaque encrypted reasoning whose on-wire token cost isn't
             // derivable from `data` length.

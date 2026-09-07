@@ -1,6 +1,6 @@
 //! Decoders for the JWT `id_token` returned by `auth.openai.com`.
 //!
-//! We extract two values:
+//! Two values are read:
 //! - `chatgpt_account_id`, sent on every Codex request as the `ChatGPT-Account-ID` header (required
 //!   for subscription auth).
 //! - The `exp` claim from the `access_token`, used to schedule refresh before the token expires.
@@ -11,7 +11,7 @@
 //!
 //! No signature verification: the auth server's TLS handshake provides integrity for the
 //! in-transit token, and the API server validates the token on every request. Local validation
-//! would only catch tampering by a process that already has full access to our memory.
+//! would only catch tampering by a process that already has full access to this one's memory.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
@@ -66,11 +66,12 @@ fn decode_jwt_payload<T: serde::de::DeserializeOwned>(jwt: &str) -> Result<T> {
         }
     };
 
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|error| MekaError::Provider(format!("id_token base64 decode failed: {error}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|error| MekaError::Provider(format!("id_token JSON decode failed: {error}")))
+    let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|error| {
+        MekaError::Provider(format!("failed to decode the id_token's base64: {error}"))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        MekaError::Provider(format!("failed to decode the id_token's JSON: {error}"))
+    })
 }
 
 #[cfg(test)]

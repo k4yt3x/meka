@@ -167,10 +167,9 @@ impl BackgroundTasks {
     ///
     /// [`Self::cancel_all`] only fires the tokens, and firing a token is not the same as the task
     /// acting on it. A task parked at an await is dropped without ever being polled again when the
-    /// runtime goes, so it reaches neither `kill_child_tree` -- leaving the `setsid()`-ed child
-    /// running with no meka process tracking it -- nor `finish_background_task`, leaving the row
-    /// `running` for the next session open to sweep to `interrupted`. Those two are precisely what
-    /// canceling it was for, so the wait is what makes the cancel mean anything.
+    /// runtime goes, so it reaches neither `kill_child_tree` (leaving the `setsid()`-ed child
+    /// running with no meka process tracking it) nor `finish_background_task` (leaving the row
+    /// `running` for the next session open to sweep to `interrupted`).
     ///
     /// Callers should bound this: canceling asks, and a task that does not answer must not hold
     /// the terminal.
@@ -224,14 +223,11 @@ impl BackgroundTasks {
 /// a scratchpad entry and the turn carries the head plus the entry name: a twenty-minute build log
 /// would otherwise land in the conversation permanently, for a result that mattered once.
 ///
-/// Interacts with `tools::shell`'s `OUTPUT_WINDOW_BYTES`, which is eight times larger and
-/// keeps **both ends** of an overflowing stream. `split_outcome` keeps only the head, so a
-/// *backgrounded* `execute_command` that overflowed loses the tail the shell tool went to trouble
-/// to preserve. That is deliberate -- an outcome arrives unbidden, mid-conversation, so it should
-/// cost less window than a result the model asked for -- but the two numbers are coupled, and
-/// raising this one without reading that one produces a delivered turn wider than the tool's own
-/// result. Nothing is lost either way: the entry name reaches the model and the scratchpad holds
-/// all of it.
+/// Coupled to `tools::shell`'s `OUTPUT_WINDOW_BYTES`, which is eight times larger and keeps both
+/// ends of an overflowing stream; `split_outcome` keeps only the head, because an outcome arrives
+/// unbidden and should cost less window than a result the model asked for. Raising this one past
+/// that one would deliver a turn wider than the tool's own result. Nothing is lost either way: the
+/// scratchpad holds all of it.
 pub(crate) const OUTCOME_INLINE_LIMIT: usize = 4 * crate::text::KIB;
 
 /// Longest task label shown in the `[Background]` index and in delivered headers.
@@ -242,8 +238,7 @@ pub(crate) const LABEL_MAX_CHARS: usize = 80;
 /// The stamps are compare-and-swaps that return the rows they took, and every caller must report
 /// against that rather than against the snapshot it chose from: two claimers reading the same row
 /// as unclaimed is the ordinary case, and acting on the read is how the same outcome reaches the
-/// model twice. Four call sites asked this and each wrote the filter out; naming it is what stops
-/// the fifth forgetting.
+/// model twice.
 pub(crate) fn only_what_was_won(
     ready: Vec<BackgroundTask>,
     claimed: &[String],
@@ -429,8 +424,8 @@ mod tests {
     }
 
     /// The ceiling has to hold against the sibling calls in one assistant message, which
-    /// `execute_tool_calls` dispatches concurrently. Counting and then registering separately let
-    /// four calls each read "zero running" and all four start.
+    /// `execute_tool_calls` dispatches concurrently: counting and then registering separately lets
+    /// every call read "zero running" and start.
     #[tokio::test]
     async fn the_ceiling_holds_against_concurrent_reservations() {
         let tasks = BackgroundTasks::default();
@@ -496,9 +491,9 @@ mod tests {
     ///
     /// `/exit` returns straight into `Runtime::shutdown_background`, which drops every task where
     /// it stands. A task parked at an await is then never polled again, so the cleanup that follows
-    /// its cancellation check -- killing its process group, writing its terminal row -- simply
-    /// never happens, which is everything the cancel was for. The task here records the same way:
-    /// it observes the token, then does one more await before setting the flag.
+    /// its cancellation check (killing its process group, writing its terminal row) never happens.
+    /// The task here records the same way: it observes the token, then does one more await before
+    /// setting the flag.
     #[tokio::test]
     async fn canceling_every_task_and_waiting_lets_them_run_their_cleanup() {
         let tasks = BackgroundTasks::default();
@@ -628,9 +623,8 @@ mod tests {
     }
 
     /// The limit bounds what lands in the conversation, which is measured in bytes. Cutting in
-    /// characters instead let a multi-byte log carry several times the budget inline, and at the
-    /// sizes just past the threshold the "head" was the whole output: a turn that announced a
-    /// scratchpad entry and then quoted everything it was meant to spare.
+    /// characters would let a multi-byte log carry several times the budget inline, and just past
+    /// the threshold the "head" would be the whole output.
     #[test]
     fn split_outcome_bounds_multibyte_output_by_bytes() {
         // Over the limit in bytes (three each), comfortably under it in characters.
@@ -694,9 +688,8 @@ mod tests {
 
     /// A caller reports what the stamp gave it, not what it read a moment earlier.
     ///
-    /// The rule is the whole of the double-delivery fix: two claimers reading the same row as
-    /// unclaimed is ordinary, the compare-and-swap picks one, and a loser that reports its snapshot
-    /// anyway delivers the outcome a second time.
+    /// Two claimers reading the same row as unclaimed is ordinary, the compare-and-swap picks one,
+    /// and a loser that reports its snapshot anyway delivers the outcome a second time.
     #[test]
     fn a_report_carries_only_the_outcomes_the_stamp_won() {
         // Distinct ids: the shared fixture hands out a fixed one, and a filter keyed on id cannot
@@ -726,10 +719,10 @@ mod tests {
 
     /// A prompt carrying an outcome is never withdrawn, whatever the job asked for.
     ///
-    /// The branch only matters when a turn fails, so nothing that drives a *successful* turn can
-    /// see it -- which was every test of this path. Withdrawing a carrier prompt destroys the only
-    /// copy of the outcome: the row was stamped delivered before the turn began and
-    /// `list_undelivered_background_tasks` never returns it again.
+    /// The branch only matters when a turn fails, so nothing that drives a successful turn can see
+    /// it. Withdrawing a carrier prompt destroys the only copy of the outcome: the row was stamped
+    /// delivered before the turn began and `list_undelivered_background_tasks` never returns it
+    /// again.
     #[test]
     fn a_prompt_carrying_an_outcome_is_never_withdrawn() {
         let carried = [task(TaskStatus::Canceled, None)];

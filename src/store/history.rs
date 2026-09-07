@@ -25,18 +25,21 @@ pub(crate) struct HistoryFilter {
     pub(crate) command_line: Option<CommandLineMatch>,
 }
 
+/// How a search's text is matched against `command_line`.
 pub(crate) enum CommandLineMatch {
     Prefix(String),
     Substring(String),
     Exact(String),
 }
 
+/// Which end of the history a search reads from first.
 #[derive(Clone, Copy)]
 pub(crate) enum HistoryOrder {
     NewestFirst,
     OldestFirst,
 }
 
+/// The `prompt_history` table, on its own synchronous connection.
 pub(crate) struct HistoryStore {
     connection: Connection,
     /// Maximum number of entries retained; older rows are pruned on append. `0` disables storage.
@@ -44,6 +47,7 @@ pub(crate) struct HistoryStore {
 }
 
 impl HistoryStore {
+    /// Open a second connection to the store at `db_path`, retaining at most `capacity` entries.
     pub(crate) fn open(db_path: &Path, capacity: usize) -> Result<Self> {
         let connection = Connection::open(db_path).map_err(database)?;
         connection
@@ -55,6 +59,7 @@ impl HistoryStore {
         })
     }
 
+    /// The most entries the table retains; `0` disables storage.
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -116,6 +121,7 @@ impl HistoryStore {
         Ok(id)
     }
 
+    /// One entry by id.
     pub(crate) fn get(&self, id: i64) -> Result<Option<String>> {
         self.connection
             .query_row(
@@ -127,6 +133,7 @@ impl HistoryStore {
             .map_err(database)
     }
 
+    /// How many entries match `filter`.
     pub(crate) fn count(&self, filter: &HistoryFilter) -> Result<i64> {
         let (conditions, bindings) = where_clause(filter);
         let mut sql = String::from("SELECT COUNT(*) FROM prompt_history");
@@ -170,6 +177,7 @@ impl HistoryStore {
             .map_err(database)
     }
 
+    /// Replace one entry's text.
     pub(crate) fn update(&self, id: i64, command_line: &str) -> Result<()> {
         self.connection
             .execute(
@@ -180,6 +188,7 @@ impl HistoryStore {
         Ok(())
     }
 
+    /// Remove one entry.
     pub(crate) fn delete(&self, id: i64) -> Result<()> {
         self.connection
             .execute("DELETE FROM prompt_history WHERE id = ?1", params![id])

@@ -2,7 +2,7 @@
 //!
 //! The protocol sibling of [`super::chat_completions`] and the auth sibling of
 //! [`super::subscription`]. It posts to `{base_url}/responses` with a bearer token, which reaches
-//! OpenAI itself and equally reaches Ollama (v0.13.3+), vLLM, LM Studio and OpenRouter -- all of
+//! OpenAI itself and equally reaches Ollama (v0.13.3+), vLLM, LM Studio and OpenRouter, all of
 //! which implement the same endpoint. The wire format lives in [`super::responses_wire`].
 //!
 //! What this backend deliberately does *not* send is
@@ -15,7 +15,7 @@
 //! The cost of that choice is real and worth naming: without the `include` there is no encrypted
 //! reasoning to replay, so a turn here carries no reasoning chain between its own tool calls, and
 //! without the summary the reasoning stays invisible. An endpoint that serves reasoning of its own
-//! accord -- vLLM and Ollama emit `response.reasoning_text.delta` unprompted -- still renders.
+//! accord (vLLM and Ollama emit `response.reasoning_text.delta` unprompted) still renders.
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -28,13 +28,14 @@ use crate::{
     provider::{CompletionRequest, Provider, StreamEvent, ToolDefinition},
 };
 
+/// The `openai-responses` backend: one profile's model, endpoint and API key.
 pub(crate) struct OpenAiResponsesProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     model: String,
     /// The settled `reasoning.effort` for the request body, resolved once at construction from the
-    /// profile's override. `None` - the unconfigured case - omits the `reasoning` block so the
+    /// profile's override. `None` (the unconfigured case) omits the `reasoning` block so the
     /// endpoint applies its own default, which matters most for the local servers this backend
     /// also reaches.
     resolved_effort: Option<String>,

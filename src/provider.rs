@@ -10,10 +10,9 @@
 
 mod anthropic;
 mod budget;
-/// Scripted provider used by the integration tests. Available in debug builds only; release builds
-/// don't pay the binary-size cost. Activated by the `MEKA_MOCK_PROVIDER` env var inside
-/// `host::build_shared_deps`, which every host builds through; never reachable from production
-/// paths otherwise.
+/// Scripted provider used by the integration tests. Compiled in debug builds and under the
+/// `mock-provider` feature, so a release build does not carry it. Activated by `MEKA_MOCK_PROVIDER`
+/// inside `host::build_shared_deps`, which every host builds through.
 #[cfg(any(debug_assertions, feature = "mock-provider"))]
 pub(crate) mod mock;
 pub(crate) mod openai;
@@ -51,6 +50,7 @@ use crate::{
     store::AuthCredential,
 };
 
+/// Claude Code's OAuth client id, which the `claude-subscription` backend authenticates as.
 pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID: &str =
     "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
@@ -64,7 +64,9 @@ pub(crate) const DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID: &str = "app_EMoamEEZ73f
 /// default it is about to apply. A prompt carrying its own copy of the string would eventually
 /// offer one URL while the request went to another.
 pub(crate) const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+/// See [`DEFAULT_ANTHROPIC_BASE_URL`].
 pub(crate) const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// See [`DEFAULT_ANTHROPIC_BASE_URL`].
 pub(crate) const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com";
 
 /// The default endpoint for `backend`.
@@ -84,12 +86,11 @@ pub(crate) fn default_base_url(backend: Backend) -> &'static str {
 ///
 /// Measured in decodable SSE *events*, not bytes. All three drivers wrap `event_stream.next()`, and
 /// `eventsource-stream` discards comment lines and refuses to dispatch a data-empty event, so a
-/// keepalive that is only `: ping` does not reset this clock -- an endpoint sending nothing else
-/// for five minutes is treated as silent, which is the intended reading of it but not what "without
-/// a byte" would mean. Bounding actual bytes would mean timing the response body underneath the SSE
-/// decoder in all three drivers, for a shape no provider meka targets produces; the wording is
-/// corrected instead. Every provider in use sends `ping` / `keep-alive` events with a data field,
-/// which do reset it.
+/// keepalive that is only `: ping` does not reset this clock: an endpoint sending nothing else for
+/// five minutes is treated as silent, which is the intended reading of it but not what "without a
+/// byte" would mean. Bounding actual bytes would mean timing the response body underneath the SSE
+/// decoder in all three drivers, for a shape no provider meka targets produces. Every provider in
+/// use sends `ping` / `keep-alive` events with a data field, which do reset it.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long to wait for the TCP + TLS handshake before giving up on a provider endpoint.
@@ -97,9 +98,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The context window meka assumes when a profile doesn't state one.
 ///
-/// meka does not look this up, probe for it, or cache it. The window is a local budgeting number -
-/// it drives compaction timing, the keep-budget and the `/status` gauge, and is never sent on the
-/// wire - so a wrong value cannot fail a request, and the user can state the real one via
+/// meka does not look this up, probe for it, or cache it. The window is a local budgeting number
+/// (it drives compaction timing, the keep-budget and the `/status` gauge, and is never sent on the
+/// wire), so a wrong value cannot fail a request, and the user can state the real one via
 /// `[profiles.<name>].context_window`.
 ///
 /// 1M is right for the current flagships on both vendors and too generous for the smaller and older
@@ -227,9 +228,9 @@ pub(crate) trait Provider: Send + Sync {
     ) -> Result<()>;
 
     /// Fetch the account's current rate-limit usage (session / weekly windows and reset times).
-    /// Returns `Ok(None)` for providers that have no per-account usage endpoint (API-key backends,
-    /// Ollama, the local CLI); OAuth subscription providers override this. Errors propagate so the
-    /// caller can surface a refresh/auth failure rather than silently showing nothing.
+    /// Returns `Ok(None)` for a backend with no per-account usage endpoint, which is every API-key
+    /// backend; the subscription backends override this. Errors propagate so the caller can surface
+    /// a refresh failure rather than silently showing nothing.
     async fn fetch_usage(&self) -> Result<Option<AccountUsage>> {
         Ok(None)
     }
@@ -287,7 +288,7 @@ pub(crate) async fn succeeded(
 /// What a tool call's raw argument text becomes, for every driver. An empty body is a legitimate
 /// zero-argument call (a tool with no parameters streams `""`, not `{}`); anything else must parse,
 /// and what does not parse is rejected with the reason rather than replaced with `{}`, which would
-/// run the tool on whatever defaults it tolerates -- a valid call the model never made. Truncated
+/// run the tool on whatever defaults it tolerates: a valid call the model never made. Truncated
 /// argument JSON is the ordinary shape of a `max_tokens` cutoff mid-call, so this is not an exotic
 /// path.
 pub(crate) fn finalize_tool_arguments(
@@ -334,8 +335,8 @@ pub(crate) struct Completion {
 /// How a stream of [`StreamEvent`]s becomes the message it described.
 ///
 /// The one fold, for the agent (which also shows each event as it arrives) and for a Responses
-/// `complete` (the stream aggregated with nobody watching). Two copies of it disagreed once on
-/// when a thinking block is kept, and a resumed transcript then differed from the live turn.
+/// `complete` (the stream aggregated with nobody watching). Two copies can disagree on when a
+/// thinking block is kept, and a resumed transcript then differs from the live turn.
 #[derive(Default)]
 pub(crate) struct MessageAccumulator {
     content: Vec<ContentBlock>,

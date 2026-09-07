@@ -137,7 +137,6 @@ impl Tool for TodoTool {
             // Precedence: items (replace) -> set (patch by resulting position).
             if let Some(items) = parsed.items {
                 let new_items: Vec<TodoItem> = items.into_iter().map(TodoItem::from).collect();
-                // A non-empty list needs a heading; the model must name what it's working towards.
                 if !new_items.is_empty() && title.is_none() {
                     return Ok(ToolOutput::text(
                         "todo: a `title` is required when creating or replacing the task list"
@@ -148,7 +147,6 @@ impl Tool for TodoTool {
                 state.title = title.map(str::to_string);
                 state.items = new_items;
             } else if let Some(title) = title {
-                // Rename without rebuilding the list.
                 state.title = Some(title.to_string());
             }
 
@@ -462,8 +460,6 @@ mod tests {
             ],
         };
         let output = format_todo_state(&state);
-        // Heading is `TODO: <title>` on its own line, followed by a blank line; tasks are a
-        // markdown checklist with no progress count.
         assert!(output.starts_with("TODO: My tasks\n\n"));
         assert!(!output.contains("done"));
         assert!(output.contains("- [ ] 1 Pending one"));

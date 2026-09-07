@@ -88,7 +88,6 @@ pub(crate) async fn get_skill(
     let skill = installed.find(&name).ok_or_else(|| {
         // The distinction `get_memory` already draws: a file that failed to parse is a different
         // answer from one that never existed, and the reason is what the operator needs to fix it.
-        // A flat 404 told a caller that a `SKILL.md` sitting in the store did not exist.
         match installed.skip_reason(&name) {
             Some(_) => store_error(installed.unavailable(&name)),
             None => not_found("skill", &name),
@@ -177,8 +176,8 @@ pub(crate) async fn put_skill(
     // above about an operator's deliberate choices, nobody chooses a silent fork.
     //
     // Shared with the CLI and the tools rather than spelled out here, which is also what makes it
-    // cover a shadowed file that does not parse: asked locally, this compared against the loaded
-    // skills and let a broken one through.
+    // cover a shadowed file that does not parse: a check against the loaded skills alone lets a
+    // broken one through.
     if let Some(refusal) = crate::skills::refuse_foreign_write(&installed, &name, &root) {
         // Logged here rather than composed into the body: the caller holds a token, not the
         // machine, and the path is out of the operator's `config.toml`. See `ForeignSkill`.
@@ -204,10 +203,9 @@ pub(crate) async fn put_skill(
     let description = crate::entry::normalize_description(&body.description);
     // On the blocking pool, like every other caller of this function. It takes a cross-process
     // `flock` and then `fsync`s, so on a runtime worker it parks one that cannot poll anything
-    // else meanwhile -- and the `flock` has no bound: a `meka skill add --edit` with an editor open
+    // else meanwhile, and the `flock` has no bound: a `meka skill add --edit` with an editor open
     // holds it for as long as the editor lives. Enough concurrent requests parked that way and the
-    // router itself stops answering, health check included. Observed: 40 parallel PUTs against a
-    // held lock made `GET /v1/health` time out until the lock dropped.
+    // router itself stops answering, health check included.
     {
         let root = root.clone();
         let name = name.clone();
@@ -225,7 +223,7 @@ pub(crate) async fn put_skill(
             )
         })
         .await
-        .map_err(|error| ProblemDetail::internal_sanitized("write task failed", error))?
+        .map_err(|error| ProblemDetail::internal_sanitized("failed to write the skill", error))?
         .map_err(store_error)?;
     }
     // Before the read-back below, which goes through the same cache: without this a second write
@@ -305,7 +303,9 @@ pub(crate) async fn delete_skill(
         let owned = name.clone();
         tokio::task::spawn_blocking(move || crate::skills::delete_skill(&root, &owned))
             .await
-            .map_err(|error| ProblemDetail::internal_sanitized("delete task failed", error))?
+            .map_err(|error| {
+                ProblemDetail::internal_sanitized("failed to delete the skill", error)
+            })?
             .map_err(|message| {
                 if missing {
                     not_found("skill", &name)
@@ -564,7 +564,7 @@ pub(crate) async fn list_tools(
             ProblemDetail::new(
                 ErrorKind::SessionNotLoaded,
                 StatusCode::CONFLICT,
-                "session is not loaded; submit a turn to load it before reading its tool catalog",
+                "session is not loaded; submit a turn to load it",
             )
             .with("session_id", id.to_string())
         })?;

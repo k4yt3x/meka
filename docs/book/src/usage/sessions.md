@@ -432,7 +432,7 @@ Read from stdin with `-`:
 cat session.json | meka session import -
 ```
 
-The import preserves the full conversation, per-message timestamps, cumulative stats, scratchpad entries, and the name of the profile the session ran on. That name is all an archive carries about the profile: the settings themselves come from whatever `[profiles.<name>]` and its account say on the installation importing it. An archive that names no profile adopts this installation's default instead; repin it with `--profile` if it ran somewhere else. If nothing can supply one, because no `default_profile` is set and several profiles are configured, the import is refused rather than restoring a session that cannot run: set a default with `meka profile use <name>`, or name one for the import with `meka --profile <name> session import`.
+The import preserves the full conversation, per-message timestamps, cumulative stats, scratchpad entries, and the name of the profile the session ran on. That name is all an archive carries about the profile: the settings themselves come from whatever `[profiles.<name>]` and its account say on the installation importing it. An archive that names no profile adopts this installation's default instead; repin it with `--profile` if it ran somewhere else. If nothing can supply one, because no `default_profile` is set and several profiles are configured, the import is refused rather than restoring a session that cannot run: name one with `meka --profile <name> session import`.
 
 `updated_at` is stamped to the import time rather than restored from the export, so that restoring an archive older than a configured `retention` window isn't undone by the retention sweep on the next launch. `created_at` still carries the original.
 

@@ -27,15 +27,15 @@ use crate::{
     stats::TokenUsage,
 };
 
+/// The `openai-chat-completions` backend: one profile's model, endpoint and API key.
 pub(crate) struct OpenAiChatCompletionsProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     model: String,
     /// The settled `reasoning_effort` for the request body, resolved once at construction from the
-    /// profile's override. `None` - the unconfigured case - omits the field so the endpoint
-    /// applies its own default, which matters most for the local servers this backend also
-    /// reaches.
+    /// profile's override. `None` (the unconfigured case) omits the field so the endpoint applies
+    /// its own default, which matters most for the local servers this backend also reaches.
     resolved_effort: Option<String>,
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`]; unset means no ceiling here.
@@ -110,6 +110,8 @@ impl OpenAiChatCompletionsProvider {
         }
     }
 
+    /// The request body: the conversation as Chat Completions messages, the tools, and the
+    /// profile's effort and output cap when it states them.
     pub(super) fn build_request_body(
         &self,
         system_prompt: &str,
@@ -142,16 +144,14 @@ impl OpenAiChatCompletionsProvider {
                                 is_error: _,
                             } = block
                             {
-                                // Chat Completions deliberately restricts the `tool` role's content
-                                // to text-only. The Chat reference defines
-                                // `ChatCompletionToolMessageParam.content` as `string | array of
-                                // ChatCompletionContentPartText` and notes "for tool messages, only
-                                // type `text` is supported." Vision is on `user`-role messages
-                                // only. So we collapse any image blocks to the literal "[Image]"
-                                // via `tool_result_text_content` here. The Responses API (used by
-                                // `chatgpt-subscription`) does accept `input_image` content blocks
-                                // in `function_call_output.output`,
-                                // and we emit those there.
+                                // Chat Completions restricts the `tool` role's content to text: the
+                                // reference defines `ChatCompletionToolMessageParam.content` as
+                                // `string | array of ChatCompletionContentPartText` and notes "for
+                                // tool messages, only type `text` is supported", with vision on
+                                // `user` messages only. So image blocks collapse to the literal
+                                // "[Image]" via `tool_result_text_content`. The Responses API takes
+                                // `input_image` in `function_call_output.output`, and its encoder
+                                // emits them.
                                 let text = ContentBlock::tool_result_text_content(content);
                                 let tool_message = serde_json::json!({
                                     "role": "tool",
@@ -262,9 +262,9 @@ impl OpenAiChatCompletionsProvider {
             body["reasoning_effort"] = serde_json::json!(effort);
         }
         // Only the profile's own cap: the endpoint's default is the endpoint's fact, and this
-        // backend reaches whatever `base_url` names. A 32k floor sent whenever `effort` was set was
-        // rejected by every model with a smaller output cap, and each rejection cost a degraded
-        // retry that failed the same way.
+        // backend reaches whatever `base_url` names. A floor sent whenever `effort` is set would be
+        // rejected by every model with a smaller output cap, and each rejection would cost a
+        // degraded retry that fails the same way.
         if let Some(max_output) = self.max_output_tokens {
             body["max_completion_tokens"] = serde_json::json!(max_output);
         }
@@ -289,6 +289,7 @@ impl OpenAiChatCompletionsProvider {
         body
     }
 
+    /// The assistant message, stop reason and usage out of a non-streaming response.
     pub(super) fn parse_non_streaming_response(
         &self,
         response: &serde_json::Value,
@@ -495,14 +496,14 @@ impl Provider for OpenAiChatCompletionsProvider {
 /// recorded `finish_reason` and falling back to tool presence when none arrived.
 ///
 /// A stream that stopped without saying so is a failure, not a short turn. The read ending before
-/// `[DONE]` -- a proxy closing the chunked response, a dropped connection -- is indistinguishable
-/// from the terminal frame unless it is tracked, and treating the two alike committed a truncated
+/// `[DONE]` (a proxy closing the chunked response, a dropped connection) is indistinguishable
+/// from the terminal frame unless it is tracked, and treating the two alike commits a truncated
 /// message as a finished one: `final_stop` is `None`, so the fallback stamps `EndTurn` and the
 /// partial answer is persisted as complete with no retry. `StreamError` is retryable, so the
 /// existing retry path applies. A close *after* the `finish_reason` chunk is the other case: the
 /// stream has said everything it had to, and a gateway that omits the `[DONE]` sentinel is read
-/// the way the Claude driver reads a close after `message_delta`. Failing it dropped every tool
-/// call of the turn.
+/// the way the Claude driver reads a close after `message_delta`. Failing it would drop every
+/// tool call of the turn.
 async fn conclude_stream(
     end: End,
     mut protocol: ChatCompletionsStream,
@@ -592,7 +593,7 @@ async fn handle_stream_chunk(
     event_sender: &mpsc::Sender<StreamEvent>,
 ) -> ChunkOutcome {
     // An error object in a 200 stream is how OpenRouter, vLLM and OpenAI itself report a failure
-    // that began after the headers went out. It has no `choices`, so reading past it committed
+    // that began after the headers went out. It has no `choices`, so reading past it would commit
     // whatever had streamed as a finished turn with no error and no retry.
     //
     // `"error": null` is a field some servers emit on every chunk, and is no error.
@@ -640,8 +641,9 @@ async fn handle_stream_chunk(
         // Fall through to the delta below rather than returning here: OpenAI itself sends
         // `finish_reason` alone with an empty delta, but vLLM-backed endpoints coalesce the final
         // content or tool_calls delta into this same chunk whenever generation ends before the
-        // stream flushes it separately. Skipping the delta dropped it, which for a tool call left
-        // `finish_reason: "tool_calls"` with no tool-use block at all - a silently empty turn.
+        // stream flushes it separately. Skipping the delta would drop it, which for a tool call
+        // leaves `finish_reason: "tool_calls"` with no tool-use block at all: a silently empty
+        // turn.
         *final_stop = Some(parse_openai_stop_reason(finish_reason));
     }
 

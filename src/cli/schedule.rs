@@ -15,8 +15,7 @@ use crate::{
 const SCHEDULE_TRUNCATE: usize = 24;
 /// Same, for the trailing prompt, and the column that spends whatever the others leave.
 ///
-/// The table is a width budget rather than a set of independent ceilings, which is how the previous
-/// seven columns reached 186 on a real store against the 120 meka targets. Worst case is `8 + 2`
+/// The table is a width budget rather than a set of independent ceilings. Worst case is `8 + 2`
 /// id, `8 + 2` session, `24 + 2` schedule, `8 + 2` next (`999d 23h`, which is what
 /// [`NEVER_SOON_DAYS`] exists to keep it under), `5 + 2` gate, and this: 120 exactly. An id widened
 /// by [`crate::text::unique_prefix_len_within`] is taken back off this, so a collision costs
@@ -42,7 +41,7 @@ const TABLE_BUDGET: usize = 120;
 ///
 /// Chosen so the cell fits the `8 + 2` the budget above reserves for it. `format_duration_short`
 /// renders `{days}d {hours}h`, which is nine columns once the day count reaches four digits and the
-/// hour two -- so the clamp has to land before four digits, not at them. `999d 23h` is eight and
+/// hour two, so the clamp has to land before four digits, not at them. `999d 23h` is eight and
 /// `>999d` is five.
 const NEVER_SOON_DAYS: i64 = 999;
 const NEVER_SOON: chrono::TimeDelta = chrono::TimeDelta::days(NEVER_SOON_DAYS);
@@ -146,9 +145,7 @@ async fn list(
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
     let jobs = match session {
-        // A prefix, as `--session 0b5c...` in this command's own help has always advertised and as
-        // `meka -c` accepts. It parsed a whole UUID and rejected everything shorter, which is also
-        // the form the `Session` column prints.
+        // A prefix, as `meka -r` accepts and as the `Session` column prints.
         Some(raw) => {
             let id = store.resolve_session_id(raw).await?;
             store.schedule_store().list_scheduled_jobs(id).await?
@@ -309,10 +306,9 @@ fn rows_for(
                 remaining => crate::text::format_duration_short(remaining.num_seconds()),
             });
             // The kind alone. What the gate *runs* is model-authored text that no column can hold
-            // legibly -- a real one truncated to `shell bash -c 'S=/home/mica/backup-st...`, which
-            // does not answer the question that column existed to answer. `shell` against `tool` is
-            // the distinction worth a column: an unsandboxed `sh -c` against a structured call. A
-            // fixed word from an enum, so unlike the summary it replaces it needs no sanitizing.
+            // legibly, and `shell` against `tool` is the distinction worth a column: an unsandboxed
+            // `sh -c` against a structured call. A fixed word from an enum, so it needs no
+            // sanitizing.
             row.push(match &job.gate {
                 Some(gate) => gate.probe.kind_str().to_string(),
                 None => "-".to_string(),
@@ -328,10 +324,8 @@ fn rows_for(
                     },
                 );
             }
-            // Whitespace collapsed first, then sanitized. The collapse is for legibility -- a
-            // prompt is prose and wraps -- and it is not a safety measure: `\u{1b}` is not
-            // whitespace, so it survived a `split_whitespace` that looked like it was cleaning
-            // the cell.
+            // Whitespace collapsed first, then sanitized. The collapse is for legibility (a prompt
+            // is prose and wraps), not safety: `\u{1b}` is not whitespace and survives it.
             row.push(crate::text::sanitize_to_line(
                 &job.prompt.split_whitespace().collect::<Vec<_>>().join(" "),
                 prompt_width,
@@ -381,8 +375,8 @@ fn render(
 /// `meka schedule show <id>`: one job, in full.
 ///
 /// The table exists to be scanned, so every cell in it is bounded. This is the surface that answers
-/// what a job actually does -- the whole prompt, the whole command a gate runs, the session it
-/// wakes -- none of which survives a column. It is also the only place `Held` is explained rather
+/// what a job actually does (the whole prompt, the whole command a gate runs, the session it
+/// wakes), none of which survives a column. It is also the only place `Held` is explained rather
 /// than encoded, which matters because a withheld job is one that will never fire.
 pub(crate) async fn show(
     store: &Store,
@@ -595,7 +589,7 @@ mod tests {
     ///
     /// `/schedule` lists one session's jobs and `/schedule cancel` resolves against that session
     /// alone. A `show` that scanned every session would print a job the listing above it never
-    /// mentioned and the `cancel` beside it would refuse -- and would leak another conversation's
+    /// mentioned and the `cancel` beside it would refuse, and would leak another conversation's
     /// prompt and gate command into this one. The CLI passes `None` and does scan everything,
     /// because there the operator has an id and no session.
     #[tokio::test]
@@ -730,8 +724,7 @@ mod tests {
     /// and refuses what falls outside it. This listing did not, so narrowing the enabled set and
     /// restarting left the operator's own table reporting a job as healthy that the running host
     /// declines on every sweep. Exercised through `with_levels` rather than `rows_for`, because
-    /// `rows_for` is handed a level that has already been through this and would pass either way:
-    /// deleting the filter left all 2452 tests green.
+    /// `rows_for` is handed a level that has already been through this and would pass either way.
     #[tokio::test]
     async fn a_level_the_enabled_set_excludes_is_not_treated_as_the_session_level() {
         let manager =
@@ -862,18 +855,13 @@ mod tests {
         assert_eq!(healthy, "no", "and an authorized gate is not withheld");
     }
 
-    /// A tool name is also a valid command, so the kind has to be on the row.
-    ///
-    /// The column carries the kind and nothing else, which is what makes it 5 columns wide instead
-    /// of 40. The distinction it exists for survives that: an unsandboxed `sh -c` and a
-    /// structured call still cannot read alike. What each one *runs* is [`show`]'s job.
     /// The `Held` cell distinguishes a verdict from a shrug.
     ///
     /// `/schedule` is the only surface that renders this cell, and its three values mean different
     /// things: `yes` is "this job cannot fire", blank is "it can", and `?` is "this process cannot
     /// establish which". Blank and `?` are the pair worth pinning, because swapping them turns "I
     /// did not check" into "it will fire" on the surface an operator uses to find out why a job is
-    /// silent. The tests that covered this moved to `withheld_summary`, which only `show` calls.
+    /// silent.
     #[test]
     fn the_held_cell_separates_a_verdict_from_an_unanswerable_question() {
         let held_cell = |gate: Option<Gate>, level: Option<Permission>| {
@@ -916,10 +904,9 @@ mod tests {
 
     /// The table holds 120 columns against the widest cell every column can produce.
     ///
-    /// The other two listings got this test and this one did not, which is where the `Next` overrun
-    /// hid: `format_duration_short` renders `{days}d {hours}h`, nine columns once the days reach
-    /// four digits, against the eight the budget reserves. Sizing each cell to its own ceiling and
-    /// never measuring the row is how a table that fits on every real store overruns on one job.
+    /// `format_duration_short` renders `{days}d {hours}h`, nine columns once the days reach four
+    /// digits, against the eight the budget reserves. Sizing each cell to its own ceiling and never
+    /// measuring the row is how a table that fits on every real store overruns on one job.
     #[test]
     fn the_table_holds_its_budget_against_the_widest_row_it_can_draw() {
         let mut job = job_with(Some(shell_gate("gh pr checks", GatePredicate::Changed)));
@@ -958,6 +945,11 @@ mod tests {
         }
     }
 
+    /// A tool name is also a valid command, so the kind has to be on the row.
+    ///
+    /// The column carries the kind and nothing else, which is what makes it 5 columns wide instead
+    /// of 40. The distinction it exists for survives that: an unsandboxed `sh -c` and a
+    /// structured call still cannot read alike. What each one *runs* is [`show`]'s job.
     #[test]
     fn the_gate_column_names_the_kind() {
         let shell = &rows_for(
@@ -1109,7 +1101,7 @@ mod tests {
     ///
     /// One session with several jobs fills the whole `Session` column with itself. Counting rows
     /// rather than distinct ids made that unsatisfiable, so the column widened to a full UUID to
-    /// distinguish an id from itself -- and charged the prompt 28 columns for it.
+    /// distinguish an id from itself, and charged the prompt 28 columns for it.
     #[test]
     fn one_session_with_several_jobs_does_not_widen_the_session_column() {
         let session = uuid::Uuid::new_v4();
@@ -1178,7 +1170,7 @@ mod tests {
     /// An occurrence that is already due is a different state from one due in no time at all.
     ///
     /// A host that was down through a fire time leaves the job overdue, and `format_duration_short`
-    /// clamps a negative duration to `0s` -- which reads as "about to fire" for a job that should
+    /// clamps a negative duration to `0s`, which reads as "about to fire" for a job that should
     /// already have.
     #[test]
     fn an_overdue_occurrence_reads_as_due() {

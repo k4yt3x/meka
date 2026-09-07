@@ -14,12 +14,10 @@ fn config_err(message: impl Into<String>) -> MekaError {
     MekaError::Config(message.into())
 }
 
-/// Run `meka mcp list`. Prints configured servers + their transport/URL.
+/// `/mcp list` in the REPL: the configured servers with their transport and target.
 ///
-/// When `manager` is `Some`, the output also carries a `state` column showing each server's live
-/// lifecycle state (`pending` / `connected` / `failed` / `disabled`). The out-of-band `meka mcp
-/// list` CLI doesn't have a running manager and gets the no-state view; the REPL's `/mcp list`
-/// passes the live manager for the richer output.
+/// With a `manager`, the table also carries a `State` column with each server's live lifecycle
+/// state; `meka mcp list` has no running manager and gets the table without it.
 pub(crate) async fn run_list(
     servers: &[McpServerConfig],
     manager: Option<&std::sync::Arc<crate::mcp::McpClientManager>>,
@@ -53,7 +51,7 @@ pub(crate) async fn list_servers(
         return Ok(());
     }
     if servers.is_empty() {
-        crate::streams::write_stderr_line("No MCP servers configured.");
+        crate::streams::write_stderr_line("No MCP servers.");
         report_orphaned_credentials(&orphans)?;
         return Ok(());
     }
@@ -72,8 +70,6 @@ pub(crate) async fn list_servers(
         }
     }
 
-    // The live-manager variant adds a `State` column; both share the shared column formatter so the
-    // table aligns regardless of how long a server name or target gets.
     let with_state = manager.is_some();
 
     let rows: Vec<Vec<String>> = servers
@@ -165,25 +161,36 @@ async fn orphaned_credentials(
         .collect())
 }
 
-/// Print the orphan block, if there is one. The names go to stdout with the rest of the answer --
-/// hiding them behind a stderr-only note is how they stayed invisible in the first place -- and the
-/// instruction for acting on them is a stderr hint.
+/// Print the orphan block, if there is one. The names go to stderr with a hint: the listing is the
+/// requested data and this is a diagnostic about the store, so `meka mcp list 2>/dev/null | awk`
+/// must not see it as rows.
 fn report_orphaned_credentials(orphans: &[String]) -> Result<()> {
     if orphans.is_empty() {
         return Ok(());
     }
-    // Not on stdout: the listing is the requested data and this is a diagnostic about the store, so
-    // `meka mcp list 2>/dev/null | awk` must not see it as rows.
     crate::streams::write_stderr_line("");
     crate::streams::write_stderr_line(format!(
         "Stored credentials with no server: {}",
         orphans.join(", ")
     ));
-    // The action only. Why the credential is here is not something the diff can say -- deleting the
-    // entry by hand is the usual cause, but a rollback that itself failed leaves the same trace --
-    // and the line above has already stated what was found.
+    // The action only: deleting the entry by hand is the usual cause, but a rollback that itself
+    // failed leaves the same trace, so a hint naming one cause would mislead the other.
     crate::render::render_hint("delete one with `meka mcp remove <name>`");
     Ok(())
+}
+
+/// The configured server `name` denotes, or the refusal naming the ones that exist.
+fn require_server<'a>(servers: &'a [McpServerConfig], name: &str) -> Result<&'a McpServerConfig> {
+    servers
+        .iter()
+        .find(|server| server.name == name)
+        .ok_or_else(|| {
+            config_err(crate::text::unknown_name(
+                "MCP server",
+                name,
+                servers.iter().map(|server| server.name.as_str()),
+            ))
+        })
 }
 
 /// Run `meka mcp get <name>`. Prints a single server config in detail.
@@ -193,10 +200,7 @@ pub(crate) async fn run_get(
     token_store: &TokenStore,
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
-    let config = servers
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| config_err(format!("no MCP server named '{name}'")))?;
+    let config = require_server(servers, name)?;
     let mut credentials = Vec::new();
     for kind in [
         crate::store::McpCredentialKind::Bearer,
@@ -359,11 +363,7 @@ pub(crate) async fn run_tools(
     name: &str,
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
-    let config = servers
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| config_err(format!("no MCP server named '{name}'")))?
-        .clone();
+    let config = require_server(servers, name)?.clone();
 
     let context = McpClientContext::new();
     let manager = McpClientManager::prepare(
@@ -430,8 +430,8 @@ pub(crate) async fn run_tools(
                 //
                 // Sanitized but never truncated, unlike every other authored cell here. This is
                 // the string the user retypes into `tools`, a per-tool `permission` override or
-                // `--eager-load-tool`, and no command prints it in full elsewhere -- a name cut to
-                // fit a column matches nothing, silently.
+                // `--eager-load-tool`, and no command prints it in full elsewhere, so a name cut
+                // to fit a column matches nothing, silently.
                 crate::text::sanitize_to_line(&tool.raw_name, usize::MAX),
                 tool.resolved_permission.to_string(),
                 // A declined hint has to say so here, because this table is where a user checks
@@ -455,10 +455,8 @@ pub(crate) async fn run_tools(
         &rows,
     ))?;
 
-    // The count is commentary on the table, not part of it, so it goes to stderr with the rest of
-    // the UI feedback. On stdout it appended a blank line and an English sentence to the data a
-    // caller piped -- in the same function whose "no tools" line was deliberately moved to stderr
-    // so `meka mcp tools x 2>/dev/null | awk ...` would work.
+    // Commentary on the table, not part of it: on stdout it would append a sentence to the data a
+    // caller piped.
     let total = tools.len();
     let allowed = tools.iter().filter(|tool| tool.allowed).count();
     crate::streams::write_stderr_line("");
@@ -527,17 +525,11 @@ pub(crate) async fn run_reconnect(
     token_store: &TokenStore,
     name: &str,
 ) -> Result<()> {
-    let config = servers
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| config_err(format!("no MCP server named '{name}'")))?
-        .clone();
+    let config = require_server(servers, name)?.clone();
 
     let context = McpClientContext::new();
-    // Per-tool permission resolution uses `[mcp].default_permission` as its global fallback.
-    // `reconnect` is a smoke-test command run from outside the main agent loop, so we don't have a
-    // `ResolvedConfig` in scope. Pass `None` and let resolution fall through to the hardcoded
-    // strict default. Any user-specific per-server / per-tool config still applies.
+    // No `[mcp].default_permission`: this is a smoke test with no `ResolvedConfig` in scope, and
+    // the per-tool resolution falls through to its strict default.
     let manager = McpClientManager::prepare(
         std::slice::from_ref(&config),
         None,
@@ -579,23 +571,21 @@ pub(crate) async fn run_logout(
     token_store: &TokenStore,
     name: &str,
 ) -> Result<()> {
-    // Best-effort revocation. Cleared from stored creds regardless.
+    // Best-effort revocation; the stored credentials are cleared regardless.
     if let Some(config) = servers
         .iter()
         .find(|c| c.name == name && matches!(c.transport, McpTransport::Http))
         && let Err(error) = crate::mcp::auth::revoke_stored_token(token_store, &config.name).await
     {
         tracing::warn!(
-            "failed to revoke token at server '{name}': {error} (continuing)",
+            "failed to revoke the token at '{name}': {error}",
             name = config.name
         );
     }
 
-    // Named, because the kinds are not equally replaceable. An OAuth bundle is reobtained by
-    // logging in again; a bearer or a client secret was typed by the user and meka is now its only
-    // holder, so dropping one silently would send them back to the provider with nothing on screen
-    // to say why. `logout` still clears them all -- it is "this server holds nothing" -- but the
-    // user gets to see which of their own secrets went with it.
+    // Named, because the kinds are not equally replaceable: an OAuth bundle is reobtained by
+    // logging in again, while a bearer or a client secret was typed by the user and meka is now its
+    // only holder. `logout` still clears them all, but says which of the user's own secrets went.
     let cleared: Vec<&str> = {
         let mut found = Vec::new();
         for kind in [
@@ -629,7 +619,7 @@ pub(crate) async fn run_logout(
 /// user already holds.
 ///
 /// Separate from [`run_login`] because the two do opposite things: that one goes and obtains a
-/// credential, this one is handed one. A confidential OAuth client needs both, in this order --
+/// credential, this one is handed one. A confidential OAuth client needs both, in this order:
 /// deposit the client secret, then run the flow that presents it.
 pub(crate) async fn run_store_secret(
     servers: &[McpServerConfig],
@@ -640,16 +630,12 @@ pub(crate) async fn run_store_secret(
 ) -> Result<()> {
     use crate::store::McpCredentialKind;
 
-    let server = servers
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| config_err(format!("no MCP server named '{name}'")))?;
+    let server = require_server(servers, name)?;
     // Checked against config rather than accepted for any name, so a typo leaves a stranded
     // credential under a server that will never exist rather than silently doing nothing useful.
     if server.transport != McpTransport::Http {
         return Err(config_err(format!(
-            "server '{name}' is stdio, so it has no HTTP credential to store; a stdio server's \
-             secrets go in its 'env' table"
+            "server '{name}' is stdio and has no HTTP credential; its secrets go in `env`"
         )));
     }
 
@@ -658,16 +644,14 @@ pub(crate) async fn run_store_secret(
     match (kind, &server.auth) {
         (McpCredentialKind::Bearer, Some(_)) => {
             return Err(config_err(format!(
-                "server '{name}' authenticates through its [auth] block, and a stored bearer would \
-                 take precedence over the token that flow obtains, so the flow would run and its \
-                 result go unused. Drop the [auth] block to use a bearer, or `meka mcp login {name}` \
-                 to use the flow"
+                "server '{name}' authenticates through its `[auth]` block, which a stored bearer \
+                 would override; drop the block first"
             )));
         }
         (McpCredentialKind::ClientSecret, None) => {
             return Err(config_err(format!(
-                "server '{name}' has no [auth] block, so nothing would present a client secret; \
-                 add `type = \"oauth\"` or `\"client_credentials\"` first"
+                "server '{name}' has no `[auth]` block to present a client secret; add one with \
+                 `type = \"oauth\"` or `\"client_credentials\"` first"
             )));
         }
         (McpCredentialKind::ClientSecret, Some(McpAuthConfig::ClientCredentialsJwt { .. })) => {
@@ -692,8 +676,7 @@ async fn run_login_flow(config: &McpServerConfig, token_store: &TokenStore) -> R
     // The one place a person is at the terminal to finish a browser login, so the one place the
     // client is given a way to ask them.
     context.set_login_prompt(std::sync::Arc::new(TerminalLogin));
-    // `login` is also out-of-band from the main agent loop; see the note in `run_reconnect` for why
-    // we pass `None` here.
+    // No `[mcp].default_permission`, for the reason `run_reconnect` gives.
     let manager = McpClientManager::prepare(
         std::slice::from_ref(config),
         None,
@@ -731,19 +714,19 @@ impl crate::mcp::auth::LoginPrompt for TerminalLogin {
         // the user's to decide, and a launch from an SSH session or a container reached nothing or
         // the wrong desktop.
         crate::streams::write_stderr_line(format!(
-            "open this URL in your browser to authorize:\n\n{url}\n"
+            "To authorize, open this URL in your browser:\n\n{url}\n"
         ));
     }
 
     fn awaiting_callback(&self, seconds: u64, accepts_paste: bool) {
         if accepts_paste {
             crate::streams::write_stderr_line(format!(
-                "waiting up to {seconds}s for the callback, or paste the callback URL here and \
+                "Waiting up to {seconds}s for the callback, or paste the callback URL here and \
                  press Enter:"
             ));
         } else {
             crate::streams::write_stderr_line(format!(
-                "waiting up to {seconds}s for the callback."
+                "Waiting up to {seconds}s for the callback."
             ));
         }
     }
@@ -758,7 +741,7 @@ impl crate::mcp::auth::LoginPrompt for TerminalLogin {
         let mut reader = BufReader::new(tokio::io::stdin());
         let mut line = String::new();
         match reader.read_line(&mut line).await {
-            Err(error) => Err(format!("stdin read failed: {error}")),
+            Err(error) => Err(format!("failed to read stdin: {error}")),
             // EOF: stdin was closed before the user pasted anything.
             Ok(0) => Ok(None),
             Ok(_) => Ok(Some(line)),
@@ -766,29 +749,17 @@ impl crate::mcp::auth::LoginPrompt for TerminalLogin {
     }
 }
 
-/// Run `meka mcp login <name>`. Drives an interactive OAuth flow.
+/// Run `meka mcp login <name>`: an interactive OAuth flow.
 ///
-/// If the config has an explicit `[auth]` block, it's honored as-is. If the server is HTTP with no
-/// `auth` set, we assume `type = "oauth"` (authorization-code grant with dynamic client
-/// registration), run the flow, and on success persist the synthesized auth block back to
-/// `config.toml` so future runs skip the assumption. stdio servers without `auth` can't be logged
-/// in to and error.
+/// An explicit `[auth]` block is honored as written. An HTTP server without one is assumed to take
+/// `type = "oauth"`, and on success that block is written back to `config.toml` so later runs do
+/// not assume. A stdio server has nothing to log in to.
 pub(crate) async fn run_login(
     servers: &[McpServerConfig],
     token_store: &TokenStore,
     name: &str,
 ) -> Result<()> {
-    let base_config = servers
-        .iter()
-        .find(|server| server.name == name)
-        .ok_or_else(|| {
-            config_err(crate::text::unknown_name(
-                "MCP server",
-                name,
-                servers.iter().map(|server| server.name.as_str()),
-            ))
-        })?
-        .clone();
+    let base_config = require_server(servers, name)?.clone();
 
     // Ahead of the branch below rather than inside it, because a stored bearer makes *any* login
     // incoherent, not only the one that would invent an `[auth]` block. rmcp sends the transport's
@@ -801,8 +772,8 @@ pub(crate) async fn run_login(
         .is_some()
     {
         return Err(config_err(format!(
-            "server '{name}' already authenticates with a stored bearer, which takes precedence over \
-             anything a login obtains. Run `meka mcp logout {name}` to drop it first"
+            "server '{name}' has a stored bearer, which would override the login; drop it first \
+             with `meka mcp logout {name}`"
         )));
     }
 
@@ -822,7 +793,7 @@ pub(crate) async fn run_login(
             }
             McpTransport::Stdio => {
                 return Err(config_err(format!(
-                    "server '{name}' is stdio and has no 'auth' configured; nothing to log in to"
+                    "server '{name}' is stdio; there is nothing to log in to"
                 )));
             }
         }
@@ -832,8 +803,8 @@ pub(crate) async fn run_login(
     // is an *input* here, so clearing every kind would delete the credential the login needs.
     //
     // Kept aside until the new flow has produced a bundle. Cleared and not restored, a login that
-    // did not complete -- the browser step left for longer than the callback waits, a closed tab --
-    // logged the server out everywhere, a running `meka serve` included on its next restart.
+    // did not complete (a closed tab, a browser step outlasting the callback wait) logged the
+    // server out everywhere, a running `meka serve` included on its next restart.
     let previous_bundle = token_store
         .load_mcp_credentials(name, crate::store::McpCredentialKind::OAuth)
         .await?;
@@ -851,8 +822,8 @@ pub(crate) async fn run_login(
                     .await
             {
                 tracing::warn!(
-                    "the login did not complete and restoring the previous OAuth bundle for \
-                     '{name}' failed: {error}"
+                    "failed to restore the previous OAuth bundle for '{name}' after an incomplete \
+                     login: {error}"
                 );
             }
             false
@@ -866,11 +837,10 @@ pub(crate) async fn run_login(
     }
 
     if needs_persist && let Err(error) = persist_auth_block_for(name) {
-        // Login worked. Don't fail the whole command if we can't write the config back; just
-        // surface the issue so the user can decide whether to hand-edit.
+        // The login itself succeeded, so the write-back is a warning rather than a failure.
         tracing::warn!(
-            "'{name}' is authorized, but adding `type = \"oauth\"` under its [auth] table in \
-             config.toml failed: {error}"
+            "failed to write `[auth] type = \"oauth\"` for '{name}' to config.toml: {error}; the \
+             login itself succeeded"
         );
     }
 
@@ -878,12 +848,11 @@ pub(crate) async fn run_login(
     Ok(())
 }
 
-/// Write `[mcp.servers.auth] type = "oauth"` for a named server if the entry doesn't already have
-/// an `auth` key. Used by [`run_login`] to make the "assumed OAuth" path a one-time thing rather
-/// than silently reapplying the assumption on every future run.
+/// Write `[mcp.servers.auth] type = "oauth"` for a named server that has no `auth` key, so the
+/// assumption [`run_login`] made is recorded rather than reapplied on every later run.
 fn persist_auth_block_for(name: &str) -> Result<()> {
     // Held to the end of the function, so this read and the write below cannot interleave with
-    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
+    // another editor's, `device_id::persist` on an ordinary launch included.
     let _config_lock = crate::config::lock_config_file()
         .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
     let path = crate::paths::config_file_path()
@@ -1008,20 +977,16 @@ struct ResolvedAddArgs {
 
 /// Run `meka mcp add …`.
 ///
-/// Persists the server into `config.toml`, then for HTTP servers:
-///   1. Probes the endpoint (RFC 6750 / RFC 9728) to see if auth is required.
-///   2. If the probe says auth is required (or the user explicitly passed `--auth oauth`) and
-///      `--no-login` wasn't set, runs the OAuth authorization_code flow immediately so the whole
-///      setup is "add + authorize" in a single command.
-///   3. If that OAuth flow fails, rolls back by purging the entry we just wrote. The CLI exit is
-///      non-zero.
+/// Persists the server into `config.toml`, then for an HTTP server probes the endpoint (RFC 6750 /
+/// RFC 9728) and, when auth is required or `--auth oauth` was passed and `--no-login` was not, runs
+/// the OAuth flow at once. A failed flow purges the entry just written and exits non-zero.
 pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<()> {
     use crate::mcp::sanitize::{is_reserved_server_name, normalize_server_name};
 
     let normalized = normalize_server_name(&args.name);
     if normalized != args.name {
         return Err(config_err(format!(
-            "server name '{}' contains invalid characters (would normalize to '{}')",
+            "server name '{}' has invalid characters; '{}' would be accepted",
             args.name, normalized
         )));
     }
@@ -1034,16 +999,15 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
     let resolved = resolve_add_args(args)?;
 
     // Held across this read and the write below, so the two cannot interleave with another
-    // editor's -- including `device_id::persist`, which runs on an ordinary launch -- and released
-    // the moment the write lands. See the `drop` below for why it does not simply stay held.
+    // editor's (`device_id::persist` on an ordinary launch included), and released the moment the
+    // write lands; see the `drop` below.
     let config_lock = crate::config::lock_config_file()
         .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
     let path = crate::paths::config_file_path()
         .ok_or_else(|| config_err("failed to determine the config directory"))?;
 
-    // Propagate every read error except "the file does not exist yet". The previous
-    // `unwrap_or_default()` would happily silently overwrite a file we merely lacked permission to
-    // read.
+    // Only a missing file starts from empty: treating any read failure as empty would overwrite a
+    // file meka merely lacked permission to read.
     let existing = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -1063,13 +1027,13 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
         .entry("mcp")
         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
-        .ok_or_else(|| config_err("config 'mcp' is not a table"))?
+        .ok_or_else(|| config_err("`mcp` in config.toml is not a table"))?
         .entry("servers")
         .or_insert(toml_edit::Item::ArrayOfTables(
             toml_edit::ArrayOfTables::new(),
         ))
         .as_array_of_tables_mut()
-        .ok_or_else(|| config_err("config 'mcp.servers' is not an array of tables"))?;
+        .ok_or_else(|| config_err("`mcp.servers` in config.toml is not an array of tables"))?;
 
     for existing_entry in servers_array.iter() {
         if existing_entry
@@ -1078,32 +1042,25 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
             .is_some_and(|n| n == resolved.name)
         {
             return Err(config_err(format!(
-                "server '{}' already exists in config",
+                "server '{}' already exists in config.toml",
                 resolved.name
             )));
         }
     }
 
-    // A secret already filed under this name belongs to a server that is demonstrably not this one:
-    // the loop above has just established the name is absent from config. Silently inheriting it is
-    // the worst of the three options.
+    // A secret already filed under this name belongs to a server the loop above has just shown is
+    // not in config: a hand-deleted `[[mcp.servers]]` entry leaves its credentials behind. Adding
+    // the name again would attach the old bearer to whatever URL the new entry names, and clearing
+    // it would destroy a credential without being asked, so neither: name what is in the way and
+    // let `mcp remove` clear it properly, revoking at the provider on the way out.
     //
-    // Names go back on the market. Deleting an `[[mcp.servers]]` entry by hand removes the server
-    // but not its credentials, which is the state `mcp list` reports as orphaned. Adding the name
-    // again would otherwise attach the old bearer to whatever URL the new entry names and send it
-    // there on the first connect: a secret issued for one host, presented to another, with nothing
-    // on screen to say so. Clearing instead would destroy a credential without being asked. So
-    // neither -- name what is in the way and let the user decide, which `mcp remove` then does
-    // properly, revoking at the provider on its way out.
-    //
-    // Ordered after the duplicate check so the message can say the entry is gone and be right, and
-    // before the write so the refusal costs nothing and needs no rollback.
+    // After the duplicate check so the message can say the entry is gone, and before the write so
+    // the refusal needs no rollback.
     if token_store.has_mcp_credentials(&resolved.name).await? {
         return Err(config_err(format!(
-            "'{}' already has a stored credential, left over from a server of that name that is \
-             no longer in config.toml. Run `meka mcp remove {}` to clear it (that also revokes an \
-             OAuth token at the provider), then add the server again",
-            resolved.name, resolved.name
+            "'{0}' has a stored credential left over from a removed server; clear it first with \
+             `meka mcp remove {0}`",
+            resolved.name
         )));
     }
 
@@ -1118,14 +1075,10 @@ pub(crate) async fn run_add(args: AddArgs, token_store: &TokenStore) -> Result<(
         path = path.display()
     );
 
-    // Released before anything that talks to a network or waits on a human.
-    //
-    // `lock_config_file` blocks with no timeout, so holding it across the OAuth flow below meant
-    // that while this command sat waiting for a browser login, *any* other meka launch that touches
-    // `config.toml` hung indefinitely -- and `device_id::persist` touches it on every ordinary
-    // start for a `claude-subscription` profile without one. The read-modify-write above is what
-    // the lock exists for, and it is finished. `purge_server` takes the lock again for the rollback
-    // below, which is the only other write this function makes.
+    // Released before anything that talks to a network or waits on a human: `lock_config_file`
+    // blocks with no timeout, so holding it across the OAuth flow would hang every other meka
+    // launch that touches `config.toml` (`device_id::persist` does, on an ordinary start) for as
+    // long as the browser login takes. `purge_server` takes the lock again for the rollback below.
     drop(config_lock);
 
     // Secrets are not config, so they land here rather than in the table just written. Straight
@@ -1207,8 +1160,7 @@ async fn store_add_secrets(resolved: &ResolvedAddArgs, token_store: &TokenStore)
 async fn roll_back(name: &str, token_store: &TokenStore, error: MekaError) -> MekaError {
     if let Err(purge_error) = purge_server(name, token_store).await {
         tracing::warn!(
-            "rollback of '{name}' also failed: {purge_error}; you may need to edit config.toml by \
-             hand"
+            "failed to roll back '{name}': {purge_error}; remove its entry from config.toml by hand"
         );
     }
     error
@@ -1247,8 +1199,7 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
         return Ok(());
     }
 
-    // Synthesised server config for the login, equivalent to parsing the entry we just wrote but
-    // without round-tripping through disk.
+    // The entry just written, without a round trip through disk.
     let server_config = resolved_to_server_config(resolved);
     tracing::info!(
         "running OAuth authorization for '{name}' (use --no-login to skip)",
@@ -1262,9 +1213,8 @@ async fn probe_then_login(resolved: &ResolvedAddArgs, token_store: &TokenStore) 
     .await
 }
 
-/// What we need to know about the probe from `run_add`'s perspective. The full `McpAuthProbe`
-/// detail is printed to the user (so they still see "server reachable" / "couldn't reach …"), but
-/// the auto-login decision only needs the three-state summary.
+/// The probe as `run_add` decides on it: the full `McpAuthProbe` is logged, and the auto-login
+/// decision needs only these three states.
 #[derive(Debug, PartialEq, Eq)]
 enum ProbeOutcome {
     Open,
@@ -1303,9 +1253,8 @@ async fn probe_and_announce(name: &str, url: &str) -> ProbeOutcome {
 /// Turn the raw CLI [`AddArgs`] into a validated [`ResolvedAddArgs`].
 ///
 /// Auto-detects transport from the positional `location` when `--transport` is not given
-/// (`http[s]://…` → http, anything else → stdio). Rejects every illegal flag combination (stdio
-/// with http-only flags, `--auth-token` together with `--auth`, OAuth flags without an OAuth-family
-/// auth kind, etc.) at add time so bad configurations never land in `config.toml`.
+/// (`http[s]://…` → http, anything else → stdio). Refuses every illegal flag combination at add
+/// time, so a bad configuration never lands in `config.toml`.
 fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
     let AddArgs {
         name,
@@ -1350,7 +1299,7 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         .map(|level| {
             level
                 .parse::<crate::permission::Permission>()
-                .map_err(|error| config_err(format!("unknown permission level '{level}': {error}")))
+                .map_err(|error| config_err(format!("`--permission`: {error}")))
         })
         .transpose()?;
 
@@ -1363,22 +1312,20 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         for entry in &tool_permission {
             let (tool, level) = entry.split_once('=').ok_or_else(|| {
                 config_err(format!(
-                    "--tool-permission expects NAME=LEVEL, got '{entry}'"
+                    "`--tool-permission` takes TOOL=LEVEL, got '{entry}'"
                 ))
             })?;
             let tool = tool.trim();
             let level = level.trim();
             if tool.is_empty() {
                 return Err(config_err(format!(
-                    "--tool-permission '{entry}' has an empty tool name"
+                    "`--tool-permission` entry '{entry}' has an empty tool name"
                 )));
             }
             let level = level
                 .parse::<crate::permission::Permission>()
                 .map_err(|error| {
-                    config_err(format!(
-                        "--tool-permission '{entry}' has unknown level '{level}': {error}"
-                    ))
+                    config_err(format!("`--tool-permission` entry '{entry}': {error}"))
                 })?;
             map.insert(tool.to_string(), level);
         }
@@ -1409,19 +1356,17 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
 
     if auth_token.is_some() && auth.is_some() {
         return Err(config_err(
-            "--auth-token-stdin is mutually exclusive with --auth",
+            "`--auth-token-stdin` cannot be combined with `--auth`",
         ));
     }
 
     match transport {
         McpTransport::Stdio => {
             let command = location.ok_or_else(|| {
-                config_err(
-                    "stdio transport needs an executable (pass it as the positional argument)",
-                )
+                config_err("stdio transport needs an executable as the positional argument")
             })?;
             if !header.is_empty() {
-                return Err(config_err("--header is HTTP-only"));
+                return Err(config_err("`--header` is HTTP-only"));
             }
             if auth_token.is_some() || auth.is_some() || auth_flags_present {
                 return Err(config_err("auth flags are HTTP-only"));
@@ -1452,15 +1397,13 @@ fn resolve_add_args(args: AddArgs) -> Result<ResolvedAddArgs> {
         }
         McpTransport::Http => {
             let url = location.ok_or_else(|| {
-                config_err("http transport needs a URL (pass it as the positional argument)")
+                config_err("http transport needs a URL as the positional argument")
             })?;
             if !tail.is_empty() {
-                return Err(config_err(
-                    "http transport doesn't take trailing positional args",
-                ));
+                return Err(config_err("http transport takes no trailing arguments"));
             }
             if !env.is_empty() {
-                return Err(config_err("--env is stdio-only"));
+                return Err(config_err("`--env` is stdio-only"));
             }
 
             let headers = parse_kv_pairs("--header", &header)?;
@@ -1533,18 +1476,14 @@ fn resolve_auth_config(
     match auth {
         None => {
             if auth_flags_present && auth_token.is_none() {
-                return Err(config_err(
-                    "OAuth-family flags require --auth (oauth, client_credentials, or \
-                     client_credentials_jwt)",
-                ));
+                return Err(config_err("OAuth-family flags need `--auth`"));
             }
             Ok(None)
         }
         Some(McpAuthKind::OAuth) => {
             if signing_key.is_some() || signing_algorithm.is_some() {
                 return Err(config_err(
-                    "--signing-key and --signing-algorithm are only valid with \
-                     --auth client_credentials_jwt",
+                    "`--signing-key` and `--signing-algorithm` need `--auth client_credentials_jwt`",
                 ));
             }
             Ok(Some(McpAuthConfig::OAuth {
@@ -1555,22 +1494,19 @@ fn resolve_auth_config(
         }
         Some(McpAuthKind::ClientCredentials) => {
             let client_id = client_id
-                .ok_or_else(|| config_err("--auth client_credentials requires --client-id"))?;
+                .ok_or_else(|| config_err("`--auth client_credentials` needs `--client-id`"))?;
             if client_secret.is_none() {
                 return Err(config_err(
-                    "--auth client_credentials requires --client-secret-stdin",
+                    "`--auth client_credentials` needs `--client-secret-stdin`",
                 ));
             }
             if signing_key.is_some() || signing_algorithm.is_some() {
                 return Err(config_err(
-                    "--signing-key and --signing-algorithm are only valid with \
-                     --auth client_credentials_jwt",
+                    "`--signing-key` and `--signing-algorithm` need `--auth client_credentials_jwt`",
                 ));
             }
             if redirect_port.is_some() {
-                return Err(config_err(
-                    "--redirect-port is only valid with --auth oauth",
-                ));
+                return Err(config_err("`--redirect-port` needs `--auth oauth`"));
             }
             Ok(Some(McpAuthConfig::ClientCredentials {
                 client_id,
@@ -1580,19 +1516,17 @@ fn resolve_auth_config(
         }
         Some(McpAuthKind::ClientCredentialsJwt) => {
             let client_id = client_id
-                .ok_or_else(|| config_err("--auth client_credentials_jwt requires --client-id"))?;
+                .ok_or_else(|| config_err("`--auth client_credentials_jwt` needs `--client-id`"))?;
             let signing_key_path = signing_key.ok_or_else(|| {
-                config_err("--auth client_credentials_jwt requires --signing-key")
+                config_err("`--auth client_credentials_jwt` needs `--signing-key`")
             })?;
             if client_secret.is_some() {
                 return Err(config_err(
-                    "--client-secret-stdin is for --auth client_credentials, not -jwt",
+                    "`--auth client_credentials_jwt` signs a JWT and takes no `--client-secret-stdin`",
                 ));
             }
             if redirect_port.is_some() {
-                return Err(config_err(
-                    "--redirect-port is only valid with --auth oauth",
-                ));
+                return Err(config_err("`--redirect-port` needs `--auth oauth`"));
             }
             Ok(Some(McpAuthConfig::ClientCredentialsJwt {
                 client_id,
@@ -1612,10 +1546,10 @@ fn parse_kv_pairs(flag: &str, pairs: &[String]) -> Result<Vec<(String, String)>>
     for entry in pairs {
         let (k, v) = entry
             .split_once('=')
-            .ok_or_else(|| config_err(format!("{flag} expects KEY=VALUE, got '{entry}'")))?;
+            .ok_or_else(|| config_err(format!("`{flag}` takes KEY=VALUE, got '{entry}'")))?;
         if k.is_empty() {
             return Err(config_err(format!(
-                "{flag} entry '{entry}' has an empty key"
+                "`{flag}` entry '{entry}' has an empty key"
             )));
         }
         out.push((k.to_string(), v.to_string()));
@@ -1623,9 +1557,9 @@ fn parse_kv_pairs(flag: &str, pairs: &[String]) -> Result<Vec<(String, String)>>
     Ok(out)
 }
 
-/// Build an [`McpServerConfig`] equivalent to what parsing the entry we just wrote into
-/// `config.toml` would yield. Lets the auto-login path in [`run_add`] call into [`run_login`]
-/// without round-tripping through disk.
+/// An [`McpServerConfig`] equal to what parsing the entry just written to `config.toml` would
+/// yield, so the auto-login path in [`run_add`] can call [`run_login`] without a round trip
+/// through disk.
 fn resolved_to_server_config(resolved: &ResolvedAddArgs) -> McpServerConfig {
     let env = if resolved.env.is_empty() {
         None
@@ -1862,7 +1796,7 @@ enum Purged {
 /// deleted by hand: `mcp list` reports it, and nothing else would clear it.
 async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
     // Held to the end of the function, so this read and the write below cannot interleave with
-    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
+    // another editor's, `device_id::persist` on an ordinary launch included.
     let _config_lock = crate::config::lock_config_file()
         .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
     let path = crate::paths::config_file_path()
@@ -1886,7 +1820,11 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
 
     if !removed_from_config {
         if !token_store.has_mcp_credentials(name).await? {
-            return Err(config_err(format!("no server named '{name}' in config")));
+            return Err(config_err(crate::text::unknown_name(
+                "MCP server",
+                name,
+                server_names(&document),
+            )));
         }
         clear_server_state(name, token_store).await?;
         return Ok(Purged::CredentialsOnly);
@@ -1897,6 +1835,23 @@ async fn purge_server(name: &str, token_store: &TokenStore) -> Result<Purged> {
 
     clear_server_state(name, token_store).await?;
     Ok(Purged::Server(path))
+}
+
+/// The server names `config.toml` carries, off the raw document, for a refusal on a file the typed
+/// config may not parse.
+fn server_names(document: &toml_edit::DocumentMut) -> Vec<String> {
+    document
+        .get("mcp")
+        .and_then(|mcp| mcp.get("servers"))
+        .and_then(|servers| servers.as_array_of_tables())
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|entry| entry.get("name").and_then(|name| name.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Drop everything meka stores about `name` outside `config.toml`: every credential kind, the
@@ -1935,7 +1890,7 @@ pub(crate) async fn run_remove(name: &str, token_store: &TokenStore) -> Result<(
 /// [`crate::fs::write_file_atomic`].
 fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::PathBuf> {
     // Held to the end of the function, so this read and the write below cannot interleave with
-    // another editor's -- including `device_id::persist`, which runs on an ordinary launch.
+    // another editor's, `device_id::persist` on an ordinary launch included.
     let _config_lock = crate::config::lock_config_file()
         .map_err(|error| config_err(format!("failed to lock config: {error}")))?;
     let path = crate::paths::config_file_path()
@@ -1946,17 +1901,19 @@ fn set_server_disabled(name: &str, disabled: bool) -> Result<std::path::PathBuf>
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| config_err(format!("failed to parse config: {error}")))?;
 
+    let known = server_names(&document);
+    let unknown = || config_err(crate::text::unknown_name("MCP server", name, known.iter()));
     let servers = document
         .get_mut("mcp")
         .and_then(|m| m.as_table_mut())
         .and_then(|t| t.get_mut("servers"))
         .and_then(|s| s.as_array_of_tables_mut())
-        .ok_or_else(|| config_err("no MCP servers in config"))?;
+        .ok_or_else(unknown)?;
 
     let entry = servers
         .iter_mut()
         .find(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(name))
-        .ok_or_else(|| config_err(format!("no server named '{name}' in config")))?;
+        .ok_or_else(unknown)?;
 
     if disabled {
         entry.insert("disabled", toml_edit::value(true));
@@ -1995,7 +1952,7 @@ pub(crate) async fn run_mcp_subcommand(
     // `validate()` never runs here, so an unparseable config has to be handled per action. The four
     // that edit `config.toml` through `toml_edit` never read `config.mcp_servers` and are how the
     // file gets repaired, so they run on a broken one; the rest would answer out of an empty server
-    // list and state it as fact ("No MCP servers configured.", "no MCP server named 'x'").
+    // list and state it as fact ("No MCP servers.", "no MCP server named 'x'").
     if matches!(
         action,
         crate::cli::McpAction::Add { .. }
@@ -2035,7 +1992,7 @@ pub(crate) async fn run_mcp_subcommand(
         } => {
             use crate::store::McpCredentialKind;
 
-            // Clap rejects both flags at once, so at most one of these reads stdin.
+            // Clap refuses both flags at once, so at most one of these reads stdin.
             let stored = match (
                 crate::cli::read_secret_from_stdin(*auth_token_stdin, "auth token")?,
                 crate::cli::read_secret_from_stdin(*client_secret_stdin, "client secret")?,
@@ -2096,7 +2053,7 @@ pub(crate) async fn run_mcp_subcommand(
                     header: header.clone(),
                     auth: *auth,
                     // Read here rather than in `run_add` because stdin is a process-wide resource
-                    // and this is the layer that owns it. Clap has already rejected both flags at
+                    // and this is the layer that owns it. Clap has already refused both flags at
                     // once, so at most one of these two reads the stream.
                     auth_token: crate::cli::read_secret_from_stdin(
                         *auth_token_stdin,
@@ -2215,7 +2172,7 @@ mod tests {
         let mut args = bare_add("srv", Some("https://example.com"));
         args.args = vec!["extra".to_string()];
         let err = resolve_add_args(args).expect_err("should reject trailing args on http");
-        assert!(format!("{err}").contains("trailing positional args"));
+        assert!(format!("{err}").contains("trailing arguments"));
     }
 
     #[test]
@@ -2223,7 +2180,7 @@ mod tests {
         let mut args = bare_add("srv", Some("https://example.com"));
         args.env = vec!["K=V".to_string()];
         let err = resolve_add_args(args).expect_err("env on http should error");
-        assert!(format!("{err}").contains("--env is stdio-only"));
+        assert!(format!("{err}").contains("`--env` is stdio-only"));
     }
 
     #[test]
@@ -2231,7 +2188,7 @@ mod tests {
         let mut args = bare_add("srv", Some("/usr/bin/mcp"));
         args.header = vec!["X-Custom=1".to_string()];
         let err = resolve_add_args(args).expect_err("header on stdio should error");
-        assert!(format!("{err}").contains("--header is HTTP-only"));
+        assert!(format!("{err}").contains("`--header` is HTTP-only"));
     }
 
     #[test]
@@ -2240,7 +2197,7 @@ mod tests {
         args.auth_token = Some("tok".to_string());
         args.auth = Some(crate::cli::McpAuthKind::OAuth);
         let err = resolve_add_args(args).expect_err("mutually exclusive flags");
-        assert!(format!("{err}").contains("mutually exclusive"));
+        assert!(format!("{err}").contains("cannot be combined"));
     }
 
     #[test]
@@ -2852,6 +2809,6 @@ mod tests {
             Ok(()) => panic!("removing a name that exists nowhere must fail"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("no server named 'typo'"), "{error}");
+        assert!(error.contains("no MCP server named 'typo'"), "{error}");
     }
 }

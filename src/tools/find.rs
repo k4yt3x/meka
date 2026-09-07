@@ -124,9 +124,8 @@ impl Tool for FindFilesTool {
             // and an ACP client may send it in `additionalDirectories`.
             let base: std::path::PathBuf = base.components().collect();
             // `glob` takes a `&str` and there is no byte-oriented entry point, so a root that is
-            // not valid UTF-8 cannot be searched. Refused loudly. Left to `to_string_lossy` it
-            // became a path that does not exist, `glob` yielded nothing, and `find_files` reported
-            // "No files found" -- a definitive answer to a question it never actually asked.
+            // not valid UTF-8 cannot be searched. Refused loudly: `to_string_lossy` would name a
+            // path that does not exist and report "No files found" as a definitive answer.
             let Some(base) = base.to_str() else {
                 return Err(MekaError::ToolExecution {
                     tool_name: "find_files".to_string(),
@@ -207,8 +206,8 @@ fn run_walk(
     // reaches it, so the cap is not a bound on the walk. `budget` is.
     let mut total: usize = 0;
     // A pattern rooted high in the tree crosses directories the user cannot read, one `GlobError`
-    // each. Logging every one at `warn` is what turned a `/`-rooted walk into gigabytes of log
-    // output, so they are counted here and reported once.
+    // each; a `/`-rooted walk logging every one at `warn` would produce gigabytes of log output,
+    // so they are counted here and reported once.
     let mut unreadable: usize = 0;
     let mut timed_out = false;
 
@@ -482,8 +481,8 @@ mod tests {
 
     #[tokio::test]
     async fn find_files_explicit_limit_with_scratchpad_caps() {
-        // Regression: an explicit `limit` should beat the scratchpad "unbounded" default; the
-        // agent might legitimately want a bounded scratchpad collection.
+        // An explicit `limit` beats the scratchpad "unbounded" default: the agent may want a
+        // bounded scratchpad collection.
         let temp_dir = tempfile::tempdir().expect("tempdir");
         for i in 0..600 {
             std::fs::write(temp_dir.path().join(format!("f{i}.txt")), "").expect("write");

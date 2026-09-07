@@ -21,27 +21,21 @@ pub(super) const DEGRADE_TIERS: [DegradeTier; 2] =
 /// What [`TurnRecovery::suspect_floor`] becomes once a compaction has rewritten the conversation:
 /// the whole of it is suspect.
 ///
-/// A compaction replaces the conversation wholesale and stamps [`LAST_ACCEPTED_UNKNOWN`], which
-/// says exactly this -- no length recorded against the old shape addresses anything in the new one,
-/// so nothing in it is known-accepted. The floor has to say the same, and zero is the only value
-/// that does.
+/// A compaction replaces the conversation wholesale and stamps [`LAST_ACCEPTED_UNKNOWN`]: no
+/// length recorded against the old shape addresses anything in the new one, so nothing in it is
+/// known-accepted, and zero is the only floor that says the same. The post-compaction
+/// `messages.len()` would claim the opposite, and the clamp in `repair_rejected_content` would then
+/// read an empty suspect window and leave the degrade-and-retry silently inert.
 ///
-/// Setting it to the post-compaction `messages.len()` makes the opposite claim: that everything
-/// present is known-good. The clamp in `repair_rejected_content` then read the two as an *empty*
-/// suspect window, both tiers found nothing, and the degrade-and-retry became silently inert for
-/// the rest of the turn -- in exactly the large-conversation case that triggers a compaction and is
-/// likeliest to be carrying a refused attachment. It failed quietly: with no tier spent, even the
-/// `/rewind` hint stayed suppressed.
-///
-/// The cost is reach. Index 0 is the summary, plain text no tier touches, but the verbatim tail
+/// The cost is reach: index 0 is the summary, plain text no tier touches, but the verbatim tail
 /// after it came from earlier turns, so a degrade here can empty a tool exchange this turn did not
-/// create. That is the same reach the cross-turn `last_accepted_len` already has, it happens only
-/// after the cheaper tier has been refused, and it is undone unless the retry carrying it succeeds.
+/// create. That is the same reach the cross-turn `last_accepted_len` already has, and it is undone
+/// unless the retry carrying it succeeds.
 pub(super) const SUSPECT_FLOOR_AFTER_REWRITE: usize = 0;
 /// How far [`degrade_rejected_content`] goes when rewriting the content a request was refused for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DegradeTier {
-    /// Replace non-text content -- a tool result's images, a message's own attachments -- with a
+    /// Replace non-text content (a tool result's images, a message's own attachments) with a
     /// note, leaving the surrounding `tool_use` / `tool_result` structure untouched.
     Attachments,
     /// Empty the turn's tool exchanges where they stand: the call keeps its name and identity and
@@ -50,9 +44,9 @@ pub(super) enum DegradeTier {
     /// undone.
     ///
     /// Reaches content [`Self::Attachments`] cannot. A tool result is usually text, and a provider
-    /// that refuses one -- a body it cannot encode, a filter, sheer size -- leaves nothing for the
+    /// that refuses one (a body it cannot encode, a filter, sheer size) leaves nothing for the
     /// first tier to remove, so without a later tier the turn dies with the refused text still
-    /// committed and every later turn re-sends it. This also reaches the *arguments*, which no tier
+    /// committed and every later turn re-sends it. This also reaches the arguments, which no tier
     /// that preserves the call can: a `tool_use` the provider objects to is repaired only by
     /// ceasing to be one.
     ToolExchanges,
@@ -64,14 +58,11 @@ pub(super) const LAST_ACCEPTED_UNKNOWN: usize = usize::MAX;
 pub(super) const GENERATION_UNKNOWN: u64 = u64::MAX;
 /// Everything a turn has to remember in order to recover from a round that went wrong.
 ///
-/// These nine values were locals of [`Agent::run_turn`], declared across eighty lines of
-/// setup and then mutated from arms scattered through several hundred more, which left the ways
-/// they depend on each other invisible. They are not independent: an emergency compaction has to
-/// invalidate the pending repair and move the floor a later rejection is allowed to blame, a repair
-/// is only undoable by the round that proves it wrong, and the withdrawal at the end of the turn is
-/// only safe while the log still measures what it measured before the first provider call. Holding
-/// them together, with one method per recovery path, puts each of those couplings in one place
-/// instead of leaving it to be reconstructed from the order of the assignments.
+/// One struct with one method per recovery path because the fields are not independent: an
+/// emergency compaction has to invalidate the pending repair and move the floor a later rejection
+/// is allowed to blame, a repair is only undoable by the round that proves it wrong, and the
+/// withdrawal at the end of the turn is only safe while the log still measures what it measured
+/// before the first provider call.
 pub(super) struct TurnRecovery {
     /// The turn's request base. Wrapped in `Arc` once so a round that appended nothing shares it
     /// with a cheap `Arc::clone` instead of a deep `Vec` clone, and rebuilt from the conversation
@@ -91,9 +82,9 @@ pub(super) struct TurnRecovery {
     pub(super) suspect_floor: usize,
     /// The log's length with this turn's prompt on the end and nothing after it. A withdrawal is
     /// only safe while it still reads this, so it is captured up front rather than reconstructed
-    /// later: every way the turn can move on from its prompt -- an assistant reply, a tool round,
-    /// either compaction, a repair, the thinking-only nudge -- goes through the event log and
-    /// moves this number. Inspecting the materialized tail instead is not equivalent, because
+    /// later: every way the turn can move on from its prompt (an assistant reply, a tool round,
+    /// either compaction, a repair, the thinking-only nudge) goes through the event log and moves
+    /// this number. Inspecting the materialized tail instead is not equivalent, because
     /// a compaction summary and a nudge are both plain `User` messages that look exactly like
     /// a prompt from the outside.
     pub(super) prompt_only_events: usize,
@@ -151,8 +142,8 @@ impl TurnRecovery {
         self.overflow_retries += 1;
         tracing::warn!("provider reported context overflow; compacting and retrying ({reason})");
         // The rebuild this does is recomputed below from the compacted conversation, so it is
-        // redundant here rather than wrong. Kept because the alternative is a second entry point
-        // that undoes *without* restoring the request base, which is the shape the bug had.
+        // redundant here rather than wrong; a second entry point that undoes without restoring
+        // the request base is the alternative.
         self.undo_rejected_repair(agent, messages);
         if let Err(compact_error) = agent
             .compact_session(
@@ -162,11 +153,9 @@ impl TurnRecovery {
             )
             .await
         {
-            // An interrupt is not an overflow, and became reachable here only once
-            // `compact_session` began refusing to rewrite the window on a fired token. Relabeling
-            // it would answer a user who pressed stop with "the conversation exceeds the model's
-            // context window", and under `serve` with a 502 `/errors/context-overflow` -- telling
-            // them to shorten a conversation that was never the problem.
+            // An interrupt is not an overflow: relabeling it would answer a user who pressed stop
+            // with "the conversation exceeds the model's context window", and under `serve` with
+            // a 502 `/errors/context-overflow`.
             if matches!(compact_error, MekaError::Interrupted) {
                 return Err(compact_error);
             }
@@ -188,7 +177,7 @@ impl TurnRecovery {
     /// emergency retry per turn and must survive a compaction to do that.
     ///
     /// Absent for a different reason: `pending_repair`. Both callers sit where it is already
-    /// `None` -- the overflow path undoes it first, and the tool loop's drain runs after
+    /// `None`: the overflow path undoes it first, and the tool loop's drain runs after
     /// `persist_vindicated_repair` has taken it. A third caller placed before a 2xx would need to
     /// undo the repair itself; this does not, and would otherwise leave the log describing a
     /// conversation the compaction replaced.
@@ -236,7 +225,7 @@ impl TurnRecovery {
     /// Returns `rejection` verbatim when no tier finds anything, which means the complaint was
     /// never about content: a `max_tokens` over the model's ceiling, an unknown header, a bad
     /// `tool_choice`. Verbatim rather than reclassified, because the turn's failure is still the
-    /// provider's -- relabeling a 500 as [`MekaError::InvalidRequest`] would have the HTTP surface
+    /// provider's: relabeling a 500 as [`MekaError::InvalidRequest`] would have the HTTP surface
     /// answer 4xx for an upstream fault.
     pub(super) async fn repair_rejected_content(
         &mut self,
@@ -272,17 +261,16 @@ impl TurnRecovery {
             // Only once a tier has actually been spent, which is what makes this a report rather
             // than a guess: the turn degraded real content, was refused anyway, and has just put
             // that content back where every later turn will re-send it. With no tier spent the
-            // window held nothing either tier could name, so the complaint was about the request
-            // and not its contents -- a `max_tokens` over the ceiling, an unknown header -- and
-            // pointing at `/rewind` would send the user to delete a turn that is not the problem.
+            // complaint was about the request and not its contents (a `max_tokens` over the
+            // ceiling, an unknown header), and pointing at a rewind would send the user to delete
+            // a turn that is not the problem.
             if self.tiers_tried > 0 {
                 agent
                     .cells
                     .frontend
                     .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
                         "the content this turn added is back in the session; if the next turn \
-                         fails the same way, shorten the session (`/rewind` in the REPL, \
-                         `meka session rewind`, or POST /rewind)"
+                         fails the same way, rewind the session"
                             .to_string(),
                     )))
                     .await;
@@ -308,29 +296,23 @@ impl TurnRecovery {
             "provider rejected the request; degrading {replaced_count} message(s) appended since the last \
              accepted one ({tier:?}) and retrying ({reason})"
         );
-        agent.cells.frontend
+        agent
+            .cells
+            .frontend
             .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
-                // Says what meka did, not why the provider did what it did. On the 5xx path the
-                // provider judged nothing and rejected nothing -- it failed, repeatedly, and this
-                // is the turn's last guess at the cause -- so the older wording ("provider rejected
-                // content in this turn") asserted something meka does not know and, on an overload,
-                // was simply false.
+                // Says what meka did, not why the provider did what it did: on the 5xx path the
+                // provider judged nothing, and this is the turn's last guess at the cause.
                 //
-                // No provider body here. `reason` is the verbatim rejection text from
-                // `error::provider_http_error`, and this notice reaches the REPL and ACP as well as
-                // `serve`, where `[serve] relay_provider_errors` does not apply. The full text is
-                // on the `warn!` immediately above, at default verbosity.
+                // No provider body here: `reason` is the verbatim rejection text, and this notice
+                // reaches the REPL and ACP as well as `serve`, where `[serve]
+                // relay_provider_errors` does not apply. The full text is on the
+                // `warn!` above.
                 //
-                // Names the way back, and names the *right* one. What a degrade removes is gone
-                // from the conversation, not from the session: the log is append-only, so the
-                // superseded rows are still on disk. But `--format json` is the only export that
-                // returns them, because the markdown writer renders a user message as its text and
-                // drops `ContentBlock::Image` outright, which is precisely the content
-                // `DegradeTier::Attachments` takes. Pointing at the default format would send
-                // somebody to a file their screenshot is not in.
-                "the provider would not take this turn's content; retrying without some of it. Its \
-                 response is in the log, and `meka session export --format json` still has the \
-                 original."
+                // `--format json`, not the default: the markdown writer drops
+                // `ContentBlock::Image` outright, which is precisely the content
+                // `DegradeTier::Attachments` takes.
+                "the provider would not take this turn's content; retrying without some of it \
+                 (`meka session export --format json` keeps the original)"
                     .to_string(),
             )))
             .await;
@@ -353,15 +335,13 @@ impl TurnRecovery {
     /// [`MekaError::InvalidRequest`] is the provider stating that it read the body and would not
     /// take it, which no amount of waiting changes, so that path degrades immediately as before.
     ///
-    /// The point is that a spent retry budget has two readings and the loop cannot see which it
-    /// has. `refusal_may_blame_content` admits a 5xx on a completion because a gateway reports its
-    /// own decoder's exception that way -- but so does a gateway that is merely overloaded, and the
-    /// retry sequence is two attempts across three seconds of backoff, which an ordinary burst
-    /// outlasts. Degrading on the wrong reading is not a wasted round trip: the degraded retry
-    /// succeeds because the outage ended, and [`Self::persist_vindicated_repair`] writes the
-    /// content loss to the store as proven-good. One wait, one unmodified attempt, and the
-    /// ambiguity is gone -- for the price of a delay paid only by a turn that was otherwise about
-    /// to start deleting things.
+    /// A spent retry budget has two readings and the loop cannot see which it has:
+    /// `refusal_may_blame_content` admits a 5xx on a completion because a gateway reports its own
+    /// decoder's exception that way, but so does a gateway that is merely overloaded, and the retry
+    /// sequence is two attempts across three seconds of backoff, which an ordinary burst outlasts.
+    /// Degrading on the wrong reading is not a wasted round trip: the degraded retry succeeds
+    /// because the outage ended, and [`Self::persist_vindicated_repair`] writes the content loss
+    /// to the store as proven-good.
     ///
     /// The sleep races the turn's cancellation token, and a canceled wait still returns `true`:
     /// the loop head is where interruption is answered, and sending control back there is how this
@@ -384,9 +364,9 @@ impl TurnRecovery {
             return false;
         }
         self.outage_reprieve_used = true;
-        // The same hint the retry layer already obeyed twice. Destructuring it rather than
-        // discarding it is the whole of this: waiting less than the provider asked for, on the one
-        // decision that removes content, was answering the question with the least evidence.
+        // The same hint the retry layer already obeyed twice: waiting less than the provider asked
+        // for, on the one decision that removes content, would answer the question with the least
+        // evidence.
         let delay = crate::provider::retry::outage_reprieve(*retry_after);
         tracing::warn!(
             "provider failed every retry ({error}); waiting {delay:?} and re-sending unchanged before \
@@ -397,8 +377,8 @@ impl TurnRecovery {
             .frontend
             .emit(FrontendEvent::Notice(crate::frontend::Notice::warn(
                 format!(
-                    "the provider failed every retry; waiting {}s and trying the same request once \
-                 more before removing anything from this turn",
+                    "the provider failed every retry; waiting {}s and re-sending unchanged before \
+                     removing anything from this turn",
                     delay.as_secs()
                 ),
             )))
@@ -425,13 +405,10 @@ impl TurnRecovery {
     /// disagreeing with its own store until the process ends.
     pub(super) fn undo_rejected_repair(&mut self, agent: &Agent, messages: &mut Conversation) {
         if self.pending_repair.take().is_some() && messages.pop_repair() {
-            // Putting the conversation back is only half of it. `repair_rejected_content` also
+            // Putting the conversation back is only half of it: `repair_rejected_content` also
             // rebuilt `base_messages` from the degraded conversation, and that is the slice the
-            // request is actually assembled from -- both tiers preserve message *count*, so
-            // `messages.len() == turn_start_len` still holds and the next round takes the branch
-            // that sends `base_messages` verbatim. Restoring one without the other left the next
-            // request carrying content the conversation no longer had, which is how an "unchanged
-            // re-send" came to send the degraded body.
+            // request is assembled from, since both tiers preserve message count and the next
+            // round takes the branch that sends `base_messages` verbatim.
             self.base_messages = Arc::from(truncate_messages_for_context(
                 messages.as_slice(),
                 agent.options.context_messages,
@@ -446,21 +423,13 @@ impl TurnRecovery {
     /// Forget what this turn has already tried, because the provider just accepted a request.
     ///
     /// Both counters exist to stop a turn re-running a recovery that has already been disproved,
-    /// and a 2xx is what disproves the disproof: whatever the next refusal is about, it is not the
-    /// exchange that just succeeded. Keying on acceptance rather than on a vindicated *repair* is
-    /// the whole point. The obvious place for this is `persist_vindicated_repair`, and putting it
-    /// there was wrong in the one case that matters most: when the outage reprieve does its job --
-    /// the wait passes, the unchanged re-send returns 2xx -- no repair was ever applied, so there
-    /// is nothing to vindicate and the reset never ran. The reprieve stayed spent for the rest of
-    /// the turn, and a second, unrelated 5xx thirty rounds later would degrade on the spot: exactly
-    /// the silent content loss [`crate::provider::retry::OUTAGE_REPRIEVE`] exists to prevent.
+    /// and a 2xx is what disproves the disproof. Keyed on acceptance rather than on a vindicated
+    /// repair because when the outage reprieve does its job no repair was ever applied, so there
+    /// is nothing to vindicate, and the reprieve would stay spent for the rest of the turn. It also
+    /// covers a tier applied, undone, and then followed by a successful unchanged re-send, which
+    /// leaving it counted would skip on the next refusal.
     ///
-    /// It also covers a case the repair-keyed version could not express at all. A tier applied,
-    /// undone, and then followed by a *successful* unchanged re-send has been shown to have been
-    /// unnecessary; leaving it counted would have the next refusal skip straight past the cheap
-    /// tier it never needed to spend.
-    ///
-    /// This cannot loop. Every reset costs a round trip the provider accepted, so it happens only
+    /// This cannot loop: every reset costs a round trip the provider accepted, so it happens only
     /// as often as the turn makes real progress, which the tool loop already bounds.
     pub(super) fn note_request_accepted(&mut self) {
         self.tiers_tried = 0;
@@ -476,15 +445,11 @@ impl TurnRecovery {
     /// completes; the cost is that a resume re-reads the rejected content and pays one more
     /// round trip to heal it again.
     ///
-    /// [`Self::tiers_tried`] resets, because a vindicated tier was not spent, it was *right*.
-    /// Leaving it counted made the next refusal in the same turn skip it: a turn whose prompt
-    /// attachment `Attachments` had just removed successfully would answer a second refusal --
-    /// over an image a later `read_file` returned, which that same tier reaches -- by jumping
-    /// straight to `ToolExchanges` and destroying the tool result whole. It also made the
-    /// `/rewind` hint in [`Self::repair_rejected_content`] fire on a turn that had restored
-    /// nothing, telling the user content was back in the session when it had been removed for
-    /// good. The bound the counter exists for is unaffected: a reset costs a 2xx, so it can only
-    /// happen as often as the turn makes real progress.
+    /// [`Self::tiers_tried`] resets, because a vindicated tier was not spent, it was right:
+    /// leaving it counted would make a second refusal in the same turn (over an image a later
+    /// `read_file` returned, which `Attachments` reaches) jump straight to `ToolExchanges` and
+    /// destroy the tool result whole. The bound the counter exists for is unaffected: a reset
+    /// costs a 2xx.
     pub(super) async fn persist_vindicated_repair(&mut self, agent: &Agent, session_id: Uuid) {
         if let Some(event) = self.pending_repair.take()
             && let Err(error) = agent.store.save_event(session_id, &event).await
@@ -516,15 +481,13 @@ impl TurnRecovery {
     /// Ask once for a user-visible response after a turn that made no tool call and produced only
     /// thinking (or nothing at all), which would otherwise end silently.
     ///
-    /// Mirrors Claude Code's `query_thinking_only_response`: record the turn, then nudge and
-    /// continue. The nudge is appended *after* the assistant message so the thinking-only turn
-    /// isn't the trailing assistant message - Claude strips trailing thinking blocks only from
-    /// the last assistant turn, so keeping it non-last preserves its thinking block on the
-    /// retry request.
+    /// The nudge is appended after the assistant message so the thinking-only turn is not the
+    /// trailing assistant message: Claude strips trailing thinking blocks only from the last
+    /// assistant turn, so keeping it non-last preserves its thinking block on the retry request.
     ///
     /// Memory moves only once the pair is on disk. The two are one unit, and a save that fails
-    /// ends the turn: appending first left the reasoning in the conversation with nothing behind
-    /// it in the store, so the session's next request carried a message a resume would never see.
+    /// ends the turn: appending first would leave the reasoning in the conversation with nothing
+    /// behind it in the store.
     pub(super) async fn nudge_thinking_only(
         &mut self,
         agent: &Agent,
@@ -557,13 +520,12 @@ impl TurnRecovery {
     /// Take back a prompt whose turn produced nothing at all, for a caller whose prompt will be
     /// produced again ([`crate::conversation::PromptRetention::WithdrawOnFailure`]).
     ///
-    /// Whether the prompt reached disk decides how, and the difference is not cosmetic. Persisted,
-    /// it is withdrawn by appending an [`crate::conversation::Event::Repair`] rather than deleting
-    /// a row: the log stays append-only, and the materialized view -- which is what a later
-    /// turn actually sends -- loses the orphan. Unpersisted, it has to be dropped from memory
-    /// instead, because a `Repair` is position-relative and writing one for an `Append` that
-    /// never reached disk would, on reload, delete whatever message *does* sit at the end of
-    /// the stored log: a turn from before this one.
+    /// Whether the prompt reached disk decides how. Persisted, it is withdrawn by appending an
+    /// [`crate::conversation::Event::Repair`] rather than deleting a row: the log stays
+    /// append-only, and the materialized view (what a later turn sends) loses the orphan.
+    /// Unpersisted, it has to be dropped from memory instead, because a `Repair` is
+    /// position-relative and writing one for an `Append` that never reached disk would, on reload,
+    /// delete whatever message does sit at the end of the stored log.
     pub(super) async fn withdraw_unanswered_prompt(
         &self,
         agent: &Agent,
@@ -668,20 +630,15 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                         ContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
                             content: kept,
-                            // Whatever the call actually reported, which for the case this tier
-                            // exists to serve is `false`: `read_file` returned the image it was
-                            // asked for, and the provider then refused the request carrying it, so
-                            // flagging the call as failed told the model its own call had gone
-                            // wrong. That was both untrue and the wrong lesson -- the note above
-                            // carries the real instruction.
-                            //
-                            // Carried rather than hardcoded to `false`, because a tool can fail
-                            // *and* return non-text: `mcp::handler` passes an MCP server's
-                            // `isError: true` through beside its image blocks, and this tier runs
-                            // over the whole conversation, so a constant would rewrite any earlier
-                            // turn's genuinely-failed image-bearing result as a success. Tier 2
-                            // sets it unconditionally and is right to: there the call and its
-                            // result are both gone.
+                            // Whatever the call actually reported: `read_file` returned the image
+                            // it was asked for and the provider refused the request carrying it,
+                            // so flagging the call as failed would teach the model the wrong
+                            // lesson; the note above carries the real instruction. Carried rather
+                            // than hardcoded to `false` because a tool can fail and return
+                            // non-text (`mcp::handler` passes `isError: true` through beside image
+                            // blocks), and a constant would rewrite an earlier turn's genuinely
+                            // failed result as a success. Tier 2 sets it unconditionally: there
+                            // the call and its result are both gone.
                             is_error: *is_error,
                         }
                     }
@@ -719,24 +676,20 @@ pub(super) fn neutralized_arguments() -> serde_json::Value {
 /// [`DegradeTier::ToolExchanges`]: empty the tool exchanges in `messages` where they stand, moving
 /// what the call carried into the result that reports it.
 ///
-/// **Nothing here changes the shape of the conversation.** A `tool_use` stays a `tool_use` and a
-/// `tool_result` stays a `tool_result`, so the one invariant both APIs enforce on replay -- that
-/// the two are matched -- cannot be broken by the repair. That is the whole design. Replacing the
-/// pair with plain text would orphan any `tool_result` whose call sits in already-accepted history
-/// unless that case were special-cased, and every provider refuses an orphan outright: the
-/// rejection this function exists to recover from would become a permanent one it cannot. Keeping
-/// the shape deletes that hazard rather than handling it.
+/// Nothing here changes the shape of the conversation: a `tool_use` stays a `tool_use` and a
+/// `tool_result` stays a `tool_result`, so the one invariant both APIs enforce on replay (that the
+/// two are matched) cannot be broken by the repair. Replacing the pair with plain text would orphan
+/// any `tool_result` whose call sits in already-accepted history, and every provider refuses an
+/// orphan outright.
 ///
 /// Two more things fall out of the same choice. The turn still ends in a `tool_use`, so the
 /// reasoning the provider issued for it stays valid and is left alone. And the result keeps
-/// `is_error` with a text body, which is byte-identical in shape to any ordinary tool failure
-/// ([`Agent::resolve_and_execute_tool`] produces exactly this for a denied permission or an unknown
-/// name), so the model needs no new concept and no frontend needs new rendering.
+/// `is_error` with a text body, which is byte-identical in shape to any ordinary tool failure, so
+/// the model needs no new concept and no frontend needs new rendering.
 ///
-/// The arguments move into the result rather than staying on the call. Size is the way a `tool_use`
-/// earns a refusal -- the model can emit a very large one -- so leaving it in place would leave the
-/// tier unable to reach the thing that may have caused the failure. They are quoted, truncated, in
-/// the result, which puts what was sent and why it failed in one block, which is where the model
+/// The arguments move into the result rather than staying on the call: size is the way a `tool_use`
+/// earns a refusal, so leaving it in place would leave the tier unable to reach the thing that may
+/// have caused the failure. They are quoted, truncated, in the result, which is where the model
 /// already looks to find out what happened to a call.
 pub(super) fn neutralize_tool_exchanges(
     messages: &[Message],
@@ -814,20 +767,14 @@ pub(super) fn neutralize_tool_exchanges(
 /// Make a provider's rejection text safe to put inside a `[meka harness]` note.
 ///
 /// The note is meka's own voice to the model, and the marker is what tells a model that the
-/// sentence around it comes from the harness rather than from the tool or the provider. Nothing
-/// interpolated into it may forge that. `render_error_body` only trims and [`elide`] only
-/// truncates, so up to [`REJECTION_REASON_LIMIT`] characters of upstream-controlled text were
-/// landing inside the marker verbatim.
+/// sentence around it comes from the harness rather than from the tool or the provider, so nothing
+/// interpolated into it may forge that; `render_error_body` only trims and [`elide`] only
+/// truncates.
 ///
-/// Two steps, because neither is sufficient alone. [`crate::text::sanitize_text`] is this
-/// codebase's existing door for foreign text entering a conversation, and strips the control
-/// characters and bidi overrides -- but it deliberately whitelists `\n` (see its own comment), so a
-/// body containing a newline followed by the marker passes through it intact. Stripping the marker
-/// itself is the load-bearing half; a model does not need it at column zero to read it as one.
-///
-/// This needs no hostile gateway. `REJECTION_REASON_LIMIT`'s own doc names the realistic path: a
-/// provider echoing the request body back, which reproduces any harness note already in the
-/// conversation -- from an earlier degrade, or from the tool-schema advisory in `crate::tools`.
+/// Two steps, because neither is sufficient alone: [`crate::text::sanitize_text`] strips the
+/// control characters and bidi overrides but deliberately whitelists `\n`, so a body containing a
+/// newline followed by the marker passes through it intact. This needs no hostile gateway: a
+/// provider echoing the request body back reproduces any harness note already in the conversation.
 pub(super) fn scrub_for_harness_note(text: &str) -> String {
     crate::text::sanitize_text(text).replace(HARNESS_NOTE, "[removed]")
 }
@@ -914,8 +861,8 @@ pub(super) fn should_retry_provider_error(
         _ => None,
     }
 }
-/// Run [`Provider::complete`] under the same retry policy a streamed turn gets. A bare `?` made
-/// one transient 429 mid-compaction terminal, surfacing as 502 `/errors/context-overflow`.
+/// Run [`Provider::complete`] under the same retry policy a streamed turn gets, so one transient
+/// 429 mid-compaction is not terminal.
 ///
 /// `content_started` is `false` by construction: nothing streamed, so a retry cannot double-emit.
 /// The wait races the caller's token, as the loops in `run_streaming` and `run_turn` do, or a
@@ -1049,18 +996,12 @@ mod tests {
 
     /// An emergency compaction must *undo* a pending repair, not carry it or merely forget it.
     ///
-    /// `Event::Repair` is *position-relative*: it records how many trailing entries it replaces,
-    /// and its own doc comment states the producer invariant that those entries must still be
-    /// the trailing ones. Compaction rewrites the conversation and writes a `CompactBoundary`,
-    /// so a repair left pending afterwards is measured against a log that no longer has the
-    /// shape it was taken from, and would replace the wrong messages. Deleting the clearing
-    /// line left every suite green: the one test that reaches this arm asserts on the turn's
-    /// outcome and never looks at the recovery state.
-    ///
-    /// Clearing the field was not enough on its own, which is what this now also pins. The degraded
-    /// messages stayed in the conversation, so the summarizer read them and the boundary made the
-    /// loss permanent -- on the strength of a `ContextOverflow`, which says the request was too big
-    /// and nothing whatever about whether the degraded content was the problem.
+    /// `Event::Repair` is position-relative: it records how many trailing entries it replaces,
+    /// and compaction rewrites the conversation, so a repair left pending afterwards would replace
+    /// the wrong messages. Clearing the field alone is not enough either: the degraded messages
+    /// would stay in the conversation, the summarizer would read them, and the boundary would make
+    /// the loss permanent on the strength of a `ContextOverflow`, which says nothing about whether
+    /// the degraded content was the problem.
     #[tokio::test]
     async fn an_emergency_compaction_undoes_a_pending_repair() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -1153,13 +1094,10 @@ mod tests {
         );
     }
 
-    /// The branch the undo above was moved *before*: compaction can fail, and its summarizer is a
-    /// provider call made against the provider that has just been misbehaving.
-    ///
-    /// With the reset happening only after a successful compaction, this path returned with the
-    /// degrade still applied and no `Event::Repair` anywhere on disk -- so the model reasoned from
-    /// a conversation the store had never heard of for the rest of the process's life, while
-    /// `GET /messages` served the original with its revision unmoved.
+    /// Compaction can fail, and its summarizer is a provider call made against the provider that
+    /// has just been misbehaving. A reset that ran only after a successful compaction would return
+    /// with the degrade still applied and no `Event::Repair` on disk, so the model would reason
+    /// from a conversation the store had never heard of.
     #[tokio::test]
     async fn a_failed_emergency_compaction_still_restores_the_degraded_content() {
         use crate::provider::mock::MockProvider;
@@ -1219,16 +1157,11 @@ mod tests {
     /// Undoing a repair has to restore the *request base*, not just the conversation.
     ///
     /// `repair_rejected_content` rebuilds `base_messages` from the degraded conversation, because
-    /// that is the slice a request is actually assembled from. The undo put the conversation back
-    /// and left `base_messages` degraded. Both tiers preserve message *count*, so `messages.len()
-    /// == turn_start_len` still held and the next round took the branch that sends `base_messages`
-    /// verbatim: the conversation said one thing and the wire said another.
-    ///
-    /// The reachable consequence was a bricked session. `take_outage_reprieve` is the one caller
-    /// that re-sends after an undo, and its whole promise is that the body is unchanged; instead it
-    /// re-sent the degraded one, and a success there stamped `last_accepted_len` against the
-    /// *restored* conversation, putting the content that earned the original refusal permanently
-    /// below every later suspect window.
+    /// that is the slice a request is assembled from, and both tiers preserve message count, so an
+    /// undo that restored only the conversation would leave the next round sending the degraded
+    /// body. `take_outage_reprieve` is the caller that re-sends after an undo, and a success there
+    /// would stamp `last_accepted_len` against the restored conversation, putting the content that
+    /// earned the original refusal permanently below every later suspect window.
     ///
     /// Stated as the inverse property rather than as that one path, because the property is what
     /// every caller of the undo relies on.
@@ -1312,10 +1245,8 @@ mod tests {
     /// The wait is the length the provider asked for, not the constant.
     ///
     /// [`crate::provider::retry::outage_reprieve`] has its own unit tests, and they pin every
-    /// bound; what none of them can see is whether this function *passes it the hint*. Reverting
-    /// the argument to `None` left the entire suite green, because the only end-to-end test that
-    /// reaches here sends `retry_after: None` and so cannot tell the two apart -- and the value it
-    /// governs is the one wait that decides whether to start deleting the user's content.
+    /// bound; what none of them can see is whether this function passes it the hint, and the only
+    /// end-to-end test that reaches here sends `retry_after: None`.
     ///
     /// Virtual time, so a thirty-second assertion costs nothing: `start_paused` advances the clock
     /// to the next timer rather than sleeping. Both arms, because a wiring that hardcoded the hint
@@ -1380,8 +1311,8 @@ mod tests {
 
     /// The reprieve is spent once per stretch of consecutive failure, not once per refusal.
     ///
-    /// It answers one question -- is this provider failing, or is it failing *on this body* -- and
-    /// a second wait against the same refusal re-asks what the first already answered while the
+    /// It answers one question (is this provider failing, or is it failing on this body) and a
+    /// second wait against the same refusal re-asks what the first already answered while the
     /// user watches. A turn refused twice more without an accepted request in between therefore
     /// degrades on the spot; `note_request_accepted` is what makes it available again.
     #[tokio::test(start_paused = true)]
@@ -1738,15 +1669,12 @@ mod tests {
 
     /// A compaction's `loaded_tools_snapshot` has to be built from the log, not from the view.
     ///
-    /// This is the wiring the test below only describes. Two compactions in a row are enough on
-    /// their own: the first replaces the `load_tool` exchange with a summary that names nothing, so
-    /// a scan of the *materialized* conversation reports no loaded tools, the second boundary
-    /// records that emptiness, and `prune_compacted_events` drops the events that would have
-    /// corrected it. `DegradeTier::ToolExchanges` is the second way into the same hole -- it
-    /// empties a `load_tool` call in place -- and both close with the same one-line change.
-    ///
-    /// The divergence is what makes it nasty in the field: the live process loses the tool and a
-    /// resume, reading the full log off disk, gets it back.
+    /// Two compactions in a row are enough: the first replaces the `load_tool` exchange with a
+    /// summary that names nothing, so a scan of the materialized conversation reports no loaded
+    /// tools, the second boundary records that emptiness, and `prune_compacted_events` drops the
+    /// events that would have corrected it. `DegradeTier::ToolExchanges` is the second way into
+    /// the same hole, since it empties a `load_tool` call in place. The live process would lose the
+    /// tool while a resume, reading the full log off disk, got it back.
     #[tokio::test]
     async fn a_second_compaction_keeps_the_tools_the_first_one_carried() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -1807,13 +1735,11 @@ mod tests {
 
     /// Emptying a `load_tool` exchange must not un-load the tool it loaded.
     ///
-    /// Both scanners are pinned, because they disagree and the disagreement is the defect. The
-    /// slice scan sees a call whose `input` names nothing and a result marked `is_error`, so it
-    /// reports the tool was never loaded; the event scan still has the `Append` rows that recorded
-    /// the load and keeps it. `compact_session` used the slice one to build
-    /// `Event::CompactBoundary::loaded_tools_snapshot`, and `prune_compacted_events` then dropped
-    /// the events that could have corrected it -- so a deferred tool disappeared from the model's
-    /// array mid-session, while a resume reading the full log off disk brought it back.
+    /// Both scanners are pinned, because they disagree: the slice scan sees a call whose `input`
+    /// names nothing and a result marked `is_error`, so it reports the tool was never loaded; the
+    /// event scan still has the `Append` rows that recorded the load and keeps it. Building
+    /// `Event::CompactBoundary::loaded_tools_snapshot` from the slice scan would drop a deferred
+    /// tool from the model's array mid-session.
     #[test]
     fn a_degraded_load_tool_stays_loaded_in_the_events() {
         let messages = [
@@ -1833,7 +1759,7 @@ mod tests {
             .expect("there is an exchange to empty");
         assert!(
             !crate::tools::extract_loaded_tool_names(&degraded).contains("fetch_url"),
-            "the slice scan cannot see through the emptied call -- which is why nothing production \
+            "the slice scan cannot see through the emptied call, which is why nothing production \
              may use it"
         );
 
@@ -1881,11 +1807,9 @@ mod tests {
 
     /// An accepted request clears what the turn has tried, and it is *acceptance* that does it.
     ///
-    /// Keying this on a vindicated repair instead left the reprieve spent for the whole turn in the
+    /// Keying this on a vindicated repair would leave the reprieve spent for the whole turn in the
     /// one case that matters: when the reprieve works, the unchanged re-send succeeds and no repair
-    /// was ever applied, so there was nothing to vindicate. A second, unrelated 5xx later in the
-    /// same turn then degraded on the spot. Both counters are checked here because both had the
-    /// same bug and only one of them had a test.
+    /// was ever applied, so there is nothing to vindicate.
     #[test]
     fn an_accepted_request_clears_what_the_turn_has_tried() {
         let mut recovery = TurnRecovery {

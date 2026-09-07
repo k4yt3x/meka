@@ -3820,7 +3820,7 @@ fn a_turn_naming_a_broken_skill_says_why_rather_than_unknown() {
     let body: serde_json::Value = response.json().expect("parse");
     let detail = body["detail"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("could not be read"),
+        detail.contains("failed to load"),
         "a present-but-unparseable file must not read as absent: {body}"
     );
     assert!(detail.contains("frontmatter"), "{body}");
@@ -6853,7 +6853,7 @@ fn getting_a_broken_skill_says_why_rather_than_404() {
     assert_eq!(response.status(), 422, "a present file is not a 404");
     let problem: serde_json::Value = response.json().expect("parse");
     let detail = problem["detail"].as_str().unwrap_or_default();
-    assert!(detail.contains("could not be read"), "{problem}");
+    assert!(detail.contains("failed to load"), "{problem}");
     // The reason, without the file it came from: discovery logs the path, and this body goes to
     // whoever holds a token. The reason itself is what the caller acts on.
     assert!(
@@ -7592,7 +7592,7 @@ fn reattach_warns_when_the_replay_buffer_cannot_reach_back_far_enough() {
         .text()
         .expect("body");
     assert!(
-        body.contains("event: notice") && body.contains("Replay buffer does not reach"),
+        body.contains("event: notice") && body.contains("replay does not reach"),
         "a truncated replay must be announced, not silently delivered: {body}"
     );
 }
@@ -8963,7 +8963,7 @@ fn reattach_with_a_stale_cross_turn_last_event_id_still_delivers() {
         "a stale id must not swallow the terminal: {body}"
     );
     assert!(
-        body.contains("event: notice") && body.contains("Replay buffer does not reach"),
+        body.contains("event: notice") && body.contains("replay does not reach"),
         "and the client must be told its position was unreachable: {body}"
     );
 }

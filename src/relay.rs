@@ -1,9 +1,7 @@
 //! Relays `tracing` output around the live REPL prompt.
 //!
-//! Without this layer, `tracing` writes directly to `std::io::stderr`. When reedline enters raw
-//! mode and redraws the prompt, anything just written to stderr risks getting overwritten by
-//! reedline's cursor positioning. The symptom users see is "an error log flashes by, then
-//! disappears."
+//! Without this layer, `tracing` writes directly to `std::io::stderr`, and a line written while
+//! reedline is in raw mode is overwritten by its next redraw of the prompt.
 //!
 //! [`Relay`] holds an optional [`reedline::ExternalPrinter`] (a crossbeam channel reedline drains
 //! every poll tick to print messages *above* the prompt without clobbering it). Tracing output goes
@@ -40,12 +38,10 @@ pub(crate) static RELAY: LazyLock<Relay> = LazyLock::new(Relay::new);
 #[derive(Clone)]
 pub(crate) struct Relay {
     printer: Arc<RwLock<Option<ExternalPrinter<String>>>>,
-    /// True only while reedline's `read_line()` owns the terminal (raw mode, prompt drawn).
-    /// reedline drains the `ExternalPrinter` channel exclusively inside that loop, so routing a
-    /// log line through the printer at any other time (e.g. during a turn, while the REPL thread
-    /// is blocked waiting on the agent) would buffer it until the next prompt is drawn. When this
-    /// is false the terminal is in cooked mode, so writing straight to stderr is both safe and
-    /// immediate.
+    /// True only while reedline's `read_line()` owns the terminal. reedline drains the
+    /// `ExternalPrinter` channel only inside that loop, so a line routed through it at any other
+    /// time would sit until the next prompt is drawn; off-prompt the terminal is in cooked mode
+    /// and stderr is safe.
     at_prompt: Arc<AtomicBool>,
     /// The host's console, so an off-prompt log line can settle the row before landing on it.
     ///
@@ -80,11 +76,8 @@ impl Relay {
         *crate::sync::write(&self.printer) = Some(printer);
     }
 
-    /// Mark whether reedline's `read_line()` is currently active. The REPL sets this true around
-    /// each `read_line()` call and false otherwise, so log lines route through the
-    /// `ExternalPrinter` only while the prompt is live (and reedline is draining it) and go
-    /// straight to stderr the rest of the time, surfacing immediately instead of buffering until
-    /// the next prompt.
+    /// Mark whether reedline's `read_line()` is currently active; the REPL sets this around each
+    /// call.
     pub(crate) fn set_at_prompt(&self, at_prompt: bool) {
         self.at_prompt.store(at_prompt, Ordering::Relaxed);
     }
@@ -116,17 +109,13 @@ pub(crate) struct RelayWriter {
 
 impl Write for RelayWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        // Only hand the line to reedline's ExternalPrinter while the prompt is live: reedline
-        // drains that channel exclusively inside `read_line()`, so off-prompt (during a turn) the
-        // line would sit buffered until the next prompt. Off-prompt the terminal is in cooked mode,
-        // so the stderr fall-through below is both safe and immediate.
+        // Only hand the line to the printer while the prompt is live: reedline drains that channel
+        // only inside `read_line()`, so an off-prompt line would sit until the next prompt.
         if self.at_prompt.load(Ordering::Relaxed)
             && let Some(printer) = &self.printer
         {
-            // Reedline's ExternalPrinter prints each message as a fresh line above the prompt and
-            // adds its own line break, so we strip the trailing newline tracing's formatter
-            // appends. Empty messages are dropped to avoid blank-line spam from formatter
-            // buffering.
+            // The printer adds its own line break, so the newline tracing's formatter appends is
+            // stripped, and an empty message (formatter buffering) would print as a blank line.
             match std::str::from_utf8(buffer) {
                 Ok(text) => {
                     let trimmed = text.trim_end_matches('\n');
@@ -134,11 +123,9 @@ impl Write for RelayWriter {
                         return Ok(buffer.len());
                     }
                     // `try_send`, never `print`: the printer is a bounded channel reedline drains
-                    // once per poll, and its `print` blocks when full. A burst of warnings then
-                    // parked a runtime worker until the next poll tick, and a line logged from the
-                    // REPL thread itself, which is the only drainer, hung the shell for good. A
-                    // full queue falls through to stderr below, which is where the line would have
-                    // gone off-prompt anyway.
+                    // once per poll, and `print` blocks when it is full, which hangs the REPL
+                    // thread for good when that thread, the only drainer, is the one logging. A
+                    // full queue falls through to stderr below.
                     match printer.sender().try_send(trimmed.to_string()) {
                         Ok(()) => return Ok(buffer.len()),
                         Err(error) if error.is_disconnected() => {
@@ -149,8 +136,7 @@ impl Write for RelayWriter {
                     }
                 }
                 Err(_) => {
-                    // Non-UTF-8 bytes from tracing are unexpected; fall through to stderr so
-                    // they're not silently dropped.
+                    // Non-UTF-8 bytes fall through to stderr rather than being dropped.
                 }
             }
         }
@@ -166,32 +152,21 @@ impl Write for RelayWriter {
 impl RelayWriter {
     /// Tell the console that output it cannot see is about to land on the current row.
     ///
-    /// Off-prompt is precisely when the row may not be free. A turn draws the thinking indicator as
-    /// a [`crate::console::RowState::Transient`] line the writer intends to overwrite or erase, so
-    /// a mid-turn `warn!` -- which the retry path emits at default verbosity -- printing onto that
-    /// row is wiped by the next `Settle::Erase`. The warning was the whole point of the retry being
-    /// visible, so losing it lost the only evidence the turn was struggling.
+    /// Off-prompt is when the row may not be free: a turn draws the thinking indicator as a
+    /// [`crate::console::RowState::Transient`] line, and a `warn!` printed onto it is wiped by the
+    /// next `Settle::Erase`.
     ///
-    /// **`try_lock`, never `lock`.** [`Console`] logs: `text_delta`, `close_stream` and the stdout
-    /// flush all report through `render::report_lost_output` on failure, so a thread already inside
-    /// a console method can re-enter here, and a blocking acquire on a non-reentrant `Mutex` would
-    /// deadlock the REPL -- a far worse outcome than the cosmetic bug being fixed. Failing to
-    /// acquire falls through to exactly the raw-stderr write this has always done. That report is
-    /// `warn!` for anything but a reader hanging up, so the re-entrant path runs at the default
-    /// verbosity rather than only under `-vv`, where a `debug!` never reached this writer at all.
+    /// `try_lock`, never `lock`: [`Console`] methods log through `render::report_lost_output`, so a
+    /// thread already inside one re-enters here holding the lock, and a blocking acquire would
+    /// deadlock the REPL. Contention falls through to the raw stderr write.
     ///
-    /// A *poisoned* mutex is recovered rather than treated as contention, which is what
-    /// `with_console` in both hosts already does. `TryLockError` folds the two together, so reading
-    /// it as one would let a single panic anywhere inside a console method stop row-settling for
-    /// the rest of the process: every later `try_lock` returns `Poisoned` forever, and the mid-turn
-    /// warning this exists to preserve goes back to being erased -- silently, and only after
-    /// something else had already gone wrong.
+    /// A poisoned mutex is recovered rather than treated as contention: `TryLockError` folds the
+    /// two together, and treating them alike would let one panic inside a console method stop
+    /// row-settling for the rest of the process.
     ///
-    /// Idempotent, which matters because a formatter is free to split one event across several
-    /// `write` calls: the first settles and leaves the row `Empty`, and the rest ask an already
-    /// settled console for nothing. The row is left `Empty` on the strength of tracing's formatter
-    /// terminating every event with a newline; an event that did not would leave the console
-    /// believing a row is free while the cursor sits mid-line.
+    /// Idempotent, because a formatter may split one event across several `write` calls. The row
+    /// is left `Empty` on the strength of tracing's formatter terminating every event with a
+    /// newline.
     fn settle_the_row(&self) {
         let Some(console) = &self.console else {
             return;
@@ -254,10 +229,8 @@ mod tests {
     /// An off-prompt log line settles the row instead of landing on it.
     ///
     /// This is the wiring, not the state machine: `step` already knows that foreign output erases a
-    /// transient row, and knew it while `tracing` was writing straight past the console anyway. The
-    /// row in question is the thinking indicator's, and the log line that lands on it is the retry
-    /// path's `warn!`, which fires at default verbosity -- so the failure erased the one message
-    /// telling the user why their turn was taking so long.
+    /// transient row. The row is the thinking indicator's, and the line that lands on it is the
+    /// retry path's `warn!`, which fires at default verbosity.
     ///
     /// `force_row` because the drawing API cannot reach `Transient` without a terminal:
     /// `thinking_indicator` returns early on `!live_indicator_supported()`.
@@ -299,9 +272,7 @@ mod tests {
     ///
     /// `Console::text_delta`, `close_stream` and the stdout flush all report through
     /// `render::report_lost_output` when their renderer fails, so a thread inside a console
-    /// method reaches this writer while holding the very lock it wants. A blocking acquire
-    /// would hang the REPL for good; the fallback is the raw stderr write that was the only
-    /// behavior before this existed.
+    /// method reaches this writer while holding the very lock it wants.
     ///
     /// The guard is held across the write, which is exactly the reentrant shape, and the test
     /// completing at all is the assertion.
@@ -326,7 +297,7 @@ mod tests {
         );
     }
 
-    /// With no console installed -- every non-interactive command -- nothing changes.
+    /// With no console installed (every non-interactive command) nothing changes.
     #[test]
     fn a_host_with_no_console_still_writes_to_stderr() {
         let relay = Relay::new();

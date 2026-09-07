@@ -99,7 +99,7 @@ One-shot mode creates a new session for each invocation, unless you point it at 
 The session id is printed to stderr when the run completes:
 
 ```text
-Session: 550e8400-e29b-41d4-a716-446655440000
+Leaving session: 550e8400-e29b-41d4-a716-446655440000
 ```
 
 You can resume this session later in interactive mode:

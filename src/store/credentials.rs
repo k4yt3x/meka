@@ -30,10 +30,10 @@ pub(crate) enum CredentialWrite {
     ///
     /// Newer in *write order*, which is the only thing this type knows and less than it sounds: it
     /// is neither necessarily unexpired nor necessarily the same kind of credential. Whether it is
-    /// worth switching to is the caller's question -- see `crate::oauth::is_worth_adopting` -- and
+    /// worth switching to is the caller's question (see `crate::oauth::is_worth_adopting`), and
     /// retrying is never the answer, because the value this write was derived from is gone.
     Superseded(Box<StoredCredential>),
-    /// The account has no stored credential at all -- removed while this write was in flight.
+    /// The account has no stored credential at all: removed while this write was in flight.
     /// Re-creating it would resurrect an account the user just disconnected.
     Gone,
 }
@@ -81,6 +81,7 @@ impl McpCredentialKind {
         }
     }
 }
+/// The credential tables of the store, handed out by [`Store::token_store`].
 #[derive(Clone)]
 pub(crate) struct TokenStore {
     pub(super) connection: Arc<Connection>,
@@ -100,7 +101,7 @@ impl TokenStore {
     /// Separate from the session locks beside it because the thing being protected is different: a
     /// session lock says who owns a conversation, this says who is allowed to spend a refresh
     /// token. Two processes refreshing the same account both present the token the other is about
-    /// to invalidate, and against an issuer with a reuse window both succeed -- leaving the
+    /// to invalidate, and against an issuer with a reuse window both succeed, leaving the
     /// database holding the *older* of the two, superseded, with the next launch getting
     /// `invalid_grant` and nothing naming why.
     ///
@@ -228,21 +229,20 @@ impl TokenStore {
     /// refresh is not an assignment: it is a value computed from the old one, over a network round
     /// trip long enough for something else to have written. Two of those somethings are real. Two
     /// meka processes refreshing at once both present the same refresh token, and against an issuer
-    /// with a reuse window *both* succeed -- so the blind upsert left the database holding
-    /// whichever finished last, which is the token the issuer has already superseded. The next
-    /// launch got `invalid_grant` with nothing naming why. And a `meka account login`
-    /// completing during a slow refresh was simply overwritten, silently, by a credential
-    /// minted before it.
+    /// with a reuse window *both* succeed, so a blind upsert leaves the database holding whichever
+    /// finished last, which is the token the issuer has already superseded, and the next launch
+    /// gets `invalid_grant` with nothing naming why. And a `meka account login` completing during
+    /// a slow refresh is simply overwritten, silently, by a credential minted before it.
     ///
     /// Returns [`CredentialWrite::Superseded`] with what the row holds now, so the caller can
     /// decide whether to switch to it. Newer in write order is not the same as usable; see
     /// `crate::oauth::is_worth_adopting`.
     ///
     /// Keyed on the row's version, its `updated_at`, which every writer here stamps, rather than
-    /// on the stored JSON. Comparing the bytes re-serialized the value this build had read back
-    /// out, so the first field added to [`AuthCredential`] would have made every row written before
-    /// it unswappable: `serde` fills the new field on the way in and writes it on the way out, and
-    /// no refresh would land again until the user signed in afresh.
+    /// on the stored JSON. Comparing the bytes would re-serialize the value this build read back
+    /// out, so the first field added to [`AuthCredential`] would make every row written before it
+    /// unswappable: `serde` fills the new field on the way in and writes it on the way out, and no
+    /// refresh would land again until the user signed in afresh.
     pub(crate) async fn replace_account_credential(
         &self,
         account: &str,
@@ -271,7 +271,7 @@ impl TokenStore {
         if changed == 1 {
             return Ok(CredentialWrite::Stored);
         }
-        // Zero rows means the row moved, or that there is no row at all -- an account whose
+        // Zero rows means the row moved, or that there is no row at all: an account whose
         // credential was deleted mid-refresh. Both are "somebody else decided what this account
         // holds", and in neither case may a token minted from a superseded one be written back.
         match self.load_account_credential_versioned(account).await? {
@@ -554,6 +554,7 @@ impl TokenStore {
             })
     }
 }
+/// What an account authenticates with, as the `account_credentials` row serializes it.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) enum AuthCredential {
     ApiKey(String),
@@ -561,18 +562,18 @@ pub(crate) enum AuthCredential {
         access_token: String,
         refresh_token: Option<String>,
         expires_at: Option<i64>,
-        /// Provider-flavoured identity carried alongside the bearer token. Currently only
-        /// `chatgpt-subscription` populates this, the `chatgpt_account_id` extracted from the
-        /// id_token JWT, sent on every request as `ChatGPT-Account-ID`. Claude OAuth
-        /// leaves it `None`.
+        /// Provider-specific identity carried alongside the bearer token. Only
+        /// `chatgpt-subscription` populates it, with the `chatgpt_account_id` read out of the
+        /// id_token JWT and sent on every request as `ChatGPT-Account-ID`; Claude OAuth leaves it
+        /// `None`.
         account_id: Option<String>,
     },
 }
 /// Hand-written so a credential cannot reach a log through a `{:?}` on any struct that holds one.
 ///
-/// The derived impl printed the bearer token verbatim, and a provider struct is exactly the kind of
-/// thing that ends up inside a `tracing::debug!` or an error's `{:?}` during a bad afternoon.
-/// Lengths are kept because they are what a "wrong key pasted" diagnosis actually needs.
+/// The derived impl prints the bearer token verbatim, and a provider struct is exactly the kind of
+/// thing that ends up inside a `tracing::debug!` or an error's `{:?}`. Lengths are kept because
+/// they are what a "wrong key pasted" diagnosis needs.
 impl std::fmt::Debug for AuthCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -604,6 +605,7 @@ impl std::fmt::Debug for AuthCredential {
     }
 }
 impl AuthCredential {
+    /// The request header this credential is presented in, as `(name, value)`.
     pub(crate) fn auth_header(&self) -> (&'static str, String) {
         match self {
             AuthCredential::ApiKey(key) => ("x-api-key", key.clone()),

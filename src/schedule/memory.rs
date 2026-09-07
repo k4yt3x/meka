@@ -10,11 +10,8 @@ use super::*;
 /// Why this job will not fire right now, phrased for the model, or `None` if it will.
 ///
 /// The whole answer, not just the gate's half: a session at `none` withholds every job, gated or
-/// not, and an *ungated* job is exactly the case a gate-shaped question misses. Without this an
-/// ungated reminder on such a session read as perfectly healthy on every surface while never
-/// firing -- the same "held and healthy look identical" problem the gate marker exists to solve,
-/// one level up, and a disagreement between the creation door (which accepts) and the fire door
-/// (which refuses).
+/// not, and an ungated job is exactly the case a gate-shaped question misses, so it would read as
+/// healthy on every surface while never firing.
 pub(crate) fn job_withheld_reason(
     memory: &SchedulerMemory,
     job: &ScheduledJob,
@@ -29,9 +26,9 @@ pub(crate) fn job_withheld_reason(
 /// What a reader is entitled to say about whether a job will fire.
 ///
 /// Three answers rather than two, because a reader without a dispatcher cannot resolve a tool gate
-/// and "I cannot tell" is not "it is fine". Collapsing them is right for the surfaces that render a
-/// *sentence* -- there is nothing to say -- and wrong for one that renders a *column*, where the
-/// empty cell beside a populated one reads as a verdict.
+/// and "I cannot tell" is not "it is fine". Collapsing them is right for a surface that renders a
+/// sentence (there is nothing to say) and wrong for one that renders a column, where the empty
+/// cell beside a populated one reads as a verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Withheld {
     /// It will fire, as far as this reader can establish.
@@ -49,11 +46,10 @@ pub(crate) fn job_withheld(
     live: Option<crate::permission::Permission>,
     tools: Option<&dyn GateTools>,
 ) -> Withheld {
-    // First, because it is the most specific, the one nothing else will explain, and the only
-    // verdict here that needs no permission level. A parked job has a healthy gate and an adequate
-    // session, so every other question answers "it will fire" while the fire door refuses it on
-    // every sweep -- and asking it before the level means a reader that could not establish one
-    // still reports the job it can see is dead.
+    // First, because it is the most specific and the only verdict here that needs no permission
+    // level: a parked job has a healthy gate and an adequate session, so every other question
+    // answers "it will fire", and a reader that could not establish a level still reports the job
+    // it can see is dead.
     if job.attempts >= MAX_CLAIM_ATTEMPTS {
         return Withheld::Yes(memory.parked_reason(job));
     }
@@ -75,18 +71,10 @@ pub(crate) fn job_withheld(
             None => Withheld::No,
         };
     };
-    // `ToolUnavailable` is the one refusal this function will not report on a guess, because it is
-    // the one that can mean "I cannot tell" rather than "it is broken".
-    //
-    // Two readers hit that. A caller with no dispatcher at all -- `meka schedule list`, which has
-    // no MCP manager -- would otherwise report *every* tool gate as dead, libelling healthy jobs to
-    // the one audience that cannot check. And a server still completing its first handshake is not
-    // a verdict yet: reporting one marks a healthy job dead for the second it takes and announces
-    // it alive again a turn later, on every start and every reconnect.
-    //
-    // The fire door is unaffected in both cases: it still declines the occurrence, because a gate
-    // whose tool cannot be resolved cannot be evaluated. Silence here is about what we are entitled
-    // to *say*, not about what runs.
+    // `ToolUnavailable` is the one refusal that can mean "I cannot tell" rather than "it is
+    // broken": a caller with no dispatcher (`meka schedule list` has no MCP manager) would
+    // otherwise report every tool gate as dead, and a server still completing its first handshake
+    // is not a verdict yet. The fire door still declines the occurrence either way.
     if matches!(refusal, GateRefusal::ToolUnavailable)
         && let GateProbe::Tool { name, .. } = &gate.probe
         && tools.is_none_or(|tools| tools.is_still_connecting(name))
@@ -97,9 +85,9 @@ pub(crate) fn job_withheld(
 }
 /// What a job's row said when a probe failure was counted against it.
 ///
-/// Neither half is written by the failing path -- it persists no `fired_at` and no baseline,
-/// deliberately -- so either of them moving is proof that *something else* evaluated this gate
-/// afterwards and got an answer. See [`SchedulerMemory::standing_probe_failure`].
+/// Neither half is written by the failing path (it persists no `fired_at` and no baseline), so
+/// either of them moving is proof that something else evaluated this gate afterwards and got an
+/// answer. See [`SchedulerMemory::standing_probe_failure`].
 pub(crate) type ProbeWitness = (Option<DateTime<Utc>>, Option<String>);
 /// The witness for `job` as its row stands now.
 pub(crate) fn probe_witness(job: &ScheduledJob) -> ProbeWitness {
@@ -112,18 +100,12 @@ pub(crate) fn probe_witness(job: &ScheduledJob) -> ProbeWitness {
 pub(crate) type ProbeFailures = std::collections::HashMap<String, (u32, String, ProbeWitness)>;
 /// How many consecutive failures before a broken probe is reported as a standing condition.
 ///
-/// Two, not one. A single failure is as often a blip as a break -- a server restarting, a network
-/// blip, a command losing a race -- and the marker says "this job is not firing", which is a
-/// statement about a state rather than an event. A watcher that recovers on its next evaluation
-/// never earns one.
+/// Two, not one: a single failure is as often a blip (a server restarting, a command losing a
+/// race) as a break, and the marker states a standing condition, not an event.
 ///
-/// Two *evaluations*, not two ticks, and the difference grew teeth when a failed probe stopped
-/// being retried every `poll_interval`. Evaluations are now one occurrence apart for a recurring
-/// job and one `claim_lease` apart for a job with no next occurrence, so the marker arrives after
-/// two periods rather than twenty seconds: twelve hours for a `6h` job, two hours for a one-shot at
-/// the default lease. That is the cost of not re-probing a broken gate at tick cadence, and it is
-/// the right way round -- the alternative spent real work to reach the same conclusion sooner --
-/// but it does mean this constant no longer implies anything about wall-clock latency.
+/// Two evaluations, not two ticks. Evaluations are one occurrence apart for a recurring job and
+/// one `claim_lease` apart for a job with no next occurrence, so the marker arrives after two
+/// periods (twelve hours for a `6h` job) and this constant says nothing about wall-clock latency.
 pub(crate) const PROBE_FAILURES_BEFORE_REPORTING: u32 = 2;
 /// What this process has learned about the jobs in one store, and the identity its leases carry.
 ///
@@ -141,20 +123,13 @@ pub(crate) struct SchedulerMemory {
     permission_declined: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Consecutive failed probe evaluations per job, with the last reason and the row as it stood.
     ///
-    /// In memory rather than on the row, which is a real limitation and the right trade.
-    /// Persisting it would mean a schema change and a write on every failed evaluation, to
-    /// report a condition that a restart re-establishes within one poll interval. The cost is
-    /// that the reporting surface and the scheduler have to be the same process to agree: they
-    /// are for the REPL, ACP and `meka serve`, which are the three that both run jobs and
-    /// render `[Scheduled]`. `meka schedule list` is a separate process and sees nothing here,
-    /// which is the same thing it already does with tool gates it cannot resolve.
+    /// In memory rather than on the row: persisting it would mean a schema change and a write on
+    /// every failed evaluation, to report a condition a restart re-establishes within one poll
+    /// interval. The cost is that `meka schedule list`, a separate process, sees nothing here.
     ///
-    /// The [`ProbeWitness`] is what keeps that from becoming a *wrong* answer rather than a
-    /// missing one. Only the host that wins `claim_occurrence` evaluates, and which host that
-    /// is, is a race between their tickers; a host that recorded two failures and then stopped
-    /// winning would go on telling its resident session's model that a job firing every hour
-    /// is dead, forever, because nothing else in this process ever re-enters the counting
-    /// path.
+    /// The [`ProbeWitness`] keeps that from becoming a wrong answer rather than a missing one:
+    /// only the host that wins `claim_occurrence` evaluates, so a host that recorded two failures
+    /// and then stopped winning would otherwise report the job dead forever.
     probe_failures: std::sync::Mutex<ProbeFailures>,
     /// A token identifying this process to the claim column, for the life of the process.
     ///
@@ -183,18 +158,12 @@ impl SchedulerMemory {
 
     /// Why a parked job stopped, said only as far as the row can support.
     ///
-    /// Two things fill `attempts`, and they have opposite remedies: a prompt that takes the host
-    /// down, and a gate probe that can never answer. The probe's error is the discriminator
-    /// when this process has one, but `SchedulerMemory` is per-process, so a restart -- which
-    /// is exactly what an operator does after noticing a job has gone inert -- loses it, and
-    /// `meka schedule list` never had it. Asserting the commoner cause from that absence
-    /// produced the worst outcome available: telling someone whose MCP server was misconfigured
-    /// that their prompt crashes meka, with a remedy aimed at the wrong artifact, on the
-    /// model's own `[Scheduled]` block.
-    ///
-    /// So absence is treated as absence. The row does still settle it in one direction: a job with
-    /// no gate has no probe that could have failed, so a crash is the only thing left and can
-    /// be named outright.
+    /// Two things fill `attempts`, with opposite remedies: a prompt that takes the host down, and a
+    /// gate probe that can never answer. The probe's error is the discriminator when this process
+    /// has one, but `SchedulerMemory` is per-process, so a restart loses it and `meka schedule
+    /// list` never had it; guessing the commoner cause from that absence aims the remedy at the
+    /// wrong artifact. The row still settles it in one direction: a job with no gate has no probe
+    /// that could have failed.
     pub(crate) fn parked_reason(&self, job: &ScheduledJob) -> String {
         let opening = format!("{} claims ended without delivering", job.attempts);
         match (self.probe_failure(&job.id), job.gate.is_some()) {
@@ -217,30 +186,22 @@ impl SchedulerMemory {
         }
     }
 
-    /// Why an *authorized* gate is still not firing: its probe keeps breaking.
+    /// Why an authorized gate is still not firing: its probe keeps breaking.
     ///
-    /// Authority is not the only way a watcher dies, and it is not the commonest. A server that
-    /// changed its schema, a command that was uninstalled, a pointer into a result that stopped
-    /// being JSON: each produces a gate that errors on every evaluation, and each looks from
-    /// the model's side exactly like a healthy watcher with nothing to report. The marker
-    /// existed for that indistinguishability and covered only half of it.
+    /// A server that changed its schema, a command that was uninstalled, a pointer into a result
+    /// that stopped being JSON: each errors on every evaluation, and each looks from the model's
+    /// side exactly like a healthy watcher with nothing to report.
     pub(crate) fn standing_probe_failure(&self, job: &ScheduledJob) -> Option<String> {
         let (failures, error, witness) = {
             let held = crate::sync::lock(&self.probe_failures);
             held.get(&job.id).cloned()?
         };
-        // The verdict is this process's, but the job is not. Only the host that wins
-        // `claim_occurrence` evaluates, so a second `meka serve` on the same store can take
-        // over every occurrence and heal the gate without this process ever hearing.
-        // Nothing here re-enters the counting path in that case, so without this check the
-        // marker stood forever: the model was told, every turn, that a job firing hourly
-        // was dead.
-        //
-        // Neither half of the witness is written by the failing path -- it persists no `fired_at`
-        // and no baseline, deliberately -- so either of them having moved is proof of a successful
-        // evaluation since. The gap it cannot close is a gate that keeps evaluating, keeps
-        // declining, and keeps producing the identical output: an unchanged row cannot testify to
-        // anything.
+        // The verdict is this process's, but the job is not: only the host that wins
+        // `claim_occurrence` evaluates, so a second `meka serve` on the same store can heal the
+        // gate without this process ever re-entering the counting path. Neither half of the
+        // witness is written by the failing path, so either having moved is proof of a successful
+        // evaluation since. A gate that keeps declining with identical output cannot be told
+        // apart this way.
         if witness != probe_witness(job) {
             self.clear_probe_failure(&job.id);
             return None;
@@ -248,18 +209,9 @@ impl SchedulerMemory {
         if failures < PROBE_FAILURES_BEFORE_REPORTING {
             return None;
         }
-        // No count in the sentence, deliberately.
-        //
-        // Every reader of this compares it by equality. `render_world_state_diff` announces a job
-        // to the model when its withheld reason *changes*, so a running total made the
-        // reason change on every failed evaluation and the model was told "can no longer
-        // fire: … 7 evaluations", then 8, then 9, for as long as the gate stayed broken.
-        // `context.rs` already leaves next-fire times out of the snapshot for exactly this
-        // reason; a counter is the same mistake wearing a different hat.
-        //
-        // The number is not lost: it is in the `warn!` at each failure, where an event belongs, and
-        // `-v` shows it. What the model needs is the standing fact and what to do about it, and
-        // that does not change between the second failure and the two-hundredth.
+        // No count in the sentence: `render_world_state_diff` announces a job to the model when
+        // its withheld reason changes, so a running total would re-announce it on every failed
+        // evaluation. The count is in the `warn!` at each failure.
         Some(format!(
             "its gate keeps failing and cannot say whether to fire: {}. Fix the check by recreating \
              the job, or cancel it",
@@ -269,17 +221,12 @@ impl SchedulerMemory {
 
     /// True the first time a job is held back for *this* reason, false while that reason persists.
     ///
-    /// Keyed by job and by reason, not by job alone. The two refusals are different facts with
-    /// different remedies -- "the session is at `none`" and "this gate needs `unrestricted`" -- and
-    /// a job that moves between them has changed in a way the operator acts on. Keyed by job
-    /// alone the second condition arrived silently, because the entry was already there:
-    /// dropping a session from `read` to `none` said nothing at all, and raising it back to
-    /// `read` said nothing either.
+    /// Keyed by job and by reason, not by job alone: "the session is at `none`" and "this gate
+    /// needs `unrestricted`" have different remedies, and keyed by job alone a move between them
+    /// would arrive silently because the entry was already there.
     ///
-    /// Entries are dropped when the job is authorized again *or* when it stops being a job meka can
-    /// see, so a canceled-while-declined job does not sit here for the life of the process. It is
-    /// one short string per held-back job, which is small, but a long-lived `meka serve` has no
-    /// other bound on it.
+    /// Entries are dropped when the job is authorized again or when it stops being a job meka can
+    /// see, because a long-lived `meka serve` has no other bound on them.
     pub(crate) fn declined_for_permission_first_time(&self, job_id: &str, reason: &str) -> bool {
         let mut held = crate::sync::lock(&self.permission_declined);
         match held.get(job_id) {
@@ -334,12 +281,9 @@ impl SchedulerMemory {
 mod tests {
     use super::*;
 
-    /// The held-back explanation is a fact about a standing state, so it is said once.
-    ///
-    /// The sweep re-evaluates every due job, and a session parked below write does not change
-    /// between sweeps. An `every = "1m"` job wrote the full explanation every minute for as long as
-    /// it stayed there, which turns the one line an operator needs to see into the noise they stop
-    /// reading. Restoring the authority arms it again, so the next withdrawal is not swallowed.
+    /// The held-back explanation is a fact about a standing state, so it is said once: an
+    /// `every = "1m"` job would otherwise write it every minute. Restoring the authority arms it
+    /// again, so the next withdrawal is not swallowed.
     #[test]
     fn a_job_held_back_for_permission_explains_itself_once_per_downgrade() {
         let job = format!("job-{}", uuid::Uuid::new_v4());
@@ -359,9 +303,8 @@ mod tests {
             "however many there are"
         );
 
-        // A different reason for the same job. Keyed by job alone this was silent, so dropping a
-        // session from `read` to `none` -- which stops *every* job, not just the gated one --
-        // arrived with no line at all, and raising it back to `read` said nothing either.
+        // A different reason for the same job: keyed by job alone, dropping a session from `read`
+        // to `none` (which stops every job, not just the gated one) would arrive with no line.
         assert!(
             memory.declined_for_permission_first_time(&job, "unattended-work:none"),
             "a job held for a different reason is a different fact, and the remedy differs too"

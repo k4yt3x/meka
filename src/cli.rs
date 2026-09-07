@@ -1,6 +1,5 @@
-//! Clap-derived CLI definition. Owns the top-level argument struct, the subcommand enum
-//! (`account`, `profile`, `session`, `history`, `mcp`, `tools`, `skill`, `acp`, `serve`), and the
-//! value enums a flag parses into through their `FromStr`.
+//! Clap-derived CLI definition: the root argument struct, the subcommand enums, and the value enums
+//! a flag parses into through their `FromStr`.
 
 use clap::Parser;
 
@@ -76,17 +75,14 @@ pub(crate) enum Command {
     },
     /// Run meka as an ACP (Agent Client Protocol) agent over stdio
     ///
-    /// Speaks newline-framed JSON-RPC on stdin/stdout so ACP clients (Zed, JetBrains, Neovim, VS
-    /// Code via the ACP extension, etc.) can drive meka turns directly. Diagnostic output stays on
-    /// stderr; stdout is reserved for the protocol.
+    /// Speaks newline-framed JSON-RPC on stdin and stdout; diagnostics go to stderr.
     Acp,
     /// Run meka as a long-lived HTTP service
     ///
-    /// Exposes the agent over HTTP+JSON for programmatic clients (bots, scripts, web UIs).
-    /// See the HTTP API docs for the full spec. Auth, session GC, and SSE streaming are configured
+    /// Exposes the agent over HTTP and JSON; auth, session GC and SSE streaming are configured
     /// under `[serve]` in config.toml.
     Serve {
-        /// Override `[serve].bind` (e.g. `0.0.0.0:8080`)
+        /// Override `[serve].bind`
         #[arg(long, value_name = "ADDR")]
         bind: Option<String>,
     },
@@ -135,27 +131,18 @@ pub(crate) enum SessionAction {
         #[arg(long, default_value = "markdown")]
         format: SessionExportFormat,
     },
-    /// Delete one or more sessions
-    ///
-    /// Examples:
-    ///   meka session delete 0e5f… 7a21…
-    ///   meka session delete --older-than-days 90
-    ///   meka session delete --all
-    #[command(verbatim_doc_comment)]
+    /// Delete sessions by id, by age, or all of them
     Delete {
         /// Session ids, or any unique prefix of each
         session_ids: Vec<String>,
         /// Delete all sessions
-        ///
-        /// Conflicts with explicit ids for the reason `--older-than-days` does: naming some
-        /// sessions and then asking for every session is two different requests, and running the
-        /// wider one silently makes the narrower one look honored.
+        // Conflicts with explicit ids: naming some sessions and then asking for every session is
+        // two different requests, and running the wider one makes the narrower one look honored.
         #[arg(long, conflicts_with_all = ["older_than_days", "session_ids"])]
         all: bool,
         /// Delete sessions not updated in this many days
-        ///
-        /// Conflicts with explicit ids rather than ignoring them: a listed session younger than
-        /// the window would otherwise be silently spared.
+        // Conflicts with explicit ids rather than ignoring them: a listed session younger than the
+        // window would otherwise be silently spared.
         #[arg(
             long = "older-than-days",
             value_name = "DAYS",
@@ -165,16 +152,16 @@ pub(crate) enum SessionAction {
     },
     /// Import a session from a JSON export
     ///
-    /// Recreates the session and any sub-agent children under fresh ids so it can be resumed with
-    /// `meka -r <new-id>`. Prints the new root session id.
+    /// Recreates the session and any sub-agent children under fresh ids, and prints the new root
+    /// session id.
     Import {
         /// Export file to read (`-` for stdin)
         input: String,
     },
     /// Fork a session into an independent copy
     ///
-    /// The copy carries the original's full conversation and continues from there; the original is
-    /// untouched. Prints the new session id.
+    /// The copy carries the full conversation; the original is untouched. Prints the new session
+    /// id.
     Fork {
         /// Session id, or any unique prefix of one
         session_id: String,
@@ -189,9 +176,8 @@ pub(crate) enum SessionAction {
     },
     /// Drop the most recent turns from a session
     ///
-    /// Cuts at a clean user boundary so no tool call is separated from its result. The log is
-    /// append-only, so `meka session export` still shows what was dropped. Use this to recover a
-    /// session the provider refuses.
+    /// Cuts at a user boundary, so no tool call is separated from its result, and `meka session
+    /// export` still shows the dropped turns. Recovers a session the provider rejects.
     Rewind {
         /// Session id, or any unique prefix of one
         session_id: String,
@@ -322,13 +308,13 @@ pub(crate) enum ProfileAction {
         /// Model name
         #[arg(long)]
         model: Option<String>,
-        /// Context window in tokens (default: 1000000); meka never infers or probes for it
+        /// Context window in tokens (default: 1000000)
         #[arg(long = "context-window", value_name = "TOKENS")]
         context_window: Option<u64>,
         /// Per-request output token cap; unset leaves the backend's default
         #[arg(long = "max-output-tokens", value_name = "TOKENS")]
         max_output_tokens: Option<u64>,
-        /// Reasoning effort; unset sends nothing, so the provider applies its own default
+        /// Reasoning effort; unset leaves the provider's default
         #[arg(long, value_name = "EFFORT")]
         effort: Option<String>,
         /// Accept image input (default: true)
@@ -359,7 +345,7 @@ pub(crate) enum ProfileAction {
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
     },
-    /// Change one setting on a profile, keeping the rest and every comment
+    /// Change one setting on a profile
     ///
     /// Keys: model, context_window, max_output_tokens, effort, vision, thinking, thinking_budget,
     /// max_request_bytes, redact_thinking. `account` is not settable; add a profile on the other
@@ -419,12 +405,6 @@ pub(crate) enum SkillAction {
         format: OutputFormat,
     },
     /// Scaffold a new skill at `~/.config/meka/skills/<name>/SKILL.md`
-    ///
-    /// Examples:
-    ///   meka skill add demo --description "X"
-    ///   meka skill add demo --description "X" --metadata author="Jane Doe"
-    ///   meka skill add custom --from-file ./template.md
-    #[command(verbatim_doc_comment)]
     Add {
         /// Unique skill name (lowercase letters, digits, hyphens)
         name: String,
@@ -465,11 +445,6 @@ pub(crate) enum SkillAction {
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum ScheduleAction {
     /// List scheduled jobs
-    ///
-    /// Examples:
-    ///   meka schedule list
-    ///   meka schedule list --session 0b5c...
-    #[command(verbatim_doc_comment)]
     List {
         /// One session's jobs, by id or prefix (default: all)
         #[arg(long)]
@@ -498,10 +473,8 @@ pub(crate) enum InstructionsAction {
     /// Print the resolved instructions and where they came from
     ///
     /// Resolution order is `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, then `instructions.md`
-    /// (or `instructions/`) in the config directory. `--instructions` belongs to a run, so it is
-    /// not consulted here. The text goes to stdout and the source to stderr, so `meka instructions
-    /// show 2>/dev/null` pipes cleanly.
-    #[command(verbatim_doc_comment)]
+    /// (or `instructions/`) in the config directory; `--instructions` belongs to a run and is not
+    /// consulted. The text goes to stdout and the source to stderr.
     Show,
     /// Print the paths checked for instructions, and whether each exists
     Path,
@@ -534,11 +507,6 @@ pub(crate) enum MemoryAction {
         format: OutputFormat,
     },
     /// Write a memory by hand
-    ///
-    /// Examples:
-    ///   meka memory add tz --description "K4YT3X is in UTC+8"
-    ///   meka memory add rules --description "House rules" --priority 1
-    #[command(verbatim_doc_comment)]
     Add {
         /// Unique name (alphanumerics, `-`, `_` only)
         name: String,
@@ -569,9 +537,7 @@ pub(crate) enum MemoryAction {
     },
     /// Open a memory's body in $VISUAL, then $EDITOR
     ///
-    /// The body only. To change a description, priority or tags, use `meka memory add <name>
-    /// --force`, which keeps whatever it does not mention.
-    #[command(verbatim_doc_comment)]
+    /// The body only; `meka memory add <name> --force` changes the description, priority or tags.
     Edit {
         /// Name of the memory to edit
         name: String,
@@ -583,24 +549,15 @@ pub(crate) enum MemoryAction {
     },
     /// Check the search index against the stored memories
     ///
-    /// The index is derived from the memories and can be regenerated, so neither answer here risks
-    /// losing a note.
-    #[command(verbatim_doc_comment)]
+    /// The index is derived from the memories, so rebuilding it cannot lose a note.
     Verify {
         /// Regenerate the index instead of only checking it
         #[arg(long)]
         rebuild: bool,
     },
     /// Write every memory out as Markdown, one file per memory
-    ///
-    /// The backup, grep and git answer for a store that lives in meka's database.
-    ///
-    /// Examples:
-    ///   meka memory export
-    ///   meka memory export --dir ~/backup/memory
-    #[command(verbatim_doc_comment)]
     Export {
-        /// Directory to write into; must be new or empty
+        /// Directory to write into; must be new or empty (default: ./meka-memory-export)
         #[arg(long, value_name = "PATH")]
         dir: Option<std::path::PathBuf>,
     },
@@ -669,7 +626,7 @@ impl std::str::FromStr for SessionExportFormat {
 )]
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum McpAction {
-    /// List all configured MCP servers
+    /// List configured MCP servers
     List {
         /// Output format: plain or json
         #[arg(long, default_value = "plain")]
@@ -718,17 +675,6 @@ pub(crate) enum McpAction {
         name: String,
     },
     /// Add a server to config.toml
-    ///
-    /// Examples:
-    ///   meka mcp add pg npx -y @modelcontextprotocol/server-postgres
-    ///   meka mcp add notion https://mcp.notion.com/mcp
-    ///   meka mcp add api https://api.example.com/mcp --auth-token-stdin
-    ///   meka mcp add notion https://mcp.notion.com/mcp --auth oauth
-    #[allow(
-        rustdoc::bare_urls,
-        reason = "these lines are also clap's help text, where the angle brackets of an auto-link would print literally"
-    )]
-    #[command(verbatim_doc_comment)]
     Add {
         /// Unique server name (alphanumerics, `-`, `_` only)
         name: String,
@@ -756,9 +702,7 @@ pub(crate) enum McpAction {
 
         /// Read a static bearer token from stdin (excludes --auth)
         ///
-        /// The token is kept in meka's database, never in config.toml. There is no flag that takes
-        /// it as an argument, because an argument is visible in `ps` output and in the shell
-        /// history of every user on the machine.
+        /// Kept in meka's database, never in config.toml.
         #[arg(long = "auth-token-stdin", conflicts_with = "client_secret_stdin")]
         auth_token_stdin: bool,
 
@@ -766,11 +710,9 @@ pub(crate) enum McpAction {
         #[arg(long, value_name = "ID")]
         client_id: Option<String>,
 
-        /// Read the OAuth client secret from stdin
+        /// Read the OAuth client secret from stdin (excludes --auth-token-stdin)
         ///
-        /// Kept in meka's database rather than config.toml, and read from stdin rather than an
-        /// argument, for the same reasons as the bearer token above. One command reads one secret,
-        /// so this cannot be combined with --auth-token-stdin.
+        /// Kept in meka's database, never in config.toml.
         #[arg(long = "client-secret-stdin")]
         client_secret_stdin: bool,
 
@@ -910,19 +852,17 @@ pub(crate) struct Cli {
 
     /// Extra directory writable at `workspace` permission (repeatable)
     ///
-    /// The working directory is always writable at that level, as are any folders an
-    /// ACP client supplies. This adds to them.
-    ///
-    /// Deliberately a flag rather than a config key: which folders this run may write is a per-run
-    /// scope, like the working directory itself, not a preference to persist.
+    /// The working directory is always writable at that level, as are any folders an ACP client
+    /// supplies. This adds to them.
+    // A flag rather than a config key: which folders this run may write is per-run scope, like the
+    // working directory itself, not a preference to persist.
     #[arg(long = "writable-root", value_name = "PATH")]
     pub(crate) writable_root: Vec<std::path::PathBuf>,
 
     /// Profile for this session; on a resume, repins it
     ///
-    /// The only profile flag on a run. A profile is an indivisible bundle of an account, a model
-    /// and every model-tied setting, so this selects one rather than rewriting part of one.
-    /// Change a field with `meka profile set`.
+    /// Selects a whole profile (account, model and every model-tied setting); change a field with
+    /// `meka profile set`.
     #[arg(long = "profile", value_name = "NAME")]
     pub(crate) profile: Option<String>,
 

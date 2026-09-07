@@ -107,7 +107,7 @@ pub(crate) struct SpawnTerms {
 ///
 /// The SQL half of [`Store::spawn_terms`]; see that function for why both columns are
 /// read. `qualifier` is the table alias with its dot (`"s."`) or empty for an unaliased query.
-/// Interpolated rather than parameterised because it names columns, not values, and takes the
+/// Interpolated rather than parameterized because it names columns, not values, and takes the
 /// alias as an argument rather than being a `const` so a joined query cannot silently pick the
 /// wrong table's columns.
 pub(crate) fn spawned_session_sql(qualifier: &str) -> String {
@@ -161,10 +161,10 @@ pub(crate) struct SessionSummary {
 }
 /// What a sweep over many sessions did, so its caller can say what it left behind.
 ///
-/// A bare count reads as "everything that matched was deleted", and that reading is what made the
-/// retention sweep destructive: it announced `deleted 1 session(s)` in an unrelated terminal and
-/// said nothing about the conversation an operator had open in another one. A sweep that spares
-/// something has to be able to say so.
+/// A bare count reads as "everything that matched was deleted", which makes the retention sweep
+/// destructive: it announces `deleted 1 session(s)` in an unrelated terminal and says nothing about
+/// the conversation an operator has open in another one. A sweep that spares something has to be
+/// able to say so.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionSweep {
     pub(crate) deleted: u64,
@@ -175,9 +175,9 @@ pub(crate) struct SessionSweep {
 /// What a host may move on a session's row once it exists, for [`Store::update_session`]. `None`
 /// leaves that column alone.
 ///
-/// One shape for every writer. Five per-column writers each carried their own `updated_at` rule,
-/// and the one for roots had forgotten it. The profile is a name and nothing else, because a
-/// profile is an indivisible bundle and the name is the whole binding.
+/// One shape for every writer, so the `updated_at` rule is stated once rather than once per
+/// column. The profile is a name and nothing else, because a profile is an indivisible bundle and
+/// the name is the whole binding.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct SessionPatch {
     pub(crate) permission: Option<Permission>,
@@ -190,6 +190,7 @@ pub(crate) struct SessionPatch {
     pub(crate) roots: Option<Vec<PathBuf>>,
 }
 impl SessionPatch {
+    /// Whether the patch moves nothing.
     pub(crate) fn is_empty(&self) -> bool {
         self.permission.is_none()
             && self.approvals.is_none()
@@ -245,14 +246,14 @@ pub(crate) enum SourceLock {
 /// Sessions a scheduled job still depends on, as a `WHERE` fragment over `sessions`.
 ///
 /// A session with a job ahead of it is *not* expired, whatever `updated_at` says. Only turns bump
-/// that column -- [`ScheduleStore::claim_occurrence`] and
-/// [`ScheduleStore::complete_claim`] touch `scheduled_jobs` alone -- so a gated watcher
-/// that evaluates every tick and rarely fires looks untouched for exactly as long as it is
-/// working. The cascade then took the job with the session, and the sweep reported
-/// `deleted 1 session(s)` without ever mentioning that a schedule went with it.
+/// that column ([`ScheduleStore::claim_occurrence`] and [`ScheduleStore::complete_claim`] touch
+/// `scheduled_jobs` alone), so a gated watcher that evaluates every tick and rarely fires looks
+/// untouched for exactly as long as it is working. The cascade would then take the job with the
+/// session, and the sweep report `deleted 1 session(s)` without ever mentioning that a schedule
+/// went with it.
 ///
 /// Sparing only the row that *owns* the job is not enough. `parent_session_id` carries
-/// `ON DELETE CASCADE`, so deleting a stale parent silently takes its sub-agent children -- and a
+/// `ON DELETE CASCADE`, so deleting a stale parent silently takes its sub-agent children, and a
 /// job created against a child (reachable over HTTP, whose only gate is that the session exists)
 /// goes with them. The recursive term walks parent links up from every job-owning session and
 /// spares that whole chain.
@@ -296,9 +297,6 @@ pub(super) const REPAIR_ROLE: &str = "repair";
 /// Pseudo-role for `Event::Redact` rows, mirroring [`REPAIR_ROLE`]: the images it names keep
 /// their rows, and the replay puts the placeholder over them.
 pub(super) const REDACT_ROLE: &str = "redact";
-/// Encode an [`crate::conversation::Event`] into the `(role, content)` columns of the `messages`
-/// table. `Event::Append` writes the message's natural role; `Event::CompactBoundary` and
-/// `Event::Repair` write a JSON envelope under their pseudo-role.
 /// The `messages` row a session's title is read from, as a `WHERE` over `messages` correlated to
 /// `sessions s`: the first user message that carries words. A `user` row is text by construction; a
 /// `user_blocks` row is a JSON array of blocks and is passed over while none of them is a `text`
@@ -334,6 +332,9 @@ pub(super) fn title_of_first_user_row(session: &str, role: &str, content: String
     };
     Conversation::from_events(vec![Event::Append(message)]).title()
 }
+/// Encode an [`crate::conversation::Event`] into the `(role, content)` columns of the `messages`
+/// table. `Event::Append` writes the message's natural role; `Event::CompactBoundary`,
+/// `Event::Repair` and `Event::Redact` write a JSON envelope under their pseudo-role.
 pub(super) fn encode_event_for_db(
     event: &crate::conversation::Event,
 ) -> std::result::Result<(String, String), serde_json::Error> {
@@ -380,7 +381,7 @@ pub(super) fn encode_event_for_db(
     }
 }
 /// Decode one persisted row back into an [`crate::conversation::Event`]. Returns `Ok(None)` when
-/// the row's role is unrecognized (forward- compat for new variants).
+/// the row's role is unrecognized (forward compatibility for new variants).
 pub(super) fn decode_event_from_row(
     row: &StoredMessage,
 ) -> std::result::Result<Option<crate::conversation::Event>, serde_json::Error> {
@@ -434,6 +435,7 @@ pub(super) struct ListSessionsCursor {
     #[serde(rename = "i")]
     pub(super) id: String,
 }
+/// A page's last `(updated_at, id)` as the opaque token a client hands back.
 pub(super) fn encode_list_cursor(updated_at: &str, id: &str) -> String {
     use base64::Engine;
     let payload = ListSessionsCursor {
@@ -448,6 +450,7 @@ pub(super) fn encode_list_cursor(updated_at: &str, id: &str) -> String {
         .expect("ListSessionsCursor is two owned Strings; serialization cannot fail");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
 }
+/// The `(updated_at, id)` a client's token encodes, refused when it is not one this made.
 pub(super) fn decode_list_cursor(token: &str) -> Result<(String, String)> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -535,22 +538,21 @@ impl Store {
 
     /// Create a session and take its lock, in that order: the lock **before** the row.
     ///
-    /// The ordering is the entire point. Committing the row first leaves a window -- microseconds
-    /// wide, but real -- in which the session is visible to `SELECT id FROM sessions` and held by
+    /// The ordering is the entire point. Committing the row first leaves a window (microseconds
+    /// wide, but real) in which the session is visible to `SELECT id FROM sessions` and held by
     /// nobody. [`Self::delete_all_sessions`] enumerates at delete time, so it lands inside that
     /// window, takes the lock legitimately, and cascades the conversation away underneath the
-    /// process creating it. Measured at **42 lost turns in 11,948** with four creators against two
-    /// `meka session delete --all` loops: each one ends `FOREIGN KEY constraint failed` with the
-    /// user's prompt gone. Targeted `meka session delete <id>` never reproduced it, because its id
-    /// list is gathered before the creator exists -- which is what identifies the window as
-    /// belonging to creation rather than to deletion.
+    /// process creating it: the turn ends `FOREIGN KEY constraint failed` with the user's prompt
+    /// gone. A targeted `meka session delete <id>` cannot, because its id list is gathered before
+    /// the creator exists, which is what identifies the window as belonging to creation rather
+    /// than to deletion.
     ///
     /// Locking first closes it with nothing left over: a sweeper either cannot see the row yet, or
     /// sees it and finds the lock held. A lock file whose row never lands is swept by
     /// [`Self::prune_orphan_lock_files`] like any other orphan.
     ///
-    /// An `Err` in the second half means the claim could not be *made* -- an unwritable lock
-    /// directory, descriptors exhausted -- and never that somebody else holds it, because no other
+    /// An `Err` in the second half means the claim could not be *made* (an unwritable lock
+    /// directory, descriptors exhausted) and never that somebody else holds it, because no other
     /// process can know this id yet. It is returned rather than logged-and-dropped so a caller that
     /// refuses can report the reason it actually hit. Callers differ on what it is worth: a host
     /// that must be alone refuses, and the agent's own path warns and runs the turn regardless
@@ -611,16 +613,14 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // Root sessions only, matching what `meka session list` shows and what the
-                // warning's own advice can act on. A sub-agent row copies its
-                // parent's binding, so counting children reported a number many
-                // times what the user could see, about rows that `meka -r <id>
-                // --profile <name>` is not for.
+                // warning's own advice can act on. A sub-agent row copies its parent's binding,
+                // so counting children would report a number many times what the user can see,
+                // about rows that `meka -r <id> --profile <name>` is not for.
                 //
                 // [`spawned_session_sql`], so "root" means here what it means in that listing.
-                // An imported sub-agent has no parent link, so keying on the link alone counted a
-                // row the user cannot see and cannot repin -- the same
-                // disagreement, in the one place whose whole job is to state a
-                // number the user is about to act on.
+                // An imported sub-agent has no parent link, so keying on the link alone would
+                // count a row the user cannot see and cannot repin, in the one place whose whole
+                // job is to state a number the user is about to act on.
                 connection.query_row(
                     &format!(
                         "SELECT COUNT(*) FROM sessions
@@ -664,10 +664,10 @@ impl Store {
 
     /// Take the lock on an id that is about to become a row.
     ///
-    /// The ordering rule in one place, because there are four doors that mint a session and each of
-    /// them had it wrong in the same way: commit, then claim. A row visible to
-    /// `SELECT id FROM sessions` and held by nobody is one a concurrent
-    /// [`Self::delete_all_sessions`] enumerates, locks and cascades away underneath its creator.
+    /// The ordering rule in one place, because four doors mint a session and each has to keep it.
+    /// Committed and then claimed, a row is visible to `SELECT id FROM sessions` and held by
+    /// nobody, which a concurrent [`Self::delete_all_sessions`] enumerates, locks and cascades
+    /// away underneath its creator.
     ///
     /// The `Err` is carried rather than logged and dropped so a caller that refuses can name the
     /// reason it hit. It never means "somebody else holds it": no other process can know this id.
@@ -759,19 +759,19 @@ impl Store {
         // binding and not necessarily the parent *row's*. The two differ for exactly as long as a
         // repin that could not take the runtime lock: ACP's `session/set_config_option` moves the
         // row mid-turn, `try_lock` fails, and the agent stays where it was until the next turn.
-        // Selecting the column here recorded the profile the sub-agent was not running on, so a
-        // later `agent_followup` on that child resolved a different account from the one
-        // that did the work. Passed in for the same reason the window is: everything about
-        // a sub-agent's binding comes off one cell.
+        // Selecting the column here would record the profile the sub-agent is not running on, so
+        // a later `agent_followup` on that child would resolve a different account from the one
+        // that did the work. Passed in for the same reason the window is: everything about a
+        // sub-agent's binding comes off one cell.
         profile: String,
     ) -> Result<(Uuid, std::result::Result<FileLock, MekaError>)> {
         let session_id = Uuid::new_v4();
-        // Locked before the row, like every other door that mints one -- and the exposure here is
-        // not the microsecond window the others had. A sub-agent's row was never locked at any
-        // point, so it sat claimable for the whole of the sub-agent's run, which is seconds to
-        // minutes. A concurrent `meka session delete --all` enumerates it, takes the lock nobody
-        // holds, and cascades it away; the sub-agent's next message insert then dies on
-        // `FOREIGN KEY constraint failed` with its work gone. Demonstrated, not theorised.
+        // Locked before the row, like every other door that mints one, and the exposure here is
+        // not the microsecond window the others have: an unlocked sub-agent row sits claimable for
+        // the whole of the sub-agent's run, which is seconds to minutes. A concurrent
+        // `meka session delete --all` enumerates it, takes the lock nobody holds, and cascades it
+        // away; the sub-agent's next message insert then dies on `FOREIGN KEY constraint failed`
+        // with its work gone.
         let lock = self.claim_a_fresh_id(session_id);
         let now = chrono::Utc::now().to_rfc3339();
         let cwd_string = cwd.map(|path| path.display().to_string());
@@ -808,12 +808,11 @@ impl Store {
             })?;
 
         // A parent that is gone selects no row, so this statement inserts nothing and succeeds.
-        // Reading the count back is what keeps that an error: the `VALUES` form this replaced was
-        // refused by `parent_session_id`'s foreign key, and without the check a spawn would hand
-        // back an id with no row behind it -- a sub-agent the model is told about, holding a lock
-        // file for a session that never existed, whose first `save_message` dies on the
-        // constraint instead. [`Self::fork_session_into`] reads its own count for the same
-        // reason.
+        // Reading the count back is what keeps that an error, where a plain `VALUES` form would be
+        // refused by `parent_session_id`'s foreign key: without the check a spawn would hand back
+        // an id with no row behind it, a sub-agent the model is told about, holding a lock file
+        // for a session that never existed, whose first `save_message` dies on the constraint
+        // instead. [`Self::fork_session_into`] reads its own count for the same reason.
         if !inserted {
             self.discard_unused_claim(lock, session_id);
             return Err(MekaError::Database(format!(
@@ -924,11 +923,11 @@ impl Store {
     /// process is writing ends on a user message nothing answered, and restores as an unusable
     /// session; that is refused as [`MekaError::SessionLocked`]. The copy's, taken before its row
     /// lands: committing first and locking after is the same commit-then-claim window
-    /// [`Self::create_session_locked`] was written to close, in the same width, and a concurrent
-    /// `meka session delete --all` enumerated the copy, took the lock nobody held, and deleted it,
-    /// after which the fork locked the vanished id successfully and its next turn died on a
-    /// foreign-key violation. Under ACP it was quieter still: `load_events` returned empty and the
-    /// editor was handed a silently blank fork.
+    /// [`Self::create_session_locked`] closes, in the same width, where a concurrent
+    /// `meka session delete --all` enumerates the copy, takes the lock nobody holds, and deletes
+    /// it, after which the fork locks the vanished id successfully and its next turn dies on a
+    /// foreign-key violation. Under ACP it is quieter still: `load_events` returns empty and the
+    /// editor is handed a silently blank fork.
     ///
     /// The one fork door. Every host reaches it: `meka session fork` and the REPL's `/fork`,
     /// `POST /v1/sessions/{id}/fork` and ACP's `session/fork`.
@@ -1135,16 +1134,14 @@ impl Store {
             .await
     }
 
-    /// Persist a batch of events atomically in one SQLite transaction.  The agent loop
-    /// uses this to save the assistant message + the matching tool-results message
-    /// together.  Without the transaction, a failure on the tool-results row would leave
-    /// the assistant message persisted with `tool_use` blocks but no matching tool
-    /// results, corrupting the conversation for subsequent turns.  The transaction
-    /// guarantees either both rows commit or neither does.
+    /// Persist a batch of events in one SQLite transaction. The agent loop uses this to save the
+    /// assistant message and the matching tool-results message together: without the transaction,
+    /// a failure on the tool-results row would leave the assistant message persisted with
+    /// `tool_use` blocks but no matching results, corrupting the conversation for every later
+    /// turn.
     ///
-    /// `events` MUST be non-empty; an empty batch is a no-op. `updated_at` is bumped once
-    /// at the end of the batch (not once per row) so the row reflects the batch's commit
-    /// time rather than the order events were appended.
+    /// An empty batch is a no-op. `updated_at` is bumped once at the end of the batch rather than
+    /// once per row, so the row reflects the batch's commit time.
     pub(crate) async fn save_events_atomic(
         &self,
         session_id: Uuid,
@@ -1203,8 +1200,8 @@ impl Store {
     ///
     /// `updated_at` is stamped to the import time rather than restored from the export. Retention
     /// GC deletes by `updated_at` ([`Self::delete_expired_sessions`], run at startup when
-    /// `[session].retention_days` is set), so restoring the original value meant an archive older
-    /// than the window was swept on the next launch, before anyone could resume it. `created_at`
+    /// `[session].retention_days` is set), so restoring the original value would have an archive
+    /// older than the window swept on the next launch, before anyone could resume it. `created_at`
     /// still carries the original for provenance.
     ///
     /// `blobs` are the image bytes the archive carries; every reference in the events has to name
@@ -1400,13 +1397,13 @@ impl Store {
                 Ok(Some(event)) => events.push(event),
                 Ok(None) => {
                     tracing::warn!(
-                        "dropping unparseable session row (role={role})",
+                        "dropping a session row with unknown role '{role}'",
                         role = row.role
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "failed to decode session row (role={role}): {error}",
+                        "failed to decode a session row of role '{role}': {error}",
                         role = row.role
                     );
                 }
@@ -1430,13 +1427,13 @@ impl Store {
                 Ok(Some(event)) => events.push((row.created_at, event)),
                 Ok(None) => {
                     tracing::warn!(
-                        "dropping unparseable session row (role={role})",
+                        "dropping a session row with unknown role '{role}'",
                         role = row.role
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "failed to decode session row (role={role}): {error}",
+                        "failed to decode a session row of role '{role}': {error}",
                         role = row.role
                     );
                 }
@@ -1690,16 +1687,15 @@ impl Store {
     ///
     /// Root sessions only, like [`Self::list_sessions`]'s default, and for a sharper reason than
     /// tidiness. A sub-agent's row is touched by its own turns, so a sub-agent still running when
-    /// its parent's turn ends -- which `agent_spawn`'s `background` parameter makes ordinary --
-    /// sorts above the session the user was actually in.
-    /// `crate::host::refuse_a_spawned_session` refuses a sub-agent, so picking one would
-    /// dead-end `-c` on a session the user never named, with no way to ask for the next one
-    /// down.
+    /// its parent's turn ends (which `agent_spawn`'s `background` parameter makes ordinary) sorts
+    /// above the session the user was actually in. `crate::host::refuse_a_spawned_session`
+    /// refuses a sub-agent, so picking one would dead-end `-c` on a session the user never named,
+    /// with no way to ask for the next one down.
     ///
     /// [`spawned_session_sql`] rather than `parent_session_id IS NULL`, so the filter answers the
     /// same question the refusal does. An imported sub-agent has no parent link and is refused all
-    /// the same, so keying on the link alone let `-c` select one and then decline it -- exactly
-    /// the dead-end above, and permanent, because nothing newer can outrank it.
+    /// the same, so keying on the link alone would let `-c` select one and then decline it:
+    /// exactly the dead-end above, and permanent, because nothing newer can outrank it.
     pub(crate) async fn last_session_id(&self) -> Result<Option<Uuid>> {
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
@@ -1769,6 +1765,7 @@ impl Store {
         }
     }
 
+    /// Whether a row with this id is in the store.
     pub(crate) async fn session_exists(&self, session_id: Uuid) -> Result<bool> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1787,9 +1784,9 @@ impl Store {
 
     /// Every session id in the store, which is the set a prefix is resolved against.
     ///
-    /// A listing filters -- `-n`, and sub-agent sessions hidden by default -- while
+    /// A listing filters (`-n`, and sub-agent sessions hidden by default) while
     /// [`Self::find_sessions_by_prefix`] does not. Sizing the printed id column against the rows
-    /// alone therefore printed a prefix that every command taking one would refuse as ambiguous.
+    /// alone would therefore print a prefix that every command taking one refuses as ambiguous.
     pub(crate) async fn all_session_ids(&self) -> Result<Vec<String>> {
         self.connection
             .call(|connection| -> rusqlite::Result<_> {
@@ -1821,9 +1818,9 @@ impl Store {
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
                     // Two is all a caller needs: one match resolves, and any second makes it
-                    // ambiguous. A cap of 16 was reported verbatim, so 17 colliding sessions read
-                    // as "matches 16" -- a count that is simply wrong. The refusal below names
-                    // every id it fetched, which is why fetching a bounded few is enough.
+                    // ambiguous. A cap reported verbatim reads as the count, so the refusal says
+                    // "at least" once the cap is hit and names every id it fetched, which is why
+                    // fetching a bounded few is enough.
                     &format!(
                         "SELECT id FROM sessions WHERE id LIKE ?1 \
                          ORDER BY updated_at DESC LIMIT {PREFIX_MATCH_CAP}"
@@ -1876,9 +1873,9 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 // The shared rule, so `--include-children` covers the same rows the refusal treats
-                // as children. Keying on the parent link alone listed an imported sub-agent among
-                // the root sessions and then declined to run it, with the refusal's own text
-                // telling the reader to pass `--include-children` to see a row that was already in
+                // as children. Keying on the parent link alone would list an imported sub-agent
+                // among the root sessions and then decline to run it, with the refusal's own text
+                // telling the reader to pass `--include-children` to see a row that is already in
                 // front of them.
                 let not_spawned = format!("NOT {}", spawned_session_sql("s."));
                 let mut clauses: Vec<&str> = Vec::new();
@@ -2182,10 +2179,9 @@ impl Store {
     /// does not touch it, so a REPL left sitting at its prompt past the window is a perfect
     /// candidate for deletion while a human is looking at it. Any start that goes through
     /// `async_main` runs this sweep, so without it a completely unrelated `meka` in another
-    /// terminal destroys the live session and announces `deleted 1 session(s)`. What the operator
-    /// saw was their next turn running against the provider and *then* failing on a foreign-key
-    /// violation, with the answer paid for and lost, and every later turn in that REPL failing the
-    /// same way.
+    /// terminal destroys the live session and announces `deleted 1 session(s)`; the operator's
+    /// next turn runs against the provider and *then* fails on a foreign-key violation, with the
+    /// answer paid for and lost, and every later turn in that REPL fails the same way.
     ///
     /// A locked *child* is not separately checked. The cascade would take one with its parent, but
     /// children are sub-agent rows, and the only thing that locks one is `agent_followup`, for the
@@ -2223,19 +2219,8 @@ impl Store {
                 // expired parents.
                 //
                 // A session with a scheduled job still ahead of it is *not* expired, whatever
-                // `updated_at` says. Only turns bump that column -- `complete_claim` and
-                // `claim_occurrence` touch `scheduled_jobs` alone -- so a gated watcher
-                // that evaluates every tick but rarely fires looks untouched for as
-                // long as it stays quiet, which is exactly when it is working. The
-                // cascade then took the job with the session, and the sweep
-                // reported "deleted 1 session(s)" without ever mentioning
-                // that a schedule went with it.
-                //
-                // Sparing only the row that *owns* the job is not enough. `parent_session_id`
-                // carries `ON DELETE CASCADE`, so deleting a stale parent silently takes its
-                // sub-agent children -- and a job created against a child (reachable over HTTP,
-                // whose only gate is that the session exists) goes with them. The recursive term
-                // walks parent links up from every job-owning session and spares that whole chain.
+                // `updated_at` says; `NOT_SPOKEN_FOR_BY_A_SCHEDULE` says why the whole parent
+                // chain of a job-owning session is spared.
                 //
                 // Selected rather than deleted outright, because which of these rows may go is not
                 // a question the database can answer: it depends on which of them another process
@@ -2363,11 +2348,11 @@ impl Store {
     /// The one writer for every column a session carries once it exists: the level, the approvals
     /// switch, the working directory, the profile and the additional roots. Every door builds a
     /// [`SessionPatch`] and lands here, so the `updated_at` rule is stated once: any column that
-    /// moves bumps it, roots included. Roots did not, on the theory that activating them is how a
-    /// session is being opened rather than activity in it; but a column that moves without the
-    /// timestamp is invisible to every reader keyed on it (the idle sweep, `session/list` order, a
-    /// client's change detection), and a door that wants no bump sends nothing, which is what every
-    /// door does for a value the row already holds.
+    /// moves bumps it, roots included. Activating roots looks like how a session is being opened
+    /// rather than activity in it, but a column that moves without the timestamp is invisible to
+    /// every reader keyed on it (the idle sweep, `session/list` order, a client's change
+    /// detection), and a door that wants no bump sends nothing, which is what every door does for a
+    /// value the row already holds.
     ///
     /// `cwd` is stored as the path's `to_string_lossy()` form, UTF-8 being the only text SQLite
     /// has. An empty patch writes nothing. A patch for a row that is gone is
@@ -2459,6 +2444,7 @@ impl Store {
             .map_err(|error| MekaError::Database(format!("failed to erase the level: {error}")))
     }
 
+    /// Empty a session's event log and scratchpad, for tests that reuse a row.
     #[cfg(test)]
     pub(crate) async fn clear_messages(&self, session_id: Uuid) -> Result<()> {
         self.connection
@@ -2489,8 +2475,8 @@ impl Store {
     /// already or is acting on a row nothing can have locked: the HTTP handler evicting its own
     /// entry, the GC dropping a session it served, a sub-agent tool removing a child row it
     /// created moments ago. Taking the lock in those cases would *refuse* the caller its own
-    /// session -- `flock` is per open file description rather than per process, so a second
-    /// descriptor contends with the first -- and `try_write` is non-blocking, so what it produces
+    /// session (`flock` is per open file description rather than per process, so a second
+    /// descriptor contends with the first), and `try_write` is non-blocking, so what it produces
     /// is a spurious [`MekaError::SessionLocked`] rather than a hang.
     ///
     /// A caller acting on a session it has never met wants

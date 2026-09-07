@@ -91,17 +91,12 @@ async fn run_add(
     if name.trim().is_empty() {
         anyhow::bail!("account name cannot be empty");
     }
-    // Every prompt below reads the same stdin the key is piped on, so one that fires under
-    // `--api-key-stdin` eats the secret and then fails with "no API key was read from stdin",
-    // naming the wrong field entirely; with two lines piped, line one would be written to
-    // `config.toml` as a `base_url`. The required backend is refused up front rather than
-    // prompted into a pipe, and the optional base URL takes the backend default.
+    // Every prompt below reads the stdin the key is piped on, so under `--api-key-stdin` a prompt
+    // would eat the secret, or write a second piped line to `config.toml` as `base_url`. The
+    // backend is required up front and the base URL takes the backend default.
     if api_key_stdin {
         let Some(backend) = backend_flag else {
-            anyhow::bail!(
-                "`--api-key-stdin` reads the key from stdin, so it cannot prompt for --backend. \
-                 Pass it as a flag."
-            );
+            anyhow::bail!("`--api-key-stdin` needs `--backend`");
         };
         let backend = validate_backend(backend)?;
         // The same refusal `meka account login` makes: `acquire_credential` ignores this flag for
@@ -109,8 +104,8 @@ async fn run_add(
         // flow it cannot see while the key it piped went unread.
         if !matches!(credential_kind(backend), CredentialKind::ApiKey) {
             anyhow::bail!(
-                "'{backend}' authenticates through the browser and has no API key to read from stdin. \
-                 Run `meka account add {name} --backend {backend}` without `--api-key-stdin`."
+                "'{backend}' logs in through the browser and takes no API key; drop \
+                 `--api-key-stdin`"
             );
         }
     }
@@ -120,8 +115,8 @@ async fn run_add(
     let existing = config::load_config_file_or_err()?;
     if existing.accounts.contains_key(name) {
         anyhow::bail!(
-            "an account named '{name}' already exists. Use `meka account login {name}` to \
-             re-authenticate, or `meka account remove {name}` first."
+            "an account named '{name}' already exists; re-authenticate it with `meka account login \
+             {name}`"
         );
     }
 
@@ -132,9 +127,7 @@ async fn run_add(
 
     let base_url = match base_url_flag {
         Some(url) => Some(url),
-        // Under `--api-key-stdin` the guard above has already established that the backend was
-        // given; this one is optional, so an absent value takes the backend default rather than
-        // prompting into the pipe the key is on.
+        // Not prompted into the pipe the key is on.
         None if api_key_stdin => None,
         None => {
             // Shows the endpoint an empty answer accepts. An empty answer writes nothing: pinning
@@ -161,16 +154,12 @@ async fn run_add(
 
     let settings = drop_inert_settings(settings_flags, backend);
 
-    // Acquire the credential last: the Codex OAuth login races a pasted-callback-URL reader against
-    // the loopback callback, and if the callback wins it can leave a stdin read parked. Keeping the
-    // interactive prompts above (which read stdin) before this ensures nothing reads stdin after.
+    // Last, after every prompt: the Codex login races a pasted-callback reader against the loopback
+    // callback, and a callback win can leave a stdin read parked, so nothing may read stdin after.
     //
-    // The grant has to be minted under the same `client_id` *and* at the same `oauth_token_url`
-    // the account is about to record, because those recorded values are what every later refresh
-    // presents and posts to (`run_login` passes the account's for the same reason). Passing `None`
-    // for the client would issue the grant to the default one and then claim a custom one: an
-    // account that authenticates once and dies at its first refresh, naming a mismatch nothing had
-    // announced.
+    // Minted under the `client_id` and at the `oauth_token_url` the account is about to record,
+    // because those are what every later refresh presents and posts to; a grant issued to the
+    // default client and then claimed by a custom one dies at its first refresh.
     let credential = acquire_credential(
         backend,
         api_key_stdin,
@@ -179,11 +168,9 @@ async fn run_add(
     )
     .await?;
 
-    // The account before the secret, so the half that lands first is the visible half. A config
-    // write can fail for ordinary reasons -- a read-only directory, a full disk -- and doing it
-    // second left a credential in the database that no account named: `account list` reports it as
-    // an orphan, but only if the user thinks to look. This way round, the failure leaves an account
-    // with no credential, which the next run refuses by name and tells you to `meka account login`.
+    // The account before the secret, so the half that lands first is the visible half: a failed
+    // config write then leaves an account with no credential, which the next run refuses by name,
+    // rather than a credential no account names, which only `account list` reports.
     write_account(name, backend, base_url.as_deref(), &settings)?;
     token_store
         .save_account_credential(name, &credential)
@@ -208,7 +195,7 @@ fn drop_inert_settings(mut settings: OAuthSettings, backend: config::Backend) ->
     }
     if !dropped.is_empty() {
         tracing::warn!(
-            "ignoring {dropped} for a '{backend}' account: that backend never reads the setting",
+            "ignoring {dropped}: a '{backend}' account never reads it",
             dropped = dropped.join(", "),
         );
     }
@@ -222,7 +209,11 @@ async fn run_login(
 ) -> anyhow::Result<()> {
     let config_file = config::load_config_file_or_err()?;
     let Some(account) = config_file.accounts.get(name) else {
-        anyhow::bail!("no account named '{name}'. Run `meka account add {name}` to create it.");
+        anyhow::bail!(crate::text::unknown_name(
+            "account",
+            name,
+            config_file.accounts.keys()
+        ));
     };
     // Before the guard below, which asks `credential_kind` a question it answers `None` to for a
     // backend it does not recognize. Otherwise a typo'd `backend` is diagnosed as a browser login
@@ -234,9 +225,8 @@ async fn run_login(
     // backend, so this is answerable before anything opens.
     if api_key_stdin && !matches!(credential_kind(backend), CredentialKind::ApiKey) {
         anyhow::bail!(
-            "account '{name}' is a '{backend}' account, which authenticates through the browser and \
-             has no API key to read from stdin. Run `meka account login {name}` without \
-             `--api-key-stdin`."
+            "'{name}' is a '{backend}' account, which logs in through the browser and takes no API \
+             key; drop `--api-key-stdin`"
         );
     }
     let credential = acquire_credential(
@@ -254,31 +244,25 @@ async fn run_login(
 }
 
 async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
-    // Deliberately does not require a configured account: this is the only path that deletes a
-    // credential, so it has to work on one whose `[accounts.<name>]` block was deleted by hand.
-    // Both sides are read before either is touched so the confirmation can say which of them
-    // actually existed, and so a typo'd name fails instead of reporting a removal that removed
-    // nothing. `open_document` rather than the parsed config on purpose: `remove` must still run on
-    // a config.toml that meka can't deserialize, since it is one of the ways such a file gets
-    // repaired.
+    // No configured account required: this is the only path that deletes a credential, so it has
+    // to work on one whose `[accounts.<name>]` block was deleted by hand. Both sides are read
+    // before either is touched, so a typo fails instead of reporting a removal that removed
+    // nothing. `open_document` rather than the parsed config, because `remove` is one of the
+    // ways a config.toml meka cannot deserialize gets repaired.
     //
-    // Asks whether the row is *there*, not whether it parses. `load_account_credential` fails on a
-    // credential it cannot deserialize, which would stop the command before the delete: the one
-    // surface that removes a corrupt row would refuse to, on the grounds that it was corrupt.
+    // Whether the row is *there*, not whether it parses: `load_account_credential` fails on a row
+    // it cannot deserialize, and the one surface that removes a corrupt row must not refuse it for
+    // being corrupt.
     let has_credential = token_store
         .list_credential_accounts()
         .await?
         .iter()
         .any(|account| account == name);
 
-    // Probed under its own short-lived guard, and the guard dropped before the `await` below.
-    //
-    // `ConfigFileLock` tracks reentrancy in a *thread*-local depth counter, so holding one across
-    // an await is unsound on a multi-threaded runtime: the task can resume on another worker, where
-    // the depth reads zero, and a nested acquisition then tries to take a file lock this process
-    // already holds. That is a self-deadlock, and the counter it leaves behind is under-balanced on
-    // one thread and over-balanced on the other. Two short critical sections cost a TOCTOU window
-    // no CLI invocation can lose anything to; one long one costs correctness.
+    // Under its own short-lived guard, dropped before the `await` below. `ConfigFileLock` tracks
+    // reentrancy in a thread-local depth counter, so a guard held across an await on a
+    // multi-threaded runtime can resume on a worker where the depth reads zero, and a nested
+    // acquisition then self-deadlocks on the file lock this process already holds.
     let (has_account, referenced_by) = {
         let (_lock, _path, document) = open_document()?;
         (
@@ -294,8 +278,8 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // rather than cascading a deletion the user did not ask for.
     if !referenced_by.is_empty() {
         anyhow::bail!(
-            "account '{}' is named by profile(s) {}; remove them with `meka profile remove <name>` \
-             or point them at another account first",
+            "account '{}' is named by profile(s) {}; remove them first with `meka profile remove \
+             <name>`",
             name,
             referenced_by.join(", ")
         );
@@ -392,7 +376,6 @@ async fn run_list(
             ]
         })
         .collect();
-    // Requested data goes to stdout via the shared column formatter, matching `meka mcp list`.
     crate::render::write_stdout(crate::text::format_columns(
         &["Name", "Backend", "Base URL", "Authenticated"],
         &rows,
@@ -562,9 +545,8 @@ pub(super) fn ensure_section_table<'a>(
         .and_then(|item| item.as_table_mut())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "`{section}` in config.toml is not a section, so meka cannot add to it without \
-                 rewriting the rest. Spell each entry as its own `[{section}.<name>]` section and \
-                 run this again"
+                "`{section}` in config.toml is not a section; spell each entry as its own \
+                 `[{section}.<name>]` section"
             )
         })
 }
@@ -594,8 +576,7 @@ pub(super) fn reparse_after_edit(before: &str, after: &str) -> anyhow::Result<co
     toml::from_str(after).map_err(|error| {
         if toml::from_str::<config::ConfigFile>(before).is_err() {
             anyhow::anyhow!(
-                "config.toml already failed to parse before this change, so this is not what broke \
-                 it. Fix the file first: {error}"
+                "config.toml already fails to parse, so this is not what broke it: {error}"
             )
         } else {
             anyhow::anyhow!("that change makes config.toml unreadable: {error}")
@@ -661,8 +642,8 @@ fn write_account(
         .is_some()
     {
         anyhow::bail!(
-            "an account named '{name}' already exists. Use `meka account login {name}` to \
-             re-authenticate, or `meka account remove {name}` first."
+            "an account named '{name}' already exists; re-authenticate it with `meka account login \
+             {name}`"
         );
     }
     let before = document.to_string();
@@ -707,12 +688,10 @@ fn prompt_secret(prompt: &str) -> io::Result<String> {
             // SAFETY: `quiet` is a termios obtained from this same descriptor with one flag
             // cleared.
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } == 0 {
-                // Restored on the way out of *every* exit, including the one the ordinary code
-                // path cannot see. Ctrl-C at this prompt is a normal thing to do -- wrong profile,
-                // wrong account, changed your mind -- and SIGINT's default disposition kills the
-                // process where it stands, so nothing below runs and the user is left in a shell
-                // that shows nothing they type until they find `stty sane`. That is the exact
-                // outcome the doc above says must not happen.
+                // Restored on every exit, including the one the ordinary code path cannot see:
+                // Ctrl-C at this prompt is normal, and SIGINT's default disposition kills the
+                // process where it stands, leaving a shell that shows nothing typed until
+                // `stty sane`.
                 let _echo = EchoGuard::install(fd, original);
                 let result = prompt_line(prompt);
                 // The Enter the user pressed was not echoed either, so the cursor is still on the
@@ -867,7 +846,7 @@ fn prompt_backend() -> anyhow::Result<config::Backend> {
             return Ok(*backend);
         }
         crate::streams::write_stderr_line(format!(
-            "Please enter a number between 1 and {}.",
+            "Enter a number between 1 and {}.",
             options.len()
         ));
     }
@@ -910,7 +889,7 @@ async fn claude_login(
     if code_input.is_empty() {
         anyhow::bail!("authorization code cannot be empty");
     }
-    // The pasted value may include the state after a '#' delimiter (e.g. "code#state").
+    // Anthropic's page hands back `code#state`.
     let code = code_input.split('#').next().unwrap_or(&code_input);
 
     exchange_claude_code(code, &code_verifier, client_id, &state, token_url).await
@@ -1005,15 +984,15 @@ async fn codex_login(
             Ok(listener) => Some(listener),
             Err(error) if paste_enabled => {
                 tracing::warn!(
-                    "failed to bind callback listener on 127.0.0.1:{CODEX_REDIRECT_PORT}: \
+                    "failed to bind the callback listener on 127.0.0.1:{CODEX_REDIRECT_PORT}: \
                      {error}; falling back to pasting the callback URL"
                 );
                 None
             }
             Err(error) => {
                 anyhow::bail!(
-                    "failed to bind callback listener on 127.0.0.1:{CODEX_REDIRECT_PORT}: {error}. \
-                     Is another login already running?"
+                    "failed to bind the callback listener on 127.0.0.1:{CODEX_REDIRECT_PORT}: \
+                     {error}"
                 );
             }
         };
@@ -1045,7 +1024,7 @@ async fn codex_login(
         (None, _) => read_pasted_codex_callback().await?,
     };
     if received_state != state {
-        anyhow::bail!("OAuth state mismatch, possible CSRF; aborting");
+        anyhow::bail!("OAuth state mismatch; refusing the callback");
     }
     exchange_codex_code(
         &received_code,
@@ -1077,7 +1056,7 @@ async fn read_pasted_codex_callback() -> anyhow::Result<(String, String)> {
                 match extract_codex_paste(&line) {
                     CodexCallback::Match { code, state } => return Ok((code, state)),
                     CodexCallback::AuthError(message) => {
-                        anyhow::bail!("authorization server returned error: {message}")
+                        anyhow::bail!("the authorization server rejected the login: {message}")
                     }
                     CodexCallback::NotCallback | CodexCallback::Malformed(_) => {
                         crate::streams::write_stderr_line(
@@ -1211,7 +1190,7 @@ async fn accept_codex_callback(
                     .await {
                     tracing::debug!("failed to answer the callback client: {error}");
                 }
-                anyhow::bail!("authorization server returned error: {message}");
+                anyhow::bail!("the authorization server rejected the login: {message}");
             }
         }
     }
@@ -1481,7 +1460,7 @@ async fn run_introspection(
             },
             None => {
                 crate::streams::write_stderr_line(format!(
-                    "Account usage isn't available for account '{}'.",
+                    "Account usage is not available for account '{}'.",
                     settings.account
                 ));
                 return Err(crate::AlreadyReported.into());
@@ -1498,8 +1477,8 @@ async fn run_introspection(
                 .await?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "no stored credential for account '{}'. Run `meka account login {}`.",
-                        settings.account,
+                        "no stored credential for account '{0}'; log in with `meka account login \
+                         {0}`",
                         settings.account
                     )
                 })?;
@@ -1553,7 +1532,7 @@ async fn run_introspection(
             }
             None => {
                 crate::streams::write_stderr_line(format!(
-                    "Account history isn't available for account '{}'.",
+                    "Account history is not available for account '{}'.",
                     settings.account
                 ));
                 return Err(crate::AlreadyReported.into());
@@ -1674,10 +1653,8 @@ mod tests {
         assert_eq!(status.expires_at, None);
     }
 
-    /// A config meka can't read must never be treated as a config that is empty: `open_document`
-    /// hands its result to `write_file_atomic`, so "" here truncates the user's real file. This
-    /// wiped 159 bytes of profiles and MCP servers off a single non-UTF-8 byte in a comment, while
-    /// printing `ok:` and exiting 0.
+    /// A config meka cannot read must never be treated as a config that is empty: `open_document`
+    /// hands its result to `write_file_atomic`, so "" here truncates the user's real file.
     #[test]
     fn open_document_refuses_an_unreadable_config() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2209,29 +2186,12 @@ mod tests {
         );
     }
 
-    /// The code exchange goes to the account's endpoint, not the built-in one.
-    ///
-    /// The account's `client_id` reaches the mint because a grant issued to the default client and
-    /// then claimed by a custom one dies at its first refresh. The endpoint is the same rule one
-    /// field over: if refresh read `oauth_token_url` while the mint posted to a constant, the
-    /// documented pair (`--client-id` with `--oauth-token-url`) could not complete a login at all,
-    /// and the case the field exists for (no direct route out) could not even reach Anthropic to
-    /// be refused.
-    ///
-    /// A real socket rather than a URL assertion, because a helper that took the endpoint and
-    /// posted somewhere else would satisfy any signature check. The stub answers nothing useful and
-    /// the exchange fails afterwards; that the request *arrived* there is the whole claim.
-    ///
-    /// **What this does not cover, and what does.** The browser leg means no test can drive
-    /// `claude_login` end to end, so the link between the account's field and this argument is held
-    /// by the compiler instead: dropping it makes `oauth_token_url` an unused parameter, which CI's
-    /// `-D warnings` turns into a build failure. Verified by reverting the call to the constant.
-    /// The same, for the other subscription backend.
+    /// The same as the Claude test below, for the other subscription backend.
     ///
     /// A sibling rather than a duplicate: `codex_login` reaches a *different* exchange helper with
-    /// a different body encoding and its own hardcoded constant, so the claude test above says
-    /// nothing about it. Threading the endpoint into one of two mints and not the other is exactly
-    /// the one-door-of-two shape the rest of the suite closes.
+    /// a different body encoding and its own hardcoded constant, so the Claude test says nothing
+    /// about it. Threading the endpoint into one of two mints and not the other is exactly the
+    /// one-door-of-two shape the rest of the suite closes.
     #[tokio::test]
     async fn the_codex_exchange_posts_to_the_profiles_token_endpoint() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -2262,6 +2222,20 @@ mod tests {
         );
     }
 
+    /// The code exchange goes to the account's endpoint, not the built-in one.
+    ///
+    /// The account's `client_id` reaches the mint because a grant issued to the default client and
+    /// then claimed by a custom one dies at its first refresh. The endpoint is the same rule one
+    /// field over: if refresh read `oauth_token_url` while the mint posted to a constant, the
+    /// documented pair (`--client-id` with `--oauth-token-url`) could not complete a login at all.
+    ///
+    /// A real socket rather than a URL assertion, because a helper that took the endpoint and
+    /// posted somewhere else would satisfy any signature check. The stub answers nothing useful and
+    /// the exchange fails afterwards; that the request *arrived* there is the whole claim.
+    ///
+    /// The browser leg means no test can drive `claude_login` end to end, so the link between the
+    /// account's field and this argument is held by the compiler instead: dropping it makes
+    /// `oauth_token_url` an unused parameter, which CI's `-D warnings` turns into a build failure.
     #[tokio::test]
     async fn the_code_exchange_posts_to_the_profiles_token_endpoint() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

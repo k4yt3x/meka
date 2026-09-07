@@ -243,9 +243,9 @@ impl Agent {
     /// The window this agent gauges against, and the one every collaborator watching the published
     /// cell sees.
     ///
-    /// Read rather than mirrored onto a field of its own. Read from the cell rather than mirrored
-    /// into `options.context_window`: hand-written assignments enforcing what the cell already
-    /// guarantees break the day a third holder is added and only two are remembered.
+    /// Read from the cell rather than mirrored into a field of its own: hand-written assignments
+    /// enforcing what the cell already guarantees break the day a third holder is added and only
+    /// two are remembered.
     pub(crate) fn context_window(&self) -> u64 {
         self.cells.profile.context_window()
     }
@@ -272,12 +272,9 @@ impl Agent {
     /// `None` for auto-compaction switched off, and for a zero window, which is not a small window
     /// but "unknown": a threshold of zero would compact every turn including the first.
     ///
-    /// One function because there are three sites that need it -- the reactive check after a turn,
-    /// the proactive projection before one, and the overflow-recovery guard -- and they were three
-    /// hand-written copies of `window * PERCENT / 100` behind three hand-written copies of the same
-    /// two-part guard. Three copies of one formula is three chances to fix a bug in two of them,
-    /// and a mutation sweep found every one of the nineteen operators involved could be flipped
-    /// with the suite still green.
+    /// One function for the three sites that need it (the reactive check after a turn, the
+    /// proactive projection before one, and the overflow-recovery guard), so the formula and its
+    /// two-part guard cannot drift between them.
     pub(crate) fn auto_compact_threshold(&self) -> Option<u64> {
         if !self.options.auto_compact {
             return None;
@@ -353,9 +350,8 @@ impl Agent {
             user_instructions: None,
             // Sub-agents run silent: no streaming UI, no MCP readiness gate.
             streaming: false,
-            // Auto-compaction *is* inherited. A worker handed a large task has the same context
-            // window as its parent and the same need to compact within it; hardcoding this off
-            // meant a big delegated job simply failed once it filled the window.
+            // Auto-compaction is inherited: a worker handed a large task has the same context
+            // window as its parent and the same need to compact within it.
             auto_compact: parent_options.auto_compact,
             // Inherited for the same reason as `auto_compact`: a worker that compacts is about to
             // discard its own working state, and the checkpoint is what lets it keep the part that
@@ -497,10 +493,8 @@ mod tests {
     };
 
     /// The switch has to reach the collaborators that outlive a turn, not just the agent's own
-    /// fields. `agent_spawn` built a worker from a provider cloned when the session was assembled
-    /// and `context_check` reported a window frozen at the same moment, so a session moved by
-    /// `/provider`, `PATCH` or `session/set_config_option` went on spawning workers that billed the
-    /// account it had just left, while the child's row recorded the new profile.
+    /// fields: `agent_spawn` and `context_check` hold the published cell, and a provider cloned
+    /// when the session was assembled would go on billing the account the session had just left.
     #[tokio::test]
     async fn a_switch_reaches_everything_holding_the_published_binding() {
         let first: Arc<dyn Provider> =
@@ -554,12 +548,9 @@ mod tests {
 
     /// The number three separate sites divide by, pinned exactly.
     ///
-    /// Every operator in `window * PERCENT / 100` and in the guard around it is flippable without a
-    /// test that pins the threshold, across the reactive check, the proactive projection and the
-    /// overflow-recovery arm. The tests that drove compaction all *forced* it, so they proved the
-    /// machinery runs and said nothing about when it starts. A wrong threshold is silent either way
-    /// -- compact every turn and lose history, or never compact and have the provider reject the
-    /// turn.
+    /// The tests that drive compaction all force it, so they prove the machinery runs and say
+    /// nothing about when it starts, and a wrong threshold is silent either way: compact every
+    /// turn and lose history, or never compact and have the provider reject the turn.
     #[tokio::test]
     async fn the_auto_compaction_threshold_is_eighty_percent_of_the_window() {
         let provider: Arc<dyn Provider> =
@@ -595,12 +586,11 @@ mod tests {
         );
     }
 
-    /// A harness that can actually reach the emergency-compaction arm.
+    /// A harness that can reach the emergency-compaction arm.
     ///
     /// The default one cannot: it sets `auto_compact: false` and a zero window, and the guard
     /// requires both, so a test driving `FailContextOverflow` through `agent_for_test` proves only
-    /// that the *guard* short-circuits. It was written specifically to close that gap and did
-    /// not.
+    /// that the guard short-circuits.
     pub(super) async fn agent_that_compacts_for_test(
         provider: Arc<dyn Provider>,
     ) -> (Agent, Store) {
@@ -763,9 +753,4 @@ mod tests {
             }],
         }
     }
-
-    // Cache prefix stability tests. These tests simulate the agent's message-assembly logic (stable
-    // base + appended tool-loop messages) to verify that the prefix sent to the API remains
-    // identical across iterations of the tool-use loop.  This is the core invariant required for KV
-    // cache reuse.
 }

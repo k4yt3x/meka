@@ -148,11 +148,8 @@ pub(super) fn world_state_still_visible(
 /// Assemble the message list for one provider call inside a turn: the turn's stable base plus
 /// whatever the tool loop has appended since, re-truncated as a whole.
 ///
-/// A named function rather than four lines inline, because the four lines had a *copy* in the test
-/// module that omitted the truncation. The five tests written to protect this windowing therefore
-/// drove the copy, could not see a change to the real path, and two of them settled on message
-/// counts the real path never produces. A test that cannot fail when its subject changes is worse
-/// than no test: it reads as coverage.
+/// A named function rather than four lines inline, so the tests that protect this windowing drive
+/// the real path rather than a copy that could omit the truncation.
 pub(super) fn assemble_api_messages(
     messages: &[Message],
     base_messages: &[Message],
@@ -197,11 +194,10 @@ pub(super) fn truncate_messages_for_context(
         })
     };
 
-    // Search *forward* first, which drops the leading tool chain whole rather than reaching back
-    // over it. Reaching back was the only behavior, and it made the cap advisory: one long tool
-    // loop with no plain user message inside it dragged `start_index` to 0, so a session configured
-    // for 50 messages sent all 900 of them and hit the context limit the setting exists to avoid.
-    // Cutting forward can keep fewer messages than asked for, which is what a maximum means.
+    // Search forward first, which drops the leading tool chain whole rather than reaching back
+    // over it: reaching back alone makes the cap advisory, since one long tool loop with no plain
+    // user message inside it drags `start_index` to 0. Cutting forward can keep fewer messages than
+    // asked for, which is what a maximum means.
     if let Some(index) = (start_index..messages.len()).find(|&index| is_safe_cut(index)) {
         return messages[index..].to_vec();
     }
@@ -222,9 +218,9 @@ pub(super) fn has_tool_results(content: &[ContentBlock]) -> bool {
 /// Split the unavailable MCP servers into the ones that stop the turn and the ones that don't.
 ///
 /// Only `required` servers gate. Whether a missing server should halt work is a property of that
-/// server, not of the installation - the same config runs on a workstation that has the binary and
-/// in a container that doesn't - so a single installation-wide switch could only ever be right for
-/// one of them. `[mcp].strict` survives as the default each server inherits.
+/// server, not of the installation (the same config runs on a workstation that has the binary and
+/// in a container that does not), so a single installation-wide switch could only ever be right
+/// for one of them. `[mcp].strict` survives as the default each server inherits.
 ///
 /// A free function rather than a method because it reads nothing from the agent, which also makes
 /// the gating decision directly testable.
@@ -291,14 +287,13 @@ pub(super) fn empty_turn_notice(stop_reason: &StopReason) -> String {
     }
 }
 /// Meta message injected to coax a user-visible response out of a turn that produced only thinking
-/// (or nothing). Mirrors Claude Code's `query_thinking_only_response` nudge.
+/// (or nothing).
 pub(super) const THINKING_ONLY_NUDGE: &str = "[Your previous response contained no visible output. Please \
                                    continue and produce a user-visible response.]";
 /// Whether to nudge the model for a user-visible response after a turn that made no tool call and
-/// produced no visible text (e.g. a thinking-only turn). Mirrors Claude Code's
-/// `query_thinking_only_response`: fire at most once per turn, and only for a terminal stop reason
-/// without its own handling - `MaxTokens` and `Refusal` carry their own outcomes, so a no-text turn
-/// under those reasons falls through to [`empty_turn_notice`] instead of being retried.
+/// produced no visible text (a thinking-only turn): at most once per turn, and only for a terminal
+/// stop reason without its own handling, since `MaxTokens` and `Refusal` carry their own outcomes
+/// and a no-text turn under those reasons falls through to [`empty_turn_notice`].
 pub(super) fn should_nudge_thinking_only(
     has_tool_calls: bool,
     has_visible_text: bool,
@@ -488,17 +483,14 @@ impl Agent {
 
     /// Park the lock on a session this agent has just created where the host can reach it.
     ///
-    /// Claiming the lock in the REPL's post-turn block instead leaves no lock file at all for the
-    /// whole of a first turn, so a second `meka -c --oneshot` in that window writes into the same
-    /// conversation. The stored log came out `user, user, assistant, assistant`, which the
-    /// Anthropic Messages API then refuses for non-alternating roles -- so the session was not
-    /// merely muddled but unusable from that point on. `--oneshot` had no claim at any point.
+    /// Claiming the lock in the REPL's post-turn block instead would leave no lock file for the
+    /// whole of a first turn, so a second `meka -c --oneshot` in that window would write into the
+    /// same conversation and leave a log with non-alternating roles that the provider refuses.
     ///
     /// `None` means the claim could not be made at all, which
-    /// [`crate::store::Store::create_session_locked`] has already warned about. The turn
-    /// runs regardless: the only way to get here is a filesystem problem with the lock directory,
-    /// and refusing to run over that would break installations that work today. What it costs is
-    /// the guarantee, not the turn.
+    /// [`crate::store::Store::create_session_locked`] has already warned about. The turn runs
+    /// regardless: the only way to get here is a filesystem problem with the lock directory, and
+    /// refusing to run over that would break installations that work today.
     fn hold_the_lock_on_a_created_session(&self, lock: Option<crate::fs::FileLock>) {
         *crate::sync::lock(&self.cells.session_lock) = lock;
     }
@@ -591,17 +583,13 @@ impl Agent {
         // A store that cannot be read degrades rather than failing the turn: this runs on every
         // prompt, and a transient `SQLITE_BUSY` should not cost the turn itself.
         //
-        // `memories_readable` is what stops that degradation becoming a lie. An empty `Vec` here is
-        // indistinguishable from an empty *store*, so the world-state diff reads it as every memory
-        // having been deleted, tells the model so by name, and then on the next successful read
-        // announces them all as "saved or updated" when nothing was written. A store that cannot be
-        // read is not a store that is empty, and the model acts on the difference. Skipped outright
-        // when no tool can open the index, exactly as the schedule and background reads are.
-        // `index()` materialises every row and carries the standing band's bodies, and
-        // `WorldSnapshot::new` then declines to render any of it -- so an installation with
-        // `[memory] enabled = false` was paying a full-table read per turn for a list it dropped.
-        // "Readable" for a store nobody asked about is `true`: nothing failed, so there is nothing
-        // for the diff to carry forward.
+        // `memories_readable` is what stops that degradation becoming a lie: an empty `Vec` here is
+        // indistinguishable from an empty store, so the world-state diff would read it as every
+        // memory having been deleted and announce them all as written again on the next successful
+        // read. Skipped outright when no tool can open the index, exactly as the schedule and
+        // background reads are: `index()` materializes every row, and `WorldSnapshot::new` would
+        // then decline to render any of it. "Readable" for a store nobody asked about is `true`:
+        // nothing failed, so there is nothing for the diff to carry forward.
         let (memories, memories_readable) = match prompt::memory_index_is_live(&catalog) {
             false => (Vec::new(), true),
             true => match self.memories.index().await {
@@ -677,11 +665,9 @@ impl Agent {
             );
             let mut last = self.last_rendered_world.write().await;
             // An unreadable store carries the previous snapshot's memories forward, so the diff
-            // compares that half against itself and says nothing about it. Advancing to an empty
-            // list instead announced the whole store as deleted, by name, and then re-announced it
-            // as written on the next turn that succeeded. Nothing to carry (the first turn of a
-            // session) leaves the list empty, which renders no `[Memory]` section at all -- silence
-            // is the honest answer when meka does not know.
+            // compares that half against itself and says nothing about it; advancing to an empty
+            // list would announce the whole store as deleted. Nothing to carry (the first turn of a
+            // session) leaves the list empty, which renders no `[Memory]` section at all.
             if !memories_readable && let Some((previous, _)) = last.as_ref() {
                 current.carry_memories_from(previous);
             }
@@ -738,17 +724,16 @@ impl Agent {
         let mut suspect_floor = messages.len();
         messages.append(user_message.clone());
         let prompt_only_events = messages.events_len();
-        // Persist the user message eagerly, before the first provider call.  A crash
-        // during the provider roundtrip would otherwise lose it from disk.  On transient
-        // DB failure the lazy save path below retries; `user_eagerly_saved` suppresses
-        // double-writes on the happy path.
+        // Persist the user message eagerly, before the first provider call, or a crash during the
+        // provider round trip would lose it from disk. On a transient database failure the lazy
+        // save path below retries; `user_eagerly_saved` suppresses double-writes on the happy path.
         let user_event = crate::conversation::Event::Append(user_message.clone());
         let mut user_eagerly_saved = match self.store.save_event(session_id, &user_event).await {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(
-                    "failed to persist user message eagerly: {error}; falling back to lazy \
-                     persist on the first provider response"
+                    "failed to persist the user message; retrying on the first provider \
+                     response: {error}"
                 );
                 false
             }
@@ -854,23 +839,13 @@ impl Agent {
                 // the provider takes it.
                 let sent_len = messages.len();
 
-                // Re-truncate the assembled request, not just the turn's starting point.
+                // Re-truncate the assembled request, not just the turn's starting point: everything
+                // the tool loop appends is spliced onto a `base_messages` capped once at turn
+                // start, so `[session] context_messages` would otherwise stop applying at the
+                // second provider call. This costs cache, since the cut walks forward to the first
+                // safe boundary and the prefix sent to the provider moves within one turn, but an
+                // unbounded request eventually hits the context limit the setting exists to avoid.
                 //
-                // This costs cache. The cut walks forward to the first safe boundary, so once a
-                // tool loop pushes the request past the cap the prefix sent to the provider moves
-                // several times within one turn, where it otherwise never moves -- the same
-                // property the tools array is built to preserve a few lines below. It buys a cap
-                // that actually holds; an unbounded request eventually hits the context limit the
-                // setting exists to avoid, which is the more expensive failure. Named here because
-                // it shows up as a bill rather than as a bug.
-                //
-                // `base_messages` is capped once at turn start and everything the tool loop appends
-                // was then spliced on untruncated, so `[session] context_messages` -- documented as
-                // "maximum number of messages to send to the LLM API per request" -- stopped
-                // applying the moment a turn made its second provider call. Worse, it stayed broken
-                // for the rest of the session: the safe-cut walk looks for a `User` message that is
-                // *not* a tool-result message, and during a tool loop every user message is one, so
-                // on later turns the walk ran to index 0 and truncated nothing at all.
                 // Whatever a request that never reached this point reported is not about the view
                 // this request is built from.
                 crate::sync::lock(&self.pending_redactions).clear();
@@ -1020,15 +995,13 @@ impl Agent {
                         if !refusal_may_blame_content(&error, progress.content_started) {
                             // The same treatment an interrupt gives a half-streamed answer: the
                             // text the user watched arrive is kept, without the tool calls that
-                            // never ran. Dropped, it was in no conversation and no store.
+                            // never ran.
                             //
-                            // The prompt goes first, as it does on the interrupt arm below. This
+                            // The prompt goes first, as it does on the interrupt arm below: this
                             // is the one exit ahead of the 2xx that persists a row, so a partial
-                            // written while the prompt's eager save had failed replayed as an
-                            // answer ahead of its question, or was what the post-loop
-                            // `pop_unsaved` removed in the prompt's place. A prompt the store
-                            // still cannot take gets no row for its answer either; the text stays
-                            // on screen and nowhere else.
+                            // written while the prompt's eager save had failed would replay as an
+                            // answer ahead of its question. A prompt the store still cannot take
+                            // gets no row for its answer either.
                             if let Some(partial) = progress.partial.take() {
                                 match recovery
                                     .ensure_prompt_saved(self, session_id, &user_message)
@@ -1105,11 +1078,10 @@ impl Agent {
                 // is the body every later request sends and the cache prefix ahead of this turn
                 // holds. Ahead of the interrupt and thinking-only exits below, because a redaction
                 // is a fact about the request the provider just accepted rather than about how the
-                // round ends: taken after those exits, an interrupted round dropped it, and every
-                // later request redacted the same images all over again. Before the round's own
-                // messages are appended, since the positions are relative to the tail of the view
-                // as the request saw it. The turn's base slice is rebuilt too, or the next request
-                // would be assembled from a copy that still carries the images.
+                // round ends. Before the round's own messages are appended, since the positions
+                // are relative to the tail of the view as the request saw it. The turn's base slice
+                // is rebuilt too, or the next request would be assembled from a copy that still
+                // carries the images.
                 let redacted = std::mem::take(&mut *crate::sync::lock(&self.pending_redactions));
                 if !redacted.is_empty() {
                     let redaction = messages.redact_images(redacted);
@@ -1266,11 +1238,12 @@ impl Agent {
                 )];
 
                 if has_tool_calls {
-                    // Surface a provider that mislabeled the stop reason - the bug this presence
+                    // Surface a provider that mislabeled the stop reason, the bug this presence
                     // check guards against.
                     if !matches!(stop_reason, StopReason::ToolUse) {
                         tracing::warn!(
-                            "assistant message carries tool calls but stop_reason is {stop_reason:?}; executing them anyway so each tool call gets a result"
+                            "assistant message carries tool calls but stop_reason is \
+                             {stop_reason:?}; executing them anyway"
                         );
                     }
 
@@ -1336,18 +1309,15 @@ impl Agent {
                         .await
                     {
                         tracing::warn!(
-                            "failed to persist a tool round ({tool_calls} tool call(s) and their \
-                             results): the session's store is one round behind this conversation, \
-                             and a resume will not carry it: {error}"
+                            "failed to persist a tool round ({tool_calls} tool call(s)); a resume \
+                             will not carry it: {error}"
                         );
                         break 'turn Err(error);
                     }
 
                     // A compaction `context_compact` asked for, run here rather than after the
                     // loop so the agent that chose the moment gets to act on the result: it takes
-                    // its checkpoint, then this turn carries on against the summary. Draining it
-                    // after the loop meant the one origin the agent picked was the only one that
-                    // never helped the turn it was picked in.
+                    // its checkpoint, then this turn carries on against the summary.
                     //
                     // After the whole batch, not the moment the tool ran: a `context_compact`
                     // issued alongside other calls lets their results into the conversation being
@@ -1507,9 +1477,8 @@ impl Agent {
 
         // The sweeper for a request the tool loop's own drain never reached. A turn that parked one
         // and then failed before that drain is the only way to arrive here holding a request, and
-        // the `result.is_ok()` below then declines to act on it -- so this exists to empty the
-        // slot, not to compact. Emptying it is the load-bearing half: the slot outlives the
-        // turn.
+        // the `result.is_ok()` below then declines to act on it, so this exists to empty the slot,
+        // not to compact: the slot outlives the turn.
         //
         // Taken in its own binding rather than inside the `if` below so the `std::sync::MutexGuard`
         // is dropped before the `.await`; held across one it would make this future non-`Send` and
@@ -1691,8 +1660,8 @@ impl Agent {
                 StreamEvent::ThinkingDelta(text) => {
                     // Marked like `StreamEvent::TextDelta` marks its first chunk, and for the same
                     // reason: this is model output a consumer now holds, and a retry would send it
-                    // again. Not the `Notice` exemption -- a notice is meka's own advisory, queued
-                    // before the request is even sent.
+                    // again. Not the `Notice` exemption, since a notice is meka's own advisory,
+                    // queued before the request is even sent.
                     //
                     // Asked of the frontend rather than assumed, because reasoning is the *first*
                     // thing a turn produces: marking every turn that reasoned would refuse the
@@ -1723,8 +1692,8 @@ impl Agent {
                     // `render::render_message_history` asks of the same block on replay, so a
                     // resumed transcript cannot gain or lose a block against the live turn.
                     //
-                    // The deltas above are not held to it: whitespace is content mid-block -- the
-                    // Responses API separates two summary parts with a bare `\n\n` delta -- so the
+                    // The deltas above are not held to it: whitespace is content mid-block (the
+                    // Responses API separates two summary parts with a bare `\n\n` delta), so the
                     // question can only be asked once the block is whole, which is here. Whether
                     // the block is *kept* is the accumulator's answer, and asks the raw text: what
                     // the provider will accept back is not a question about what is worth showing.
@@ -1830,38 +1799,28 @@ impl Agent {
                 }
                 StreamEvent::MessageEnd { .. } | StreamEvent::Usage(_) => {}
                 StreamEvent::Notice(notice) => {
-                    // Forward provider-side advisories (image redaction, etc.) to the frontend
-                    // alongside the stream. Emitted inline so the user sees them in order with the
-                    // assistant text that follows.
+                    // Provider advisories (image redaction) are emitted inline so the user sees
+                    // them in order with the assistant text that follows.
                     //
-                    // Deliberately does *not* set `content_started`. That flag exists so a retry
-                    // cannot double-emit model output, and a notice is not model output -- the
+                    // Deliberately does not set `content_started`: that flag exists so a retry
+                    // cannot double-emit model output, and a notice is not model output. The
                     // Claude providers queue the image-redaction advisory before the request is
-                    // even sent, so marking it would have disabled retry for the whole turn from
-                    // the first event onward. An image-heavy session would then fail outright on
-                    // the next 429 or dropped connection instead of backing off, having produced
-                    // nothing at all, and the user would pay to re-send the same multi-megabyte
-                    // body. Re-showing one advisory line after a retry is far cheaper than losing
-                    // the turn.
+                    // even sent, so marking it would disable retry for the whole turn from the
+                    // first event onward, and re-showing one advisory line after a retry is far
+                    // cheaper than losing the turn.
                     self.forward_notice(notice.clone()).await;
                 }
                 StreamEvent::Error(error) => {
-                    // Log only; deliberately don't return here. Every producer of this event sends
-                    // it immediately before its own typed `Err` return (see `provider::sse`), so
-                    // the task finishes right after this, the channel closes, and this loop ends
-                    // naturally. The `stream_handle.await` join below then surfaces the ORIGINAL
-                    // typed error (e.g. `RetryableProvider` vs. plain `Provider`) -- returning a
-                    // generic `MekaError::Provider(error)` here would discard that classification
-                    // before `run_streaming`'s retry logic ever saw it. Close out any thinking
-                    // *before* logging, and keep it that way. Whatever was in flight is over, and
-                    // nothing else will say so: a failed turn emits no `TurnFinished`, and
-                    // `ThinkingComplete` only comes from a `content_block_stop` this stream never
-                    // reached, so a frontend drawing a live indicator would hold its line open. The
-                    // log below goes to the same stderr at a level shown by default -- emitting
-                    // after it would print the error onto the indicator's row, which is the exact
-                    // mess this prevents. Sent unconditionally because every frontend ignores it
-                    // when nothing is drawn, which is cheaper than tracking block state to suppress
-                    // it.
+                    // Log only, no return: every producer of this event sends it immediately
+                    // before its own typed `Err` return (see `provider::sse`), so the channel
+                    // closes and the `stream_handle.await` below surfaces the original typed
+                    // error, which `run_streaming`'s retry logic needs to see.
+                    //
+                    // Close out any thinking before logging: a failed turn emits no `TurnFinished`
+                    // and `ThinkingComplete` only comes from a `content_block_stop` this stream
+                    // never reached, so a frontend drawing a live indicator would hold its line
+                    // open, and the log below would print onto that row. Sent unconditionally
+                    // because every frontend ignores it when nothing is drawn.
                     self.cells.frontend.emit(FrontendEvent::ThinkingEnded).await;
                     tracing::error!("stream error: {error}");
                 }
@@ -1908,8 +1867,8 @@ mod tests {
         conversation::ToolResultContent,
         provider::mock::text_round,
     };
-    /// The text that streamed before the connection died is kept. It was on screen; losing it
-    /// from the conversation and the store made the user re-ask for what they had already read.
+    /// The text that streamed before the connection died is kept: it was on screen, and losing it
+    /// from the conversation and the store makes the user re-ask for what they had already read.
     #[tokio::test]
     async fn a_mid_stream_failure_keeps_the_text_that_had_arrived() {
         let provider = Arc::new(MockProvider::from_rounds(vec![vec![
@@ -2019,7 +1978,7 @@ mod tests {
 
     /// A `Keep` prompt survives a failed turn, in the conversation and on disk.
     ///
-    /// `Keep` exists because the prompt may carry something that exists nowhere else -- a
+    /// `Keep` exists because the prompt may carry something that exists nowhere else: a
     /// background outcome, whose row is stamped delivered before the turn starts and is never
     /// handed out again. A failed turn that discards it therefore destroys the only copy, and the
     /// user's retry finds nothing left to retry with.
@@ -2066,8 +2025,8 @@ mod tests {
 
     /// A `Keep` prompt survives a failed turn whose *store* failed too.
     ///
-    /// This is the arm the sibling above cannot reach. `pop_unsaved` runs only when the eager
-    /// persist failed, so a healthy store never gets there -- and popping would take a delivered
+    /// This is the arm the sibling above cannot reach: `pop_unsaved` runs only when the eager
+    /// persist failed, so a healthy store never gets there, and popping would take a delivered
     /// background outcome out of the conversation as well as off disk, its row already stamped and
     /// never handed out again. `SQLITE_BUSY` with a second meka on the store is the ordinary way
     /// in.
@@ -2088,7 +2047,7 @@ mod tests {
         let mut messages = Conversation::new();
 
         // Between creating the session and running the turn, so the session exists and only the
-        // message write fails -- which is exactly the state the arm is guarded on.
+        // message write fails, which is exactly the state the arm is guarded on.
         rusqlite::Connection::open(&path)
             .expect("second connection")
             .execute_batch("DROP TABLE messages;")
@@ -2135,12 +2094,10 @@ mod tests {
     }
 
     /// The row order on disk after a turn whose prompt could not be saved eagerly and whose
-    /// stream then died with text on screen: the prompt first, then the partial answer.
-    ///
-    /// The partial was persisted where the stream failed, ahead of the lazy prompt save that
-    /// only ran on a 2xx, so a resume replayed the answer before its question -- and a
-    /// `WithdrawOnFailure` turn's `pop_unsaved` took the partial out of memory in the prompt's
-    /// place, leaving disk and memory describing different conversations.
+    /// stream then died with text on screen: the prompt first, then the partial answer. A partial
+    /// persisted ahead of the lazy prompt save would replay as an answer before its question, and
+    /// a `WithdrawOnFailure` turn's `pop_unsaved` would take it out of memory in the prompt's
+    /// place.
     #[tokio::test]
     async fn a_partial_answer_never_lands_on_disk_ahead_of_its_prompt() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2216,7 +2173,7 @@ mod tests {
     }
 
     /// A compaction that runs inside the turn persists the prompt with its tail, so it counts as
-    /// the prompt's persist: the lazy save on the 2xx wrote a second copy after the boundary
+    /// the prompt's persist, or the lazy save on the 2xx writes a second copy after the boundary
     /// whenever the eager one had failed.
     #[tokio::test]
     async fn a_compaction_inside_the_turn_counts_as_the_prompts_persist() {
@@ -2301,9 +2258,9 @@ mod tests {
     /// A tool round whose save fails still answers every `tool_use` in memory.
     ///
     /// The tools have run, so the only conversation that describes what happened is one that ends
-    /// on their results. Breaking out with the assistant's calls unanswered left the provider
-    /// refusing every later request until a `/rewind`. Disk may be one round behind; what it must
-    /// never hold is half a round.
+    /// on their results; breaking out with the assistant's calls unanswered would leave the
+    /// provider refusing every later request until a `/rewind`. Disk may be one round behind; what
+    /// it must never hold is half a round.
     #[tokio::test]
     async fn a_tool_round_whose_save_fails_still_answers_its_calls_in_memory() {
         use crate::provider::mock::MockStopReason;
@@ -2392,9 +2349,9 @@ mod tests {
             .expect("the next turn is not refused for an unanswered tool call");
     }
 
-    /// The thinking-only nudge moves memory only once its pair is on disk. Appended first, a save
-    /// that then failed left the reasoning in the conversation with nothing behind it in the store,
-    /// so the next request carried a message a resume would never see.
+    /// The thinking-only nudge moves memory only once its pair is on disk: appended first, a save
+    /// that then fails leaves the reasoning in the conversation with nothing behind it in the
+    /// store.
     #[tokio::test]
     async fn a_nudge_whose_save_fails_leaves_memory_untouched() {
         use crate::provider::mock::MockStopReason;
@@ -2446,10 +2403,9 @@ mod tests {
         );
     }
 
-    /// An interrupted round still records what the request budget redacted. A redaction is a fact
-    /// about the request the provider accepted, not about how the round ended; taken after the
-    /// interrupt exit, it was dropped with the round and every later request redacted the same
-    /// image again.
+    /// An interrupted round still records what the request budget redacted: a redaction is a fact
+    /// about the request the provider accepted, not about how the round ended, and dropping it
+    /// with the round makes every later request redact the same image again.
     #[tokio::test]
     async fn an_interrupted_round_still_records_its_redaction() {
         use crate::{
@@ -2554,10 +2510,9 @@ mod tests {
     }
 
     /// `meka serve` cancels its shutdown token before draining, and a scheduled turn's token is a
-    /// child of it, so a job due during a shutdown is interrupted with its prompt already on disk
-    /// -- and the occurrence is then handed back, so the identical prompt arrives again on the
-    /// next run. Keeping it would guarantee a duplicate, which is why interruption withdraws
-    /// too.
+    /// child of it, so a job due during a shutdown is interrupted with its prompt already on disk,
+    /// and the occurrence is then handed back, so the identical prompt arrives again on the next
+    /// run. Keeping it would guarantee a duplicate, which is why interruption withdraws too.
     #[tokio::test]
     async fn a_fire_interrupted_before_it_began_withdraws_its_prompt() {
         let (agent, _store) = agent_for_test(unreachable_provider(1)).await;
@@ -2607,7 +2562,7 @@ mod tests {
     }
 
     /// A thinking-only reply is answered with a nudge, which is itself a plain `User` message
-    /// carrying no tool result -- so from the outside it looks exactly like a turn-opening prompt.
+    /// carrying no tool result, so from the outside it looks exactly like a turn-opening prompt.
     /// If the retry then fails, withdrawal must not take the nudge: doing so leaves the prompt (the
     /// message the feature exists to remove) while retracting one meka had just committed.
     #[tokio::test]
@@ -2657,7 +2612,7 @@ mod tests {
     }
 
     /// Withdrawal is only for a turn that produced nothing. One that failed after a tool round has
-    /// real work behind it -- a command that ran, a file that was written -- and erasing the prompt
+    /// real work behind it (a command that ran, a file that was written) and erasing the prompt
     /// would orphan the record of it.
     #[tokio::test]
     async fn a_fire_that_got_as_far_as_a_tool_call_keeps_everything() {
@@ -2697,9 +2652,9 @@ mod tests {
             .await
             .expect_err("the second round fails");
 
-        // Asserted on content, not on a message count. Withdrawal drops exactly the last message,
-        // and here that is the tool *result* -- so a count-based check still passes while the
-        // record of what the tool returned has been erased out from under its `tool_use`.
+        // Asserted on content, not on a message count: withdrawal drops exactly the last message,
+        // and here that is the tool result, so a count-based check would still pass while the
+        // record of what the tool returned had been erased out from under its `tool_use`.
         let blocks: Vec<_> = messages
             .as_slice()
             .iter()
@@ -2723,9 +2678,7 @@ mod tests {
         );
     }
 
-    /// Minimal in-memory agent driving `provider`: no tools, no skills, no memories, silent
-    /// frontend. Enough to exercise `run_turn`'s recovery arms, which touch none of that.
-    /// Same harness, but with a frontend that records what the turn emitted.
+    /// [`agent_for_test`] with a frontend that records what the turn emitted.
     async fn agent_recording_for_test(
         provider: Arc<dyn Provider>,
     ) -> (Agent, Arc<crate::frontend::testing::RecordingFrontend>) {
@@ -2736,9 +2689,8 @@ mod tests {
         (agent, frontend)
     }
 
-    /// A round that only reasoned is nudged for an answer, and on the blocking path the emit loop
-    /// sat after that nudge's `continue`, so the reasoning the streaming path shows as it arrives
-    /// was never shown at all.
+    /// A round that only reasoned is nudged for an answer, and on the blocking path the reasoning
+    /// the streaming path shows as it arrives has to be shown before that nudge's `continue`.
     #[tokio::test]
     async fn a_thinking_only_round_shows_its_thinking_without_streaming() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -2833,11 +2785,10 @@ mod tests {
 
     /// The reactive check fires *above* the threshold, not at it, and never on one message.
     ///
-    /// [`Agent::auto_compact_threshold`] pins the number; this pins the comparisons that read it.
-    /// Every operator here could be flipped with the suite green, because the tests that reached
-    /// compaction all forced it and none approached the boundary. `>=` is the interesting one: it
-    /// would compact a session sitting exactly on 80%, and since a compaction resets occupancy well
-    /// below the line it would not loop, just fire one turn early, forever, invisibly.
+    /// [`Agent::auto_compact_threshold`] pins the number; this pins the comparisons that read it,
+    /// which the tests that force compaction never approach. `>=` is the interesting one: it would
+    /// compact a session sitting exactly on 80%, and since a compaction resets occupancy well below
+    /// the line it would not loop, just fire one turn early, forever, invisibly.
     #[tokio::test]
     async fn the_reactive_compaction_fires_above_the_threshold_and_not_at_it() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -2950,13 +2901,10 @@ mod tests {
     }
 
     /// The wiring, not the method: nothing else fails when the call in `run_turn` is deleted.
-    ///
-    /// `WorldSnapshot::carry_memories_from` had a test that called it directly, so the branch that
-    /// decides *when* to call it was uncovered and a mutation removing it survived. What it guards
-    /// is the failure the `[Memory]` section exists to prevent in its sharpest form: a store that
-    /// cannot be read for one turn looks like a store that is empty, and the diff announces every
-    /// memory as deleted, by name, then re-announces them all as written on the next turn that
-    /// succeeds.
+    /// What it guards is the failure the `[Memory]` section exists to prevent in its sharpest
+    /// form: a store that cannot be read for one turn looks like a store that is empty, and the
+    /// diff would announce every memory as deleted, by name, then re-announce them all as written
+    /// on the next turn that succeeds.
     ///
     /// The store is broken by dropping the table under a live connection, which is a real error
     /// through the real path rather than a stubbed one.
@@ -2993,7 +2941,7 @@ mod tests {
         agent.store = store.clone();
         agent.memories = memories.clone();
         // The harness builds sub-agent-shaped agents, and a `system_prompt_override` skips the
-        // per-turn world state entirely -- which is the block under test.
+        // per-turn world state entirely, which is the block under test.
         agent.options.system_prompt_override = None;
 
         let mut messages = Conversation::new();
@@ -3085,11 +3033,9 @@ mod tests {
     /// A streamed request reaches the provider still knowing which prompt it serves.
     ///
     /// `run_streaming_attempt` hands `provider.stream(...)` to `tokio::spawn`, and a task-local
-    /// does not cross a spawn. Deleting the `scope_attribution` wrapper compiles, streams, and
-    /// answers identically; the only visible effect is on the wire, where `claude-subscription`'s
-    /// billing header quietly loses `cc_prompt_id` and `cc_prev_req` and every turn starts looking
-    /// like a side query. Recording the attribution the mock provider *saw* is the only way to see
-    /// it from a test.
+    /// does not cross a spawn; the only visible effect of losing the attribution is on the wire,
+    /// where `claude-subscription`'s billing header loses `cc_prompt_id` and `cc_prev_req`.
+    /// Recording the attribution the mock provider saw is the only way to see it from a test.
     #[tokio::test]
     async fn a_streamed_request_knows_which_prompt_it_serves() {
         use crate::provider::mock::{MockEvent, MockProvider};
@@ -3121,17 +3067,11 @@ mod tests {
 
     /// An overflow the agent cannot compact away has to surface once, not loop.
     ///
-    /// This is the *guard*, not the recovery: `agent_for_test` sets `auto_compact: false` and
-    /// `context_window: 0`, so the match arm never fires here whatever the conversation looks like.
-    /// It was written to close the plan's `FailContextOverflow` gap and does not -- deleting
-    /// `recover_from_context_overflow`, `MAX_OVERFLOW_RETRIES` and the arm leaves it green. The
-    /// recovery itself is covered by
-    /// `an_overflow_it_can_compact_away_is_compacted_and_retried_once`, which uses a harness that
-    /// can reach it.
-    ///
-    /// What this does prove is worth keeping: the overflow keeps its own error type and is
-    /// attempted exactly once. The recorded requests are the only way to see the second part,
-    /// since the returned error is identical whether the loop ran once or a thousand times.
+    /// This is the guard, not the recovery: `agent_for_test` sets `auto_compact: false` and
+    /// `context_window: 0`, so the match arm never fires here. The recovery itself is covered by
+    /// `an_overflow_it_can_compact_away_is_compacted_and_retried_once`. What this proves is that
+    /// the overflow keeps its own error type and is attempted exactly once; the recorded requests
+    /// are the only way to see the second part.
     #[tokio::test]
     async fn an_overflow_it_cannot_compact_away_surfaces_instead_of_looping() {
         use crate::provider::mock::{MockEvent, MockProvider};
@@ -3249,8 +3189,6 @@ mod tests {
 
     /// A redaction is counted against the session the request belonged to, from the notice the
     /// provider sends, because the provider is cached per profile and serves every session on it.
-    /// Until this, providers recorded onto a process-wide counter nothing read, so `/status` never
-    /// showed a redaction on any host.
     #[tokio::test]
     async fn a_redaction_notice_is_counted_on_the_sessions_stats() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -3288,7 +3226,6 @@ mod tests {
         assert_eq!(snapshot.redacted_bytes, 4_000_000);
     }
 
-    /// A redaction the budget reports is recorded on the conversation, once: the image the
     /// What a turn stores: one user message of two blocks, the context meka injected and the words
     /// as typed, in that order, so a reader of the row can take the words alone.
     #[tokio::test]
@@ -3354,6 +3291,7 @@ mod tests {
         });
     }
 
+    /// A redaction the budget reports is recorded on the conversation, once: the image the
     /// provider redacted from the body is the placeholder in the view and on disk from then on, so
     /// the next request carries the placeholder rather than redacting the image all over again.
     #[tokio::test]
@@ -3512,14 +3450,10 @@ mod tests {
         assert_eq!(snapshot.redacted_bytes, 2_000_000);
     }
 
-    /// The emergency arm, actually reached: an overflow the agent *can* compact away is compacted
-    /// and the turn retried once.
-    ///
-    /// Its sibling above exercises the case where the guard short-circuits, which is the honest
-    /// reading of what `agent_for_test` allows -- `auto_compact: false` and `context_window: 0`
-    /// mean `recover_from_context_overflow` is never called there. Deleting the method, the
-    /// retry constant and the match arm left that test green, so the branch this feature exists
-    /// for was still unreached after the test written to reach it.
+    /// The emergency arm, actually reached: an overflow the agent can compact away is compacted
+    /// and the turn retried once. Its sibling above exercises the case where the guard
+    /// short-circuits, since `agent_for_test`'s `auto_compact: false` and `context_window: 0`
+    /// keep `recover_from_context_overflow` from being called there.
     #[tokio::test]
     async fn an_overflow_it_can_compact_away_is_compacted_and_retried_once() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -3595,18 +3529,11 @@ mod tests {
 
     /// A retryable failure on the first attempt costs a retry, not the turn.
     ///
-    /// **What this does not guard, stated because it is easy to assume otherwise.** The mock hands
-    /// back a [`MekaError::RetryableProvider`] directly, so nothing here reaches
-    /// `provider_transport_error`, and reverting that function to return a bare `Provider` again
-    /// leaves this test passing. It was written for that fix and would have signed off on it
-    /// unchanged. The two tests that do bite are
-    /// `error::tests::a_provider_call_that_never_answered_is_retryable` for the rule and, for the
-    /// wiring, the Anthropic messages test that reports an unreachable endpoint as retryable.
-    ///
-    /// What it is still worth keeping for: it pins the half of the behavior that made the fix a
-    /// classification change rather than a retry-loop change. The loop already did the right thing
-    /// with a failure typed this way, including leaving no trace of the failed attempt in the
-    /// conversation, which is what stops a later turn resending it.
+    /// The mock hands back a [`MekaError::RetryableProvider`] directly, so nothing here reaches
+    /// `provider_transport_error`; the classification is pinned by
+    /// `error::tests::a_provider_call_that_never_answered_is_retryable` and the Anthropic messages
+    /// test that reports an unreachable endpoint as retryable. This pins the loop: a failure typed
+    /// this way is retried and leaves no trace in the conversation for a later turn to resend.
     #[tokio::test]
     async fn run_turn_retries_a_call_that_never_answered() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -3816,11 +3743,9 @@ mod tests {
     /// The case the reprieve exists for: an outage that ends, and content that survives it.
     ///
     /// A `529` burst lasting a few seconds outlives the whole retry sequence, which is two attempts
-    /// across three seconds of backoff. Without the reprieve the turn read that as a verdict on its
-    /// own body, degraded, and the degraded retry then succeeded -- not because the degrade helped,
-    /// but because the burst had ended -- so `persist_vindicated_repair` wrote the loss to the
-    /// store as proven-good. The user's attachment was gone permanently, in exchange for
-    /// nothing.
+    /// across three seconds of backoff. Without the reprieve the turn would read that as a verdict
+    /// on its own body, degrade, and have the degraded retry succeed because the burst had ended,
+    /// so `persist_vindicated_repair` would write the loss to the store as proven-good.
     ///
     /// The script says exactly that: one spent sequence, then a success. If the reprieve fires, the
     /// success answers the *unmodified* request and the image is still there.
@@ -3875,11 +3800,10 @@ mod tests {
 
     /// End to end: a reprieve that *worked* is available again later in the same turn.
     ///
-    /// This is the wiring, and the wiring is where the bug was. The unit test above pins what
-    /// `note_request_accepted` does; nothing pinned *when it is called*, and calling it from
-    /// `persist_vindicated_repair` meant it never ran on the one path that matters. A successful
-    /// reprieve applies no repair, so there is nothing to vindicate, so the flag stayed spent and a
-    /// later unrelated 5xx degraded on the spot.
+    /// This is the wiring: the unit test pins what `note_request_accepted` does, and this pins
+    /// when it is called. Called from `persist_vindicated_repair` it would never run on the one
+    /// path that matters, since a successful reprieve applies no repair and there is nothing to
+    /// vindicate.
     ///
     /// Counted rather than inspected, because `TurnRecovery` is local to `run_turn`. Each reprieve
     /// costs one extra *sequence* of unchanged re-sends, so the request tally separates the two
@@ -3948,10 +3872,9 @@ mod tests {
     ///
     /// `suspect_floor` is captured before the prompt is appended, so it counts messages of the
     /// conversation the compaction then replaces. Left alone it lands past the end of the collapsed
-    /// one, the clamp in `repair_rejected_content` reads the window as *empty*, both tiers find
-    /// nothing, and the turn dies with the refused attachment committed -- in precisely the
-    /// large-conversation case that triggers a compaction and is likeliest to be carrying one. The
-    /// failure was silent twice over: no tier was spent, so even the `/rewind` hint stayed quiet.
+    /// one, the clamp in `repair_rejected_content` reads the window as empty, both tiers find
+    /// nothing, and the turn dies with the refused attachment committed, silently: no tier was
+    /// spent, so even the rewind hint stays quiet.
     #[tokio::test]
     async fn a_turn_that_compacted_on_the_way_in_can_still_degrade() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -4080,10 +4003,9 @@ mod tests {
 
     /// A refused tool round with nothing but text in it recovers, on the first attempt.
     ///
-    /// This is the shape the whole tier list exists for. `Attachments` has nothing to remove here,
-    /// and before the second tier that was the end of the turn: the refused body stayed
-    /// committed and every later turn in the session re-sent it, so the only way out was `/rewind`
-    /// or editing the store by hand. The single refusal in the script is the point -- finding
+    /// This is the shape the whole tier list exists for: `Attachments` has nothing to remove here,
+    /// and without the second tier the refused body would stay committed and every later turn in
+    /// the session would re-send it. The single refusal in the script is the point: finding
     /// nothing must make a tier step aside, not spend a round trip proving it.
     ///
     /// Driven with a call to a tool that does not exist: the dispatcher answers an unknown name
@@ -4158,7 +4080,7 @@ mod tests {
         );
     }
 
-    /// The `/rewind` hint reports, so it must fire exactly when there is something to report.
+    /// The rewind hint reports, so it must fire exactly when there is something to report.
     ///
     /// It is earned by having spent a tier: real content was degraded, refused anyway, and put
     /// back where every later turn re-sends it. A turn that never found a tier to spend was
@@ -4190,7 +4112,7 @@ mod tests {
                 .await
                 .expect_err("every attempt was refused");
             frontend.events().iter().any(|event| {
-                matches!(event, FrontendEvent::Notice(notice) if notice.text.contains("/rewind"))
+                matches!(event, FrontendEvent::Notice(notice) if notice.text.contains("rewind"))
             })
         }
 
@@ -4542,7 +4464,7 @@ mod tests {
     ///
     /// This is the contract the live indicator rests on: it holds a line open across the reasoning
     /// phase, and under `redact-thinking` no text ever arrives to close it. Without this event the
-    /// line stays open until some later event happens to occur -- and a turn that errors or is
+    /// line stays open until some later event happens to occur, and a turn that errors or is
     /// interrupted emits none, so an error message would print onto the indicator's row.
     #[tokio::test]
     async fn a_silent_thinking_block_announces_that_it_ended() {
@@ -4658,7 +4580,7 @@ mod tests {
     /// A stream that dies has to close out any thinking in flight.
     ///
     /// The failing turn emits no `TurnFinished`, and `ThinkingComplete` only arrives from a
-    /// `content_block_stop` the stream never reached -- so without this the frontend's live
+    /// `content_block_stop` the stream never reached, so without this the frontend's live
     /// indicator keeps its line open and the error message prints onto that row.
     #[tokio::test]
     async fn a_failed_stream_closes_out_thinking() {
@@ -4689,9 +4611,9 @@ mod tests {
         );
     }
 
-    /// The other direction: a block with readable text renders as a block, and must *not* also
-    /// report an empty ending -- the frontend erases the indicator for one and keeps it for the
-    /// other, so emitting both would erase a line and then commit nothing.
+    /// The other direction: a block with readable text renders as a block, and must not also
+    /// report an empty ending, since the frontend erases the indicator for one and keeps it for
+    /// the other, so emitting both would erase a line and then commit nothing.
     #[tokio::test]
     async fn a_thinking_block_with_text_reports_only_the_block() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
@@ -4744,7 +4666,7 @@ mod tests {
     /// arrives and closes when its arguments are complete.
     ///
     /// The dispatch event alone puts the whole of that window on the wrong side of the signal,
-    /// because by the time it fires the arguments -- the message, for a tool that sends one -- are
+    /// because by the time it fires the arguments (the message, for a tool that sends one) are
     /// already written.
     #[tokio::test]
     async fn a_tool_call_announces_composition_before_dispatch() {
@@ -5826,9 +5748,8 @@ mod tests {
         assert!(!has_tool_results(&result[0].content));
     }
 
-    /// `context_messages` is a maximum, and reaching *back* over a tool chain to find a cut point
-    /// let one long tool loop ignore it entirely: a session capped at 4 sent all 12 messages, into
-    /// the context limit the cap exists to stay under.
+    /// `context_messages` is a maximum, and reaching back over a tool chain to find a cut point
+    /// would let one long tool loop ignore it entirely.
     #[test]
     fn a_long_tool_loop_cannot_carry_the_window_past_its_cap() {
         let mut messages = vec![user_message("go")];
@@ -5888,8 +5809,8 @@ mod tests {
         }
     }
 
-    /// Compares two message slices for semantic equality (same role, same content blocks).  This is
-    /// what determines whether the KV cache prefix is reusable.
+    /// Compares two message slices for semantic equality (same role, same content blocks), which
+    /// is what determines whether the KV cache prefix is reusable.
     fn assert_messages_equal(a: &[Message], b: &[Message], context: &str) {
         assert_eq!(a.len(), b.len(), "{context}: length mismatch");
         for (i, (ma, mb)) in a.iter().zip(b.iter()).enumerate() {
@@ -5907,9 +5828,8 @@ mod tests {
 
     #[test]
     fn stable_base_during_tool_loop() {
-        // Simulate a conversation with history, then a tool loop that adds 3 tool call/result
-        // pairs.  The base prefix (everything before the tool loop) must be identical across all
-        // iterations.
+        // A conversation with history, then a tool loop that adds 3 tool call/result pairs. The
+        // base prefix (everything before the tool loop) must be identical across all iterations.
         let mut messages = vec![
             user_message("first question"),
             assistant_message("first answer"),
@@ -5959,14 +5879,13 @@ mod tests {
     /// forward with it. This is the trade the per-round truncation makes.
     ///
     /// Applying the cap once at turn start would freeze the base for the whole turn, which is what
-    /// makes `context_messages` stop applying the moment a turn makes its second provider call. It
-    /// could not see the change because it drove a copy of the assembly that omitted the
-    /// truncation; against the real path it asserts 7 where the answer is 5.
+    /// would make `context_messages` stop applying the moment a turn makes its second provider
+    /// call.
     ///
-    /// The cost is real and belongs here: a prefix that moves is a prefix the provider cannot serve
-    /// from cache, so a long tool loop now re-reads its window several times per turn. The
-    /// alternative was a cap that did not hold, which is worse -- an unbounded request eventually
-    /// hits the context limit the setting exists to avoid.
+    /// The cost is real: a prefix that moves is a prefix the provider cannot serve from cache, so
+    /// a long tool loop re-reads its window several times per turn. The alternative is a cap that
+    /// does not hold, which is worse, since an unbounded request eventually hits the context limit
+    /// the setting exists to avoid.
     #[test]
     fn the_window_moves_forward_when_a_tool_loop_pushes_past_the_cap() {
         let limit = Some(6);
@@ -6135,8 +6054,7 @@ mod tests {
     fn multi_turn_truncation_keeps_every_request_well_formed() {
         // Two turns, each computing its own base. Turn 1 stays under the cap, so its base is
         // stable across the loop; turn 2 crosses it, so the window moves and only the
-        // well-formedness invariants hold. The old name promised a stable base in both,
-        // which stopped being true when the cap started applying per round.
+        // well-formedness invariants hold.
         let limit = Some(6);
 
         // -- Turn 1 --
@@ -6173,11 +6091,9 @@ mod tests {
         messages.push(tool_result_for("t2b", "more"));
         let api_t2_iter2 = assemble_api_messages(&messages, &base_t2, start_t2, limit);
 
-        // Turn 2 is the one where the cap bites, and there the base is *not* stable: the request
-        // is re-truncated each round, so the window walks forward. Asserting stability here was
-        // what made this test false -- it expected seven messages where the real path sends three.
-        // What survives is the invariant that matters: the cap holds and the request stays
-        // well-formed.
+        // Turn 2 is the one where the cap bites, and there the base is not stable: the request
+        // is re-truncated each round, so the window walks forward. What survives is the invariant
+        // that matters: the cap holds and the request stays well-formed.
         for (round, request) in [(1, &api_t2_iter1), (2, &api_t2_iter2)] {
             assert!(
                 request.len() <= 6,

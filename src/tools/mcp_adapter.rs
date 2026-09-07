@@ -144,9 +144,8 @@ pub(crate) async fn install_on_worker_registry(
         let tools = match manager.discover_server_tools(&name).await {
             Ok(tools) => tools,
             Err(error) => {
-                // Pending / Failed servers fall through `require_connected` as Err; that's
-                // normal, not worth a warn. The worker just won't see this server's tools until it
-                // next runs (and the parent's connector finishes the handshake).
+                // A Pending or Failed server falls through `require_connected` as `Err`, which is
+                // the normal state during the parent's handshake, so not a warning.
                 tracing::debug!("MCP server '{name}' skipped for sub-agent registry: {error}");
                 continue;
             }
@@ -177,13 +176,9 @@ fn tool_output_from_result(
 ) -> ToolOutput {
     let mut content = convert_tool_result_content(&result.content);
 
-    // If the server included structured_content, append it as a fenced JSON block so providers
-    // can reason over it without needing a dedicated ToolResultContent variant. Matches Claude
-    // Code's pragmatic passthrough.
-    //
-    // This block is for the model to *read*. Callers that compute on the result take the
-    // `structured` field below instead, so the wording and fencing here stay free to change
-    // without altering what a scheduled job's gate predicate decides.
+    // Structured content is appended as a fenced JSON block for the model to read. Callers that
+    // compute on the result take the `structured` field below instead, so the wording and fencing
+    // here stay free to change without altering what a scheduled job's gate predicate decides.
     if let Some(structured) = &result.structured_content {
         let pretty = serde_json::to_string_pretty(structured).unwrap_or_default();
         if !pretty.is_empty() {
@@ -211,17 +206,13 @@ fn tool_output_from_result(
 /// The arguments an MCP call actually carries: everything the model sent, minus meka's own.
 ///
 /// `scratchpad` and `background` are accepted on every tool and consumed by the agent loop, so a
-/// remote server never declared them. Forwarding them sends a property the server did not ask for,
-/// which a strict schema validator on the far side rejects outright -- failing a call whose only
-/// fault was that the model used a meka feature. The tool documentation already said this happened;
-/// it did not.
+/// remote server never declared them, and a strict schema validator on the far side rejects a
+/// property the server did not ask for.
 ///
-/// `schema` is the tool's own advertised `input_schema`, and a name it declares belongs to *it*.
-/// `offer_background` in `src/tools.rs` already refuses to splice `background` onto a tool that
-/// advertises the name, precisely so a server owning it keeps its meaning -- but this side stripped
-/// unconditionally, so the value the model sent for the *server's* parameter was deleted on the way
-/// out and the call arrived missing an argument it had asked for. Both halves have to consult the
-/// schema or the pair is incoherent.
+/// `schema` is the tool's own advertised `input_schema`, and a name it declares belongs to it:
+/// `offer_background` in `src/tools.rs` refuses to splice `background` onto a tool that advertises
+/// the name, so this side must forward the model's value for it, or the call arrives missing an
+/// argument the server asked for.
 fn forwarded_arguments(
     input: &serde_json::Value,
     schema: &serde_json::Value,
@@ -252,12 +243,10 @@ mod tests {
 
     /// A server's structured output reaches callers as data, not only as rendered prose.
     ///
-    /// The fenced block is what the model reads and is deliberately presentational, so anything
-    /// deciding *on* a result -- a scheduled job's gate predicate is the caller this exists for --
-    /// has to take the field. Recovering the JSON by parsing the block back out would make that
-    /// format string a wire format between two parts of meka while it reads as formatting, and a
-    /// readability edit would then silently change what a gate decides. Both halves are asserted
-    /// here so neither can quietly stop happening.
+    /// The fenced block is what the model reads and is presentational, so a scheduled job's gate
+    /// predicate has to take the field: parsing the block back out would make a format string a
+    /// wire format between two parts of meka. Both halves are asserted so neither can quietly
+    /// stop happening.
     #[test]
     fn structured_content_is_carried_as_data_and_still_rendered_for_the_model() {
         let structured = serde_json::json!({ "chats": [{ "id": "a" }], "checked_at": "now" });
@@ -304,15 +293,10 @@ mod tests {
     /// A remote server sees the model's arguments and nothing of meka's.
     ///
     /// `scratchpad` and `background` are accepted on every tool and consumed here, so no server
-    /// declares them; sending one is an undeclared property, and a server validating its schema
-    /// strictly refuses the call over it. `tools/overview.md` documented this stripping before the
-    /// code did it. A server that declares `background` or `scratchpad` itself owns the name, and
-    /// the value the model sent for it must reach the server.
-    ///
-    /// `offer_background` (src/tools.rs) already declines to splice `background` onto a tool that
-    /// advertises it, exactly so the server keeps the name. This side stripped unconditionally, so
-    /// the pair disagreed: meka left the server's own parameter in the schema the model reads, then
-    /// deleted the model's answer on the way out, and the call arrived missing a required argument.
+    /// declares them and a server validating its schema strictly rejects the call over one. A
+    /// server that declares either name itself owns it, and the value the model sent must reach
+    /// the server: `offer_background` leaves the server's parameter in the schema the model reads,
+    /// so stripping it here would make the call arrive missing a required argument.
     #[test]
     fn a_parameter_the_server_declares_is_forwarded_not_stripped() {
         let schema = serde_json::json!({

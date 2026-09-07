@@ -1,10 +1,9 @@
 //! `meka instructions`: where the standing instructions come from, and their text.
 
-/// `meka instructions`: answer "what is the model actually being told, and why".
+/// `meka instructions`: what the model is being told, and where that came from.
 ///
-/// With four tiers feeding one value and a conventional path that appears in no config file, that
-/// question is otherwise only answerable by reading the source. Not async: every tier is either a
-/// process environment read or a small synchronous file read.
+/// Four tiers feed one value and the conventional path appears in no config file, so the question
+/// is otherwise only answerable by reading the source.
 pub(crate) fn run_instructions_subcommand(
     action: &crate::cli::InstructionsAction,
 ) -> anyhow::Result<()> {
@@ -21,9 +20,8 @@ pub(crate) fn run_instructions_subcommand(
                     crate::render::write_stdout_line(&found.text)?;
                 }
                 None => crate::streams::write_stderr_line(format!(
-                    "No instructions configured. Write them to {} (or split them across {}).",
+                    "No instructions configured; write them to {}.",
                     display_path(crate::instructions::instructions_file()),
-                    display_path(crate::instructions::instructions_dir()),
                 )),
             }
         }

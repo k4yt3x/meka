@@ -133,10 +133,8 @@ impl Tool for LoadToolTool {
                 continue;
             };
 
-            // Tools that aren't deferred are already part of the active tool set. Treat this as a
-            // no-op success so the scanner harmlessly records the name (it was already there). The
-            // model gets a clear hint to call the tool directly next time without an extra round
-            // trip.
+            // A tool that is not deferred is already in the active set, so this is a no-op success:
+            // the scanner records a name that was already there.
             let is_deferred = self
                 .deferred
                 .upgrade()
@@ -180,11 +178,8 @@ impl Tool for LoadToolTool {
         } else {
             String::new()
         };
-        // Only claimed when something actually loaded. Appended unconditionally, the trailer turns
-        // a call naming one unregistered tool into an error followed by "The full schema is now
-        // available on your next turn": a flat contradiction, in the one sentence a model reads to
-        // decide whether to call the tool. Found by a sub-agent that tried to load `memory_write`
-        // it had not been granted, and said the line was misleading.
+        // Only claimed when something loaded: appended unconditionally, the trailer would follow an
+        // error with "The full schema is now available on your next turn".
         let body = if resolved == 0 {
             sections.join("\n\n---\n\n")
         } else {
@@ -202,19 +197,16 @@ impl Tool for LoadToolTool {
     }
 }
 
-/// Walk events and collect the names of tools loaded via successful `load_tool` calls. **The only
-/// door for this question**: a scan of the materialized slice cannot see a load whose exchange a
-/// compaction has summarized away or a repair has emptied, and this absorbs
-/// [`Event::CompactBoundary::loaded_tools_snapshot`] when it crosses a boundary. Pending uses
-/// inside the summarized window are cleared at the boundary (the actual tool_use/tool_result rows
-/// for those uses are still in the log on disk, but they're below the materialized view's "logical
-/// start" so the model can't act on them).
-/// Returns names in **load order**, de-duplicated. The order is what makes the tools array a stable
-/// cache prefix: `load_tool` calls only ever append to the conversation, so appending each newly
-/// loaded tool to the tail means the array can only grow at the end. Returning an unordered set and
-/// letting the registry impose its own order would reinsert an earlier-registered tool ahead of a
-/// later-registered one that was loaded first, which is a mid-array edit and re-caches the whole
-/// conversation behind it.
+/// Walk events and collect the names of tools loaded via successful `load_tool` calls. The only
+/// door for this question: a scan of the materialized slice cannot see a load whose exchange a
+/// compaction has summarized away or a repair has emptied, so this absorbs
+/// [`Event::CompactBoundary::loaded_tools_snapshot`] at a boundary and clears the pending uses
+/// inside the summarized window, whose results are below the view's logical start.
+///
+/// Returns names in load order, de-duplicated. The order is what makes the tools array a stable
+/// cache prefix: `load_tool` calls only ever append to the conversation, so the array can only
+/// grow at the end, whereas the registry's own order would reinsert an earlier-registered tool
+/// ahead of one loaded first and re-cache the whole conversation behind it.
 pub(crate) fn extract_loaded_tool_names_from_events(events: &[Event]) -> Vec<String> {
     use std::collections::HashMap;
     let mut loaded: Vec<String> = Vec::new();
@@ -394,10 +386,7 @@ mod tests {
         let text = result.text_content();
         assert!(text.contains("not registered"));
         assert!(text.contains("[Tool discovery]"));
-        // And it must not also claim the schema arrived. Appended whatever happened, the trailer
-        // makes a failed load read as an error immediately contradicted by "The full schema is now
-        // available on your next turn", which is the one sentence the model uses to decide whether
-        // to go ahead and call the tool.
+        // And it must not also claim the schema arrived.
         assert!(
             !text.contains("next turn"),
             "a load that resolved nothing must not promise a schema: {text}"
@@ -454,9 +443,8 @@ mod tests {
 
     #[tokio::test]
     async fn load_tool_already_available_tool() {
-        // Registered but not in the deferred set: model should be told to call it directly.
-        // Returned as success so the scanner records the name harmlessly (it was already in the
-        // active set).
+        // Registered but not in the deferred set: a success, so the scanner records a name that
+        // was already in the active set.
         let fake = Arc::new(FakeTool {
             name: "read_file".to_string(),
             description: "Read a file from disk.".to_string(),
@@ -583,9 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_tool_registry_dropped() {
-        // Simulate the registry going away while the LoadToolTool is still held somewhere. Both
-        // Weak upgrades should fail gracefully, returning a plain error tool_result, not
-        // panicking.
+        // The registry has gone while the `LoadToolTool` is still held somewhere.
         let mut fixture = build_test_tool(Vec::new(), &[]);
         fixture.tools.take();
         fixture.deferred.take();

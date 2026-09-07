@@ -174,7 +174,7 @@ fn session_rewind_rejects_zero_turns_without_describing_the_conversation() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("-n must be 1 or more"),
+        stderr.contains("`-n` must be 1 or more"),
         "expected the argument to be blamed, got: {stderr}"
     );
     assert!(
@@ -225,8 +225,8 @@ fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("No MCP servers configured."),
-        "expected 'No MCP servers configured.' on stderr, got: {stderr}"
+        stderr.contains("No MCP servers."),
+        "expected 'No MCP servers.' on stderr, got: {stderr}"
     );
     assert!(
         stdout.trim().is_empty(),
@@ -839,7 +839,7 @@ fn the_workspace_level_is_accepted_at_the_flag_and_in_the_config_file() {
 
 /// `--writable-root` naming a path that does not exist warns, and does not fail the run.
 ///
-/// Both halves matter. A root that cannot be canonicalised is dropped from the boundary by
+/// Both halves matter. A root that cannot be canonicalized is dropped from the boundary by
 /// `writable_roots`, so without the warning the user learns about it from a refused write naming a
 /// boundary they believed included the path. And a build directory that does not exist *yet* is a
 /// legitimate root, so this cannot be an error: the boundary is recomputed on every write.
@@ -898,7 +898,7 @@ fn the_long_lived_hosts_refuse_the_flags_that_name_one_session() {
                 flag.join(" ")
             );
             assert!(
-                stderr.contains(flag[0]) && stderr.contains("one run's session"),
+                stderr.contains(flag[0]) && stderr.contains("creates a session per request"),
                 "meka {} {host} must say why: {stderr}",
                 flag.join(" ")
             );

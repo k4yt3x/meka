@@ -1,10 +1,9 @@
 //! Scheduled wakeups: the agent arranging to be prompted again later.
 //!
-//! Every turn meka runs today originates outside the agent -- a human typing, an editor sending
+//! Every other turn meka runs originates outside the agent: a human typing, an editor sending
 //! `session/prompt`, a client calling `POST /v1/sessions/{id}/turn`. This module supplies the one
-//! trigger nothing else can: a timer. External events already have a door (that HTTP endpoint takes
-//! anything that can make a request), so what was missing was the agent's ability to say "wake me
-//! at 09:00" and have that survive the process it was said in.
+//! trigger nothing else can, a timer: the agent's ability to say "wake me at 09:00" and have that
+//! survive the process it was said in.
 //!
 //! A job pairs a [`Schedule`] with the prompt to deliver, and optionally a *gate*: a cheap shell
 //! command run first, whose result decides whether the expensive model turn happens at all. Without
@@ -28,7 +27,7 @@ mod memory;
 
 pub(crate) use self::{gate::*, memory::*};
 
-/// Smallest interval a recurring job may use. Not a policy limit -- a zero or sub-second interval
+/// Smallest interval a recurring job may use. Not a policy limit: a zero or sub-second interval
 /// makes `next_after` return an instant that is already in the past by the time it is stored, so
 /// the job fires every poll tick forever.
 const MIN_EVERY: Duration = Duration::from_secs(1);
@@ -50,7 +49,7 @@ pub(crate) const MAX_COALESCED_REPORTED: u32 = 1000;
 ///
 /// It also bounds the one shape the "advance on a failed probe" rule cannot reach: a job with no
 /// next occurrence, which in practice means a one-shot. There the lease is held rather than
-/// released, so the retry waits out `claim_lease` instead of coming round on the next tick -- and
+/// released, so the retry waits out `claim_lease` instead of coming round on the next tick, and
 /// this is what stops that from going on until the grace period closes. Three attempts an hour
 /// apart is a budget a transient outage survives and a broken gate does not; three ten-second ones,
 /// which is what releasing the lease would have given, is neither.
@@ -120,10 +119,10 @@ impl Schedule {
     pub(crate) fn parse_cron(input: &str) -> Result<Self, String> {
         let input = input.trim();
         // Five fields, explicitly. `Cron::from_str` defaults to `Seconds::Optional`, so a six-field
-        // pattern parsed with the *first* field as seconds -- and `*/10 * * * * *`, written by a
-        // model meaning "every 10 minutes" in the Quartz shape, became every 10 seconds instead.
-        // The `MIN_EVERY` floor that stops `every` firing on each poll tick does not apply to
-        // `cron`, so nothing else caught it, and the confirmation echoed the pattern back verbatim.
+        // pattern would parse with the first field as seconds, and `*/10 * * * * *`, written by a
+        // model meaning "every 10 minutes" in the Quartz shape, would become every 10 seconds. The
+        // `MIN_EVERY` floor that stops `every` firing on each poll tick does not apply to `cron`,
+        // and the confirmation echoes the pattern back verbatim.
         let cron = croner::parser::CronParser::builder()
             .seconds(croner::parser::Seconds::Disallowed)
             .build()
@@ -188,17 +187,16 @@ impl Schedule {
     /// This is what a firing job needs, and it is **not** `next_after(now)`. For `Every`, anchoring
     /// on the current time adds the pickup latency to every interval, permanently: the scheduler
     /// polls, notices a job is due some milliseconds late, and schedules the next one a full
-    /// interval from *that* moment rather than from the occurrence it just spent. Measured at
-    /// `poll_interval = 1s`: `every = "5s"` ran at a mean of 5.83s, and `every = "1s"` at a clean
-    /// 2.0s -- half the requested rate, because the tick one interval later lands microseconds
-    /// early and the job loses a whole poll.
+    /// interval from that moment rather than from the occurrence it just spent. At `poll_interval
+    /// = 1s` an `every = "1s"` job would run at 2.0s, half the requested rate, because the tick one
+    /// interval later lands microseconds early and the job loses a whole poll.
     ///
     /// Advancing by whole intervals from `delivered` preserves the phase, so a job fires on the
     /// grid it was created on however late any single pickup is. A backlog is skipped in one
     /// multiplication rather than a loop, which matters after an outage: `occurrences_between`
     /// separately reports how many were coalesced.
     ///
-    /// `Cron` is unaffected -- its occurrences are absolute wall-clock instants, so the next one
+    /// `Cron` is unaffected: its occurrences are absolute wall-clock instants, so the next one
     /// after `now` is the next one, and `At` has no successor at all.
     pub(crate) fn next_after_delivering(
         &self,
@@ -212,9 +210,8 @@ impl Schedule {
                 // Milliseconds, not seconds. `num_seconds` truncates, and `parse_every` accepts
                 // anything from 1s up while humantime parses `"1500ms"` and `"1s 500ms"`, which
                 // round-trip through `spec()`. With the interval truncated to 1s, a `1500ms` job
-                // advanced by whole seconds and walked off its own grid a little further on every
-                // fire -- never looping, because the result stayed strictly after `now`, just
-                // drifting. That is exactly the property this function exists to hold.
+                // would advance by whole seconds and walk off its own grid a little further on
+                // every fire, which is exactly the property this function exists to hold.
                 let step_millis = step.num_milliseconds();
                 // A zero or negative interval has no grid to stay on; fall back rather than divide
                 // by zero.
@@ -238,8 +235,8 @@ impl Schedule {
     /// The first occurrence strictly after `anchor`, or `None` when there is no next occurrence
     /// (a one-shot whose instant has passed, or a cron pattern matching no upcoming date).
     ///
-    /// Callers must pass the job's own anchor -- `last_fired_at` if it has ever fired, otherwise
-    /// `created_at` -- and never `Utc::now()`. Anchoring on the current time makes a pinned pattern
+    /// Callers must pass the job's own anchor (`last_fired_at` if it has ever fired, otherwise
+    /// `created_at`) and never `Utc::now()`. Anchoring on the current time makes a pinned pattern
     /// such as `30 14 27 2 *` skip to next year whenever the process happens to restart after its
     /// window; anchoring permanently on `created_at` makes a long-lived job replay every occurrence
     /// since it was created.
@@ -259,8 +256,8 @@ impl Schedule {
                 // pattern that matches no calendar date, so its verdict is the whole answer. An
                 // extra horizon here would be indistinguishable from that verdict at the call site,
                 // and `prepare` retires a job whose schedule has no next occurrence: a 366-day one
-                // deleted `0 0 29 2 *` the first time it fired, because the next February 29th is
-                // up to four years out.
+                // would delete `0 0 29 2 *` the first time it fired, because the next February
+                // 29th is up to four years out.
                 let next = cron.find_next_occurrence(&local_anchor, false).ok()?;
                 Some(next.with_timezone(&Utc))
             }
@@ -357,8 +354,9 @@ pub(crate) fn occurrences_between(
         // A one-shot has exactly the one occurrence, which is the fire being delivered.
         Schedule::At(_) => 0,
         Schedule::Every(interval) => {
-            // Milliseconds, matching `next_after_delivering`: `as_secs` truncated, so a `1500ms`
-            // job counted its coalesced occurrences against a 1s grid it does not run on.
+            // Milliseconds, matching `next_after_delivering`: `as_secs` would truncate, so a
+            // `1500ms` job would count its coalesced occurrences against a 1s grid it does not run
+            // on.
             let interval = interval.as_millis();
             if interval == 0 {
                 return 0;
@@ -369,7 +367,7 @@ pub(crate) fn occurrences_between(
                 .min(MAX_COALESCED_REPORTED)
         }
         Schedule::Cron(_) => {
-            // Counts occurrences in `(from, to]`, i.e. everything after the one being delivered --
+            // Counts occurrences in `(from, to]`, i.e. everything after the one being delivered,
             // matching the `Every` arm above, which divides the same open interval.
             let mut cursor = from;
             let mut count = 0;
@@ -475,9 +473,9 @@ mod tests {
         assert!(Schedule::parse_cron("*/5 * * * *").is_ok());
     }
 
-    /// The fix has to reach the rows already on disk, which is the only population it matters for.
-    /// Creation was closed first and rehydration was left on the permissive parser, so a six-field
-    /// row kept its every-ten-seconds reading forever.
+    /// The five-field rule has to reach the rows already on disk, which is the only population it
+    /// matters for: with rehydration left on the permissive parser, a six-field row would keep its
+    /// every-ten-seconds reading forever.
     #[test]
     fn a_stored_cron_spec_is_read_with_the_same_grammar_it_was_created_under() {
         assert!(
@@ -706,11 +704,10 @@ mod tests {
 
     /// And it still parses when the document is larger than the turn is allowed to see.
     ///
-    /// The two limits are unrelated and were entangled: `text` is capped so a runaway probe cannot
-    /// push the prompt over the context window, and the cap appends a marker, so the result no
-    /// longer parsed. Every shell probe and every MCP server that returns JSON as text content
-    /// took that path, so an `at` gate over a large result reported "the probe did not return
-    /// JSON" -- about a probe that did.
+    /// The two limits are unrelated: `text` is capped so a runaway probe cannot push the prompt
+    /// over the context window, and the cap appends a marker, so a result parsed after capping
+    /// would no longer parse and an `at` gate over a large result would report "the probe did not
+    /// return JSON" about a probe that did.
     #[test]
     fn a_pointer_reads_a_document_larger_than_the_turn_is_shown() {
         let filler = "x".repeat(GATE_OUTPUT_LIMIT);
@@ -786,8 +783,7 @@ mod tests {
     /// the output is the only way to tell a fix from a no-op here.
     ///
     /// Capture goes through [`crate::render::log_capture`], which explains why the subscriber
-    /// behind it is global. This test used `tracing::subscriber::set_default` instead and lost
-    /// roughly two runs in ten to the callsite-interest race described there.
+    /// behind it is global rather than a `tracing::subscriber::set_default`.
     ///
     /// `#[tokio::test]` is single-threaded, so `body` is polled on the thread that owns the
     /// capture buffer throughout.
@@ -802,13 +798,12 @@ mod tests {
             .count()
     }
 
-    /// A held job says so once, not once per poll interval -- including a one-shot.
+    /// A held job says so once, not once per poll interval, including a one-shot.
     ///
     /// Retiring a one-shot must not clear its held-back state on the reasoning that the row is
-    /// gone. Once an authority refusal started putting the row back, that clear ran *before* the
-    /// refusal on every sweep, so the "first time" check was true every time: a held one-shot
-    /// warned every 10 seconds for up to the whole `missed_grace` window. Recurring jobs were
-    /// unaffected, which is why it went unnoticed.
+    /// gone: an authority refusal puts the row back, so a clear that ran before the refusal on
+    /// every sweep would make the "first time" check true every time, and a held one-shot would
+    /// warn every 10 seconds for up to the whole `missed_grace` window.
     #[tokio::test]
     async fn a_held_job_warns_once_not_once_per_sweep() {
         for (label, schedule) in [
@@ -878,8 +873,8 @@ mod tests {
     ///
     /// Both cancel doors resolve an id from a listing and then delete it, and a scheduler sweep can
     /// retire the row in between: a one-shot's occurrence retires it, and deleting a session takes
-    /// its jobs through the foreign key. Reporting success regardless said "Canceled job abc12345"
-    /// about a job this call did not cancel, in the same words it uses when it did.
+    /// its jobs through the foreign key. Reporting success regardless would say "Canceled job
+    /// abc12345" about a job this call did not cancel, in the same words it uses when it did.
     #[tokio::test]
     async fn deleting_a_job_that_is_already_gone_reports_that_it_removed_nothing() {
         let harness = SchedulerHarness::new().await;
@@ -997,7 +992,7 @@ mod tests {
     /// A gate runs in its session's directory, not the host process's.
     ///
     /// A parked job stays in the table on purpose, so "a row is due" and "something will run" are
-    /// different questions. Asking the first one is what let a job at `MAX_CLAIM_ATTEMPTS`
+    /// different questions. Asking the first one would let a job at `MAX_CLAIM_ATTEMPTS`
     /// interrupt the prompt every poll interval, forever, to run nothing.
     #[test]
     fn a_wake_is_only_worth_it_for_a_job_that_can_still_run() {
@@ -1037,7 +1032,7 @@ mod tests {
 
     /// A non-zero exit is how several perfectly good `changed` gates signal a change: `diff -q`
     /// and `git diff --exit-code` exit 1 exactly when there is a difference. Refusing to fire on a
-    /// non-zero exit silenced those permanently.
+    /// non-zero exit would silence those permanently.
     #[cfg(unix)]
     #[tokio::test]
     async fn an_on_change_gate_that_signals_through_its_exit_code_still_fires() {
@@ -1350,21 +1345,12 @@ mod tests {
         }
     }
 
-    /// Every field a job carries survives the write and the read back.
-    ///
-    /// `ScheduledJobRow` addresses columns by position, so the `INSERT`, the three `SELECT` lists
-    /// and the decoder have to agree on an ordering that is written out four times and checked
-    /// nowhere. A field asserted here is one an index shift cannot move silently: the timestamps
-    /// stop parsing, and the gate and the schedule come back as something else.
-    ///
-    /// Both an ungated and a gated job, because the gate occupies four consecutive columns in the
-    /// middle of the row and a shift that starts after them is invisible to a job that has none.
     /// An empty prefix cancels nothing, on the door the model can reach.
     ///
     /// `schedule_cancel {"id": ""}` is a tool call, and `require_str` accepts an empty string, so
     /// this is reachable without a user typing anything. `"".starts_with` is true of every id, so
-    /// without the guard it resolved to whichever job was alone and destroyed the agent's own
-    /// reminder -- reporting success, and only starting to error once a second job existed.
+    /// without the guard it would resolve to whichever job was alone and destroy the agent's own
+    /// reminder, reporting success, and only start to error once a second job existed.
     #[tokio::test]
     async fn canceling_an_empty_prefix_destroys_no_job() {
         let harness = SchedulerHarness::new().await;
@@ -1412,6 +1398,15 @@ mod tests {
         );
     }
 
+    /// Every field a job carries survives the write and the read back.
+    ///
+    /// `ScheduledJobRow` addresses columns by position, so the `INSERT`, the three `SELECT` lists
+    /// and the decoder have to agree on an ordering that is written out four times and checked
+    /// nowhere. A field asserted here is one an index shift cannot move silently: the timestamps
+    /// stop parsing, and the gate and the schedule come back as something else.
+    ///
+    /// Both an ungated and a gated job, because the gate occupies four consecutive columns in the
+    /// middle of the row and a shift that starts after them is invisible to a job that has none.
     #[tokio::test]
     async fn every_field_of_a_job_survives_the_round_trip() {
         let harness = SchedulerHarness::new().await;
@@ -1682,7 +1677,7 @@ mod tests {
     }
 
     /// The budget is checked before `prepare`, which is where a gate runs, so holding a job over
-    /// must cost nothing -- not even the shell command whose expense is half the reason gates
+    /// must cost nothing, not even the shell command whose expense is half the reason gates
     /// exist.
     ///
     /// Observed through a side effect on the filesystem rather than through the job's stored gate
@@ -1913,8 +1908,8 @@ mod tests {
     }
 
     /// A gate is authorized once, at `unrestricted`, and then persists as a row that any process
-    /// executes on a timer. Nothing about the creating session's later downgrade -- Shift+Tab to
-    /// `read`, or a `meka serve --permission read` restart inheriting the job -- can reach back to
+    /// executes on a timer. Nothing about the creating session's later downgrade (Shift+Tab to
+    /// `read`, or a `meka serve --permission read` restart inheriting the job) can reach back to
     /// withdraw it, so the level travels on the row and is re-checked here. Asserted through a real
     /// filesystem side effect rather than through the returned outcome, because "did not fire" and
     /// "did not *run*" are different claims and only the second one is the security property. The
@@ -1922,11 +1917,10 @@ mod tests {
     /// `Unrestricted` it was legitimately created with, and the *session* has since dropped to
     /// `read`.
     ///
-    /// The sibling below hand-sets `gate.permission` to `Read`, which no creation path can produce
-    /// -- both `schedule_create` and the HTTP handler demand `Unrestricted` before writing the row,
-    /// and nothing updates the column afterwards. So that test proved the mechanism worked on
-    /// an input reality never supplies, and the check it guarded compared `unrestricted` with
-    /// itself for every real job.
+    /// The sibling below hand-sets `gate.permission` to `Read`, which no creation path can produce:
+    /// both `schedule_create` and the HTTP handler demand `Unrestricted` before writing the row,
+    /// and nothing updates the column afterwards. That test alone would prove the mechanism on an
+    /// input reality never supplies.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_gate_is_not_executed_once_the_session_drops_below_unrestricted() {
@@ -1959,11 +1953,11 @@ mod tests {
 
     /// A recurring job stays on the grid it was created on, however late a pickup is.
     ///
-    /// The old call passed `now` to `next_after`, so each fire added that sweep's pickup latency to
-    /// the interval and kept it. At `poll_interval = 1s` a measured `every = "1s"` ran at 2.0s --
-    /// half the requested rate -- because the tick one interval later lands microseconds early and
-    /// the job waits a whole extra poll. This asserts the property directly rather than by timing a
-    /// live scheduler, which would be flaky.
+    /// Passing `now` to `next_after` would add each sweep's pickup latency to the interval and keep
+    /// it: at `poll_interval = 1s` an `every = "1s"` job would run at 2.0s, half the requested
+    /// rate, because the tick one interval later lands microseconds early and the job waits a whole
+    /// extra poll. This asserts the property directly rather than by timing a live scheduler, which
+    /// would be flaky.
     #[test]
     fn a_recurring_schedule_advances_from_the_occurrence_it_delivered_not_from_now() {
         let every = Schedule::parse_every("5s").expect("parses");
@@ -2016,9 +2010,9 @@ mod tests {
 
     /// And the wiring: the row `prepare` writes back is on the grid, not one interval from now.
     ///
-    /// The unit test above covers `next_after_delivering`; reverting the *call site* to
-    /// `next_after(now)` left every schedule test passing, which is the same shape as the four
-    /// dead wirings this round started with. What the user feels is this value, persisted.
+    /// The unit test above covers `next_after_delivering`; reverting the call site to
+    /// `next_after(now)` would leave every other schedule test passing. What the user feels is this
+    /// value, persisted.
     #[tokio::test]
     async fn a_fired_job_is_rescheduled_onto_its_own_grid() {
         let harness = SchedulerHarness::new().await;
@@ -2059,7 +2053,7 @@ mod tests {
     /// persists its own level, so `--permission` on the host is a *default* and not a ceiling, and
     /// the only thing an operator can narrow that a row cannot exceed is the enabled set. Without
     /// the filter this test guards, that operator restarts, watches the session re-attach at
-    /// `read` in the log, and the gate keeps firing at `unrestricted` -- while the creation door
+    /// `read` in the log, and the gate keeps firing at `unrestricted`, while the creation door
     /// two files over returns 403 for the very same authority.
     #[cfg(unix)]
     #[tokio::test]
@@ -2097,8 +2091,8 @@ mod tests {
 
         // And the control: with `unrestricted` still enabled, the identical row does authorize the
         // gate, so the refusal above is the enabled set rather than some unrelated part of the
-        // fixture. A *second* job, because the sweep above claimed the first one's occurrence by
-        // advancing it -- a declined gate still spends the occurrence, which is what stops a
+        // fixture. A second job, because the sweep above claimed the first one's occurrence by
+        // advancing it: a declined gate still spends the occurrence, which is what stops a
         // refused watcher from re-running every poll.
         harness
             .overdue_job(
@@ -2126,9 +2120,9 @@ mod tests {
     /// A panic in one fire must not stop the scheduler.
     ///
     /// Under `meka serve` the callback runs a whole agent turn, so everything the tool loop can do
-    /// is inside the surface that can panic. Nothing joins this task, so losing it produced no
-    /// error anywhere: scheduled jobs simply stopped firing, for the life of the process, and the
-    /// first sign was a reminder that never arrived.
+    /// is inside the surface that can panic. Nothing joins this task, so losing it would produce
+    /// no error anywhere: scheduled jobs would simply stop firing, for the life of the process, and
+    /// the first sign would be a reminder that never arrived.
     #[tokio::test]
     async fn a_panicking_fire_does_not_stop_the_scheduler() {
         let harness = SchedulerHarness::new().await;
@@ -2184,9 +2178,8 @@ mod tests {
     ///
     /// "Did not run" and "did not fire" are separate claims and both matter. A gate is the
     /// condition on the job, so a gate that cannot be evaluated has not passed, and delivering the
-    /// prompt regardless turns a conditional job into an unconditional one. Delivering it was the
-    /// first shape of this fix, and on an `every = "1m"` watcher it meant a turn a minute for as
-    /// long as the session stayed below `unrestricted`.
+    /// prompt regardless turns a conditional job into an unconditional one: on an `every = "1m"`
+    /// watcher, a turn a minute for as long as the session stayed below `unrestricted`.
     #[tokio::test]
     async fn a_job_whose_gate_cannot_be_run_does_not_fire_regardless() {
         let harness =
@@ -2245,8 +2238,8 @@ mod tests {
     }
 
     /// A row that could not be read grants nothing, and neither does one that is gone. Read as "no
-    /// level recorded", a failed read fell back to the host's level, so a `SQLITE_BUSY` on a
-    /// session recorded at `read` evaluated its gates at `unrestricted` for that sweep.
+    /// level recorded", a failed read would fall back to the host's level, so a `SQLITE_BUSY` on a
+    /// session recorded at `read` would evaluate its gates at `unrestricted` for that sweep.
     #[tokio::test]
     async fn an_unreadable_session_row_fails_closed() {
         let harness = SchedulerHarness::new().await;
@@ -2266,8 +2259,9 @@ mod tests {
     }
 
     /// The clock is read per job. A sweep contains the turns it fires, so the second job's
-    /// `fired_at` and `next_fire_at` were computed from an instant the first job's turn had left
-    /// behind; a recurring job was then advanced into the past and fired again on the next tick.
+    /// `fired_at` and `next_fire_at` would otherwise be computed from an instant the first job's
+    /// turn had left behind; a recurring job would then be advanced into the past and fire again on
+    /// the next tick.
     #[tokio::test]
     async fn each_job_in_a_sweep_is_timed_from_its_own_instant() {
         let harness = SchedulerHarness::new().await;
@@ -2398,8 +2392,8 @@ mod tests {
     }
 
     /// A gate that logs more than the stderr cap still answers: its stderr is drained past the cap
-    /// and only the head kept. A `take` at the cap closed the read end, so the child's next log
-    /// line was `SIGPIPE` and the gate died before it could print its answer.
+    /// and only the head kept. A `take` at the cap would close the read end, so the child's next
+    /// log line would be `SIGPIPE` and the gate would die before it could print its answer.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_chatty_stderr_does_not_kill_the_probe() {
@@ -2417,8 +2411,8 @@ mod tests {
     }
 
     /// A gate whose tool cannot be resolved *yet* is left for the next sweep, not declined.
-    /// Declining spent the occurrence, so a `6h` job due while its server was still connecting
-    /// was advanced six hours without its probe ever running.
+    /// Declining would spend the occurrence, so a `6h` job due while its server was still
+    /// connecting would be advanced six hours without its probe ever running.
     #[tokio::test]
     async fn a_gate_whose_server_is_still_connecting_keeps_its_occurrence() {
         let harness = SchedulerHarness::new().await;
@@ -2451,8 +2445,8 @@ mod tests {
     }
 
     /// A gate that never stops producing is cut off at the parse limit, not held in memory until
-    /// its time budget runs out. `wait_with_output` read the whole pipe, so `yes` took the host's
-    /// memory inside its own timeout.
+    /// its time budget runs out. `wait_with_output` reads the whole pipe, so `yes` would take the
+    /// host's memory inside its own timeout.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_runaway_probe_is_cut_off_at_the_parse_limit() {
@@ -2504,11 +2498,10 @@ mod tests {
 
     /// An unreadable `gate_permission` decodes to the level that authorizes nothing.
     ///
-    /// This is the arm a row holding a value this build does not resolve hits. It fails *closed* --
-    /// `Permission::None` authorizes no gate -- and nothing asserted it, so changing the fallback
-    /// to `Unrestricted` left the suite green while every upgraded database silently regained
-    /// unattended arbitrary shell. The fixtures all plant valid values, which is why the one value
-    /// that matters on upgrade was the one never exercised.
+    /// This is the arm a row holding a value this build does not resolve hits. It fails closed
+    /// (`Permission::None` authorizes no gate), and a fallback to `Unrestricted` would let every
+    /// upgraded database silently regain unattended arbitrary shell. The fixtures all plant valid
+    /// values, so the one value that matters on upgrade needs its own test.
     #[test]
     fn an_unreadable_gate_permission_authorizes_nothing() {
         let row = |permission: Option<&str>| ScheduledJobRow {
@@ -2585,7 +2578,7 @@ mod tests {
             )
             .await;
 
-        // The session has since been withdrawn to `read` -- the row the REPL now keeps current.
+        // The session has since been withdrawn to `read`: the row the REPL now keeps current.
         harness
             .manager
             .update_session(harness.session_id, crate::store::SessionPatch {
@@ -2640,7 +2633,7 @@ mod tests {
     /// A session this process holds answers for its level from its cell, not its row. The row is
     /// written back on every change and the write can fail; until it lands the row says
     /// `unrestricted` for a session the user has just dropped to `read`, and the poller in the
-    /// same process fired a shell gate on the strength of it.
+    /// same process would fire a shell gate on the strength of it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_resident_sessions_live_level_outranks_its_row() {
@@ -2689,10 +2682,9 @@ mod tests {
     /// nothing, changes nothing, and its `schedule_cancel` is refused too, leaving it unable to
     /// stop itself being woken again. Registration does not depend on the level, so it *sees* the
     /// job in `[Scheduled]` and is offered the tool; the refusal is at the point of use, which is
-    /// the worst of both. An ungated `every = "5s"` job was a turn every five seconds for as long
-    /// as the session sat there, stoppable only by an operator. Ungated is the case that matters
-    /// here: a gated job was already refused by the authority check, which is why this went
-    /// unnoticed.
+    /// the worst of both. An ungated `every = "5s"` job would be a turn every five seconds for as
+    /// long as the session sat there, stoppable only by an operator. Ungated is the case that
+    /// matters here: a gated job is already refused by the authority check.
     #[tokio::test]
     async fn an_ungated_job_does_not_fire_on_a_session_at_none() {
         let harness = SchedulerHarness::new().await;
@@ -2725,10 +2717,10 @@ mod tests {
     ///
     /// A one-shot is retired the instant it comes due, *before* the gate is consulted, which is
     /// right when the gate ran and said no: its moment has passed either way. It is wrong when the
-    /// gate was never consulted at all. Lowering a session for one minute destroyed every one-shot
-    /// that happened to come due in that minute, and the log line said "not fired", which reads as
-    /// held rather than deleted. The gate-error path already made this distinction for a gate that
-    /// *errored*; the two authority refusals belong on the same side of it.
+    /// gate was never consulted at all. Lowering a session for one minute would destroy every
+    /// one-shot that happened to come due in that minute, while the log line says "not fired",
+    /// which reads as held rather than deleted. The gate-error path makes this distinction for a
+    /// gate that errored; the two authority refusals belong on the same side of it.
     #[tokio::test]
     async fn a_one_shot_held_for_authority_is_kept_rather_than_retired() {
         for (label, level, gate_on_it) in [
@@ -2778,7 +2770,7 @@ mod tests {
     ///
     /// The second job is not decoration. With one row in the table the deleted rowid is also `max +
     /// 1`, so SQLite hands the same value straight back and the assertion holds under both
-    /// orderings -- which is what this test did until the mutation check caught it.
+    /// orderings.
     #[tokio::test]
     async fn a_refused_one_shot_keeps_its_row_rather_than_being_deleted_and_restored() {
         let harness = SchedulerHarness::new().await;
@@ -2840,7 +2832,7 @@ mod tests {
     /// Authority is not the commonest way a watcher dies. A server that changed its schema, a
     /// command that was uninstalled, a pointer into a result that stopped being JSON: each errors
     /// on every evaluation and each is indistinguishable, from the model's side, from a healthy
-    /// watcher with nothing to report -- which is the whole reason the marker exists. The first
+    /// watcher with nothing to report, which is the whole reason the marker exists. The first
     /// failure is deliberately silent, because one failure is as often a blip as a break.
     #[tokio::test]
     async fn a_gate_whose_probe_keeps_failing_is_reported_after_the_second_failure() {
@@ -2887,8 +2879,8 @@ mod tests {
         );
 
         // And the sentence does not move once it has been said. Every reader compares it by
-        // equality, so a running total in it made `render_world_state_diff` re-announce the job to
-        // the model on every single failed evaluation.
+        // equality, so a running total in it would make `render_world_state_diff` re-announce the
+        // job to the model on every single failed evaluation.
         harness.overdue_now(&job.id).await;
         harness.tick().await;
         assert_eq!(
@@ -2919,8 +2911,8 @@ mod tests {
 
     /// A crash between the claim and the delivery costs a retry, not the job.
     ///
-    /// This is what the lease is for. Consuming the row to claim it -- advancing a recurring job's
-    /// `next_fire_at`, deleting a one-shot's row outright -- leaves the occurrence spent when a
+    /// This is what the lease is for. Consuming the row to claim it (advancing a recurring job's
+    /// `next_fire_at`, deleting a one-shot's row outright) leaves the occurrence spent when a
     /// host dies before the turn runs, and for a one-shot the reminder is gone with nothing
     /// anywhere to recover it from. Nothing swept for it either, unlike `background_tasks`, which
     /// is marked `interrupted` when a process takes the session lock.
@@ -3029,7 +3021,7 @@ mod tests {
     /// A stale *completion* is refused too, not just a stale release.
     ///
     /// The completion of a one-shot is the one `DELETE` the scheduler issues, so an unscoped one
-    /// would let a host whose lease expired retire a job the current holder is still delivering --
+    /// would let a host whose lease expired retire a job the current holder is still delivering:
     /// the reminder vanishing mid-turn, from a write issued by a host that no longer owns it.
     #[tokio::test]
     async fn a_stale_completion_does_not_retire_another_hosts_job() {
@@ -3087,7 +3079,7 @@ mod tests {
     ///
     /// Two properties in one shape, because they are the same trade. Leaving the lease is what
     /// spaces the retries: giving the occurrence back at once leaves the row due on the next
-    /// sweep, so three panics arrive within `3 * poll_interval` -- half a minute at the default --
+    /// sweep, so three panics arrive within `3 * poll_interval` (half a minute at the default)
     /// and park a recurring job that `missed_grace` will never retire. *Not* resetting the attempt
     /// count is what stops the same panic being retried forever once the spacing is in place.
     #[tokio::test]
@@ -3527,8 +3519,7 @@ mod tests {
 
     /// The arbitration between hosts, at the primitive. Two `meka serve` instances sharing a
     /// database both read the same occurrence into their due lists; exactly one of them may take
-    /// it. Before this the write was unconditional, so both advanced the row and both went on to
-    /// fire.
+    /// it. An unconditional write would let both advance the row and both go on to fire.
     ///
     /// One shape for both kinds of schedule, which is the point of leasing rather than consuming:
     /// claiming a one-shot by deleting its row needs a second shape, and the delete has nothing to
@@ -3627,12 +3618,11 @@ mod tests {
     /// A gate that cannot be evaluated spends the occurrence, exactly as one that ran and said no
     /// does.
     ///
-    /// The obvious handling was to release the lease, since nothing was measured and the job has
-    /// not had its turn. That leaves `next_fire_at` where it was, so the row is due again on the
-    /// very next sweep: a six-hour job whose server is down was re-probed every `poll_interval`
-    /// rather than every six hours, and a probe that hangs burned the whole `gate_timeout` out of
-    /// each sweep. Under consume-to-claim the schedule had already advanced before the gate ran, so
-    /// this could not happen and nothing had to decide it.
+    /// Releasing the lease instead, since nothing was measured and the job has not had its turn,
+    /// would leave `next_fire_at` where it was, so the row would be due again on the very next
+    /// sweep: a six-hour job whose server is down would be re-probed every `poll_interval` rather
+    /// than every six hours, and a probe that hangs would burn the whole `gate_timeout` out of each
+    /// sweep.
     #[tokio::test]
     async fn a_gate_that_cannot_be_evaluated_spends_a_recurring_occurrence() {
         let harness = SchedulerHarness::new().await;
@@ -3694,7 +3684,7 @@ mod tests {
     /// The same for a one-shot, which has no next occurrence to spend: the lease is what waits.
     ///
     /// Advancing is not available, so the row stays due, and releasing the lease would make it due
-    /// *now* -- re-probed on every sweep, and parked by the attempt ceiling after three of them,
+    /// now: re-probed on every sweep, and parked by the attempt ceiling after three of them,
     /// which at the default `poll_interval` is half a minute. A server restarting anywhere near a
     /// one-shot's due time would silently destroy the reminder, which is a worse failure than the
     /// cost the advance exists to avoid. Keeping the lease spaces the retry by `claim_lease`.
@@ -3798,10 +3788,10 @@ mod tests {
     /// the paths that retire and advance without taking one.
     ///
     /// Nothing clears `claimed_by` but a release, a completion or a fresh claim, so a host that
-    /// dies holding a lease leaves it set for good. While those two paths tested the column rather
-    /// than the expiry, such a row was handed to `prepare` on every sweep and was invisible to
-    /// both: a one-shot past its grace period was never retired, never fired and never logged, and
-    /// a refused recurring job never advanced.
+    /// dies holding a lease leaves it set for good. If those two paths tested the column rather
+    /// than the expiry, such a row would be handed to `prepare` on every sweep and be invisible to
+    /// both: a one-shot past its grace period would never be retired, never fired and never logged,
+    /// and a refused recurring job would never advance.
     #[tokio::test]
     async fn a_lease_left_by_a_dead_host_does_not_wedge_the_occurrence() {
         for (label, schedule, level, overdue) in [
@@ -3860,12 +3850,10 @@ mod tests {
 
     /// A sweep that bounded its own coverage says so.
     ///
-    /// The budget holds jobs over, and the next sweep takes them, so nothing is lost -- which is
+    /// The budget holds jobs over, and the next sweep takes them, so nothing is lost, which is
     /// exactly why the line matters: without it a capped run is indistinguishable from a complete
     /// one in the log, and an operator watching a backlog has no way to tell that the cap is what
-    /// they are looking at. Found by a mutation sweep: `held_over += 1` could be neutered and
-    /// `held_over > 0` inverted with every test still green, because the count had no reader but
-    /// this line and the line had no reader at all.
+    /// they are looking at. The count has no reader but this line.
     #[tokio::test]
     async fn a_sweep_that_holds_jobs_over_reports_that_it_did() {
         let mut harness = SchedulerHarness::new().await;
@@ -3910,9 +3898,8 @@ mod tests {
     /// Several hosts noticing the same expired one-shot produce one announcement, not one each.
     ///
     /// The delete is scoped to the occurrence, so whoever wins removes the row and everyone else
-    /// changes nothing -- and the return value is how the winner knows to be the one that speaks.
-    /// Every assertion about the row itself passes whichever way that value goes, which is why a
-    /// mutation of it survived.
+    /// changes nothing, and the return value is how the winner knows to be the one that speaks.
+    /// Every assertion about the row itself passes whichever way that value goes.
     #[tokio::test]
     async fn only_the_host_that_removed_an_expired_one_shot_announces_it() {
         let harness = SchedulerHarness::new().await;
@@ -3947,9 +3934,9 @@ mod tests {
     /// `attempts` is on the row; the reason it rose is in a process-global map. A restart is
     /// exactly what an operator does once a job has gone inert, and `meka schedule list` is a
     /// separate process that never had the map at all, so the commonest way to read this message
-    /// is with the cause missing. Asserting the likelier cause from that absence told someone whose
-    /// MCP server was misconfigured that their prompt takes meka down, with a remedy aimed at the
-    /// wrong thing, in the model's own `[Scheduled]` block.
+    /// is with the cause missing. Asserting the likelier cause from that absence would tell someone
+    /// whose MCP server was misconfigured that their prompt takes meka down, with a remedy aimed at
+    /// the wrong thing, in the model's own `[Scheduled]` block.
     ///
     /// The row still settles it one way: no gate means no probe that could have failed.
     #[tokio::test]
@@ -3963,7 +3950,7 @@ mod tests {
             )
             .await;
         gated.attempts = MAX_CLAIM_ATTEMPTS;
-        // A fresh memory, so this process holds no record of why the claims failed -- which is
+        // A fresh memory, so this process holds no record of why the claims failed, which is
         // the state every reader is in after a restart.
         let memory = SchedulerMemory::default();
 
@@ -4005,7 +3992,7 @@ mod tests {
     /// The counter is per process and only the host that wins `claim_occurrence` ever touches it.
     /// Which host wins is a race between their tickers, so a second `meka serve` on the same store
     /// can take over every occurrence and heal the gate while this process's count stays where it
-    /// stopped. The marker then stood forever: the model was told, every turn, that a job firing
+    /// stopped. The marker would then stand forever: the model told, every turn, that a job firing
     /// hourly was dead.
     ///
     /// Driven in one process rather than two. Advancing `last_fired_at` here is exactly what the
@@ -4082,9 +4069,9 @@ mod tests {
     /// Closing an occurrence that is not there any more is not the same as losing the lease.
     ///
     /// Both make the scoped write match nothing, and they mean opposite things. A job that fires
-    /// and then cancels itself is an ordinary shape -- `schedule_create`'s own reply tells the
-    /// model how -- and it was being told, on every such fire, that a duplicate delivery was
-    /// possible and that an unrelated setting should be raised.
+    /// and then cancels itself is an ordinary shape (`schedule_create`'s own reply tells the model
+    /// how), and conflating the two would tell it, on every such fire, that a duplicate delivery
+    /// was possible and that an unrelated setting should be raised.
     #[tokio::test]
     async fn closing_an_occurrence_tells_a_canceled_job_from_a_lost_lease() {
         let harness = SchedulerHarness::new().await;
@@ -4203,7 +4190,7 @@ mod tests {
     }
 
     /// What a lost claim must cost: nothing. `prepare` evaluates the gate only after the claim is
-    /// won, so a host that arrives second neither spawns the command nor produces a wakeup -- and
+    /// won, so a host that arrives second neither spawns the command nor produces a wakeup, and
     /// leaves the winner's schedule exactly as the winner wrote it.
     ///
     /// Observed through a side effect on the filesystem for the same reason
@@ -4326,7 +4313,7 @@ mod tests {
     /// A whole-row upsert applied by id would let a host that lost the claim and was then refused
     /// the session lock overwrite the winner's `next_fire_at` with a time already in the past,
     /// bringing the job due on the very next tick while the winner is still running the turn. One
-    /// hourly occurrence produced three gate runs and two agent turns that way.
+    /// hourly occurrence would produce three gate runs and two agent turns that way.
     ///
     /// Scoping to the lease makes that structural rather than careful: the shape below is a host
     /// whose lease expired and was taken over while it was still working, which is the only way two
@@ -4475,7 +4462,7 @@ mod tests {
     }
 
     /// The fallback arm of [`SAME_OCCURRENCE`]. Every writer in meka renders the column with
-    /// `to_rfc3339`, so the textual comparison matches in practice -- but a row that reached the
+    /// `to_rfc3339`, so the textual comparison matches in practice, but a row that reached the
     /// database any other way must still be claimable. The failure this guards against is the
     /// quietest one available: a compare-and-swap that matches nothing on every sweep, forever,
     /// with the job simply never firing again and not a line said about it.
@@ -4523,16 +4510,14 @@ mod tests {
     /// A job that really fires records that it fired, and a recurring one past the grace period is
     /// rescheduled rather than deleted.
     ///
-    /// Two mutations survived the whole suite, including the cross-process tests. Emptying the
-    /// completion at the end of the sweep changed nothing any test could see -- the store method
-    /// has its own test, and nothing checked that `prepare` calls it -- so every job would have
-    /// read as never-fired in `meka schedule list` and an interval schedule would re-anchor on
-    /// `created_at` after a restart and replay everything since.
+    /// The store method has its own test, so this checks that `prepare` calls it: otherwise every
+    /// job would read as never-fired in `meka schedule list` and an interval schedule would
+    /// re-anchor on `created_at` after a restart and replay everything since.
     ///
-    /// And `if !recurring && past_grace` still passed with the `!recurring` term forced true. The
-    /// comment says "Recurring jobs need no equivalent rule"; `DEFAULT_MISSED_GRACE` is 24 hours
-    /// and the latest fixture in the suite is 6 hours overdue, so the term was never the deciding
-    /// factor. A laptop shut for a weekend would have had every recurring job silently retired.
+    /// And the `!recurring` term in `if !recurring && past_grace` needs a fixture that exercises
+    /// it: `DEFAULT_MISSED_GRACE` is 24 hours and every other fixture in the suite is at most 6
+    /// hours overdue, so without one a laptop shut for a weekend could have every recurring job
+    /// silently retired.
     #[tokio::test]
     async fn a_fire_is_recorded_and_a_long_outage_does_not_retire_a_recurring_job() {
         let harness = SchedulerHarness::new().await;

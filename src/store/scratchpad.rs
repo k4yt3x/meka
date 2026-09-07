@@ -2,6 +2,7 @@
 
 use super::*;
 
+/// One scratchpad entry as a listing shows it: its name, size and creation time, not its content.
 #[derive(Debug, Clone)]
 pub(crate) struct ScratchpadEntry {
     pub(crate) name: String,
@@ -17,6 +18,7 @@ pub(crate) enum RenameOutcome {
 }
 
 impl Store {
+    /// Write a scratchpad entry, replacing one of the same name.
     pub(crate) async fn save_scratchpad_entry(
         &self,
         session_id: Uuid,
@@ -37,9 +39,12 @@ impl Store {
                 Ok(())
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to save tool output: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to save the scratchpad entry: {error}"))
+            })
     }
 
+    /// Replace an existing entry's content; `false` when there is no entry of that name.
     pub(crate) async fn update_scratchpad_entry(
         &self,
         session_id: Uuid,
@@ -59,9 +64,12 @@ impl Store {
                 Ok(updated > 0)
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to update tool output: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to update the scratchpad entry: {error}"))
+            })
     }
 
+    /// Remove an entry; `false` when there was none of that name.
     pub(crate) async fn delete_scratchpad_entry(
         &self,
         session_id: Uuid,
@@ -78,9 +86,12 @@ impl Store {
                 Ok(deleted > 0)
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to delete tool output: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to delete the scratchpad entry: {error}"))
+            })
     }
 
+    /// Rename an entry, refusing to overwrite one that already has the new name.
     pub(crate) async fn rename_scratchpad_entry(
         &self,
         session_id: Uuid,
@@ -114,9 +125,12 @@ impl Store {
                 })
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to rename tool output: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to rename the scratchpad entry: {error}"))
+            })
     }
 
+    /// Every entry of a session, oldest first, without content.
     pub(crate) async fn list_scratchpad_entries(
         &self,
         session_id: Uuid,
@@ -141,9 +155,12 @@ impl Store {
                 Ok(rows)
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to list tool outputs: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to list the scratchpad entries: {error}"))
+            })
     }
 
+    /// One entry's content, or `None` when there is no entry of that name.
     pub(crate) async fn load_scratchpad_entry(
         &self,
         session_id: Uuid,
@@ -167,9 +184,12 @@ impl Store {
                 }
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to load tool output: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load the scratchpad entry: {error}"))
+            })
     }
 
+    /// Every entry of a session with its content, oldest first, as `(name, content)`.
     pub(crate) async fn load_all_scratchpad_entries(
         &self,
         session_id: Uuid,
@@ -190,6 +210,8 @@ impl Store {
                 Ok(rows)
             })
             .await
-            .map_err(|error| MekaError::Database(format!("failed to load tool outputs: {error}")))
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load the scratchpad entries: {error}"))
+            })
     }
 }

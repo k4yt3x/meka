@@ -8,18 +8,18 @@ use super::*;
 /// defragmented image rather than one that may span a live WAL, and carries `user_version` across,
 /// so restoring the copy yields a store that identifies itself as the version it was and migrates
 /// once when next opened. Lives here rather than in [`migrations`] because it is a question about
-/// the store *file* -- a path, a mode -- and because that module is deliberately kept clear of
-/// meka's own code.
+/// the store *file* (a path, a mode) and because that module is deliberately kept clear of meka's
+/// own code.
 ///
 /// Kept rather than cleaned up on success. It is the user's undo, and deleting it the moment the
 /// migration works removes the safety net exactly when they might still want it.
 ///
 /// Written to a staging name and renamed into place, so the name the docs tell people to restore
 /// either does not exist or is a complete copy. `VACUUM INTO` does not unlink its output when a
-/// write fails partway: measured under a write limit, it left a file with a zeroed page-1 header,
-/// which SQLite then opens cleanly as an *empty database* that passes `integrity_check`. The retry
-/// stepped past it to `.bak.1`, so the file wearing the documented name was the empty one. Staging
-/// plus rename removes that whole class rather than special-casing it.
+/// write fails partway, and the file it leaves (a zeroed page-1 header) opens cleanly as an
+/// *empty database* that passes `integrity_check`; a retry would step past it to `.bak.1` and
+/// leave the empty one wearing the documented name. Staging plus rename removes that whole class
+/// rather than special-casing it.
 pub(super) fn back_up_before_migrating(
     connection: &rusqlite::Connection,
     database_path: &Path,
@@ -57,8 +57,8 @@ pub(super) fn back_up_before_migrating(
     let Some(staging_text) = staging.to_str() else {
         remove_partial_backup(&staging);
         return Err(MekaError::Database(format!(
-            "cannot write the pre-migration backup to '{}' because the path is not valid UTF-8. \
-             Nothing has been changed. Move the store somewhere it is, or set MEKA_DATA_DIR",
+            "cannot write the pre-migration backup to '{}': the path is not valid UTF-8. Nothing \
+             has been changed. Set `MEKA_DATA_DIR` to a path that is",
             staging.display()
         )));
     };
@@ -70,8 +70,7 @@ pub(super) fn back_up_before_migrating(
             error
         )));
     }
-    // Belt-and-braces on platforms where the mode above is a no-op, and against a umask that
-    // somehow widened it.
+    // For platforms where the mode above is a no-op, and against a umask that somehow widened it.
     restrict_permissions(&staging, 0o600);
     std::fs::rename(&staging, &target).map_err(|error| {
         remove_partial_backup(&staging);
@@ -125,7 +124,7 @@ pub(super) fn prune_older_backups(database_path: &Path, keep: &Path) {
     };
     for entry in entries {
         // Not `.flatten()`. An entry that cannot be read is a question this cannot answer, and
-        // skipping it is right -- but silently is not, because the answer it stands in for is
+        // skipping it is right, but silently is not, because the answer it stands in for is
         // "there may be a superseded copy still on disk".
         let entry = match entry {
             Ok(entry) => entry,
@@ -245,19 +244,16 @@ pub(super) fn remove_partial_backup(staging: &Path) {
 /// migration that replaced it would destroy the copy taken before whatever failure made a second
 /// attempt necessary.
 ///
-/// **Both halves of the pair have to be free, and that is the whole of a bug worth remembering.**
-/// The copy is staged at `<name>.partial` and renamed into place, so an abnormal exit between the
-/// two leaves a `.partial` behind. Checking only the target then chose that same name again, and
-/// `create_new` failed `EEXIST` on every subsequent start: measured, one `kill -9` during the
-/// upgrade of a 90 MB store, then three consecutive runs all refusing with `failed to create the
-/// pre-migration backup … File exists` and the store still at its old version. A single interrupted
-/// upgrade wedged meka permanently, which is the opposite of what staging was introduced to
-/// achieve.
+/// **Both halves of the pair have to be free.** The copy is staged at `<name>.partial` and renamed
+/// into place, so an abnormal exit between the two leaves a `.partial` behind. Checking only the
+/// target then chooses that same name again, and `create_new` fails `EEXIST` on every subsequent
+/// start: one interrupted upgrade wedges meka permanently, which is the opposite of what staging
+/// is for.
 ///
 /// Exhaustion is an error rather than a fallback to the unsuffixed name. Returning the occupied
 /// base is not safe here: the write is staged to `.partial` and finished with `std::fs::rename`,
-/// which refuses nothing, where `VACUUM INTO` would have refused a non-empty target. So the old
-/// fallback silently overwrote the *oldest* backup, the one most likely to matter.
+/// which refuses nothing, where `VACUUM INTO` would refuse a non-empty target. A fallback would
+/// silently overwrite the *oldest* backup, the one most likely to matter.
 pub(super) fn free_backup_path(database_path: &Path, from: u32) -> Result<PathBuf> {
     let base = {
         let mut name = database_path.as_os_str().to_os_string();
@@ -277,7 +273,7 @@ pub(super) fn free_backup_path(database_path: &Path, from: u32) -> Result<PathBu
     }
     Err(MekaError::Database(format!(
         "cannot name a pre-migration backup: '{}' and its {} numbered variants are all taken. \
-         Nothing has been changed. Move or delete the old copies beside the store",
+         Nothing has been changed. Remove the old copies beside the store",
         base.display(),
         MAX_BACKUP_SUFFIX - 1
     )))
@@ -290,7 +286,7 @@ pub(super) fn is_free_pair(target: &Path) -> bool {
 /// Where a copy is written before it is renamed onto `target`.
 ///
 /// One function so the caller and [`is_free_pair`] cannot disagree about the name, which is exactly
-/// how the wedge above happened: the check looked at one path and the create at another.
+/// how the wedge above happens: the check looks at one path and the create at another.
 pub(super) fn staging_path(target: &Path) -> PathBuf {
     let mut name = target.as_os_str().to_os_string();
     name.push(".partial");

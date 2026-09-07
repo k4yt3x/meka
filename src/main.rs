@@ -5,13 +5,9 @@
 //! SQLite, a [`tools`] registry, an MCP client manager, and a [`host::repl`] input loop. The
 //! [`agent`] module owns the per-turn loop that streams provider output and dispatches tool calls.
 
-// Production code shouldn't panic on unexpected input; the `Cargo.toml` `[lints.clippy]` block
-// enforces that with `unwrap_used` / `expect_used` / `panic` at warn level (CI promotes warnings to
-// errors). Tests use `.unwrap()` and `.expect()` heavily on purpose: a failed test should panic
-// with a clear message rather than thread `Result` through every fixture. The cfg_attr below scopes
-// the relaxation to test builds only.
-// A build without the HTTP API leaves the items only it reads unused; that configuration is
-// secondary, and the items are not.
+// A test panics on failure by design, so the `[lints.clippy]` panic lints in `Cargo.toml` are
+// relaxed for test builds alone. A build without the HTTP API leaves the items only it reads
+// unused; that configuration is secondary, and the items are not.
 #![cfg_attr(not(feature = "serve"), allow(dead_code))]
 #![cfg_attr(
     test,
@@ -220,8 +216,8 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     }
                     Err(error) => {
                         tracing::warn!(
-                            "failed to read config.toml, so this run cannot say which profile \
-                             anything should adopt: {error}"
+                            "failed to read config.toml, so no profile can be adopted for older \
+                             sessions: {error}"
                         );
                         (
                             None,
@@ -279,7 +275,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         });
     }
 
-    // --oneshot needs something to do; reject early before any setup.
+    // Refused before any setup, so a run with nothing to do never opens the store.
     if cli.oneshot && cli.prompt.is_none() && cli.skill.is_none() {
         return Err(anyhow::anyhow!("--oneshot requires --prompt or --skill"));
     }
@@ -306,23 +302,16 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
         .filter_map(|(given, flag)| given.then_some(flag))
         .collect::<Vec<_>>();
         if !offending.is_empty() {
-            // The remedy differs by host, and saying so beats one sentence that is right for
-            // neither. `POST /v1/sessions` genuinely takes a `profile`; ACP's `session/new` does
-            // not -- it creates on the host's default and a client moves it afterwards through
-            // `session/set_config_option`, which is what `configOptions` advertises it for.
+            // The remedy differs by host: ACP resumes through `session/load`, and an HTTP client
+            // names the session in the path.
             let remedy = if acp_mode {
-                "Create the session with `session/new`, then move it with \
-                 `session/set_config_option` if it needs another profile; `session/load` restores \
-                 the one a session recorded"
+                "resume one with `session/load`"
             } else {
-                "Name a `profile` on `POST /v1/sessions` instead"
+                "address one by id under `/v1/sessions/{id}`"
             };
             anyhow::bail!(
-                "`meka {}` does not take {}: they name one run's session, and this host creates \
-                 one per request. {}.",
-                host,
+                "`meka {host}` does not take {}: this host creates a session per request; {remedy}.",
                 offending.join(", "),
-                remedy
             );
         }
     }
@@ -356,23 +345,19 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
 
 /// Build the `tracing` filter for meka.
 ///
-/// When the user sets `RUST_LOG`, we honor it verbatim; no hidden
-/// overrides. Debugging with `RUST_LOG=rmcp=debug` works as expected.
-/// Otherwise we start from `log_level` (derived from `-v` / `-vv`) and
-/// add directives that quiet two rmcp log sites which fire on every retry:
+/// `RUST_LOG` is honored verbatim. Otherwise the `-v` level is the floor, with two rmcp log sites
+/// that fire on every retry quieted:
 ///
-/// 1. MCP servers behind a CDN / edge (Cloudflare, Fastly, …) close idle HTTP streams after ~100 s,
-///    which trips `rmcp::transport::common::client_side_sse`'s `warn!("sse stream error: …")`
-///    before rmcp transparently reconnects via `Last-Event-ID`. The warn fires on every expected
-///    reconnect; the real failure mode (`"max retry times reached"`) is emitted at `error!` from
-///    the same module, so an `=error` floor keeps the useful signal and drops the noise.
-/// 2. `rmcp::transport::worker` emits `error!("worker quit with fatal: …")` each time a transport
-///    fails to come up. A configured-but-unreachable server is retried in the background for the
-///    life of the process, so that lands on the user's prompt every few minutes, at `error` level,
-///    saying nothing meka hasn't already reported once itself through `record_connect_failure`.
-///    Silenced outright rather than floored, because the noise *is* the error level.
+/// 1. An MCP server behind a CDN closes idle HTTP streams after about 100 s, which trips
+///    `rmcp::transport::common::client_side_sse`'s `warn!` before rmcp reconnects on its own via
+///    `Last-Event-ID`. The real failure ("max retry times reached") is an `error!` from the same
+///    module, so an `=error` floor keeps it and drops the noise.
+/// 2. `rmcp::transport::worker` logs an `error!` each time a transport fails to come up, and an
+///    unreachable server is retried for the life of the process, so that lands on the prompt every
+///    few minutes saying nothing `record_connect_failure` has not already said once. Silenced
+///    outright, because the noise is at the error level itself.
 ///
-/// Verified against rmcp 2.1. `RUST_LOG` short-circuits both, so nothing is permanently hidden.
+/// Verified against rmcp 2.1.
 fn build_log_filter(rust_log: Option<&str>, log_level: &str) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
     if let Some(value) = rust_log
@@ -404,9 +389,8 @@ async fn async_main(
     acp_mode: bool,
     serve_mode: bool,
 ) -> anyhow::Result<()> {
-    // Validate provider name and model before opening the session store or resolving credentials so
-    // the user sees a clear "not configured" or "invalid value" message instead of the downstream
-    // credential error.
+    // Before the store is opened or a credential resolved, so a misconfigured profile is reported
+    // as such rather than as a credential error.
     config.validate()?;
 
     // The file's default rather than this run's level: a row the migration stamps is read by every
@@ -457,9 +441,6 @@ async fn async_main(
         return host::acp::run_acp(config, store, mcp_manager).await;
     }
 
-    // `--oneshot` runs a single turn and exits; the prompt is required (validated at startup).
-    // Without `--oneshot`, any provided prompt/skill becomes the first-turn input but the REPL
-    // stays open afterwards.
     if config.request.oneshot {
         // Startup already refused `--oneshot` without a prompt or `--skill`; this is the same
         // refusal for a request that arrived by another route, in place of a panic.
@@ -1063,9 +1044,7 @@ mod tests {
 
     // -- log filter --
 
-    /// The default filter (no `RUST_LOG`) floors rmcp's SSE-reconnect module at `error`. Guards
-    /// against a future refactor silently dropping the directive and letting the noisy warning back
-    /// in.
+    /// The default filter (no `RUST_LOG`) floors rmcp's SSE-reconnect module at `error`.
     #[test]
     fn default_log_filter_downgrades_rmcp_sse_warns() {
         let rendered = format!("{}", build_log_filter(None, "warn"));
@@ -1076,8 +1055,7 @@ mod tests {
         );
     }
 
-    /// When the user sets `RUST_LOG`, we honor it verbatim (no hidden directive overlay), so
-    /// debugging rmcp internals with e.g. `RUST_LOG=rmcp=debug` works as expected.
+    /// `RUST_LOG` is honored verbatim, or there is no way to see rmcp's internals when debugging.
     #[test]
     fn explicit_rust_log_is_not_overridden() {
         let rendered = format!("{}", build_log_filter(Some("rmcp=debug"), "warn"));

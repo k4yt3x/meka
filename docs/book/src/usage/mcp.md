@@ -111,11 +111,11 @@ and over SSH. The `authorized` line is an `info` log, shown here with `-v`.
 
 ```console
 $ meka -v mcp login notion
-open this URL in your browser to authorize:
+To authorize, open this URL in your browser:
 
 https://mcp.notion.com/authorize?response_type=code&…
 
-waiting up to 120s for the callback, or paste the callback URL here and press Enter:
+Waiting up to 120s for the callback, or paste the callback URL here and press Enter:
 http://127.0.0.1:46437/callback?code=…&state=…     ← paste here
 authorized 'notion'
 ```

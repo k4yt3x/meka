@@ -8,14 +8,8 @@ pub(crate) mod prompts;
 
 use super::{terminal::*, *};
 
-/// Run a `/compact` with Ctrl+C wired to a fresh cancellation token, aborting the listener
-/// afterwards.
-///
-/// Compaction is not a turn, but it makes provider calls and - at `ask` permission - can block on
-/// an approval prompt, so it needs a signal source for exactly the reason
-/// [`run_turn_interruptible`] documents: a bare token silently swallows Ctrl+C. It has no
-/// background tasks to reap, so it skips that function's second press and escalates straight from
-/// cancel to exit.
+/// Run the interactive host: resume or create the session, spawn the editor thread, and answer its
+/// events until it leaves.
 pub(crate) async fn run_interactive(
     config: ResolvedConfig,
     store: Store,
@@ -32,9 +26,6 @@ pub(crate) async fn run_interactive(
         std::path::PathBuf::from(".")
     });
 
-    // Resolve session resumption BEFORE spawning the REPL so the "Resuming session" message appears
-    // before the first prompt, and before the permission and cwd cells exist because a resumed
-    // session brings both.
     // Everything printed between two prompts, wherever it came from. One instance, shared by the
     // agent's frontend, the blocking REPL thread and this loop, because the blank lines that
     // bracket an episode follow from what the episode did rather than from which of the three
@@ -64,6 +55,8 @@ pub(crate) async fn run_interactive(
     let _last_episode = LastEpisode(Arc::clone(&console));
     let repl_console = Arc::clone(&console);
 
+    // Before the REPL thread exists, so the resume banner lands above the first prompt, and before
+    // the permission and cwd cells, which a resumed session brings with it.
     let ResumedSession {
         mut session_id,
         messages,
@@ -140,10 +133,8 @@ pub(crate) async fn run_interactive(
 
     let (input_sender, mut input_receiver) = tokio::sync::mpsc::unbounded_channel::<ReplEvent>();
 
-    // If a prompt or skill was given without `--oneshot`, queue it as a synthetic user input so the
-    // first turn runs immediately. The REPL takes over afterwards for follow-up turns. The send
-    // cannot fail; the receiver was just constructed above. Tracking the flag separately tells the
-    // REPL to wait for the synthetic turn's events before drawing its first prompt; otherwise
+    // A prompt or skill given without `--oneshot` is queued as the first turn's input. The flag
+    // tells the REPL to wait for that turn's events before drawing its first prompt; otherwise
     // reedline's prompt collides with the agent's output.
     let initial_turn_pending = initial_prompt.is_some();
     if let Some(prompt) = initial_prompt {
@@ -170,14 +161,6 @@ pub(crate) async fn run_interactive(
         },
     ));
 
-    // MCP progress and elicitation events flow through the per-session `Frontend` trait, not
-    // through process-global sinks wired up here. Progress: `ReplFrontend::emit(McpProgress)` and
-    // the matching ACP impl carry the event to the right UI. Elicitation:
-    // `Frontend::handle_elicitation` runs the round-trip on whichever frontend the in-flight call's
-    // `progress::register` recorded. The agent_event_sender is still the bridge between
-    // `ReplFrontend` (on the agent's task) and the blocking REPL thread; that wiring happens inside
-    // `ReplFrontend` itself.
-
     let repl_permission = shared_permission.clone();
     let show_path_in_prompt = config.show_path_in_prompt;
     let input_style = config.input_style;
@@ -191,21 +174,18 @@ pub(crate) async fn run_interactive(
     let repl_skill_roots = config.skill_roots();
     let repl_history_db_path = Some(store.database_path().to_path_buf());
 
-    // Live context gauge for the prompt: a shared counter the agent writes after each turn and the
-    // prompt reads each render. Created here (before the agent) so the REPL, spawned below, can
-    // hold it; the agent adopts the same atomic via `set_context_tokens`. Seeded with an
-    // estimate when resuming so the gauge isn't blank until the first new turn measures the
-    // context exactly.
-    // A handle, seeded from the process default and corrected to the session's own window as soon
-    // as the agent below resolves it. It cannot be read from `config` and left alone: this session
-    // may be pinned to another profile, and `/profile` may move it again, and a prompt dividing by
-    // a window the agent is not gauging against contradicts `/status` on the very next line.
+    // The prompt's context gauge: the agent writes it after each turn and the prompt reads it each
+    // render. Created before the agent so the REPL thread can hold it. The window is seeded from
+    // the process default and corrected to the session's own as soon as the agent resolves it: the
+    // session may be pinned to another profile, and `/profile` may move it again, and a prompt
+    // dividing by a window the agent is not gauging against contradicts `/status`.
     let context_window_gauge = Arc::new(std::sync::atomic::AtomicU64::new(
         config
             .session_context_window
             .unwrap_or(crate::provider::DEFAULT_CONTEXT_WINDOW),
     ));
     let context_tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Seeded with an estimate on a resume, so the gauge is not blank until the first turn measures.
     if !messages.is_empty() {
         context_tokens.store(
             crate::tokens::estimate_messages(messages.as_slice()),
@@ -280,8 +260,7 @@ pub(crate) async fn run_interactive(
                 None => false,
             };
             // The default when there is one, so the suggested move is the profile the rest of this
-            // config already runs on. With no profile at all there is nowhere to move to, and the
-            // generic setup example is the more useful answer.
+            // config already runs on. With no profile at all there is nowhere to move to.
             let move_to = config
                 .default_profile
                 .as_deref()
@@ -297,11 +276,9 @@ pub(crate) async fn run_interactive(
     };
     // After the agent, so a start the builder refused leaves the row at the level it had.
     record_resume_permission(&store, session_id, permission_to_record).await;
-    // Installed by the host, once, rather than by each turn. It is `OnceLock`-guarded either way,
-    // so the per-turn calls were already no-ops after the first; what they could not supply is the
-    // console. Its escalation arms print, and a bare `eprintln!` from a spawned task lands wherever
-    // the cursor happens to be -- which, on a second Ctrl+C during a turn, is the middle of the
-    // thinking indicator's row.
+    // Installed by the host, with the console: the escalation arms print, and a bare `eprintln!`
+    // from a spawned task lands wherever the cursor happens to be, which on a second Ctrl+C during
+    // a turn is the middle of the thinking indicator's row.
     let agent = Arc::new(agent);
     let conversation = Arc::new(tokio::sync::Mutex::new(messages));
     let cancel = crate::host::CancelCell::default();
@@ -317,11 +294,9 @@ pub(crate) async fn run_interactive(
         )
     });
 
-    // Spawned once there is an agent to answer it, which is what makes every refusal above final.
-    // Started before the agent, the prompt outlived a failed construction: the loop below never
-    // ran, so `/profile` -- the one way to move a session off a profile that has left
-    // `config.toml` -- was sent to nobody and waited for an answer that could not come, and the
-    // user was left typing into a shell that ignored them.
+    // Spawned once there is an agent to answer it, which is what makes every refusal above final:
+    // started earlier, the prompt outlives a failed construction and the user types into a shell
+    // that answers nothing.
     let repl_handle = tokio::task::spawn_blocking(move || {
         crate::host::repl::editor::run_repl(crate::host::repl::editor::ReplLaunch {
             shared_permission: repl_permission,
@@ -400,7 +375,7 @@ pub(crate) async fn run_interactive(
                             schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         Ok(false) => {}
-                        Err(error) => tracing::warn!("scheduler watcher failed: {error}"),
+                        Err(error) => tracing::warn!("failed to poll the schedule: {error}"),
                     }
                 }
                 if background_enabled {
@@ -416,7 +391,7 @@ pub(crate) async fn run_interactive(
                             schedule_wake.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         Ok(_) => {}
-                        Err(error) => tracing::warn!("background watcher failed: {error}"),
+                        Err(error) => tracing::warn!("failed to poll background tasks: {error}"),
                     }
                 }
             }
@@ -429,11 +404,9 @@ pub(crate) async fn run_interactive(
             // not look like one, so no `AgentToReplEvent::Done` and no spacing.
             //
             // The row is what a *scheduled gate* is re-checked against at fire time, and a row that
-            // carries no level falls back to the polling process's own startup flag. Before this,
-            // a REPL session's row was always NULL, so a `meka serve` sharing the data directory
-            // answered that question with its own `--permission` -- and kept running a gate the
-            // user had just withdrawn with Shift+Tab. `docs/book/src/usage/scheduling.md` documents
-            // that withdrawal, so it was a promise the code did not keep whenever serve was up.
+            // carries no level falls back to the polling process's own startup flag, so a `meka
+            // serve` sharing the data directory would keep running a gate the user has just
+            // withdrawn with Shift+Tab.
             ReplEvent::PermissionChanged(level) => {
                 let Some(id) = session_id else {
                     // No row yet: the level the first turn creates the session with is this one, so
@@ -481,10 +454,8 @@ pub(crate) async fn run_interactive(
             // surprise this whole feature exists to remove.
             ReplEvent::ProfileChange(name) => {
                 // A labeled block rather than `continue`, so every way out passes the `Done`
-                // below. Without it this was the one forwarded command that did not hand the
-                // prompt back, and the REPL thread painted the next prompt while this task was
-                // still deciding what to print: the confirmation, or the error, landed on top of
-                // the line the user had started typing.
+                // below; otherwise the REPL thread paints the next prompt while this task is still
+                // deciding what to print, and the answer lands on the line being typed.
                 'switch: {
                     // The profile as configured. `/profile` moves the session to that bundle
                     // entire, which is the only thing naming a profile can mean.
@@ -630,10 +601,8 @@ pub(crate) async fn run_interactive(
                 }
             }
             ReplEvent::Command(command) => {
-                // The dispatcher moved to `crate::host::repl::editor::host_commands`, exhaustive
-                // over `SlashCommand`. Written inline it is hundreds of lines
-                // ending in `_ => {}`, which is how a forwarded command arrives,
-                // matches nothing, and still gets its episode brackets.
+                // Exhaustive over `SlashCommand`: a match ending in `_ => {}` is how a forwarded
+                // command arrives, matches nothing, and still gets its episode brackets.
                 let after = {
                     let mut messages = conversation.lock().await;
                     crate::host::repl::commands::answer(
@@ -708,15 +677,10 @@ pub(crate) async fn run_interactive(
     // would release nothing.
     hold_session_lock(&session_lock, None);
 
-    // Stop this process's background tasks on the way out.
-    //
-    // Nothing did before: `/exit` broke the loop and returned, and `BackgroundTasks` has no `Drop`,
-    // so a detached `execute_command` kept running -- `setsid()`-ed, so not even a terminal hangup
-    // reaches it -- with no meka process tracking it. Its row stayed `running` and the next session
-    // open swept it to `interrupted`, telling the model work had died that was in fact still going,
-    // possibly still writing to the workspace. The HTTP `DELETE /v1/sessions/{id}` handler already
-    // does this, and its comment claimed "The REPL does the same thing on its way out", which is
-    // what this makes true.
+    // Stop this process's background tasks on the way out. `BackgroundTasks` has no `Drop`, and a
+    // detached `execute_command` is `setsid()`-ed, so nothing else reaches it: left alone it runs
+    // on untracked, and the next session open sweeps its row to `interrupted` while it may still be
+    // writing to the workspace.
     let stopped = crate::host::release_agent(&agent, &cancel, mcp_manager.as_ref()).await;
     if stopped > 0 {
         with_console(&console, |console| {

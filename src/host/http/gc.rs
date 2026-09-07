@@ -58,15 +58,12 @@ async fn evict_idle(state: &ServerState, idle_timeout: Duration, delete_on_idle:
     );
 
     // Detach each evicted session's tool registry from the MCP manager so its
-    // `tools/list_changed` callbacks stop targeting a registry that's about to drop. Mirrors
+    // `tools/list_changed` callbacks stop targeting a registry that is about to drop. Mirrors
     // `handle_close_session` in `acp.rs`.
     //
-    // Read off the hoisted handle, not through `runtime`. Out-of-band turns now mark themselves
-    // busy, so `is_idle` keeps one from being evicted mid-run, but this loop still must not wait
-    // on a mutex it does not need: anything blocking here stalls the rest of the batch, including
-    // the `FileLock`s of sessions already removed from the map but still held by `evicted`,
-    // whose owners would get `session-locked` for the duration.
-    // `DELETE /v1/sessions/{id}` reads the same handle.
+    // Nothing here waits on the conversation mutex: anything blocking stalls the rest of the
+    // batch, including the `FileLock`s of sessions already removed from the map but still held by
+    // `evicted`, whose owners would get `session-locked` for the duration.
     for (_id, entry) in &evicted {
         entry.release(state.shared.mcp_manager.as_ref()).await;
     }

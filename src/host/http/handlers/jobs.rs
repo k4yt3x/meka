@@ -1,10 +1,10 @@
 //! Scheduled jobs and background tasks: the two kinds of work that outlive the request that
 //! started them.
 //!
-//! `meka serve` is already the durable host for both. It runs the scheduler over *every* job in
-//! the database rather than only those belonging to an open conversation, because it can revive any
+//! `meka serve` is the durable host for both. It runs the scheduler over *every* job in the
+//! database rather than only those belonging to an open conversation, because it can revive any
 //! session on demand (`crate::host::http::schedule`), and it polls background-task outcomes on its
-//! own timer. Until now it was also the only surface with no way to ask what it was about to run.
+//! own timer.
 //!
 //! Scheduled jobs are keyed by `schedule:r` / `schedule:w` rather than `sessions:*`: a job survives
 //! the conversation that created it and fires unattended, so the ability to plant one is a
@@ -140,7 +140,7 @@ pub(crate) struct CreateGate {
     /// "arguments": {…}}` for a tool call.
     pub(crate) check: serde_json::Value,
     /// When to fire: `"changed"` (the default), `"succeeded"`, `{"matches": "<regex>"}`, or
-    /// `{"at": "<json pointer>", "is": "not-empty" | "empty" | "changed"}`.
+    /// `{"at": "<json pointer>", "is": "not_empty" | "empty" | "changed"}`.
     ///
     /// Untyped here because one parser answers for this field on every door
     /// ([`crate::schedule::GatePredicate::parse_request`]); a second, derived shape would drift
@@ -187,8 +187,7 @@ pub(crate) async fn create(
         return Err(ProblemDetail::new(
             ErrorKind::NotFound,
             StatusCode::NOT_FOUND,
-            "scheduling is disabled on this server (`[schedule] enabled = false`), so a job \
-             created here would never fire",
+            "scheduling is disabled on this server (`[schedule] enabled = false`)",
         )
         .with("session_id", id.to_string()));
     }
@@ -257,9 +256,8 @@ pub(crate) async fn create(
             ErrorKind::SessionPermission,
             StatusCode::FORBIDDEN,
             format!(
-                "this session is at {permission}, where no tool is executable, so a scheduled turn could \
-                 neither act on the job nor cancel it. Raise the session with `PATCH \
-                 /v1/sessions/{{id}}` first."
+                "this session is at {permission}, where no tool runs; raise it with \
+                 `PATCH /v1/sessions/{{id}}` first"
             ),
         )
         .with("session_id", id.to_string()));
@@ -283,8 +281,7 @@ pub(crate) async fn create(
                     ErrorKind::AuthScope,
                     StatusCode::FORBIDDEN,
                     "a `gate` runs a probe unattended, so it needs `sessions:w` as well as \
-                     `schedule:w`. Create the job without `gate` and check the condition inside \
-                     the prompt instead.",
+                     `schedule:w`",
                 )
                 .with("session_id", id.to_string())
             })?;
@@ -337,18 +334,17 @@ pub(crate) async fn create(
                         .gate_tools
                         .as_ref()
                         .is_some_and(|tools| tools.is_still_connecting(&probe.summary()));
-                let advice = if transient {
-                    "Its MCP server has not finished connecting; retry shortly."
+                let explained = refusal.explain(&probe, permission);
+                let detail = if transient {
+                    format!(
+                        "{explained}; its MCP server has not finished connecting, retry shortly"
+                    )
                 } else {
-                    "Create the job without `gate` and check the condition inside the prompt \
-                     instead."
+                    explained
                 };
-                return Err(ProblemDetail::new(
-                    kind,
-                    status,
-                    format!("{}. {}", refusal.explain(&probe, permission), advice),
-                )
-                .with("session_id", id.to_string()));
+                return Err(
+                    ProblemDetail::new(kind, status, detail).with("session_id", id.to_string())
+                );
             }
             Some(Gate {
                 probe,
@@ -381,7 +377,8 @@ pub(crate) async fn create(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,
             format!(
-                "session already has {existing} scheduled jobs (the configured limit). Cancel one first."
+                "session already has {existing} scheduled jobs, the configured limit; cancel one \
+                 first"
             ),
         )
         .with("session_id", id.to_string()));
@@ -514,19 +511,14 @@ fn withheld_for_scope(reason: Option<String>, reveal_command: bool) -> Option<St
 /// Refuse a job on a session that is somebody's sub-agent, returning the problem when it is one.
 ///
 /// A job belongs to a root session, and this endpoint is the only door that could plant one
-/// elsewhere. A sub-agent has no `schedule_*` tools by construction
-/// ([`crate::tools::ToolRegistry::build_for_subagent`] passes no schedule config), so until this
-/// the rule was held by omission at the tool door and by nothing at all here.
+/// elsewhere: a sub-agent has no `schedule_*` tools by construction
+/// ([`crate::tools::ToolRegistry::build_for_subagent`] passes no schedule config).
 ///
 /// **The authority escalation is closed a level down**, by
 /// [`crate::host::refuse_a_spawned_session`]: both agent builders refuse a session that records a
 /// parent, so a job keyed to a sub-agent cannot wake it unrestricted because nothing can wake it at
-/// all. That is where the rule belongs, since `POST /v1/sessions/{id}/turn`, ACP `session/load`,
-/// re-attach and `meka -r` reach the same builders and a scheduling-only guard left every one of
-/// them open.
-///
-/// What this refusal is worth is therefore narrow: a job on a sub-agent is refused *when it is
-/// created*, naming the session to use instead, rather than being accepted and then failing on
+/// all. What this refusal is worth is therefore narrow: a job on a sub-agent is refused *when it
+/// is created*, naming the session to use instead, rather than being accepted and then failing on
 /// every fire until someone reads a log. A diagnosis, not a boundary.
 ///
 /// `SessionNotDrivable` rather than `AuthScope` or `SessionPermission`: no token and no permission
@@ -536,9 +528,8 @@ fn withheld_for_scope(reason: Option<String>, reveal_command: bool) -> Option<St
 /// same `type`. [`create`] routes its gate refusals by the same rule.
 ///
 /// Takes [`crate::store::SpawnTerms`] rather than a parent, so it asks the question
-/// [`crate::host::refuse_a_spawned_session`] asks. Keyed on the parent alone it admits a job on an
-/// imported sub-agent: `201 Created`, then `session unavailable: Session is a sub-agent's
-/// conversation` in the log on every fire, at the poll cadence, forever.
+/// [`crate::host::refuse_a_spawned_session`] asks; keyed on the parent alone it admits a job on an
+/// imported sub-agent, which then fails on every fire at the poll cadence.
 fn refuse_subagent_session(
     id: Uuid,
     spawned: Option<crate::store::SpawnTerms>,
@@ -546,14 +537,12 @@ fn refuse_subagent_session(
     let terms = spawned?;
     let detail = match terms.parent {
         Some(parent) => format!(
-            "session '{id}' is a sub-agent of '{parent}', and a sub-agent runs only while the \
-             agent that spawned it is waiting on it. Schedule the job on '{parent}' instead and \
-             let its turn dispatch the sub-agent."
+            "session '{id}' is a sub-agent of '{parent}', which runs it only while waiting on it; \
+             schedule the job on '{parent}'"
         ),
         None => format!(
-            "session '{id}' carries the terms another session spawned it under, so it is a \
-             sub-agent's conversation and runs only while that session is waiting on it. Its \
-             parent is not in this store, so nothing here can fire a job on it."
+            "session '{id}' is a sub-agent whose parent is not in this store, so nothing here can \
+             fire a job on it"
         ),
     };
     Some(
@@ -651,8 +640,7 @@ fn parse_schedule(
 /// job to a human shows (`meka schedule list`, the REPL's `/schedule`, the `schedule_list` tool),
 /// so an operator will paste one here, and answering 204 to an id that matched nothing would report
 /// a still-firing job as canceled. A gated job kept alive that way goes on running a shell command
-/// unattended. `schedule_cancel` and `meka schedule cancel` already resolve prefixes and already
-/// report a miss; this is the surface that did not.
+/// unattended.
 #[utoipa::path(
     delete,
     path = "/v1/schedule/{job_id}",
@@ -948,10 +936,9 @@ mod tests {
     /// This keeps the failure at creation time, where it can name the session to schedule on
     /// instead, rather than letting a job be accepted and fail on every fire.
     ///
-    /// All three arms are asserted. A guard that refused everything would pass a
-    /// refusal-only test while breaking every ordinary job, and one that read only the parent
-    /// admitted an imported sub-agent -- which is how a `201 Created` came to be followed by a fire
-    /// failure at the poll cadence for as long as the job lived.
+    /// All three arms are asserted. A guard that refused everything would pass a refusal-only test
+    /// while breaking every ordinary job, and one that read only the parent admits an imported
+    /// sub-agent.
     #[test]
     fn a_job_is_refused_on_a_sub_agent_session_and_admitted_on_a_top_level_one() {
         let sub_agent = Uuid::new_v4();
@@ -985,7 +972,7 @@ mod tests {
         assert_eq!(orphaned.type_uri, ErrorKind::SessionNotDrivable.type_uri());
         let detail = orphaned.detail.as_deref().unwrap_or_default();
         assert!(
-            detail.contains(&sub_agent.to_string()) && !detail.contains("Schedule the job on"),
+            detail.contains(&sub_agent.to_string()) && !detail.contains("schedule the job on"),
             "with no parent in the store there is no session to redirect to: {detail}"
         );
     }

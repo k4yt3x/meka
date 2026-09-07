@@ -219,8 +219,8 @@ pub(crate) async fn submit_turn(
                     return Err(ProblemDetail::new(
                         ErrorKind::Idempotency,
                         StatusCode::CONFLICT,
-                        "Idempotency-Key has been used with a different request body; replays \
-                         must be byte-identical",
+                        "Idempotency-Key was used with a different request body; a replay must be \
+                         byte-identical",
                     ));
                 }
                 LookupOutcome::InFlight => {
@@ -235,8 +235,8 @@ pub(crate) async fn submit_turn(
                     let mut problem = ProblemDetail::new(
                         ErrorKind::Idempotency,
                         StatusCode::TOO_MANY_REQUESTS,
-                        "per-token idempotency-key cache is full; reduce the rate of unique \
-                         keys or wait for in-flight requests to complete",
+                        "per-token idempotency-key cache is full; retry once in-flight requests \
+                         complete",
                     )
                     .with_retry_after(60);
                     // Override the generic "conflict" title: this is cache pressure, not a
@@ -375,10 +375,9 @@ pub(crate) async fn submit_turn(
 ///
 /// A named function rather than three lines inline: the call site sits inside an SSE generator's
 /// `Lagged` arm, which no test can reach without forcing a broadcast overflow against two live
-/// consumers. Inline, the decision was untestable and a mutation removing it left the suite green.
-/// Returns whether the turn was canceled, which decides what the caller may truthfully tell the
-/// client: a turn that is still running for someone else has not failed, and saying it has sends
-/// this client to retry into a 409 `turn-in-flight`.
+/// consumers. Returns whether the turn was canceled, which decides what the caller may truthfully
+/// tell the client: a turn that is still running for someone else has not failed, and saying it
+/// has sends this client to retry into a 409 `turn-in-flight`.
 fn cancel_if_nobody_else_is_reading(
     frontend: &crate::host::http::http_frontend::HttpFrontend,
     cancellation: &CancellationToken,
@@ -399,8 +398,7 @@ fn cancel_if_nobody_else_is_reading(
 
 /// The event a lagging consumer's stream ends with, as `(event type, payload)`.
 ///
-/// Two different facts, and conflating them is how this told a client to do the one thing
-/// guaranteed to fail. When the turn was canceled it really did fail, and a retry is the remedy.
+/// Two different facts. When the turn was canceled it really did fail, and a retry is the remedy.
 /// When it was not, the turn is still running for the consumer that kept up: `turn.failed` would
 /// be a lie, and the retry it invites returns 409 `turn-in-flight`. Re-attaching with
 /// `Last-Event-ID` is the remedy there, and it recovers the dropped events rather than redoing
@@ -419,8 +417,8 @@ fn lag_event_parts(
             crate::host::http::errors::ErrorKind::SseLag,
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "SSE consumer fell behind; {skipped} event(s) were dropped. Nobody else was \
-                 reading, so the turn was canceled. Retry the turn."
+                "SSE consumer fell behind and {skipped} event(s) were dropped, so the turn was \
+                 canceled; retry it"
             ),
         )
         .instance(format!("/v1/sessions/{session_id}/turn"));
@@ -434,9 +432,8 @@ fn lag_event_parts(
         );
     }
     let notice = Notice::warn(format!(
-        "SSE consumer fell behind; {skipped} event(s) were dropped and this stream is closing to \
-         avoid serving an incomplete transcript. The turn is still running for another consumer: \
-         re-attach with Last-Event-ID to collect what was missed rather than retrying."
+        "SSE consumer fell behind and {skipped} event(s) were dropped; the turn is still running, \
+         so re-attach with Last-Event-ID"
     ));
     let mut data =
         serde_json::to_value(NoticeView::from(notice)).unwrap_or(serde_json::Value::Null);
@@ -525,7 +522,7 @@ async fn decode_turn_images(
             ErrorKind::InvalidBody,
             StatusCode::UNPROCESSABLE_ENTITY,
             "image attachments require a profile with vision enabled; set `vision = true` under \
-             `[profiles.<name>]` or omit `images`",
+             `[profiles.<name>]`",
         ));
     }
     let owned: Vec<(String, String)> = images
@@ -552,7 +549,7 @@ async fn decode_turn_images(
         ProblemDetail::new(
             ErrorKind::Internal,
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("image decode task failed: {error}"),
+            format!("failed to decode the images: {error}"),
         )
     })?
 }
@@ -945,14 +942,6 @@ fn build_sse_stream(
     }
 }
 
-/// Resolve a finished turn into the `(event type, envelope)` of its terminal SSE event.
-///
-/// Returns the parts rather than a rendered `Event` because the terminal has to be *stored* as
-/// well as sent: [`crate::host::http::http_frontend::HttpFrontend::record_terminal`] keeps it so a
-/// client that reconnects after the turn ended still learns how it ended.
-///
-/// A successful agent outcome always wins over a concurrent cancel signal, so a race between
-/// completion and cancellation doesn't discard an already-persisted result.
 /// Why a turn that ended `Interrupted` was stopped, for the recorded `turn.canceled` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CancelReason {
@@ -960,8 +949,8 @@ pub(super) enum CancelReason {
     Client,
     /// The graceful drain.
     ServerShutdown,
-    /// The only SSE consumer fell behind and the turn was stopped for it. Recorded as `client`,
-    /// a re-attaching reader concluded a human had stopped it.
+    /// The only SSE consumer fell behind and the turn was stopped for it. Recorded as `client`, a
+    /// re-attaching reader would conclude a human had stopped it.
     SseLag,
 }
 
@@ -975,6 +964,14 @@ impl CancelReason {
     }
 }
 
+/// Resolve a finished turn into the `(event type, envelope)` of its terminal SSE event.
+///
+/// Returns the parts rather than a rendered `Event` because the terminal has to be *stored* as
+/// well as sent: [`crate::host::http::http_frontend::HttpFrontend::record_terminal`] keeps it so a
+/// client that reconnects after the turn ended still learns how it ended.
+///
+/// A successful agent outcome always wins over a concurrent cancel signal, so a race between
+/// completion and cancellation does not discard an already-persisted result.
 fn terminal_event_parts(
     turn_result: std::result::Result<crate::error::Result<TurnOutcome>, tokio::task::JoinError>,
     cancel_reason: CancelReason,
@@ -1432,8 +1429,7 @@ mod tests {
     /// The canceled half is a `turn.failed` whose `error` is the cataloged `sse-lag` problem
     /// rather than a hand-written object that can drift from it. The other half is a `notice` in
     /// the `level`/`text` shape every other `notice` event carries, which is the shape the docs
-    /// promise; it shipped as `{"notice": ...}`, which nothing reading the documented shape could
-    /// display.
+    /// promise.
     #[test]
     fn a_lag_ends_the_stream_with_a_cataloged_failure_or_a_shaped_notice() {
         let turn_id = Uuid::from_u128(1);
@@ -1842,8 +1838,8 @@ fn build_reattach_stream(
                 .event("notice")
                 .json_data(serde_json::json!({
                     "level": "warn",
-                    "text": "Replay buffer does not reach your Last-Event-ID; some events were \
-                             dropped. Read GET /v1/sessions/{id}/messages for the full transcript.",
+                    "text": "the replay does not reach your Last-Event-ID, so events were \
+                             dropped; read `GET /v1/sessions/{id}/messages` for the full transcript",
                 }))
                 .unwrap_or_else(|_| Event::default().comment("gap-notice serialize-failed")));
         }
@@ -1920,8 +1916,8 @@ fn build_reattach_stream(
                                 "type": crate::host::http::errors::ErrorKind::StreamDetached.type_uri(),
                                 "title": crate::host::http::errors::ErrorKind::StreamDetached.title(),
                                 "status": 500,
-                                "detail": "The turn's stream closed without recording an outcome. \
-                                           Read GET /v1/sessions/{id}/messages for what completed.",
+                                "detail": "the turn's stream closed without recording an outcome; \
+                                           read `GET /v1/sessions/{id}/messages` for what completed",
                             },
                         }))
                         .unwrap_or_else(|_| Event::default().comment("detached serialize-failed")));

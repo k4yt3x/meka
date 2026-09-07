@@ -44,8 +44,8 @@ const BACKOFF_CAP: Duration = Duration::from_secs(8);
 ///
 /// Sized to honor the hint rather than to override it. Rate-limit windows in the wild are seconds
 /// to a minute, and a cap below them turns "the provider told us exactly when to come back" into
-/// "we came back too early and were refused again" -- which spends a retry to learn nothing. That
-/// matters more at [`MAX_PROVIDER_RETRIES`] = 2 than it did at 3: there are only two to spend.
+/// "we came back too early and were refused again", which spends a retry to learn nothing. At
+/// [`MAX_PROVIDER_RETRIES`] = 2 there are only two to spend.
 ///
 /// A cap is still needed, because `parse_retry_after` relays whatever the header said and the sleep
 /// happens before the next budget check, so a broken or hostile upstream saying a day would be
@@ -84,17 +84,17 @@ pub(crate) const OUTAGE_REPRIEVE: Duration = BACKOFF_CAP;
 // time rather than on the one path a user reaches during an outage.
 //
 // A comment rather than a doc comment: this item is anonymous, so rustdoc renders nothing and a
-// `///` here would silently swallow the next item's documentation instead. It did, for a while.
+// `///` here would silently swallow the next item's documentation instead.
 const _: () = assert!(OUTAGE_REPRIEVE.as_nanos() <= RETRY_AFTER_CAP.as_nanos());
 
 /// How long the reprieve waits, given whatever the failing response asked for.
 ///
 /// The provider's own `Retry-After` decides, up to [`RETRY_AFTER_CAP`], with [`OUTAGE_REPRIEVE`] as
-/// the floor. Honoring it here rather than only in [`backoff_delay`] closes a gap that read badly
-/// once stated: a `503` carrying `Retry-After: 60` had both retries wait the full minute on the
-/// provider's instruction, and then the one wait that decides whether to *delete the user's
-/// content* was eight seconds. The hint is the only evidence anyone has about how long the outage
-/// lasts, and the wait it governs here is the most consequential of the three.
+/// the floor. Honored here as well as in [`backoff_delay`], because otherwise a `503` carrying
+/// `Retry-After: 60` has both retries wait the full minute on the provider's instruction, and then
+/// the one wait that decides whether to *delete the user's content* is eight seconds. The hint is
+/// the only evidence anyone has about how long the outage lasts, and the wait it governs here is
+/// the most consequential of the three.
 ///
 /// Still floored, because a provider that answers `Retry-After: 0` on a 5xx is not telling us the
 /// outage is over; it is telling us nothing, and re-sending instantly would spend the reprieve

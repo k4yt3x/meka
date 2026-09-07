@@ -6,8 +6,8 @@
 //!
 //! The `gate` field is the exception, and is checked inside [`ScheduleCreateTool::execute`]
 //! against [`crate::schedule::gate_probe_is_authorized`]. A gate runs unattended, on a timer, until
-//! someone cancels it -- persistent in a way a tool call inside a turn is not, since that at least
-//! ends with the turn that made it. The bar depends on what the gate runs: a shell command needs
+//! someone cancels it, which a tool call inside a turn is not. The bar depends on what the gate
+//! runs: a shell command needs
 //! `unrestricted` because it is unsandboxed, while a read-only tool call needs only what that tool
 //! needs. [`Tool::required_permission`] is per-tool and cannot vary by argument, so the check has
 //! to live in the body either way.
@@ -140,7 +140,7 @@ impl Tool for ScheduleCreateTool {
                                                 exits 0 or the tool call does not error. \
                                                 {\"matches\": \"regex\"} fires when the result \
                                                 matches. {\"at\": \"/json/pointer\", \"is\": \
-                                                \"not-empty\"|\"empty\"|\"changed\"} judges one \
+                                                \"not_empty\"|\"empty\"|\"changed\"} judges one \
                                                 field. Use `at` for anything returning JSON: a \
                                                 result carrying a timestamp or an id differs on \
                                                 every call, so \"changed\" over the whole of it \
@@ -404,12 +404,10 @@ impl Tool for ScheduleListTool {
                     gate.probe.detail()
                 ));
             }
-            // A job that cannot fire is the difference between one quietly waiting and one that is
-            // dead, and the two look identical without this line: both simply never fire, and
-            // `last fired` is absent for a brand-new job too. Outside the `gate` branch because an
-            // ungated job on a session at `none` is held as well. Reported to the model because it
-            // can act on it -- `schedule_cancel` needs only `read` -- where until now the only
-            // trace was a `warn!` in the operator's log.
+            // A held job and a healthy one look identical without this line: both simply never
+            // fire, and `last fired` is absent for a brand-new job too. Outside the `gate` branch
+            // because an ungated job on a session at `none` is held as well. Reported to the model
+            // because it can act on it: `schedule_cancel` needs only `read`.
             if let Some(reason) = crate::schedule::job_withheld_reason(
                 self.context.store.scheduler_memory(),
                 job,
@@ -584,12 +582,9 @@ mod tests {
     /// The permission rule that cannot live in `required_permission`, since that is per-tool.
     #[tokio::test]
     async fn a_gate_is_refused_below_write_but_the_reminder_is_not() {
-        // Every level below `unrestricted`, not just `read`.
-        //
-        // `workspace` is the one that matters: letting it *pass* this door is a one-call escape,
-        // since `schedule_create` with a gate runs arbitrary unconfined commands from inside the
-        // confined level within one poll interval. Exercising only `read` left it unguarded at the
-        // tool door.
+        // Every level below `unrestricted`, not just `read`. `workspace` is the one that matters:
+        // letting it pass this door is a one-call escape, since `schedule_create` with a gate runs
+        // arbitrary unconfined commands from inside the confined level within one poll interval.
         for level in [Permission::None, Permission::Read, Permission::Workspace] {
             refuses_a_gate_at(level).await;
         }

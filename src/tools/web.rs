@@ -57,9 +57,8 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
             builder = builder.no_proxy();
         }
         Some(url) => {
-            // Pre-validate the scheme before handing off; `reqwest::Proxy::all` is lenient (it'll
-            // accept `"not-a-url"` as `http://not-a-url/`), which silently routes traffic through a
-            // non-existent host. A typo in the config should fail loudly.
+            // `reqwest::Proxy::all` accepts `"not-a-url"` as `http://not-a-url/`, which would
+            // silently route traffic through a non-existent host.
             const ALLOWED_SCHEMES: &[&str] = &[
                 "http://",
                 "https://",
@@ -69,13 +68,15 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
             ];
             if !ALLOWED_SCHEMES.iter().any(|s| url.starts_with(s)) {
                 return Err(MekaError::Installation(format!(
-                    "[web].proxy: invalid URL '{}': expected one of {}",
+                    "`[web].proxy` '{}' is not a proxy URL: expected one of {}",
                     url,
                     ALLOWED_SCHEMES.join(", ")
                 )));
             }
             let proxy = reqwest::Proxy::all(url).map_err(|error| {
-                MekaError::Installation(format!("[web].proxy: invalid URL '{url}': {error}"))
+                MekaError::Installation(format!(
+                    "`[web].proxy` '{url}' is not a proxy URL: {error}"
+                ))
             })?;
             builder = builder.proxy(proxy);
         }
@@ -84,26 +85,23 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
     if let Some(path) = &config.ca_cert_file {
         let bytes = std::fs::read(path).map_err(|error| {
             MekaError::Installation(format!(
-                "[web].ca_cert_file '{}': {}",
+                "failed to read `[web].ca_cert_file` '{}': {}",
                 path.display(),
                 error
             ))
         })?;
-        // Handles both single-cert and bundle PEM files (multiple concatenated `-----BEGIN/END
-        // CERTIFICATE-----` blocks).
         let certs = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|error| {
             MekaError::Installation(format!(
-                "[web].ca_cert_file '{}': not a valid PEM: {}",
+                "`[web].ca_cert_file` '{}' is not valid PEM: {}",
                 path.display(),
                 error
             ))
         })?;
-        // `from_pem_bundle` silently returns an empty Vec when the file contains no PEM blocks.
-        // That's not what the user asked for. Reject explicitly so typos don't ship a client
-        // with zero added CAs.
+        // `from_pem_bundle` returns an empty list for a file with no PEM blocks, which would ship
+        // a client with zero added CAs.
         if certs.is_empty() {
             return Err(MekaError::Installation(format!(
-                "[web].ca_cert_file '{}': no PEM certificates found in file",
+                "`[web].ca_cert_file` '{}' holds no PEM certificates",
                 path.display()
             )));
         }
@@ -128,13 +126,13 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
 
     if config.danger_accept_invalid_certs {
         tracing::warn!(
-            "[web].danger_accept_invalid_certs is enabled; any HTTPS response could be spoofed"
+            "`[web].danger_accept_invalid_certs` is enabled; any HTTPS response could be spoofed"
         );
         builder = builder.danger_accept_invalid_certs(true);
     }
     if config.danger_accept_invalid_hostnames {
         tracing::warn!(
-            "[web].danger_accept_invalid_hostnames is enabled; any HTTPS response with a valid \
+            "`[web].danger_accept_invalid_hostnames` is enabled; any HTTPS response with a valid \
              certificate for any name could be spoofed"
         );
         builder = builder.danger_accept_invalid_hostnames(true);
@@ -145,7 +143,6 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
         .map_err(|error| MekaError::Installation(format!("failed to build web client: {error}")))
 }
 
-// Static CSS selectors for search result parsing (parsed once, reused on every call).
 #[allow(
     clippy::expect_used,
     reason = "a literal selector; a parse failure is a typo the first test run catches"
@@ -355,11 +352,9 @@ impl Tool for FetchUrlTool {
             let sniffed = crate::image::classify_bytes(&body_bytes);
             if !matches!(sniffed, ImageHandling::Unsupported) {
                 let marker = format!("Image fetched from {url}");
-                // Off the runtime, for the reason `read_file` documents at src/tools/file.rs:
-                // decoding and re-encoding a multi-megapixel image is tens of milliseconds of pure
-                // CPU, and on the runtime it blocks every other task on that worker -- a `serve`
-                // process stalls unrelated sessions' streams behind one agent's image fetch. This
-                // is the sibling that did not get it.
+                // Off the runtime, as `read_file` does it: decoding and re-encoding a
+                // multi-megapixel image is tens of milliseconds of pure CPU, and on the runtime it
+                // blocks every other task on that worker.
                 let marker = marker.clone();
                 return tokio::task::spawn_blocking(move || {
                     build_image_tool_output(&marker, sniffed, &body_bytes)
@@ -376,8 +371,7 @@ impl Tool for FetchUrlTool {
 
         let raw = input["raw"].as_bool().unwrap_or(false);
         // Parsing and converting up to ten megabytes of HTML is pure CPU, and on the runtime it
-        // blocks every other task on that worker: under `serve` one agent's fetch stalled unrelated
-        // sessions' streams.
+        // blocks every other task on that worker.
         let body = if raw {
             html
         } else {
@@ -401,13 +395,9 @@ impl Tool for FetchUrlTool {
                 .unwrap_or(DEFAULT_LIMIT_CHARS)
         };
 
-        // The regex runs against the whole document, before any truncation.
-        //
-        // Running it after meant `limit` silently decided which matches existed: a pattern
-        // whose only hit sat past the cut returned "No matches found", which reads as a fact about
-        // the page rather than about the window. The truncation notice was discarded along with it,
-        // so nothing said a cut had happened at all. The cap then applies to the match list, which
-        // is what the caller asked to be shown.
+        // The regex runs against the whole document, before any truncation: run after, `limit`
+        // would decide which matches existed, and "No matches found" would read as a fact about
+        // the page. The cap then applies to the match list.
         let matched = match input.get("regex").and_then(|value| value.as_str()) {
             Some(pattern) => {
                 let re = compile_user_regex(pattern, "fetch_url")?;
@@ -543,10 +533,8 @@ impl Tool for WebSearchTool {
                 ),
             })?;
 
-        // A rate-limit or block page is a 4xx/5xx that still carries HTML, and parsing it found no
-        // result rows, so the agent was told "No search results found." -- a statement about the
-        // query rather than about being turned away. Reject it before parsing so the difference is
-        // visible.
+        // A rate-limit or block page is a 4xx/5xx that still carries HTML with no result rows, so
+        // parsing it would report "No search results found." about a query that was turned away.
         let status = response.status();
         if !status.is_success() {
             return Err(MekaError::ToolExecution {
@@ -580,9 +568,8 @@ impl Tool for WebSearchTool {
     }
 }
 
-/// Distinguishes the three meaningful states of a DuckDuckGo HTML response. Before this enum, a
-/// CAPTCHA page was indistinguishable from a legitimate zero-hit query; both produced `""` and the
-/// agent saw `"No search results found."`, which encouraged blind retries against the same
+/// The three meaningful states of a DuckDuckGo HTML response. A CAPTCHA page and a zero-hit query
+/// both parse to no results, and reporting the first as the second invites blind retries against a
 /// rate-limited endpoint.
 enum DdgOutcome {
     /// At least one result was parsed. The inner string is the rendered, numbered,
@@ -690,9 +677,8 @@ fn is_ad_result(block: scraper::ElementRef<'_>, resolved_url: Option<&str>) -> b
 }
 
 /// Decode DDG's legacy `/l/?uddg=<percent-encoded-url>` redirect into the direct URL. Current DDG
-/// usually puts the direct URL on the href already, but older cached pages (and the /lite/
-/// endpoint) can still emit the redirect wrapper; keep the decode as a fallback so we don't
-/// regress.
+/// usually puts the direct URL on the href already, but older cached pages and the `/lite/`
+/// endpoint still emit the redirect wrapper.
 fn resolve_result_href(href: &str) -> String {
     if let Some(pos) = href.find("uddg=") {
         let encoded = &href[pos + 5..];
@@ -1045,8 +1031,8 @@ mod tests {
 
     #[test]
     fn nav_links_survive_markdown_conversion() {
-        // Regression: fast_html2md drops the whole subtree of <nav>/<footer>, taking link text and
-        // href with it. The pre-pass rewrites those containers to <div> so the links survive.
+        // `fast_html2md` drops the whole subtree of `<nav>` and `<footer>`, link text and href
+        // included; the pre-pass rewrites those containers to `<div>` so the links survive.
         let html = r#"<nav class="x"><a href="/docs">Docs</a></nav>"#;
         assert_eq!(rewrite_html(html, false), "");
         let fixed = rewrite_html(&keep_boilerplate_container_content(html), false);
@@ -1200,8 +1186,8 @@ mod tests {
             message.contains("[web].proxy") && message.contains("not-a-url"),
             "expected proxy error naming the bad value, got: {message}"
         );
-        // The class, not just the words. As `Config` this is a refusal every host relays verbatim,
-        // and `meka serve` published the operator's proxy URL in a 422 to whoever holds a token.
+        // The class, not just the words: as `Config` this would be a refusal every host relays
+        // verbatim, and `meka serve` would publish the operator's proxy URL in a 422.
         assert!(
             matches!(error, MekaError::Installation(_)),
             "a client meka cannot build is the operator's to fix: {error:?}"
@@ -1280,8 +1266,8 @@ mod tests {
 
     #[test]
     fn build_web_client_with_danger_flags_builds() {
-        // Builds successfully; the function also logs a warn! per flag, which we don't assert here
-        // (tracing capture would add plumbing for negligible test value).
+        // The `warn!` per flag is not asserted: tracing capture would add plumbing for negligible
+        // value.
         let config = WebClientConfig {
             danger_accept_invalid_certs: true,
             danger_accept_invalid_hostnames: true,

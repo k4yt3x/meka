@@ -115,11 +115,10 @@ impl ProgressRegistry {
         }
     }
 
-    /// Best-effort lookup: find the frontend of any in-flight tool call targeting `server_name`.
-    /// Used by the elicitation handler, which has no `progressToken` correlation of its own. The
-    /// server's elicitation request lands on the rmcp handler task with only its own request id
-    /// and the originating server identity. Scanning the registry for a matching in-flight call
-    /// is the pragmatic best we can do without protocol-level help.
+    /// Best-effort lookup: the frontend of any in-flight tool call targeting `server_name`, for
+    /// the elicitation handler, which has no `progressToken` correlation of its own. The server's
+    /// elicitation request lands on the rmcp handler task with only its own request id and the
+    /// originating server identity, so a scan for a matching in-flight call is all there is.
     ///
     /// Returns the first match (HashMap iteration order is arbitrary). In a multi-session ACP
     /// process where two sessions race calls to the same server, an elicitation arriving during

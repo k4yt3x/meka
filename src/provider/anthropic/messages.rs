@@ -2,7 +2,7 @@
 //! key.
 //!
 //! `POST {base_url}/v1/messages` with `x-api-key`, and none of the Claude Code fingerprinting or
-//! attestation machinery [`super::subscription`] needs -- the two speak the same protocol and
+//! attestation machinery [`super::subscription`] needs: the two speak the same protocol and
 //! differ only in how they authenticate and whose client they look like. The wire format is shared
 //! through [`super::shared`].
 //!
@@ -22,6 +22,7 @@ use crate::{
     provider::{CompletionRequest, Provider, StreamEvent, ThinkingOverride, ToolDefinition},
 };
 
+/// The `anthropic-messages` backend: one profile's model, endpoint and API key.
 pub(crate) struct AnthropicMessagesProvider {
     client: reqwest::Client,
     api_key: String,
@@ -30,7 +31,7 @@ pub(crate) struct AnthropicMessagesProvider {
     thinking: ThinkingMode,
     thinking_budget_tokens: u64,
     /// The settled `output_config.effort` for the request body, resolved once at construction from
-    /// the profile's override. `None` - the unconfigured case - omits the field so Anthropic (or
+    /// the profile's override. `None` (the unconfigured case) omits the field so Anthropic (or
     /// whatever endpoint `base_url` names) applies its own default. The direct Messages API takes
     /// effort with no beta header.
     resolved_effort: Option<String>,

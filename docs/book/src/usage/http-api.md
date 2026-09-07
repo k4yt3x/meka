@@ -28,7 +28,7 @@ scopes = ["sessions:r", "sessions:w"]
 
 On startup the server logs the bind address and begins accepting requests. All endpoints (except health probes and OpenAPI docs) require a valid `Authorization: Bearer <token>` header.
 
-Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and the server creates one per `POST /v1/sessions`, each naming its own profile. Pass `profile` on the create request instead. `--profile` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the server rather than of one session.
+Two flags are refused rather than ignored: `-c` and `-r`. Both name one run's session, and the server creates one per `POST /v1/sessions`, each naming its own profile. Address an existing session by id under `/v1/sessions/{id}`, and pass `profile` on the create request. `--profile` is accepted, since it selects which configured profile a session gets when it names none, which is a property of the server rather than of one session.
 
 > **TLS**: `meka serve` speaks plain HTTP. For production, front it with a TLS-terminating reverse proxy (nginx, Caddy, Cloudflare Tunnel).
 
@@ -643,7 +643,7 @@ Possible outcomes:
 
 ### Approvals with blocking turns
 
-When `stream: false` and approvals are on, there is no SSE channel for permission prompts. The agent runs the turn with tool permissions **auto-denied**; each denied tool appends a `notice` to the response explaining what happened and suggesting a higher `permission`, `stream: true`, or turning approvals off.
+When `stream: false` and approvals are on, there is no SSE channel for permission prompts. The agent runs the turn with tool permissions **auto-denied**; each denied tool appends a `notice` to the response saying so and pointing at `stream: true`.
 
 **MCP elicitations** (interactive form prompts from MCP servers) are always auto-declined over HTTP; there is no channel for interactive input. A `notice` event is emitted when this happens.
 
@@ -782,11 +782,11 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
 | `/errors/turn-canceled` | 409 | Turn was canceled |
 | `/errors/store-read-only` | 409 | The skill lives under a `[skills] extra_paths` root; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
-| `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation. Reading it is unaffected; continuing it means `agent_followup` from the parent, whose id the message names. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
+| `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation, which only its parent drives. Reading it is unaffected; the message names the parent and what to do there: `agent_followup` for a turn or a fork, `POST /v1/sessions/{parent}/responses/{request_id}` for an approval, and the parent itself for a scheduled job. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
 | `/errors/idempotency` | 409/429 | Key conflict (body mismatch: 409; cache cap: 429) |
 | `/errors/invalid-body` | 400/422 | Request body validation failed (422), or a path/query parameter the router rejected (400) |
-| `/errors/request-too-large` | 422 | meka refused to send the turn: the conversation is still over the profile's `max_request_bytes` after redacting older tool-result images. meka's own ceiling, so no provider judged it and no `provider_response` rides along; `detail` names the size, the limit and the remedy. **Do not retry unchanged**: `POST /compact`, drop large attachments from the latest turn, or split the work |
+| `/errors/request-too-large` | 422 | meka refused to send the turn: the conversation is still over the profile's `max_request_bytes` after redacting older tool-result images. meka's own ceiling, so no provider judged it and no `provider_response` rides along; `detail` names the size, the limit and the remedy, `/compact`. **Do not retry unchanged**: `POST /compact` first |
 | `/errors/payload-too-large` | 413 | Body exceeds `max_body_bytes`, meka's limit on the HTTP request itself. Unrelated to `request-too-large`, which is about what meka may send onward |
 | `/errors/concurrency-limit` | 429 | Process-wide turn limit reached (`Retry-After` header included) |
 | `/errors/sse-lag` | 500 | SSE consumer fell behind; stream terminated (see [SSE lag](#sse-lag)) |
@@ -1002,7 +1002,7 @@ jobs left from before the flag was flipped can still be cleared out.
 Exactly one of `at`, `every` and `cron` is required. A `gate` is `{"check": ..., "when": ...}`:
 `check` is `{"command": "..."}` for a shell command or `{"tool": "...", "arguments": {...}}` for a
 read-only tool call, and `when` is `"changed"` (the default), `"succeeded"`, `{"matches": "<regex>"}`
-or `{"at": "<json pointer>", "is": "not-empty" | "empty" | "changed"}`. What a gate requires of the
+or `{"at": "<json pointer>", "is": "not_empty" | "empty" | "changed"}`. What a gate requires of the
 token and the session is under [Endpoint reference](#endpoint-reference).
 
 ## Reverse proxy setup
@@ -1090,7 +1090,7 @@ A **tool** gate (`"check": {"tool": "…", "arguments": {…}}`) is not held to 
 
 `execute_command` is one such tool wherever a sandbox backend is usable, so a `read` session can plant an arbitrary command on a timer through the tool form. That is deliberate and it is not the same grant as the shell form: a gate dispatches at `read`, the level meka sandboxes, so the command runs read-only-confined rather than as a bare `sh -c`, and where no sandbox is available the tool resolves above `read` and the gate is refused instead. The confinement blocks writes, not the network. See [Scheduled jobs](./scheduling.md) for the longer version.
 
-No job of any kind can be created on a session at `none`, gated or not: nothing is dispatchable there, so the turn could neither act on the job nor cancel it, and `POST /v1/sessions/{id}/schedule` answers 403 `session-permission` rather than creating a row that can never run. A job whose session drops to `none` afterwards keeps its row and reports itself: every job view carries a `withheld` field, present only when something is holding the job back. With `sessions:r` it is the same sentence the agent is given; a `schedule:r`-only token gets a fixed sentence saying the reason needs `sessions:r`, because the reason can name the session's level, a gate's tool, or the first line of a check's output. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the job being rewritten.
+No job of any kind can be created on a session at `none`, gated or not: no tool runs there, so the turn could neither act on the job nor cancel it, and `POST /v1/sessions/{id}/schedule` answers 403 `session-permission` rather than creating a row that can never run. A job whose session drops to `none` afterwards keeps its row and reports itself: every job view carries a `withheld` field, present only when something is holding the job back. With `sessions:r` it is the same sentence the agent is given; a `schedule:r`-only token gets a fixed sentence saying the reason needs `sessions:r`, because the reason can name the session's level, a gate's tool, or the first line of a check's output. It is computed per request from the session's current level, so it tracks a `PATCH /v1/sessions/{id}` without the job being rewritten.
 
 A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot reach a gate at all. Scope a bridge accordingly, and note that `GET /v1/schedule` is server-wide, so `schedule:r` alone lists every session id in the store.
 

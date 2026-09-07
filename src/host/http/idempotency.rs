@@ -62,9 +62,9 @@ enum Slot {
         body_hash: [u8; 32],
         stored_at: Instant,
         /// Held strongly by the ticket. While it is, the request is running and the slot is not
-        /// expired whatever the clock says: a fixed grace shorter than a real turn made the retry
-        /// of a long turn a `Miss`, and the client got `turn-in-flight` in place of the
-        /// idempotency answer it was owed.
+        /// expired whatever the clock says: a fixed grace shorter than a real turn makes the retry
+        /// of a long turn a `Miss`, and the client gets `turn-in-flight` in place of the
+        /// idempotency answer it is owed.
         alive: std::sync::Weak<()>,
     },
     /// First request committed its response. Subsequent same-key + same-body requests get

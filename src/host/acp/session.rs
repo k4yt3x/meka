@@ -368,20 +368,17 @@ pub(super) async fn handle_load_session(
 
     // Before the lock, and before the writes below. `build_session_runtime` refuses a sub-agent at
     // the end of this handler, but by then it has taken the sub-agent's file lock, rewritten its
-    // `cwd` and replaced its `additional_roots_json` -- durable writes to a session the caller
-    // may not drive, followed by an *internal* error for something the caller got wrong. `cwd`
-    // is the writable boundary at `workspace` and the directory a scheduled gate is re-checked
-    // in, so moving it is not cosmetic; the test below proves it moves without this.
+    // `cwd` and replaced its `additional_roots_json`: durable writes to a session the caller may
+    // not drive, followed by an *internal* error for something the caller got wrong. `cwd` is the
+    // writable boundary at `workspace` and the directory a scheduled gate is re-checked in, so
+    // moving it is not cosmetic.
     //
     // The `claim_session` call in between is *not* part of the harm, though it looks like it: its
     // sweep is keyed on this id, and a sub-agent has no `background_tasks` rows because
     // `Agent::new_subagent` never enables them.
     //
-    // Both load doors, not one. `session/resume` got this first and `session/load` did not, which
-    // left the guard on the method editors reach for least: every side effect above stayed
-    // reachable, and the changelog and upgrade guide both said otherwise. Through the shared
-    // predicate rather than `summary.parent_id`, so the doors cannot drift and an imported
-    // sub-agent with no surviving parent is refused here too.
+    // Through the shared predicate rather than `summary.parent_id`, so the load doors cannot drift
+    // and an imported sub-agent with no surviving parent is refused here too.
     if let Err(error) =
         crate::host::refuse_a_spawned_session(&state.shared.store, Some(session_uuid)).await
     {
@@ -580,12 +577,8 @@ pub(super) async fn handle_resume_session(
         return responder.respond_with_error(error);
     }
 
-    // Before the lock, and before any of the writes below. `build_session_runtime` refuses a
-    // sub-agent at the end of this handler, but by then this has taken the sub-agent's file lock,
-    // rewritten its `cwd`, retired the background work its parent left running, and replaced its
-    // `additional_roots_json` -- side effects on a session the caller may not drive, followed by an
-    // *internal* error for something the caller got wrong. `session/fork` refuses up front for the
-    // same reason; this is its sibling.
+    // Before the lock, and before any of the writes below, for the reason `session/load` gives:
+    // the builder's refusal arrives after the side effects on a session the caller may not drive.
     //
     // Through the shared predicate rather than `summary.parent_id`, so the two doors cannot drift
     // and so an imported sub-agent with no surviving parent is refused here too.
@@ -749,24 +742,22 @@ pub(super) async fn handle_fork_session(
     // Before the copy, for the reason `crate::host::http::handlers::sessions::fork_session` refuses
     // there: a fork of a sub-agent is a sibling under the same parent, so the copy is a sub-agent
     // too and `build_session_runtime` below refuses to build it. That refusal is correct but
-    // arrives far too late to say anything useful -- it is reported as an *internal* error, for
-    // something the caller got wrong, and it names the copy's id, which the client has never
-    // seen and which `discard_failed_fork` has already deleted by the time it reads it.
+    // arrives far too late to say anything useful: it is reported as an *internal* error, for
+    // something the caller got wrong, and it names the copy's id, which the client has never seen
+    // and which `discard_failed_fork` has already deleted by the time it reads it.
     //
     // `spawn_terms` and not the parent link, so the same rows the builders refuse are refused
-    // here. Keyed on the link alone, an imported sub-agent fell straight through this check into
-    // the failure it exists to prevent.
+    // here, an imported sub-agent among them.
     match state.shared.store.spawn_terms(source_uuid).await {
         Ok(Some(terms)) => {
             return responder.respond_with_error(invalid_params_error(match terms.parent {
                 Some(parent) => format!(
-                    "session {source_uuid} is a sub-agent of {parent}, so a copy of it is another \
-                     sub-agent and there is no session to hand back. Continue the conversation \
-                     with `agent_followup` from {parent}."
+                    "session {source_uuid} is a sub-agent of session {parent}, so a copy of it \
+                     cannot be driven; continue it with `agent_followup` there"
                 ),
                 None => format!(
                     "session {source_uuid} is a sub-agent whose parent is not in this store, so a \
-                     copy of it is another sub-agent and there is no session to hand back."
+                     copy of it cannot be driven"
                 ),
             }));
         }
@@ -904,8 +895,8 @@ pub(super) async fn handle_fork_session(
     if !request.mcp_servers.is_empty() {
         let provided = request.mcp_servers.len();
         tracing::warn!(
-            "session/fork: client provided {provided} mcpServers, ignored (config-driven MCP \
-             servers are still active)"
+            "session/fork: ignoring {provided} client-provided mcpServers; MCP servers come from \
+             config.toml"
         );
     }
 
@@ -1028,13 +1019,8 @@ pub(super) async fn handle_set_session_mode(
     if let Err(error) = entry.cells().permission.try_set(permission) {
         return responder.respond_with_error(acp_error_for(&error, false));
     }
-    // Persist alongside the in-memory cell, the way `PATCH /v1/sessions/{id}` already does.
-    //
-    // The scheduler's live gate re-check reads the session *row* and nothing else. An ACP session
-    // that only ever moved its in-memory cell left that column at what `session/new` wrote, so
-    // cycling to `unrestricted` in the editor and authoring a gate left the gate refused, and
-    // cycling back down to `read` did not withdraw one already written. The row is also what
-    // `session/list` reports, so it was misreporting the level for the same reason.
+    // Persisted alongside the in-memory cell, as `PATCH /v1/sessions/{id}` does: the scheduler's
+    // live gate re-check reads the session *row* and nothing else, and `session/list` reports it.
     //
     // In-memory first: the change the user asked for has already taken effect on the next tool
     // call, and what a failed write costs is `record_session_change`'s to decide.
@@ -1050,12 +1036,8 @@ pub(super) async fn handle_set_session_mode(
     {
         return responder.respond_with_error(acp_error_for(&error, false));
     }
-    // The canonical id for the level that was actually set, not the string the client sent.
-    //
-    // `parse_mode_id` accepts exactly what `--permission` accepts, one spelling per level. Echoing
-    // the request verbatim reported a `currentMode` matching none of the ids advertised in
-    // `availableModes`, which is what an editor compares against to tick the right entry in its
-    // mode picker.
+    // The canonical id for the level that was set, not the string the client sent: an editor ticks
+    // its mode picker by comparing `currentMode` against the ids advertised in `availableModes`.
     send_session_update(
         &entry.frontend.connection,
         &entry.frontend.session_id,

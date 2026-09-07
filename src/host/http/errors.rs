@@ -399,10 +399,7 @@ impl ProblemDetail {
             // Adjacent, and to the same shape [`crate::host::http::reattach::agent_build_problem`]
             // gives them, because the two arrive the same way: a builder refusing something the
             // caller can act on, in its own words. Every door that can raise `SessionNotDrivable`
-            // today goes through that function, so these arms are the belt to its braces. Falling
-            // through to `other` would answer "internal server error; consult server logs" to a
-            // client whose only problem is that it posted at a sub-agent's id, which is the failure
-            // that function exists to prevent.
+            // goes through that function, so these arms are the belt to its braces.
             //
             // Same status, different `type`, because the remedies do not overlap: a `Config`
             // refusal is about what the caller sent or how the installation is set up, while
@@ -424,9 +421,8 @@ impl ProblemDetail {
             }
             // meka's own ceiling, refused before anything was sent. A 422 rather than one of the
             // 502s below: no provider judged this request, so there is no upstream response to
-            // relay and `detail` -- which names the size, the ceiling and the remedy -- is the
-            // whole answer. Published as `provider` with an empty `provider_response`, it told a
-            // client to look in the server log for an upstream body that never existed.
+            // relay and `detail`, which names the size, the ceiling and the remedy, is the whole
+            // answer.
             MekaError::RequestTooLarge(message) => ProblemDetail::new(
                 ErrorKind::RequestTooLarge,
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -455,15 +451,9 @@ impl ProblemDetail {
             // rather than this module's; `attach` above is where the answer is applied and
             // `ServeConfig::relay_provider_errors` is where it is argued.
             //
-            // `webhook.rs` withholds content from outbound deliveries (identifiers and status
-            // travel, content does not), which is right there, because a webhook URL is a string in
-            // a config file rather than a caller holding a token. The difference is who is on the
-            // other end.
-            //
-            // A length bound was tried as a *redaction* technique and did not work, for a reason
-            // worth keeping: it keeps the *start* of the body, and every one of those identifiers
-            // lives at the start of a JSON error object. `RELAYED_BODY_CAP` is a size bound rather
-            // than a redaction one and does not revisit that.
+            // A length bound is not a redaction: it keeps the *start* of the body, and every one
+            // of those identifiers lives at the start of a JSON error object. The bound on the
+            // relayed body is a size bound only.
             MekaError::Provider(message) | MekaError::InvalidRequest(message) => {
                 tracing::warn!("provider error: {message}");
                 let problem = ProblemDetail::new(
@@ -480,22 +470,17 @@ impl ProblemDetail {
             // is spent, so one of these can arrive after three attempts or after none, and reading
             // a count into the type would be inventing a guarantee.
             //
-            // Split from the arm above because a client's sensible responses differ, and sharing
-            // one type left it unable to choose. A relayed `Retry-After` was the only thing
-            // separating them, and it is missing from most instances of this very arm: a transport
-            // failure never received a response to carry one, a mid-stream `overloaded` event has
-            // no headers, and `parse_retry_after` reads only delta-seconds. The 529 a bridge sees
-            // most often therefore arrived byte-identical to a dead credential.
+            // Split from the arm above because a client's sensible responses differ. A relayed
+            // `Retry-After` cannot be what separates them: it is missing from most instances of
+            // this very arm, since a transport failure never received a response to carry one, a
+            // mid-stream `overloaded` event has no headers, and `parse_retry_after` reads only
+            // delta-seconds.
             //
             // `StreamError` is here rather than above because every producer is transport-shaped:
             // an idle timeout, an `Err` from the SSE stream itself, and a stream that ended before
             // its terminal event. A malformed SSE payload is *not* one of them, being skipped with
             // a `warn!` and a `continue`, so nothing in this arm resends into a body the provider
             // will reject identically forever.
-            //
-            // Falling through to the `other` arm answers 500 and logs at `error!` as an unhandled
-            // internal fault, sending an operator to look in the wrong process for a failure meka
-            // classified correctly.
             MekaError::StreamError(message) => {
                 tracing::warn!("provider error: {message}");
                 let problem = ProblemDetail::new(
@@ -540,14 +525,11 @@ impl ProblemDetail {
             // The same 502 as its neighbors, and for the same reason: the upstream refused the
             // turn. Its own `type` because the remedy is the opposite one. `provider` invites the
             // client to send the same request again, which is right for a 529 and wrong here: the
-            // conversation is too long and will be too long next time. Sharing the type left a
-            // correct client retrying forever, so the split is deliberate.
+            // conversation is too long and will be too long next time.
             //
             // Not a 413. That status is spoken for by `max_body_bytes`, which is meka's own limit
             // on the HTTP request rather than the model's window, so reusing it would make one
-            // status mean two unrelated things. Sharing 502 with the arm above is the opposite
-            // arrangement and the one this module is built on: distinct types over a shared status,
-            // exactly as the module docs describe for the several 404s and 409s.
+            // status mean two unrelated things.
             //
             // Reaching here at all means the agent loop could not compact its way out:
             // `auto_compact` is off, or its retries are spent, or there was only one message and
@@ -562,14 +544,12 @@ impl ProblemDetail {
                 );
                 attach(problem, message)
             }
-            // The last variant that was falling into the `other` arm with a fault of its own, and
-            // the one where 500 read worst: a required MCP server being down is a clean, fully
-            // classified pre-flight refusal, and answering "internal server error; consult server
-            // logs" sends an operator looking for a bug in meka instead of at the subprocess that
-            // did not start.
+            // A required MCP server being down is a clean, fully classified pre-flight refusal;
+            // answering "internal server error" sends an operator looking for a bug in meka instead
+            // of at the subprocess that did not start.
             //
             // The names travel and the reasons do not, which is the policy the provider arms above
-            // state. A reason here is the connector's own text and has carried a spawn failure
+            // state. A reason here is the connector's own text and can carry a spawn failure
             // complete with the command line and its path; the names are the operator's own
             // configuration and the only part a caller can act on. `servers` rides as an extension
             // so a client can branch on which one rather than parse the sentence.
@@ -668,10 +648,9 @@ mod tests {
 
     /// The operator's switch decides whether a 502 carries the provider's own response text.
     ///
-    /// That body has held an account identifier, a rate-limit posture and a fragment of the
+    /// That body can hold an account identifier, a rate-limit posture and a fragment of the
     /// request; whoever holds a `sessions:w` token is not necessarily whoever holds the provider
-    /// account. Truncating it was the first attempt and kept the start, which is where all three
-    /// live in a JSON error object.
+    /// account.
     #[test]
     fn the_upstream_body_travels_only_when_the_operator_asked_for_it() {
         let leaky = "{\"error\":{\"account_uuid\":\"acct-0f3c\",\"type\":\"rate_limit_error\",\
@@ -783,16 +762,14 @@ mod tests {
 
     /// A transient failure carrying no `Retry-After` is still distinguishable from a permanent one.
     ///
-    /// This is the whole complaint, as a test. The two shared `/errors/provider`, so a relayed
-    /// `Retry-After` was the only thing separating them, and it is absent from most transient
-    /// failures: a transport error has no response to read a header from, a mid-stream `overloaded`
-    /// event has no headers at all, and `parse_retry_after` understands only delta-seconds. An
-    /// overload therefore reached a bridge byte-identical to a revoked credential, leaving it to
-    /// choose between retrying a dead token forever and discarding turns a second attempt would
+    /// A relayed `Retry-After` is absent from most transient failures: a transport error has no
+    /// response to read a header from, a mid-stream `overloaded` event has no headers at all, and
+    /// `parse_retry_after` understands only delta-seconds. Sharing one `type` would leave a bridge
+    /// choosing between retrying a dead token forever and discarding turns a second attempt would
     /// have completed.
     ///
-    /// `retry_after: None` is the load-bearing part of the setup. With a header present the two
-    /// were already distinguishable, so a version of this test that supplied one would pass against
+    /// `retry_after: None` is the load-bearing part of the setup: with a header present the two
+    /// are distinguishable anyway, so a version of this test that supplied one would pass against
     /// the shape it exists to reject.
     #[test]
     fn a_transient_failure_without_a_retry_after_is_still_distinguishable() {
@@ -1005,12 +982,9 @@ mod tests {
         );
     }
 
-    /// meka's own request ceiling is the caller's to act on and has no upstream behind it.
-    ///
-    /// As `InvalidRequest` it was published as a 502 `provider` whose `detail` sent the client to
-    /// the server log for a provider response that never existed, and whose `provider_response`
-    /// member -- when relaying was on -- carried meka's own sentence as though the upstream had
-    /// said it. The remedy is in `detail`, so `detail` is asserted rather than merely present.
+    /// meka's own request ceiling is the caller's to act on and has no upstream behind it, so it
+    /// must not be published as a 502 `provider` pointing at a provider response that never
+    /// existed. The remedy is in `detail`, so `detail` is asserted rather than merely present.
     #[test]
     fn the_request_ceiling_is_mekas_own_refusal_rather_than_a_provider_failure() {
         let error = MekaError::RequestTooLarge(

@@ -6,7 +6,7 @@
 //!
 //! The protocol itself lives in [`super::responses_wire`], shared with the API-key
 //! [`super::responses`] backend. What is particular to this one is the endpoint, the OAuth
-//! credential, the Codex client headers, and the two reasoning parameters Codex sends -- the
+//! credential, the Codex client headers, and the two reasoning parameters Codex sends: the
 //! `include` of encrypted reasoning content and the `reasoning.summary` that makes the reasoning
 //! visible. Those two stay here because this backend's endpoint is always ChatGPT.
 
@@ -40,6 +40,7 @@ const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// tool so OpenAI can attribute traffic.
 const ORIGINATOR: &str = "meka_cli";
 
+/// The `chatgpt-subscription` backend: one profile's model and the OAuth credential it bills.
 pub(crate) struct ChatGptSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
@@ -62,7 +63,7 @@ pub(crate) struct ChatGptSubscriptionProvider {
     /// back to the correct `account_credentials` row.
     credential_key: String,
     /// The settled `reasoning.effort` for the request body, resolved once at construction from the
-    /// profile's override. `None` - the unconfigured case - skips the reasoning block entirely, so
+    /// profile's override. `None` (the unconfigured case) skips the reasoning block entirely, so
     /// the Responses API applies its own default.
     resolved_effort: Option<String>,
     /// Per-request output token cap from the profile; `None` leaves the Responses API default.
@@ -73,6 +74,7 @@ pub(crate) struct ChatGptSubscriptionProvider {
 }
 
 impl ChatGptSubscriptionProvider {
+    /// Build from a profile's settings, whose credential the builder has checked is an OAuth one.
     pub(crate) fn new(settings: crate::provider::ProviderBuilder) -> Result<Self> {
         let credential_key = settings.credential_key_or_default();
         let crate::provider::ProviderBuilder {
@@ -154,7 +156,7 @@ impl ChatGptSubscriptionProvider {
             true,
         );
         // Safe here and only here: this backend's endpoint is always ChatGPT, and the first-party
-        // Codex client asks for the same two things -- a summary so the reasoning is visible, and
+        // Codex client asks for the same two things, a summary so the reasoning is visible, and
         // the encrypted content so it survives a stateless round trip. Summary first: it settles
         // the `reasoning` object the `include` keys off.
         request_reasoning_summary(&mut body);
@@ -163,9 +165,9 @@ impl ChatGptSubscriptionProvider {
     }
 
     /// Returns the URL the request POSTs to. Codex's own client appends `/backend-api`
-    /// automatically when the base URL is one of the chatgpt.com domains, but we keep the path
-    /// explicit so a profile whose `base_url` names a custom proxy doesn't need its author to know
-    /// the rewrite rule.
+    /// automatically when the base URL is one of the chatgpt.com domains; the path is kept explicit
+    /// here so a profile whose `base_url` names a custom proxy doesn't need its author to know the
+    /// rewrite rule.
     fn responses_url(&self) -> String {
         let base = &self.base_url;
         match self.base_url_shape {
@@ -178,8 +180,8 @@ impl ChatGptSubscriptionProvider {
     /// segment removed, and `/backend-api` appended when the path has none.
     ///
     /// The account endpoints live beside `codex`, not under it: built from a `/backend-api/codex`
-    /// base verbatim they landed on `/backend-api/codex/wham/usage` and `meka account` failed on a
-    /// profile whose turns worked.
+    /// base verbatim they would land on `/backend-api/codex/wham/usage`, and `meka account` would
+    /// fail on a profile whose turns work.
     fn backend_api_root(&self) -> String {
         let base = &self.base_url;
         match self.base_url_shape {
@@ -312,9 +314,9 @@ impl ChatGptSubscriptionProvider {
         };
 
         // Only refreshers queue here. `credential` is taken for the reads and writes themselves and
-        // never held across the database or network awaits below: using its write lock as the
-        // refresh gate meant a provider endpoint that went silent wedged every reader in the
-        // process, not just the task refreshing. See the Claude provider for the same contract.
+        // never held across the database or network awaits below: with its write lock as the
+        // refresh gate, a provider endpoint that goes silent wedges every reader in the process,
+        // not just the task refreshing. See the Claude provider for the same contract.
         let _refreshing = self.refresh_gate.lock().await;
 
         // And the same thing one layer out. `refresh_gate` is a `tokio::sync::Mutex`, so it
@@ -327,15 +329,15 @@ impl ChatGptSubscriptionProvider {
             None => None,
         };
 
-        // Re-read the latest credential from the DB. Refresh tokens rotate on each successful
-        // refresh, and a sibling meka process may have rotated ours since startup. Without this
-        // re-read we'd POST a stale refresh_token and the OAuth provider would reject it with
+        // Re-read the latest credential from the store. Refresh tokens rotate on each successful
+        // refresh, and a sibling meka process may have rotated this one since startup; without
+        // the re-read a stale refresh token is posted and the issuer rejects it with
         // `invalid_grant`.
         //
         // Installed only when it is at least as new as what memory holds. The row is behind in one
-        // case, a refresh in this process whose persist failed: adopting it spent a refresh token
-        // the issuer had already retired while the live one sat here. The row's version is kept
-        // either way: the refresh below replaces the row on it, so a stale row catches up.
+        // case, a refresh in this process whose persist failed: adopting it would spend a refresh
+        // token the issuer has already retired while the live one sits here. The row's version is
+        // kept either way: the refresh below replaces the row on it, so a stale row catches up.
         let mut observed_version = None;
         if let Some(store) = &self.token_store {
             match store
@@ -392,8 +394,8 @@ impl ChatGptSubscriptionProvider {
             AuthCredential::OAuthToken { refresh_token, .. } => refresh_token.clone(),
             AuthCredential::ApiKey(_) => None,
         };
-        // With nothing to refresh with, a rejected or expired token has one remedy, and this is
-        // the one exit from the refresh path that did not name it.
+        // With nothing to refresh with, a rejected or expired token has one remedy, which every
+        // exit from the refresh path names.
         let Some(refresh_token) = refresh_token else {
             return Err(crate::oauth::with_login_remedy(
                 MekaError::Provider(
@@ -411,7 +413,7 @@ impl ChatGptSubscriptionProvider {
             .refresh_oauth_token(&refresh_token, prior_account_id)
             .await?;
 
-        // A refresh rotates the refresh token, so the one in the database is now dead -- but only
+        // A refresh rotates the refresh token, so the one in the database is now dead, but only
         // if the database still holds the one this was derived from. Where it does not, what comes
         // back is the newer credential to use instead of this one.
         let new_credential = match &self.token_store {
@@ -486,7 +488,7 @@ impl ChatGptSubscriptionProvider {
         // Re-extract `chatgpt_account_id` from the new id_token if the server returned one: the
         // workspace association can change. A refresh that returns no id token, or one without
         // the claim, says nothing about the account, so the one already known stands; blanking
-        // it billed a workspace subscriber's traffic to the personal account, durably.
+        // it would bill a workspace subscriber's traffic to the personal account, durably.
         let account_id = data
             .id_token
             .as_deref()
@@ -619,8 +621,8 @@ impl Provider for ChatGptSubscriptionProvider {
     }
 
     async fn fetch_identity(&self) -> Result<Option<AccountIdentity>> {
-        // The plan is the one identity field the usage payload carries; name/org/role need
-        // `accounts/check` (a documented follow-up), so leave them `None` for now.
+        // The plan is the one identity field the usage payload carries; name, org and role need
+        // `accounts/check`, so they stay `None`.
         let plan = self.fetch_wham_usage().await?.plan_type;
         Ok(Some(AccountIdentity {
             display_name: None,
@@ -634,8 +636,8 @@ impl Provider for ChatGptSubscriptionProvider {
     }
 }
 
-/// Subset of the ChatGPT backend `GET /wham/usage` body that we render. Mirrors the fields the
-/// Codex CLI reads (`RateLimitStatusPayload`), tolerant of absent/null buckets.
+/// The subset of the ChatGPT backend `GET /wham/usage` body that is rendered. Mirrors the fields
+/// the Codex CLI reads (`RateLimitStatusPayload`), tolerant of absent/null buckets.
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     #[serde(default)]
@@ -845,8 +847,8 @@ pub(crate) enum ChatGptBaseUrlShape {
 /// Classify a `base_url`, refusing every shape the appended paths would not reach.
 ///
 /// One definition for `meka account add` and for building the provider, so a URL the first
-/// accepts is one the second can use. Judged on path segments rather than substrings: a host named
-/// `codex.example.com` was once routed as if its path already ended in `/codex`.
+/// accepts is one the second can use. Judged on path segments rather than substrings, so a host
+/// named `codex.example.com` is not routed as if its path already ended in `/codex`.
 pub(crate) fn chatgpt_base_url_shape(base_url: &str) -> Result<ChatGptBaseUrlShape> {
     let normalized = crate::provider::normalize_base_url(base_url);
     let segments: Vec<String> = reqwest::Url::parse(&normalized)
@@ -882,7 +884,7 @@ pub(crate) fn chatgpt_base_url_shape(base_url: &str) -> Result<ChatGptBaseUrlSha
     }
     Err(MekaError::Installation(format!(
         "`base_url` '{base_url}' is not a shape the chatgpt-subscription backend accepts: give the \
-         origin (as 'https://chatgpt.com') or a path ending in '/backend-api/codex'"
+         origin, or a path ending in '/backend-api/codex'"
     )))
 }
 
