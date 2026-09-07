@@ -208,7 +208,10 @@ pub(crate) fn resolve_sandbox_backend(
         SandboxCapability::Unavailable => BackendProbe::Missing {
             reason: "no platform sandbox backend available".to_string(),
         },
-        capability => BackendProbe::Ok(capability),
+        #[cfg(target_os = "macos")]
+        capability @ SandboxCapability::SandboxExec => BackendProbe::Ok(capability),
+        #[cfg(target_os = "windows")]
+        capability @ SandboxCapability::LowIntegrity => BackendProbe::Ok(capability),
     };
     // `SandboxBackend::Landlock` is a stand-in here; the field exists for Linux config parity but
     // is never consulted on this platform.

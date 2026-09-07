@@ -560,7 +560,7 @@ impl Agent {
     /// - It sees full text (only images are stripped), so it judges what actually happened rather
     ///   than a head-and-tail excerpt of it.
     ///
-    /// Cancellable through the caller's token. A bare `CancellationToken::new()` here would be a
+    /// Cancelable through the caller's token. A bare `CancellationToken::new()` here would be a
     /// token with no signal source, which `run_turn_interruptible` documents as silently swallowing
     /// Ctrl+C - and the checkpoint is the longest thing compaction does: up to
     /// `CHECKPOINT_MAX_ITERATIONS` full-conversation calls, plus a prompt, with approvals on, that
@@ -718,7 +718,7 @@ impl Agent {
                             admission,
                         ) {
                             (Err(refusal), _) => refusal,
-                            (Ok(_), super::dispatch::Admission::Refuse(refusal)) => refusal,
+                            (Ok(_), super::dispatch::Admission::Refuse(refusal)) => *refusal,
                             (Ok((input, _detach)), admission) => {
                                 if matches!(admission, super::dispatch::Admission::Ask)
                                     && let Some(denial) = self
@@ -1032,7 +1032,7 @@ mod tests {
     ///
     /// Giving compaction a retry loop is what made this reachable: before it, the call was one
     /// `complete` with no sleep in it, so there was nothing for a Ctrl+C to sit through.
-    /// [`Agent::run_checkpoint_turn`]'s own doc says it is cancellable through the caller's token,
+    /// [`Agent::run_checkpoint_turn`]'s own doc says it is cancelable through the caller's token,
     /// and it checks that per round -- but a bare `tokio::time::sleep` inside the round would sit
     /// out a `Retry-After` of up to [`crate::provider::retry::RETRY_AFTER_CAP`] first, once per
     /// attempt, once per iteration. That is compaction becoming the one provider call the user
@@ -1047,7 +1047,7 @@ mod tests {
     /// its ordinary interrupt path, and that call is meant to go through, so a token read before
     /// the first attempt would be a behavior change rather than a stricter test.
     #[tokio::test]
-    async fn a_retry_wait_ends_when_the_turn_is_cancelled() {
+    async fn a_retry_wait_ends_when_the_turn_is_canceled() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
 
         let provider: Arc<dyn Provider> = Arc::new(MockProvider::from_rounds(vec![

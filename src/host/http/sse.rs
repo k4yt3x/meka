@@ -26,7 +26,7 @@ pub(crate) struct SseEvent {
 
 /// Stable event-name strings shipped on the wire. Keep these in lockstep with the HTTP API docs.
 ///
-/// Lifecycle events (`turn.started`, `turn.finished`, `turn.failed`, `turn.cancelled`) do not pass
+/// Lifecycle events (`turn.started`, `turn.finished`, `turn.failed`, `turn.canceled`) do not pass
 /// through [`translate`]: they carry one-off envelopes the turn handler assembles rather than
 /// anything a `FrontendEvent` describes. They are named here, and ride on [`SseEvent`], because a
 /// re-attaching client has to be able to receive a *terminal* event, and that means the terminal
@@ -45,7 +45,7 @@ pub(crate) enum SseEventType {
     TurnStarted,
     TurnFinished,
     TurnFailed,
-    TurnCancelled,
+    TurnCanceled,
 }
 
 impl SseEventType {
@@ -54,7 +54,7 @@ impl SseEventType {
     pub(crate) const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::TurnFinished | Self::TurnFailed | Self::TurnCancelled
+            Self::TurnFinished | Self::TurnFailed | Self::TurnCanceled
         )
     }
 }
@@ -74,7 +74,7 @@ impl SseEventType {
             Self::TurnStarted => "turn.started",
             Self::TurnFinished => "turn.finished",
             Self::TurnFailed => "turn.failed",
-            Self::TurnCancelled => "turn.cancelled",
+            Self::TurnCanceled => "turn.canceled",
         }
     }
 }

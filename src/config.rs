@@ -5257,7 +5257,7 @@ enabled = ["read", "workspace"]
                 panic!("Ok(Unavailable) is incoherent: expected a real capability or Missing")
             }
             BackendProbe::Ok(_) | BackendProbe::Missing { .. } => {}
-            other => panic!("unexpected probe variant on non-Linux: {:?}", other),
+            other => panic!("unexpected probe variant on non-Linux: {other:?}"),
         }
     }
 

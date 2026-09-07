@@ -285,7 +285,7 @@ impl ServerEntry {
 
     /// Record what a handshake's `InitializeResult` said, replacing whatever the previous one said.
     ///
-    /// Takes the raw string rather than the service, so the sanitising and the truncating live in
+    /// Takes the raw string rather than the service, so the sanitizing and the truncating live in
     /// one place and can be exercised without a peer.
     pub(crate) fn record_instructions(&self, raw: Option<String>) {
         let captured =
@@ -1907,9 +1907,9 @@ mod tests {
     async fn an_mcp_round_trip_answers_to_cancellation_and_to_the_clock() {
         let entry = pending_entry("quiet-srv", McpTransport::Http);
 
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
-        let outcome = bounded(&entry, "resources/read", &cancelled, async {
+        let canceled = CancellationToken::new();
+        canceled.cancel();
+        let outcome = bounded(&entry, "resources/read", &canceled, async {
             std::future::pending::<Result<()>>().await
         })
         .await;

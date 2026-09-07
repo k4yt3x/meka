@@ -169,7 +169,7 @@ pub(crate) enum ErrorKind {
     /// The remedy here is the opposite: submit a turn, which loads the session.
     SessionNotLoaded,
     TurnInFlight,
-    TurnCancelled,
+    TurnCanceled,
     /// A re-attached stream ended with no recorded outcome, because the task that would have
     /// recorded one died. Only ever carried inside a terminal `turn.failed` SSE event, never as an
     /// HTTP response body, but cataloged here so the type URI has one definition rather than a
@@ -283,7 +283,7 @@ impl ErrorKind {
             Self::SessionLocked => "https://meka.so/errors/session-locked",
             Self::SessionNotLoaded => "https://meka.so/errors/session-not-loaded",
             Self::TurnInFlight => "https://meka.so/errors/turn-in-flight",
-            Self::TurnCancelled => "https://meka.so/errors/turn-cancelled",
+            Self::TurnCanceled => "https://meka.so/errors/turn-canceled",
             Self::StreamDetached => "https://meka.so/errors/stream-detached",
             Self::SseLag => "https://meka.so/errors/sse-lag",
             Self::RequestNotFound => "https://meka.so/errors/request-not-found",
@@ -312,7 +312,7 @@ impl ErrorKind {
             Self::SessionLocked => "Session is locked by another process",
             Self::SessionNotLoaded => "Session is not loaded",
             Self::TurnInFlight => "Turn already in flight",
-            Self::TurnCancelled => "Turn canceled",
+            Self::TurnCanceled => "Turn canceled",
             Self::StreamDetached => "Turn outcome unavailable",
             Self::SseLag => "SSE consumer lagged",
             Self::RequestNotFound => "Pending request not found",
@@ -588,7 +588,7 @@ impl ProblemDetail {
                 .with("servers", Value::from(names))
             }
             MekaError::Interrupted => ProblemDetail::new(
-                ErrorKind::TurnCancelled,
+                ErrorKind::TurnCanceled,
                 StatusCode::CONFLICT,
                 "turn was canceled (client cancel, shutdown, or disconnect)",
             ),

@@ -114,7 +114,7 @@ pub(crate) fn install_interrupt_handler(
                             .background_store()
                             .finish_background_task(
                                 &id,
-                                crate::store::background::TaskStatus::Cancelled,
+                                crate::store::background::TaskStatus::Canceled,
                                 None,
                                 None,
                             )

@@ -209,7 +209,7 @@ pub(crate) async fn cancel(
             .collect();
         for id in &running {
             store
-                .finish_background_task(id, TaskStatus::Cancelled, None, None)
+                .finish_background_task(id, TaskStatus::Canceled, None, None)
                 .await?;
         }
         return Ok(running);
@@ -233,7 +233,7 @@ pub(crate) async fn cancel(
     }
     store
         .background_store()
-        .finish_background_task(&task.id, TaskStatus::Cancelled, None, None)
+        .finish_background_task(&task.id, TaskStatus::Canceled, None, None)
         .await?;
     Ok(vec![task.id])
 }
@@ -394,10 +394,10 @@ mod tests {
         let (manager, session) = manager_with_session().await;
         let task = seed(&manager, session, "sleep 600").await;
 
-        let cancelled = cancel(&manager, session, Some(&task.id[..8]))
+        let canceled = cancel(&manager, session, Some(&task.id[..8]))
             .await
             .expect("cancel");
-        assert_eq!(cancelled, vec![task.id.clone()]);
+        assert_eq!(canceled, vec![task.id.clone()]);
 
         let undelivered = manager
             .background_store()
@@ -405,7 +405,7 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(undelivered.len(), 1);
-        assert_eq!(undelivered[0].status, TaskStatus::Cancelled);
+        assert_eq!(undelivered[0].status, TaskStatus::Canceled);
     }
 
     /// `/tasks cancel ""` must not stop the only running task.
@@ -415,7 +415,7 @@ mod tests {
     /// error only appears once a second task exists. `--all` is the way to mean all of them, and it
     /// is spelled.
     #[tokio::test]
-    async fn cancelling_an_empty_prefix_stops_nothing() {
+    async fn canceling_an_empty_prefix_stops_nothing() {
         let (manager, session) = manager_with_session().await;
         let task = seed(&manager, session, "sleep 600").await;
 
@@ -445,8 +445,8 @@ mod tests {
         seed(&manager, session, "sleep 1").await;
         seed(&manager, session, "sleep 2").await;
 
-        let cancelled = cancel(&manager, session, None).await.expect("cancel all");
-        assert_eq!(cancelled.len(), 2);
+        let canceled = cancel(&manager, session, None).await.expect("cancel all");
+        assert_eq!(canceled.len(), 2);
         assert!(
             manager
                 .background_store()

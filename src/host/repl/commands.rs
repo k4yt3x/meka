@@ -429,10 +429,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     .cancel_scheduled_job(session, &id)
                     .await
                 {
-                    Ok(Some(cancelled)) => {
+                    Ok(Some(canceled)) => {
                         crate::streams::write_stderr_line(format!(
                             "Canceled job {}.",
-                            &cancelled[..8.min(cancelled.len())]
+                            &canceled[..8.min(canceled.len())]
                         ));
                     }
                     Ok(None) => {
@@ -467,16 +467,16 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 // overwrites a `running` row, so a task finishing in the same instant
                 // cannot report success after the user was told it stopped.
                 match crate::cli::background::cancel(store, session, id.as_deref()).await {
-                    Ok(cancelled) if cancelled.is_empty() => {
+                    Ok(canceled) if canceled.is_empty() => {
                         crate::streams::write_stderr_line("No running background tasks.")
                     }
-                    Ok(cancelled) => {
-                        for task_id in &cancelled {
+                    Ok(canceled) => {
+                        for task_id in &canceled {
                             agent.background_tasks().cancel(task_id).await;
                         }
                         crate::streams::write_stderr_line(format!(
                             "Canceling {} background task(s).",
-                            cancelled.len()
+                            canceled.len()
                         ));
                     }
                     Err(error) => with_console(console, |console| console.error(&error)),

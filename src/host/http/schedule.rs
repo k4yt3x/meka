@@ -203,7 +203,7 @@ struct HttpHooks {
 pub(super) fn fired_status(outcome: &Result<(), crate::error::MekaError>) -> &'static str {
     match outcome {
         Ok(()) => "completed",
-        Err(crate::error::MekaError::Interrupted) => "cancelled",
+        Err(crate::error::MekaError::Interrupted) => "canceled",
         Err(_) => "failed",
     }
 }
@@ -379,11 +379,11 @@ mod tests {
 
     /// A stopped fire is reported as canceled, the way the REPL reports it, not as a failure.
     #[test]
-    fn a_stopped_fire_is_cancelled_not_failed() {
+    fn a_stopped_fire_is_canceled_not_failed() {
         assert_eq!(fired_status(&Ok(())), "completed");
         assert_eq!(
             fired_status(&Err(crate::error::MekaError::Interrupted)),
-            "cancelled"
+            "canceled"
         );
         assert_eq!(
             fired_status(&Err(crate::error::MekaError::Provider("boom".to_string()))),

@@ -892,7 +892,7 @@ async fn apply_write(
             // Stopping the turn is not the client failing, and it is emphatically not a reason to
             // write the file locally instead: the editor may hold unsaved changes this content was
             // never diffed against.
-            Delegation::Failed(error) if error.is_cancelled() => {
+            Delegation::Failed(error) if error.is_canceled() => {
                 return Err(MekaError::Interrupted);
             }
             // The client serves this path, so a write failure is never a reason to write behind
@@ -1093,7 +1093,7 @@ impl Tool for ReadFileTool {
         // Text reads delegate to the editor when it offers `fs.read_text_file`, so the model is
         // shown the document the editor will apply an edit against rather than the bytes under it.
         //
-        // Including a regex read. There is no `fs/*` analogue for searching, but none is needed:
+        // Including a regex read. There is no `fs/*` analog for searching, but none is needed:
         // fetch the file through the same route and filter it here. Routing this one locally
         // instead searched the disk while `edit_file` went on to edit the buffer, and stamped the
         // read in terms `edit_file`'s freshness check could not compare against that buffer, so on
@@ -1124,7 +1124,7 @@ impl Tool for ReadFileTool {
             }
             // The turn was stopped while the client had the request. Reading locally instead would
             // be answering a question the user withdrew.
-            Delegation::Failed(error) if error.is_cancelled() => {
+            Delegation::Failed(error) if error.is_canceled() => {
                 return Err(MekaError::Interrupted);
             }
             // Any other failure leaves open that the client owns this file and has unsaved changes
@@ -1444,7 +1444,7 @@ impl Tool for EditFileTool {
             }
             // The turn was stopped mid-request. Same short-circuit as below, reported as the stop
             // it is.
-            Delegation::Failed(error) if error.is_cancelled() => {
+            Delegation::Failed(error) if error.is_canceled() => {
                 return Err(MekaError::Interrupted);
             }
             // Any other failure has to short-circuit. The client may own this file and hold
@@ -1719,13 +1719,13 @@ impl Tool for WriteFileTool {
             }
             // Not a degraded probe: the user stopped the turn, so there is no write to do. Falling
             // through here would carry on and write the file after the stop.
-            Delegation::Failed(error) if error.is_cancelled() => {
+            Delegation::Failed(error) if error.is_canceled() => {
                 return Err(MekaError::Interrupted);
             }
             // The client did not disown the path, it just failed this probe. The write still goes
             // to it; only the `old_text` is degraded.
             //
-            // The route here labels where `old_text` *came from*, and it came from disk. Labelling
+            // The route here labels where `old_text` *came from*, and it came from disk. Labeling
             // it `Delegated` was not merely informational, because `stale_read_complaint` reads the
             // route to decide which fingerprint to compare: it took the delegated arm and matched a
             // disk hash against one recorded from the editor's buffer. With an unsaved change open
@@ -1915,13 +1915,13 @@ mod tests {
         }
 
         /// A client that owns the path and was still holding the request when the user pressed
-        /// stop, so no answer is coming. What `AcpFrontend::until_cancelled` reports.
+        /// stop, so no answer is coming. What `AcpFrontend::until_canceled` reports.
         fn canceled(buffer: Option<&str>) -> Self {
             Self {
-                read: Delegation::Failed(crate::frontend::FrontendError::cancelled(
+                read: Delegation::Failed(crate::frontend::FrontendError::canceled(
                     "fs/read_text_file",
                 )),
-                write: Delegation::Failed(crate::frontend::FrontendError::cancelled(
+                write: Delegation::Failed(crate::frontend::FrontendError::canceled(
                     "fs/write_text_file",
                 )),
                 buffer: std::sync::Mutex::new(buffer.map(str::to_string)),
@@ -3320,7 +3320,7 @@ mod tests {
                     "content": "rewritten",
                     "force": true,
                 }),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await
             .expect("write should succeed");

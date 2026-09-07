@@ -235,6 +235,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "root_rows_take_the_default_level_once_the_config_reads",
         step: Step::Contextual(root_rows_take_the_default_level_once_the_config_reads),
     },
+    // The reader accepts one spelling of a task status, the American one meka now writes; a task
+    // stopped on request under an earlier meka recorded the other.
+    Migration {
+        name: "background_tasks_spell_canceled_with_one_l",
+        step: Step::Sql(BACKGROUND_TASKS_CANCELED),
+    },
 ];
 
 const PROMPT_HISTORY_0_46: &str = "CREATE TABLE IF NOT EXISTS prompt_history (
@@ -242,6 +248,9 @@ const PROMPT_HISTORY_0_46: &str = "CREATE TABLE IF NOT EXISTS prompt_history (
     command_line TEXT NOT NULL,
     created_at TEXT NOT NULL
 )";
+
+const BACKGROUND_TASKS_CANCELED: &str =
+    "UPDATE background_tasks SET status = 'canceled' WHERE status = 'cancelled'";
 
 /// What [`plan`] decided, and what [`apply`] will do about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2440,6 +2449,10 @@ mod tests {
                 "root_rows_take_the_default_level_once_the_config_reads",
                 12427590907437771145_u64,
             ),
+            (
+                "background_tasks_spell_canceled_with_one_l",
+                10686117140380679488_u64,
+            ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -4370,7 +4383,7 @@ mod tests {
                      VALUES ('done', 's', 't', 'l', 'completed', 'now', 'stamped');
                  INSERT INTO background_tasks \
                      (id, session_id, tool_name, label, status, started_at, delivered_at) \
-                     VALUES ('waiting', 's', 't', 'l', 'cancelled', 'now', NULL);",
+                     VALUES ('waiting', 's', 't', 'l', 'canceled', 'now', NULL);",
             )
             .expect("seed");
 
@@ -4401,5 +4414,52 @@ mod tests {
             None,
             "an undelivered one was never announced, so the poller still owes it"
         );
+    }
+
+    /// A task an earlier meka stopped on request recorded `cancelled`, and the reader accepts only
+    /// the spelling meka writes now. Replayed, the step finds nothing left to rewrite.
+    #[test]
+    fn a_task_status_spelled_with_two_ls_reads_back_as_canceled() {
+        let mut store = store_as_0_42_left_it();
+        store
+            .execute_batch(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'now', 'now');
+                 INSERT INTO background_tasks \
+                     (id, session_id, tool_name, label, status, started_at) \
+                     VALUES ('stopped', 's', 't', 'l', 'cancelled', 'now');
+                 INSERT INTO background_tasks \
+                     (id, session_id, tool_name, label, status, started_at) \
+                     VALUES ('done', 's', 't', 'l', 'completed', 'now');",
+            )
+            .expect("seed");
+
+        let plan = plan(&store).expect("classified");
+        apply(&mut store, plan, &Context::adopting(Some("p"))).expect("migrated");
+
+        let status_of = |id: &str| -> String {
+            store
+                .query_row(
+                    "SELECT status FROM background_tasks WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("read")
+        };
+        assert_eq!(
+            status_of("stopped").parse::<crate::store::background::TaskStatus>(),
+            Ok(crate::store::background::TaskStatus::Canceled),
+            "the row reads back through the one spelling the reader accepts"
+        );
+        assert_eq!(
+            status_of("done"),
+            "completed",
+            "every other status is left as it was"
+        );
+
+        // A `.dump` round trip drops `user_version`, so every step replays over data that has it.
+        let rewritten = store
+            .execute(BACKGROUND_TASKS_CANCELED, [])
+            .expect("safe to run twice");
+        assert_eq!(rewritten, 0, "a replay finds nothing left to rewrite");
     }
 }

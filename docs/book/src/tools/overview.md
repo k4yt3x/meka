@@ -168,7 +168,7 @@ Inputs (all optional):
 - `items`: replace the whole list. Each entry is a task string (status defaults to `pending`) or an object `{text, status}`. Tasks are numbered `1..N` in order.
 - `set`: a sparse status update keyed by task number, e.g. `{"1": "completed", "2": "in_progress"}`. This is the common path while working.
 
-Task statuses are `pending`, `in_progress`, `completed`, and `cancelled`. Calling `todo` with no arguments simply reads the current list.
+Task statuses are `pending`, `in_progress`, `completed`, and `canceled`. Calling `todo` with no arguments simply reads the current list.
 
 ## `agent_spawn`
 

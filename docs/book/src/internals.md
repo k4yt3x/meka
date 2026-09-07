@@ -116,9 +116,9 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
 
 Non-secret settings live in `config.toml`. Secrets live in the store. Environment variables are
 operational only. The store is one SQLite file, `meka.db` under `MEKA_DATA_DIR`, opened by `Store`,
-and its shape is whatever the migration ledger says it is: eighteen entries today, so a current store
-reads `PRAGMA user_version = 18`, and `HEAD_SCHEMA_FINGERPRINT` in `store/migrations.rs` pins the
-columns of the eleven tables in `HEAD_TABLES`. The last entry, `root_rows_take_the_default_level_once_the_config_reads`, stamps `[permissions].default` on a root row that still records no level and refuses to migrate while `config.toml` cannot be read, so the store keeps its shape until the file reads.
+and its shape is whatever the migration ledger says it is: nineteen entries today, so a current store
+reads `PRAGMA user_version = 19`, and `HEAD_SCHEMA_FINGERPRINT` in `store/migrations.rs` pins the
+columns of the eleven tables in `HEAD_TABLES`. The last entry, `background_tasks_spell_canceled_with_one_l`, rewrites a task status an earlier meka stored as `cancelled` to the `canceled` the reader accepts. Before it, `root_rows_take_the_default_level_once_the_config_reads` stamps `[permissions].default` on a root row that still records no level and refuses to migrate while `config.toml` cannot be read, so the store keeps its shape until the file reads.
 
 | Table | Owner | Columns and indexes |
 |-------|-------|---------------------|
@@ -275,10 +275,10 @@ to the parent's frontend and drops the rest). Where they differ:
 | `Notice` info / warn | `console.notice`, dim or warn-colored | agent-message chunk prefixed `[meka]` / `[meka warn]` | `notice` event (`NoticeView`) | `notices[]` | `notices[]` | dropped |
 | `McpProgress` | inline status line | `tracing::info!` | `progress` event | dropped | dropped | dropped |
 | `Compacted` | nothing (`/compact` prints `render::compaction_summary`) | info notice | `context.compacted` event | dropped; `GET /messages` carries the marker | dropped | dropped |
-| Approval with nobody to ask | warn `approval_refused_without_asking`, deny (REPL thread gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Cancelled` on cancel | `permission_required` event; deny after `APPROVAL_TIMEOUT` or on disconnect | warn notice in its own words (`stream=false has no channel`), deny | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
+| Approval with nobody to ask | warn `approval_refused_without_asking`, deny (REPL thread gone) | asks the client; deny after `APPROVAL_TIMEOUT`, `Canceled` on cancel | `permission_required` event; deny after `APPROVAL_TIMEOUT` or on disconnect | warn notice in its own words (`stream=false has no channel`), deny | warn `approval_refused_without_asking`, deny | deny; the notice goes nowhere |
 | Elicitation | asks through the REPL thread; warn `elicitation_declined` and decline when it is gone | `elicitation/create`; warn `elicitation_declined` and decline when the client lacks the mode | warn `elicitation_declined`, decline | same | trait default: warn `elicitation_declined`, decline | same, dropped |
 | Scheduled fire prompt | dim info notice on the console | `UserMessageChunk` | info notice into the stream | info notice, drained after the turn | no scheduler | n/a |
-| Scheduled fire failure | `console.error`; "interrupted" annotation on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `cancelled` or `failed`; nothing on the frontend | same webhook | no scheduler | n/a |
+| Scheduled fire failure | `console.error`; "interrupted" annotation on a cancel | warn notice `scheduled job '<id>' failed: ...`; info on a cancel | `schedule.fired` webhook, `status` `completed`, `canceled` or `failed`; nothing on the frontend | same webhook | no scheduler | n/a |
 
 The scheduled-fire rows come from each host's `HostHooks` (`show_prompt`, `finished`) rather than
 its `Frontend`, in `host/repl.rs`, `host/acp/schedule.rs` and `host/http/schedule.rs`.

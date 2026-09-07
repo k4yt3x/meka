@@ -323,7 +323,7 @@ impl AcpFrontend {
     /// delegate, do it locally" -- so a `?` on an `Option` here turned pressing stop into a local
     /// write, computing the edit from on-disk bytes and overwriting whatever the editor still held
     /// unsaved. Returning a `Result` makes that `?` a type error instead of a silent one.
-    pub(super) async fn until_cancelled<T>(
+    pub(super) async fn until_canceled<T>(
         &self,
         what: &str,
         work: impl std::future::Future<Output = T>,
@@ -606,7 +606,7 @@ impl Frontend for AcpFrontend {
             }
             FrontendEvent::TodoListUpdated { items, .. } => {
                 // The `todo` tool's list maps onto ACP's plan panel. The REPL-only `title` has no
-                // `Plan` analogue and is dropped. The agent loop (`agent/dispatch.rs`) never emits
+                // `Plan` analog and is dropped. The agent loop (`agent/dispatch.rs`) never emits
                 // an emptied list, so a cleared plan is not pushed, as on the REPL.
                 SessionUpdate::Plan(Plan::new(todo_items_to_plan(&items)))
             }
@@ -704,12 +704,12 @@ impl Frontend for AcpFrontend {
         let acp_request = RequestPermissionRequest::new(session_id, tool_call, options);
         // Race the round-trip against the per-turn cancellation token. If `session/cancel` fires
         // while we're waiting for the client to answer the permission prompt, we resolve as
-        // `Cancelled` instead of holding the runtime mutex forever, which would block
+        // `Canceled` instead of holding the runtime mutex forever, which would block
         // `session/close` and `session/set_mode` too.
         let response = tokio::select! {
             biased;
             _ = request.cancellation.cancelled() => {
-                return PermissionOutcome::Cancelled;
+                return PermissionOutcome::Canceled;
             }
             // The backstop the cancellation race alone does not provide. A client that is
             // *connected* but never answers -- an editor whose UI thread is wedged, a headless
@@ -773,14 +773,14 @@ impl Frontend for AcpFrontend {
             request = request.limit(limit);
         }
         let outcome = match self
-            .until_cancelled(
+            .until_canceled(
                 "fs/read_text_file",
                 connection.send_request(request).block_task(),
             )
             .await
         {
             Ok(outcome) => outcome,
-            Err(cancelled) => return Delegation::Failed(cancelled),
+            Err(canceled) => return Delegation::Failed(canceled),
         };
         match outcome {
             Ok(response) => Delegation::Served(response.content),
@@ -798,14 +798,14 @@ impl Frontend for AcpFrontend {
         let request =
             WriteTextFileRequest::new(session_id, path.to_path_buf(), content.to_string());
         let outcome = match self
-            .until_cancelled(
+            .until_canceled(
                 "fs/write_text_file",
                 connection.send_request(request).block_task(),
             )
             .await
         {
             Ok(outcome) => outcome,
-            Err(cancelled) => return Delegation::Failed(cancelled),
+            Err(canceled) => return Delegation::Failed(canceled),
         };
         match outcome {
             Ok(_) => Delegation::Served(()),
@@ -869,14 +869,14 @@ impl Frontend for AcpFrontend {
         // third state and the MCP server needs an answer either way. The turn is stopping; what the
         // server does with the refusal no longer changes what the user sees.
         let outcome = match self
-            .until_cancelled(
+            .until_canceled(
                 "elicitation/create",
                 self.connection.clone().send_request(request).block_task(),
             )
             .await
         {
             Ok(outcome) => outcome,
-            Err(_cancelled) => {
+            Err(_canceled) => {
                 tracing::debug!(
                     "MCP elicitation from '{server}' ({kind}) declined: the turn was canceled",
                     server = prompt.server_name,
@@ -956,7 +956,7 @@ pub(super) async fn race_against_cancellation<T>(
         biased;
         _ = cancellation.cancelled() => {
             tracing::debug!("{what} abandoned: the turn was canceled");
-            Err(FrontendError::cancelled(what))
+            Err(FrontendError::canceled(what))
         }
         result = work => Ok(result),
     }
@@ -978,7 +978,7 @@ where
     F: FnMut(StickyDecision),
 {
     match outcome {
-        RequestPermissionOutcome::Cancelled => PermissionOutcome::Cancelled,
+        RequestPermissionOutcome::Cancelled => PermissionOutcome::Canceled,
         RequestPermissionOutcome::Selected(selected) => {
             let option_id: &str = selected.option_id.0.as_ref();
             match option_id {
@@ -1055,7 +1055,7 @@ pub(super) fn sanitize_title(text: &str) -> String {
     }
 }
 /// Convert meka's `todo` tool list into ACP [`PlanEntry`] rows for [`SessionUpdate::Plan`]. meka's
-/// `Cancelled` status has no ACP analogue, so it maps to `Completed` ("no longer active") to keep
+/// `Canceled` status has no ACP analog, so it maps to `Completed` ("no longer active") to keep
 /// the entry count stable against the model's own todo list. meka tracks no per-item priority, so
 /// every entry is reported as `Medium`.
 pub(super) fn todo_items_to_plan(items: &[TodoItem]) -> Vec<PlanEntry> {
@@ -1065,7 +1065,7 @@ pub(super) fn todo_items_to_plan(items: &[TodoItem]) -> Vec<PlanEntry> {
             let status = match item.status {
                 TodoStatus::Pending => PlanEntryStatus::Pending,
                 TodoStatus::InProgress => PlanEntryStatus::InProgress,
-                TodoStatus::Completed | TodoStatus::Cancelled => PlanEntryStatus::Completed,
+                TodoStatus::Completed | TodoStatus::Canceled => PlanEntryStatus::Completed,
             };
             PlanEntry::new(item.text.clone(), PlanEntryPriority::Medium, status)
         })

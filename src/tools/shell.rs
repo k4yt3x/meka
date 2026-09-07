@@ -289,9 +289,8 @@ impl Tool for ExecuteCommandTool {
                 );
                 #[cfg(not(target_os = "linux"))]
                 let message = format!(
-                    "sandbox is unavailable: {}. `unrestricted` runs shell commands \
-                     without a sandbox.",
-                    reason
+                    "sandbox is unavailable: {reason}. `unrestricted` runs shell commands \
+                     without a sandbox."
                 );
                 return Err(MekaError::ToolExecution {
                     tool_name: "execute_command".to_string(),
@@ -1095,7 +1094,7 @@ async fn run_windows_sandboxed(
     confinement: &crate::sandbox::windows::WindowsConfinement,
     cwd: std::path::PathBuf,
     timeout: std::time::Duration,
-    cancellation: CancellationToken,
+    cancellation: tokio_util::sync::CancellationToken,
     relay: Option<OutputRelay>,
 ) -> Result<ToolOutput> {
     use std::{sync::Arc, time::Duration};
@@ -1109,7 +1108,7 @@ async fn run_windows_sandboxed(
         crate::sandbox::windows::spawn_sandboxed_command(command, confinement, &cwd).map_err(
             |error| MekaError::ToolExecution {
                 tool_name: "execute_command".to_string(),
-                message: format!("failed to spawn sandboxed command: {}", error),
+                message: format!("failed to spawn sandboxed command: {error}"),
             },
         )?;
 
@@ -1158,11 +1157,11 @@ async fn run_windows_sandboxed(
             let status = join
                 .map_err(|error| MekaError::ToolExecution {
                     tool_name: "execute_command".to_string(),
-                    message: format!("wait task panicked: {}", error),
+                    message: format!("wait task panicked: {error}"),
                 })?
                 .map_err(|error| MekaError::ToolExecution {
                     tool_name: "execute_command".to_string(),
-                    message: format!("failed to wait for command: {}", error),
+                    message: format!("failed to wait for command: {error}"),
                 })?;
 
             let exit_code = status.code().unwrap_or(-1);
@@ -1981,10 +1980,10 @@ mod tests {
                 // the field must still be populated. `Landlock` is the conventional placeholder.
                 sandbox_backend: crate::config::SandboxBackend::Landlock,
                 backend_probe,
-                shared_permission,
                 sandbox_enabled: true,
-                cwd: crate::workspace::cwd_for_test(),
-                frontend: Arc::new(crate::frontend::SilentFrontend),
+                site: crate::session::ToolSite::for_test()
+                    .with_permission(shared_permission)
+                    .with_cwd(crate::workspace::cwd_for_test()),
             }
         }
 
@@ -2012,7 +2011,7 @@ mod tests {
                 Permission::Workspace,
                 crate::permission::EnabledPermissions::ALL,
             ));
-            tool.cwd = crate::workspace::SharedCwd::new(work.clone());
+            tool.site.cwd = crate::workspace::SharedCwd::new(work.clone());
             tool.scope = crate::workspace::WriteScope::confined(vec![work.clone()]);
 
             let result = tool
@@ -2025,7 +2024,7 @@ mod tests {
                             outside.display()
                         ),
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2163,7 +2162,7 @@ mod tests {
                     permission,
                     crate::permission::EnabledPermissions::ALL,
                 ));
-                tool.cwd = crate::workspace::SharedCwd::new(work.clone());
+                tool.site.cwd = crate::workspace::SharedCwd::new(work.clone());
                 tool.scope = crate::workspace::WriteScope::confined(vec![work.clone()]);
 
                 let result = tool
@@ -2175,7 +2174,7 @@ mod tests {
                                 probe_child_test_name()
                             ),
                         }),
-                        CancellationToken::new(),
+                        crate::tools::ToolContext::detached(CancellationToken::new()),
                     )
                     .await
                     .expect("execute should not error");
@@ -2221,9 +2220,9 @@ mod tests {
             let _ = tool
                 .execute(
                     serde_json::json!({
-                        "command": format!("echo hello > \"{}\"", probe_path),
+                        "command": format!("echo hello > \"{probe_path}\""),
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2233,8 +2232,7 @@ mod tests {
             let _ = std::fs::remove_file(&probe_path);
             assert!(
                 !existed,
-                "Low-integrity sandbox should have blocked write to {}",
-                probe_path
+                "Low-integrity sandbox should have blocked write to {probe_path}"
             );
         }
 
@@ -2253,7 +2251,7 @@ mod tests {
                         "command": "'x' * 262144",
                         "timeout_ms": 60000u64,
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2266,8 +2264,7 @@ mod tests {
             let x_count = text.matches('x').count();
             assert!(
                 x_count >= 262144,
-                "expected >= 262144 'x' characters in output, got {}",
-                x_count
+                "expected >= 262144 'x' characters in output, got {x_count}"
             );
         }
 
@@ -2285,7 +2282,7 @@ mod tests {
                         "command": "($input | Measure-Object).Count",
                         "timeout_ms": 5000u64,
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 ),
             )
             .await
@@ -2296,8 +2293,7 @@ mod tests {
             let text = result.text_content();
             assert!(
                 text.trim().starts_with('0'),
-                "expected stdin-object count of 0, got {:?}",
-                text
+                "expected stdin-object count of 0, got {text:?}"
             );
         }
 
@@ -2323,17 +2319,15 @@ mod tests {
                 let result = tool
                     .execute(
                         serde_json::json!({ "command": script, "timeout_ms": 10000u64 }),
-                        CancellationToken::new(),
+                        crate::tools::ToolContext::detached(CancellationToken::new()),
                     )
                     .await
                     .expect("execute should not error");
-                assert!(!result.is_error, "command for marker {:?} errored", marker);
+                assert!(!result.is_error, "command for marker {marker:?} errored");
                 let text = result.text_content();
                 assert!(
                     text.contains(marker),
-                    "marker {:?} missing from output {:?}",
-                    marker,
-                    text
+                    "marker {marker:?} missing from output {text:?}"
                 );
             }
         }
@@ -2357,7 +2351,7 @@ mod tests {
                         "command": "$env:ANTHROPIC_API_KEY",
                         "timeout_ms": 10000u64,
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");
@@ -2369,8 +2363,7 @@ mod tests {
             let text = result.text_content();
             assert!(
                 !text.contains("probe-12345-leaked"),
-                "parent API key leaked into sandboxed child env: {:?}",
-                text
+                "parent API key leaked into sandboxed child env: {text:?}"
             );
         }
 
@@ -2384,7 +2377,7 @@ mod tests {
                     serde_json::json!({
                         "command": "type C:\\Windows\\System32\\drivers\\etc\\hosts",
                     }),
-                    CancellationToken::new(),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
                 )
                 .await
                 .expect("execute should not error");

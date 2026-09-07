@@ -85,7 +85,7 @@ impl Tool for TodoTool {
                                         },
                                         "status": {
                                             "type": "string",
-                                            "enum": ["pending", "in_progress", "completed", "cancelled"]
+                                            "enum": ["pending", "in_progress", "completed", "canceled"]
                                         }
                                     },
                                     "required": ["text"]
@@ -99,7 +99,7 @@ impl Tool for TodoTool {
                                         {\"1\":\"completed\",\"2\":\"in_progress\"}.",
                         "additionalProperties": {
                             "type": "string",
-                            "enum": ["pending", "in_progress", "completed", "cancelled"]
+                            "enum": ["pending", "in_progress", "completed", "canceled"]
                         }
                     }
                 }
@@ -284,7 +284,8 @@ mod tests {
                 "items": [
                     {"text": "A", "status": "done"},
                     {"text": "B", "status": "wip"},
-                    {"text": "C", "status": "skipped"}
+                    {"text": "C", "status": "skipped"},
+                    {"text": "D", "status": "cancelled"}
                 ]
             }),
             crate::tools::ToolContext::detached(CancellationToken::new()),
@@ -295,7 +296,17 @@ mod tests {
         let state = list.get();
         assert_eq!(state.items[0].status, TodoStatus::Completed);
         assert_eq!(state.items[1].status, TodoStatus::InProgress);
-        assert_eq!(state.items[2].status, TodoStatus::Cancelled);
+        assert_eq!(state.items[2].status, TodoStatus::Canceled);
+        assert_eq!(
+            state.items[3].status,
+            TodoStatus::Canceled,
+            "a model may spell it either way"
+        );
+        assert_eq!(
+            serde_json::to_value(TodoStatus::Canceled).expect("serializes"),
+            serde_json::json!("canceled"),
+            "meka writes one spelling"
+        );
     }
 
     #[tokio::test]
@@ -446,7 +457,7 @@ mod tests {
                 },
                 TodoItem {
                     text: "Dropped".to_string(),
-                    status: TodoStatus::Cancelled,
+                    status: TodoStatus::Canceled,
                 },
             ],
         };

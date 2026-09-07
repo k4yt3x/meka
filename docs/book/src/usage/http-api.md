@@ -471,9 +471,9 @@ With `stream: true`, the response is a `text/event-stream`. Every event has a mo
 | `turn.started` | `turn_id`, `session_id`, `started_at` | Turn begins |
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, optional `refusal_text` | Turn completed successfully |
 | `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape) | Turn failed mid-stream |
-| `turn.cancelled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, or `"sse_lag"` when the only consumer fell behind and the turn was stopped for it) | Turn was canceled |
+| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, or `"sse_lag"` when the only consumer fell behind and the turn was stopped for it) | Turn was canceled |
 
-`turn.finished`, `turn.failed`, and `turn.cancelled` are **terminal**; the connection closes immediately after. Every terminal carries `turn_id` and `session_id`, so a client holding several streams can file it without keeping per-connection state.
+`turn.finished`, `turn.failed`, and `turn.canceled` are **terminal**; the connection closes immediately after. Every terminal carries `turn_id` and `session_id`, so a client holding several streams can file it without keeping per-connection state.
 
 #### Content deltas
 
@@ -524,7 +524,7 @@ A `: keep-alive` comment is sent every 20 seconds. SSE clients ignore these auto
 
 The server buffers up to 256 events per SSE stream. If a consumer reads too slowly and falls behind, the server closes that consumer's stream, and what it sends first depends on whether anyone else was still reading:
 
-- **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.so/errors/sse-lag`. The outcome recorded for a later re-attach is a `turn.cancelled` with `reason: "sse_lag"`. Retry by submitting a new turn.
+- **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.so/errors/sse-lag`. The outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"`. Retry by submitting a new turn.
 - **Another consumer was keeping up.** The turn keeps running for them, so nothing has failed. The lagging stream ends with a `warn` `notice` explaining the drop (the usual `level` and `text`, plus `turn_id` and `session_id`) and closes. **Re-attach with `Last-Event-ID`** rather than retrying: the turn is still in flight, so a new turn would be refused with `409 turn-in-flight`, and re-attaching recovers the dropped events instead of redoing the work.
 
 Turn events are broadcast, so a re-attached client or a second consumer counts as a separate reader. Use `GET /messages` to inspect what the agent completed either way.
@@ -583,7 +583,7 @@ Every delivery carries `delivery_id`, `event`, `timestamp`, and event-specific i
 }
 ```
 
-A `schedule.fired` `status` is `completed`, `failed`, or `cancelled` when the turn was stopped before it finished, as happens when the server drains during it.
+A `schedule.fired` `status` is `completed`, `failed`, or `canceled` when the turn was stopped before it finished, as happens when the server drains during it.
 
 **Payloads never carry message content.** A webhook URL is a string in a config file: it can be mistyped, it can outlive whatever owned it, and anything that learns it can reach it. So a delivery tells you *what happened to which session*, and you fetch the conversation with your own bearer token over the API you already authenticate against. A compromised endpoint learns that a session was active, not what was said in it.
 
@@ -780,7 +780,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 | `/errors/session-not-loaded` | 409 | The session exists but is not in memory; submit a turn to load it. Do **not** retry `POST /cancel`: there is no turn to cancel |
 | `/errors/session-locked` | 409 | Another meka process holds the session's lock (e.g. two `meka serve` instances sharing one store); wait or restart the other process |
 | `/errors/turn-in-flight` | 409 | A turn is already running on this session within *this* process; cancel it via `POST /cancel` first |
-| `/errors/turn-cancelled` | 409 | Turn was canceled |
+| `/errors/turn-canceled` | 409 | Turn was canceled |
 | `/errors/store-read-only` | 409 | The skill lives under a `[skills] extra_paths` root; meka reads those but never writes to them, so writing here would shadow the file rather than change it |
 | `/errors/session-not-drivable` | 422 | The id names a sub-agent's conversation. Reading it is unaffected; continuing it means `agent_followup` from the parent, whose id the message names. **Do not retry with a corrected payload**: no body addressed at this id is accepted |
 | `/errors/request-not-found` | 404 | Unknown or expired `request_id` |
@@ -853,7 +853,7 @@ A session is never evicted while a turn is in flight, while a scheduled fire or 
 
 1. Stop accepting new connections.
 2. Cancel all in-flight turns (same mechanism as `POST /cancel`).
-3. Emit `turn.cancelled` with `reason: "server_shutdown"` on open SSE streams.
+3. Emit `turn.canceled` with `reason: "server_shutdown"` on open SSE streams.
 4. Wait up to `shutdown_drain_timeout` for every turn to finish unwinding, including scheduled
    fires, background-outcome deliveries, and turns whose client has already disconnected.
    Canceling a turn is not the same as waiting for one: what follows the cancellation is the
@@ -1096,7 +1096,7 @@ A `schedule:*`-only token can still plant ordinary prompt-only jobs; it cannot r
 
 `DELETE /v1/schedule/{job_id}` and `DELETE /v1/sessions/{id}/tasks/{task_id}` both accept a unique id prefix as well as the full id, matching `meka schedule cancel` and the `schedule_cancel` / `task_cancel` tools: the 8-character short form those surfaces print is enough. An id matching nothing is a 404 and one matching several is a 422, so a typo is never reported as a cancellation. A job that a scheduler sweep retired between the lookup and the delete is a 404 as well, for the same reason: 204 means this request canceled the job, not merely that it is gone.
 
-Canceling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `cancelled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
+Canceling a background task records the cancellation and signals the running task, but only `meka serve` can signal work `meka serve` started. If the session is open in another process (a `meka -r` REPL, say), the row is marked `canceled` and the command keeps running there until it ends on its own; its result is then discarded, because the row is no longer `running`.
 
 `POST /v1/mcp/{name}/reconnect` answers 200 with where the server now stands, which is not the same as "it worked": **read `state`, not the status code**. An attempt that ran and failed is a 200 carrying `state: "failed"`, not a 502. A server the startup sweep is still connecting comes back as `state: "pending"` with no attempt made, so a dashboard polling `GET /v1/mcp` during startup does not mistake "still coming up" for "down". The two non-200s are narrow: 422 when the server is `disabled` in config, and 502 when an already-connected server's transport could not be re-established within `[mcp] connect_timeout`.
 

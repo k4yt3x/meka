@@ -1184,7 +1184,7 @@ fn a_resumed_session_replays_the_reasoning_it_recorded() {
 /// only a prompt redraw is wasted. It is an optimization sitting in front of the real guard, and
 /// catching it needs an assertion about drawing rather than about the conversation.
 #[test]
-fn a_cancelled_task_rides_the_next_prompt_in_the_repl() {
+fn a_canceled_task_rides_the_next_prompt_in_the_repl() {
     let install = repl_install_with_extra(
         true,
         true,

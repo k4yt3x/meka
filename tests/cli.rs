@@ -2119,10 +2119,10 @@ fn a_oneshot_run_carries_an_outcome_that_was_waiting() {
         .execute(
             "INSERT INTO background_tasks \
              (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
-             VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+             VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
             rusqlite::params![uuid::Uuid::new_v4().to_string(), &id, now],
         )
-        .expect("seed the cancelled task");
+        .expect("seed the canceled task");
 
     let resumed = run_scripted(&install, &["-r", &id, "--oneshot", "-p", "what happened?"]);
     assert!(

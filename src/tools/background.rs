@@ -181,7 +181,7 @@ impl Tool for TaskCancelTool {
             let store = self.context.store.background_store();
             for id in &ids {
                 store
-                    .finish_background_task(id, TaskStatus::Cancelled, None, None)
+                    .finish_background_task(id, TaskStatus::Canceled, None, None)
                     .await?;
             }
             let signaled = self.context.tasks.cancel_session(session_id).await;
@@ -232,7 +232,7 @@ impl Tool for TaskCancelTool {
         self.context
             .store
             .background_store()
-            .finish_background_task(&task.id, TaskStatus::Cancelled, None, None)
+            .finish_background_task(&task.id, TaskStatus::Canceled, None, None)
             .await?;
         let signaled = self.context.tasks.cancel(&task.id).await;
         if !signaled {
@@ -414,7 +414,7 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(undelivered.len(), 1);
-        assert_eq!(undelivered[0].status, TaskStatus::Cancelled);
+        assert_eq!(undelivered[0].status, TaskStatus::Canceled);
     }
 
     #[tokio::test]
@@ -516,7 +516,7 @@ mod tests {
             .await
             .expect("list");
         assert_eq!(undelivered.len(), 1);
-        assert_eq!(undelivered[0].status, TaskStatus::Cancelled);
+        assert_eq!(undelivered[0].status, TaskStatus::Canceled);
     }
 
     #[tokio::test]

@@ -696,7 +696,7 @@ mod tests {
     use tokio::sync::{Mutex, RwLock};
 
     use super::*;
-    use crate::config::{McpAuthConfig, McpServerConfig, McpTransport};
+    use crate::config::{McpAuthConfig, McpServerConfig};
 
     /// A stored bearer and an `[auth]` block cannot both be honored, and rmcp resolves the tie the
     /// wrong way round: it consults the authorization flow only when the transport carries no

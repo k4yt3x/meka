@@ -94,8 +94,11 @@ assumption is the entire return, and it is lost the moment a second place tolera
 
 ## Prose style
 
-- American spelling (behavior, color, canceled, catalog) in prose, comments, docs and strings.
-  Protocol and API names keep their own (`initialize`, `authorization_code`, `serde::Serialize`).
+- American spelling everywhere meka owns the word: prose, comments, docs, strings, identifiers and
+  meka's own wire values (`canceled`, `color`, `catalog`, `behavior`). Only a name another protocol
+  or crate defines keeps its spelling (ACP's `stopReason: "cancelled"`, MCP's
+  `notifications/cancelled`, `serde::Serialize`), and a value a model emits may be accepted in both
+  spellings while meka writes one.
 - No em dashes (`—`). Prefer a colon, a comma or parentheses.
 - Sentence-case headings in the book; product names keep their case.
 

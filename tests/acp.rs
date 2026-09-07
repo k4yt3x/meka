@@ -2851,7 +2851,7 @@ model = "claude-sonnet-4-5"
         serde_json::from_str(response_line).expect("parse PromptResponse");
     assert_eq!(
         response["result"]["stopReason"], "cancelled",
-        "session/cancel must resolve the in-flight prompt with cancelled; got: {response}",
+        "session/cancel must resolve the in-flight prompt with canceled; got: {response}",
     );
 }
 
@@ -2976,7 +2976,7 @@ model = "claude-sonnet-4-5"
         .expect("parse PromptResponse");
         assert_eq!(
             response["result"]["stopReason"], "cancelled",
-            "prompt must resolve as cancelled; got: {response}",
+            "prompt must resolve as canceled; got: {response}",
         );
 
         drop(stdin);
@@ -3872,7 +3872,7 @@ fn acp_multi_session_cancel_fires_only_target_session() {
     assert_eq!(
         a_stop.as_deref(),
         Some("cancelled"),
-        "session A must resolve cancelled",
+        "session A must resolve canceled",
     );
     assert_eq!(
         b_stop.as_deref(),
@@ -3946,7 +3946,7 @@ fn acp_session_close_while_prompt_in_flight_cancels_and_rejects_followups() {
     assert_eq!(
         prompt_stop_reason.as_deref(),
         Some("cancelled"),
-        "in-flight prompt must resolve cancelled when session is closed mid-turn",
+        "in-flight prompt must resolve canceled when session is closed mid-turn",
     );
     assert!(
         close_result_seen,
@@ -4966,10 +4966,10 @@ fn acp_session_prompt_accepts_image_with_vision() {
 
 /// `session/cancel` yields a `Cancelled` stop reason even when the cancellation manifests as
 /// a non-`Interrupted` provider error. Script a `Sleep` followed by a `Fail`; fire cancel during
-/// the sleep; assert `stopReason: cancelled` rather than the JSON-RPC error the `Fail` would
+/// the sleep; assert `stopReason: canceled` rather than the JSON-RPC error the `Fail` would
 /// otherwise produce.
 #[test]
-fn acp_session_prompt_cancelled_after_provider_error() {
+fn acp_session_prompt_canceled_after_provider_error() {
     let script = serde_json::json!([[
         { "type": "text", "text": "starting..." },
         { "type": "sleep", "ms": 5000 },
@@ -5036,7 +5036,7 @@ fn acp_a_cancel_sent_straight_after_a_prompt_stops_it() {
 /// Canceling a turn that is actually running must not disarm the next one. The latch exists for
 /// the cancel no turn received; a cancel a live turn consumed has already done its work.
 #[test]
-fn acp_cancelling_a_running_turn_leaves_the_next_one_alone() {
+fn acp_canceling_a_running_turn_leaves_the_next_one_alone() {
     // First turn sleeps so the cancel lands mid-flight. Second turn is short: it must run.
     let script = serde_json::json!([
         [
@@ -5267,7 +5267,7 @@ enabled = ["read", "unrestricted"]
 /// `session/cancel` during an approval prompt resolves the turn promptly. Without the race against
 /// the cancellation token, the agent hangs inside `request_permission` until the client answers.
 #[test]
-fn acp_session_request_permission_cancelled_by_session_cancel() {
+fn acp_session_request_permission_canceled_by_session_cancel() {
     let config_toml = r#"
 [accounts.mock]
 backend = "anthropic-messages"
@@ -6858,14 +6858,14 @@ poll_interval = "200ms"
             .execute(
                 "INSERT INTO background_tasks \
                  (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     &session_id,
                     now.to_rfc3339()
                 ],
             )
-            .expect("seed the cancelled task");
+            .expect("seed the canceled task");
         // Due a minute ago, so the very next sweep fires it.
         connection
             .execute(
@@ -6970,7 +6970,7 @@ poll_interval = "200ms"
     );
     harness.cancel(&session_id);
 
-    // Past the script's sleep, so an uncancelled turn would have written its far side by now.
+    // Past the script's sleep, so an uncanceled turn would have written its far side by now.
     std::thread::sleep(Duration::from_secs(8));
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
     let reached: i64 = connection
@@ -7112,14 +7112,14 @@ poll_interval = "200ms"
             .execute(
                 "INSERT INTO background_tasks \
                  (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     &session_id,
                     chrono::Utc::now().to_rfc3339(),
                 ],
             )
-            .expect("seed the cancelled task");
+            .expect("seed the canceled task");
     }
 
     // Several poll intervals, so a delivering poller has every chance to prove itself.
@@ -7167,7 +7167,7 @@ poll_interval = "200ms"
 /// the suite green. Seeded straight into the store rather than run for real: what is under test is
 /// what the editor's prompt carries, not whether `sleep` works.
 #[test]
-fn a_cancelled_task_rides_the_editors_next_prompt() {
+fn a_canceled_task_rides_the_editors_next_prompt() {
     let script = serde_json::json!([[
         { "type": "text", "text": "answered" },
         { "type": "message_end", "stop_reason": "end_turn" }
@@ -7193,14 +7193,14 @@ enabled = true
             .execute(
                 "INSERT INTO background_tasks \
                  (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
-                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'cancelled', NULL, ?3, ?3)",
+                 VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
                     &session_id,
                     chrono::Utc::now().to_rfc3339(),
                 ],
             )
-            .expect("seed the cancelled task");
+            .expect("seed the canceled task");
     }
 
     let id = harness.prompt(&session_id, "what is in this CSV?");

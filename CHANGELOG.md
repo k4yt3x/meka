@@ -18,7 +18,7 @@ table, meka's per-turn context is its own content block, and a scheduled job run
 level its session recorded. Under the surface, one definition answers each question that several
 doors used to answer differently: unknown names, session writes, recorded levels, working
 directories, titles, timestamps, sizes, error mapping, JSON record shapes. A 0.45 `config.toml` is
-converted by `scripts/migrate-0.45-to-0.46.py`; the store migrates itself in nine ledger steps behind
+converted by `scripts/migrate-0.45-to-0.46.py`; the store migrates itself in ten ledger steps behind
 a backup. The upgrade guide lists every breaking change with its remedy.
 
 ### Added
@@ -111,6 +111,10 @@ a backup. The upgrade guide lists every breaking change with its remedy.
 - **Breaking:** `GET /v1/health/ready` reports `profile_configured` (was `provider_configured`).
 - **Breaking:** `mcp add --auth` takes `oauth`, `client_credentials` or `client_credentials_jwt`, the
   spelling the `[auth]` block records; the hyphenated forms and case variants are gone.
+- **Breaking:** American spelling on every wire meka owns: a stopped background task's `status` is
+  `canceled` (the store rewrites existing rows on open), a stopped turn's SSE terminal event is
+  `turn.canceled` with problem type `/errors/turn-canceled`, and a `schedule.fired` webhook reports
+  `status: "canceled"`; the `todo` tool writes `canceled` and still understands `cancelled`.
 - **Breaking:** ACP `session/set_config_option` refuses a profile switch while a turn is in flight
   instead of writing the row and deferring the move.
 - One sentence per refusal on every host: `session '<id>' not found`, `cannot <verb> while a turn is
@@ -274,6 +278,8 @@ a backup. The upgrade guide lists every breaking change with its remedy.
   to the user for approval; `agent_followup` moved a sub-agent's profile row before the lock or
   hydration could refuse the turn.
 - Wrapping a tool argument to one or two rows produced one row more than the budget allowed.
+- A `chatgpt-subscription` turn sent two `Content-Type` headers, which the backend refused with
+  `400 Unsupported content type`; the send path sets the header once.
 - A `[web]` client meka cannot build fails startup on every host, not the first turn of a session.
 - Skill-store refusals name the skill and log the path instead of putting it in HTTP 409 and 422
   bodies; a skill that cannot be read mid-turn no longer names the skills directory in its 500.

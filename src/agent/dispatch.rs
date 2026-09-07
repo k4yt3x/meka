@@ -179,7 +179,7 @@ impl Agent {
             tool.runs_outside_confinement(),
         );
         if let Admission::Refuse(refusal) = admission {
-            return refusal;
+            return *refusal;
         }
         // Scope the id across both dispatch paths, so a tool that has to correlate itself with the
         // client's view of this call -- `agent_spawn`, routing its sub-agent's activity back into
@@ -302,7 +302,7 @@ impl Agent {
                 "User denied tool execution.".to_string(),
                 true,
             )),
-            PermissionOutcome::Cancelled => Some(crate::tools::ToolOutput::text(
+            PermissionOutcome::Canceled => Some(crate::tools::ToolOutput::text(
                 "Approval request was canceled.".to_string(),
                 true,
             )),
@@ -590,7 +590,10 @@ pub(super) enum Admission {
     /// Above the level, and the session submits such calls for approval.
     Ask,
     /// Above the level, with nobody to ask: the result the model gets instead.
-    Refuse(crate::tools::ToolOutput),
+    ///
+    /// Boxed because a `ToolOutput` alone crosses clippy's `large_enum_variant` threshold on
+    /// Windows, where `PathBuf` is eight bytes wider.
+    Refuse(Box<crate::tools::ToolOutput>),
 }
 
 /// The one rule for whether a tool call runs, is submitted for approval, or is refused.
@@ -620,13 +623,13 @@ pub(super) fn admit_tool_call(
         if approvals {
             return Admission::Ask;
         }
-        return Admission::Refuse(crate::tools::ToolOutput::text(
+        return Admission::Refuse(Box::new(crate::tools::ToolOutput::text(
             format!(
                 "Permission denied: '{name}' requires `{required}` permission, current level is \
                  `{permission}`. Ask the user to raise it to `{required}`."
             ),
             true,
-        ));
+        )));
     }
     if permission == crate::permission::Permission::Workspace
         && !required.is_within(permission)
@@ -635,14 +638,14 @@ pub(super) fn admit_tool_call(
         if approvals {
             return Admission::Ask;
         }
-        return Admission::Refuse(crate::tools::ToolOutput::text(
+        return Admission::Refuse(Box::new(crate::tools::ToolOutput::text(
             format!(
                 "'{name}' runs inside its MCP server's own process, which meka does not sandbox, so \
                  `workspace` cannot confine what it writes. Ask the user for `unrestricted`, or \
                  grant it explicitly with `[mcp.servers.*].tool_permissions` in the config."
             ),
             true,
-        ));
+        )));
     }
     Admission::Run
 }

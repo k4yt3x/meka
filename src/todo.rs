@@ -20,12 +20,12 @@ pub(crate) enum TodoStatus {
     #[serde(alias = "done", alias = "complete", alias = "finished")]
     Completed,
     #[serde(
-        alias = "canceled",
+        alias = "cancelled",
         alias = "skipped",
         alias = "dropped",
         alias = "wontfix"
     )]
-    Cancelled,
+    Canceled,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TodoItem {
@@ -107,9 +107,9 @@ pub(crate) fn format_todo_state(state: &TodoState) -> String {
             TodoStatus::Pending => "[ ]",
             TodoStatus::InProgress => "[~]",
             TodoStatus::Completed => "[x]",
-            TodoStatus::Cancelled => "[-]",
+            TodoStatus::Canceled => "[-]",
         };
-        if item.status == TodoStatus::Cancelled {
+        if item.status == TodoStatus::Canceled {
             output.push_str(&format!(
                 "- {} {} (canceled) {}\n",
                 marker, number, item.text

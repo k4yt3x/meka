@@ -175,7 +175,7 @@ fn refuse_if_undecodable(bytes: &[u8], format: ImageFormat) -> Result<(), String
 ///
 /// Those same caps then permit 16384x16384x3, about 805 MB, against a ceiling of 128 MiB.
 /// `output_buffer_size` is computed from the frame header and allocated in one go, so it is the
-/// exact analogue of a PNG's `IHDR` and is checked the same way: over the ceiling means meka
+/// exact analog of a PNG's `IHDR` and is checked the same way: over the ceiling means meka
 /// declines to find out, which is a pass, not a refusal (see [`refuse_if_undecodable`]).
 fn refuse_undecodable_jpeg(bytes: &[u8]) -> Result<(), String> {
     let options = zune_core::options::DecoderOptions::default()

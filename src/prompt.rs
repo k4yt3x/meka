@@ -578,7 +578,7 @@ fn detect_os_description() -> Option<String> {
             .output()
             .ok()?;
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        (!version.is_empty()).then(|| format!("macOS {}", version))
+        (!version.is_empty()).then(|| format!("macOS {version}"))
     }
     #[cfg(target_os = "windows")]
     {

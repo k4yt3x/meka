@@ -554,7 +554,7 @@ mod tests {
             TaskStatus::Running,
             TaskStatus::Completed,
             TaskStatus::Failed,
-            TaskStatus::Cancelled,
+            TaskStatus::Canceled,
             TaskStatus::Interrupted,
         ] {
             assert_eq!(status.name().parse::<TaskStatus>(), Ok(status));
@@ -578,7 +578,7 @@ mod tests {
         let headlines: Vec<String> = [
             TaskStatus::Completed,
             TaskStatus::Failed,
-            TaskStatus::Cancelled,
+            TaskStatus::Canceled,
             TaskStatus::Interrupted,
         ]
         .into_iter()
@@ -687,7 +687,7 @@ mod tests {
             );
         }
         assert!(
-            !TaskStatus::Cancelled.wakes_a_host(),
+            !TaskStatus::Canceled.wakes_a_host(),
             "whoever canceled it already knows, and a stop command must not start a turn"
         );
     }
@@ -703,7 +703,7 @@ mod tests {
         // be tested with two rows that carry the same one.
         let mut won = task(TaskStatus::Completed, Some("built"));
         won.id = "11111111-0000-0000-0000-000000000000".to_string();
-        let mut lost = task(TaskStatus::Cancelled, None);
+        let mut lost = task(TaskStatus::Canceled, None);
         lost.id = "22222222-0000-0000-0000-000000000000".to_string();
         let read = vec![won.clone(), lost.clone()];
 
@@ -732,7 +732,7 @@ mod tests {
     /// `list_undelivered_background_tasks` never returns it again.
     #[test]
     fn a_prompt_carrying_an_outcome_is_never_withdrawn() {
-        let carried = [task(TaskStatus::Cancelled, None)];
+        let carried = [task(TaskStatus::Canceled, None)];
         for asked in [
             crate::conversation::PromptRetention::Keep,
             crate::conversation::PromptRetention::WithdrawOnFailure,
@@ -768,7 +768,7 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             tool_name: "execute_command".to_string(),
             label: "sleep 900".to_string(),
-            status: TaskStatus::Cancelled,
+            status: TaskStatus::Canceled,
             outcome: None,
             scratchpad_name: None,
             announced_at: None,

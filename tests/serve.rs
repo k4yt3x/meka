@@ -15,15 +15,15 @@
 //! End-to-end integration tests for `meka serve`. Spawns the real `meka serve` binary against
 //! a tempdir and a scripted mock provider, then drives it over HTTP via `reqwest`.
 
-// Only the `#[cfg(unix)]` shutdown tests read an SSE body directly; importing it unconditionally
-// made the Windows build warn about an import nothing there uses.
-#[cfg(unix)]
-use std::io::Read;
 use std::{
     io::BufRead,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     time::{Duration, Instant},
 };
+// Only the `#[cfg(unix)]` shutdown tests read an SSE body directly and shell out to `kill`; an
+// unconditional import of either made the Windows build warn about an unused import.
+#[cfg(unix)]
+use std::{io::Read, process::Command};
 
 #[path = "harness/support.rs"]
 mod support;
@@ -1654,11 +1654,11 @@ fn idempotency_does_not_cache_server_errors() {
     );
 }
 
-/// `POST /cancel` against an in-flight streaming turn produces a `turn.cancelled` SSE event
+/// `POST /cancel` against an in-flight streaming turn produces a `turn.canceled` SSE event
 /// with `"reason":"client"` on the streaming response, validating the SSE select-loop's
 /// cancel branch.
 #[test]
-fn cancel_during_in_flight_turn_emits_cancelled_event() {
+fn cancel_during_in_flight_turn_emits_canceled_event() {
     let script = serde_json::json!([
         [
             { "type": "sleep", "ms": 2000 },
@@ -1704,8 +1704,8 @@ fn cancel_during_in_flight_turn_emits_cancelled_event() {
     let response = streaming.join().expect("join");
     let body = response.text().expect("body");
     assert!(
-        body.contains("event: turn.cancelled"),
-        "stream must emit turn.cancelled when /cancel fires mid-turn; body was:\n{body}",
+        body.contains("event: turn.canceled"),
+        "stream must emit turn.canceled when /cancel fires mid-turn; body was:\n{body}",
     );
     assert!(
         body.contains("\"reason\":\"client\""),
@@ -1794,13 +1794,13 @@ fn max_concurrent_turns_returns_429_across_sessions() {
 }
 
 /// Graceful shutdown: an in-flight streaming turn receives a final
-/// `turn.cancelled{reason:"server_shutdown"}` SSE event when the server is SIGTERM'd.
+/// `turn.canceled{reason:"server_shutdown"}` SSE event when the server is SIGTERM'd.
 ///
 /// Unix-only (uses `kill` to send SIGTERM); skipped on Windows since the server's shutdown path
 /// there only listens for Ctrl+C and we can't deliver that to a child process easily.
 #[cfg(unix)]
 #[test]
-fn graceful_shutdown_emits_server_shutdown_cancelled() {
+fn graceful_shutdown_emits_server_shutdown_canceled() {
     // Long-sleep script so the streaming turn is still in flight when the signal arrives.
     let script = serde_json::json!([
         [
@@ -1840,7 +1840,7 @@ fn graceful_shutdown_emits_server_shutdown_cancelled() {
     });
 
     // The turn has to be admitted before the signal lands, or there is nothing to cancel and
-    // the drain emits no `turn.cancelled` at all.
+    // the drain emits no `turn.canceled` at all.
     harness.wait_until_in_flight(&id);
     let kill_status = Command::new("kill")
         .arg("-TERM")
@@ -1852,8 +1852,8 @@ fn graceful_shutdown_emits_server_shutdown_cancelled() {
     let response = streaming.join().expect("stream join");
     let body = response.text().expect("body");
     assert!(
-        body.contains("event: turn.cancelled"),
-        "drained server must emit turn.cancelled; body was:\n{body}",
+        body.contains("event: turn.canceled"),
+        "drained server must emit turn.canceled; body was:\n{body}",
     );
     assert!(
         body.contains("\"reason\":\"server_shutdown\""),
@@ -4646,9 +4646,9 @@ fn blocking_turn_with_reasoning_stream_includes_thinking() {
     assert_eq!(text["text"], "answer.");
 }
 
-/// A blocking-mode `POST /cancel` produces 409 `turn-cancelled`.
+/// A blocking-mode `POST /cancel` produces 409 `turn-canceled`.
 #[test]
-fn cancel_during_blocking_turn_returns_409_turn_cancelled() {
+fn cancel_during_blocking_turn_returns_409_turn_canceled() {
     let script = serde_json::json!([
         [
             { "type": "sleep", "ms": 2000 },
@@ -4695,10 +4695,10 @@ fn cancel_during_blocking_turn_returns_409_turn_cancelled() {
     assert_eq!(
         response.status(),
         409,
-        "blocking-mode cancel must surface as 409 turn-cancelled, not 500 internal",
+        "blocking-mode cancel must surface as 409 turn-canceled, not 500 internal",
     );
     let problem: serde_json::Value = response.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/turn-cancelled");
+    assert_eq!(problem["type"], "https://meka.so/errors/turn-canceled");
 }
 
 /// The auto-deny path itself: a scripted tool call above the level, with approvals on and
@@ -4942,10 +4942,10 @@ fn cancel_mid_tool_call_leaves_no_orphaned_tool_use_in_the_store() {
     assert_eq!(
         response.status(),
         409,
-        "a turn cancelled mid-composition is reported as cancelled"
+        "a turn canceled mid-composition is reported as canceled"
     );
     let problem: serde_json::Value = response.json().expect("parse");
-    assert_eq!(problem["type"], "https://meka.so/errors/turn-cancelled");
+    assert_eq!(problem["type"], "https://meka.so/errors/turn-canceled");
 
     let messages: serde_json::Value = harness
         .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
@@ -5758,7 +5758,7 @@ fn import_rejects_a_malformed_envelope() {
 /// what gets pasted here. Canceling on it must work, and an id matching nothing must say so
 /// rather than answering 204 over a job that is still firing.
 #[test]
-fn cancelling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
+fn canceling_a_scheduled_job_takes_a_prefix_and_reports_a_miss() {
     let harness = ServeTestHarness::spawn_with("", "", mock_simple_turn(), "sk_test_token", &[
         "sessions:r",
         "sessions:w",
@@ -8009,7 +8009,7 @@ fn webhook_payloads_carry_no_message_content() {
 /// answer while a turn holds the runtime mutex, and if it ever captured a different registry than
 /// the agent dispatches through, this endpoint would report 204 over a task that kept running.
 #[test]
-fn cancelling_a_running_background_task_stops_it() {
+fn canceling_a_running_background_task_stops_it() {
     let script = serde_json::json!([
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
@@ -8073,7 +8073,7 @@ fn cancelling_a_running_background_task_stops_it() {
         .find(|task| task["id"] == task_id.as_str())
         .expect("the task must still be listed");
     assert_eq!(
-        task["status"], "cancelled",
+        task["status"], "canceled",
         "the cancellation must be recorded, not just signaled: {after}"
     );
 }
@@ -8090,7 +8090,7 @@ fn cancelling_a_running_background_task_stops_it() {
 /// The script is the assertion that no turn was spent: it holds exactly one round after the
 /// cancellation, so a poller that delivered would consume it and leave the real turn to fail.
 #[test]
-fn a_cancelled_task_rides_on_the_next_turn_instead_of_causing_one() {
+fn a_canceled_task_rides_on_the_next_turn_instead_of_causing_one() {
     let script = serde_json::json!([
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "execute_command" },
@@ -8483,7 +8483,7 @@ fn a_scheduled_fire_announces_what_it_claims() {
         .expect("the fire that claimed the outcome must also announce it");
     let body: serde_json::Value = serde_json::from_str(&delivery.body).expect("json");
     assert_eq!(body["event"], "task.finished");
-    assert_eq!(body["status"], "cancelled", "body was {body}");
+    assert_eq!(body["status"], "canceled", "body was {body}");
 }
 
 /// A scheduled fire carries a cancellation that has been waiting for a turn.
@@ -8604,7 +8604,7 @@ fn a_scheduled_fire_carries_a_cancellation_that_was_waiting() {
 /// the announce half -- the payload test above rides the ordinary completed path, which announced
 /// correctly before the change too.
 #[test]
-fn a_cancelled_task_is_announced_without_being_delivered() {
+fn a_canceled_task_is_announced_without_being_delivered() {
     let (port, rx) = spawn_webhook_listener();
     let config = format!(
         "\n[background]\nenabled = true\n\n[schedule]\npoll_interval = \"200ms\"\n\n         [[serve.webhooks]]\nurl = \"http://127.0.0.1:{port}/hook\"\n         secret = \"s\"\nevents = [\"task.finished\"]\n"
@@ -8669,10 +8669,10 @@ fn a_cancelled_task_is_announced_without_being_delivered() {
 
     let delivery = rx
         .recv_timeout(Duration::from_secs(30))
-        .expect("a cancelled task must still reach subscribers");
+        .expect("a canceled task must still reach subscribers");
     let body: serde_json::Value = serde_json::from_str(&delivery.body).expect("json");
     assert_eq!(body["event"], "task.finished");
-    assert_eq!(body["status"], "cancelled", "body was {body}");
+    assert_eq!(body["status"], "canceled", "body was {body}");
 
     // Announcing must not have delivered: the conversation is untouched, and a second delivery must
     // not arrive on any later poll.
@@ -9346,7 +9346,7 @@ fn zero_valued_serve_knobs_are_rejected_at_startup() {
 /// turn then returned instantly and compaction fell back to the standalone summarizer -- no
 /// memories written, a worse summary, and a `warn` as the only trace.
 #[test]
-fn compacting_after_a_cancelled_turn_still_runs_the_checkpoint() {
+fn compacting_after_a_canceled_turn_still_runs_the_checkpoint() {
     let script = serde_json::json!([
         // Turn one: slow enough to cancel.
         [
@@ -9402,7 +9402,7 @@ fn compacting_after_a_cancelled_turn_still_runs_the_checkpoint() {
     let source = body["source"].as_str().unwrap_or_default();
     assert!(
         source.starts_with("checkpoint"),
-        "the checkpoint turn must actually run after a cancelled turn, not be skipped because it \
+        "the checkpoint turn must actually run after a canceled turn, not be skipped because it \
          inherited the fired token; source was {source:?}"
     );
 }
@@ -9517,7 +9517,7 @@ fn a_turn_honors_one_compaction_request_however_many_it_gets() {
 /// The request is parked by a tool that ignores its cancellation token, so it survives the
 /// interrupt. Running it anyway replaces the whole window and -- because a fired token makes
 /// `run_checkpoint_turn` return early -- does it through the standalone summarizer, writing nothing
-/// to memory. That is the failure `compacting_after_a_cancelled_turn_still_runs_the_checkpoint`
+/// to memory. That is the failure `compacting_after_a_canceled_turn_still_runs_the_checkpoint`
 /// exists to prevent, reached through a different door.
 ///
 /// Pins the outcome, not which guard delivers it. Two now stand in the way -- the drain declines to
@@ -9586,7 +9586,7 @@ fn an_interrupt_stops_a_requested_compaction_before_it_replaces_the_window() {
 /// The same stop, one instant later: an interrupt that arrives *inside* the compaction.
 ///
 /// Guarding only the drain's entry covers the narrow case. Nothing between there and the rewrite
-/// is cancellable: `run_checkpoint_turn` answers a fired token with `Ok(None)` and hands on to the
+/// is cancelable: `run_checkpoint_turn` answers a fired token with `Ok(None)` and hands on to the
 /// summarizer, and `provider.complete` takes no token, so the compaction reports success and the
 /// window goes anyway. The checkpoint is skipped precisely because the token fired, so what
 /// replaces the conversation is a summary written without the agent, with nothing saved.
@@ -9660,7 +9660,7 @@ fn an_interrupt_inside_a_requested_compaction_still_spares_the_window() {
 ///
 /// The emergency path turns any error from `compact_session` into `ContextOverflow`, which was
 /// harmless while that call could not fail on an interrupt. Now that it refuses to rewrite the
-/// window on a fired token, relabelling would answer a user who pressed stop with "the
+/// window on a fired token, relabeling would answer a user who pressed stop with "the
 /// conversation exceeds the model's context window" -- and a 502 `/errors/context-overflow` --
 /// telling them to shorten a conversation that was never the problem.
 ///
@@ -9908,7 +9908,7 @@ fn two_requests_for_an_evicted_session_are_both_served() {
 ///
 /// Two properties in one run, because they were entangled. The key exists so a client whose
 /// connection died can retry; cancellation is the case that most invites a retry, and caching it
-/// answered every retry "cancelled" for the full 24h TTL. But an earlier version of this test was
+/// answered every retry "canceled" for the full 24h TTL. But an earlier version of this test was
 /// flaky at about one run in four, and the cause was a second defect rather than the test: the
 /// turn's cancellation token is published *after* `TurnGuard::acquire`, so a `POST /cancel` landing
 /// in that window canceled the previous turn's token, answered 204, and left this turn running to
@@ -9916,7 +9916,7 @@ fn two_requests_for_an_evicted_session_are_both_served() {
 /// describe -- walked straight into it. `SessionEntry::cancel_epoch` closes the window, and this is
 /// the test that exercises the wiring rather than the helper.
 #[test]
-fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
+fn a_canceled_turn_is_not_cached_against_its_idempotency_key() {
     let script = serde_json::json!([
         [
             { "type": "sleep", "ms": 4000 },
@@ -9939,7 +9939,7 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
         .expect("id")
         .to_string();
 
-    let key = "cancelled-then-retried";
+    let key = "canceled-then-retried";
     let body = serde_json::json!({"message": "long", "stream": false});
 
     let base_url = harness.base_url.clone();
@@ -9967,13 +9967,13 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
         .expect("cancel");
     assert_eq!(cancel.status(), 204);
 
-    let cancelled = first.join().expect("join");
-    let cancelled_status = cancelled.status();
-    let cancelled_body = cancelled.text().expect("text");
+    let canceled = first.join().expect("join");
+    let canceled_status = canceled.status();
+    let canceled_body = canceled.text().expect("text");
     assert!(
-        !cancelled_status.is_success(),
+        !canceled_status.is_success(),
         "the 204 said the turn was canceled, but it ran to completion: \
-         {cancelled_status} {cancelled_body}"
+         {canceled_status} {canceled_body}"
     );
 
     // Same key, same body. A cached cancellation would replay verbatim and the mock's second round
@@ -10002,7 +10002,7 @@ fn a_cancelled_turn_is_not_cached_against_its_idempotency_key() {
         "the retry did not run a turn: {retry_body}"
     );
     assert!(
-        !retry_body.contains("turn-cancelled"),
+        !retry_body.contains("turn-canceled"),
         "the retry replayed the cached cancellation instead of running: {retry_body}"
     );
 }

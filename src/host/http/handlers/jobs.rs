@@ -746,7 +746,7 @@ pub(crate) struct BackgroundTaskView {
     pub(crate) tool_name: String,
     /// Human-readable summary of what was started.
     pub(crate) label: String,
-    /// `running`, `completed`, `failed`, `cancelled`, or `interrupted`.
+    /// `running`, `completed`, `failed`, `canceled`, or `interrupted`.
     pub(crate) status: String,
     /// The tool's output for a terminal task, truncated when it was also spilled to the
     /// scratchpad.
@@ -900,7 +900,7 @@ pub(crate) async fn cancel_task(
         .shared
         .store
         .background_store()
-        .finish_background_task(&task.id, TaskStatus::Cancelled, None, None)
+        .finish_background_task(&task.id, TaskStatus::Canceled, None, None)
         .await
         .map_err(|error| {
             ProblemDetail::internal_sanitized("failed to record task cancellation", error)
@@ -921,7 +921,7 @@ pub(crate) async fn cancel_task(
     };
     if !signaled {
         // `warn`, not `debug`: this is the one outcome that differs from what the 204 claims. The
-        // row now says `cancelled` and `GET /tasks` will agree, but nothing in this process could
+        // row now says `canceled` and `GET /tasks` will agree, but nothing in this process could
         // reach the task, so if it is still running it will run to completion unnoticed -- and a
         // second cancel short-circuits on the now-terminal status. Worth seeing by default.
         tracing::warn!(

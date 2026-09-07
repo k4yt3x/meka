@@ -29,7 +29,7 @@ pub(crate) struct InfoResponse {
     pub(crate) version: String,
     pub(crate) default_permission: String,
     pub(crate) enabled_permissions: Vec<String>,
-    /// Whether the process default profile accepts image attachments. The HTTP analogue of ACP's
+    /// Whether the process default profile accepts image attachments. The HTTP analog of ACP's
     /// `promptCapabilities.image`, so a client can tell whether attaching one is worth the base64
     /// payload instead of discovering it from a 422.
     ///

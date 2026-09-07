@@ -124,7 +124,7 @@ fn retain_broadest(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
 /// The roots a write may land under at [`crate::permission::Permission::Workspace`]: the working
 /// directory plus [`SharedRoots`].
 ///
-/// All three sources the user can name feed [`SharedRoots`] rather than travelling separately: an
+/// All three sources the user can name feed [`SharedRoots`] rather than traveling separately: an
 /// ACP client's `additionalDirectories`, and each `--writable-root` on the command line. They mean
 /// the same thing (this folder is part of my workspace) and get the same treatment, searchable and
 /// writable, so there is no second list to keep in step with this one.

@@ -392,7 +392,7 @@ impl Frontend for ReplFrontend {
                     "(the turn was stopped; this approval is withdrawn. Press Enter to clear the \
                      prompt.)",
                 );
-                PermissionOutcome::Cancelled
+                PermissionOutcome::Canceled
             }
             response = response_receiver => match response {
                 Ok(decision) => {
@@ -407,7 +407,7 @@ impl Frontend for ReplFrontend {
                         PermissionOutcome::Deny
                     }
                 }
-                Err(_) => PermissionOutcome::Cancelled,
+                Err(_) => PermissionOutcome::Canceled,
             },
         }
     }
@@ -500,7 +500,7 @@ mod tests {
         )
         .await
         .expect("a canceled turn must not wait on the prompt");
-        assert_eq!(outcome, crate::frontend::PermissionOutcome::Cancelled);
+        assert_eq!(outcome, crate::frontend::PermissionOutcome::Canceled);
         // The prompt was still dispatched, so the editor thread has one to discard.
         assert!(matches!(
             receiver.try_recv(),
@@ -702,7 +702,7 @@ mod tests {
     /// model that simply chose not to use its tools, which is what sent someone debugging the
     /// prompt instead of the flag.
     ///
-    /// `Deny`, not `Cancelled`: nothing stopped the turn, the call was refused, and the tool result
+    /// `Deny`, not `Canceled`: nothing stopped the turn, the call was refused, and the tool result
     /// the model reads should say which.
     #[tokio::test]
     async fn a_tool_nobody_can_approve_is_denied_and_said_on_the_console() {

@@ -41,7 +41,7 @@ lists for anything you automated.
    it at a copy instead. `--self-test` checks the script against its own fixture and exits.
 2. **Install 0.46 and launch it once.** The store migrates on that open, behind an automatic copy
    beside it named for the schema version it came from (`meka.db.v9.bak` for a store 0.45 left),
-   in nine ledger steps. The first creates the REPL's `prompt_history` table where a store lacks
+   in ten ledger steps. The first creates the REPL's `prompt_history` table where a store lacks
    one, a no-op otherwise. The other eight: `sessions.provider` becomes `sessions.profile`, and
    `provider_credentials` becomes `account_credentials`, keyed by account, both renames of what
    was always there; an `approvals` column is added, every `ask` session becomes `none` with it
@@ -180,6 +180,12 @@ key whose value is not a whole number is left under its old name and reported, w
   `never`.
 - **Skills you wrote** that name a renamed tool parameter (next table) or the old `[ask]` prompt
   must be edited by hand; meka does not rewrite skill files.
+- **`canceled`, one `l`, on every wire meka owns.** Match `turn.canceled` as the SSE terminal event,
+  `https://meka.so/errors/turn-canceled` as the problem `type`, and `status == "canceled"` in task
+  views (`GET /v1/sessions/{id}/tasks`, `DELETE .../tasks/{task_id}`), `task_list` output and
+  `schedule.fired` webhook bodies; the `reason` values are unchanged. The store rewrites its stored
+  task rows on first open (the tenth ledger step). ACP's `stopReason: "cancelled"` and MCP's
+  `notifications/cancelled` are those protocols' own spellings and stay.
 
 ### Tool parameters
 
@@ -383,7 +389,7 @@ lock, rewrite its `cwd`, retire its background work and replace its roots before
 `Internal error`; both now decline with `InvalidParams` before touching anything, naming the parent
 to use `agent_followup` from. An editor that stored a sub-agent's id from `session/list` gets a clear
 refusal instead of a mutated row and an opaque failure. Over HTTP the same holds for every write-side
-endpoint: `POST /v1/sessions/{id}/turn` and its neighbours refuse before taking the sub-agent's lock or
+endpoint: `POST /v1/sessions/{id}/turn` and its neighbors refuse before taking the sub-agent's lock or
 marking its background tasks interrupted.
 
 **A session that carries spawn terms is refused even when its parent is not in the store.** That

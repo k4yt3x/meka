@@ -385,7 +385,7 @@ fn cancel_if_nobody_else_is_reading(
 ) -> bool {
     let remaining = frontend.subscriber_count();
     if remaining <= 1 {
-        frontend.note_cancelled_for_lag();
+        frontend.note_canceled_for_lag();
         cancellation.cancel();
         true
     } else {
@@ -409,12 +409,12 @@ fn cancel_if_nobody_else_is_reading(
 /// The notice is the `level`/`text` shape every other `notice` event carries, with the ids beside
 /// it so the client can confirm which turn it is being told to rejoin.
 fn lag_event_parts(
-    cancelled: bool,
+    canceled: bool,
     skipped: u64,
     turn_id: Uuid,
     session_id: Uuid,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
-    if cancelled {
+    if canceled {
         let problem = crate::host::http::errors::ProblemDetail::new(
             crate::host::http::errors::ErrorKind::SseLag,
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -452,7 +452,7 @@ fn lag_event_parts(
 /// Caches success (2xx) and client-error (4xx) envelopes. Server-side errors (5xx) and
 /// `TurnInFlight` are skipped: a transient provider 502 would otherwise be replayed for the full
 /// 24h TTL, defeating the point of an idempotent retry; `TurnInFlight` means the turn was never
-/// attempted at all; and `TurnCancelled` means it was interrupted, which is a fact about one
+/// attempted at all; and `TurnCanceled` means it was interrupted, which is a fact about one
 /// attempt rather than about the request. Caching that one pinned "canceled" as the answer for the
 /// next 24 hours, so the retry the cancellation invites could never run. In all three cases the
 /// ticket's `Drop` clears the `Pending` entry so a retry re-executes.
@@ -468,7 +468,7 @@ async fn commit_idempotency(
         response,
         Err(problem) if problem.status >= 500
             || problem.is(ErrorKind::TurnInFlight)
-            || problem.is(ErrorKind::TurnCancelled)
+            || problem.is(ErrorKind::TurnCanceled)
     );
     if skip_cache {
         tracing::debug!(
@@ -668,7 +668,7 @@ async fn run_blocking_turn(
 
     // Publish the cancellation token *after* the mutex has been acquired, which `submit_turn` did
     // before dispatching here. Publishing without the lock would let a rejected Turn B overwrite a
-    // running Turn A's token, making Turn A uncancellable. The window between the acquire and this
+    // running Turn A's token, making Turn A uncancelable. The window between the acquire and this
     // publish is harmless whatever its length: `POST /cancel` reading the old (session-creation or
     // prior-turn) token is a no-op on an already-finished turn.
     let cancellation = CancellationToken::new();
@@ -712,7 +712,7 @@ async fn run_blocking_turn(
                 // `Interrupted` is a cancellation, and `notify_turn_end` drops those on the floor;
                 // routing it through keeps the classification in one place.
                 let event_type = if matches!(error, crate::error::MekaError::Interrupted) {
-                    crate::host::http::sse::SseEventType::TurnCancelled
+                    crate::host::http::sse::SseEventType::TurnCanceled
                 } else {
                     crate::host::http::sse::SseEventType::TurnFailed
                 };
@@ -743,7 +743,7 @@ async fn run_blocking_turn(
 }
 
 /// Run a turn with `stream: true`. Returns an SSE response that emits events live as the agent
-/// produces them, plus a terminal `turn.finished` (or `turn.failed` / `turn.cancelled`) event
+/// produces them, plus a terminal `turn.finished` (or `turn.failed` / `turn.canceled`) event
 /// before closing.
 fn run_streaming_turn(
     state: ServerState,
@@ -801,7 +801,7 @@ fn run_streaming_turn(
         // nobody and a reconnecting client would wait forever for an end that never comes.
         let cancel_reason = if shutdown_for_task.is_cancelled() {
             CancelReason::ServerShutdown
-        } else if entry_for_task.frontend.cancelled_for_lag() {
+        } else if entry_for_task.frontend.canceled_for_lag() {
             CancelReason::SseLag
         } else {
             CancelReason::Client
@@ -895,10 +895,10 @@ fn build_sse_stream(
                             );
                             // Stop burning provider tokens for a consumer that has lost data and
                             // will need to retry, but only when nobody else is still reading.
-                            let cancelled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
+                            let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
                             let (event_type, data) =
-                                lag_event_parts(cancelled, skipped, turn_id, session_id);
-                            yield Ok(if cancelled {
+                                lag_event_parts(canceled, skipped, turn_id, session_id);
+                            yield Ok(if canceled {
                                 Event::default()
                                     .id(ids.next().to_string())
                                     .event(event_type.as_str())
@@ -953,7 +953,7 @@ fn build_sse_stream(
 ///
 /// A successful agent outcome always wins over a concurrent cancel signal, so a race between
 /// completion and cancellation doesn't discard an already-persisted result.
-/// Why a turn that ended `Interrupted` was stopped, for the recorded `turn.cancelled` event.
+/// Why a turn that ended `Interrupted` was stopped, for the recorded `turn.canceled` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CancelReason {
     /// `POST /cancel`.
@@ -988,7 +988,7 @@ fn terminal_event_parts(
         Ok(Err(crate::error::MekaError::Interrupted)) => {
             // Every stop surfaces as `Interrupted` by the time the agent loop unwinds; who asked
             // for it is carried alongside.
-            cancelled_parts(cancel_reason.as_str(), turn_id, session_id)
+            canceled_parts(cancel_reason.as_str(), turn_id, session_id)
         }
         Ok(Err(error)) => {
             let instance = format!("/v1/sessions/{session_id}/turn");
@@ -1095,13 +1095,13 @@ fn panic_terminal(panic: tokio::task::JoinError, turn_id: Uuid, session_id: Uuid
         .unwrap_or_else(|_| Event::default().comment("panic terminal serialize-failed"))
 }
 
-fn cancelled_parts(
+fn canceled_parts(
     reason: &'static str,
     turn_id: Uuid,
     session_id: Uuid,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
     (
-        crate::host::http::sse::SseEventType::TurnCancelled,
+        crate::host::http::sse::SseEventType::TurnCanceled,
         serde_json::json!({
             "turn_id": turn_id.to_string(),
             "session_id": session_id.to_string(),
@@ -1392,13 +1392,13 @@ mod tests {
             .expect("a live stream accepts a re-attach");
 
         let cancellation = CancellationToken::new();
-        let cancelled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
+        let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
         assert!(
             !cancellation.is_cancelled(),
             "the turn was canceled out from under a consumer that was keeping up"
         );
         assert!(
-            !cancelled,
+            !canceled,
             "and the caller must be told so, or it reports a turn.failed for a turn still running"
         );
     }
@@ -1416,13 +1416,13 @@ mod tests {
         );
 
         let cancellation = CancellationToken::new();
-        let cancelled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
+        let canceled = cancel_if_nobody_else_is_reading(&frontend, &cancellation);
         assert!(
             cancellation.is_cancelled(),
             "nobody is reading, so the turn should not keep running"
         );
         assert!(
-            cancelled,
+            canceled,
             "and the caller must be told so, or it withholds the turn.failed the client needs"
         );
     }

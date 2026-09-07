@@ -163,7 +163,7 @@ impl TurnRecovery {
             .await
         {
             // An interrupt is not an overflow, and became reachable here only once
-            // `compact_session` began refusing to rewrite the window on a fired token. Relabelling
+            // `compact_session` began refusing to rewrite the window on a fired token. Relabeling
             // it would answer a user who pressed stop with "the conversation exceeds the model's
             // context window", and under `serve` with a 502 `/errors/context-overflow` -- telling
             // them to shorten a conversation that was never the problem.
@@ -236,7 +236,7 @@ impl TurnRecovery {
     /// Returns `rejection` verbatim when no tier finds anything, which means the complaint was
     /// never about content: a `max_tokens` over the model's ceiling, an unknown header, a bad
     /// `tool_choice`. Verbatim rather than reclassified, because the turn's failure is still the
-    /// provider's -- relabelling a 500 as [`MekaError::InvalidRequest`] would have the HTTP surface
+    /// provider's -- relabeling a 500 as [`MekaError::InvalidRequest`] would have the HTTP surface
     /// answer 4xx for an upstream fault.
     pub(super) async fn repair_rejected_content(
         &mut self,

@@ -30,7 +30,7 @@ const WALK_TIME_BUDGET: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WalkStop {
     /// The enclosing turn was canceled (Ctrl+C, ACP `session/cancel`).
-    Cancelled,
+    Canceled,
     /// The walk outran [`WALK_TIME_BUDGET`].
     TimedOut,
 }
@@ -68,7 +68,7 @@ impl WalkBudget {
     /// Called once per directory entry, so it stays to one atomic load plus one clock read.
     pub(super) fn check(&self) -> Option<WalkStop> {
         if self.cancellation.is_cancelled() {
-            return Some(WalkStop::Cancelled);
+            return Some(WalkStop::Canceled);
         }
         if Instant::now() >= self.deadline {
             return Some(WalkStop::TimedOut);
@@ -365,7 +365,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         let budget = WalkBudget::with_budget(cancellation, Duration::from_secs(0));
-        assert_eq!(budget.check(), Some(WalkStop::Cancelled));
+        assert_eq!(budget.check(), Some(WalkStop::Canceled));
     }
 
     #[test]

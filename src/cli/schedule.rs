@@ -569,7 +569,7 @@ async fn resolve_job(
 async fn cancel(store: &Store, id_prefix: &str) -> Result<()> {
     let job = resolve_job(store, id_prefix, None).await?;
     // Reported from the delete's own row count, not from the listing that found the job: a
-    // scheduler sweep can retire it in between, and `ok: cancelled` about a job this command did
+    // scheduler sweep can retire it in between, and `ok: canceled` about a job this command did
     // not cancel is indistinguishable from the real thing.
     match store.schedule_store().delete_scheduled_job(&job.id).await? {
         true => {

@@ -443,8 +443,7 @@ impl WindowsGrants {
     /// off the async executor.
     pub(crate) fn ensure(&self, root: &std::path::Path) -> std::io::Result<()> {
         unsafe { set_workspace_ace(root, true)? };
-        let mut granted = crate::sync::lock(&self.granted);
-        granted.insert(root.to_path_buf());
+        crate::sync::lock(&self.granted).insert(root.to_path_buf());
         Ok(())
     }
 
@@ -1008,7 +1007,7 @@ pub(crate) fn spawn_sandboxed_command(
 }
 
 /// Create an empty Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set. Any process later
-/// assigned to the job is killed when the job's last handle closes, the Windows analogue to
+/// assigned to the job is killed when the job's last handle closes, the Windows analog to
 /// Unix process groups teardown via `kill(-pgid, SIGKILL)`. Grandchildren inherit job
 /// membership automatically.
 unsafe fn create_kill_on_close_job() -> std::io::Result<OwnedHandle> {

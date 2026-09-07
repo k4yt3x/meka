@@ -631,7 +631,7 @@ impl MemorySearchTool {
                     // within it, so this rejects them without building the matrix. Without it a
                     // pasted blob -- a stack trace, base64, a URL, exactly what produces an
                     // all-tiers miss and reaches this code -- cost 14 s against 200 memories and
-                    // 93 s against 20,000, on a runtime worker, uncancellable.
+                    // 93 s against 20,000, on a runtime worker, uncancelable.
                     //
                     // Counted in *characters*, because `fuzzy_threshold` and `edit_distance` both
                     // are. Comparing `len()` measured bytes against a character threshold, which

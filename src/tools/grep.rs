@@ -197,7 +197,7 @@ fn search_with_grep(
         // doesn't exist, never reaches the walk, so a long list of them would advance without
         // consulting the budget once and ignore both the deadline and a `session/cancel`.
         match budget.check() {
-            Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+            Some(WalkStop::Canceled) => return Err(MekaError::Interrupted),
             Some(WalkStop::TimedOut) => {
                 timed_out = true;
                 break;
@@ -408,7 +408,7 @@ fn walk_directory(
         // the user has no permission for) never reaches the inner loop, and would otherwise grind
         // through the whole work-stack without consulting the budget once.
         match budget.check() {
-            Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+            Some(WalkStop::Canceled) => return Err(MekaError::Interrupted),
             Some(WalkStop::TimedOut) => return Ok(true),
             None => {}
         }
@@ -425,7 +425,7 @@ fn walk_directory(
 
         for entry in entries {
             match budget.check() {
-                Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+                Some(WalkStop::Canceled) => return Err(MekaError::Interrupted),
                 Some(WalkStop::TimedOut) => return Ok(true),
                 None => {}
             }

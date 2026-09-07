@@ -1276,6 +1276,7 @@ mod tests {
                     sandbox_backend: crate::config::SandboxBackend::Landlock,
                     backend_probe: crate::sandbox::BackendProbe::Ok(sandbox_capability),
                     builtin_filter: BuiltinToolFilter::default(),
+                    write_locks: crate::workspace::WriteLocks::default(),
                 },
                 skills: crate::skills::SkillCache::for_root(None),
                 skills_agent_managed: false,
@@ -1291,7 +1292,7 @@ mod tests {
                 ..crate::session::SessionCells::for_test(
                     permission,
                     crate::workspace::SharedCwd::new(workspace.clone()),
-                    Arc::new(std::sync::RwLock::new(vec![workspace.clone()])),
+                    crate::workspace::SharedRoots::new(vec![workspace.clone()]),
                     Arc::new(crate::frontend::SilentFrontend),
                 )
             },
@@ -1305,7 +1306,7 @@ mod tests {
         let result = execute_command
             .execute(
                 serde_json::json!({"command": "cmd /c echo ok"}),
-                CancellationToken::new(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
             )
             .await;
         assert!(result.is_ok(), "the confined command must run: {result:?}");

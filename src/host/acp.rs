@@ -645,7 +645,7 @@ mod tests {
     /// that owes no reply once the turn is canceled, so without the race the stop button left the
     /// turn parked on a request nobody was going to answer.
     #[tokio::test]
-    async fn a_cancelled_turn_abandons_a_request_the_client_has_not_answered() {
+    async fn a_canceled_turn_abandons_a_request_the_client_has_not_answered() {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -664,12 +664,12 @@ mod tests {
 
         let error = outcome.expect_err("a canceled turn must not wait on the client");
         assert!(
-            error.is_cancelled(),
+            error.is_canceled(),
             "the caller has to be able to tell a stop from a failure: {error}"
         );
     }
 
-    /// The other half: an uncancelled turn must still get its answer, or the race would make every
+    /// The other half: an uncanceled turn must still get its answer, or the race would make every
     /// client round trip fail.
     #[tokio::test]
     async fn a_live_turn_receives_the_clients_answer() {
@@ -854,7 +854,7 @@ mod tests {
             },
             TodoItem {
                 text: "fourth".to_string(),
-                status: TodoStatus::Cancelled,
+                status: TodoStatus::Canceled,
             },
         ];
         let entries = todo_items_to_plan(&items);
@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(entries[0].status, PlanEntryStatus::Pending);
         assert_eq!(entries[1].status, PlanEntryStatus::InProgress);
         assert_eq!(entries[2].status, PlanEntryStatus::Completed);
-        // Cancelled has no ACP analogue; it collapses to Completed.
+        // Canceled has no ACP analog; it collapses to Completed.
         assert_eq!(entries[3].status, PlanEntryStatus::Completed);
         // meka tracks no per-item priority, so every entry is Medium.
         assert!(
@@ -1332,7 +1332,7 @@ mod tests {
 
         assert_eq!(
             translate_permission_outcome(RequestPermissionOutcome::Cancelled, "read_file", record,),
-            PermissionOutcome::Cancelled,
+            PermissionOutcome::Canceled,
         );
     }
 

@@ -130,10 +130,13 @@ impl ResidentPermissions for NoResidents {
 }
 
 /// A process holding every session at one level, for a test that pits the cell against the row.
-#[cfg(test)]
+///
+/// Only the Unix-only gate tests in `schedule` build one, so it carries their cfg; under a bare
+/// `cfg(test)` a Windows build reports it dead.
+#[cfg(all(test, unix))]
 pub(crate) struct ResidentAt(pub(crate) crate::permission::Permission);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[async_trait::async_trait]
 impl ResidentPermissions for ResidentAt {
     async fn live_permission_of(
@@ -193,7 +196,7 @@ impl SchedulerScope {
 /// Start the scheduler loop. Returns the handle so the caller can abort it on shutdown; the task
 /// runs until then.
 ///
-/// Modelled on [`crate::host::http::gc::spawn`]: a tokio interval that wakes, queries, and hands
+/// Modeled on [`crate::host::http::gc::spawn`]: a tokio interval that wakes, queries, and hands
 /// work to a host-supplied callback. Fires are awaited one at a time rather than spawned, so a
 /// process with several due jobs runs one turn at a time. That bounds concurrent model spend, which
 /// matters more here than latency: nobody is waiting on these.
@@ -526,7 +529,7 @@ pub(crate) fn live_permission(
 /// Whether any of `due` belongs to this session and is not parked.
 ///
 /// Separated from the two database reads around it so the rule can be asserted directly: a job at
-/// [`MAX_CLAIM_ATTEMPTS`] stays in the table on purpose (listed, cancellable, reported as held), so
+/// [`MAX_CLAIM_ATTEMPTS`] stays in the table on purpose (listed, cancelable, reported as held), so
 /// "there is a due row" and "something will run" are different questions and the watcher has to ask
 /// the second one.
 pub(crate) fn has_runnable_job(due: &[ScheduledJob], session_id: uuid::Uuid) -> bool {
@@ -705,7 +708,7 @@ pub(crate) async fn prepare(
     //
     // Claiming is a lease now, so nothing else stops a prompt that reliably kills the process from
     // being picked up on every expiry, forever. The row stays exactly where it is: listed,
-    // cancellable, and reported as held on every surface, because destroying a user's job over a
+    // cancelable, and reported as held on every surface, because destroying a user's job over a
     // failure meka cannot diagnose would be worse than leaving it visible and inert.
     if job.attempts >= MAX_CLAIM_ATTEMPTS {
         if memory.declined_for_permission_first_time(&job.id, "crashed") {

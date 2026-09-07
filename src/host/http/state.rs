@@ -31,7 +31,7 @@ pub(crate) struct ServerState {
     ///
     /// What actually stops an in-flight turn is `host::http::drain_active_sessions`, which fires
     /// every per-session `cancellation` token. A streaming turn's task reads *this* one only
-    /// to label its terminal event `turn.cancelled{reason:"server_shutdown"}` rather than
+    /// to label its terminal event `turn.canceled{reason:"server_shutdown"}` rather than
     /// `client`.
     pub(crate) shutdown: tokio_util::sync::CancellationToken,
     /// Outbound webhook fan-out. Empty unless `[[serve.webhooks]]` is configured, in which case

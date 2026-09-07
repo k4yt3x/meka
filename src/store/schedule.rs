@@ -210,7 +210,7 @@ impl ScheduleStore {
         // The listing above and the `DELETE` below are two statements, and a scheduler sweep can
         // retire the row between them: a one-shot's occurrence retires it, and a session deleted
         // elsewhere takes its jobs with it through the foreign key. Reporting the id regardless
-        // told the agent "Cancelled job abc12345" about a job this call did not cancel, which is
+        // told the agent "Canceled job abc12345" about a job this call did not cancel, which is
         // the same sentence it gets when it did -- and there is no way to tell them apart
         // afterwards, because both end with no such row.
         match self.delete_scheduled_job(&id).await? {
@@ -728,7 +728,7 @@ mod tests {
 
     /// `meka schedule list` and `cancel` work from a job id, so they need every job regardless of
     /// when it is due. Approximating it with "due within the next century" leaves a job scheduled
-    /// past that horizon invisible and therefore uncancellable.
+    /// past that horizon invisible and therefore uncancelable.
     #[tokio::test]
     async fn list_all_includes_jobs_beyond_any_due_horizon() {
         let store = Store::for_test().await;
@@ -878,13 +878,13 @@ mod tests {
                 .is_none()
         );
 
-        let cancelled = store
+        let canceled = store
             .schedule_store()
             .cancel_scheduled_job(session_id, job.short_id())
             .await
             .expect("cancel runs")
             .expect("prefix matched");
-        assert_eq!(cancelled, job.id);
+        assert_eq!(canceled, job.id);
         assert!(
             store
                 .schedule_store()

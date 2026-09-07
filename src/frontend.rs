@@ -50,7 +50,7 @@ pub(crate) trait Frontend: Send + Sync {
     async fn emit(&self, event: FrontendEvent);
 
     /// Round-trip request for user approval of a tool call, sent when the session's approvals
-    /// switch submits a call above its level. [`PermissionOutcome::Cancelled`] is
+    /// switch submits a call above its level. [`PermissionOutcome::Canceled`] is
     /// distinct from [`PermissionOutcome::Deny`]; it indicates the user canceled the enclosing
     /// turn (Ctrl+C, `session/cancel`), which ACP will surface later. Today's REPL collapses it to
     /// deny semantics.
@@ -212,7 +212,7 @@ pub(crate) enum DelegateFailure {
     /// Routes like [`Self::Transient`] -- the local filesystem is not a substitute for an answer
     /// the frontend never gave -- but reads differently to a caller: nothing failed, and the tool
     /// should end as an interruption rather than report the client broken.
-    Cancelled,
+    Canceled,
 }
 
 tokio::task_local! {
@@ -302,12 +302,12 @@ impl FrontendError {
         }
     }
 
-    /// Construct a [`DelegateFailure::Cancelled`] error. `what` names the round-trip that was
+    /// Construct a [`DelegateFailure::Canceled`] error. `what` names the round-trip that was
     /// abandoned, e.g. `"fs/read_text_file"`.
-    pub(crate) fn cancelled(what: &str) -> Self {
+    pub(crate) fn canceled(what: &str) -> Self {
         Self {
             message: format!("{what} was abandoned: the turn was canceled"),
-            failure: DelegateFailure::Cancelled,
+            failure: DelegateFailure::Canceled,
         }
     }
 
@@ -320,8 +320,8 @@ impl FrontendError {
     /// Whether this is the turn being stopped rather than a delegation failing. Callers turn it
     /// into [`crate::error::MekaError::Interrupted`] instead of a tool error, so stopping a turn
     /// mid-`fs/*` reads as a stop and not as a broken client.
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.failure == DelegateFailure::Cancelled
+    pub(crate) fn is_canceled(&self) -> bool {
+        self.failure == DelegateFailure::Canceled
     }
 }
 
@@ -551,8 +551,8 @@ pub(crate) enum PermissionOutcome {
     Allow,
     Deny,
     /// The enclosing turn was canceled while the request was in flight. The ACP frontend surfaces
-    /// this as `{outcome: cancelled}`; the REPL collapses it to a deny-shaped tool error.
-    Cancelled,
+    /// this as `{outcome: canceled}`; the REPL collapses it to a deny-shaped tool error.
+    Canceled,
 }
 
 /// Frontend wrapper used by sub-agents when the parent is interactive enough to host permission
@@ -1221,7 +1221,7 @@ mod tests {
 
     /// A detached call's token is what frontend delegation must honor on that task.
     ///
-    /// `AcpFrontend::until_cancelled` reads this before falling back to the session's cell. Without
+    /// `AcpFrontend::until_canceled` reads this before falling back to the session's cell. Without
     /// it, a `session/cancel` on any later turn abandoned a background task's `fs/*` request
     /// without sending it, contradicting `docs/book/src/usage/background.md`.
     #[tokio::test]

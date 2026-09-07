@@ -218,7 +218,7 @@ fn run_walk(
         // of empty or missing roots would advance through the whole list without consulting the
         // budget once, ignoring both the deadline and a `session/cancel`.
         match budget.check() {
-            Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+            Some(WalkStop::Canceled) => return Err(MekaError::Interrupted),
             Some(WalkStop::TimedOut) => {
                 timed_out = true;
                 break 'roots;
@@ -237,7 +237,7 @@ fn run_walk(
 
         for entry in paths {
             match budget.check() {
-                Some(WalkStop::Cancelled) => return Err(MekaError::Interrupted),
+                Some(WalkStop::Canceled) => return Err(MekaError::Interrupted),
                 Some(WalkStop::TimedOut) => {
                     timed_out = true;
                     break 'roots;

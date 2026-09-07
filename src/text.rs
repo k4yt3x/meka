@@ -1,4 +1,4 @@
-//! Text helpers with no terminal behind them: widths, truncation, sanitising, columns and the
+//! Text helpers with no terminal behind them: widths, truncation, sanitizing, columns and the
 //! id-prefix rules. Everything here is pure, so any layer may use it; what knows the terminal's
 //! width or writes to a stream lives in `render`.
 

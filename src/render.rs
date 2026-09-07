@@ -2346,7 +2346,7 @@ pub(crate) fn render_todo_list(title: Option<&str>, items: &[crate::todo::TodoIt
         let color = match item.status {
             TodoStatus::Completed => Color::Green,
             TodoStatus::InProgress => Color::Yellow,
-            TodoStatus::Pending | TodoStatus::Cancelled => Color::DarkGrey,
+            TodoStatus::Pending | TodoStatus::Canceled => Color::DarkGrey,
         };
         // Composed uncolored first, then colored, so the width a test measures is the width that
         // prints. Coloring in place would put escape bytes in the middle of the string.
@@ -2388,7 +2388,7 @@ fn todo_row(index: usize, item: &crate::todo::TodoItem, width: usize) -> String 
         TodoStatus::Completed => "[x]",
         TodoStatus::InProgress => "[~]",
         TodoStatus::Pending => "[ ]",
-        TodoStatus::Cancelled => "[-]",
+        TodoStatus::Canceled => "[-]",
     };
     let number = (index + 1).to_string();
     // `- `, the marker, a space, the task number and a space; none of it model-supplied.
@@ -2403,12 +2403,12 @@ fn todo_row(index: usize, item: &crate::todo::TodoItem, width: usize) -> String 
 
 /// One task's text, prefixed when canceled. Sanitized for the reason on [`todo_heading`].
 fn todo_item_text(item: &crate::todo::TodoItem, budget: usize) -> String {
-    const CANCELLED: &str = "(canceled) ";
-    if item.status == crate::todo::TodoStatus::Cancelled {
-        let text = sanitize_to_line(&item.text, budget.saturating_sub(display_width(CANCELLED)));
+    const CANCELED: &str = "(canceled) ";
+    if item.status == crate::todo::TodoStatus::Canceled {
+        let text = sanitize_to_line(&item.text, budget.saturating_sub(display_width(CANCELED)));
         // Truncated as one string, not just the part after the prefix: below twelve columns the
         // subtraction above leaves nothing and the prefix alone is already over budget.
-        truncate_to_width(&format!("{CANCELLED}{text}"), budget)
+        truncate_to_width(&format!("{CANCELED}{text}"), budget)
     } else {
         sanitize_to_line(&item.text, budget)
     }
@@ -3339,7 +3339,7 @@ mod tests {
     /// `every_tool_with_arguments_can_show_a_primary_param` is what generalizes it to
     /// every built-in; this is the case a reader recognizes.
     #[test]
-    fn a_replayed_cancellation_says_what_it_cancelled() {
+    fn a_replayed_cancellation_says_what_it_canceled() {
         assert_eq!(
             tool_indicator_line(
                 "schedule_cancel",
@@ -3799,7 +3799,7 @@ mod tests {
                     super::display_width(&heading) <= width,
                     "todo heading at width {width}: {heading:?}"
                 );
-                for status in [TodoStatus::Pending, TodoStatus::Cancelled] {
+                for status in [TodoStatus::Pending, TodoStatus::Canceled] {
                     // Through `todo_row`, which is what computes the chrome. Calling
                     // `todo_item_text` with a budget the test worked out itself passed even when
                     // the caller's subtraction was deleted.

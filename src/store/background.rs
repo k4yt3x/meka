@@ -398,7 +398,7 @@ pub(crate) enum TaskStatus {
     /// The tool returned an error, or panicked.
     Failed,
     /// Stopped on request, via `task_cancel` or a second Ctrl+C.
-    Cancelled,
+    Canceled,
     /// The process holding it went away. Reconstructed by the session-load sweep, never written by
     /// the task itself, which by definition is not around to write it.
     Interrupted,
@@ -409,7 +409,7 @@ impl TaskStatus {
         Self::Running,
         Self::Completed,
         Self::Failed,
-        Self::Cancelled,
+        Self::Canceled,
         Self::Interrupted,
     ];
 
@@ -425,7 +425,7 @@ impl TaskStatus {
     /// the task. The agent asked to be told about the first two and cannot infer the third, and
     /// there may be no human about to type.
     pub(crate) fn wakes_a_host(self) -> bool {
-        !matches!(self, Self::Cancelled)
+        !matches!(self, Self::Canceled)
     }
 
     /// The one spelling of this status: the `status` column, the HTTP view and `task_list`.
@@ -434,7 +434,7 @@ impl TaskStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
+            Self::Canceled => "canceled",
             Self::Interrupted => "interrupted",
         }
     }
@@ -458,7 +458,7 @@ impl TaskStatus {
             Self::Running => "is still running",
             Self::Completed => "finished",
             Self::Failed => "failed",
-            Self::Cancelled => "was canceled",
+            Self::Canceled => "was canceled",
             Self::Interrupted => "was interrupted",
         }
     }
@@ -747,7 +747,7 @@ mod tests {
                 .background_store()
                 .finish_background_task(
                     &task.id,
-                    crate::store::background::TaskStatus::Cancelled,
+                    crate::store::background::TaskStatus::Canceled,
                     None,
                     None,
                 )
@@ -1074,7 +1074,7 @@ mod tests {
             .background_store()
             .finish_background_task(
                 &task.id,
-                crate::store::background::TaskStatus::Cancelled,
+                crate::store::background::TaskStatus::Canceled,
                 None,
                 None,
             )
@@ -1098,7 +1098,7 @@ mod tests {
             .expect("list undelivered");
         assert_eq!(
             undelivered[0].status,
-            crate::store::background::TaskStatus::Cancelled
+            crate::store::background::TaskStatus::Canceled
         );
         assert!(undelivered[0].outcome.is_none());
     }

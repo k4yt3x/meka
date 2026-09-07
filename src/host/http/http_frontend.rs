@@ -66,7 +66,7 @@ pub(crate) struct HttpFrontend {
     sticky: StickyApprovals,
     /// Set when the turn was canceled because its only SSE consumer fell behind, so the recorded
     /// terminal says so rather than blaming a client that never asked.
-    cancelled_for_lag: std::sync::atomic::AtomicBool,
+    canceled_for_lag: std::sync::atomic::AtomicBool,
     /// Event ids, monotonic across the *session* rather than restarting per turn.
     ///
     /// Per-turn ids look tidier and make `Last-Event-ID` unusable: a client holding id 5 from one
@@ -241,20 +241,20 @@ impl HttpFrontend {
             pending: Arc::new(Mutex::new(HashMap::new())),
             capabilities,
             sticky: StickyApprovals::default(),
-            cancelled_for_lag: std::sync::atomic::AtomicBool::new(false),
+            canceled_for_lag: std::sync::atomic::AtomicBool::new(false),
             ids: Arc::new(EventIdGenerator::default()),
         }
     }
 
     /// Record that this turn is being canceled for a lagging consumer, before the token fires.
-    pub(crate) fn note_cancelled_for_lag(&self) {
-        self.cancelled_for_lag
+    pub(crate) fn note_canceled_for_lag(&self) {
+        self.canceled_for_lag
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether the last cancel was for a lagging consumer. Cleared when a new stream is installed.
-    pub(crate) fn cancelled_for_lag(&self) -> bool {
-        self.cancelled_for_lag
+    pub(crate) fn canceled_for_lag(&self) -> bool {
+        self.canceled_for_lag
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -688,17 +688,17 @@ impl Frontend for HttpFrontend {
 
         let outcome = tokio::select! {
             biased;
-            _ = request.cancellation.cancelled() => PermissionOutcome::Cancelled,
+            _ = request.cancellation.cancelled() => PermissionOutcome::Canceled,
             _ = disconnect_poll => {
                 tracing::info!(
                     "SSE consumer disconnected while permission_required for '{tool}' was \
                      pending; auto-canceling",
                     tool = request.tool_name,
                 );
-                PermissionOutcome::Cancelled
+                PermissionOutcome::Canceled
             },
             _ = tokio::time::sleep(APPROVAL_TIMEOUT) => PermissionOutcome::Deny,
-            response = receiver => response.unwrap_or(PermissionOutcome::Cancelled),
+            response = receiver => response.unwrap_or(PermissionOutcome::Canceled),
         };
         // Remove the entry if it's still there (timeout, cancellation, or disconnect paths).
         let mut guard = crate::sync::lock(&self.pending);
@@ -1096,7 +1096,7 @@ mod tests {
     }
 
     /// When the SSE consumer disconnects (all broadcast receivers dropped) while
-    /// `request_permission` is parked, the permission wait should resolve to `Cancelled`
+    /// `request_permission` is parked, the permission wait should resolve to `Canceled`
     /// within `DISCONNECT_POLL_INTERVAL` instead of blocking until the approval timeout.
     ///
     /// Zero grace, so this tests the resolution path rather than the reconnect window;
@@ -1212,7 +1212,7 @@ mod tests {
         cancellation.cancel();
         assert_eq!(
             join.await.expect("task"),
-            PermissionOutcome::Cancelled,
+            PermissionOutcome::Canceled,
             "the parked request follows the turn's stop"
         );
     }
@@ -1260,8 +1260,8 @@ mod tests {
             .expect("task should not panic");
         assert_eq!(
             outcome,
-            PermissionOutcome::Cancelled,
-            "SSE disconnect must resolve the parked permission to Cancelled"
+            PermissionOutcome::Canceled,
+            "SSE disconnect must resolve the parked permission to Canceled"
         );
 
         // The pending map should be cleaned up.

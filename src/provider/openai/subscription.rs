@@ -526,8 +526,10 @@ impl ChatGptSubscriptionProvider {
             .header("Authorization", crate::text::bearer(access_token))
             .header("originator", ORIGINATOR)
             .header("User-Agent", &self.user_agent)
-            .header("Accept", "text/event-stream")
-            .header("Content-Type", "application/json");
+            .header("Accept", "text/event-stream");
+        // No `Content-Type` here: the shared send in `responses_wire` sets it when it attaches the
+        // serialized body, and `reqwest` appends a second header rather than replacing the first,
+        // which the backend refuses as an unsupported content type.
         if let Some(account_id) = account_id {
             request = request.header("ChatGPT-Account-ID", account_id);
         }
@@ -959,6 +961,90 @@ mod tests {
         assert!(
             matches!(error, MekaError::RetryableProvider { .. }),
             "a stream that never started must be retryable, got: {error}"
+        );
+    }
+
+    /// The turn request names its content type once. `apply_headers` used to set it too, beside
+    /// the shared send that attaches the serialized body; `reqwest` appends rather than replaces,
+    /// and the backend refuses a request with two of them as an unsupported content type.
+    #[tokio::test]
+    async fn a_turn_request_carries_one_content_type_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a mock responses endpoint");
+        let local = listener.local_addr().expect("local addr");
+        let (head_sender, head_receiver) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = Vec::with_capacity(4096);
+            loop {
+                let mut chunk = [0u8; 2048];
+                let read = match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let end = buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap_or(buffer.len());
+            let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+            // The test does not need an answer, so the shortest refusal will do.
+            let response =
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            if socket.shutdown().await.is_err() {
+                return;
+            }
+            if head_sender.send(head).is_err() {
+                tracing::debug!("the test dropped its receiver before the head arrived");
+            }
+        });
+
+        let provider = ChatGptSubscriptionProvider::new(
+            crate::provider::ProviderBuilder::new(
+                crate::config::Backend::ChatGptSubscription,
+                credential_for_test(),
+                "gpt-5".to_string(),
+            )
+            .base_url(Some(format!("http://{local}")))
+            .client_id(None)
+            .oauth_token_url(None)
+            .token_store(None)
+            .credential_key(Some("test".to_string()))
+            .effort(Some("high".to_string()))
+            .max_output_tokens(None),
+        )
+        .expect("provider");
+        let (sender, _receiver) = mpsc::channel(8);
+        // The refusal is the point of the mock, not of the test.
+        if let Ok(()) = provider
+            .stream(
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
+                sender,
+                CancellationToken::new(),
+            )
+            .await
+        {
+            panic!("a 400 from the endpoint must not read as a completed stream");
+        }
+        let head = head_receiver.await.expect("the mock saw the request");
+        let content_types = head
+            .lines()
+            .filter(|line| line.starts_with("content-type:"))
+            .count();
+        assert_eq!(
+            content_types, 1,
+            "the turn request must carry exactly one Content-Type header; head:\n{head}"
         );
     }
 

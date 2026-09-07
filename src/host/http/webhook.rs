@@ -459,7 +459,7 @@ mod tests {
             session_id,
             tool_name: "execute_command".to_string(),
             label: "sleep 900".to_string(),
-            status: crate::store::background::TaskStatus::Cancelled,
+            status: crate::store::background::TaskStatus::Canceled,
             outcome: None,
             scratchpad_name: None,
             started_at: chrono::Utc::now(),

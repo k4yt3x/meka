@@ -1058,13 +1058,11 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
                             continue;
                         }
                         None => {
+                            // Not the `unknown_name` template: listing every slash command on one
+                            // line is noise, and `/help` already is the list (k4yt3x's call).
                             with_console(&console, |console| {
-                                console.line(&crate::text::unknown_name(
-                                    "command",
-                                    trimmed,
-                                    crate::host::COMMANDS
-                                        .iter()
-                                        .map(|command| format!("/{}", command.name)),
+                                console.line(&format!(
+                                    "Unknown command: {trimmed}. Type /help for available commands."
                                 ))
                             });
                             continue;

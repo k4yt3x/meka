@@ -609,7 +609,7 @@ impl CancelCell {
     }
 
     /// The live turn's token, or `None` between turns. A poisoned lock still answers: a panicking
-    /// turn has to stay cancellable.
+    /// turn has to stay cancelable.
     pub(crate) fn live(&self) -> Option<tokio_util::sync::CancellationToken> {
         crate::sync::read(&self.token).clone()
     }

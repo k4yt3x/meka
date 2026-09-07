@@ -42,7 +42,7 @@ pub(crate) const MAX_COALESCED_REPORTED: u32 = 1000;
 ///
 /// A lease is handed back on expiry, so a prompt that reliably kills the process is otherwise
 /// claimed again forever. Counting the claims that ended in neither a delivery nor a handback
-/// identifies exactly that job, and this is where it is parked: still listed, still cancellable,
+/// identifies exactly that job, and this is where it is parked: still listed, still cancelable,
 /// reported as held on every surface, and unable to take the daemon down with it. Three, because
 /// two is within the range of ordinary bad luck (a deploy during a fire, then a machine restart)
 /// and a fourth attempt on something that has failed three times is not going to be the one that
@@ -2969,7 +2969,7 @@ mod tests {
     ///
     /// The counterpart the lease requires. A lease hands the same occurrence back every time, so
     /// without a ceiling a prompt that kills the process is claimed again on every sweep, forever.
-    /// The row is kept rather than deleted: it stays listed, cancellable, and reported as held,
+    /// The row is kept rather than deleted: it stays listed, cancelable, and reported as held,
     /// because meka cannot tell a poisonous prompt from an unlucky one and destroying a user's job
     /// on that guess would be worse.
     #[tokio::test]
