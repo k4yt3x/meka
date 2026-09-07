@@ -45,7 +45,13 @@ pub(crate) enum ListDetail {
 /// drift something you can see and rebalance rather than something you discover when the index
 /// stops being useful. That is a deliberate inspection, though, not what `/memory` is for.
 pub(crate) async fn run_list(store: &MemoryStore, detail: ListDetail) -> Result<()> {
-    list(store, detail, crate::cli::OutputFormat::Plain).await
+    list(
+        store,
+        detail,
+        crate::cli::OutputFormat::Plain,
+        crate::render::Stream::Stderr,
+    )
+    .await
 }
 
 /// [`run_list`] under a chosen format. The REPL's `/memory` has no format flag and takes the door
@@ -55,6 +61,7 @@ pub(crate) async fn list(
     store: &MemoryStore,
     detail: ListDetail,
     format: crate::cli::OutputFormat,
+    stream: crate::render::Stream,
 ) -> Result<()> {
     let index = store.index().await?;
     if format == crate::cli::OutputFormat::Json {
@@ -87,7 +94,7 @@ pub(crate) async fn list(
         })
         .collect();
 
-    crate::render::write_stdout(crate::text::format_columns(
+    stream.write(crate::text::format_columns(
         &["Name", "Priority", "Recorded", "Tags", "Description"],
         &rows,
     ))?;
@@ -160,7 +167,13 @@ pub(crate) async fn run_get(
 /// would act on. `meka memory export` is the door that hands back exactly what is stored, and
 /// `meka memory edit` is the one that round-trips it.
 pub(crate) async fn run_show(store: &MemoryStore, name: &str) -> Result<()> {
-    show(store, name, crate::cli::OutputFormat::Plain).await
+    show(
+        store,
+        name,
+        crate::cli::OutputFormat::Plain,
+        crate::render::Stream::Stderr,
+    )
+    .await
 }
 
 /// [`run_show`] under a chosen format; the REPL's `/memory <name>` takes the door above. The object
@@ -169,6 +182,7 @@ pub(crate) async fn show(
     store: &MemoryStore,
     name: &str,
     format: crate::cli::OutputFormat,
+    stream: crate::render::Stream,
 ) -> Result<()> {
     let entry = require_memory(store, name).await?;
     if format == crate::cli::OutputFormat::Json {
@@ -177,9 +191,9 @@ pub(crate) async fn show(
         return Ok(());
     }
     let body = memory::render_for_model(&entry.body.unwrap_or_default());
-    crate::render::write_stdout(&body)?;
+    stream.write(&body)?;
     if !body.ends_with('\n') {
-        crate::render::write_stdout_line("")?;
+        stream.write_line("")?;
     }
     Ok(())
 }
@@ -743,6 +757,7 @@ pub(crate) async fn run_memory_subcommand(
                 &store,
                 crate::cli::memory::ListDetail::WithDistribution,
                 *format,
+                crate::render::Stream::Stdout,
             )
             .await?
         }
@@ -750,7 +765,7 @@ pub(crate) async fn run_memory_subcommand(
             crate::cli::memory::run_get(&store, name, *format).await?
         }
         crate::cli::MemoryAction::Show { name, format } => {
-            crate::cli::memory::show(&store, name, *format).await?
+            crate::cli::memory::show(&store, name, *format, crate::render::Stream::Stdout).await?
         }
         crate::cli::MemoryAction::Add {
             name,

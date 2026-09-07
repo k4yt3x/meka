@@ -81,6 +81,17 @@ fn run_repl(install: &Install, script: &str, inputs: &[&str]) -> Vec<String> {
 
 /// Fork a pty, exec meka on the child side, and drive the master side to completion.
 fn drive(install: &Install, inputs: &[&str]) -> Vec<u8> {
+    drive_to(install, inputs, None)
+}
+
+/// [`drive`] with the child's stderr sent to `stderr` instead of the pty, so a test can tell the
+/// two streams apart: the pty then carries stdout alone. It is stderr that leaves, not stdout,
+/// because the line editor draws on stdout and reads its cursor position back through the pty.
+fn drive_to(install: &Install, inputs: &[&str], stderr: Option<&std::path::Path>) -> Vec<u8> {
+    // Built before the fork: the child must not allocate between `fork` and `exec`.
+    let stderr_path = stderr.map(|path| {
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a path without NUL")
+    });
     let mut master: RawFd = -1;
     // SAFETY: `forkpty` with null pointers for the optional out-params is the documented way to get
     // a pty pair plus a child. The child branch below does nothing but set state and `exec`, which
@@ -104,6 +115,19 @@ fn drive(install: &Install, inputs: &[&str]) -> Vec<u8> {
             if libc::tcgetattr(0, &mut attrs) == 0 {
                 attrs.c_lflag &= !libc::ECHO;
                 libc::tcsetattr(0, libc::TCSANOW, &attrs);
+            }
+        }
+        if let Some(path) = &stderr_path {
+            // SAFETY: still single-threaded before `exec`; `open` and `dup2` are async-signal-safe.
+            unsafe {
+                let fd = libc::open(
+                    path.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                    0o600,
+                );
+                if fd < 0 || libc::dup2(fd, 2) < 0 {
+                    std::process::exit(126);
+                }
             }
         }
         // Not spawned: this process *is* the child, and `exec` replaces it.
@@ -1312,5 +1336,49 @@ fn a_canceled_task_rides_the_next_prompt_in_the_repl() {
     assert!(
         delivered.is_some(),
         "and riding a turn is a delivery, so the row must be stamped"
+    );
+}
+
+/// A slash command's table is the user looking at the UI, so it goes to stderr with the rest of
+/// the chrome, while the model's answer stays on stdout. Driven with stderr redirected to a file,
+/// which a merged pty could not tell apart.
+#[test]
+fn a_slash_commands_table_goes_to_stderr_and_the_answer_stays_on_stdout() {
+    const ANSWER: &str = r#"[
+ [{"type":"text","text":"answer-on-stdout"},
+  {"type":"message_end","stop_reason":"end_turn"}]
+]"#;
+    let install = repl_install(true, true, "");
+    let mut add = support::meka();
+    add.args([
+        "memory",
+        "add",
+        "stream-audit-memory",
+        "--description",
+        "kept for the stream test",
+    ]);
+    let added = install.env(&mut add).output().expect("run memory add");
+    assert!(
+        added.status.success(),
+        "memory add: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    install.write_script(ANSWER);
+    let stderr_path = install.work_dir().join("stderr.txt");
+    let captured = drive_to(&install, &["/memory", "hello", "/exit"], Some(&stderr_path));
+    let rows = replay(&captured);
+    assert!(
+        rows.iter().any(|row| row.contains("answer-on-stdout")),
+        "the answer reaches the terminal through stdout: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("stream-audit-memory")),
+        "the table is not on stdout: {rows:#?}"
+    );
+    let stderr = std::fs::read_to_string(&stderr_path).expect("stderr file");
+    assert!(
+        stderr.contains("stream-audit-memory"),
+        "the table is on stderr: {stderr:?}"
     );
 }

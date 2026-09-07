@@ -26,10 +26,14 @@ pub(crate) async fn run_list_for_session(store: &Store, session: uuid::Uuid) -> 
             .background_store()
             .list_background_tasks(session)
             .await?,
+        crate::render::Stream::Stderr,
     )
 }
 
-fn render(tasks: Vec<crate::store::background::BackgroundTask>) -> Result<()> {
+fn render(
+    tasks: Vec<crate::store::background::BackgroundTask>,
+    stream: crate::render::Stream,
+) -> Result<()> {
     if tasks.is_empty() {
         // stderr: an empty list is a status note, not the data a script asked for.
         crate::streams::write_stderr_line("No background tasks.");
@@ -38,7 +42,7 @@ fn render(tasks: Vec<crate::store::background::BackgroundTask>) -> Result<()> {
 
     let rows = task_rows(&tasks);
 
-    crate::render::write_stdout(crate::text::format_columns(
+    stream.write(crate::text::format_columns(
         &["ID", "Status", "Tool", "What", "Elapsed", "Result"],
         &rows,
     ))?;
@@ -114,7 +118,12 @@ fn task_rows(tasks: &[crate::store::background::BackgroundTask]) -> Vec<Vec<Stri
 /// The listing shortens an id to whatever distinguishes it, which is only safe because this prints
 /// the whole thing. It also carries the two cells a column cannot hold: the command line as
 /// written, and the outcome rather than a 40-column excerpt of it.
-pub(crate) async fn show(store: &Store, session: uuid::Uuid, id_prefix: &str) -> Result<()> {
+pub(crate) async fn show(
+    store: &Store,
+    session: uuid::Uuid,
+    id_prefix: &str,
+    stream: crate::render::Stream,
+) -> Result<()> {
     let Some(task) = store
         .background_store()
         .resolve_background_task(session, id_prefix)
@@ -125,7 +134,7 @@ pub(crate) async fn show(store: &Store, session: uuid::Uuid, id_prefix: &str) ->
         )));
     };
 
-    crate::render::write_stdout(show_lines(&task))?;
+    stream.write(show_lines(&task))?;
     Ok(())
 }
 

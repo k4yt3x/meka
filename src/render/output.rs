@@ -89,6 +89,44 @@ pub(crate) fn write_stdout_line(line: impl std::fmt::Display) -> io::Result<()> 
         .and_then(|()| out.flush())
         .map_err(reader_hung_up)
 }
+/// Where a command's rendered output goes.
+///
+/// The same table is data on one host and chrome on another: `meka memory list` is invoked for
+/// its table, so it belongs on stdout, while `/memory` inside the REPL is the user glancing at the
+/// UI, where stdout carries only the model's answers. The renderer takes the stream from its door
+/// rather than deciding, so one function serves both without a second copy of the rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stream {
+    /// The data a command was invoked to obtain.
+    Stdout,
+    /// Everything else, including a REPL slash command's output.
+    Stderr,
+}
+
+impl Stream {
+    /// Write `text` to the stream. A stderr failure is dropped by design (see
+    /// [`crate::streams::write_stderr`]), so only stdout can report one.
+    pub(crate) fn write(self, text: impl std::fmt::Display) -> io::Result<()> {
+        match self {
+            Stream::Stdout => write_stdout(text),
+            Stream::Stderr => {
+                crate::streams::write_stderr(text);
+                Ok(())
+            }
+        }
+    }
+
+    /// [`Self::write`] plus the newline.
+    pub(crate) fn write_line(self, line: impl std::fmt::Display) -> io::Result<()> {
+        match self {
+            Stream::Stdout => write_stdout_line(line),
+            Stream::Stderr => {
+                crate::streams::write_stderr_line(line);
+                Ok(())
+            }
+        }
+    }
+}
 /// The payload marking a broken pipe as *this process's stdout* rather than any other.
 ///
 /// A reader that stops reading is its own decision and meka exits 0 for it, but that has to mean

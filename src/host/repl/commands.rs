@@ -469,7 +469,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
         },
         SlashCommand::TaskShow { id } => match session_id {
             Some(session) => {
-                if let Err(error) = crate::cli::background::show(store, session, &id).await {
+                if let Err(error) =
+                    crate::cli::background::show(store, session, &id, crate::render::Stream::Stderr)
+                        .await
+                {
                     with_console(console, |console| console.error(&error));
                 }
             }

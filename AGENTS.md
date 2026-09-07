@@ -239,7 +239,9 @@ command output; and hard errors. Everything else is `tracing`.
 
 The stream is a contract:
 
-- **stdout**: only the data the command was invoked to obtain.
+- **stdout**: only the data the command was invoked to obtain. In the REPL that is the model's
+  answers (and the line editor, which draws there); every slash command's output, tables included,
+  is stderr.
 - **stderr**: everything else, including prompts, live UI, indicators, hints, status and errors,
   and every spacing blank line emitted around them.
 

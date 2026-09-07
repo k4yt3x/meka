@@ -100,7 +100,8 @@ Pasting multi-line content also works seamlessly: all pasted lines appear in the
 ## Slash commands
 
 meka supports `/` prefix commands for controlling the shell. `/help` prints this table, with the
-`/mcp` subcommands beneath `/mcp` and the three shortcuts below it:
+`/mcp` subcommands beneath `/mcp` and the three shortcuts below it. Every slash command writes to
+stderr, beside the prompts and notices; the model's answers stay on stdout.
 
 | Command | Description |
 |---------|-------------|

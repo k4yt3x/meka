@@ -66,7 +66,15 @@ pub(crate) async fn run(
             // that the running host declines on every sweep.
             let config = crate::config::ResolvedConfig::resolve(cli_args.overrides());
             config.require_readable_config()?;
-            show_job(store, id, &config.schedule, None, *format).await
+            show_job(
+                store,
+                id,
+                &config.schedule,
+                None,
+                *format,
+                crate::render::Stream::Stdout,
+            )
+            .await
         }
         ScheduleAction::Cancel { id } => cancel(store, id).await,
     }
@@ -90,6 +98,7 @@ pub(crate) async fn run_list_for_session(
         &jobs,
         Layout::SessionScoped,
         None,
+        crate::render::Stream::Stderr,
         &Resolvable::of(&jobs),
         crate::cli::OutputFormat::Plain,
     )
@@ -177,6 +186,7 @@ async fn list(
         &jobs,
         Layout::Unscoped,
         None,
+        crate::render::Stream::Stdout,
         &resolvable,
         format,
     )
@@ -343,6 +353,7 @@ fn render(
     )],
     layout: Layout,
     tools: Option<&dyn crate::schedule::GateTools>,
+    stream: crate::render::Stream,
     resolvable: &Resolvable,
     format: crate::cli::OutputFormat,
 ) -> Result<()> {
@@ -365,7 +376,7 @@ fn render(
         Layout::Unscoped => &COLUMNS,
         Layout::SessionScoped => &SESSION_SCOPED_COLUMNS,
     };
-    crate::render::write_stdout(crate::text::format_columns(
+    stream.write(crate::text::format_columns(
         headers,
         &rows_for(memory, jobs, layout, tools, resolvable),
     ))?;
@@ -390,6 +401,7 @@ pub(crate) async fn show(
         config,
         scope,
         crate::cli::OutputFormat::Plain,
+        crate::render::Stream::Stderr,
     )
     .await
 }
@@ -402,6 +414,7 @@ async fn show_job(
     config: &crate::config::ResolvedScheduleConfig,
     scope: Option<uuid::Uuid>,
     format: crate::cli::OutputFormat,
+    stream: crate::render::Stream,
 ) -> Result<()> {
     let job = resolve_job(store, id_prefix, scope).await?;
     let level = with_levels(store, config, vec![job]).await;
@@ -464,7 +477,7 @@ async fn show_job(
         out.push('\n');
     }
 
-    crate::render::write_stdout(&out)?;
+    stream.write(&out)?;
     Ok(())
 }
 

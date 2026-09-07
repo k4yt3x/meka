@@ -31,7 +31,12 @@ pub(crate) struct AddArgs<'a> {
 
 /// `/skill` in the REPL, which has no format flag: the plain table.
 pub(crate) fn run_list(roots: &[std::path::PathBuf], paths: bool) -> Result<()> {
-    list(roots, paths, crate::cli::OutputFormat::Plain)
+    list(
+        roots,
+        paths,
+        crate::cli::OutputFormat::Plain,
+        crate::render::Stream::Stderr,
+    )
 }
 
 /// `meka skill list`: a column table of every installed skill, or under `--format json` the
@@ -41,6 +46,7 @@ pub(crate) fn list(
     roots: &[std::path::PathBuf],
     paths: bool,
     format: crate::cli::OutputFormat,
+    stream: crate::render::Stream,
 ) -> Result<()> {
     let skills = skills::discover_skills_in_roots(roots);
     let native_root = crate::paths::skills_dir();
@@ -53,7 +59,7 @@ pub(crate) fn list(
         crate::cli::write_json_listing("skills", &views)?;
         return Ok(());
     }
-    print_list(&skills.skills, native_root.as_deref(), paths)?;
+    print_list(&skills.skills, native_root.as_deref(), paths, stream)?;
     Ok(())
 }
 
@@ -71,12 +77,17 @@ pub(crate) fn list(
 /// Nothing else about a skill belongs here. `license`, `compatibility`, `allowed-tools`, `version`
 /// and arbitrary `metadata` keys are per-skill detail, which is what `meka skill get` is for; a
 /// column apiece would be mostly empty and would push `Description` off the screen.
-fn print_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool) -> Result<()> {
+fn print_list(
+    skills: &[skills::Skill],
+    native_root: Option<&Path>,
+    paths: bool,
+    stream: crate::render::Stream,
+) -> Result<()> {
     if skills.is_empty() {
         crate::streams::write_stderr_line("No skills.");
         return Ok(());
     }
-    crate::render::write_stdout(render_list(skills, native_root, paths))?;
+    stream.write(render_list(skills, native_root, paths))?;
     Ok(())
 }
 
@@ -569,7 +580,7 @@ pub(crate) async fn run_skill_subcommand(
     let roots = config.skill_roots();
     match action {
         crate::cli::SkillAction::List { paths, format } => {
-            crate::cli::skills::list(&roots, *paths, *format)?
+            crate::cli::skills::list(&roots, *paths, *format, crate::render::Stream::Stdout)?
         }
         crate::cli::SkillAction::Get { name, format } => {
             crate::cli::skills::run_get(name, &roots, *format)?

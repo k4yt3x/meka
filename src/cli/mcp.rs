@@ -28,6 +28,7 @@ pub(crate) async fn run_list(
         manager,
         token_store,
         crate::cli::OutputFormat::Plain,
+        crate::render::Stream::Stderr,
     )
     .await
 }
@@ -39,6 +40,7 @@ pub(crate) async fn list_servers(
     manager: Option<&std::sync::Arc<crate::mcp::McpClientManager>>,
     token_store: &TokenStore,
     format: crate::cli::OutputFormat,
+    stream: crate::render::Stream,
 ) -> Result<()> {
     // Computed before the early return below: "every server is gone but the OAuth bundles are still
     // here" is precisely the state worth reporting, and it is the one that return would hide.
@@ -135,7 +137,7 @@ pub(crate) async fn list_servers(
     } else {
         &["Name", "Transport", "Required", "Permission", "Target"]
     };
-    crate::render::write_stdout(crate::text::format_columns(headers, &rows))?;
+    stream.write(crate::text::format_columns(headers, &rows))?;
     report_orphaned_credentials(&orphans)?;
     Ok(())
 }
@@ -1967,7 +1969,14 @@ pub(crate) async fn run_mcp_subcommand(
     let token_store = store.token_store();
     match action {
         crate::cli::McpAction::List { format } => {
-            crate::cli::mcp::list_servers(&config.mcp_servers, None, &token_store, *format).await?
+            crate::cli::mcp::list_servers(
+                &config.mcp_servers,
+                None,
+                &token_store,
+                *format,
+                crate::render::Stream::Stdout,
+            )
+            .await?
         }
         crate::cli::McpAction::Get { name, format } => {
             crate::cli::mcp::run_get(&config.mcp_servers, name, &token_store, *format).await?

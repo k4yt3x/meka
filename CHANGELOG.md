@@ -75,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reads, searches and `scratchpad_load_file` refuse meka's own directories below `unrestricted`.
 - **Breaking:** `/provider` is `/profile`.
 - REPL notices are colored by level, and the REPL echoes a scheduled job's prompt before its reply.
+- Every REPL slash command prints to stderr, like `/status`; the model's answers stay on stdout.
 - **Breaking:** `provider` is `profile` on `POST`, `PATCH` and every response of `/v1/sessions`.
 - **Breaking:** `GET /v1/providers` is `GET /v1/profiles`; rows carry `account` and `backend`.
 - **Breaking:** `GET /v1/health/ready` reports `profile_configured` (was `provider_configured`).
