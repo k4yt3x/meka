@@ -4632,16 +4632,27 @@ mod tests {
 
         // What the worker was told about its workspace on its first turn: its own directory and
         // roots, and nothing of the parent's.
-        let first_turn = format!(
-            "{:?}",
-            provider
-                .completions()
-                .first()
-                .expect("the worker's first request")
-        );
-        let sub = dirs.sub.display().to_string();
-        let extra = dirs.extra.display().to_string();
-        let elsewhere = dirs.elsewhere.display().to_string();
+        // The text as the worker read it, not a `Debug` rendering: that would escape every
+        // backslash and no Windows path could match.
+        let first_turn = provider
+            .completions()
+            .first()
+            .expect("the worker's first request")
+            .iter()
+            .map(crate::conversation::Message::wire_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The worker names the canonical spelling the acceptor produced, which on Windows differs
+        // from the temp directory as created (8.3 short names, verbatim prefixes).
+        let canonical = |path: &std::path::Path| {
+            crate::workspace::accept_cwd(path)
+                .expect("the test directory exists")
+                .display()
+                .to_string()
+        };
+        let sub = canonical(&dirs.sub);
+        let extra = canonical(&dirs.extra);
+        let elsewhere = canonical(&dirs.elsewhere);
         assert!(
             first_turn.contains(&format!("Working directory: {sub}")),
             "the first root is the working directory the worker is told about: {first_turn}"

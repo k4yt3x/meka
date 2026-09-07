@@ -1986,9 +1986,15 @@ fn a_sub_agent_bounded_by_writable_roots_writes_only_there() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("exactly one worker row");
+    // meka records the canonical path without Windows' verbatim `\\?\` prefix, which
+    // `std::fs::canonicalize` includes there.
+    let expected = std::fs::canonicalize(&sub).expect("canonical");
+    let expected = expected
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
     assert_eq!(
-        std::path::PathBuf::from(cwd),
-        std::fs::canonicalize(&sub).expect("canonical"),
+        cwd, expected,
         "the worker's working directory is the first root, spelled canonically"
     );
     assert!(
