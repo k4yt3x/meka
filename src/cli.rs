@@ -257,7 +257,9 @@ pub(crate) enum AccountAction {
         /// Account name
         name: String,
     },
-    /// Show account rate-limit usage (session / weekly windows)
+    /// Show the account's rate-limit usage
+    ///
+    /// The session and weekly windows, with their reset times.
     Usage {
         /// Profile to reach the account through (default: the profile a new session runs on)
         #[arg(long, value_name = "NAME")]
@@ -266,7 +268,10 @@ pub(crate) enum AccountAction {
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
     },
-    /// Show account identity (plan, tier, org, role) and local auth status
+    /// Show who the account is and whether it is logged in
+    ///
+    /// The plan, tier, organization and role the backend reports, and the state of the stored
+    /// credential.
     Whoami {
         /// Profile to reach the account through (default: the profile a new session runs on)
         #[arg(long, value_name = "NAME")]
@@ -275,7 +280,9 @@ pub(crate) enum AccountAction {
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
     },
-    /// Show historical usage (lifetime tokens, streaks, per-day counts)
+    /// Show the account's historical usage
+    ///
+    /// Lifetime tokens, streaks and per-day counts, as the backend reports them.
     Stats {
         /// Profile to reach the account through (default: the profile a new session runs on)
         #[arg(long, value_name = "NAME")]
@@ -417,7 +424,7 @@ pub(crate) enum SkillAction {
         #[arg(long, value_parser = clap::value_parser!(u8).range(0..=9))]
         priority: Option<u8>,
 
-        /// Frontmatter metadata as key=value (repeatable)
+        /// Frontmatter metadata (repeatable)
         #[arg(long, value_name = "KEY=VALUE")]
         metadata: Vec<String>,
 
@@ -653,7 +660,7 @@ pub(crate) enum McpAction {
         #[arg(long, default_value = "plain")]
         format: OutputFormat,
     },
-    /// Authenticate a server interactively (OAuth assumed for HTTP)
+    /// Authenticate a server interactively
     ///
     /// With neither flag, runs the OAuth authorization-code flow. With one, stores the secret read
     /// from stdin and exits, which is also how an existing one is rotated.
@@ -688,11 +695,11 @@ pub(crate) enum McpAction {
         #[arg(long)]
         transport: Option<crate::config::McpTransport>,
 
-        /// Environment variable for stdio (KEY=VALUE, repeatable)
+        /// Environment variable for a stdio server (repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
 
-        /// HTTP header (KEY=VALUE, repeatable)
+        /// HTTP header (repeatable)
         #[arg(long = "header", value_name = "KEY=VALUE")]
         header: Vec<String>,
 
@@ -748,7 +755,7 @@ pub(crate) enum McpAction {
         #[arg(long = "eager-load-tool", value_name = "TOOL")]
         eager_load_tool: Vec<String>,
 
-        /// Per-tool permission override (TOOL=LEVEL, repeatable)
+        /// Per-tool permission override (repeatable)
         #[arg(long = "tool-permission", value_name = "TOOL=LEVEL")]
         tool_permission: Vec<String>,
 
@@ -894,7 +901,7 @@ pub(crate) struct Cli {
     #[arg(long = "format", default_value = "plain", value_name = "FORMAT")]
     pub(crate) format: OutputFormat,
 
-    /// Eager-load an MCP tool this session (raw SERVER:TOOL, repeatable)
+    /// Eager-load an MCP tool this session (repeatable)
     #[arg(long = "eager-load-tool", value_name = "SERVER:TOOL")]
     pub(crate) eager_load_tool: Vec<String>,
 

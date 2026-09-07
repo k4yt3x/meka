@@ -1100,18 +1100,70 @@ fn format_without_oneshot_is_refused() {
 }
 
 /// Ctrl+C ends a one-shot run with 130, as it ends every other host, not with 0 over a partial
-/// answer; under `--format json` the report still goes out, and says `interrupted`.
+/// answer, and what streamed before the press is kept. The press waits for a notice the script
+/// raises right after its first text, which the console prints to stderr as it arrives; the
+/// session row is no signal, since it lands as the turn begins, before the first delta, and a
+/// press in that gap leaves nothing to keep.
 #[cfg(unix)]
 #[test]
-fn an_interrupted_oneshot_run_exits_130_and_still_reports_under_json() {
+fn an_interrupted_oneshot_run_exits_130_and_keeps_what_streamed() {
+    use std::io::Read;
     let install = Install::new();
     write_provider_config(&install, "mock", &["mock"]);
-    install.write_script(
-        r#"[[{"type":"text","text":"starting"},
-            {"type":"sleep","ms":30000},
-            {"type":"text","text":"never reached"},
-            {"type":"message_end","stop_reason":"end_turn"}]]"#,
+    write_slow_script(&install);
+    let mut child = install
+        .meka(&["--oneshot", "-p", "slow"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn meka");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let mut chrome = Vec::new();
+    let mut buffer = [0u8; 4096];
+    // A closed pipe here means the run ended on its own, which the status assertion reports.
+    while !String::from_utf8_lossy(&chrome).contains("text-has-streamed") {
+        let read = stderr.read(&mut buffer).expect("read stderr");
+        if read == 0 {
+            break;
+        }
+        chrome.extend_from_slice(&buffer[..read]);
+    }
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    stderr.read_to_end(&mut chrome).expect("drain stderr");
+    let status = child.wait().expect("wait for meka");
+    let mut answer = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut answer)
+        .expect("read stdout");
+    let chrome = String::from_utf8_lossy(&chrome);
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "an interrupted run exits like an interrupted REPL: {chrome}"
     );
+    assert!(chrome.contains("(interrupted)"), "{chrome}");
+    assert!(
+        answer.contains("starting") && !answer.contains("never reached"),
+        "what streamed before the press is kept, and nothing after it: {answer:?}"
+    );
+}
+
+/// Under `--format json` an interrupted run still prints its one report, and it says
+/// `interrupted`. Whether the report carries partial text depends on when the press landed, so
+/// that claim lives in the raw-mode twin above, where the press waits for the text.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_json_oneshot_run_still_reports() {
+    let install = Install::new();
+    write_provider_config(&install, "mock", &["mock"]);
+    write_slow_script(&install);
     let child = install
         .meka(&["--oneshot", "--format", "json", "-p", "slow"])
         .stdin(std::process::Stdio::null())
@@ -1139,19 +1191,24 @@ fn an_interrupted_oneshot_run_exits_130_and_still_reports_under_json() {
     }
     let output = child.wait_with_output().expect("wait for meka");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(130),
-        "an interrupted run exits like an interrupted REPL: {stderr}"
-    );
+    assert_eq!(output.status.code(), Some(130), "{stderr}");
     assert!(stderr.contains("(interrupted)"), "{stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let report: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|error| panic!("one object on stdout ({error}): {stdout:?}"));
     assert_eq!(report["stop_reason"], "interrupted");
-    assert_eq!(
-        report["text"], "starting",
-        "what streamed before the press is reported"
+}
+
+/// A script whose answer starts at once, says so on stderr, and then holds for longer than any
+/// test waits.
+#[cfg(unix)]
+fn write_slow_script(install: &Install) {
+    install.write_script(
+        r#"[[{"type":"text","text":"starting"},
+            {"type":"notice","message":"text-has-streamed"},
+            {"type":"sleep","ms":30000},
+            {"type":"text","text":"never reached"},
+            {"type":"message_end","stop_reason":"end_turn"}]]"#,
     );
 }
 
