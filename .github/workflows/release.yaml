@@ -129,7 +129,6 @@ jobs:
           body_path: release-notes.md
           files: |
             artifacts/*
-            scripts/migrate-0.45-to-0.46.py
 
   container:
     name: Build and push container

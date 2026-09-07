@@ -7,173 +7,179 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- `agent_spawn` takes `writable_roots`, bounding a sub-agent's writes within the parent's reach.
-
-## [0.46.0] - 2026-09-06
-
-The account and profile release. A provider profile splits into the account that logs in and bills
-and the profile that picks a model on it, so one login can run several models. `meka account` and
-`meka profile` replace `meka provider`, the prompt is `-p`, and the `ask` level gives way to an
-`approvals` switch, so an approved call runs at the session's level rather than unconfined. A 0.45
-`config.toml` is converted by `scripts/migrate-0.45-to-0.46.py`; the store migrates itself behind
-a backup. The upgrade guide lists every breaking change with its remedy.
+## [0.46.0] - 2026-09-07
 
 ### Added
 
 - `meka account` (`add`, `login`, `list`, `remove`) manages the accounts that log in and bill.
 - `meka profile` (`add`, `set`, `use`, `list`, `remove`) manages the profiles that pick a model.
+- `migrate-0.45-to-0.46.py`, a release asset, converts a 0.45 `config.toml`, dry-run by default.
+- A profile's `max_request_bytes` caps requests on every backend; old images are redacted to fit.
+- `[display].stream` sets whether answers stream; `--no-stream` keeps turning it off for one run.
 - `-p -` reads the first turn's prompt from stdin, to end of input.
 - `--oneshot --format json` prints the turn as one object: text, tool calls, usage and stop reason.
 - `--format json` on every `list` and `show` command, printing the HTTP API's record shapes.
-- `scripts/migrate-0.45-to-0.46.py` converts a 0.45 `config.toml` in place, dry-run by default.
 - With `approvals` on, a tool call above the session's level is put to the user instead of refused.
-- `/approvals`, `PATCH /v1/sessions/{id}` and the ACP `approvals` option set it for a session.
 - `[permissions].approvals` is what a new session starts with.
+- `/approvals`, `PATCH /v1/sessions/{id}` and the ACP `approvals` option set it for a session.
 - The REPL approval prompt takes `always` and `never`, which answer for that tool for the session.
-- Images are stored once, keyed by content hash, and shared across sessions; exports carry them.
-- `GET /v1/sessions/{id}/blobs/{hash}` serves a stored image's bytes.
-- A profile's `max_request_bytes` caps requests on every backend; old images are redacted to fit.
-- `[display].stream` sets whether answers stream; `--no-stream` keeps turning it off for one run.
-- `scratchpad_merge` takes an optional `prefix` that selects every own entry starting with it.
-- `search_contents` takes a `limit` of 1 to 100 matches; a `scratchpad` target still lifts the cap.
+- The HTTP `permission_required` event carries `input`, the call's arguments.
+- An HTTP SSE `progress` event relays MCP `notifications/progress` for a running tool.
+- A `turn.canceled` event carries `reason: "sse_lag"` when a slow consumer stopped the turn.
+- `read_count` on HTTP memory records, and `read_only_hint_declined` on `GET /v1/mcp/{name}/tools`.
+- Every HTTP operation's OpenAPI entry names the scopes that admit it and lists its 500 response.
 - ACP permission requests carry `rawInput` and a JSON content block with the call's arguments.
 - ACP relays compactions, failed scheduled turns and declined elicitations as `[meka]` chunks.
-- An HTTP SSE `progress` event relays MCP `notifications/progress` for a running tool.
-- `read_count` on HTTP memory records, and `read_only_hint_declined` on `GET /v1/mcp/{name}/tools`.
-- A `schedule.fired` webhook reports `status: "canceled"` for a stopped turn, not `failed`.
-- A `turn.canceled` event carries `reason: "sse_lag"` when a slow consumer stopped the turn.
-- Every HTTP operation's OpenAPI entry names the scopes that admit it and lists its 500 response.
+- `scratchpad_merge` takes an optional `prefix` that selects every own entry starting with it.
+- `search_contents` takes a `limit` of 1 to 100 matches; a `scratchpad` target still lifts the cap.
+- `agent_spawn` takes `writable_roots`, bounding a sub-agent's writes within the parent's reach.
 - MCP `initialize` names meka as the client and declares elicitation support to the server.
+- Images are stored once, keyed by content hash, and shared across sessions; exports carry them.
+- `GET /v1/sessions/{id}/blobs/{hash}` serves a stored image's bytes.
 - A store whose tables lag its version is refused, naming the `-wal` file a copy may have left.
 - Cargo features: `serve` (default) for the HTTP API, `mock-provider` for the test provider.
 
 ### Changed
 
-- Tool calls show their real names everywhere (`read_file`, not `ReadFile`), as MCP tools do.
 - **Breaking:** `[providers.<name>]` splits into `[accounts.<name>]` and `[profiles.<name>]`.
 - **Breaking:** `default_provider` is `default_profile`.
 - **Breaking:** a 0.45 `config.toml` is refused at startup until the script converts it.
-- **Breaking:** the prompt is `-p, --prompt`; there is no positional prompt.
-- **Breaking:** `--provider` is `--profile`, long form only; `-p` is the prompt.
-- **Breaking:** `provider` is `profile` on `POST`, `PATCH` and every response of `/v1/sessions`.
-- **Breaking:** `GET /v1/providers` is `GET /v1/profiles`; rows carry `account` and `backend`.
-- **Breaking:** ACP's `provider` config option is `profile`; the REPL's `/provider` is `/profile`.
-- **Breaking:** a session export archive names its `profile`, and its `format_version` is 2.
-- **Breaking:** `GET /v1/health/ready` reports `profile_configured` (was `provider_configured`).
-- `meka profile add` no longer sets `default_profile`; a lone profile is the default.
-- **Breaking:** an unknown permission level in `config.toml` is a parse error, not a warning.
-- **Breaking:** a scheduled job runs at its session's level, never at the host's `--permission`.
-- A session that recorded no level adopts `[permissions].default` when the store migrates.
-- **Breaking:** an image block in session messages and exports carries a `hash`, not its bytes.
-- **Breaking:** per-turn context is a typed `turn_context` block ahead of a user message's `text`.
-- **Breaking:** `conversation_search` takes `is_regex` (was `regex`).
-- **Breaking:** `conversation_read` takes `limit` (was `count`).
-- **Breaking:** `find_files` takes `glob` (was `pattern`).
-- **Breaking:** `fetch_url` takes `limit` (was `max_length`).
-- **Breaking:** `agent_followup` and `agent_delete` name the sub-agent by `id` (was `agent`).
-- **Breaking:** a gate's `is` test is spelled `not_empty` (was `not-empty`); stored jobs convert.
 - **Breaking:** config durations are strings like `"30d"`; `_seconds` and `_days` keys are gone.
 - **Breaking:** `[mcp].strict` is `default_required` and `[thinking].budget_tokens` is `budget`.
 - **Breaking:** `MEKA_MCP_STDIO_CONCURRENCY` and `MEKA_MCP_HTTP_CONCURRENCY` are gone.
 - `[mcp].stdio_concurrency` (3) and `[mcp].http_concurrency` (20) replace them; zero is refused.
 - **Breaking:** `MEKA_MCP_TOOL_TIMEOUT` takes a duration such as `10m`, not milliseconds.
-- **Breaking:** `mcp add --auth` takes `oauth`, `client_credentials` or `client_credentials_jwt`.
+- **Breaking:** an unknown permission level in `config.toml` is a parse error, not a warning.
+- `meka profile add` no longer sets `default_profile`; a lone profile is the default.
+- `meka profile set` refuses a thinking key on a backend without thinking.
+- `client_id` and `oauth_token_url` are omitted on a backend that ignores them, and warn if set.
+- A `chatgpt-subscription` `base_url` must be an origin or end in `/backend-api/codex`.
+- **Breaking:** the prompt is `-p, --prompt`; there is no positional prompt.
+- **Breaking:** `--provider` is `--profile`, long form only; `-p` is the prompt.
 - **Breaking:** flag values such as `--permission read` and `--format json` refuse case variants.
-- **Breaking:** a stopped background task's `status` is `canceled`, stored rows included.
+- **Breaking:** `mcp add --auth` takes `oauth`, `client_credentials` or `client_credentials_jwt`.
+- `meka account login` and `meka mcp login` print the OAuth URL instead of opening a browser.
+- `meka session show` labels the title `title` (was `opening`).
+- `meka session export` writes the file atomically and owner-only, as `memory export` does.
+- An empty listing says `No <nouns>.` on stderr; the `show` commands align their fields alike.
+- **Breaking:** tool calls show their real names (`read_file`, not `ReadFile`) on every surface.
+- Refusals read the same on every host, e.g. `no profile named 'x' (configured: a, b)`.
+- Messages use American spelling and quote names in single quotes, keys and commands in backticks.
+- Timestamps print in local time with the UTC offset; listings no longer print unlabeled UTC.
+- Sizes in tool results, notices and `/status` print as MiB, KiB or B to one decimal.
+- Lost writes, failed sandbox restrictions and capture fallbacks warn instead of logging at debug.
+- The REPL's approval prompt is headed `[approval]` instead of `[ask]`, matching the switch.
+- The read-mode sandbox hides meka's own directories; Landlock and Windows warn that they cannot.
+- `write_file` and `edit_file` refuse a target inside meka's own directories at `workspace`.
+- Reads, searches and `scratchpad_load_file` refuse meka's own directories below `unrestricted`.
+- **Breaking:** `/provider` is `/profile`.
+- REPL notices are colored by level, and the REPL echoes a scheduled job's prompt before its reply.
+- **Breaking:** `provider` is `profile` on `POST`, `PATCH` and every response of `/v1/sessions`.
+- **Breaking:** `GET /v1/providers` is `GET /v1/profiles`; rows carry `account` and `backend`.
+- **Breaking:** `GET /v1/health/ready` reports `profile_configured` (was `provider_configured`).
 - **Breaking:** a stopped turn's SSE terminal event is `turn.canceled` (`/errors/turn-canceled`).
-- The `todo` tool writes `canceled` and still accepts `cancelled`.
-- **Breaking:** a refusal the ACP caller can act on answers `InvalidParams`, not `InternalError`.
-- **Breaking:** ACP `session/set_config_option` refuses a profile switch while a turn is in flight.
-- **Breaking:** ACP `tool_call` and permission titles read `<DisplayName> <argument>` (`Shell ls`).
-- **Breaking:** the HTTP `permission_required` event carries `input`, the call's arguments.
 - An HTTP permission request stays answerable for 30 minutes (was 60 seconds), as on ACP.
 - Every optional HTTP API field is omitted when absent, never `null`; `display_summary` included.
 - A request body that fails to parse is answered `invalid <endpoint> request body: <diagnostic>`.
 - `POST /v1/sessions/{id}/turn` with `options.skill` and an empty `message` runs the skill alone.
 - Answering a permission request on a session not in memory is 404 instead of loading the session.
 - `[serve].relay_provider_errors` governs `meka acp` as well as the HTTP API.
-- Refusals read the same on every host, e.g. `no profile named 'x' (configured: a, b)`.
-- Messages use American spelling and quote names in single quotes, keys and commands in backticks.
-- Lost writes, failed sandbox restrictions and capture fallbacks warn instead of logging at debug.
+- **Breaking:** ACP's `provider` config option is `profile`.
+- **Breaking:** a refusal the ACP caller can act on answers `InvalidParams`, not `InternalError`.
+- **Breaking:** ACP `session/set_config_option` refuses a profile switch while a turn is in flight.
+- **Breaking:** ACP tool call and permission titles read `<tool name> <argument>`.
 - An ACP prompt refused because the session is busy says what holds it and to retry.
-- The REPL's approval prompt is headed `[approval]` instead of `[ask]`, matching the switch.
-- REPL notices are colored by level, and the REPL echoes a scheduled job's prompt before its reply.
-- Timestamps print in local time with the UTC offset; listings no longer print unlabeled UTC.
-- Sizes in tool results, notices and `/status` print as MiB, KiB or B to one decimal.
-- The session title is the first user words, cut at 80 characters, everywhere it appears.
-- `meka session show` labels the title `title` (was `opening`).
-- A session's `cwd` and the `cwd` listing filter are both canonicalized, on every host.
-- An empty listing says `No <nouns>.` on stderr; the `show` commands align their fields alike.
-- `skill_read` renders as `SkillRead` in tool-call indicators (was `Skill`).
+- **Breaking:** `conversation_search` takes `is_regex` (was `regex`).
+- **Breaking:** `conversation_read` takes `limit` (was `count`).
+- **Breaking:** `find_files` takes `glob` (was `pattern`).
+- **Breaking:** `fetch_url` takes `limit` (was `max_length`).
+- **Breaking:** `agent_followup` and `agent_delete` name the sub-agent by `id` (was `agent`).
+- The `todo` tool writes `canceled` and still accepts `cancelled`.
+- **Breaking:** a scheduled job runs at its session's level, never at the host's `--permission`.
+- **Breaking:** a gate's `is` test is spelled `not_empty` (was `not-empty`); stored jobs convert.
+- A `schedule.fired` webhook reports a stopped turn as `canceled`, not `failed`.
 - `meka schedule show` reports a job whose session's level is disabled as withheld, not as unknown.
 - A scheduled fire that finds its session busy waits for the next sweep, on every host alike.
 - A gate may call a tool that needs `read` or less, not only one that needs exactly `read`.
 - Only `meka mcp login` runs the OAuth flow; a host marks a server with no credential as failed.
-- `meka account login` and `meka mcp login` print the OAuth URL instead of opening a browser.
-- A `chatgpt-subscription` `base_url` must be an origin or end in `/backend-api/codex`.
-- `client_id` and `oauth_token_url` are omitted on a backend that ignores them, and warn if set.
-- `meka profile set` refuses a thinking key on a backend without thinking.
 - `anthropic-messages` sends no one-hour cache TTL or beta; `claude-subscription` keeps both.
-- `meka session export` writes the file atomically and owner-only, as `memory export` does.
-- The read-mode sandbox hides meka's own directories; Landlock and Windows warn that they cannot.
-- `write_file` and `edit_file` refuse a target inside meka's own directories at `workspace`.
-- Reads, searches and `scratchpad_load_file` refuse meka's own directories below `unrestricted`.
+- **Breaking:** an image block in session messages and exports carries a `hash`, not its bytes.
+- **Breaking:** per-turn context is a typed `turn_context` block ahead of a user message's `text`.
+- **Breaking:** a session export archive names its `profile`, and its `format_version` is 2.
+- **Breaking:** a stopped background task's `status` is `canceled`, stored rows included.
+- A session that recorded no level adopts `[permissions].default` when the store migrates.
+- The session title is the first user words, cut at 80 characters, everywhere it appears.
+- A session's `cwd` and the `cwd` listing filter are both canonicalized, on every host.
 
 ### Removed
 
 - **Breaking:** `meka provider`; `meka account` and `meka profile` replace it.
 - **Breaking:** the positional profile on `account usage`, `whoami` and `stats`; use `--profile`.
-- **Breaking:** the `ask` permission level; an `ask` session migrates to `none` with approvals on.
 - **Breaking:** the one-letter levels (`n`, `r`, `w`, `u`) on `--permission` and `MEKA_PERMISSION`.
 - **Breaking:** the aliases `rich` (`termimad`), `text` (`--format plain`) and `md` (`markdown`).
+- **Breaking:** the `ask` permission level; an `ask` session migrates to `none` with approvals on.
 
 ### Fixed
 
-- An image the request budget redacts stays redacted, so later requests keep the cache prefix.
-- A request still over the ceiling after redaction drops attachments and retries; it used to fail.
-- `/status` counts image redactions, checkpoints and summaries included; it always showed none.
-- The cache breakpoint lands on the last block actually sent, after trailing thinking is stripped.
-- `openai-chat-completions` sends `max_completion_tokens` from the profile only, never a guess.
-- A Chat Completions `error` mid-stream fails the turn instead of committing the partial answer.
-- A Chat Completions tool call whose id arrives late is kept, and tool messages drop `is_error`.
-- A Chat Completions stream closing after `finish_reason` without `[DONE]` completes, not fails.
-- A mid-stream error with a numeric `code` is retried as that status; `"error": null` is benign.
-- A Responses `error` frame ends the turn with its reason instead of retrying as truncated.
-- A non-streaming Responses answer cut by `max_output_tokens` is kept with its usage, not lost.
-- An Anthropic-protocol gateway sending `data:` frames without `event:` lines is read, not retried.
-- A `chatgpt-subscription` turn sent two `Content-Type` headers, which the backend refused.
-- A ChatGPT subscription refresh that returns no id token keeps the account id it already had.
-- A ChatGPT subscription `base_url` whose host name contains `codex` is routed by its path.
-- `meka account usage` with a `base_url` ending in `/backend-api/codex` finds the usage endpoints.
-- A rejected subscription token gets one refresh and retry before `meka account login` is named.
-- Two requests refused with one subscription token share a refresh; the second no longer fails.
-- A failed credential save no longer spends a retired refresh token an hour later.
-- A stored subscription credential stays refreshable after an upgrade changes the stored shape.
-- A `claude-subscription` device id is resolved at startup; the first request could block on it.
-- The text that streamed before a connection died is kept in the conversation and the store.
-- A partial answer kept after a mid-stream failure is stored after its prompt, not before it.
-- A thinking-only round shows its reasoning under `--no-stream`, as it does when streaming.
-- A compaction after a repaired resume no longer leaves the first messages above the summary.
-- A compaction inside a turn no longer writes the prompt twice.
-- A conversation of four messages or fewer keeps its unanswered prompt verbatim when compacted.
-- An automatic compaction canceled before summarizing no longer pays for a summary it discards.
-- A permission level lowered during a checkpoint compaction stops its next tool call.
-- An MCP tool called during a compaction sends its progress and elicitations to the right session.
-- A sub-agent spawned while its parent auto-compacts no longer switches the parent's thinking off.
-- `GET /v1/sessions/{id}/messages` shows a repaired image or tool result as the model sees it.
-- A tool round whose save fails keeps its results in the conversation and warns the store lags.
-- A refused prompt no longer swallows background task reports; they ride the next admitted turn.
-- A background task whose outcome write fails is retried once, then marked `failed`, not `running`.
-- A tool call nobody can approve is denied and named on every frontend, not reported as canceled.
-- An MCP elicitation declined for want of a prompt was only logged; every host now raises a notice.
+- `mcp list`, `account list` and `memory list` put notes on stderr, so stdout is only the table.
+- `meka account add --api-key-stdin` refuses an empty stdin by name, as `mcp add` does.
+- `meka account` reports a failure like every other command instead of exiting mid-run.
+- `meka profile add` cannot overwrite a profile another process added meanwhile.
+- `meka memory edit` and `meka skill add --edit` help name `$VISUAL`, then `$EDITOR`, as tried.
+- A failed one-shot turn waits for a command it detached instead of leaving the child untracked.
+- Command-output captures that fall back to the temp directory are swept there too.
+- A tool call nobody can approve is denied and named on every host, not reported as canceled.
 - A detached call that would be refused anyway is no longer put to the user for approval first.
-- A refused `agent_followup` no longer leaves the sub-agent on the new profile.
 - `always` and `never` approval answers survived `/fork`; the copy starts with nothing remembered.
 - Ctrl+C at the REPL approval prompt cancels it, and a bare Enter afterward no longer approves.
 - A session whose recorded level is disabled warns and starts at the default, on every host.
 - `--permission` on a resume that fails to start leaves the session's recorded level as it was.
+- `/rewind` with an argument that is not a count says so, instead of rewinding one turn.
+- `/clear` clears the terminal on stderr, so a redirected stdout no longer receives the escapes.
+- `/status` counts image redactions, checkpoints and summaries included; it always showed none.
+- A line padded with zero-width characters no longer holds the REPL for minutes while wrapping.
+- Wrapping a tool argument to one or two rows produced one row more than the budget allowed.
+- A log line relayed to the REPL never blocks, which could hang the shell.
+- Ctrl+C while a turn waits for MCP servers cancels the turn instead of being lost.
+- The Windows sandbox warning says a workspace root above meka's directories can write them.
+- **Breaking:** a `[web]` or `base_url` misconfiguration answers a sanitized 500, not a 422.
+- **Breaking:** a session lock meka cannot open answers 500, not a 409 blaming another process.
+- **Breaking:** meka's own request-ceiling refusal is 422 `request-too-large`, not 502 `provider`.
+- **Breaking:** `GET`/`PATCH /v1/sessions/{id}` answer 404 or 500, never 200 with `profile: ""`.
+- **Breaking:** `POST /v1/sessions/{id}/schedule` with scheduling disabled answers 404, not 422.
+- `GET /v1/sessions/{id}/messages` shows a repaired image or tool result as the model sees it.
+- `DELETE /v1/sessions/{id}` refuses a session another meka process holds with 409, not a delete.
+- `GET /v1/sessions?limit=0` returns one session rather than an empty page with no cursor.
+- A permission answer at a sub-agent's id is 422 `session-not-drivable`, as documented, not 404.
+- An empty or malformed turn body on a busy session is refused as 422 rather than 409.
+- A retry of a long turn is told its request is in flight instead of getting `turn-in-flight`.
+- A session response omits `permission` for a row with no level, as documented, not `""`.
+- SSE lag is typed `sse-lag` with `level` and `text`; `stream-detached` carries `turn_id`.
+- HTTP skill refusals name the skill and keep the skills directory path out of the body.
+- A `[web]` client meka cannot build fails startup on every host, not the first turn of a session.
+- `[web].ca_cert_file` goes through `~` expansion like every other path setting.
+- Opening a store another process holds no longer stalls the server's other requests.
+- ACP `session/new` deletes the row it created when the session cannot be built or locked.
+- ACP `session/new`, `load`, `resume` and `fork` refuse a `cwd` that is not an existing directory.
+- ACP `session/load` and `resume` no longer rewrite a session's `cwd` and roots before refusing it.
+- ACP no longer puts provider bodies, MCP reasons or store paths in a failed turn's `error.data`.
+- ACP `session/close` cancels the session's detached tool calls, as the HTTP delete already did.
+- The ACP shutdown drain cancels a prompt admitted but not yet published.
+- An image on an ACP prompt is judged against the session's profile, not the process default.
+- `edit_file` refuses an empty `old_string`; with `replace_all` it rewrote the whole file.
+- `scratchpad_save_file` refuses an existing file without `force`; its description said otherwise.
+- `scratchpad_save_file` refuses a target it cannot stat instead of overwriting it as absent.
+- `scratchpad_read` documents `offset` and `limit` as bytes, snapped to character boundaries.
+- `search_contents` counts files it could not read in its "skipped" note.
+- `todo` accepts the universal `scratchpad` parameter instead of refusing the call.
+- `context_compact` cannot be detached with `background: true`; it fired against a later turn.
+- A memory or skill name under 64 characters but over 64 bytes was refused for its length in bytes.
+- A sub-agent's `scratchpad` parameter refuses an inherited entry's name instead of shadowing it.
+- `agent_spawn` refuses mistyped restrictions rather than spawning an unrestricted sub-agent.
+- `agent_spawn` with `scratchpad: null` keeps the sub-agent id in its result.
+- A refused `agent_followup` no longer leaves the sub-agent on the new profile.
+- A sub-agent spawned while its parent auto-compacts no longer switches the parent's thinking off.
+- A sub-agent's activity line no longer goes blank for the rest of the run after an internal error.
 - A scheduled gate honors a live session's level even when the level's row write failed.
 - A session row the scheduler cannot read grants nothing; it fell back to the host's level.
 - A scheduled job whose gate tool or session is unreachable keeps its occurrence for a later sweep.
@@ -184,67 +190,51 @@ a backup. The upgrade guide lists every breaking change with its remedy.
 - A gate's shell probe stops at the parse limit instead of buffering everything until its timeout.
 - A gate whose stderr exceeds the cap is drained instead of dying on `SIGPIPE` before it answers.
 - `meka schedule list --session` reports an unknown session id as such, not as a config error.
-- `meka -r <id>` under `[session].retention` no longer deletes the session it was asked to resume.
-- A session resumed while the retention sweep runs survives it.
-- HTTP and ACP forks refuse a source another process holds, or one mid-turn, instead of copying it.
-- A failed fork or export leaves no lock file behind, and a fork that cannot be read back fails.
-- An HTTP fork cannot lose its copy to a concurrent `meka session delete --all`.
-- ACP `session/new` deletes the row it created when the session cannot be built or locked.
-- ACP `session/new`, `load`, `resume` and `fork` refuse a `cwd` that is not an existing directory.
-- ACP `session/load` and `resume` no longer rewrite a session's `cwd` and roots before refusing it.
-- ACP no longer puts provider bodies, MCP reasons or store paths in a failed turn's `error.data`.
-- ACP `session/close` cancels the session's detached tool calls, as the HTTP delete already did.
-- The ACP shutdown drain cancels a prompt admitted but not yet published.
-- An image on an ACP prompt is judged against the session's profile, not the process default.
-- `meka serve` and `meka acp` keep statistics per session, so a resume continues its totals.
-- `DELETE /v1/sessions/{id}` refuses a session another meka process holds with 409, not a delete.
-- `GET /v1/sessions?limit=0` returns one session rather than an empty page with no cursor.
-- A permission answer at a sub-agent's id is 422 `session-not-drivable`, as documented, not 404.
-- An empty or malformed turn body on a busy session is refused as 422 rather than 409.
-- A retry of a long turn is told its request is in flight instead of getting `turn-in-flight`.
-- A session response omits `permission` for a row with no level, as documented, not `""`.
-- SSE lag is typed `sse-lag` with `level` and `text`; `stream-detached` carries `turn_id`.
-- HTTP skill refusals name the skill and keep the skills directory path out of the body.
-- **Breaking:** a `[web]` or `base_url` misconfiguration answers a sanitized 500, not a 422.
-- **Breaking:** a session lock meka cannot open answers 500, not a 409 blaming another process.
-- **Breaking:** meka's own request-ceiling refusal is 422 `request-too-large`, not 502 `provider`.
-- **Breaking:** `GET`/`PATCH /v1/sessions/{id}` answer 404 or 500, never 200 with `profile: ""`.
-- **Breaking:** `POST /v1/sessions/{id}/schedule` with scheduling disabled answers 404, not 422.
-- A `[web]` client meka cannot build fails startup on every host, not the first turn of a session.
-- `[web].ca_cert_file` goes through `~` expansion like every other path setting.
-- Opening a store another process holds no longer stalls the server's other requests.
-- Atomic writes sync the parent directory after the rename, so a crash cannot lose the new file.
-- `edit_file` refuses an empty `old_string`; with `replace_all` it rewrote the whole file.
-- `scratchpad_save_file` refuses an existing file without `force`; its description said otherwise.
-- `scratchpad_save_file` refuses a target it cannot stat instead of overwriting it as absent.
-- `scratchpad_read` documents `offset` and `limit` as bytes, snapped to character boundaries.
-- A sub-agent's `scratchpad` parameter refuses an inherited entry's name instead of shadowing it.
-- `agent_spawn` refuses mistyped restrictions rather than spawning an unrestricted sub-agent.
-- `agent_spawn` with `scratchpad: null` keeps the sub-agent id in its result.
-- `context_compact` cannot be detached with `background: true`; it fired against a later turn.
-- `todo` accepts the universal `scratchpad` parameter instead of refusing the call.
-- `search_contents` counts files it could not read in its "skipped" note.
-- A memory or skill name under 64 characters but over 64 bytes was refused for its length in bytes.
 - An MCP server whose `headers` or `env` name an unset variable is refused, not sent `${VAR}`.
 - An MCP server with stored credentials no longer fails because the OAuth callback port is busy.
 - A failed `meka mcp login` restores the credential it replaced.
 - A pasted OAuth callback URL decodes form encoding like the listener does.
 - `meka mcp add --eager-load-tool` reaches `config.toml`; it was accepted, reported, and dropped.
-- `mcp list`, `account list` and `memory list` put notes on stderr, so stdout is only the table.
-- `meka account add --api-key-stdin` refuses an empty stdin by name, as `mcp add` does.
-- `meka account` reports a failure like every other command instead of exiting mid-run.
-- `meka profile add` cannot overwrite a profile another process added meanwhile.
-- `meka memory edit` and `meka skill add --edit` help name `$VISUAL`, then `$EDITOR`, as tried.
-- `/rewind` with an argument that is not a count says so, instead of rewinding one turn.
-- `/clear` clears the terminal on stderr, so a redirected stdout no longer receives the escapes.
-- A line padded with zero-width characters no longer holds the REPL for minutes while wrapping.
-- Wrapping a tool argument to one or two rows produced one row more than the budget allowed.
-- A relayed log line never blocks on a full editor queue, which could hang the shell.
-- A sub-agent's activity line no longer goes blank for the rest of the run after an internal error.
-- Ctrl+C while a turn waits for MCP servers cancels the turn instead of being lost.
-- A failed one-shot turn waits for a command it detached instead of leaving the child untracked.
-- Command-output captures that fall back to the temp directory are swept there too.
-- The Windows sandbox warning says a workspace root above meka's directories can write them.
+- An MCP elicitation declined for want of a prompt was only logged; every host now raises a notice.
+- An MCP tool called during a compaction sends its progress and elicitations to the right session.
+- `openai-chat-completions` sends `max_completion_tokens` from the profile only, never a guess.
+- A Chat Completions `error` mid-stream fails the turn instead of committing the partial answer.
+- A Chat Completions tool call whose id arrives late is kept, and tool messages drop `is_error`.
+- A Chat Completions stream closing after `finish_reason` without `[DONE]` completes, not fails.
+- A mid-stream error with a numeric `code` is retried as that status; `"error": null` is benign.
+- A Responses `error` frame ends the turn with its reason instead of retrying as truncated.
+- A non-streaming Responses answer cut by `max_output_tokens` is kept with its usage, not lost.
+- An Anthropic-protocol gateway sending `data:` frames without `event:` lines is read, not retried.
+- The cache breakpoint lands on the last block actually sent, after trailing thinking is stripped.
+- A `chatgpt-subscription` turn sent two `Content-Type` headers, which the backend refused.
+- A ChatGPT subscription refresh that returns no id token keeps the account id it already had.
+- A ChatGPT subscription `base_url` whose host name contains `codex` is routed by its path.
+- `meka account usage` with a `base_url` ending in `/backend-api/codex` finds the usage endpoints.
+- A rejected subscription token gets one refresh and retry before `meka account login` is named.
+- Two requests refused with one subscription token share a refresh; the second no longer fails.
+- A failed credential save no longer spends a retired refresh token an hour later.
+- A stored subscription credential stays refreshable after an upgrade changes the stored shape.
+- A `claude-subscription` device id is resolved at startup; the first request could block on it.
+- An image the request budget redacts stays redacted, so later requests keep the cache prefix.
+- A request still over the ceiling after redaction drops attachments and retries; it used to fail.
+- The text that streamed before a connection died is kept in the conversation and the store.
+- A partial answer kept after a mid-stream failure is stored after its prompt, not before it.
+- A thinking-only round shows its reasoning under `--no-stream`, as it does when streaming.
+- A tool round whose save fails keeps its results in the conversation and warns the store lags.
+- A compaction after a repaired resume no longer leaves the first messages above the summary.
+- A compaction inside a turn no longer writes the prompt twice.
+- A conversation of four messages or fewer keeps its unanswered prompt verbatim when compacted.
+- An automatic compaction canceled before summarizing no longer pays for a summary it discards.
+- A permission level lowered during a checkpoint compaction stops its next tool call.
+- A refused prompt no longer swallows background task reports; they ride the next admitted turn.
+- A background task whose outcome write fails is retried once, then marked `failed`, not `running`.
+- `meka -r <id>` under `[session].retention` no longer deletes the session it was asked to resume.
+- A session resumed while the retention sweep runs survives it.
+- HTTP and ACP forks refuse a source another process holds, or one mid-turn, instead of copying it.
+- A failed fork or export leaves no lock file behind, and a fork that cannot be read back fails.
+- An HTTP fork cannot lose its copy to a concurrent `meka session delete --all`.
+- `meka serve` and `meka acp` keep statistics per session, so a resume continues its totals.
+- Atomic writes sync the parent directory after the rename, so a crash cannot lose the new file.
 
 ## [0.45.1] - 2026-09-04
 

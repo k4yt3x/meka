@@ -304,7 +304,6 @@ points a `meka` command at it (`MEKA_CONFIG_DIR`, `MEKA_DATA_DIR`, `HOME`, `XDG_
 `MEKA_MOCK_PROVIDER=1`, the script when one was written) and `Install::meka(args)` builds one.
 
 The exact gate CI runs is in `AGENTS.md` under "Build gate"; run it before declaring a change done,
-since clippy and rustdoc deny warnings there and not locally. `scripts/migrate-0.45-to-0.46.py` is
-the one-shot conversion for a 0.45 `config.toml`; `--self-test` checks it against the fixture it
-carries, and the `migration-script` job in `.github/workflows/ci.yaml` runs that and a dry run over
-`tests/fixtures/config-0.45.toml`. The release workflow attaches the script to every release.
+since clippy and rustdoc deny warnings there and not locally. The one-shot conversion for a 0.45
+`config.toml`, `migrate-0.45-to-0.46.py`, is not in the repository: like the 0.42 script before it,
+it is attached to its release as an asset by hand and carries its own `--self-test` fixture.

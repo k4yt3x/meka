@@ -17,8 +17,7 @@ release changes its shape: a `[providers.<name>]` profile is now an `[accounts.<
 a `[profiles.<name>]` table, `default_provider` is `default_profile`, and the `ask` permission
 level is gone. A config in the old shape is refused at startup, naming the first key meka does not
 know, rather than read with a guess at what it meant. The conversion is a one-shot script,
-`migrate-0.45-to-0.46.py`, attached as an asset to the 0.46 release and kept under `scripts/` in the
-repository.
+`migrate-0.45-to-0.46.py`, attached as an asset to the 0.46 release.
 
 Beyond the config shape, this release renames several tool parameters, changes a handful of HTTP
 fields and status codes, and makes ACP answer `InvalidParams` where it answered `InternalError`.
@@ -175,7 +174,8 @@ key whose value is not a whole number is left under its old name and reported, w
   <argument>` (`read_file src/x`) and permission requests carry `rawInput` with a JSON content block.
 - **Terminal output**: every timestamp is local time with its UTC offset (`2026-09-07 14:03
   +02:00`), sizes print as MiB, KiB or B, and every listing command takes `--format json`, printing
-  the HTTP API's record shapes. The approval prompt is headed `[approval]` and takes `always` and
+  the HTTP API's record shapes. Tool-call indicators and the approval prompt show a tool's real
+  name (`read_file`, not `ReadFile`); the prompt is headed `[approval]` and takes `always` and
   `never`.
 - **Skills you wrote** that name a renamed tool parameter (next table) or the old `[ask]` prompt
   must be edited by hand; meka does not rewrite skill files.

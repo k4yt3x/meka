@@ -170,7 +170,6 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
 cargo test --locked                  # CI adds --features mock-provider; debug builds carry it anyway
 cargo check --locked --all-targets   # on the MSRV in Cargo.toml's rust-version
 mdbook build docs/book
-python3 scripts/migrate-0.45-to-0.46.py --self-test   # needs tomlkit; CI also dry-runs the fixture
 ```
 
 `--all-targets` matters: plain clippy skips tests and benches. In rustdoc, watch

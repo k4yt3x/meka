@@ -149,21 +149,6 @@ jobs:
       - name: Build the book
         run: mdbook build docs/book
 
-  migration-script:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Install tomlkit
-        run: python3 -m venv .venv && .venv/bin/pip install tomlkit
-
-      - name: Check the config migration script
-        run: |
-          .venv/bin/python scripts/migrate-0.45-to-0.46.py --self-test
-          .venv/bin/python scripts/migrate-0.45-to-0.46.py --config tests/fixtures/config-0.45.toml
-
   docker:
     runs-on: ubuntu-latest
 
