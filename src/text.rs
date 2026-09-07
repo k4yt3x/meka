@@ -29,9 +29,9 @@ fn is_safe_char(ch: char) -> bool {
     // Only the two whitespace controls that cannot move the cursor back pass. `\r` is deliberately
     // not among them: it returns the cursor to column zero without advancing a line, which is
     // enough to overwrite a line meka has already printed using no escape sequence at all. A
-    // server progress message of `"\r[approval] Shell\n  command: ls\nAllow? (Y/n) "` would
-    // otherwise repaint a convincing approval block at column zero, and everything that renders
-    // server text (the elicitation banner, the form labels, the progress line) trusts this
+    // server progress message of `"\r[approval] execute_command\n  command: ls\nAllow? (Y/n) "`
+    // would otherwise repaint a convincing approval block at column zero, and everything that
+    // renders server text (the elicitation banner, the form labels, the progress line) trusts this
     // function to have made it terminal-safe.
     if ch == '\n' || ch == '\t' {
         return true;

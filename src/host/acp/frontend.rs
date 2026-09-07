@@ -663,18 +663,17 @@ impl Frontend for AcpFrontend {
         // user just read, when it actually approves every shell command for the rest of the
         // session. Spelling the tool out is what makes the affordance and the semantics agree, and
         // it is spelled the way the title spells it.
-        let display_name = crate::tools::tool_display_name(&request.tool_name);
         let options = vec![
             PermissionOption::new(OPTION_ALLOW_ONCE, "Allow", PermissionOptionKind::AllowOnce),
             PermissionOption::new(
                 OPTION_ALLOW_ALWAYS,
-                sticky_option_label("allow", display_name),
+                sticky_option_label("allow", &request.tool_name),
                 PermissionOptionKind::AllowAlways,
             ),
             PermissionOption::new(OPTION_REJECT_ONCE, "Deny", PermissionOptionKind::RejectOnce),
             PermissionOption::new(
                 OPTION_REJECT_ALWAYS,
-                sticky_option_label("deny", display_name),
+                sticky_option_label("deny", &request.tool_name),
                 PermissionOptionKind::RejectAlways,
             ),
         ];
@@ -1020,18 +1019,15 @@ pub(super) fn tool_kind_for(name: &str) -> ToolKind {
         _ => ToolKind::Other,
     }
 }
-/// Build the human-readable `title` for a tool call: the tool's display name, then the resolved
-/// primary argument (`display_summary`: the command for `execute_command`, the path for
-/// `read_file`, the URL for `fetch_url`, ...), so editors show what's running and not only which
-/// tool. The name comes from [`crate::tools::tool_display_name`], the same one the REPL's indicator
-/// and approval prompt show, so the two surfaces share one vocabulary and a tool added later needs
-/// no second table here. `raw_input` still carries the full argument object for clients that want
-/// it.
+/// Build the human-readable `title` for a tool call: the tool's name, then the resolved primary
+/// argument (`display_summary`: the command for `execute_command`, the path for `read_file`, the
+/// URL for `fetch_url`, ...), so editors show what's running and not only which tool. The name is
+/// the one the REPL's indicator and approval prompt show, so the surfaces share one vocabulary.
+/// `raw_input` still carries the full argument object for clients that want it.
 pub(super) fn tool_call_title(name: &str, display_summary: Option<&str>) -> String {
-    let display_name = crate::tools::tool_display_name(name);
     let raw = match display_summary.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(argument) => format!("{display_name} {argument}"),
-        None => display_name.to_string(),
+        Some(argument) => format!("{name} {argument}"),
+        None => name.to_string(),
     };
     sanitize_title(&raw)
 }

@@ -1020,49 +1020,49 @@ mod tests {
         assert!(matches!(blocks[0], ToolCallContent::Diff(_)));
     }
 
-    /// The title opens with the same display name the REPL's indicator and approval prompt use,
-    /// so a user reading both surfaces meets one vocabulary; the argument follows it.
+    /// The title opens with the tool's name, the one the REPL's indicator and approval prompt
+    /// show, so a user reading both surfaces meets one vocabulary; the argument follows it.
     #[test]
     fn tool_call_title_per_tool() {
         assert_eq!(
             tool_call_title("execute_command", Some("git status && git diff")),
-            "Shell git status && git diff"
+            "execute_command git status && git diff"
         );
         assert_eq!(
             tool_call_title("read_file", Some("src/main.rs")),
-            "ReadFile src/main.rs"
+            "read_file src/main.rs"
         );
         assert_eq!(
             tool_call_title("edit_file", Some("src/lib.rs")),
-            "EditFile src/lib.rs"
+            "edit_file src/lib.rs"
         );
         assert_eq!(
             tool_call_title("write_file", Some("out.txt")),
-            "WriteFile out.txt"
+            "write_file out.txt"
         );
         assert_eq!(
             tool_call_title("find_files", Some("**/*.rs")),
-            "FindFiles **/*.rs"
+            "find_files **/*.rs"
         );
         assert_eq!(
             tool_call_title("search_contents", Some("TODO")),
-            "SearchContents TODO"
+            "search_contents TODO"
         );
         assert_eq!(
             tool_call_title("fetch_url", Some("https://example.com")),
-            "FetchUrl https://example.com"
+            "fetch_url https://example.com"
         );
         assert_eq!(
             tool_call_title("search_web", Some("rust acp")),
-            "SearchWeb rust acp"
+            "search_web rust acp"
         );
         // An MCP tool's name is the server's, shown as the server spells it.
         assert_eq!(
             tool_call_title("mcp__exa__web_search_exa", Some("query")),
             "mcp__exa__web_search_exa query"
         );
-        // No primary argument resolved -> the display name alone.
-        assert_eq!(tool_call_title("read_file", None), "ReadFile");
+        // No primary argument resolved -> the name alone.
+        assert_eq!(tool_call_title("read_file", None), "read_file");
     }
 
     #[test]
@@ -1070,7 +1070,7 @@ mod tests {
         // A multi-line command collapses to a single line.
         assert_eq!(
             tool_call_title("execute_command", Some("git status\n  && git diff")),
-            "Shell git status && git diff"
+            "execute_command git status && git diff"
         );
         // Over-long titles are truncated with an ellipsis.
         let long = "x".repeat(400);

@@ -580,8 +580,8 @@ and setting `off` for a quiet scrollback must not leave you approving calls you 
 
 | Value | Description |
 |-------|-------------|
-| `off` | Name only: `[tool Shell]`. No argument reaches your terminal |
-| `summary` | Name plus the one argument that identifies the call: ``[tool Shell(`cargo test`)]`` (default) |
+| `off` | Name only: `[tool execute_command]`. No argument reaches your terminal |
+| `summary` | Name plus the one argument that identifies the call: ``[tool execute_command(`cargo test`)]`` (default) |
 | `full` | Every argument, as an indented block under the name |
 
 Default: `summary`
@@ -592,13 +592,13 @@ readable instead of collapsing into escaped newlines. Nesting is carried by inde
 for array elements:
 
 ```
-[tool EditFile]
+[tool edit_file]
   path: src/render.rs
   old_string:
     let first_line = thinking.lines().next().unwrap_or("");
     let truncated = truncate_display(first_line, 80);
 
-[tool AgentSpawn]
+[tool agent_spawn]
   prompt: Audit the scheduler for missed-occurrence bugs
   tools:
     - read_file

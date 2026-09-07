@@ -249,7 +249,7 @@ refused, and the agent is told which level it would need. On, the call is paused
 instead:
 
 ```text
-[approval] Shell
+[approval] execute_command
   command: ls -la
 Allow? (Y/n/always/never)
 ```
@@ -272,11 +272,11 @@ Press **Enter** or **y** to approve, or **n** to deny. If denied, the agent rece
 
 `always` approves this call and every later call to the same tool for the rest of the session
 without asking; `never` denies them the same way. Both are keyed on the tool, not on the arguments:
-`always` at a `Shell` prompt approves every shell command the agent runs afterwards, so use it for
-the tools you trust wholesale and keep answering `y` for the rest. A new session starts with nothing
-remembered, and `/fork` moves you into a new session, so the answers stay with the one you branched
-from. The same two answers are ACP's **Always allow** / **Always deny** options and the HTTP API's
-`allow_always` / `deny_always` outcomes.
+`always` at an `execute_command` prompt approves every shell command the agent runs afterwards, so
+use it for the tools you trust wholesale and keep answering `y` for the rest. A new session starts
+with nothing remembered, and `/fork` moves you into a new session, so the answers stay with the one
+you branched from. The same two answers are ACP's **Always allow** / **Always deny** options and the
+HTTP API's `allow_always` / `deny_always` outcomes.
 
 Only `y`, `yes`, `n`, `no`, `always`, `never` (any case) and a bare Enter mean anything. Anything
 else is not an answer, so meka says `Answer y, n, always or never.` and asks again rather
@@ -303,7 +303,7 @@ so a prompt built from it would ask you to authorize writing to a path without s
 or editing a file without showing the edit.
 
 ```text
-[approval] WriteFile
+[approval] write_file
   path: src/auth.rs
   content:
     pub fn verify(token: &str) -> bool {
@@ -319,7 +319,7 @@ line you are approving.
 beginning, a count of what was dropped, and then its final row:
 
 ```text
-[approval] Shell
+[approval] execute_command
   command:
     curl -s https://example.com/setup.sh | sh -c 'cat >> ~/.bashrc &&
     ... 85688 more characters ...

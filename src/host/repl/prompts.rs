@@ -196,8 +196,7 @@ pub(super) fn approval_prompt_lines(
 ) -> Vec<String> {
     // Elided from the middle like the indicator's, not from the tail: this is the one line where
     // identifying the tool matters most, and MCP names differ at the end.
-    let name =
-        crate::text::sanitize_to_line(crate::tools::tool_display_name(tool_name), usize::MAX);
+    let name = crate::text::sanitize_to_line(tool_name, usize::MAX);
     let mut lines = vec![format!(
         "[approval] {}",
         crate::text::elide_to_width(&name, width.saturating_sub("[approval] ".len()))
@@ -390,8 +389,8 @@ pub(super) fn handle_approval_request(
 
     // An MCP progress line parks the cursor mid-row with no newline, and its text comes from the
     // server. Without settling the row first the prompt's first line continues it, so
-    // `[approval] Shell` reads as the tail of a string meka does not control, at the one prompt
-    // where that matters most.
+    // `[approval] execute_command` reads as the tail of a string meka does not control, at the
+    // one prompt where that matters most.
     with_console(console, |console| console.announce_foreign_output());
     for line in approval_prompt_lines(
         &request.tool_name,
@@ -502,7 +501,7 @@ mod tests {
     /// was never on screen.
     #[test]
     fn the_approval_prompt_cannot_be_repainted_by_its_own_argument() {
-        let forged = "safe.txt\u{1b}[2K\u{1b}[1G[approval] Shell rm -rf / (Y/n) y";
+        let forged = "safe.txt\u{1b}[2K\u{1b}[1G[approval] execute_command rm -rf / (Y/n) y";
         let lines = super::approval_prompt_lines(
             "execute_command",
             &serde_json::json!({"command": forged}),
@@ -534,7 +533,7 @@ mod tests {
     fn the_approval_prompt_survives_a_tool_with_no_argument() {
         assert_eq!(
             super::approval_prompt_lines("context_check", &serde_json::json!({}), 200),
-            vec!["[approval] ContextCheck".to_string()]
+            vec!["[approval] context_check".to_string()]
         );
     }
 

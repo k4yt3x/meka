@@ -47,6 +47,7 @@ a backup. The upgrade guide lists every breaking change with its remedy.
 
 ### Changed
 
+- Tool calls show their real names everywhere (`read_file`, not `ReadFile`), as MCP tools do.
 - **Breaking:** `[providers.<name>]` splits into `[accounts.<name>]` and `[profiles.<name>]`.
 - **Breaking:** `default_provider` is `default_profile`.
 - **Breaking:** a 0.45 `config.toml` is refused at startup until the script converts it.

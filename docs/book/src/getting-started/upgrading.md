@@ -171,8 +171,8 @@ key whose value is not a whole number is left under its old name and reported, w
   refusal the caller can act on answer `InvalidParams` (was `InternalError`);
   `session/set_config_option` refuses a profile switch while a turn is in flight instead of writing
   the row and deferring; `session/new`, `load`, `resume` and `fork` refuse a `cwd` that is not an
-  existing directory and record it canonically; tool-call and permission titles read `<DisplayName>
-  <argument>` (`ReadFile src/x`) and permission requests carry `rawInput` with a JSON content block.
+  existing directory and record it canonically; tool-call and permission titles read `<tool_name>
+  <argument>` (`read_file src/x`) and permission requests carry `rawInput` with a JSON content block.
 - **Terminal output**: every timestamp is local time with its UTC offset (`2026-09-07 14:03
   +02:00`), sizes print as MiB, KiB or B, and every listing command takes `--format json`, printing
   the HTTP API's record shapes. The approval prompt is headed `[approval]` and takes `always` and

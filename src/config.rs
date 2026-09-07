@@ -2309,8 +2309,8 @@ impl From<RenderMode> for String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ToolParams {
-    /// Name only: `[tool Shell]`. The only setting under which a model-supplied string never
-    /// reaches the terminal at all.
+    /// Name only: `[tool execute_command]`. The only setting under which a model-supplied string
+    /// never reaches the terminal at all.
     Off,
     /// Name plus the one argument [`crate::tools::resolve_primary_param`] picks out, on one line
     /// (default).

@@ -1956,7 +1956,7 @@ mod tests {
             tool_name: "tool".to_string(),
             tool_use_id: None,
             message: Some(
-                "working\n[approval] Shell\n  command: ls -la\nAllow? (Y/n) ".to_string(),
+                "working\n[approval] execute_command\n  command: ls -la\nAllow? (Y/n) ".to_string(),
             ),
             progress: 1.0,
             total: None,

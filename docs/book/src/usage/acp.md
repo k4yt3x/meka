@@ -141,7 +141,7 @@ While the turn runs, meka streams `session/update` notifications:
 
 - `agent_message_chunk` for each piece of assistant text.
 - `agent_thought_chunk` for thinking blocks (Claude OAuth / extended-thinking models).
-- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd, with the start line for `read_file`), the raw input, and a human-readable `title`. The title is the tool's display name followed by its primary argument, the same words the REPL's `[tool ...]` indicator uses, so editors show what's running rather than the bare tool name: `Shell <command>`, `ReadFile <path>` / `EditFile <path>` / `WriteFile <path>`, `FetchUrl <url>`, `SearchWeb <query>`, and an MCP tool's own name.
+- `tool_call` when a tool starts, with `kind`, `status: "in_progress"`, an absolute `locations` array (relative paths resolved against the session cwd, with the start line for `read_file`), the raw input, and a human-readable `title`. The title is the tool's name followed by its primary argument, the same words the REPL's `[tool ...]` indicator uses, so editors show what's running rather than the bare tool name: `execute_command <command>`, `read_file <path>` / `edit_file <path>` / `write_file <path>`, `fetch_url <url>`, `search_web <query>`, and the same under an MCP tool's own name.
 - `tool_call_update` when a tool finishes, with the final `status` (`completed` / `failed`), a `content` array, and `raw_output` (the structured tool result). `execute_command` output is wrapped in a fenced `console` code block so editors render it monospaced; `edit_file` and `write_file` populate diff content blocks so clients can render the apply-diff UI. (Large outputs offloaded to the scratchpad show the scratchpad reference rather than the full payload.)
 - `plan` whenever the agent's `todo` tool updates the task list, so clients with a plan panel (e.g. Zed) render the live to-do list. meka's `canceled` todo status maps to `completed`.
 - `session_info_update` once per session, carrying the title (the first user message's words, cut to 80 characters) so a freshly created or loaded tab gets a label without a `session/list` call.
@@ -178,11 +178,11 @@ gets it; see below.
 With the `approvals` config option on, a tool call above the active level triggers a `session/request_permission` round-trip instead of a refusal. Clients render four options:
 
 - **Allow**: run this call only.
-- **Always allow any `<Tool>`**: run this call and skip the prompt for that tool for the rest of the session.
+- **Always allow any `<tool_name>`**: run this call and skip the prompt for that tool for the rest of the session.
 - **Deny**: refuse this call only.
-- **Always deny any `<Tool>`**: refuse this call and every subsequent call to that tool.
+- **Always deny any `<tool_name>`**: refuse this call and every subsequent call to that tool.
 
-The sticky options name the tool because that is exactly their scope: the decision is keyed on the tool name and takes no account of arguments. The prompt's title is `<Tool> <primary argument>`, the tool's display name (`Shell` for `execute_command`) and the argument the indicator shows, so for a shell command you are reading one specific command line while the sticky option covers *every* shell command the agent runs afterwards. If you want per-command control, use **Allow** and keep answering. The request's `rawInput`, and a fenced `json` content block beside the title, carry every argument the call was made with, so a client that renders either shows what is being written and not only where.
+The sticky options name the tool because that is exactly their scope: the decision is keyed on the tool name and takes no account of arguments. The prompt's title is `<tool_name> <primary argument>`, the tool's name and the argument the indicator shows, so for a shell command you are reading one specific command line while the sticky option covers *every* shell command the agent runs afterwards. If you want per-command control, use **Allow** and keep answering. The request's `rawInput`, and a fenced `json` content block beside the title, carry every argument the call was made with, so a client that renders either shows what is being written and not only where.
 
 Sticky decisions live in meka's process memory with the session entry; they reset on `session/close` and when the idle sweep releases the session.
 

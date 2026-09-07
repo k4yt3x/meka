@@ -584,12 +584,12 @@ model = "claude-sonnet-4-5"
             update["status"], "in_progress",
             "expected tool_call status in_progress: {update}",
         );
-        // The title carries the display name the REPL's indicator uses, then the resolved primary
-        // argument (the path): not the bare tool name, and not a second vocabulary.
+        // The title carries the tool's name, then the resolved primary argument (the path): not
+        // the bare name alone, and not a second vocabulary.
         let title = update["title"].as_str().unwrap_or("");
         assert!(
-            title.starts_with("ReadFile ") && title.contains("target.txt"),
-            "tool_call title should be 'ReadFile <path>': {update}",
+            title.starts_with("read_file ") && title.contains("target.txt"),
+            "tool_call title should be 'read_file <path>': {update}",
         );
         true
     });
@@ -934,15 +934,15 @@ enabled = ["read", "unrestricted"]
         match value["method"].as_str() {
             Some("session/request_permission") => {
                 saw_permission_request = true;
-                // What the editor is asked to approve: the display name the REPL uses, every
-                // argument (so the write's content is on screen, not only its path), and sticky
-                // options that name the tool in the same words as the title.
+                // What the editor is asked to approve: the tool's name, every argument (so the
+                // write's content is on screen, not only its path), and sticky options that name
+                // the tool in the same words as the title.
                 let tool_call = &value["params"]["toolCall"];
                 assert!(
                     tool_call["title"]
                         .as_str()
-                        .is_some_and(|title| title.starts_with("WriteFile ")),
-                    "the permission title opens with the tool's display name: {value}"
+                        .is_some_and(|title| title.starts_with("write_file ")),
+                    "the permission title opens with the tool's name: {value}"
                 );
                 assert_eq!(
                     tool_call["rawInput"]["content"], "hello",
@@ -963,8 +963,8 @@ enabled = ["read", "unrestricted"]
                     .filter_map(|option| option["name"].as_str())
                     .collect();
                 assert!(
-                    option_names.contains(&"Always allow any WriteFile")
-                        && option_names.contains(&"Always deny any WriteFile"),
+                    option_names.contains(&"Always allow any write_file")
+                        && option_names.contains(&"Always deny any write_file"),
                     "the sticky options name the tool the way the title does: {option_names:?}"
                 );
                 Some(serde_json::json!({

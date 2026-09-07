@@ -733,65 +733,6 @@ pub(crate) fn resolve_primary_param(
     }
     schema.and_then(|s| schema_primary_param(s, input))
 }
-/// The label a tool indicator shows for a built-in.
-///
-/// One entry per name in [`BUILTIN_TOOL_NAMES`], in PascalCase, enforced by
-/// `every_builtin_tool_has_a_display_name`: a hand-maintained table drifts into several styles and
-/// misses whole families, and a tool added without an entry falls through to `other` unnoticed.
-pub(crate) fn tool_display_name(name: &str) -> &str {
-    match name {
-        "agent_delete" => "AgentDelete",
-        "agent_followup" => "AgentFollowup",
-        "agent_list" => "AgentList",
-        "agent_spawn" => "AgentSpawn",
-        "context_check" => "ContextCheck",
-        "context_compact" => "ContextCompact",
-        "conversation_read" => "ConversationRead",
-        "conversation_search" => "ConversationSearch",
-        "edit_file" => "EditFile",
-        "execute_command" => "Shell",
-        "fetch_url" => "FetchUrl",
-        "find_files" => "FindFiles",
-        "load_tool" => "LoadTool",
-        "mcp_prompt_get" => "McpPromptGet",
-        "mcp_prompt_list" => "McpPromptList",
-        "mcp_resource_list" => "McpResourceList",
-        "mcp_resource_read" => "McpResourceRead",
-        "mcp_resource_subscribe" => "McpResourceSubscribe",
-        "mcp_resource_unsubscribe" => "McpResourceUnsubscribe",
-        "mcp_resource_updates_list" => "McpResourceUpdatesList",
-        "memory_delete" => "MemoryDelete",
-        "memory_read" => "MemoryRead",
-        "memory_search" => "MemorySearch",
-        "memory_write" => "MemoryWrite",
-        "read_file" => "ReadFile",
-        "render_image" => "RenderImage",
-        "schedule_cancel" => "ScheduleCancel",
-        "schedule_create" => "ScheduleCreate",
-        "schedule_list" => "ScheduleList",
-        "scratchpad_delete" => "ScratchpadDelete",
-        "scratchpad_edit" => "ScratchpadEdit",
-        "scratchpad_list" => "ScratchpadList",
-        "scratchpad_load_file" => "ScratchpadLoadFile",
-        "scratchpad_merge" => "ScratchpadMerge",
-        "scratchpad_read" => "ScratchpadRead",
-        "scratchpad_rename" => "ScratchpadRename",
-        "scratchpad_save_file" => "ScratchpadSaveFile",
-        "scratchpad_write" => "ScratchpadWrite",
-        "search_contents" => "SearchContents",
-        "search_web" => "SearchWeb",
-        "skill_delete" => "SkillDelete",
-        "skill_read" => "SkillRead",
-        "skill_search" => "SkillSearch",
-        "skill_write" => "SkillWrite",
-        "task_cancel" => "TaskCancel",
-        "task_list" => "TaskList",
-        "todo" => "Todo",
-        "write_file" => "WriteFile",
-        // An MCP tool's name is the server's, not meka's, so it is shown as the server spells it.
-        other => other,
-    }
-}
 /// Whether [`builtin_primary_param`] answers for `name` given an input shaped like `parameters`.
 ///
 /// The probe is built from the tool's own declared properties, not from a fixed list of keys: a
@@ -898,11 +839,11 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         return input.get("id").and_then(|v| v.as_str()).map(str::to_string);
     }
 
-    // Sorted, like `tool_display_name` and `BUILTIN_TOOL_NAMES`, so the three can be read against
-    // each other. Mostly this agrees with the schema's own `required[0]`, which is what the live
-    // path would have fallen back to; where it does not, the schema's first required key names the
-    // server a call is addressed to rather than the thing it acts on, and the object is what a
-    // reader wants (`mcp_resource_read` shows the URI, not which server holds it).
+    // Sorted like `BUILTIN_TOOL_NAMES`, so the two can be read against each other. Mostly this
+    // agrees with the schema's own `required[0]`, which is what the live path would have fallen
+    // back to; where it does not, the schema's first required key names the server a call is
+    // addressed to rather than the thing it acts on, and the object is what a reader wants
+    // (`mcp_resource_read` shows the URI, not which server holds it).
     let key = match name {
         "agent_delete" | "agent_followup" => "id",
         "agent_spawn" => "prompt",
@@ -1023,7 +964,7 @@ impl Tool for FixtureDeferredTool {
 mod tests {
     use super::{
         BUILTINS_WITHOUT_ARGUMENTS, builtin_primary_param, primary_param_answers_for_schema,
-        resolve_primary_param, schema_primary_param, tool_display_name,
+        resolve_primary_param, schema_primary_param,
     };
     use crate::store::Store;
 
@@ -2077,42 +2018,6 @@ mod tests {
         }
     }
 
-    /// Every built-in has a label, and every label is spelled the same way. Asserting the style as
-    /// well as the presence is what makes the test worth having: a mapping added as
-    /// `"memory_search" => "Search memories"` satisfies "has an entry" and reintroduces exactly
-    /// the inconsistency this exists to stop.
-    #[test]
-    fn every_builtin_tool_has_a_display_name() {
-        let missing: Vec<&str> = crate::tools::BUILTIN_TOOL_NAMES
-            .iter()
-            .copied()
-            .filter(|name| tool_display_name(name) == *name)
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "built-ins with no display name, so they render as raw snake_case next to labeled \
-             siblings: {missing:?}"
-        );
-
-        let misspelled: Vec<(&str, &str)> = crate::tools::BUILTIN_TOOL_NAMES
-            .iter()
-            .copied()
-            .map(|name| (name, tool_display_name(name)))
-            .filter(|(_, label)| {
-                !label
-                    .chars()
-                    .next()
-                    .is_some_and(|first| first.is_ascii_uppercase())
-                    || !label.chars().all(|c| c.is_ascii_alphanumeric())
-            })
-            .collect();
-        assert!(
-            misspelled.is_empty(),
-            "display names are PascalCase with no spaces, so one transcript reads in one voice: \
-             {misspelled:?}"
-        );
-    }
-
     #[test]
     fn builtin_primary_param_todo() {
         // set transitions take priority.
@@ -2144,31 +2049,6 @@ mod tests {
             builtin_primary_param("todo", &serde_json::json!({})).as_deref(),
             Some("read")
         );
-    }
-
-    #[test]
-    fn tool_display_name_mappings() {
-        assert_eq!(tool_display_name("execute_command"), "Shell");
-        assert_eq!(tool_display_name("read_file"), "ReadFile");
-        assert_eq!(tool_display_name("write_file"), "WriteFile");
-        assert_eq!(tool_display_name("edit_file"), "EditFile");
-        assert_eq!(tool_display_name("find_files"), "FindFiles");
-        assert_eq!(tool_display_name("search_contents"), "SearchContents");
-        assert_eq!(tool_display_name("fetch_url"), "FetchUrl");
-        assert_eq!(tool_display_name("search_web"), "SearchWeb");
-        assert_eq!(tool_display_name("skill_read"), "SkillRead");
-        assert_eq!(tool_display_name("render_image"), "RenderImage");
-        assert_eq!(tool_display_name("custom_tool"), "custom_tool");
-        // Every family member has a mapping; a missing one falls through to raw snake_case and
-        // shows up beside its PascalCase siblings.
-        for (name, display) in [
-            ("agent_spawn", "AgentSpawn"),
-            ("agent_list", "AgentList"),
-            ("agent_followup", "AgentFollowup"),
-            ("agent_delete", "AgentDelete"),
-        ] {
-            assert_eq!(tool_display_name(name), display);
-        }
     }
 
     #[test]

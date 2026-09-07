@@ -368,7 +368,8 @@ alone would read as acting on the scratchpad itself; accepted as names, not as a
 Renaming a tool is breaking: names appear in config lists, user-authored skills, and the history of
 every existing session. Prefer getting it right at introduction. When renaming anyway, add a
 `**Breaking:**` changelog line and update `BUILTIN_TOOL_NAMES` (sorted), `MCP_META_TOOL_NAMES`, and
-`tool_display_name` and `builtin_primary_param` in `src/tools.rs`. Two silent traps: a blanket
+`builtin_primary_param` in `src/tools.rs`. A tool is shown by its real name on every surface, the
+way MCP tools are; there is no display alias to update. Two silent traps: a blanket
 find-and-replace rewrites MCP tool names containing a built-in as a substring, so anchor every
 substitution to a name boundary; and reversing word order defeats the edit-distance hint
 (`did_you_mean_hint`, behind `builtin_name_hint` and `near_miss_hint`), so nothing points a resumed

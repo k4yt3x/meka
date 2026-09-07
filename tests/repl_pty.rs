@@ -410,7 +410,7 @@ fn an_always_answer_at_the_approval_prompt_covers_the_next_call_to_the_tool() {
     ]);
     let prompts = rows
         .iter()
-        .filter(|row| row.contains("[approval] WriteFile"))
+        .filter(|row| row.contains("[approval] write_file"))
         .count();
     assert_eq!(
         prompts, 1,
@@ -463,7 +463,7 @@ fn an_always_answer_does_not_survive_a_fork() {
     );
     let prompts = rows
         .iter()
-        .filter(|row| row.contains("[approval] WriteFile"))
+        .filter(|row| row.contains("[approval] write_file"))
         .count();
     assert_eq!(
         prompts, 2,
