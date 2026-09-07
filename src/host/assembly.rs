@@ -461,10 +461,7 @@ pub(crate) async fn record_session_change(
         Ok(()) => Ok(()),
         Err(error) if carries_profile => Err(error),
         Err(error) => {
-            tracing::warn!(
-                "failed to record {described} for session '{session_id}': {error}; another meka \
-                 process may still act on this session's previous value"
-            );
+            tracing::warn!("failed to record {described} for session '{session_id}': {error}");
             Ok(())
         }
     }

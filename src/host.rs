@@ -85,7 +85,7 @@ pub(crate) async fn sweep_expired_sessions(
         let deleted = sweep.deleted;
         let window = humantime_serde::re::humantime::format_duration(retention);
         tracing::warn!(
-            "deleted {deleted} session(s) not updated in {window} ([session].retention)"
+            "deleted {deleted} session(s) not updated in {window} (`[session].retention`)"
         );
     }
     // Only turns bump `updated_at`, so a REPL idle past the window looks expired while a human is

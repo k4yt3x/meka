@@ -379,13 +379,14 @@ $ meka profile set work effort --unset
 
 `--unset` removes the key so the profile falls back to meka's default for it. That is not the same
 as writing an empty value: an absent key follows whatever the documented default later becomes,
-which is what an unstated setting has always meant.
+which is what an unstated setting has always meant. `model` is the one key with no default to fall
+back to, so `--unset model` and an empty `model` are both refused.
 
 Nine keys are settable, each named after the [profile field](#profile-fields) it writes:
 
 | Key | Value |
 |---|---|
-| `model` | Any string, forwarded to the provider verbatim |
+| `model` | Any non-empty string, forwarded to the provider verbatim; the one key `--unset` refuses |
 | `context_window` | A whole number of tokens |
 | `max_output_tokens` | A whole number of tokens |
 | `effort` | Any string |
@@ -405,8 +406,12 @@ leaving it silently off the list: moving a profile to another account moves ever
 onto another credential and possibly another backend. Add a profile on the other account instead.
 An account key (`base_url`, `client_id`, ...) is refused with a pointer to the account table.
 
-Two more rules are enforced on `meka profile add` and `meka profile set` alike, so neither door can
-leave behind a profile the other would have declined:
+Three more rules are enforced on `meka profile add` and `meka profile set` alike, so neither door
+can leave behind a profile the other would have declined:
+
+- **A profile without a model.** A session on such a profile is refused by name at its first turn,
+  so `--unset model`, `set <name> model ""` and `add --model ""` are refused before the file is
+  written.
 
 - **A key on a backend that never sends it.** `thinking` and `thinking_budget` are Anthropic
   Messages request fields, so profiles on `anthropic-messages` and `claude-subscription` accounts

@@ -38,13 +38,14 @@ pub(crate) struct MessagesResponse {
     pub(crate) total: usize,
     /// How many times this conversation has been rewritten rather than appended to.
     ///
-    /// Increments on every compaction, rewind, and mid-turn repair. A polling client that sees it
-    /// change knows its copy is no longer a prefix of the server's and must re-fetch rather than
-    /// diff; `total` alone cannot tell it apart from data loss.
+    /// Increments on every compaction, rewind, mid-turn repair and image redaction. A polling
+    /// client that sees it change knows its copy is no longer a prefix of the server's and must
+    /// re-fetch rather than diff; `total` alone cannot tell it apart from data loss.
     ///
-    /// The per-message `compaction` marker explains one of those three. This covers the other two:
-    /// a rewind removes messages with nothing left behind to attach a marker to, which would
-    /// otherwise reproduce exactly the silent-rewrite failure the marker was added to prevent.
+    /// The per-message `compaction` marker explains one of those four. This covers the other
+    /// three: a rewind removes messages with nothing left behind to attach a marker to, which
+    /// would otherwise reproduce exactly the silent-rewrite failure the marker was added to
+    /// prevent, and a repair or a redaction rewrites a message in place.
     pub(crate) revision: u64,
 }
 
@@ -72,7 +73,7 @@ pub(crate) struct MessageView {
     /// Present only on a message that *is* a compaction summary.
     ///
     /// Without this a client polling `/messages` watches history rewrite itself: a compaction
-    /// truncates the materialised tail and pushes a summary in its place, so `total` shrinks and
+    /// truncates the materialized tail and pushes a summary in its place, so `total` shrinks and
     /// messages the client already rendered stop coming back. The marker is what lets it tell
     /// "the window was summarized" from "the server lost my conversation".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,7 +82,7 @@ pub(crate) struct MessageView {
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct CompactionMarker {
-    /// How many materialised messages the boundary removed.
+    /// How many materialized messages the boundary removed.
     ///
     /// The whole pre-compaction window, including the recent tail that compaction then re-appends
     /// verbatim, so it over-counts what the summary itself stands for. Use it to detect *that* the

@@ -442,9 +442,13 @@ pub(super) async fn handle_load_session(
     // account with no stored credential -- and a load refused for one of those had already
     // rewritten the session's `cwd` and roots on its way to saying so. `cwd` is the writable
     // boundary at `workspace` and the directory a scheduled gate is re-checked in, so a session
-    // this handler declined to open must not come away pointing somewhere else. The runtime is
-    // released on a failed write for the same reason a failed build is: it holds the session's lock
-    // and an MCP-attached registry.
+    // this handler declined to open must not come away pointing somewhere else.
+    //
+    // A write that fails is not a refusal: `record_session_change` warns and returns `Ok`, so the
+    // load goes on in the client's directory with the row still naming the old one, as the REPL's
+    // `/cd` does. The error arm is for whatever that function decides a door must refuse (today a
+    // profile, which this patch never carries), and it releases the runtime for the reason a failed
+    // build does: it holds the session's lock and an MCP-attached registry.
     if let Err(error) = crate::host::record_session_change(
         &state.shared.store,
         session_uuid,
@@ -633,7 +637,8 @@ pub(super) async fn handle_resume_session(
 
     // Written after the build, for the reason `session/load` gives at length: the builder's own
     // refusals arrive after this handler's, and a resume refused for one of them had already moved
-    // the session's `cwd` and roots.
+    // the session's `cwd` and roots. As there, a failed `cwd` or roots write is warned about and
+    // the resume goes on; the error arm answers only what `record_session_change` refuses.
     if let Err(error) = crate::host::record_session_change(
         &state.shared.store,
         session_uuid,

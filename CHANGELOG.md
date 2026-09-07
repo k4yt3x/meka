@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `--provider` is `--profile`, long form only; `-p` is the prompt.
 - **Breaking:** flag values such as `--permission read` and `--format json` refuse case variants.
 - **Breaking:** `mcp add --auth` takes `oauth`, `client_credentials` or `client_credentials_jwt`.
+- Markdown exports separate a user's words from an image placeholder and mark a wordless turn.
 - `meka account login` and `meka mcp login` print the OAuth URL instead of opening a browser.
 - `meka session show` labels the title `title` (was `opening`).
 - `meka session export` writes the file atomically and owner-only, as `memory export` does.
@@ -136,6 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--permission` on a resume that fails to start leaves the session's recorded level as it was.
 - `/rewind` with an argument that is not a count says so, instead of rewinding one turn.
 - `/clear` clears the terminal on stderr, so a redirected stdout no longer receives the escapes.
+- A Ctrl+C between turns no longer counts as the second press that stops background tasks.
+- `/mcp reconnect` without a server name says so instead of reporting an unknown command.
+- A Ctrl+C during `/compact` prints `(interrupted)` instead of an error.
 - `/status` counts image redactions, checkpoints and summaries included; it always showed none.
 - A line padded with zero-width characters no longer holds the REPL for minutes while wrapping.
 - Wrapping a tool argument to one or two rows produced one row more than the budget allowed.
@@ -235,6 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An HTTP fork cannot lose its copy to a concurrent `meka session delete --all`.
 - `meka serve` and `meka acp` keep statistics per session, so a resume continues its totals.
 - Atomic writes sync the parent directory after the rename, so a crash cannot lose the new file.
+- An interrupted one-shot run exits 130 instead of 0; `--format json` still prints its report.
 
 ## [0.45.1] - 2026-09-04
 

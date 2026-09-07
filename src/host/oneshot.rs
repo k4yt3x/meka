@@ -10,11 +10,24 @@ use super::{terminal::*, *};
 /// path prints, so the report's `notices` says why a call the model made did not run.
 struct JsonFrontend {
     events: std::sync::Mutex<Vec<crate::frontend::FrontendEvent>>,
+    /// Where the one line the report does not carry goes; see `emit`.
+    console: Arc<std::sync::Mutex<crate::console::Console>>,
+    show_session_id_on_create: bool,
 }
 
 #[async_trait::async_trait]
 impl crate::frontend::Frontend for JsonFrontend {
     async fn emit(&self, event: crate::frontend::FrontendEvent) {
+        // Printed as the REPL frontend prints it, on stderr through the console, so the setting
+        // holds under `--format json` too and a run that never reaches its report has still said
+        // which session it made. Stdout stays the report's alone.
+        if let crate::frontend::FrontendEvent::SessionStarted { id } = &event
+            && self.show_session_id_on_create
+        {
+            with_console(&self.console, |console| {
+                console.session_id("Creating new session", &id.to_string())
+            });
+        }
         crate::sync::lock(&self.events).push(event);
     }
 
@@ -181,6 +194,8 @@ pub(crate) async fn run_oneshot(
     .then(|| {
         Arc::new(JsonFrontend {
             events: std::sync::Mutex::new(Vec::new()),
+            console: Arc::clone(&console),
+            show_session_id_on_create: config.show_session_id_on_create,
         })
     });
     let oneshot_frontend: Arc<dyn crate::frontend::Frontend> = match &json_frontend {
@@ -245,8 +260,8 @@ pub(crate) async fn run_oneshot(
     // rather than against the configured default.
     if start_approvals && start_permission != crate::permission::Permission::Unrestricted {
         tracing::warn!(
-            "approvals are on but a one-shot run has no prompt to ask at, so every call above the \
-             level is refused; run at the `--permission` the run needs"
+            "approvals are on but a one-shot run cannot prompt, so every call above the level is \
+             refused; run at the `--permission` it needs"
         );
     }
 
@@ -301,19 +316,23 @@ pub(crate) async fn run_oneshot(
     .await
     {
         Ok(outcome) => (None, Some(outcome)),
-        Err(crate::error::MekaError::Interrupted) => {
+        // Kept as the run's error, so the process leaves with 130 the way every host does on a
+        // Ctrl+C, rather than with 0 over a partial answer. The report below still goes out for it.
+        Err(error @ crate::error::MekaError::Interrupted) => {
             with_console(&console, |console| console.annotation("interrupted"));
-            (None, None)
+            (Some(error), None)
         }
         Err(error) => (Some(error), None),
     };
+    let interrupted = matches!(turn_error, Some(crate::error::MekaError::Interrupted));
     // Closed whichever way the turn went, so a turn that streamed a partial answer and then failed
     // still shows what it streamed. `TurnFinished` closes the happy path; nothing closed this one.
     close_console_episode(&console);
-    // The report goes out only for a turn that ended, whichever way: a failed turn is reported on
-    // stderr and by the exit code, and an object beside it would read as an answer.
+    // The report goes out for a turn that ended, whichever way, an interrupt included: its
+    // `stop_reason` says so, and the exit code says so again. A failed turn is reported on stderr
+    // and by the exit code alone, because an object beside it would read as an answer.
     if let Some(frontend) = &json_frontend
-        && turn_error.is_none()
+        && (turn_error.is_none() || interrupted)
     {
         let events = std::mem::take(&mut *crate::sync::lock(&frontend.events));
         let report = assemble_report(events, outcome, session_id, agent.profile());

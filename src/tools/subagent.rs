@@ -16,7 +16,9 @@ use crate::{
     prompt::build_environment_context,
     provider::ToolDefinition,
     session::AgentOptions,
-    workspace::{BoundedWorkspace, SharedCwd, SharedRoots, accept_writable_roots},
+    workspace::{
+        BoundedWorkspace, SharedCwd, SharedRoots, accept_writable_roots, admit_within_parent_reach,
+    },
 };
 
 /// Hard ceiling on sub-agent nesting depth, independent of the tunable `session.subagent_max_depth`
@@ -66,10 +68,11 @@ pub(crate) struct ToolBuilderParams {
 /// turning a second question into a one-call privilege escalation. The same holds for the deny
 /// lists and the memory level: every restriction the spawn call chose has to outlive the call.
 ///
-/// Every field except `permission` carries a `#[serde(default)]`, so a spec written by a build with
-/// fewer fields still loads; a spec missing `permission` is a hard decode error, which
-/// `agent_followup` turns into a refusal. Each default is the *restrictive* value, so a spec that
-/// loses a field loses authority rather than gaining it.
+/// The `#[serde(default)]` on every field but `permission` is an integrity guard, not tolerance
+/// for an older shape: `meka session import` writes this JSON verbatim from a user-supplied
+/// archive, and a hand-edited row can drop any field. Each default is the *restrictive* value, so a
+/// spec that lost a field lost authority rather than gaining it; a spec missing `permission` has no
+/// restrictive reading and is a hard decode error, which `agent_followup` turns into a refusal.
 ///
 /// What is deliberately *not* here: the task (already in the event log), and the cwd of a worker
 /// that shares its parent's workspace (already on the session row). A worker bounded by
@@ -177,10 +180,11 @@ impl SubagentSpec {
     /// **replayed** grant resolves to under the parent's current level.
     ///
     /// `greatest_within_both`, not `clamp_to`: a follow-up must never run the worker at more than
-    /// the spawn call asked for. `clamp_to` would resolve a recorded `workspace` under an `ask`
-    /// parent to `ask`, handing the worker whole-filesystem reach that the original
-    /// `agent_spawn({permission: "workspace"})` explicitly declined. See the helper for why spawn
-    /// and replay are different questions.
+    /// the spawn call asked for. On the ladder `none` < `read` < `workspace` < `unrestricted`,
+    /// `clamp_to` answers the *spawn* question (the request when the parent holds it, else the
+    /// parent's own level), so a parent that has since been raised would hand a recorded `read`
+    /// its new rung. A later parent change may narrow a recorded grant and never widen it, which
+    /// is the minimum of the two. See the helper for why spawn and replay are different questions.
     fn effective_permission(&self, ceiling: Permission) -> Permission {
         let own = if self.writable_roots.is_empty() {
             self.permission
@@ -1193,8 +1197,8 @@ impl Tool for AgentFollowupTool {
             .ok_or_else(|| MekaError::ToolExecution {
                 tool_name: "agent_followup".to_string(),
                 message: format!(
-                    "sub-agent '{agent_id}' has no recorded spawn terms (it predates follow-up support), \
-                     so it cannot be resumed safely. Spawn a new one."
+                    "sub-agent '{agent_id}' has no recorded spawn terms, so it cannot be resumed \
+                     safely. Spawn a new one."
                 ),
             })?;
         let spec: SubagentSpec =
@@ -1216,20 +1220,31 @@ impl Tool for AgentFollowupTool {
         let ceiling = self.parent_permission.get();
         // The worker's own cwd, as recorded when it was spawned, not the parent's current one: a
         // `/cd` between the spawn and the follow-up must not move a worker mid-task. A bounded
-        // worker's directory and roots come off its spawn terms instead, put back through the
-        // acceptor against the parent's reach *now*: a parent that has since dropped below
-        // `workspace`, or moved to a directory that no longer contains the boundary, is refused
-        // rather than resuming a writer it could not spawn today, the way `effective_permission`
-        // narrows a plain worker to what the parent currently holds.
+        // worker's directory and roots come off its spawn terms instead. Either way the directory
+        // goes back through `admit_within_parent_reach` against the parent's reach *now*: a parent
+        // that has moved to a directory that no longer contains it is refused rather than resuming
+        // a writer it could not spawn today, and a bounded worker's parent that has dropped below
+        // `workspace` likewise, the way `effective_permission` narrows a plain worker to what the
+        // parent currently holds. One rule for both doors, or a plain worker keeps writing under
+        // the very directory a bounded one is refused.
         let cells = &self.tool_builder_params.cells;
         let workspace = if spec.writable_roots.is_empty() {
+            let cwd = row
+                .cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| cells.cwd.get());
+            admit_within_parent_reach(ceiling, &cells.cwd, &cells.roots, &cwd).map_err(
+                |error| MekaError::ToolExecution {
+                    tool_name: "agent_followup".to_string(),
+                    message: format!(
+                        "sub-agent '{agent_id}' works in a directory this session can no longer \
+                         grant: {error}"
+                    ),
+                },
+            )?;
             WorkerWorkspace {
-                cwd: SharedCwd::new(
-                    row.cwd
-                        .as_deref()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| cells.cwd.get()),
-                ),
+                cwd: SharedCwd::new(cwd),
                 roots: cells.roots.clone(),
             }
         } else {
@@ -1252,9 +1267,8 @@ impl Tool for AgentFollowupTool {
 
         let effective_permission = spec.effective_permission(ceiling);
         // `!=`, not `<`. The derived `Ord` is display order, which the enum doc says must not
-        // decide authority, and it cannot see a sideways move at all: a `workspace` spec resolving
-        // to `ask` compares as *greater* and reported nothing, even though the worker changed
-        // level. Any difference from what was recorded is worth saying out loud.
+        // decide authority. `greatest_within_both` never resolves above the recorded rung, so any
+        // difference is a narrowing, and every one is worth saying out loud.
         if effective_permission != spec.permission {
             let recorded = spec.permission;
             tracing::info!(
@@ -1344,12 +1358,17 @@ impl Tool for AgentFollowupTool {
         //
         // The row is the billing record, so a write that fails fails the call: the policy every
         // host applies to a profile through `record_session_change`, which a tool cannot reach.
+        //
+        // The level rides along for the reason `agent_spawn` writes it: the row answers for the
+        // worker wherever a row is read, and `effective_permission` reads the spec, not the row, so
+        // the row can follow the live answer without the recorded grant moving.
         let ran_on = sub_agent.profile();
         self.tool_builder_params
             .materials
             .store
             .update_session(agent_id, crate::store::SessionPatch {
                 profile: Some(ran_on.clone()),
+                permission: Some(effective_permission),
                 ..Default::default()
             })
             .await
@@ -3084,7 +3103,7 @@ mod tests {
         // *do*, and a spec-only assertion would still pass if the clamp never reached the registry.
         let transcript = format!("{:?}", store.load_events(child).await.expect("events"));
         assert!(
-            transcript.contains("Permission denied") && transcript.contains("write_file"),
+            transcript.contains("'write_file' requires `workspace`; the session is at `read`"),
             "the worker should have been refused write_file at Read, got: {transcript}"
         );
         assert!(!target.exists(), "and nothing should have been written");
@@ -4984,6 +5003,194 @@ mod tests {
             store.load_events(agent_id).await.expect("events").len(),
             events_before,
             "neither refusal may have run a turn"
+        );
+    }
+
+    /// The two follow-up doors judge a parent's move the same way. A plain worker keeps the
+    /// directory it was spawned in, and once that directory lies outside the parent's reach at
+    /// `workspace` the follow-up is refused as a bounded worker's is, rather than writing where the
+    /// parent itself no longer can. An `unrestricted` parent reaches everywhere and is unaffected.
+    #[tokio::test]
+    async fn a_followup_on_a_plain_worker_is_refused_once_the_parent_has_moved_out_from_over_it() {
+        let dirs = workspaces();
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Workspace,
+            dirs.work.clone(),
+        );
+        let spawn = spawn_tool_for(params.clone(), mock(vec![text_round("spawned")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "wait" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+        let events_before = store.load_events(agent_id).await.expect("events").len();
+        let leak = dirs.work.join("leak.txt");
+        let ask = || serde_json::json!({ "id": agent_id.to_string(), "prompt": "write it" });
+
+        // The parent `/cd`s to a directory that does not contain the worker's.
+        params.cells.cwd.set(dirs.elsewhere.clone());
+        let followup = followup_tool_for(
+            params.clone(),
+            mock(vec![
+                write_file_round("call-1", &leak, "leak"),
+                text_round("never runs"),
+            ]),
+        );
+        let refusal = followup
+            .execute(
+                ask(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a parent that has moved out from over the worker cannot resume it")
+            .to_string();
+        assert!(
+            refusal.contains("can no longer grant")
+                && refusal.contains("outside this session's workspace"),
+            "{refusal}"
+        );
+        assert!(
+            !leak.exists(),
+            "the refused follow-up must not have written"
+        );
+        assert_eq!(
+            store.load_events(agent_id).await.expect("events").len(),
+            events_before,
+            "the refusal may not have run a turn"
+        );
+
+        // The control: an `unrestricted` parent may write anywhere, so its move bounds nothing.
+        params
+            .cells
+            .permission
+            .set_unchecked(Permission::Unrestricted);
+        let followup = followup_tool_for(params, mock(vec![text_round("resumed")]));
+        followup
+            .execute(
+                ask(),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("an unrestricted parent resumes the worker wherever it has moved");
+    }
+
+    /// A worker answers its parent's prompt, so every request it makes carries the prompt id the
+    /// spawning call was handed, on the spawn and again on a follow-up. The Claude subscription
+    /// backend bills by it, and nothing in the worker's answer shows whether it arrived.
+    #[tokio::test]
+    async fn a_workers_requests_carry_the_prompt_id_of_the_call_that_spawned_it() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        let provider = mock(vec![text_round("spawned"), text_round("followed up")]);
+        let call = |prompt_id: Uuid| crate::tools::ToolContext {
+            session_id: None,
+            tool_call_id: None,
+            prompt_id: Some(prompt_id),
+            frontend: Arc::new(crate::frontend::SilentFrontend),
+            cancellation: CancellationToken::new(),
+        };
+
+        let spawning_prompt = Uuid::new_v4();
+        let spawn = spawn_tool_for(params.clone(), provider.clone());
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "permission": "read" }),
+                call(spawning_prompt),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+        assert_eq!(
+            provider.completion_prompt_ids(),
+            vec![Some(spawning_prompt)],
+            "the spawned worker's request must bill to the prompt that spawned it"
+        );
+
+        let followup_prompt = Uuid::new_v4();
+        let followup = followup_tool_for(params, provider.clone());
+        followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "and then?" }),
+                call(followup_prompt),
+            )
+            .await
+            .expect("the follow-up runs");
+        assert_eq!(
+            provider.completion_prompt_ids(),
+            vec![Some(spawning_prompt), Some(followup_prompt)],
+            "a follow-up's request must bill to the prompt that asked for it"
+        );
+    }
+
+    /// The row answers for a worker wherever a row is read (`meka session show`, `GET
+    /// /v1/sessions`, an export), so after a follow-up under a tightened parent it records the
+    /// level the worker ran at, not the one it was spawned at. The recorded spawn terms are what
+    /// keep the grant, so the row is free to follow the live answer.
+    #[tokio::test]
+    async fn a_followup_records_the_level_the_worker_ran_at_on_its_row() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_at(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Permission::Unrestricted,
+            crate::workspace::cwd_for_test().get(),
+        );
+        let spawn = spawn_tool_for(params.clone(), mock(vec![text_round("spawned")]));
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "wait" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+        let recorded_level = |rows: Vec<crate::store::SessionMetaRow>| {
+            rows.into_iter()
+                .find(|row| row.id == agent_id)
+                .expect("the worker's row")
+                .permission
+        };
+        assert_eq!(
+            recorded_level(store.load_session_tree(parent_sid).await.expect("tree")),
+            Some(Permission::Unrestricted),
+            "spawned at the parent's level"
+        );
+
+        // The session is then restricted, as `/permission` or Shift+Tab would.
+        params.cells.permission.set_unchecked(Permission::Read);
+        let followup = followup_tool_for(params, mock(vec![text_round("resumed")]));
+        followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("the follow-up runs");
+        assert_eq!(
+            recorded_level(store.load_session_tree(parent_sid).await.expect("tree")),
+            Some(Permission::Read),
+            "the row must say what the worker ran at"
         );
     }
 

@@ -42,6 +42,25 @@ pub(crate) struct ExportedBlob {
     /// The bytes, base64-encoded: the archive is JSON.
     pub(crate) data: String,
 }
+/// The profile facts [`plan_import`] settles every imported session against.
+///
+/// A session runs on the profile its row names, and an import is a door that writes such a row, so
+/// it answers to the same rule as every other: the name is one this installation configures, or
+/// the import is refused. `--profile` is the explicit act that moves a session onto another.
+pub(crate) struct ImportProfiles<'a> {
+    /// `--profile <name>`, when it was passed: every imported session takes it, whatever the
+    /// archive recorded.
+    pub(crate) selected: Option<&'a str>,
+    /// What a session the archive records no profile for adopts when no flag was passed: this
+    /// installation's default, which is the only thing that can be known about such a session.
+    pub(crate) default: Option<&'a str>,
+    /// The profiles this installation configures, which every name written has to be among.
+    /// `None` only where there is no installation to check against, which is the planner's own
+    /// tests: `meka session import` refuses ahead of planning when `config.toml` cannot be read,
+    /// and the HTTP server always holds a parsed one.
+    pub(crate) configured:
+        Option<&'a std::collections::BTreeMap<String, crate::config::ProfileConfig>>,
+}
 /// What [`plan_import`] settled: the sessions to write, the image bytes they reference, and the
 /// id the archive's root was given.
 pub(crate) struct ImportPlan {
@@ -167,11 +186,9 @@ pub(crate) async fn build_session_export(
 /// session). Pure and I/O-free so the ID-remap and ordering are unit-testable.
 pub(crate) fn plan_import(
     export: SessionExport,
-    // What an archive that names no profile adopts. Settled here rather than at the reader because
-    // an import is where a session enters *this* installation, and this installation's default is
-    // the only thing that can be known about an archive that names none. `None` refuses the import
-    // rather than writing a session that cannot run.
-    default_profile: Option<&str>,
+    // How each session's profile is settled, here rather than at the reader because an import is
+    // where a session enters *this* installation.
+    profiles: ImportProfiles<'_>,
     // What an archive session that records no level adopts, settled here for the same reason as
     // the profile: a row with no level runs nothing under the scheduler, and this installation's
     // default is what such a session would start at. `None` refuses the archive rather than
@@ -220,6 +237,15 @@ pub(crate) fn plan_import(
         .collect();
     let order = parents_first_order(&nodes)?;
 
+    // Checked once, ahead of any session being planned: a flag naming nothing moves nothing.
+    if let (Some(name), Some(configured)) = (profiles.selected, profiles.configured) {
+        crate::config::require_profile(name, configured).map_err(|refusal| {
+            crate::error::MekaError::Usage(format!(
+                "{refusal}; pass a configured name to `--profile`"
+            ))
+        })?;
+    }
+
     // Decoded and checked against their hashes before any session is planned: a blob whose bytes
     // do not hash to the name its blocks reference would be served under a name it does not
     // deserve, by every reader that trusts the name.
@@ -258,7 +284,7 @@ pub(crate) fn plan_import(
         })?;
         let new_id = remap.get(&session.id).copied().ok_or_else(|| {
             crate::error::MekaError::Usage(
-                "internal error: session id missing from ID remap".to_string(),
+                "internal error: session id missing from id remap".to_string(),
             )
         })?;
         let new_parent_id = session
@@ -276,6 +302,38 @@ pub(crate) fn plan_import(
                 )));
             }
         };
+        let profile = match (
+            profiles.selected,
+            session.profile.is_empty(),
+            profiles.default,
+        ) {
+            (Some(name), ..) => name.to_string(),
+            // Refused rather than written: a row naming a profile this installation lacks is a
+            // session every resume refuses by name, and a state no other door can produce.
+            (None, false, _) => {
+                if let Some(configured) = profiles.configured {
+                    crate::config::require_profile(&session.profile, configured).map_err(
+                        |refusal| {
+                            crate::error::MekaError::Usage(format!(
+                                "{refusal}; the archive names it, so import it with `meka --profile \
+                                 <name> session import`"
+                            ))
+                        },
+                    )?;
+                }
+                session.profile
+            }
+            (None, true, Some(default)) => default.to_string(),
+            // Refused rather than left blank, for the same reason: a session with no profile
+            // cannot run, and a blank is a state no other door can produce.
+            (None, true, None) => {
+                return Err(crate::error::MekaError::Usage(
+                    "this archive names no profile and no default profile is set; import it with \
+                     `meka --profile <name> session import`"
+                        .to_string(),
+                ));
+            }
+        };
         records.push(crate::store::ImportSessionRecord {
             new_id,
             new_parent_id,
@@ -286,22 +344,7 @@ pub(crate) fn plan_import(
             capabilities_json: session.capabilities_json,
             additional_roots: session.additional_roots,
             subagent_spec_json: session.subagent_spec_json,
-            profile: if session.profile.is_empty() {
-                // Refused rather than left blank. A session with no profile cannot run, so
-                // importing one is writing a row whose only future is a refusal the user has to
-                // work backwards from, and it would put a state into the store that no other
-                // door can produce, which every reader would then have to know about.
-                let Some(default_profile) = default_profile else {
-                    return Err(crate::error::MekaError::Usage(
-                        "this archive names no profile and no default profile is configured; import \
-                         it with `meka --profile <name> session import`"
-                            .to_string(),
-                    ));
-                };
-                default_profile.to_string()
-            } else {
-                session.profile
-            },
+            profile,
             stats: session.stats,
             events: session
                 .events
@@ -359,4 +402,137 @@ pub(crate) fn parents_first_order(
         ));
     }
     Ok(order)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-session archive whose session ran on `profile`.
+    fn archive_on(profile: &str) -> SessionExport {
+        serde_json::from_value(serde_json::json!({
+            "format_version": SESSION_EXPORT_FORMAT_VERSION,
+            "meka_version": "test",
+            "exported_at": "now",
+            "root_session_id": "11111111-1111-4111-8111-111111111111",
+            "sessions": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "parent_id": null,
+                "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z",
+                "cwd": null,
+                "permission": "read",
+                "capabilities_json": null,
+                "profile": profile,
+                "stats": crate::stats::SessionStatsSnapshot::default(),
+                "events": [],
+                "tool_outputs": {},
+            }],
+        }))
+        .expect("a well-formed archive")
+    }
+
+    fn configured(
+        names: &[&str],
+    ) -> std::collections::BTreeMap<String, crate::config::ProfileConfig> {
+        names
+            .iter()
+            .map(|name| {
+                (name.to_string(), crate::config::ProfileConfig {
+                    account: name.to_string(),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    fn refusal(outcome: crate::error::Result<ImportPlan>) -> String {
+        match outcome {
+            Ok(_) => panic!("the import must be refused"),
+            Err(crate::error::MekaError::Usage(message)) => message,
+            Err(other) => panic!("the refusal must be the caller's to act on, got {other}"),
+        }
+    }
+
+    /// An archive from another installation names the profile it ran on there. Written as it
+    /// stands, the row is a session every resume refuses by name; refused here, the remedy is the
+    /// one flag that moves a session.
+    #[test]
+    fn an_archive_naming_a_profile_this_installation_lacks_is_refused() {
+        let profiles = configured(&["other"]);
+        let message = refusal(plan_import(
+            archive_on("work"),
+            ImportProfiles {
+                selected: None,
+                default: Some("other"),
+                configured: Some(&profiles),
+            },
+            None,
+        ));
+        assert!(
+            message.contains("'work'") && message.contains("--profile <name> session import"),
+            "{message}"
+        );
+    }
+
+    /// `--profile` is the explicit act that moves a session: every imported session takes it,
+    /// whatever the archive recorded, and a flag naming nothing moves nothing.
+    #[test]
+    fn a_profile_flag_moves_every_imported_session_onto_it() {
+        let profiles = configured(&["other"]);
+        let plan = plan_import(
+            archive_on("work"),
+            ImportProfiles {
+                selected: Some("other"),
+                default: None,
+                configured: Some(&profiles),
+            },
+            None,
+        )
+        .expect("the flag names a configured profile");
+        assert!(
+            plan.records.iter().all(|record| record.profile == "other"),
+            "every session moved onto the selected profile"
+        );
+
+        let message = refusal(plan_import(
+            archive_on("work"),
+            ImportProfiles {
+                selected: Some("ghost"),
+                default: None,
+                configured: Some(&profiles),
+            },
+            None,
+        ));
+        assert!(message.contains("'ghost'"), "{message}");
+    }
+
+    /// An archive recording no profile adopts the installation's default, as before, and is
+    /// refused when there is none.
+    #[test]
+    fn an_archive_naming_no_profile_takes_the_default_or_is_refused() {
+        let profiles = configured(&["other"]);
+        let plan = plan_import(
+            archive_on(""),
+            ImportProfiles {
+                selected: None,
+                default: Some("other"),
+                configured: Some(&profiles),
+            },
+            None,
+        )
+        .expect("the default supplies one");
+        assert_eq!(plan.records[0].profile, "other");
+
+        let message = refusal(plan_import(
+            archive_on(""),
+            ImportProfiles {
+                selected: None,
+                default: None,
+                configured: Some(&profiles),
+            },
+            None,
+        ));
+        assert!(message.contains("--profile"), "{message}");
+    }
 }

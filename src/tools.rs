@@ -15,7 +15,7 @@ mod memory;
 mod render_image;
 mod schedule;
 pub(crate) mod scratchpad;
-mod shell;
+pub(crate) mod shell;
 mod skill;
 pub(crate) mod subagent;
 pub(crate) mod todo;
@@ -622,6 +622,13 @@ impl ToolOutput {
         }
     }
 
+    /// What the model reads when a tool fails. One spelling for the dispatcher, which converts an
+    /// `Err` from `execute`, and for a tool stating the same refusal through
+    /// [`Tool::refusal_at_level`] before it runs.
+    pub(crate) fn from_error(error: &crate::error::MekaError) -> Self {
+        Self::text(format!("Tool error: {error}"), true)
+    }
+
     /// Attach structured frontend metadata to an existing output, e.g. the pre/post text from a
     /// successful `edit_file`. Chains after any other builder so the call site reads as
     /// `ToolOutput::text(...).with_metadata(diff)`.
@@ -687,9 +694,24 @@ pub(crate) trait Tool: Send + Sync {
     /// Schema surfaced to the model (name + description + JSON-schema for parameters). Called once
     /// per registry build, not per call.
     fn definition(&self) -> ToolDefinition;
-    /// Lowest permission level that may invoke this tool. The dispatch loop short-circuits with a
-    /// "permission denied" tool error when the current level is below this.
+    /// Lowest permission level that may invoke this tool. The dispatch loop refuses the call, or
+    /// submits it for approval, when the current level is below this.
     fn required_permission(&self) -> Permission;
+    /// The refusal this call meets at `level` whatever the user answers, or `None` when the level
+    /// alone settles nothing.
+    ///
+    /// An approved call runs *at the level*: the write fence and the shell's confinement read it,
+    /// so approval turns a refusal into a question without widening reach. A tool whose `execute`
+    /// would refuse the call for a reason the level and the arguments already decide states it
+    /// here, and the door returns it in place of the approval prompt, so the user is never asked a
+    /// question whose yes cannot matter. The wording is the one `execute` would have used.
+    async fn refusal_at_level(
+        &self,
+        _level: Permission,
+        _input: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        None
+    }
     /// Whether this tool's work happens in a process meka does not confine.
     ///
     /// True only for MCP adapters today: the call is forwarded to a server meka spawned but does

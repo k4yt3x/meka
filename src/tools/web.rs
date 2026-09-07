@@ -126,14 +126,14 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
 
     if config.danger_accept_invalid_certs {
         tracing::warn!(
-            "`[web].danger_accept_invalid_certs` is enabled; any HTTPS response could be spoofed"
+            "`[web].danger_accept_invalid_certs` is enabled; a forged certificate can spoof any HTTPS response"
         );
         builder = builder.danger_accept_invalid_certs(true);
     }
     if config.danger_accept_invalid_hostnames {
         tracing::warn!(
-            "`[web].danger_accept_invalid_hostnames` is enabled; any HTTPS response with a valid \
-             certificate for any name could be spoofed"
+            "`[web].danger_accept_invalid_hostnames` is enabled; a certificate for any name can \
+             spoof any HTTPS response"
         );
         builder = builder.danger_accept_invalid_hostnames(true);
     }

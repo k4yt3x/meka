@@ -188,11 +188,12 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             // build. Opening the store is what migrates it, and a store carried forward by `meka
             // account list` must record the same profile one carried forward by `meka` would.
             //
-            // Two values, and the difference matters. The ledger takes the one `default_profile`
+            // Two readers, and the difference matters. The ledger takes the one `default_profile`
             // picks, ignoring `--profile`: it stamps a profile onto every session that predates
             // meka recording one, once and irreversibly, and that must not turn on a flag the first
-            // invocation after an upgrade happened to carry. `meka session import` takes the
-            // flag-aware one, where choosing per run is exactly what `--profile` is for. An
+            // invocation after an upgrade happened to carry. `meka session import` takes the flag
+            // itself beside that default and the configured profiles, and settles per run in
+            // `plan_import`, where choosing per run is exactly what `--profile` is for. An
             // unreadable `config.toml` is carried to the ledger as itself rather than collapsing
             // into "nothing resolved", because the two must not produce the same write: the adopt
             // step runs once and irreversibly, so a parse error read as "nothing resolved" strands
@@ -201,18 +202,16 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
             // the raw document through `toml_edit` and are how a user *repairs* such a file;
             // refusing every subcommand would close the only door out. The migration refuses
             // instead, and only when it actually has rows to stamp.
-            let (default_profile, default_permission, context) =
+            let (installation, default_permission, context) =
                 match config::default_profile_on_disk(None) {
                     Ok(adopted) => {
-                        let flag_aware =
-                            config::default_profile_on_disk(cli_ref.profile.as_deref())?;
+                        // The file is read again for its profile table, which the default reader
+                        // does not hand back.
+                        let configured = config::load_config_file_or_err()?.profiles;
                         let permission = config::default_permission_on_disk()?;
-                        (
-                            flag_aware,
-                            Some(permission),
-                            store::migrations::Context::adopting(adopted.as_deref())
-                                .starting_at(&permission.to_string()),
-                        )
+                        let context = store::migrations::Context::adopting(adopted.as_deref())
+                            .starting_at(&permission.to_string());
+                        (Some((adopted, configured)), Some(permission), context)
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -235,10 +234,19 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                     crate::cli::profile::run(action, &store).await
                 }
                 cli::Command::Session { action } => {
+                    let (default, configured) = match &installation {
+                        Some((default, configured)) => (default.as_deref(), Some(configured)),
+                        None => (None, None),
+                    };
+                    let profiles = crate::store::export::ImportProfiles {
+                        selected: cli_ref.profile.as_deref(),
+                        default,
+                        configured,
+                    };
                     crate::cli::session::run_session_subcommand(
                         &store,
                         action,
-                        default_profile.as_deref(),
+                        profiles,
                         default_permission,
                     )
                     .await
@@ -277,12 +285,14 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
 
     // Refused before any setup, so a run with nothing to do never opens the store.
     if cli.oneshot && cli.prompt.is_none() && cli.skill.is_none() {
-        return Err(anyhow::anyhow!("--oneshot requires --prompt or --skill"));
+        return Err(anyhow::anyhow!(
+            "`--oneshot` requires `--prompt` or `--skill`"
+        ));
     }
     // Refused rather than ignored: the flag shapes what a one-shot run prints, the REPL has no use
     // for it, and a script that wrote `--format json` without `--oneshot` meant to.
     if cli.format != config::OutputFormat::Plain && !cli.oneshot {
-        return Err(anyhow::anyhow!("--format applies to --oneshot runs"));
+        return Err(anyhow::anyhow!("`--format` needs `--oneshot`"));
     }
 
     // Refused rather than ignored. Both name *this run's session*, and a long-lived host has no
@@ -310,7 +320,7 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 "address one by id under `/v1/sessions/{id}`"
             };
             anyhow::bail!(
-                "`meka {host}` does not take {}: this host creates a session per request; {remedy}.",
+                "`meka {host}` does not take {}; {remedy}",
                 offending.join(", "),
             );
         }
@@ -445,7 +455,7 @@ async fn async_main(
         // Startup already refused `--oneshot` without a prompt or `--skill`; this is the same
         // refusal for a request that arrived by another route, in place of a panic.
         let Some(prompt) = config.request.prompt.clone() else {
-            anyhow::bail!("--oneshot requires --prompt or --skill");
+            anyhow::bail!("`--oneshot` requires `--prompt` or `--skill`");
         };
         return host::oneshot::run_oneshot(config, store, prompt, mcp_manager).await;
     }

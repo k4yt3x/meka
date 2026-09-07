@@ -99,7 +99,7 @@ impl AuthRegistry {
             let is_match: bool = if candidate.len() == presented.len() {
                 candidate.ct_eq(presented).into()
             } else {
-                // Dummy ct_eq to equalise timing on length-mismatch.
+                // Dummy ct_eq to equalize timing on length-mismatch.
                 let _: bool = candidate.ct_eq(candidate).into();
                 false
             };

@@ -554,7 +554,7 @@ impl ProblemDetail {
             // configuration and the only part a caller can act on. `servers` rides as an extension
             // so a client can branch on which one rather than parse the sentence.
             MekaError::McpTurnGated { servers } => {
-                tracing::warn!("mcp gate refused a turn: {error}");
+                tracing::warn!("mcp gate declined a turn: {error}");
                 let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
                 ProblemDetail::new(
                     ErrorKind::McpUnavailable,

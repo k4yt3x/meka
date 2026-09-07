@@ -14,8 +14,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) oauth_token_url: Option<String>,
     pub(super) token_store: Option<Arc<TokenStore>>,
     /// Account name the credential is stored under; OAuth providers use it to write refreshed
-    /// tokens back to the right `account_credentials` row. Defaults to the backend name; see
-    /// [`Self::credential_key_or_default`].
+    /// tokens back to the right `account_credentials` row. Required by both subscription backends;
+    /// see [`Self::resolve_credential_key`].
     pub(super) credential_key: Option<String>,
     pub(super) thinking: ThinkingMode,
     pub(super) thinking_budget_tokens: u64,
@@ -76,8 +76,8 @@ impl ProviderBuilder {
         self
     }
 
-    /// Account name the credential is stored under (OAuth refresh write-back key). Defaults to the
-    /// backend name when unset.
+    /// Account name the credential is stored under (OAuth refresh write-back key). A subscription
+    /// backend does not build without one.
     pub(crate) fn credential_key(mut self, value: Option<String>) -> Self {
         self.credential_key = value;
         self
@@ -127,10 +127,19 @@ impl ProviderBuilder {
     }
 
     /// The row a subscription backend writes refreshed tokens to.
-    pub(super) fn credential_key_or_default(&self) -> String {
-        self.credential_key
-            .clone()
-            .unwrap_or_else(|| self.backend.name().to_string())
+    ///
+    /// No default in its place: the registry is the one authority on which row a profile's
+    /// credential lives in, and a builder that fell back to the backend name would write refreshed
+    /// tokens to a row no account names, leaving the real one stale and `account list` reporting an
+    /// orphan. Only meka's own code reaches a build, so a missing name is a defect here, not a
+    /// configuration error.
+    pub(super) fn resolve_credential_key(&self) -> Result<String> {
+        self.credential_key.clone().ok_or_else(|| {
+            MekaError::Internal(format!(
+                "a '{}' provider was built without the account its credential is stored under",
+                self.backend
+            ))
+        })
     }
 
     pub(crate) fn build(self) -> Result<Arc<dyn Provider>> {
@@ -142,8 +151,8 @@ impl ProviderBuilder {
                     AuthCredential::ApiKey(key) => key.clone(),
                     AuthCredential::OAuthToken { .. } => {
                         return Err(MekaError::Config(
-                            "backend 'openai-responses' takes an API key, not an OAuth token; use \
-                             'chatgpt-subscription' to bill a subscription"
+                            "backend 'openai-responses' takes an API key, not an OAuth token; \
+                             'chatgpt-subscription' bills a subscription"
                                 .to_string(),
                         ));
                     }
@@ -156,7 +165,7 @@ impl ProviderBuilder {
                     AuthCredential::OAuthToken { .. } => {
                         return Err(MekaError::Config(
                             "backend 'openai-chat-completions' takes an API key, not an OAuth \
-                             token; use 'chatgpt-subscription' to bill a subscription"
+                             token; 'chatgpt-subscription' bills a subscription"
                                 .to_string(),
                         ));
                     }
@@ -168,8 +177,8 @@ impl ProviderBuilder {
                     AuthCredential::ApiKey(key) => key.clone(),
                     AuthCredential::OAuthToken { .. } => {
                         return Err(MekaError::Config(
-                            "backend 'anthropic-messages' takes an API key, not an OAuth token; use \
-                             'claude-subscription' to bill a subscription"
+                            "backend 'anthropic-messages' takes an API key, not an OAuth token; \
+                             'claude-subscription' bills a subscription"
                                 .to_string(),
                         ));
                     }
@@ -467,11 +476,7 @@ impl ProviderRegistry {
         }
 
         let credential = self.credential_for(&settings.account).await?;
-        let model = settings.model.clone().ok_or_else(|| {
-            MekaError::Config(format!(
-                "profile '{profile}' names no model; set `model` in `[profiles.{profile}]`"
-            ))
-        })?;
+        let model = crate::config::require_model(profile, settings.model.as_deref())?.to_string();
         let needs_token_store = matches!(credential, AuthCredential::OAuthToken { .. });
         let provider = ProviderBuilder::new(settings.backend, credential, model)
             .base_url(settings.base_url.clone())

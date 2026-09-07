@@ -107,7 +107,7 @@ impl ProfileView {
         Self {
             name: summary.name.clone(),
             account: summary.account.clone(),
-            backend: Some(summary.backend.clone()),
+            backend: summary.backend.clone(),
             model: summary.model.clone(),
             active,
         }
@@ -644,6 +644,37 @@ mod tests {
                 "{absent} must be omitted rather than null: {document}"
             );
         }
+    }
+
+    /// A profile on an account that is not configured has no backend to report, and both
+    /// constructors say so the same way: the key is omitted, never sent as `""` by one host and
+    /// left out by the other.
+    #[test]
+    fn a_profile_view_omits_the_backend_of_a_missing_account_however_it_is_built() {
+        let summary = ProfileSummary {
+            name: "orphan".to_string(),
+            account: "gone".to_string(),
+            backend: None,
+            model: None,
+        };
+        let from_summary =
+            serde_json::to_value(ProfileView::from_summary(&summary, false)).expect("json");
+        let profile = ProfileConfig {
+            account: "gone".to_string(),
+            ..Default::default()
+        };
+        let from_config = serde_json::to_value(ProfileView::from_config(
+            "orphan",
+            &profile,
+            &BTreeMap::new(),
+            false,
+        ))
+        .expect("json");
+        for document in [&from_summary, &from_config] {
+            assert!(document.get("backend").is_none(), "{document}");
+            assert_eq!(document["account"], "gone");
+        }
+        assert_eq!(from_summary, from_config, "one record, one shape");
     }
 
     /// A gate's command is disclosed only to a reader allowed to see it, and the gate's kind and

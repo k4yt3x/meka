@@ -22,8 +22,8 @@ mod profile;
 pub(crate) use profile::PROFILE_KEY_ORDER;
 pub(crate) use profile::{
     AccountConfig, Backend, ProfileConfig, ProfileRequest, ProfileSettings, account_for,
-    default_profile_on_disk, require_profile, resolve_device_id, resolve_profile, select_profile,
-    sort_account_keys, sort_profile_keys, validate_max_output_tokens,
+    default_profile_on_disk, require_model, require_profile, resolve_device_id, resolve_profile,
+    select_profile, sort_account_keys, sort_profile_keys, validate_max_output_tokens,
 };
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
@@ -1076,12 +1076,13 @@ pub(crate) struct RunRequest {
 }
 
 /// One configured profile as a listing shows it: its name, the account it bills, that account's
-/// `backend` as written, and the model when the profile names one.
+/// `backend` as written (`None` when the account is not configured), and the model when the
+/// profile names one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProfileSummary {
     pub(crate) name: String,
     pub(crate) account: String,
-    pub(crate) backend: String,
+    pub(crate) backend: Option<String>,
     pub(crate) model: Option<String>,
 }
 
@@ -1792,8 +1793,7 @@ impl ResolvedConfig {
                 account: profile.account.clone(),
                 backend: accounts
                     .get(&profile.account)
-                    .map(|account| account.backend.clone())
-                    .unwrap_or_default(),
+                    .map(|account| account.backend.clone()),
                 model: profile.model.clone(),
             })
             .collect();
@@ -2168,12 +2168,10 @@ impl ResolvedConfig {
                     .to_string(),
             ));
         }
-        if self.model.is_none() {
-            return Err(crate::error::MekaError::Config(format!(
-                "profile '{0}' names no model; set one with `meka profile set {0} model <model>`",
-                self.default_profile.as_deref().unwrap_or("?"),
-            )));
-        }
+        require_model(
+            self.default_profile.as_deref().unwrap_or("?"),
+            self.model.as_deref(),
+        )?;
         validate_max_output_tokens(
             self.default_profile.as_deref().unwrap_or("?"),
             self.backend,

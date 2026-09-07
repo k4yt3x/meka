@@ -263,27 +263,16 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // reentrancy in a thread-local depth counter, so a guard held across an await on a
     // multi-threaded runtime can resume on a worker where the depth reads zero, and a nested
     // acquisition then self-deadlocks on the file lock this process already holds.
-    let (has_account, referenced_by) = {
+    let has_account = {
         let (_lock, _path, document) = open_document()?;
-        (
-            table_names(&document, "accounts")
-                .iter()
-                .any(|account| account == name),
-            profiles_on_account(&document, name),
-        )
+        // Ahead of every write. A profile that names this account cannot run without it, and
+        // every session on that profile would refuse to resume; refusing here names what to move
+        // first rather than cascading a deletion the user did not ask for.
+        refuse_a_referenced_account(&document, name)?;
+        table_names(&document, "accounts")
+            .iter()
+            .any(|account| account == name)
     };
-
-    // Ahead of every write. A profile that names this account cannot run without it, and every
-    // session on that profile would refuse to resume; refusing here names what to move first
-    // rather than cascading a deletion the user did not ask for.
-    if !referenced_by.is_empty() {
-        anyhow::bail!(
-            "account '{}' is named by profile(s) {}; remove them first with `meka profile remove \
-             <name>`",
-            name,
-            referenced_by.join(", ")
-        );
-    }
     if !has_account && !has_credential {
         anyhow::bail!("no account or stored credential named '{name}'");
     }
@@ -293,11 +282,18 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
     // stops the command above instead, with nothing done: an error that leaves the secret deleted
     // reads to the user as "nothing happened", which is the one thing it must not mean.
     token_store.delete_account_credential(name).await?;
-    // Re-read under a fresh guard so the edit below is applied to the current file, and so the
-    // read-modify-write is one critical section with no await inside it.
-    let (_lock, path, mut document) = open_document()?;
-    let removed_account = remove_account_document(&mut document, name);
-    crate::fs::write_file_atomic(&path, &document.to_string())?;
+    let removed_account = match remove_account_under_lock(name) {
+        Ok(removed) => removed,
+        Err(error) => {
+            // The credential is already gone, so a refusal here must not read as "nothing
+            // happened": that is the one thing this command's errors must never mean.
+            tracing::warn!(
+                "the stored credential for '{name}' is already cleared; log in again with `meka \
+                 account login {name}`"
+            );
+            return Err(error);
+        }
+    };
 
     // What the write actually did, not what a probe predicted.
     if removed_account {
@@ -306,6 +302,40 @@ async fn run_remove(name: &str, token_store: &TokenStore) -> anyhow::Result<()> 
         tracing::info!("cleared the stored credential for '{name}'; no account was configured");
     }
     Ok(())
+}
+
+/// Refuse to remove an account while a profile names it.
+///
+/// Asked twice by `run_remove`, of the file as it stands each time: ahead of the credential
+/// deletion, and again under the lock the config write takes, because a `profile add` naming this
+/// account can land between the two and the first answer is stale by then.
+fn refuse_a_referenced_account(
+    document: &toml_edit::DocumentMut,
+    name: &str,
+) -> anyhow::Result<()> {
+    let referenced_by = profiles_on_account(document, name);
+    if referenced_by.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "account '{}' is named by profile(s) {}; remove them first with `meka profile remove \
+         <name>`",
+        name,
+        referenced_by.join(", ")
+    )
+}
+
+/// Remove `[accounts.<name>]` from the file, answering whether there was one to remove.
+///
+/// The check and the write are one critical section: `_lock` is held to the end, and the document
+/// is read under it rather than carried over from `run_remove`'s probe, so the edit applies to the
+/// current file. No `await` inside, for the reason `run_remove` gives about `ConfigFileLock`.
+fn remove_account_under_lock(name: &str) -> anyhow::Result<bool> {
+    let (_lock, path, mut document) = open_document()?;
+    refuse_a_referenced_account(&document, name)?;
+    let removed = remove_account_document(&mut document, name);
+    crate::fs::write_file_atomic(&path, &document.to_string())?;
+    Ok(removed)
 }
 
 /// The profiles naming `account`, read off the raw document so `remove` can refuse on a config
@@ -1432,6 +1462,9 @@ async fn run_introspection(
         overrides.profile = Some(name);
     }
     let config = config::ResolvedConfig::resolve(overrides);
+    // A parse error leaves `profiles` empty, and the refusal below would then blame a missing
+    // profile for a typo in the file; every sibling subcommand fails on the parse error instead.
+    config.require_readable_config()?;
     let name = config.default_profile.clone().ok_or_else(|| {
         anyhow::anyhow!(
             config
@@ -1885,6 +1918,69 @@ mod tests {
         );
         let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
         assert!(contents.contains("[accounts.work]"), "{contents}");
+    }
+
+    /// The locked write asks the referenced-by question again, of the file as it stands then.
+    ///
+    /// `run_remove` probes under one guard and writes under another, with the credential deletion
+    /// awaited between them, so a `profile add` naming the account can land in the window and the
+    /// probe's answer is stale by the write. Only a refusal under the write's own lock holds.
+    #[test]
+    fn the_locked_write_refuses_an_account_a_profile_has_since_named() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[accounts.work]\nbackend = \"anthropic-messages\"\n\n\
+             [profiles.daily]\naccount = \"work\"\nmodel = \"m\"\n",
+        )
+        .expect("write config");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = remove_account_under_lock("work");
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(_) => panic!("an account a profile names must not be removed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("profile(s) daily;"), "{error}");
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(contents.contains("[accounts.work]"), "{contents}");
+    }
+
+    /// The read-only views fail on an unreadable `config.toml` the way every sibling does, rather
+    /// than reading its empty parse as "no profile configured" and sending the user to add one.
+    #[tokio::test]
+    async fn an_introspection_command_reports_an_unreadable_config_rather_than_a_missing_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "bogus = 1\n").expect("write config");
+        let store = crate::store::Store::for_test().await;
+        let cli = <crate::cli::Cli as clap::Parser>::parse_from(["meka"]);
+        let action = crate::cli::AccountAction::Whoami {
+            profile: None,
+            format: crate::cli::OutputFormat::Plain,
+        };
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_introspection(&store, &action, &cli).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("an unreadable config must fail the command"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("failed to parse") && error.contains("bogus"),
+            "the parse error is the answer: {error}"
+        );
+        assert!(
+            !error.contains("meka account add"),
+            "an unreadable file is not a missing profile: {error}"
+        );
     }
 
     /// Without this, `account remove typo` would report `removed account 'typo'` and exit 0 having

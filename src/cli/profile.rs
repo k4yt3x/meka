@@ -102,16 +102,18 @@ fn run_add(
         None => prompt_account(&existing)?,
     };
     let Some(account) = existing.accounts.get(&account_name) else {
-        anyhow::bail!(
-            "{}; create it with `meka account add {account_name}`",
-            crate::text::unknown_name("account", &account_name, existing.accounts.keys())
-        );
+        return Err(unknown_account(&account_name, existing.accounts.keys()));
     };
     // The backend decides which settings are worth asking about and which flags are inert, so it
     // is read before the prompts rather than left to fail at the first run.
     let backend = validate_backend(&account.backend)?;
 
     let model = match model_flag {
+        // Refused here rather than left to the write door, whose remedy is `profile set` on a
+        // profile this command has not created; at this door the remedy is the flag.
+        Some(model) if config::require_model(name, Some(&model)).is_err() => {
+            anyhow::bail!("`--model` cannot be empty")
+        }
         Some(model) => model,
         None => {
             let default_model = default_model_for(backend);
@@ -142,6 +144,18 @@ fn run_add(
     write_profile(name, &account_name, model.as_str(), &tuning)?;
     tracing::info!("added profile '{name}' on account '{account_name}'");
     Ok(())
+}
+
+/// The refusal for a profile naming an account that is not configured, worded once for the door
+/// ahead of the prompts and the one under the lock.
+fn unknown_account(
+    account: &str,
+    known: impl IntoIterator<Item = impl AsRef<str>>,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{}; create it with `meka account add {account}`",
+        crate::text::unknown_name("account", account, known)
+    )
 }
 
 /// Ask which account a new profile bills. A sole account is offered as the default; several are
@@ -266,8 +280,8 @@ const SETTABLE_PROFILE_KEYS: &[&str] = &[
 ///
 /// Each key parses the way the matching `profile add` flag does, `thinking` through the same
 /// `ValueEnum` for the reason [`resolve_tuning`]'s prompt gives: a second hand-written match would
-/// be a second thing to keep in step with the enum.
-fn parse_profile_value(key: &str, value: &str) -> anyhow::Result<toml_edit::Value> {
+/// be a second thing to keep in step with the enum. `name` is only for the refusal a value earns.
+fn parse_profile_value(name: &str, key: &str, value: &str) -> anyhow::Result<toml_edit::Value> {
     let integer = |what: &str| -> anyhow::Result<toml_edit::Value> {
         let parsed: u64 = value
             .parse()
@@ -282,7 +296,13 @@ fn parse_profile_value(key: &str, value: &str) -> anyhow::Result<toml_edit::Valu
         }
     };
     match key {
-        "model" | "effort" => Ok(toml_edit::Value::from(value)),
+        // The predicate the write doors and a run apply, asked of the value alone: `""` is valid
+        // TOML and a model no provider has, and it would otherwise be written and then sent.
+        "model" => Ok(toml_edit::Value::from(config::require_model(
+            name,
+            Some(value),
+        )?)),
+        "effort" => Ok(toml_edit::Value::from(value)),
         "context_window" => integer("context_window"),
         "max_output_tokens" => integer("max_output_tokens"),
         "vision" => boolean("vision"),
@@ -449,7 +469,7 @@ fn run_set(name: &str, key: &str, value: Option<&str>, unset: bool) -> anyhow::R
     ensure_settable_key(key)?;
     // Clap's `conflicts_with` rules out "both"; this is the other half, which it cannot express.
     let parsed = match (value, unset) {
-        (Some(value), _) => Some(parse_profile_value(key, value)?),
+        (Some(value), _) => Some(parse_profile_value(name, key, value)?),
         (None, true) => None,
         (None, false) => anyhow::bail!(
             "`meka profile set {name} {key}` needs a value, or `--unset` to remove the setting"
@@ -491,8 +511,6 @@ fn run_set(name: &str, key: &str, value: Option<&str>, unset: bool) -> anyhow::R
 }
 
 fn run_use(name: &str) -> anyhow::Result<()> {
-    let config_file = config::load_config_file_or_err()?;
-    config::require_profile(name, &config_file.profiles)?;
     set_default_profile(name)?;
     tracing::info!("default profile set to '{name}'");
     Ok(())
@@ -500,63 +518,61 @@ fn run_use(name: &str) -> anyhow::Result<()> {
 
 fn run_list(format: crate::cli::OutputFormat) -> anyhow::Result<()> {
     let config_file = config::load_config_file_or_err()?;
-    if format == crate::cli::OutputFormat::Json {
-        let (active, _) = config::select_profile(
-            config_file.default_profile.clone(),
-            config::ProfileRequest::DefaultProfile,
-            &config_file.profiles,
-        );
-        // `active` is the profile a session gets when it names none, by the same selection rule a
-        // run applies; a profile on a missing account is listed without a backend and the note on
-        // stderr reports it.
-        let views: Vec<crate::view::ProfileView> = config_file
-            .profiles
-            .iter()
-            .map(|(name, profile)| {
-                crate::view::ProfileView::from_config(
-                    name,
-                    profile,
-                    &config_file.accounts,
-                    Some(name.as_str()) == active.as_deref(),
-                )
-            })
-            .collect();
-        crate::cli::write_json_listing("profiles", &views)?;
-        report_broken_profiles(&config_file);
-        return Ok(());
+    let views = profile_views(&config_file);
+    match format {
+        crate::cli::OutputFormat::Json => crate::cli::write_json_listing("profiles", &views)?,
+        crate::cli::OutputFormat::Plain if views.is_empty() => {
+            crate::streams::write_stderr_line("No profiles.");
+        }
+        crate::cli::OutputFormat::Plain => {
+            let rows: Vec<Vec<String>> = views
+                .iter()
+                .map(|view| {
+                    vec![
+                        view.name.clone(),
+                        view.account.clone(),
+                        view.backend.clone().unwrap_or_else(|| "-".to_string()),
+                        view.model.clone().unwrap_or_else(|| "-".to_string()),
+                        if view.active { "*" } else { "" }.to_string(),
+                    ]
+                })
+                .collect();
+            crate::render::write_stdout(crate::text::format_columns(
+                &["Name", "Account", "Backend", "Model", "Default"],
+                &rows,
+            ))?;
+        }
     }
-    if config_file.profiles.is_empty() {
-        crate::streams::write_stderr_line("No profiles.");
-        return Ok(());
-    }
-    let default = config_file.default_profile.as_deref();
-    let rows: Vec<Vec<String>> = config_file
+    // After every branch, the empty one included: a `default_profile` naming nothing over zero
+    // profiles is exactly the state worth reporting, and only this listing reports it.
+    report_broken_profiles(&config_file);
+    Ok(())
+}
+
+/// Every configured profile as either format prints it, the default marked by the selection rule a
+/// run applies, so a sole profile with no `default_profile` is the default under both.
+///
+/// One list for both formats, so the marker cannot be computed one way for plain and another for
+/// JSON. A profile on a missing account is listed without a backend and [`report_broken_profiles`]
+/// says so on stderr.
+fn profile_views(config_file: &config::ConfigFile) -> Vec<crate::view::ProfileView> {
+    let (active, _) = config::select_profile(
+        config_file.default_profile.clone(),
+        config::ProfileRequest::DefaultProfile,
+        &config_file.profiles,
+    );
+    config_file
         .profiles
         .iter()
         .map(|(name, profile)| {
-            vec![
-                name.clone(),
-                profile.account.clone(),
-                config_file
-                    .accounts
-                    .get(&profile.account)
-                    .map(|account| account.backend.clone())
-                    .unwrap_or_else(|| "-".to_string()),
-                profile.model.clone().unwrap_or_else(|| "-".to_string()),
-                if Some(name.as_str()) == default {
-                    "*".to_string()
-                } else {
-                    String::new()
-                },
-            ]
+            crate::view::ProfileView::from_config(
+                name,
+                profile,
+                &config_file.accounts,
+                Some(name.as_str()) == active.as_deref(),
+            )
         })
-        .collect();
-    crate::render::write_stdout(crate::text::format_columns(
-        &["Name", "Account", "Backend", "Model", "Default"],
-        &rows,
-    ))?;
-    report_broken_profiles(&config_file);
-    Ok(())
+        .collect()
 }
 
 /// The two states a listing can reveal and a run then fails on, said on stderr under either format.
@@ -721,6 +737,15 @@ fn write_profile(
              <value>`"
         );
     }
+    // The account too, for the same reason: `account remove` re-asks its own side under this lock,
+    // and the pair only holds if this side asks as well. Read off the document rather than the
+    // config `run_add` parsed, because that parse is what has gone stale.
+    if !table_names(&document, "accounts")
+        .iter()
+        .any(|configured| configured == account)
+    {
+        return Err(unknown_account(account, table_names(&document, "accounts")));
+    }
     let before = document.to_string();
     upsert_profile_document(&mut document, name, account, model, tuning)?;
     let after = document.to_string();
@@ -741,6 +766,9 @@ fn write_profile(
 fn refuse_a_profile_that_cannot_run(before: &str, after: &str, name: &str) -> anyhow::Result<()> {
     let candidate = reparse_after_edit(before, after)?;
     if let Some(profile) = candidate.profiles.get(name) {
+        // `--unset model` and `--model ""` both arrive here as a profile a run would refuse by
+        // name; the predicate the run applies refuses the write first.
+        config::require_model(name, profile.model.as_deref())?;
         config::validate_max_output_tokens(
             name,
             candidate
@@ -758,10 +786,20 @@ fn refuse_a_profile_that_cannot_run(before: &str, after: &str, name: &str) -> an
     Ok(())
 }
 
+/// Point `default_profile` at `name`, refusing a name that is not a profile.
+///
+/// The refusal is asked under the lock the write takes, of the file as it stands then. Asked of a
+/// parse taken before the lock, a `profile remove` landing between the two leaves `default_profile`
+/// naming a profile that is gone, and the next run fails on a key this command just wrote.
 fn set_default_profile(name: &str) -> anyhow::Result<()> {
-    // `_lock` is held to the end of the function, so the read above and the write below are one
+    // `_lock` is held to the end of the function, so the check and the write below are one
     // critical section.
     let (_lock, path, mut document) = open_document()?;
+    // The typed parse rather than the document's table names: `use` writes a pointer for the typed
+    // reader to follow, so it has nothing to do on a file that reader refuses, and
+    // `require_profile` is the one definition of a name that is a profile.
+    let config_file = config::load_config_file_or_err()?;
+    config::require_profile(name, &config_file.profiles)?;
     document["default_profile"] = toml_edit::value(name);
     crate::fs::write_file_atomic(&path, &document.to_string())?;
     Ok(())
@@ -1297,7 +1335,7 @@ model = "untouched"
         );
 
         // And through the door `set` actually uses, since that is where a user meets it.
-        let error = parse_profile_value("context_window", &u64::MAX.to_string())
+        let error = parse_profile_value("work", "context_window", &u64::MAX.to_string())
             .expect_err("`set` refuses it too");
         assert!(
             error.to_string().contains("context_window"),
@@ -1315,12 +1353,12 @@ model = "untouched"
     #[test]
     fn a_profile_that_could_not_start_is_refused_by_both_write_doors() {
         let good = "[accounts.work]\nbackend = \"anthropic-messages\"\n\n[profiles.work]\naccount = \
-                    \"work\"\nthinking = \"budgeted\"\nthinking_budget = 8000\nmax_output_tokens = \
-                    32000\n";
+                    \"work\"\nmodel = \"m\"\nthinking = \"budgeted\"\nthinking_budget = \
+                    8000\nmax_output_tokens = 32000\n";
         let cap_below_budget = "[accounts.work]\nbackend = \
                                 \"anthropic-messages\"\n\n[profiles.work]\naccount = \
-                                \"work\"\nthinking = \"budgeted\"\nthinking_budget = \
-                                32000\nmax_output_tokens = 8000\n";
+                                \"work\"\nmodel = \"m\"\nthinking = \"budgeted\"\n\
+                                thinking_budget = 32000\nmax_output_tokens = 8000\n";
         refuse_a_profile_that_cannot_run(good, good, "work").expect("a workable pairing passes");
         let error = refuse_a_profile_that_cannot_run(good, cap_below_budget, "work")
             .expect_err("a cap at or below the budget cannot produce a valid request");
@@ -1334,13 +1372,171 @@ model = "untouched"
         // refused even though neither number is written beside the other.
         let global_budget = "[thinking]\nbudget = 64000\n\n[accounts.work]\nbackend = \
                              \"anthropic-messages\"\n\n[profiles.work]\naccount = \
-                             \"work\"\nthinking = \"budgeted\"\nmax_output_tokens = 16000\n";
+                             \"work\"\nmodel = \"m\"\nthinking = \"budgeted\"\n\
+                             max_output_tokens = 16000\n";
         refuse_a_profile_that_cannot_run(good, global_budget, "work")
             .expect_err("the fallback budget is checked too, not skipped for being absent");
 
         // A profile the edit did not touch is not this call's business.
         refuse_a_profile_that_cannot_run(good, cap_below_budget, "other")
             .expect("only the named profile is judged");
+    }
+
+    /// A profile that names no model, or an empty one, is refused by both write doors.
+    ///
+    /// `--unset model` and `--model ""` reach the same place: a profile every run refuses by name
+    /// and every session on it refuses to resume through. `""` is the half `is_none()` misses, and
+    /// the one that would otherwise go to the provider as the model's name.
+    #[test]
+    fn a_profile_without_a_model_is_refused_by_both_write_doors() {
+        let with_model = "[accounts.work]\nbackend = \"anthropic-messages\"\n\n[profiles.work]\n\
+                          account = \"work\"\nmodel = \"m\"\n";
+        let without_model = "[accounts.work]\nbackend = \"anthropic-messages\"\n\n\
+                             [profiles.work]\naccount = \"work\"\n";
+        let empty_model = "[accounts.work]\nbackend = \"anthropic-messages\"\n\n[profiles.work]\n\
+                           account = \"work\"\nmodel = \"\"\n";
+        refuse_a_profile_that_cannot_run(without_model, with_model, "work")
+            .expect("a profile that gains a model can run");
+        for broken in [without_model, empty_model] {
+            let message = refuse_a_profile_that_cannot_run(with_model, broken, "work")
+                .expect_err("a profile with no model cannot run")
+                .to_string();
+            assert!(
+                message.contains("names no model") && message.contains("meka profile set work"),
+                "the refusal names the profile and the command that fixes it: {message}"
+            );
+        }
+        // And at the parse door, before the lock is taken.
+        assert!(parse_profile_value("work", "model", "").is_err());
+        assert!(parse_profile_value("work", "model", "   ").is_err());
+    }
+
+    /// `--model ""` is refused at the flag, ahead of the prompts and with the flag as the remedy.
+    ///
+    /// The write door refuses it too, but its remedy is `meka profile set <name> model`, on a
+    /// profile this command has not created.
+    #[test]
+    fn add_refuses_an_empty_model_flag_before_anything_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), TWO_ACCOUNTS).expect("write config");
+        // Every prompted setting is pinned, so `resolve_tuning` would return before any prompt if
+        // the refusal were missing: no stdin involved either way.
+        let pinned = ProfileTuning {
+            context_window: Some(1_000),
+            effort: Some("low".to_string()),
+            thinking: Some(config::ThinkingMode::Off),
+            ..Default::default()
+        };
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_add("blank", Some("work"), Some(String::new()), pinned);
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = result.expect_err("an empty model").to_string();
+        assert!(error.contains("--model"), "the remedy is the flag: {error}");
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(!contents.contains("blank"), "{contents}");
+    }
+
+    /// The account is checked under the lock the write takes, not only before the prompts.
+    ///
+    /// `run_add` asks of the config it parsed before prompting, and `account remove` re-asks its
+    /// own side under this same lock; the pair holds only if the write asks too, or a removal that
+    /// landed during the prompts leaves a profile naming an account that is gone.
+    #[test]
+    fn write_profile_refuses_an_account_the_locked_file_does_not_have() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[accounts.work]\nbackend = \"anthropic-messages\"\n",
+        )
+        .expect("write config");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let refused = write_profile("daily", "gone", "m", &ProfileTuning::default());
+        let written = write_profile("daily", "work", "m", &ProfileTuning::default());
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = refused
+            .expect_err("an account that is not configured")
+            .to_string();
+        assert!(error.contains("no account named 'gone'"), "{error}");
+        written.expect("a configured account");
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(contents.contains("account = \"work\""), "{contents}");
+        assert!(
+            !contents.contains("gone"),
+            "a refused write leaves nothing: {contents}"
+        );
+    }
+
+    /// `default_profile` is written only for a profile the locked file has.
+    ///
+    /// Asked under the lock rather than of a parse taken before it, so a `profile remove` landing
+    /// between the two cannot leave the key naming a profile that is gone.
+    #[test]
+    fn set_default_profile_refuses_a_name_the_locked_file_does_not_have() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("{TWO_ACCOUNTS}[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n"),
+        )
+        .expect("write config");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.blocking_lock();
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let refused = set_default_profile("ghost");
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = refused
+            .expect_err("a name that is not a profile")
+            .to_string();
+        assert!(error.contains("no profile named 'ghost'"), "{error}");
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(!contents.contains("default_profile"), "{contents}");
+    }
+
+    /// Plain and JSON mark the same profile as the default: the one the selection rule picks, so a
+    /// sole profile with no `default_profile` is marked under both rather than only under JSON.
+    #[test]
+    fn the_default_marker_follows_the_selection_rule_under_either_format() {
+        let sole: config::ConfigFile = toml::from_str(&format!(
+            "{TWO_ACCOUNTS}[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n"
+        ))
+        .expect("parse");
+        let views = profile_views(&sole);
+        assert_eq!(views.len(), 1);
+        assert!(
+            views[0].active,
+            "a sole profile is the default by the selection rule"
+        );
+
+        let two: config::ConfigFile = toml::from_str(&format!(
+            "{TWO_ACCOUNTS}[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n\n\
+             [profiles.side]\naccount = \"oai\"\nmodel = \"m\"\n"
+        ))
+        .expect("parse");
+        assert!(
+            profile_views(&two).iter().all(|view| !view.active),
+            "two profiles and no `default_profile` pick nothing"
+        );
+
+        let pointed: config::ConfigFile = toml::from_str(&format!(
+            "default_profile = \"side\"\n\n{TWO_ACCOUNTS}[profiles.work]\naccount = \
+             \"work\"\nmodel = \"m\"\n\n[profiles.side]\naccount = \"oai\"\nmodel = \"m\"\n"
+        ))
+        .expect("parse");
+        let active: Vec<String> = profile_views(&pointed)
+            .into_iter()
+            .filter(|view| view.active)
+            .map(|view| view.name)
+            .collect();
+        assert_eq!(active, ["side"]);
     }
 
     /// A file that was already unreadable is not blamed on the edit that found it.
@@ -1488,14 +1684,14 @@ account = "work"
     /// Every settable key parses its own value type, and refuses what it cannot mean.
     #[test]
     fn each_profile_key_parses_the_way_its_add_flag_does() {
-        assert!(parse_profile_value("model", "claude-opus-5").is_ok());
-        assert!(parse_profile_value("context_window", "200000").is_ok());
-        assert!(parse_profile_value("context_window", "lots").is_err());
-        assert!(parse_profile_value("vision", "false").is_ok());
-        assert!(parse_profile_value("vision", "no").is_err());
-        assert!(parse_profile_value("thinking", "budgeted").is_ok());
-        assert!(parse_profile_value("thinking", "sideways").is_err());
-        assert!(parse_profile_value("thinking_budget", "2048").is_ok());
+        assert!(parse_profile_value("work", "model", "claude-opus-5").is_ok());
+        assert!(parse_profile_value("work", "context_window", "200000").is_ok());
+        assert!(parse_profile_value("work", "context_window", "lots").is_err());
+        assert!(parse_profile_value("work", "vision", "false").is_ok());
+        assert!(parse_profile_value("work", "vision", "no").is_err());
+        assert!(parse_profile_value("work", "thinking", "budgeted").is_ok());
+        assert!(parse_profile_value("work", "thinking", "sideways").is_err());
+        assert!(parse_profile_value("work", "thinking_budget", "2048").is_ok());
 
         // Every key in the advertised list has an arm. A key listed but unhandled would fall to the
         // catch-all and be refused as unknown, which reads as meka having forgotten its own field.
@@ -1508,7 +1704,7 @@ account = "work"
                 _ => "value",
             };
             assert!(
-                parse_profile_value(key, sample).is_ok(),
+                parse_profile_value("work", key, sample).is_ok(),
                 "'{key}' is advertised as settable but does not parse"
             );
         }
@@ -1565,7 +1761,7 @@ account = "work"
     /// that meka is declining to change for them.
     #[test]
     fn changing_a_profiles_account_is_refused_with_its_reason() {
-        let error = parse_profile_value("account", "oai")
+        let error = parse_profile_value("work", "account", "oai")
             .expect_err("the account is not settable in place");
         let message = error.to_string();
         assert!(
@@ -1573,7 +1769,7 @@ account = "work"
             "the refusal must say why and where to go: {message}"
         );
 
-        let base_url = parse_profile_value("base_url", "https://x.invalid")
+        let base_url = parse_profile_value("work", "base_url", "https://x.invalid")
             .expect_err("an account setting is not a profile setting");
         assert!(
             base_url.to_string().contains("[accounts.<name>]"),

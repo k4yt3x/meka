@@ -31,7 +31,7 @@ struct TodoInput {
     _scratchpad: Option<String>,
 }
 
-pub(super) struct TodoTool {
+pub(crate) struct TodoTool {
     pub(crate) todo_list: SharedTodoList,
 }
 

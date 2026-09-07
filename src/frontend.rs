@@ -483,7 +483,7 @@ pub(crate) enum FrontendEvent {
         /// `checkpoint`, `checkpoint_text`, or `summarizer`. The three differ in fidelity, not
         /// just mechanism.
         source: &'static str,
-        /// How many materialised messages the boundary removed.
+        /// How many materialized messages the boundary removed.
         ///
         /// The whole pre-compaction window, including the recent tail that is then re-appended
         /// verbatim -- so this over-counts what the summary actually stands for. It is the figure
@@ -785,10 +785,23 @@ impl Notice {
     /// indistinguishable from a model that chose not to use its tools, and that has sent people
     /// debugging the prompt instead of the flag.
     pub(crate) fn approval_refused_without_asking(tool_name: &str) -> Self {
+        Self::warn(Self::approval_refused_without_asking_text(tool_name))
+    }
+
+    /// [`Self::approval_refused_without_asking`] with the host's reason and remedy appended, for a
+    /// surface where the caller could have provided a channel and did not.
+    pub(crate) fn approval_refused_without_asking_because(tool_name: &str, reason: &str) -> Self {
         Self::warn(format!(
+            "{}: {reason}",
+            Self::approval_refused_without_asking_text(tool_name)
+        ))
+    }
+
+    fn approval_refused_without_asking_text(tool_name: &str) -> String {
+        format!(
             "approvals are on but nobody can answer here, so '{tool_name}' was refused without \
              asking"
-        ))
+        )
     }
 
     /// What every frontend says when it declines an MCP elicitation on the user's behalf. `reason`

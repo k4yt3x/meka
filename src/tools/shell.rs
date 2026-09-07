@@ -128,7 +128,7 @@ fn bwrap_args(
     args
 }
 
-pub(super) struct ExecuteCommandTool {
+pub(crate) struct ExecuteCommandTool {
     /// The process's workspace-ACE ledger on Windows.
     ///
     /// A handle on the one `process_grants()` singleton, not a per-tool ledger. It reads as a
@@ -158,6 +158,66 @@ pub(super) struct ExecuteCommandTool {
     pub(crate) backend_probe: crate::sandbox::BackendProbe,
     pub(crate) sandbox_enabled: bool,
     pub(crate) site: crate::session::ToolSite,
+}
+
+impl ExecuteCommandTool {
+    /// Whether a command may be spawned at `permission` given that its confinement `sandboxed` it
+    /// or did not. Asked by `execute` ahead of the spawn and by `refusal_at_level` ahead of the
+    /// approval prompt, so the two cannot disagree about a refusal approval could never lift.
+    ///
+    /// `[shell].sandbox = false` unconfines every level. That is right for the levels that never
+    /// promised a boundary and wrong for every level that did: left alone it would run the shell
+    /// with no confinement while the file tools stayed fenced, so one config key would make the
+    /// level mean two different things and the weaker meaning would be the silent one.
+    ///
+    /// Refused rather than hidden. `required_permission` cannot hide it: `Workspace.allows` is true
+    /// for everything by design, because scope is meant to be enforced at the door rather than by
+    /// withholding tools. Refusing at that door is the same shape as the write fence, and it can
+    /// say what to do about it where a missing tool could not.
+    ///
+    /// `unrestricted` is the only level whose intent is `Unconfined`; every other level reaching an
+    /// unconfined spawn is a configuration that cannot deliver what the level says. Keyed on
+    /// `workspace` alone, the sibling case stays open: `[tools.tool_permissions]` overrides a
+    /// tool's required level with no floor, so `execute_command = "read"` plus `[shell].sandbox =
+    /// false` would run a plain `sh -c` at `read`, with the full parent environment, since the
+    /// scrub is gated on `sandboxed` too.
+    fn admit_confinement(&self, permission: Permission, sandboxed: bool) -> Result<()> {
+        if permission != Permission::Unrestricted && !sandboxed {
+            return Err(MekaError::ToolExecution {
+                tool_name: "execute_command".to_string(),
+                message: "`[shell].sandbox = false` leaves nothing to confine this command \
+                          below `unrestricted`; set `[shell].sandbox = true`"
+                    .to_string(),
+            });
+        }
+        if !sandboxed {
+            return Ok(());
+        }
+        // Configured backend isn't usable on this host. Hard-error with the specific reason so the
+        // model can surface it via `render::render_error` rather than treat the failure as a tool
+        // result it could try to recover from.
+        let Some(reason) = crate::sandbox::backend_unavailable_reason(&self.backend_probe) else {
+            return Ok(());
+        };
+        // `sandbox_backend` is Linux-only; on other platforms there's nothing to reconfigure. The
+        // only escape hatch is `unrestricted`, which is also the only level whose confinement is
+        // `Unconfined` and so never reaches this branch.
+        #[cfg(target_os = "linux")]
+        let message = format!(
+            "configured sandbox backend ({}) is unavailable: {}; set `[shell].sandbox_backend` to \
+             a usable one",
+            self.sandbox_backend, reason
+        );
+        #[cfg(not(target_os = "linux"))]
+        let message = format!(
+            "sandbox is unavailable: {reason}. `unrestricted` runs shell commands without a \
+             sandbox."
+        );
+        Err(MekaError::ToolExecution {
+            tool_name: "execute_command".to_string(),
+            message,
+        })
+    }
 }
 
 #[async_trait]
@@ -217,6 +277,24 @@ impl Tool for ExecuteCommandTool {
         }
     }
 
+    /// The level and the configuration decide whether anything can confine a command; the command
+    /// itself and the user's answer do not.
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        _input: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        let confinement = crate::sandbox::Confinement::resolve(
+            self.sandbox_enabled,
+            level,
+            &self.scope,
+            &self.site.cwd,
+        );
+        self.admit_confinement(level, confinement.is_sandboxed())
+            .err()
+            .map(|error| ToolOutput::from_error(&error))
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -239,58 +317,7 @@ impl Tool for ExecuteCommandTool {
             &self.site.cwd,
         );
         let sandboxed = confinement.is_sandboxed();
-
-        // `[shell].sandbox = false` unconfines every level. That is right for the levels that never
-        // promised a boundary and wrong for every level that did: left alone it would run the shell
-        // with no confinement while the file tools stayed fenced, so one config key would make the
-        // level mean two different things and the weaker meaning would be the silent one.
-        //
-        // Refused rather than hidden. `required_permission` cannot hide it: `Workspace.allows` is
-        // true for everything by design, because scope is meant to be enforced at the door rather
-        // than by withholding tools. Refusing at that door is the same shape as the write fence,
-        // and it can say what to do about it where a missing tool could not.
-        //
-        // `unrestricted` is the only level whose intent is `Unconfined`; every other level reaching
-        // an unconfined spawn is a configuration that cannot deliver what the level says. Keyed on
-        // `workspace` alone, the sibling case stays open: `[tools.tool_permissions]` overrides a
-        // tool's required level with no floor, so `execute_command = "read"` plus `[shell].sandbox
-        // = false` would run a plain `sh -c` at `read`, with the full parent environment, since the
-        // scrub is gated on `sandboxed` too.
-        if permission != Permission::Unrestricted && !sandboxed {
-            return Err(MekaError::ToolExecution {
-                tool_name: "execute_command".to_string(),
-                message: "`[shell].sandbox = false` leaves nothing to confine this command, which \
-                          every level below `unrestricted` requires; set `[shell].sandbox = true` \
-                          or run at `unrestricted`"
-                    .to_string(),
-            });
-        }
-
-        if sandboxed {
-            // Configured backend isn't usable on this host. Hard-error with the specific reason so
-            // the model can surface it via `render::render_error` rather than treat the failure as
-            // a tool result it could try to recover from.
-            if let Some(reason) = crate::sandbox::backend_unavailable_reason(&self.backend_probe) {
-                // `sandbox_backend` is Linux-only; on other platforms there's nothing to
-                // reconfigure. The only escape hatch is `unrestricted`, which is also the only
-                // level whose confinement is `Unconfined` and so never reaches this branch.
-                #[cfg(target_os = "linux")]
-                let message = format!(
-                    "configured sandbox backend ({}) is unavailable: {}; set \
-                     `[shell].sandbox_backend` to another backend or run at `unrestricted`",
-                    self.sandbox_backend, reason
-                );
-                #[cfg(not(target_os = "linux"))]
-                let message = format!(
-                    "sandbox is unavailable: {reason}. `unrestricted` runs shell commands \
-                     without a sandbox."
-                );
-                return Err(MekaError::ToolExecution {
-                    tool_name: "execute_command".to_string(),
-                    message,
-                });
-            }
-        }
+        self.admit_confinement(permission, sandboxed)?;
 
         // Windows + sandboxed: spawn directly via CreateProcessAsUserW with a Low-integrity token.
         // This path can't go through tokio::process because the stdlib gives no hook for injecting
@@ -334,10 +361,8 @@ impl Tool for ExecuteCommandTool {
                         return Err(MekaError::ToolExecution {
                             tool_name: "execute_command".to_string(),
                             message: format!(
-                                "failed to make '{}' writable for the sandboxed shell: {}. \
-                                 meka needs to own the directory to grant itself write access \
-                                 there; a network share or another user's folder cannot be a \
-                                 workspace root on Windows.",
+                                "failed to make '{}' writable for the sandboxed shell: {}; a \
+                                 workspace root on Windows must be a directory meka owns",
                                 root.display(),
                                 error
                             ),
@@ -1266,6 +1291,32 @@ mod tests {
                 .with_permission(shared_permission)
                 .with_cwd(crate::workspace::cwd_for_test()),
         }
+    }
+
+    /// With `[shell].sandbox = false`, nothing can confine a command below `unrestricted`, and that
+    /// follows from the level alone, so the tool states the refusal ahead of the approval prompt in
+    /// the words `execute` would use. `unrestricted` promised no boundary and has nothing to say.
+    #[tokio::test]
+    async fn the_shell_states_its_confinement_refusal_ahead_of_the_prompt() {
+        let tool = tool_for_test(shared_permission_for_test(), false);
+        let input = serde_json::json!({"command": "true"});
+
+        let refusal = tool
+            .refusal_at_level(Permission::Read, &input)
+            .await
+            .expect("nothing confines the command at `read`");
+        assert!(refusal.is_error);
+        assert!(
+            refusal.text_content().contains("`[shell].sandbox = false`"),
+            "{}",
+            refusal.text_content()
+        );
+        assert!(
+            tool.refusal_at_level(Permission::Unrestricted, &input)
+                .await
+                .is_none(),
+            "`unrestricted` runs unconfined by design"
+        );
     }
 
     /// A real signal kill and meka's own timeout kill must spell the same signal the same way; a

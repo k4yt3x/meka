@@ -236,8 +236,14 @@ pub(crate) fn private_directories() -> Vec<PathBuf> {
         crate::paths::meka_data_dir(),
         Some(crate::paths::command_output_dir()),
     ];
+    private_directories_among(candidates.into_iter().flatten())
+}
+
+/// [`private_directories`] over the given candidates, so the rule can be tested without the
+/// environment deciding where meka's directories are.
+fn private_directories_among(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut directories: Vec<PathBuf> = Vec::new();
-    for directory in candidates.into_iter().flatten() {
+    for directory in candidates {
         // Only a directory that exists: bubblewrap mounts its mask over a path in the bound root,
         // and there is nothing to hide where nothing is. And never one the system masks already
         // cover, which happens when captures fall back to the temp directory: taking `/tmp` as
@@ -525,11 +531,6 @@ pub(crate) fn accept_writable_roots(
              `{parent_level}`"
         )));
     }
-    // Computed once, and only at the level where it constrains: at `unrestricted` the parent's
-    // boundary is the whole filesystem and there is nothing to compare against.
-    let parent_reach =
-        (parent_level == Permission::Workspace).then(|| writable_roots(parent_cwd, parent_roots));
-
     let mut accepted = Vec::with_capacity(requested.len());
     for entry in requested {
         let canonical = accept_cwd(&resolve_against_cwd(parent_cwd, entry))
@@ -541,27 +542,8 @@ pub(crate) fn accept_writable_roots(
                 canonical.display()
             )));
         }
-        if let Some(reach) = &parent_reach
-            && !is_within_roots(&canonical, reach)
-        {
-            let where_to = if reach.is_empty() {
-                "no root of this session's workspace currently resolves".to_string()
-            } else {
-                format!(
-                    "this session's writes land under {}",
-                    reach
-                        .iter()
-                        .map(|root| root.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            return Err(MekaError::Usage(format!(
-                "writable_roots: '{}' is outside this session's workspace: {where_to}, and a \
-                 sub-agent's reach cannot exceed its parent's",
-                canonical.display()
-            )));
-        }
+        admit_within_parent_reach(parent_level, parent_cwd, parent_roots, &canonical)
+            .map_err(|error| MekaError::Usage(format!("writable_roots: {error}")))?;
         accepted.push(canonical);
     }
     // The one place an empty list is refused: a bounded worker with no working directory cannot
@@ -577,6 +559,55 @@ pub(crate) fn accept_writable_roots(
         cwd,
         additional_roots: accepted.collect(),
     })
+}
+
+/// Admit a directory a sub-agent works in against its parent's reach *now*.
+///
+/// One rule for what a parent's state means for the directory a worker holds, whichever door gave
+/// it: an entry of `writable_roots`, judged by [`accept_writable_roots`] at spawn and again on a
+/// follow-up, or the parent's own working directory at spawn, which a plain worker keeps across a
+/// follow-up and which is judged here once the parent may have moved. Two doors deciding this
+/// separately is how one of them came to resume a writer under a directory the other refused.
+///
+/// At `workspace` the directory must lie within [`writable_roots`], compared canonical to canonical
+/// and component-wise, so a sub-agent's reach is never wider than its parent's. `unrestricted`
+/// reaches everywhere and bounds nothing. Below `workspace` the parent has no write reach and a
+/// worker under it is narrowed to none, so there is nothing to compare. The directory is
+/// canonicalized when it still resolves; one that does not is compared as recorded, and the fence
+/// then refuses every write under it as it always has.
+pub(crate) fn admit_within_parent_reach(
+    parent_level: crate::permission::Permission,
+    parent_cwd: &SharedCwd,
+    parent_roots: &SharedRoots,
+    directory: &Path,
+) -> Result<(), String> {
+    if parent_level != crate::permission::Permission::Workspace {
+        return Ok(());
+    }
+    let canonical = std::fs::canonicalize(directory)
+        .map(strip_verbatim)
+        .unwrap_or_else(|_| directory.to_path_buf());
+    let reach = writable_roots(parent_cwd, parent_roots);
+    if is_within_roots(&canonical, &reach) {
+        return Ok(());
+    }
+    let where_to = if reach.is_empty() {
+        "no root of this session's workspace currently resolves".to_string()
+    } else {
+        format!(
+            "this session's writes land under {}",
+            reach
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Err(format!(
+        "'{}' is outside this session's workspace: {where_to}, and a sub-agent's reach cannot \
+         exceed its parent's",
+        canonical.display()
+    ))
 }
 
 /// Whether `path` lies within one of `roots`.
@@ -682,21 +713,32 @@ impl WriteScope {
         }
     }
 
+    /// The write lock for `canonical`, from the map every scope built for this host shares.
+    pub(crate) async fn lock_path(&self, canonical: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        self.locks.lock_path(canonical).await
+    }
+
     /// The roots a write must land under right now, or `None` when this level imposes no boundary.
     ///
     /// Only `unrestricted` disclaims a boundary, by definition; an approved call runs at its own
     /// level and reaches no further. Every other level, `none` and `read` included, is confined
     /// here: a level that should never reach a write door must fail closed if one is ever wired to
-    /// it. The write lock for `canonical`, from the map every scope built for this host shares.
-    pub(crate) async fn lock_path(&self, canonical: &Path) -> tokio::sync::OwnedMutexGuard<()> {
-        self.locks.lock_path(canonical).await
+    /// it.
+    pub(crate) fn confined_to(&self, cwd: &SharedCwd) -> Option<Vec<PathBuf>> {
+        self.confined_to_at(self.permission.get(), cwd)
     }
 
-    pub(crate) fn confined_to(&self, cwd: &SharedCwd) -> Option<Vec<PathBuf>> {
+    /// [`Self::confined_to`] at a level the caller has already read, for a door that has judged the
+    /// call at that level and must not re-read the handle to find a different one.
+    fn confined_to_at(
+        &self,
+        level: crate::permission::Permission,
+        cwd: &SharedCwd,
+    ) -> Option<Vec<PathBuf>> {
         if self.denied {
             return Some(Vec::new());
         }
-        match self.permission.get() {
+        match level {
             // Only the level that disclaims a boundary is exempt. Written as an allow-list rather
             // than `Workspace => Some(..), _ => None`, because that catch-all fails open: `none`
             // and `read` normally never reach a write door, but `[tools.tool_permissions]`
@@ -728,18 +770,31 @@ impl WriteScope {
     /// it cannot (a path being created). Both are checked the same way; the difference is only in
     /// how much the caller has been able to resolve.
     pub(crate) fn admit(&self, cwd: &SharedCwd, target: &std::path::Path) -> Result<(), String> {
-        self.admit_with_private(cwd, target, &private_directories())
+        self.admit_at(self.permission.get(), cwd, target)
     }
 
-    /// [`Self::admit`] with meka's private directories taken as a parameter, so the refusal can be
-    /// tested without the environment deciding where those are.
+    /// [`Self::admit`] at a level the caller has already read. The approval door asks this with the
+    /// level it admitted the call at, so the refusal it reports ahead of the prompt is the one the
+    /// write would meet, not one read off the handle a moment later.
+    pub(crate) fn admit_at(
+        &self,
+        level: crate::permission::Permission,
+        cwd: &SharedCwd,
+        target: &std::path::Path,
+    ) -> Result<(), String> {
+        self.admit_with_private(level, cwd, target, &private_directories())
+    }
+
+    /// [`Self::admit_at`] with meka's private directories taken as a parameter, so the refusal can
+    /// be tested without the environment deciding where those are.
     fn admit_with_private(
         &self,
+        level: crate::permission::Permission,
         cwd: &SharedCwd,
         target: &std::path::Path,
         private: &[PathBuf],
     ) -> Result<(), String> {
-        let Some(roots) = self.confined_to(cwd) else {
+        let Some(roots) = self.confined_to_at(level, cwd) else {
             return Ok(());
         };
         let candidate = normalize_lexically(target);
@@ -777,7 +832,7 @@ impl WriteScope {
             )
         };
         Err(format!(
-            "'{}' is outside the workspace: at `workspace` permission {}. Pick a path inside, or \
+            "'{}' is outside the workspace: below `unrestricted` {}. Pick a path inside, or \
              ask the user for `unrestricted` if it genuinely belongs elsewhere.",
             target.display(),
             where_to
@@ -1094,6 +1149,41 @@ mod tests {
         ));
     }
 
+    /// A private directory is one that exists, is a directory, and is not already a system mask.
+    /// The last case is the one the capture directory produces when it falls back to the temp
+    /// directory: taking `/tmp` as private would mask every working directory under it.
+    #[test]
+    fn a_private_directory_is_an_existing_directory_that_is_not_a_system_mask() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let kept = canonical_for_test(temp.path());
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"x").expect("write");
+        let mut candidates = vec![temp.path().to_path_buf(), temp.path().join("missing"), file];
+        // `cfg!` rather than `#[cfg]`, so the binding is mutated on every platform and Windows
+        // does not see an unused `mut`.
+        if cfg!(unix) {
+            candidates.push(PathBuf::from("/tmp"));
+        }
+
+        assert_eq!(private_directories_among(candidates), vec![kept]);
+    }
+
+    /// A released lock is pruned on the next acquisition and a held one is not, so the map is
+    /// bounded by the files being written concurrently rather than by every file ever touched.
+    #[tokio::test]
+    async fn a_released_write_lock_is_pruned_and_a_held_one_is_kept() {
+        let locks = WriteLocks::default();
+        let held = locks.lock_path(Path::new("/held")).await;
+        let released = locks.lock_path(Path::new("/released")).await;
+        drop(released);
+        let _next = locks.lock_path(Path::new("/next")).await;
+
+        let mut keys: Vec<PathBuf> = crate::sync::lock(&locks.by_path).keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, [PathBuf::from("/held"), PathBuf::from("/next")]);
+        drop(held);
+    }
+
     /// The read door is the write fence's twin: below `unrestricted` nothing under meka's own
     /// directories is readable, whatever roots the session holds. Without it a session at `read`,
     /// the level whose contract is "cannot change the machine", read the credential store.
@@ -1139,19 +1229,20 @@ mod tests {
             WriteLocks::default(),
         );
         let private = vec![store.clone()];
+        let level = crate::permission::Permission::Workspace;
         assert!(
             scope
-                .admit_with_private(&cwd, &root.join("notes.txt"), &private)
+                .admit_with_private(level, &cwd, &root.join("notes.txt"), &private)
                 .is_ok(),
             "a path beside the store is still inside the workspace"
         );
         let refusal = scope
-            .admit_with_private(&cwd, &store.join("config.toml"), &private)
+            .admit_with_private(level, &cwd, &store.join("config.toml"), &private)
             .expect_err("a path inside the store is refused although the root contains it");
         assert!(refusal.contains("meka's own directory"), "{refusal}");
         assert!(
             scope
-                .admit_with_private(&cwd, &store.join("config.toml"), &[])
+                .admit_with_private(level, &cwd, &store.join("config.toml"), &[])
                 .is_ok(),
             "the refusal is the private list's doing, not the root's"
         );

@@ -622,7 +622,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                             .collect();
                         kept.push(ToolResultContent::Text {
                             text: format!(
-                                "{HARNESS_NOTE} The provider refused this tool result, so its \
+                                "{HARNESS_NOTE} The provider rejected this tool result, so its \
                                  non-text content was removed to keep the conversation usable: \
                                  {reason}. Do not repeat this call unchanged."
                             ),
@@ -631,7 +631,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                             tool_use_id: tool_use_id.clone(),
                             content: kept,
                             // Whatever the call actually reported: `read_file` returned the image
-                            // it was asked for and the provider refused the request carrying it,
+                            // it was asked for and the provider rejected the request carrying it,
                             // so flagging the call as failed would teach the model the wrong
                             // lesson; the note above carries the real instruction. Carried rather
                             // than hardcoded to `false` because a tool can fail and return
@@ -647,7 +647,7 @@ pub(super) fn strip_non_text_content(messages: &[Message], reason: &str) -> Opti
                         ContentBlock::Text {
                             text: format!(
                                 "{HARNESS_NOTE} An image attached to this message was removed \
-                                 because the provider refused it: {reason}."
+                                 because the provider rejected it: {reason}."
                             ),
                         }
                     }
@@ -743,10 +743,10 @@ pub(super) fn neutralize_tool_exchanges(
                             tool_use_id: tool_use_id.clone(),
                             content: vec![ToolResultContent::Text {
                                 text: format!(
-                                    "{HARNESS_NOTE} The provider refused the request carrying this \
-                                     call, so its arguments and result were removed to keep the \
-                                     conversation usable.{call} The provider said: {reason}. Do not repeat \
-                                     this call unchanged."
+                                    "{HARNESS_NOTE} The provider rejected the request carrying \
+                                     this call, so its arguments and result were removed to keep \
+                                     the conversation usable.{call} The provider said: {reason}. \
+                                     Do not repeat this call unchanged."
                                 ),
                             }],
                             is_error: true,
@@ -1456,7 +1456,7 @@ mod tests {
                 assert_eq!(tool_use_id, "call_1", "the pairing must survive");
                 assert!(
                     !is_error,
-                    "the tool succeeded; the provider refused the request carrying its result, and \
+                    "the tool succeeded; the provider rejected the request carrying its result, and \
                      flagging the call as failed teaches the model the wrong lesson. The harness \
                      note in `content` carries the real instruction. Tier 2 sets it and is right \
                      to: there the call and its result are both gone."

@@ -19,6 +19,18 @@ use crate::{
     store::Store,
 };
 
+/// Say how a turn, or a `/compact`, ended when it did not succeed.
+///
+/// An interrupt is the user's own act, so it is annotated the way every turn-running host annotates
+/// one rather than reported as an error. One place for the three commands here that run provider
+/// calls, so `/compact` cannot drift from `/skill` and `/mcp <server>:<prompt>` again.
+fn report_failure(console: &std::sync::Mutex<crate::console::Console>, error: &error::MekaError) {
+    with_console(console, |console| match error {
+        error::MekaError::Interrupted => console.annotation("interrupted"),
+        error => console.error(error),
+    });
+}
+
 /// What the host loop does once a command has been answered.
 ///
 /// A return value rather than a `break` inside the arm, because the dispatcher sits outside the
@@ -104,15 +116,13 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         console.hint(&render::compaction_summary(&outcome))
                     });
                 }
-                Err(error) => {
-                    with_console(console, |console| console.error(&error));
-                }
+                Err(error) => report_failure(console, &error),
             }
         }
         SlashCommand::RewindInvalid(argument) => {
             with_console(console, |console| {
                 console.error(&format!(
-                    "/rewind takes a turn count of 1 or more, not {argument:?}"
+                    "/rewind takes a turn count of 1 or more, not '{argument}'"
                 ))
             });
         }
@@ -266,6 +276,19 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 Err(error) => with_console(console, |console| console.error(&error)),
             }
         }
+        SlashCommand::McpMissingServer { verb } => {
+            with_console(console, |console| {
+                console.error(&format!("/mcp {verb} takes a server name"))
+            });
+        }
+        SlashCommand::McpUnknownVerb { verb } => {
+            with_console(console, |console| {
+                console.error(&format!(
+                    "'{verb}' is not an `/mcp` verb: `/mcp` takes {} or <server>:<prompt>",
+                    repl::MCP_SUBCOMMANDS.join(", ")
+                ))
+            });
+        }
         SlashCommand::McpPrompt {
             server,
             prompt: prompt_name,
@@ -366,10 +389,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         .await
                         {
                             Ok(_) => {}
-                            Err(error::MekaError::Interrupted) => {
-                                with_console(console, |console| console.annotation("interrupted"));
-                            }
-                            Err(error) => with_console(console, |console| console.error(&error)),
+                            Err(error) => report_failure(console, &error),
                         }
                     }
                 }
@@ -537,10 +557,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             .await
             {
                 Ok(_) => {}
-                Err(error::MekaError::Interrupted) => {
-                    with_console(console, |console| console.annotation("interrupted"));
-                }
-                Err(error) => with_console(console, |console| console.error(&error)),
+                Err(error) => report_failure(console, &error),
             }
         }
         SlashCommand::Status => {
@@ -558,10 +575,10 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             Err(error) => with_console(console, |console| console.error(&error)),
         },
         SlashCommand::History(limit) => {
-            let materialised = messages.as_slice();
+            let materialized = messages.as_slice();
             let slice = match limit {
-                Some(n) => render::last_n_turns(materialised, n),
-                None => materialised,
+                Some(n) => render::last_n_turns(materialized, n),
+                None => materialized,
             };
             // Say so rather than printing nothing, like every other list command
             // (`/tasks`, `/memory`, `/skill`). Silence here would be ambiguous between
@@ -573,7 +590,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 slice,
                 &crate::host::terminal::history_render_options(config),
             ) {
-                if materialised.is_empty() {
+                if materialized.is_empty() {
                     crate::streams::write_stderr_line("No conversation history yet.");
                 } else {
                     crate::streams::write_stderr_line("Nothing to show.");
@@ -668,6 +685,16 @@ pub(crate) enum SlashCommand {
     McpLogout {
         server: String,
     },
+    /// `/mcp reconnect`, `/mcp login` or `/mcp logout` typed without the server it acts on.
+    /// Refused by name rather than as an unknown command: the command is known, its argument is
+    /// missing.
+    McpMissingServer {
+        verb: String,
+    },
+    /// `/mcp <word>` where the word is neither a verb nor a `<server>:<prompt>` spec.
+    McpUnknownVerb {
+        verb: String,
+    },
     /// `/memory` (no argument): list saved memories, most important first.
     MemoryList,
     ScheduleList,
@@ -723,7 +750,7 @@ pub(crate) enum SlashCommand {
     /// and reported that count, which the user had not asked for.
     RewindInvalid(String),
     /// `/history [N]`: reprint past conversation in REPL style. Bare `/history` dumps every
-    /// materialised message; `/history N` shows the last `N` turns (turn = user prompt + the agent
+    /// materialized message; `/history N` shows the last `N` turns (turn = user prompt + the agent
     /// work it triggered). Any non-numeric argument (e.g. `all`) falls back to the dump-everything
     /// path.
     History(Option<usize>),
@@ -761,6 +788,8 @@ impl SlashCommand {
             SlashCommand::McpList => Answerer::Host,
             SlashCommand::McpLogin { .. } => Answerer::Host,
             SlashCommand::McpLogout { .. } => Answerer::Host,
+            SlashCommand::McpMissingServer { .. } => Answerer::Host,
+            SlashCommand::McpUnknownVerb { .. } => Answerer::Host,
             SlashCommand::McpPrompt { .. } => Answerer::Host,
             SlashCommand::McpReconnect { .. } => Answerer::Host,
             SlashCommand::MemoryList => Answerer::Host,
@@ -809,7 +838,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "export" => Some(SlashCommand::Export),
         "fork" => Some(SlashCommand::Fork),
         "cd" => Some(SlashCommand::Cd(argument)),
-        "mcp" => parse_mcp_slash(argument.as_deref().unwrap_or("")),
+        "mcp" => Some(parse_mcp_slash(argument.as_deref().unwrap_or(""))),
         "skill" => Some(parse_skill_slash(argument.as_deref().unwrap_or(""))),
         "status" => Some(SlashCommand::Status),
         "usage" => Some(SlashCommand::Usage),
@@ -894,51 +923,56 @@ pub(super) fn parse_skill_slash(rest: &str) -> SlashCommand {
     SlashCommand::SkillInvoke { name, extra }
 }
 /// Parse the argument to `/mcp …`.
-pub(super) fn parse_mcp_slash(rest: &str) -> Option<SlashCommand> {
+///
+/// Every shape parses to a command, so nothing here falls through to "Unknown command": a verb
+/// typed without its server name and a first word that is neither a verb nor a `<server>:<prompt>`
+/// spec are answered as what they are, an `/mcp` the user has to finish.
+pub(super) fn parse_mcp_slash(rest: &str) -> SlashCommand {
     let rest = rest.trim();
     if rest.is_empty() || rest == "list" {
-        return Some(SlashCommand::McpList);
+        return SlashCommand::McpList;
     }
-    // `<subcommand> <server>` shapes. Reject bare `reconnect` / `login` / `logout` with no server
-    // argument so users see the "Unknown command" error instead of silently firing against no
-    // target.
-    type McpServerCtor = fn(String) -> SlashCommand;
-    fn mk_reconnect(s: String) -> SlashCommand {
-        SlashCommand::McpReconnect { server: s }
-    }
-    fn mk_login(s: String) -> SlashCommand {
-        SlashCommand::McpLogin { server: s }
-    }
-    fn mk_logout(s: String) -> SlashCommand {
-        SlashCommand::McpLogout { server: s }
-    }
-    let subcommands: [(&str, McpServerCtor); 3] = [
-        ("reconnect ", mk_reconnect),
-        ("login ", mk_login),
-        ("logout ", mk_logout),
-    ];
-    for (keyword, ctor) in subcommands {
-        if let Some(server) = rest.strip_prefix(keyword) {
-            let server = server.trim();
-            if server.is_empty() {
-                return None;
+    let (verb, argument) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(verb, argument)| (verb, argument.trim()));
+    let with_server: Option<fn(String) -> SlashCommand> = match verb {
+        "reconnect" => Some(|server| SlashCommand::McpReconnect { server }),
+        "login" => Some(|server| SlashCommand::McpLogin { server }),
+        "logout" => Some(|server| SlashCommand::McpLogout { server }),
+        _ => None,
+    };
+    if let Some(build) = with_server {
+        return if argument.is_empty() {
+            SlashCommand::McpMissingServer {
+                verb: verb.to_string(),
             }
-            return Some(ctor(server.to_string()));
-        }
+        } else {
+            build(argument.to_string())
+        };
     }
-    // `<server>:<prompt> [args...]`: the first token is the prompt spec.
-    let mut parts = rest.split_whitespace();
-    let spec = parts.next()?;
-    let (server, prompt) = spec.split_once(':')?;
-    if server.is_empty() || prompt.is_empty() {
-        return None;
+    // `<server>:<prompt> [args...]`: the first word is the prompt spec.
+    if let Some((server, prompt)) = verb.split_once(':')
+        && !server.is_empty()
+        && !prompt.is_empty()
+    {
+        return SlashCommand::McpPrompt {
+            server: server.to_string(),
+            prompt: prompt.to_string(),
+            args: argument.split_whitespace().map(str::to_string).collect(),
+        };
     }
-    let args = parts.map(str::to_string).collect();
-    Some(SlashCommand::McpPrompt {
-        server: server.to_string(),
-        prompt: prompt.to_string(),
-        args,
-    })
+    SlashCommand::McpUnknownVerb {
+        verb: verb.to_string(),
+    }
+}
+/// The line for a slash command the REPL does not know. It names the command and only the command:
+/// `/frob a b` is refused as `/frob`, because the argument was never read.
+///
+/// Not the `unknown_name` template: listing every slash command on one line is noise, and `/help`
+/// already is the list.
+pub(crate) fn unknown_command_message(line: &str) -> String {
+    let command = line.split(char::is_whitespace).next().unwrap_or(line);
+    format!("Unknown command: {command}. Type /help for available commands.")
 }
 pub(super) fn print_help() {
     crate::streams::write_stderr_line("Commands:");

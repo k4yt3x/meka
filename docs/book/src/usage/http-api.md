@@ -354,11 +354,11 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
 
 ### Detecting a rewritten history
 
-`GET /messages` returns the *materialized* view: what the model can currently see. Three things rewrite it rather than appending to it (compaction, `POST /rewind`, and a mid-turn repair of a malformed request), and after any of them your copy is no longer a prefix of the server's.
+`GET /messages` returns the *materialized* view: what the model can currently see. Four things rewrite it rather than appending to it (compaction, `POST /rewind`, a mid-turn repair of a malformed request, and the redaction of an image that no longer fit the request size budget), and after any of them your copy is no longer a prefix of the server's.
 
 Two signals cover this:
 
-- **`revision`** on the response increments on every rewrite. If it changed since your last poll, re-fetch rather than diff. This is the one to key on, because it covers all three causes.
+- **`revision`** on the response increments on every rewrite. If it changed since your last poll, re-fetch rather than diff. This is the one to key on, because it covers all four causes.
 - **`compaction`** on a message identifies a summary and says how many messages it replaced and which compaction it was. Only compaction leaves a message behind to carry it; a rewind removes messages with nothing in their place, which is why `revision` exists.
 
 `total` alone is not enough: a shrinking `total` is indistinguishable from the server losing your conversation.
@@ -455,7 +455,7 @@ Key fields:
 - **`messages`**: structured message array for clients that want richer rendering.
 - **`tool_calls`**: every tool the agent called during the turn, with inputs and outputs.
 - **`stop_reason`**: `end_turn`, `max_tokens`, or `refusal`.
-- **`notices`**: provider advisories and auto-deny warnings.
+- **`notices`**: provider advisories and warnings about approvals refused without asking.
 - **`refusal_text`**: present only when `stop_reason` is `"refusal"`.
 
 ## Streaming response
@@ -643,11 +643,11 @@ Possible outcomes:
 
 ### Approvals with blocking turns
 
-When `stream: false` and approvals are on, there is no SSE channel for permission prompts. The agent runs the turn with tool permissions **auto-denied**; each denied tool appends a `notice` to the response saying so and pointing at `stream: true`.
+When `stream: false` and approvals are on, there is no SSE channel for permission prompts. Every call that would need approval is **refused without asking**; each refused tool appends a `notice` to the response saying so and pointing at `stream: true`.
 
 **MCP elicitations** (interactive form prompts from MCP servers) are always auto-declined over HTTP; there is no channel for interactive input. A `notice` event is emitted when this happens.
 
-**Recommendation:** non-interactive callers (bots, bridges, scripts) should leave approvals off and create sessions at the level they need, so auto-deny never triggers. Use `stream: true` with approvals on if you need approval flow.
+**Recommendation:** non-interactive callers (bots, bridges, scripts) should leave approvals off and create sessions at the level they need, so nothing is refused without asking. Use `stream: true` with approvals on if you need approval flow.
 
 ## Authentication
 
@@ -817,7 +817,7 @@ These endpoints help clients inspect the server's capabilities at runtime.
 |----------|------|-------------|
 | `GET /v1/health/live` | None | Liveness probe: 200 if the process is up |
 | `GET /v1/health/ready` | None | Readiness probe: 200 if the store is healthy, at least one profile is configured, and no `required` MCP server has failed. A failed *optional* server doesn't affect readiness, since it can't stop a turn either. Returns `status`, `session_db`, `profile_configured`, and `mcp_servers_healthy` (boolean, no server names). **`profile_configured` means a profile exists in `config.toml`, not that it has a usable credential**: a profile's credential is checked when a session first needs it, so a server can be ready and still answer 422 to `POST /v1/sessions`. |
-| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend`, `model` (omitted when the profile names none) and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
+| `GET /v1/profiles` | Any read scope | Configured profiles, as `{"profiles": [...]}`. Each carries `name`, `account`, `backend` (omitted when the profile names an account that is not configured), `model` (omitted when the profile names none) and `active: true` on the one a session gets when it names none. Read-only; profiles come from `config.toml` |
 | `GET /v1/info` | Any read scope | Server version and permission surface. `vision` reports whether the *default* profile accepts [image attachments](#image-attachments); a session on another profile follows that one. Carries no profile or model: `GET /v1/profiles` reports both per profile and marks the default with `active` |
 | `GET /v1/skills` | Any read scope | Installed skills |
 | `GET /v1/mcp` | Any read scope | MCP server connection status |

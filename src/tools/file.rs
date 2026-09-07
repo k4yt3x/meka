@@ -190,6 +190,43 @@ async fn resolve_existing_prefix(path: &Path) -> std::path::PathBuf {
     out
 }
 
+/// The spelling of `path` the write fence judges: resolved against `cwd`, with every component
+/// that exists canonicalized.
+///
+/// Judging the lexical form alone is not enough: `admit` normalizes `.` and `..` as text while
+/// `create_dir_all` hands the path to the kernel, which follows symlinks, so with `<root>/L -> /`
+/// (`MAKE_SYM` is granted beneath every workspace root) a write to `<root>/L/home/you/.config/x`
+/// would pass and create that entire directory chain at the real `/home/you/...` before the
+/// canonical `admit` refused the file. After this, the existing prefix contains no unresolved
+/// symlink, and the components that do not exist yet cannot contain one either.
+async fn resolve_for_fence(cwd: &crate::workspace::SharedCwd, path: &str) -> std::path::PathBuf {
+    resolve_existing_prefix(&crate::workspace::resolve_against_cwd(cwd, path)).await
+}
+
+/// The refusal the write fence would give a create-or-overwrite of `input["path"]` at `level`,
+/// worded as [`resolve_write_target`] words it, or `None` when the write may land or the input
+/// names no path for `execute` to report.
+///
+/// Answers [`Tool::refusal_at_level`] for `write_file` and `scratchpad_save_file`, the two tools
+/// that resolve through `resolve_write_target`, so the approval door never asks about a write the
+/// fence refuses however the user answers: an approved call runs at the level, and below
+/// `unrestricted` the fence confines it to the workspace roots.
+pub(super) async fn write_fence_refusal(
+    tool_name: &str,
+    cwd: &crate::workspace::SharedCwd,
+    scope: &crate::workspace::WriteScope,
+    level: Permission,
+    input: &serde_json::Value,
+) -> Option<ToolOutput> {
+    let path = input["path"].as_str()?;
+    let file_path = resolve_for_fence(cwd, path).await;
+    let refusal = scope.admit_at(level, cwd, &file_path).err()?;
+    Some(ToolOutput::from_error(&MekaError::ToolExecution {
+        tool_name: tool_name.to_string(),
+        message: refusal,
+    }))
+}
+
 /// Resolve `path` to the file a write will land on, and take that file's write lock.
 ///
 /// Shared by `write_file` and `scratchpad_save_file` because they must agree on both answers: both
@@ -210,16 +247,7 @@ pub(super) async fn resolve_write_target(
     scope: &crate::workspace::WriteScope,
     path: &str,
 ) -> Result<(std::path::PathBuf, tokio::sync::OwnedMutexGuard<()>)> {
-    let file_path = crate::workspace::resolve_against_cwd(cwd, path);
-
-    // Every component that exists is resolved before the boundary is judged. Judging the lexical
-    // form alone is not enough: `admit` normalizes `.` and `..` as text while `create_dir_all`
-    // hands the path to the kernel, which follows symlinks, so with `<root>/L -> /` (`MAKE_SYM` is
-    // granted beneath every workspace root) a write to `<root>/L/home/you/.config/x` would pass
-    // and create that entire directory chain at the real `/home/you/...` before the canonical
-    // `admit` refused the file. After this, the existing prefix contains no unresolved symlink,
-    // and the components that do not exist yet cannot contain one either.
-    let file_path = resolve_existing_prefix(&file_path).await;
+    let file_path = resolve_for_fence(cwd, path).await;
 
     // Judged before `create_dir_all` below. Left until after canonicalization, a refused write to
     // `/etc/foo/bar/baz.txt` would already have created `/etc/foo/bar` on its way to being refused.
@@ -681,8 +709,8 @@ async fn publish_temp_over(temp_path: &Path, path: &Path) -> std::io::Result<()>
         }
         return tokio::fs::rename(temp_path, path).await.map_err(|rescue| {
             std::io::Error::other(format!(
-                "could not replace '{}' ({error}), and the file is no longer there; the new \
-                 content is in '{}' and could not be moved into place either ({rescue})",
+                "failed to replace '{}' ({error}), and the file is no longer there; the new \
+                 content is in '{}' and also failed to move into place ({rescue})",
                 path.display(),
                 temp_path.display()
             ))
@@ -1275,6 +1303,23 @@ impl Tool for EditFileTool {
         Permission::Workspace
     }
 
+    /// The fence below judges the canonical target, so the answer here is the same one: a file
+    /// that does not resolve is left for `execute` to report, since that is not the level's doing.
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        input: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        let path = input["path"].as_str()?;
+        let resolved = crate::workspace::resolve_against_cwd(&self.site.cwd, path);
+        let canonical = canonicalize_for_tool("edit_file", &resolved).await.ok()?;
+        let refusal = self
+            .scope
+            .admit_at(level, &self.site.cwd, &canonical)
+            .err()?;
+        Some(ToolOutput::text(refusal, true))
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -1598,6 +1643,14 @@ impl Tool for WriteFileTool {
     /// that write a path the user named.
     fn required_permission(&self) -> Permission {
         Permission::Workspace
+    }
+
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        input: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        write_fence_refusal("write_file", &self.site.cwd, &self.scope, level, input).await
     }
 
     async fn execute(
@@ -5245,6 +5298,108 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&inside).expect("read back"),
             "payload"
+        );
+    }
+
+    /// A write outside the roots at `read` is refused however the user answers: an approved call
+    /// runs at the level, and below `unrestricted` the fence confines it. The tool says so ahead of
+    /// the approval prompt, in the fence's own words, and says nothing about a write the fence
+    /// would admit, which is the one worth asking about. Stating a refusal writes nothing.
+    #[tokio::test]
+    async fn a_write_the_fence_refuses_at_the_level_is_stated_ahead_of_the_prompt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = crate::workspace::canonical_for_test(temp.path());
+        let work = base.join("work");
+        std::fs::create_dir(&work).expect("work");
+        let tool = WriteFileTool {
+            scope: crate::workspace::WriteScope::confined(vec![work.clone()]),
+            read_tracker: tracker_for_test(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::SharedCwd::new(work.clone())),
+        };
+        let outside = base.join("escaped.txt");
+        let inside = work.join("allowed.txt");
+        let write_to = |path: &std::path::Path| {
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "content": "payload",
+            })
+        };
+
+        let refusal = tool
+            .refusal_at_level(Permission::Read, &write_to(&outside))
+            .await
+            .expect("a write outside every root is refused at `read`");
+        assert!(refusal.is_error);
+        assert!(
+            refusal.text_content().contains("outside the workspace"),
+            "{}",
+            refusal.text_content()
+        );
+        assert!(
+            tool.refusal_at_level(Permission::Unrestricted, &write_to(&outside))
+                .await
+                .is_none(),
+            "`unrestricted` disclaims the boundary"
+        );
+        assert!(
+            tool.refusal_at_level(Permission::Read, &write_to(&inside))
+                .await
+                .is_none(),
+            "a write the fence admits is the approval prompt's to decide"
+        );
+        assert!(
+            !outside.exists() && !inside.exists(),
+            "stating a refusal must not write"
+        );
+    }
+
+    /// The same for `edit_file`, whose fence judges the canonical existing target. A target that
+    /// does not resolve is not the level's refusal to make, so the tool says nothing about it.
+    #[tokio::test]
+    async fn an_edit_the_fence_refuses_at_the_level_is_stated_ahead_of_the_prompt() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = crate::workspace::canonical_for_test(temp.path());
+        let work = base.join("work");
+        std::fs::create_dir(&work).expect("work");
+        let inside = work.join("inside.txt");
+        let outside = base.join("outside.txt");
+        std::fs::write(&inside, "alpha\n").expect("inside");
+        std::fs::write(&outside, "alpha\n").expect("outside");
+        let tool = EditFileTool {
+            scope: crate::workspace::WriteScope::confined(vec![work.clone()]),
+            read_tracker: tracker_for_test(),
+            site: crate::session::ToolSite::for_test()
+                .with_cwd(crate::workspace::SharedCwd::new(work.clone())),
+        };
+        let edit = |path: &std::path::Path| {
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "old_string": "alpha",
+                "new_string": "BETA",
+            })
+        };
+
+        let refusal = tool
+            .refusal_at_level(Permission::Read, &edit(&outside))
+            .await
+            .expect("an edit outside every root is refused at `read`");
+        assert!(refusal.is_error);
+        assert!(
+            tool.refusal_at_level(Permission::Read, &edit(&inside))
+                .await
+                .is_none()
+        );
+        assert!(
+            tool.refusal_at_level(Permission::Read, &edit(&base.join("missing.txt")))
+                .await
+                .is_none(),
+            "a missing file is `execute`'s to report"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside"),
+            "alpha\n",
+            "stating a refusal must not edit"
         );
     }
 

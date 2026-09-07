@@ -2596,7 +2596,7 @@ fn acp_terminal_capable_client_gets_an_agent_owned_terminal() {
         "an empty append is a wasted notification; got {chunks:?}",
     );
 
-    // The real exit code, not a synthesised 1: a terminal shows the status, and 7 is only
+    // The real exit code, not a synthesized 1: a terminal shows the status, and 7 is only
     // available because the shell tool reports it structurally.
     let exits = for_call("terminal_exit");
     assert_eq!(exits.len(), 1, "expected exactly one terminal_exit");

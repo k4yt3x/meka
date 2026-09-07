@@ -149,8 +149,8 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
     let busy = entry.mark_busy();
     if let Err(error) = hooks.prepare(&entry).await {
         tracing::warn!(
-            "scheduled job {job_id} did not run: its session's profile did not resolve; move the \
-             session with `meka -r <id> --profile <name>`: {error}"
+            "scheduled job {job_id} did not run: its session's profile did not resolve \
+             ({error}); move it with `meka -r <id> --profile <name>`"
         );
         return FireOutcome::Unrunnable;
     }
@@ -179,8 +179,8 @@ pub(crate) async fn run_wakeup<H: HostHooks>(hooks: &H, wakeup: Wakeup) -> FireO
         // this turn regardless and the refusal is logged, as `submit_turn` logs its own.
         if !hooks.announce(&riding).await {
             tracing::warn!(
-                "scheduled job {job_id} carries {outcomes} background outcome(s) a delivery \
-                 webhook refused; delivering them anyway, since they are claimed",
+                "scheduled job {job_id} carries {outcomes} background outcome(s) a webhook \
+                 rejected; delivering them anyway, since they are claimed",
                 outcomes = riding.len()
             );
         }

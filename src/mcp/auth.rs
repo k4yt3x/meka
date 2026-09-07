@@ -1205,7 +1205,7 @@ impl CredentialStore for SqliteCredentialStore {
                 Ok(None)
             }
             Err(error) => Err(AuthError::InternalError(format!(
-                "failed to load credentials from database: {error}"
+                "failed to load credentials from the store: {error}"
             ))),
         }
     }
@@ -1222,7 +1222,7 @@ impl CredentialStore for SqliteCredentialStore {
                 .await
                 .map_err(|error| {
                     AuthError::InternalError(format!(
-                        "failed to save credentials to database: {error}"
+                        "failed to save credentials to the store: {error}"
                     ))
                 })?,
             LastRead::Nothing => {
@@ -1235,7 +1235,7 @@ impl CredentialStore for SqliteCredentialStore {
                     .await
                     .map_err(|error| {
                         AuthError::InternalError(format!(
-                            "failed to save credentials to database: {error}"
+                            "failed to save credentials to the store: {error}"
                         ))
                     })?;
                 true
@@ -1288,7 +1288,7 @@ impl CredentialStore for SqliteCredentialStore {
             .await
             .map_err(|error| {
                 AuthError::InternalError(format!(
-                    "failed to clear credentials from database: {error}"
+                    "failed to clear credentials from the store: {error}"
                 ))
             })
     }

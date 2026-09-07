@@ -267,6 +267,8 @@ the level, it is recorded on the session and comes back on a resume.
 does not widen reach. An approved `write_file` at `read` lands only under the workspace roots, and
 an approved `execute_command` at `read` runs in the read-only sandbox. To let an approved call reach
 further, raise the level. At `unrestricted` nothing sits above the level, so nothing is ever asked.
+A call the level refuses however you answer is refused without a prompt: a write outside the
+workspace roots, or `execute_command` below `unrestricted` when nothing can sandbox it.
 
 `none` with approvals on is the most cautious shape: every tool call is put to you, and nothing runs
 unattended. Sub-agents share their parent's switch, and their prompts are forwarded to the parent's

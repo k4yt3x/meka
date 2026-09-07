@@ -908,10 +908,7 @@ pub(crate) fn parse_skill_definition(
     let extra = frontmatter.extra;
     let mut metadata = frontmatter.metadata;
     if metadata.as_ref().is_some_and(|value| !value.is_mapping()) {
-        tracing::warn!(
-            "skill '{name}' has a 'metadata' that is not a map; keeping it verbatim, but the spec \
-             describes a map of string to string and other clients may read it differently"
-        );
+        tracing::warn!("skill '{name}' has a `metadata` that is not a map; keeping it verbatim");
     }
     let priority_raw = take_priority(&mut metadata, name);
     canonicalize_empty_metadata(&mut metadata);

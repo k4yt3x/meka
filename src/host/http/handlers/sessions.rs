@@ -659,7 +659,7 @@ async fn roll_back_fork(state: &ServerState, forked: Uuid) {
         .await
     {
         tracing::warn!(
-            "failed to roll back fork {forked} after its runtime could not be built: {error}"
+            "failed to roll back fork {forked} after its runtime failed to build: {error}"
         );
     }
 }

@@ -898,7 +898,7 @@ fn the_long_lived_hosts_refuse_the_flags_that_name_one_session() {
                 flag.join(" ")
             );
             assert!(
-                stderr.contains(flag[0]) && stderr.contains("creates a session per request"),
+                stderr.contains(flag[0]) && stderr.contains("does not take"),
                 "meka {} {host} must say why: {stderr}",
                 flag.join(" ")
             );
@@ -1096,7 +1096,93 @@ fn format_without_oneshot_is_refused() {
     let output = run_scripted(&install, &["--format", "json", "-p", "hi"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--format applies to --oneshot"), "{stderr}");
+    assert!(stderr.contains("`--format` needs `--oneshot`"), "{stderr}");
+}
+
+/// Ctrl+C ends a one-shot run with 130, as it ends every other host, not with 0 over a partial
+/// answer; under `--format json` the report still goes out, and says `interrupted`.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_oneshot_run_exits_130_and_still_reports_under_json() {
+    let install = Install::new();
+    write_provider_config(&install, "mock", &["mock"]);
+    install.write_script(
+        r#"[[{"type":"text","text":"starting"},
+            {"type":"sleep","ms":30000},
+            {"type":"text","text":"never reached"},
+            {"type":"message_end","stop_reason":"end_turn"}]]"#,
+    );
+    let child = install
+        .meka(&["--oneshot", "--format", "json", "-p", "slow"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn meka");
+    // The row is written as the turn begins, after the interrupt handler is installed, so it is
+    // the signal that a SIGINT now lands on a live turn rather than on a process still starting.
+    support::wait_until(
+        "the session row",
+        std::time::Duration::from_secs(20),
+        || {
+            install.database().exists()
+                && store(&install)
+                    .query_row("SELECT count(*) FROM sessions", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .is_ok_and(|rows| rows > 0)
+        },
+    );
+    // SAFETY: `child.id()` is a live process this test spawned and still owns.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    let output = child.wait_with_output().expect("wait for meka");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "an interrupted run exits like an interrupted REPL: {stderr}"
+    );
+    assert!(stderr.contains("(interrupted)"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("one object on stdout ({error}): {stdout:?}"));
+    assert_eq!(report["stop_reason"], "interrupted");
+    assert_eq!(
+        report["text"], "starting",
+        "what streamed before the press is reported"
+    );
+}
+
+/// `[display].show_session_id_on_create` holds under `--format json`: the id line goes to stderr,
+/// and stdout is still the one object.
+#[test]
+fn a_json_oneshot_run_prints_the_new_session_id_on_stderr_when_asked() {
+    let install = Install::new();
+    write_provider_config(&install, "mock", &["mock"]);
+    let config_path = install.config_dir().join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).expect("read config.toml");
+    config.push_str(
+        "\n[display]\nshow_session_id_on_create = true\nshow_session_id_on_exit = false\n",
+    );
+    install.write_config(&config);
+    let output = run_scripted(&install, &["--oneshot", "--format", "json", "-p", "hi"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let id = only_session(&install);
+    assert!(
+        stderr.contains("Creating new session") && stderr.contains(&id),
+        "the id line is printed as the REPL prints it: {stderr:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "stdout is the report alone: {stdout:?}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one object");
+    assert_eq!(report["session_id"], id);
 }
 
 /// The store an isolated run left behind, read directly: what is being set up is a row shape no
@@ -1606,7 +1692,7 @@ fn a_resume_with_an_unconfigured_profile_is_refused_by_name() {
 /// End to end rather than at `set_profile_field`, because the unit test cannot see the last of
 /// those: a write that parses in isolation can still produce a file that fails at startup.
 #[test]
-fn provider_set_writes_the_key_and_leaves_a_config_the_next_run_can_start_on() {
+fn profile_set_writes_the_key_and_leaves_a_config_the_next_run_can_start_on() {
     let install = Install::new();
     write_provider_config(&install, "alpha", &["alpha"]);
 
@@ -1658,14 +1744,22 @@ fn provider_set_writes_the_key_and_leaves_a_config_the_next_run_can_start_on() {
         String::from_utf8_lossy(&turn.stderr)
     );
 
-    // And `--unset` returns the profile to stating nothing, which a later run then refuses by name
-    // rather than inventing a model for.
+    // And `--unset` on the model is refused: a profile stating no model cannot run, so the write
+    // door declines to produce one and the file keeps what it had.
     let unset = run_isolated(&install, &["profile", "set", "alpha", "model", "--unset"]);
-    assert!(unset.status.success(), "unset should succeed");
-    let cleared = std::fs::read_to_string(&config_path).expect("read config");
     assert!(
-        !cleared.contains("swapped-model"),
-        "the key is gone, not emptied: {cleared}"
+        !unset.status.success(),
+        "unsetting the model must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&unset.stderr);
+    assert!(
+        stderr.contains("model"),
+        "the refusal names the model: {stderr}"
+    );
+    let kept = std::fs::read_to_string(&config_path).expect("read config");
+    assert!(
+        kept.contains("model = \"swapped-model\""),
+        "a refused write leaves the file as it was: {kept}"
     );
 }
 

@@ -52,18 +52,18 @@ pub(crate) async fn run_serve(
     mcp_manager: Option<Arc<mcp::McpClientManager>>,
 ) -> anyhow::Result<()> {
     let mut serve = ResolvedServeConfig::resolve(config.serve.take())
-        .map_err(|error| anyhow::anyhow!("invalid [serve] config: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("invalid `[serve]` config: {error}"))?;
     if let Some(bind_override) = config.request.serve_bind_override.take() {
         serve.bind = bind_override;
     }
     if serve.tokens.is_empty() {
-        anyhow::bail!("[serve] has no tokens; add a `[[serve.tokens]]` entry with `scopes`");
+        anyhow::bail!("`[serve]` has no tokens; add a `[[serve.tokens]]` entry with `scopes`");
     }
     for token in &serve.tokens {
         if matches!(token.source, crate::host::http::config::TokenSource::Inline) {
             tracing::warn!(
                 description = token.description.as_deref().unwrap_or("(no description)"),
-                "inline plaintext token configured; prefer ${{ENV_VAR}} or token_file for production",
+                "inline plaintext token configured; use `${{ENV_VAR}}` or `token_file` instead",
             );
         }
     }

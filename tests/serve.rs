@@ -1950,10 +1950,16 @@ fn graceful_shutdown_waits_for_a_detached_turn_to_unwind() {
 #[test]
 fn mid_turn_permission_round_trips() {
     // Round 1: model asks to run write_file; round 2: after deny, model gives up.
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let write_path_text = workspace
+        .path()
+        .join("meka-test.txt")
+        .to_string_lossy()
+        .to_string();
     let script = serde_json::json!([
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
-            { "type": "tool_use_end", "input": {"path": "/tmp/meka-test.txt", "content": "x"} },
+            { "type": "tool_use_end", "input": {"path": &write_path_text, "content": "x"} },
             { "type": "message_end", "stop_reason": "tool_use" }
         ],
         [
@@ -1965,7 +1971,7 @@ fn mid_turn_permission_round_trips() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "cwd": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -2033,7 +2039,7 @@ fn mid_turn_permission_round_trips() {
                 assert_eq!(payload["tool_name"], "write_file", "{payload}");
                 assert_eq!(
                     payload["input"],
-                    serde_json::json!({"path": "/tmp/meka-test.txt", "content": "x"}),
+                    serde_json::json!({"path": write_path_text, "content": "x"}),
                     "every argument of the call rides on the event: {payload}"
                 );
                 assert_eq!(
@@ -3264,11 +3270,12 @@ fn the_turn_failed_payload_tells_a_transient_failure_from_a_permanent_one() {
 /// and the turn proceeds to completion.
 #[test]
 fn permission_allow_outcome_resumes_turn() {
+    let workspace = tempfile::tempdir().expect("tempdir");
     let script = serde_json::json!([
         [
             { "type": "tool_use_start", "id": "tu_1", "name": "write_file" },
             { "type": "tool_use_end", "input": {
-                "path": std::env::temp_dir().join("meka-permission-allow-test.txt").to_string_lossy(),
+                "path": workspace.path().join("meka-permission-allow-test.txt").to_string_lossy(),
                 "content": "hello"
             } },
             { "type": "message_end", "stop_reason": "tool_use" }
@@ -3282,7 +3289,7 @@ fn permission_allow_outcome_resumes_turn() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "cwd": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -4483,7 +4490,8 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
     // Two tool_use rounds of the same write-tier tool + a terminal text round. `write_file`
     // is above `read`, so approvals gate it; `list_directory` would short-circuit as read-tier
     // without prompting and miss the point of the test.
-    let write_path = std::env::temp_dir().join("meka-test-sticky.txt");
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let write_path = workspace.path().join("meka-test-sticky.txt");
     let _ = std::fs::remove_file(&write_path);
     let script = serde_json::json!([
         [
@@ -4505,7 +4513,7 @@ fn sticky_allow_always_short_circuits_second_tool_call() {
     let create = harness
         .request(reqwest::Method::POST, "/v1/sessions")
         .json(&serde_json::json!({
-            "cwd": std::env::temp_dir().to_string_lossy(),
+            "cwd": workspace.path().to_string_lossy(),
             "permission": "read",
             "approvals": true,
         }))
@@ -4748,9 +4756,9 @@ fn blocking_turn_with_approvals_auto_denies_with_notice() {
             notice["level"] == "warn"
                 && notice["text"]
                     .as_str()
-                    .is_some_and(|text| text.contains("auto-denied"))
+                    .is_some_and(|text| text.contains("refused without asking"))
         }),
-        "the denial must be announced as a warn notice; got {body}"
+        "the refusal must be announced as a warn notice; got {body}"
     );
     assert_eq!(
         body["tool_calls"][0]["is_error"], true,

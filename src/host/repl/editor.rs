@@ -725,7 +725,7 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
         match crate::host::repl::history::PromptHistory::open(&path, HISTORY_CAPACITY) {
             Ok(history) => Some(Box::new(history) as Box<dyn History>),
             Err(error) => {
-                tracing::warn!("failed to open input history database: {error}");
+                tracing::warn!("failed to open the store for input history: {error}");
                 None
             }
         }
@@ -896,7 +896,9 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
                                             for profile in &configured_profiles {
                                                 console.line(&format!(
                                                     "- {} ({}, {})",
-                                                    profile.name, profile.account, profile.backend
+                                                    profile.name,
+                                                    profile.account,
+                                                    profile.backend.as_deref().unwrap_or("-")
                                                 ));
                                             }
                                         }
@@ -1047,12 +1049,8 @@ pub(crate) fn run_repl(launch: ReplLaunch) {
                             continue;
                         }
                         None => {
-                            // Not the `unknown_name` template: listing every slash command on one
-                            // line is noise, and `/help` already is the list.
                             with_console(&console, |console| {
-                                console.line(&format!(
-                                    "Unknown command: {trimmed}. Type /help for available commands."
-                                ))
+                                console.line(&unknown_command_message(trimmed))
                             });
                             continue;
                         }
@@ -2015,12 +2013,45 @@ mod tests {
         }
     }
 
+    /// A verb typed without its server is a known command missing its argument, not an unknown
+    /// command, and never fires against some default server.
     #[test]
-    fn parse_mcp_slash_reconnect_without_server_is_none() {
-        // Bare `reconnect` with no server name: neither the reconnect arm nor the
-        // `<server>:<prompt>` arm matches, so the command is rejected rather than silently firing
-        // against some default.
-        assert!(parse_slash_command("/mcp reconnect").is_none());
+    fn an_mcp_verb_without_its_server_is_refused_by_name() {
+        for verb in ["reconnect", "login", "logout"] {
+            match parse_slash_command(&format!("/mcp {verb}")) {
+                Some(SlashCommand::McpMissingServer { verb: named }) => assert_eq!(named, verb),
+                other => panic!("expected McpMissingServer, got {:?}", option_label(&other)),
+            }
+        }
+    }
+
+    /// A first word that is neither a verb nor a `<server>:<prompt>` spec is an `/mcp` mistake,
+    /// answered as one rather than as a command the REPL has never heard of.
+    #[test]
+    fn an_unknown_mcp_verb_is_refused_as_one() {
+        for (line, word) in [
+            ("/mcp frob", "frob"),
+            ("/mcp frob a b", "frob"),
+            ("/mcp :prompt", ":prompt"),
+            ("/mcp server:", "server:"),
+        ] {
+            match parse_slash_command(line) {
+                Some(SlashCommand::McpUnknownVerb { verb }) => assert_eq!(verb, word, "{line}"),
+                other => panic!(
+                    "{line}: expected McpUnknownVerb, got {:?}",
+                    option_label(&other)
+                ),
+            }
+        }
+    }
+
+    /// The refusal names the command and only the command; the argument was never read, so echoing
+    /// it would suggest it had been.
+    #[test]
+    fn an_unknown_command_is_refused_by_its_command_alone() {
+        let expected = "Unknown command: /x. Type /help for available commands.";
+        assert_eq!(unknown_command_message("/x"), expected);
+        assert_eq!(unknown_command_message("/x some words"), expected);
     }
 
     #[test]
@@ -2037,16 +2068,6 @@ mod tests {
             Some(SlashCommand::McpLogout { server }) => assert_eq!(server, "notion"),
             other => panic!("expected McpLogout, got {:?}", option_label(&other)),
         }
-    }
-
-    #[test]
-    fn parse_mcp_slash_login_without_server_is_none() {
-        assert!(parse_slash_command("/mcp login").is_none());
-    }
-
-    #[test]
-    fn parse_mcp_slash_logout_without_server_is_none() {
-        assert!(parse_slash_command("/mcp logout").is_none());
     }
 
     #[test]
@@ -2087,16 +2108,6 @@ mod tests {
             }
             other => panic!("expected McpPrompt, got {:?}", option_label(&other)),
         }
-    }
-
-    #[test]
-    fn parse_mcp_slash_empty_server_rejected() {
-        assert!(parse_slash_command("/mcp :prompt").is_none());
-    }
-
-    #[test]
-    fn parse_mcp_slash_empty_prompt_rejected() {
-        assert!(parse_slash_command("/mcp server:").is_none());
     }
 
     #[test]
@@ -2230,6 +2241,8 @@ mod tests {
             Some(SlashCommand::McpReconnect { .. }) => "McpReconnect",
             Some(SlashCommand::McpLogin { .. }) => "McpLogin",
             Some(SlashCommand::McpLogout { .. }) => "McpLogout",
+            Some(SlashCommand::McpMissingServer { .. }) => "McpMissingServer",
+            Some(SlashCommand::McpUnknownVerb { .. }) => "McpUnknownVerb",
             Some(SlashCommand::McpPrompt { .. }) => "McpPrompt",
             Some(SlashCommand::MemoryList) => "MemoryList",
             Some(SlashCommand::MemoryShow { .. }) => "MemoryShow",

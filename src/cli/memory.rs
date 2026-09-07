@@ -547,9 +547,8 @@ pub(crate) async fn run_export(store: &MemoryStore, directory: &Path) -> Result<
         .collect();
     if !unusable.is_empty() {
         return Err(MekaError::Config(format!(
-            "nothing exported: {} memor{} cannot be written out ({}); fix a description with \
-             `meka memory add <name> --force --description <text>` and remove a bad name with \
-             `meka memory remove <name>`",
+            "nothing exported: {} memor{} cannot be written out ({}); repair each with \
+             `meka memory add <name> --force --description <text>` or remove it",
             unusable.len(),
             if unusable.len() == 1 { "y" } else { "ies" },
             unusable.join(", "),

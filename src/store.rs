@@ -103,7 +103,7 @@ fn default_database_path() -> Result<PathBuf> {
     // confined shell: two answers to "where is the store" would leave one of them unmasked.
     let directory = crate::paths::meka_data_dir().ok_or_else(|| {
         MekaError::Config(
-            "failed to determine a data directory for the database; set `MEKA_DATA_DIR` to an \
+            "failed to determine a data directory for the store; set `MEKA_DATA_DIR` to an \
              absolute path"
                 .into(),
         )
@@ -165,7 +165,7 @@ impl Store {
                 .open(&database_path)
                 .map_err(|error| {
                     MekaError::Database(format!(
-                        "failed to pre-touch database '{}': {}",
+                        "failed to pre-touch the store at '{}': {}",
                         database_path.display(),
                         error
                     ))
@@ -174,7 +174,7 @@ impl Store {
 
         let connection = Connection::open(&database_path).await.map_err(|error| {
             MekaError::Database(format!(
-                "failed to open database '{}': {}",
+                "failed to open the store at '{}': {}",
                 database_path.display(),
                 error
             ))

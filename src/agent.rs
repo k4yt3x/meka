@@ -697,9 +697,17 @@ mod tests {
 
         async fn execute(
             &self,
-            _input: serde_json::Value,
+            input: serde_json::Value,
             _context: crate::tools::ToolContext,
         ) -> Result<crate::tools::ToolOutput> {
+            // One path that fails, so a test can tell a call that ran and failed from one that
+            // never ran: the two are treated differently by the schema advisory's bookkeeping.
+            if input.get("path").and_then(serde_json::Value::as_str) == Some("/missing.png") {
+                return Ok(crate::tools::ToolOutput::text(
+                    "No such file: /missing.png".to_string(),
+                    true,
+                ));
+            }
             Ok(crate::tools::ToolOutput::text(
                 "Sent (message id 1)".to_string(),
                 false,

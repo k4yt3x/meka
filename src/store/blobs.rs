@@ -166,10 +166,10 @@ pub(super) fn link_message_blobs(
 
 /// Whether every hash in `hashes` names a stored blob, or the first that does not.
 pub(super) fn missing_blob(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &rusqlite::Connection,
     hashes: &[String],
 ) -> rusqlite::Result<Option<String>> {
-    let mut lookup = transaction.prepare("SELECT 1 FROM blobs WHERE hash = ?1")?;
+    let mut lookup = connection.prepare("SELECT 1 FROM blobs WHERE hash = ?1")?;
     for hash in hashes {
         if !lookup.exists(rusqlite::params![hash])? {
             return Ok(Some(hash.clone()));
@@ -216,13 +216,20 @@ impl Store {
         for event in events.iter_mut() {
             for message in messages_in(event) {
                 for source in sources_in(message) {
-                    let ImageSource::Blob { hash, .. } = source else {
-                        continue;
+                    let (hash, media_type) = match &*source {
+                        ImageSource::Blob {
+                            hash, media_type, ..
+                        } => (hash.clone(), media_type.clone()),
+                        ImageSource::Base64 { .. } => continue,
                     };
                     match by_hash.get(hash.as_str()) {
+                        // Declared as the block was written, not as the row says: `blobs` keeps
+                        // the first writer's `media_type` for the same bytes, and a later block
+                        // that declared them differently would come back wearing a type it never
+                        // carried, which `repair_invalid_images` then replaces with a note.
                         Some(blob) => {
                             *source = ImageSource::Base64 {
-                                media_type: blob.media_type.clone(),
+                                media_type,
                                 data: base64::engine::general_purpose::STANDARD.encode(&blob.bytes),
                             };
                         }
@@ -235,6 +242,19 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// The first of `hashes` that names no stored blob, or `None` when every one does. What an
+    /// import asks before it writes, so an archive naming bytes nobody holds is refused in the
+    /// caller's words rather than inside the transaction.
+    pub(super) async fn first_missing_blob(&self, hashes: Vec<String>) -> Result<Option<String>> {
+        if hashes.is_empty() {
+            return Ok(None);
+        }
+        self.connection
+            .call(move |connection| missing_blob(connection, &hashes))
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to check image blobs: {error}")))
     }
 
     /// The stored blobs among `hashes`. One that is missing is simply absent from the result.
@@ -404,6 +424,44 @@ mod tests {
             0,
             "nothing references it any more"
         );
+    }
+
+    /// A block comes back declared as it was written. Two blocks can name the same bytes under
+    /// different types and the row keeps only the first writer's, so hydrating from the row would
+    /// hand the second block a type it never declared.
+    #[tokio::test]
+    async fn a_block_keeps_its_own_media_type_when_its_bytes_are_shared() {
+        let store = Store::for_test().await;
+        let session = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        let as_png = Event::Append(Message::user_with_images("first", vec![image("aGVsbG8=")]));
+        let as_jpeg = Event::Append(Message::user_with_images("second", vec![
+            ImageSource::Base64 {
+                media_type: "image/jpeg".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+        ]));
+        store.save_event(session, &as_png).await.expect("save");
+        store.save_event(session, &as_jpeg).await.expect("save");
+        assert_eq!(
+            store.blob_count().await.expect("count"),
+            1,
+            "one row for the bytes"
+        );
+
+        let mut events = store.load_events(session).await.expect("load");
+        store.inline_blobs(&mut events).await.expect("inline");
+        let declared = |event: &Event| match event {
+            Event::Append(message) => match &message.content[1] {
+                ContentBlock::Image { source } => source.media_type().to_string(),
+                other => panic!("expected the image block, got {other:?}"),
+            },
+            other => panic!("expected an append, got {other:?}"),
+        };
+        assert_eq!(declared(&events[0]), "image/png");
+        assert_eq!(declared(&events[1]), "image/jpeg");
     }
 
     /// A payload that is not base64 is left inline rather than stored under a hash of nothing.

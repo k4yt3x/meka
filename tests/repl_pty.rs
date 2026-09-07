@@ -521,12 +521,72 @@ fn a_rewind_with_a_bad_count_is_refused_on_screen() {
     let rows = run_repl(&install, TWO_TURNS, &["/rewind all", "/exit"]);
     assert!(
         rows.iter()
-            .any(|row| row.contains("/rewind takes a turn count")),
-        "the refusal must reach the screen: {rows:#?}"
+            .any(|row| row.contains("/rewind takes a turn count of 1 or more, not 'all'")),
+        "the refusal must reach the screen, quoting the value as a value: {rows:#?}"
     );
     assert!(
         !rows.iter().any(|row| row.contains("Rewound")),
         "nothing may be rewound on a refused count: {rows:#?}"
+    );
+}
+
+/// A known command missing its argument is refused as that command, and an unknown one is refused
+/// by its command word alone: the rest of the line was never read, so echoing it would say it was.
+#[test]
+fn a_half_typed_command_is_refused_for_what_it_is() {
+    let install = repl_install(true, true, "");
+    let rows = run_repl(&install, TWO_TURNS, &[
+        "/mcp reconnect",
+        "/mcp frob",
+        "/frob a b",
+        "/exit",
+    ]);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("/mcp reconnect takes a server name")),
+        "a verb without its server is a known command missing its argument: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("'frob' is not an `/mcp` verb")),
+        "an unknown verb is an `/mcp` mistake, not an unknown command: {rows:#?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Unknown command: /frob. Type /help")),
+        "the unknown command is named by its word alone: {rows:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("Unknown command: /mcp") || row.contains("/frob a b.")),
+        "neither line echoes what was never read: {rows:#?}"
+    );
+}
+
+/// Ctrl+C during `/compact` is annotated the way Ctrl+C during a turn is. The one place a manual
+/// compaction can still end in an interrupt is the wait before a retry, so the summarizer's call is
+/// scripted to be refused with a long `Retry-After`, with the checkpoint turn off so that call is
+/// the one made.
+#[test]
+fn an_interrupted_compaction_is_annotated_not_reported_as_an_error() {
+    const RETRY_LATER: &str = r#"[
+ [{"type":"text","text":"First answer."},
+  {"type":"message_end","stop_reason":"end_turn"}],
+ [{"type":"fail_retryable","message":"busy","retry_after_secs":20}]
+]"#;
+    let install =
+        repl_install_with_extra(true, true, "", "\n[session]\ncompact_checkpoint = false\n");
+    let rows = run_repl(&install, RETRY_LATER, &["hi", "/compact", "\u{3}", "/exit"]);
+
+    let body = between(&rows, "> /compact", "> /exit");
+    assert!(
+        body.iter().any(|row| row.contains("(interrupted)")),
+        "the interrupt is annotated: {body:#?}"
+    );
+    assert!(
+        !body.iter().any(|row| row.contains("interrupted by user")),
+        "and not reported as an error: {body:#?}"
     );
 }
 

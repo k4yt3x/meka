@@ -84,7 +84,7 @@ pub(crate) struct CompactResponse {
         (status = 409, description = "A turn is in flight; cancel first (`/errors/turn-in-flight`). Or another meka process holds the session (`/errors/session-locked`)", body = ProblemDetail),
         (status = 413, description = "Request body exceeds `[serve] max_body_bytes`", body = ProblemDetail),
         (status = 422, description = "Invalid body, nothing to compact, or the id names a sub-agent's conversation (`/errors/session-not-drivable`), which no payload makes acceptable", body = ProblemDetail),
-        (status = 502, description = "The provider refused or failed the summarizing turn. Read `type`: `/errors/provider-unavailable` is worth resending after a pause, `/errors/provider` covers everything meka does not classify, and `/errors/context-overflow` here means the conversation will not fit even to summarize it", body = ProblemDetail),
+        (status = 502, description = "The provider rejected or failed the summarizing turn. Read `type`: `/errors/provider-unavailable` is worth resending after a pause, `/errors/provider` covers everything meka does not classify, and `/errors/context-overflow` here means the conversation will not fit even to summarize it", body = ProblemDetail),
         (status = 503, description = "An MCP server the checkpoint turn needed was unavailable (`/errors/mcp-unavailable`)", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
     ),
@@ -241,7 +241,7 @@ pub(crate) struct ContextResponse {
     /// How many times this session has already been compacted. Fidelity degrades with each pass,
     /// so a client deciding whether to fork rather than compact again wants this.
     pub(crate) generation: u64,
-    /// Messages currently in the materialised window (post-compaction), not the full history.
+    /// Messages currently in the materialized window (post-compaction), not the full history.
     ///
     /// Absent while a turn holds the conversation. Everything else here is read from atomics and
     /// the database, so occupancy stays answerable during a turn; this one field genuinely needs
@@ -647,7 +647,7 @@ pub(crate) struct ExportQuery {
 
 /// `GET /v1/sessions/{id}/export`: the full conversation, including pre-compaction turns.
 ///
-/// Reads the raw event log rather than the materialised view, so turns that compaction hid from
+/// Reads the raw event log rather than the materialized view, so turns that compaction hid from
 /// the model are still in the export. That is the whole point of having it: `GET /messages` shows
 /// what the model can see, and this shows what actually happened.
 #[utoipa::path(
@@ -767,17 +767,21 @@ pub(crate) async fn import(
     if export.sessions.len() > crate::store::export::MAX_IMPORT_SESSIONS {
         return Err(store_too_large(export.sessions.len()));
     }
-    // Version mismatch and an empty session list both surface here, as 422 rather than 500: the
-    // envelope is the caller's, so a rejection is a statement about their input.
-    // An archive that names no profile adopts this server's default, which is the same profile
-    // `POST /v1/sessions` gives a body that names none.
+    // Version mismatch, an empty session list and a profile this server does not configure all
+    // surface here, as 422 rather than 500: the envelope is the caller's, so a rejection is a
+    // statement about their input. An archive that names no profile adopts this server's default,
+    // which is the same profile `POST /v1/sessions` gives a body that names none.
     let crate::store::export::ImportPlan {
         records,
         blobs,
         root_new_id,
     } = crate::store::export::plan_import(
         export,
-        state.shared.default_profile.as_deref(),
+        crate::store::export::ImportProfiles {
+            selected: None,
+            default: state.shared.default_profile.as_deref(),
+            configured: Some(&state.shared.config.profiles),
+        },
         Some(state.shared.config.permission),
     )
     .map_err(|error| {
@@ -793,7 +797,12 @@ pub(crate) async fn import(
         .store
         .import_sessions(records, blobs)
         .await
-        .map_err(|error| ProblemDetail::internal_sanitized("failed to import sessions", error))?;
+        .map_err(|error| match error {
+            // The archive's own fault, found before any write: an image blob it references and
+            // neither it nor the store holds.
+            error @ crate::error::MekaError::Usage(_) => ProblemDetail::for_error(&error, false),
+            error => ProblemDetail::internal_sanitized("failed to import sessions", error),
+        })?;
 
     tracing::info!("imported {count} session(s) via HTTP as root {root_new_id}");
     Ok((

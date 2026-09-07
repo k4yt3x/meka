@@ -463,10 +463,20 @@ mod tests {
         conversation::{self, format_session_as_markdown},
         host::{ForkHandoff, fork_and_lock},
         store::export::{
-            SESSION_EXPORT_FORMAT_VERSION, SessionExport, build_session_export,
+            ImportProfiles, SESSION_EXPORT_FORMAT_VERSION, SessionExport, build_session_export,
             parents_first_order, plan_import,
         },
     };
+
+    /// The planner with no installation behind it: nothing selected, nothing to check against,
+    /// and whatever default the test states.
+    fn planner_profiles(default: Option<&str>) -> ImportProfiles<'_> {
+        ImportProfiles {
+            selected: None,
+            default,
+            configured: None,
+        }
+    }
 
     fn user_msg(text: &str) -> crate::conversation::Message {
         crate::conversation::Message::user(text)
@@ -495,7 +505,14 @@ mod tests {
             sessions: Vec::new(),
             blobs: Vec::new(),
         };
-        assert!(plan_import(export, None, Some(crate::permission::Permission::Read)).is_err());
+        assert!(
+            plan_import(
+                export,
+                planner_profiles(None),
+                Some(crate::permission::Permission::Read)
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -614,7 +631,12 @@ mod tests {
             records,
             blobs,
             root_new_id,
-        } = plan_import(reparsed, None, Some(crate::permission::Permission::Read)).expect("plan");
+        } = plan_import(
+            reparsed,
+            planner_profiles(None),
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plan");
         assert_ne!(root_new_id, root, "import mints a new id");
         manager
             .import_sessions(records, blobs)
@@ -825,7 +847,12 @@ mod tests {
             records,
             blobs,
             root_new_id: new_id,
-        } = plan_import(reparsed, None, Some(crate::permission::Permission::Read)).expect("plan");
+        } = plan_import(
+            reparsed,
+            planner_profiles(None),
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plan");
         manager
             .import_sessions(records, blobs)
             .await
@@ -871,7 +898,7 @@ mod tests {
             root_new_id: _,
         } = plan_import(
             export,
-            Some("work"),
+            planner_profiles(Some("work")),
             Some(crate::permission::Permission::Read),
         )
         .expect("plan");
@@ -906,8 +933,11 @@ mod tests {
             }],
         });
         let export: SessionExport = serde_json::from_value(json).expect("deserialize");
-        let Err(error) = plan_import(export, None, Some(crate::permission::Permission::Read))
-        else {
+        let Err(error) = plan_import(
+            export,
+            planner_profiles(None),
+            Some(crate::permission::Permission::Read),
+        ) else {
             panic!("no default and no recorded profile must refuse the import");
         };
         assert!(
@@ -963,7 +993,12 @@ mod tests {
             records,
             blobs: _,
             root_new_id: _,
-        } = plan_import(hostile, None, Some(crate::permission::Permission::Read)).expect("plan");
+        } = plan_import(
+            hostile,
+            planner_profiles(None),
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plan");
         assert_eq!(
             records[0].profile, "work",
             "the session runs on its profile, and the endpoint comes from that profile alone"
@@ -975,11 +1010,16 @@ mod tests {
             records,
             blobs: _,
             root_new_id: _,
-        } = plan_import(plain, None, Some(crate::permission::Permission::Read)).expect("plan");
+        } = plan_import(
+            plain,
+            planner_profiles(None),
+            Some(crate::permission::Permission::Read),
+        )
+        .expect("plan");
         assert_eq!(records[0].profile, "work");
     }
 
-    /// Retention GC deletes by `updated_at` when `[session].retention_days` is set, so an import
+    /// Retention GC deletes by `updated_at` when `[session].retention` is set, so an import
     /// that restored the export's value would be undone by the next launch.
     #[tokio::test]
     async fn import_survives_retention_gc() {

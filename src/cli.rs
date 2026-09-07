@@ -214,8 +214,8 @@ pub(crate) enum AccountAction {
     /// Add an account and authenticate it
     ///
     /// Prompts for the backend and base URL when not flagged, then acquires the secret (an OAuth
-    /// login for the subscription backends, an API-key prompt for the rest) and stores it in the
-    /// database.
+    /// login for the subscription backends, an API-key prompt for the rest) and saves it to the
+    /// store.
     Add {
         /// Account name
         name: String,
@@ -232,7 +232,7 @@ pub(crate) enum AccountAction {
         /// OAuth client id override (subscription backends only)
         #[arg(long = "client-id", value_name = "ID")]
         client_id: Option<String>,
-        /// Read the API key from stdin (API-key backends only); needs --backend
+        /// Read the API key from stdin (API-key backends only); needs `--backend`
         #[arg(long = "api-key-stdin")]
         api_key_stdin: bool,
     },
@@ -355,7 +355,7 @@ pub(crate) enum ProfileAction {
         name: String,
         /// Setting to write
         key: String,
-        /// New value; omit it and pass --unset to remove the setting
+        /// New value; omit it and pass `--unset` to remove the setting
         value: Option<String>,
         /// Remove the setting, so the profile falls back to the default
         #[arg(long, conflicts_with = "value")]
@@ -429,7 +429,7 @@ pub(crate) enum SkillAction {
         #[arg(long)]
         force: bool,
 
-        /// Open the new SKILL.md afterwards in $VISUAL, then $EDITOR
+        /// Open the new SKILL.md afterwards in `$VISUAL`, then `$EDITOR`
         #[arg(long)]
         edit: bool,
     },
@@ -523,11 +523,11 @@ pub(crate) enum MemoryAction {
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
 
-        /// Detail loaded only on memory_read
+        /// Detail loaded only on `memory_read`
         #[arg(long)]
         body: Option<String>,
 
-        /// Read the body from this file, not --body
+        /// Read the body from this file, not `--body`
         #[arg(long = "from-file", value_name = "PATH")]
         from_file: Option<std::path::PathBuf>,
 
@@ -535,7 +535,7 @@ pub(crate) enum MemoryAction {
         #[arg(long)]
         force: bool,
     },
-    /// Open a memory's body in $VISUAL, then $EDITOR
+    /// Open a memory's body in `$VISUAL`, then `$EDITOR`
     ///
     /// The body only; `meka memory add <name> --force` changes the description, priority or tags.
     Edit {
@@ -700,9 +700,9 @@ pub(crate) enum McpAction {
         #[arg(long)]
         auth: Option<McpAuthKind>,
 
-        /// Read a static bearer token from stdin (excludes --auth)
+        /// Read a static bearer token from stdin (excludes `--auth`)
         ///
-        /// Kept in meka's database, never in config.toml.
+        /// Kept in the store, never in config.toml.
         #[arg(long = "auth-token-stdin", conflicts_with = "client_secret_stdin")]
         auth_token_stdin: bool,
 
@@ -710,9 +710,9 @@ pub(crate) enum McpAction {
         #[arg(long, value_name = "ID")]
         client_id: Option<String>,
 
-        /// Read the OAuth client secret from stdin (excludes --auth-token-stdin)
+        /// Read the OAuth client secret from stdin (excludes `--auth-token-stdin`)
         ///
-        /// Kept in meka's database, never in config.toml.
+        /// Kept in the store, never in config.toml.
         #[arg(long = "client-secret-stdin")]
         client_secret_stdin: bool,
 
@@ -740,11 +740,11 @@ pub(crate) enum McpAction {
         #[arg(long = "allow-tool", value_name = "TOOL")]
         allow_tool: Vec<String>,
 
-        /// Raw tool name to block (repeatable; applied after --allow-tool)
+        /// Raw tool name to block (repeatable; applied after `--allow-tool`)
         #[arg(long = "disable-tool", value_name = "TOOL")]
         disable_tool: Vec<String>,
 
-        /// Raw tool name to eager-load (repeatable; skips load_tool)
+        /// Raw tool name to eager-load (repeatable; skips `load_tool`)
         #[arg(long = "eager-load-tool", value_name = "TOOL")]
         eager_load_tool: Vec<String>,
 
@@ -756,11 +756,11 @@ pub(crate) enum McpAction {
         #[arg(long = "no-login")]
         no_login: bool,
 
-        /// Persist with disabled=true; re-enable via `meka mcp enable`
+        /// Persist with `disabled = true`; re-enable via `meka mcp enable`
         #[arg(long = "disabled")]
         disabled: bool,
 
-        /// Gate turns on this server: refuse the turn if it is not connected
+        /// Gate turns on this server: decline the turn if it is not connected
         #[arg(long = "required")]
         required: bool,
     },
@@ -886,7 +886,7 @@ pub(crate) struct Cli {
     #[arg(long = "skill", value_name = "NAME")]
     pub(crate) skill: Option<String>,
 
-    /// Exit after the first turn finishes (requires --prompt or --skill)
+    /// Exit after the first turn finishes (requires `--prompt` or `--skill`)
     #[arg(long = "oneshot")]
     pub(crate) oneshot: bool,
 

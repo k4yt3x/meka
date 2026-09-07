@@ -357,9 +357,8 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
     #[cfg(windows)]
     if context == WarnContext::Startup {
         tracing::warn!(
-            "the Windows sandbox cannot hide meka's config directory and credential store from a \
-             confined command: a command at `read` can read them, and a workspace root that \
-             contains them can write them"
+            "the Windows sandbox cannot hide meka's config and credential store: `read` can read \
+             them, a root containing them can write them"
         );
     }
 
@@ -370,8 +369,8 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             // on this host (a kernel without Landlock, bwrap not installed).
             let backend = state.backend;
             tracing::warn!(
-                "read-level sandbox unavailable: {reason} (configured: {backend}); shell commands \
-                 at `read` fail until `[shell].sandbox_backend` names a usable backend"
+                "no usable `read` sandbox ({backend}: {reason}); shell commands at `read` fail \
+                 until `[shell].sandbox_backend` names one"
             );
             return;
         }
@@ -381,7 +380,7 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             && matches!(state.backend, crate::config::SandboxBackend::Landlock)
         {
             tracing::warn!(
-                "using Landlock for the sandbox; install Bubblewrap for stronger protection, or set \
+                "sandboxing with Landlock because Bubblewrap is unavailable; set \
                  `[shell].sandbox_backend = \"landlock\"` to silence this"
             );
         }
@@ -397,9 +396,8 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             )
         {
             tracing::warn!(
-                "Landlock cannot hide meka's config directory and credential store from a confined \
-                 command: a command at `read` can read them, and a workspace root that contains \
-                 them can write them. Bubblewrap masks both"
+                "Landlock cannot hide meka's config and credential store (`read` reads them, a \
+                 root containing them writes them); Bubblewrap can"
             );
         }
 
@@ -427,9 +425,8 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             // install bwrap to close these channels would send them the wrong way.
             let missing = missing.join(", ");
             tracing::warn!(
-                "Landlock ABI v{abi_version} write-protects the filesystem but does not restrict \
-                 {missing}; a command at `read` can still reach a local service over those \
-                 channels. A newer kernel closes them, and Bubblewrap does not"
+                "Landlock ABI v{abi_version} does not restrict {missing}; a command at `read` can \
+                 reach a local service over them; only a newer kernel closes them"
             );
         }
     }

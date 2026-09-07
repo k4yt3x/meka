@@ -112,8 +112,7 @@ fn require_root(cache: &SkillCache, tool_name: &str) -> Result<std::path::PathBu
         .map(|root| root.to_path_buf())
         .ok_or_else(|| MekaError::ToolExecution {
             tool_name: tool_name.to_string(),
-            message: "skills are disabled or the meka config directory could not be resolved"
-                .to_string(),
+            message: "skills are disabled, or no config directory resolved".to_string(),
         })
 }
 

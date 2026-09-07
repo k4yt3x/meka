@@ -355,6 +355,24 @@ pub(crate) fn require_profile<'a>(
             known: profiles.keys().cloned().collect(),
         })
 }
+/// The model a profile names, refused when it names none or an empty one.
+///
+/// One predicate for every door that needs a model in hand: startup validation of the default
+/// profile, the registry resolving the profile a session names, and both `meka profile` write
+/// doors. `""` is what makes this more than an `is_none()`: TOML admits it, the option check does
+/// not see it, and the empty string would go to the provider as the model's name.
+pub(crate) fn require_model<'a>(
+    profile: &str,
+    model: Option<&'a str>,
+) -> crate::error::Result<&'a str> {
+    match model {
+        Some(model) if !model.trim().is_empty() => Ok(model),
+        _ => Err(crate::error::MekaError::Config(format!(
+            "profile '{profile}' names no model; set one with `meka profile set {profile} model \
+             <model>`"
+        ))),
+    }
+}
 /// Which tier asked for the profile [`select_profile`] could not find.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProfileRequest {
@@ -449,9 +467,8 @@ pub(crate) fn validate_max_output_tokens(
         // have been inherited from. Both fix the refusal; only one of them leaves every other
         // profile budgeting against what it did before.
         return Err(crate::error::MekaError::Config(format!(
-            "profile '{profile}': `max_output_tokens` ({max_output}) must exceed the thinking \
-             budget ({thinking_budget}) under `thinking = \"budgeted\"`; raise `max_output_tokens` \
-             under `[profiles.{profile}]`",
+            "profile '{profile}': `max_output_tokens` ({max_output}) must exceed `thinking_budget` \
+             ({thinking_budget}); raise it in `[profiles.{profile}]`",
         )));
     }
     Ok(())
@@ -483,7 +500,7 @@ pub(crate) mod device_id {
             return id.to_string();
         }
 
-        let (id, source) = match read_claude_code_user_id() {
+        let (id, source) = match read_claude_code_user_id(dirs::home_dir()) {
             Some(id) => (id, "~/.claude.json"),
             None => (generate(), "random"),
         };
@@ -498,15 +515,17 @@ pub(crate) mod device_id {
         id
     }
 
-    fn generate() -> String {
+    /// A fresh device id: 32 random bytes as lowercase hex.
+    pub(super) fn generate() -> String {
         use rand::RngExt;
         let mut bytes = [0u8; 32];
         rand::rng().fill(&mut bytes);
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
-    fn read_claude_code_user_id() -> Option<String> {
-        read_user_id_from(&dirs::home_dir()?.join(".claude.json"))
+    /// Claude Code's `userID`, read from the `.claude.json` under `home`.
+    pub(super) fn read_claude_code_user_id(home: Option<std::path::PathBuf>) -> Option<String> {
+        read_user_id_from(&home?.join(".claude.json"))
     }
 
     pub(crate) fn read_user_id_from(path: &Path) -> Option<String> {
@@ -580,54 +599,24 @@ pub(crate) mod device_id {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// A user-id file that is there but unusable is warned about, since the device id it would
-    /// have shared with Claude Code is quietly replaced by a fresh one; an absent file is not,
-    /// because that is every machine without Claude Code.
+
+    /// A model is a non-empty name. `""` is the half `is_none()` misses, and the half that would
+    /// otherwise be written by `profile set` and sent to the provider verbatim.
     #[test]
-    fn an_unparseable_user_id_file_warns_where_an_absent_one_is_silent() {
-        #[derive(Clone)]
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-                crate::sync::lock(&self.0).extend_from_slice(buffer);
-                Ok(buffer.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let captured = Capture(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let temp = tempfile::tempdir().expect("tempdir");
-
-        assert!(super::device_id::read_user_id_from(&temp.path().join("absent.json")).is_none());
-        assert!(
-            crate::sync::lock(&captured.0).is_empty(),
-            "an absent file is the ordinary case and not worth a warning"
+    fn a_profile_needs_a_model_that_is_not_empty() {
+        assert_eq!(
+            require_model("work", Some("claude-opus-5")).expect("a model"),
+            "claude-opus-5"
         );
-
-        let path = temp.path().join("claude.json");
-        std::fs::write(&path, "{ not json").expect("write the file");
-        assert!(super::device_id::read_user_id_from(&path).is_none());
-        let logged = String::from_utf8_lossy(&crate::sync::lock(&captured.0)).to_string();
-        assert!(
-            logged.contains("failed to parse") && logged.contains("claude.json"),
-            "an unusable file is warned about by path: {logged:?}"
-        );
+        for missing in [None, Some(""), Some("   ")] {
+            let message = require_model("work", missing)
+                .expect_err("no model to run on")
+                .to_string();
+            assert!(
+                message.contains("'work'") && message.contains("meka profile set work model"),
+                "the refusal names the profile and the command that fixes it: {message}"
+            );
+        }
     }
 
     fn profiles_from(
@@ -1002,6 +991,50 @@ mod tests {
         );
     }
 
+    /// The account sorter is the profile sorter's twin: a scrambled account comes back in
+    /// [`ACCOUNT_KEY_ORDER`], with its annotations still on the keys they explain.
+    #[test]
+    fn sorting_an_account_orders_its_keys_and_carries_the_comments_with_them() {
+        let mut document: toml_edit::DocumentMut = concat!(
+            "[accounts.work]\n",
+            "device_id = \"a-device\"\n",
+            "\n",
+            "# the endpoint this account bills\n",
+            "base_url = \"https://api.anthropic.com\"\n",
+            "backend = \"anthropic-messages\" # pinned deliberately\n",
+        )
+        .parse()
+        .expect("parse");
+
+        let account = document
+            .get_mut("accounts")
+            .and_then(|accounts| accounts.get_mut("work"))
+            .expect("the account table");
+        sort_account_keys(account);
+
+        let rendered = document.to_string();
+        let keys: Vec<&str> = rendered
+            .lines()
+            .filter_map(|line| line.split_once(" = "))
+            .map(|(key, _)| key.trim())
+            .collect();
+        assert_eq!(
+            keys,
+            ["backend", "base_url", "device_id"],
+            "keys should follow ACCOUNT_KEY_ORDER: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "# the endpoint this account bills\nbase_url = \"https://api.anthropic.com\""
+            ),
+            "the comment should still sit above the key it explains: {rendered}"
+        );
+        assert!(
+            rendered.contains("backend = \"anthropic-messages\" # pinned deliberately"),
+            "a trailing comment should still sit beside its value: {rendered}"
+        );
+    }
+
     /// A key this build does not model sorts last rather than wherever the sort left it.
     ///
     /// `deny_unknown_fields` means it cannot survive a load, so this pins what an unreachable case
@@ -1148,6 +1181,38 @@ mod tests {
         );
     }
 
+    /// A generated device id has the shape of the one it stands in for, and no two runs share one.
+    #[test]
+    fn a_generated_device_id_is_64_lowercase_hex_characters_and_never_repeats() {
+        let first = device_id::generate();
+        let second = device_id::generate();
+        for id in [&first, &second] {
+            assert_eq!(id.len(), 64, "{id}");
+            assert!(
+                id.chars()
+                    .all(|character| matches!(character, '0'..='9' | 'a'..='f')),
+                "{id}"
+            );
+        }
+        assert_ne!(first, second);
+    }
+
+    /// Claude Code's id comes from the `.claude.json` in the home directory and from nowhere else:
+    /// a machine without one yields nothing, never a placeholder.
+    #[test]
+    fn claude_code_s_user_id_is_read_from_the_home_directory_only_when_the_file_is_there() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let under_home = || Some(home.path().to_path_buf());
+        assert_eq!(device_id::read_claude_code_user_id(under_home()), None);
+        assert_eq!(device_id::read_claude_code_user_id(None), None);
+
+        std::fs::write(home.path().join(".claude.json"), r#"{"userID": "abc123"}"#).expect("write");
+        assert_eq!(
+            device_id::read_claude_code_user_id(under_home()).as_deref(),
+            Some("abc123")
+        );
+    }
+
     #[test]
     fn the_budget_invariant_is_checked_only_under_budgeted_thinking() {
         // Budgeted draws the thinking budget out of `max_tokens`, so a cap at or below it can only
@@ -1166,7 +1231,10 @@ mod tests {
             );
             assert!(result.is_err(), "{backend}");
             assert!(
-                result.unwrap_err().to_string().contains("thinking budget"),
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("`thinking_budget`"),
                 "{backend}: the error must name the budget it conflicts with"
             );
         }

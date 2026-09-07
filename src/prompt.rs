@@ -629,25 +629,27 @@ pub(crate) fn build_system_prompt(
     }
     if sandboxed_shell {
         prompt.push_str(
-            "- `workspace`: full tool access with no approval required, but writes are \
-             confined to the workspace roots named in `[Environment context]`. Reads are \
-             not confined. `execute_command` runs under the same boundary.\n",
+            "- `workspace`: full tool access, but writes are confined to the workspace \
+             roots named in `[Environment context]`. Reads are not confined. \
+             `execute_command` runs under the same boundary.\n",
         );
     } else {
         prompt.push_str(
-            "- `workspace`: full tool access with no approval required, but writes are \
-             confined to the workspace roots named in `[Environment context]`. Reads are \
-             not confined. `execute_command` is blocked at this level, because no sandbox \
-             is available to confine it.\n",
+            "- `workspace`: full tool access, but writes are confined to the workspace \
+             roots named in `[Environment context]`. Reads are not confined. \
+             `execute_command` is blocked at this level, because no sandbox is available \
+             to confine it.\n",
         );
     }
     prompt.push_str(
-        "- `ask`: full tool access with no confinement; each tool call is presented to \
-         the user for approval before execution.\n",
-    );
-    prompt.push_str(
         "- `unrestricted`: full tool access, no approval required, and no boundary on \
          where writes may land.\n\n",
+    );
+    prompt.push_str(
+        "Approvals are a per-session switch, separate from the level. When it is on, a tool \
+         call above the current level is put to the user for approval instead of being \
+         refused; an approved call still runs at the current level. `[Permission context]` \
+         says whether it is on.\n\n",
     );
     prompt.push_str(
         "The current level is in the per-turn `[Permission context]` block; each tool's \
@@ -3366,8 +3368,15 @@ mod tests {
         assert!(prompt.contains("`none`"));
         assert!(prompt.contains("`read`"));
         assert!(prompt.contains("`workspace`"));
-        assert!(prompt.contains("`ask`"));
         assert!(prompt.contains("`unrestricted`"));
+        // Four rungs. `ask` was a level once and is a switch now; a model told about a fifth rung
+        // asks the user for one they cannot set.
+        assert!(!prompt.contains("`ask`"), "{prompt}");
+        assert!(!prompt.contains("no approval required, but"), "{prompt}");
+        assert!(
+            prompt.contains("Approvals are a per-session switch"),
+            "{prompt}"
+        );
         assert!(prompt.contains("`[Permission context]`"));
         // No key, command or endpoint: the level is raised differently in the REPL, over ACP and
         // over HTTP, and a prompt that names one sends the model to tell a chat user to press a

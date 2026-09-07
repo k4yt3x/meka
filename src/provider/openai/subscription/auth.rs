@@ -78,7 +78,7 @@ fn decode_jwt_payload<T: serde::de::DeserializeOwned>(jwt: &str) -> Result<T> {
 mod tests {
     use super::*;
 
-    /// Build a synthesised JWT-shape string from a payload JSON object. Header and signature are
+    /// Build a synthesized JWT-shape string from a payload JSON object. Header and signature are
     /// placeholders; `decode_jwt_payload` only reads the middle segment, so the others just need
     /// to be non-empty.
     fn make_jwt(payload: serde_json::Value) -> String {

@@ -168,10 +168,11 @@ impl Agent {
             .tool_registry
             .required_permission_for(name)
             .unwrap_or_else(|| tool.required_permission());
+        let permission = self.cells.permission.get();
         let admission = admit_tool_call(
             name,
             required,
-            self.cells.permission.get(),
+            permission,
             self.cells.permission.approvals(),
             tool.runs_outside_confinement(),
         );
@@ -203,15 +204,22 @@ impl Agent {
             return refusal;
         }
 
-        // Approval resolves *before* a detach, never inside it. A prompt surfacing minutes after
-        // the turn that caused it, with nothing on screen to explain it, is worse than the
-        // round trip it would save.
-        if matches!(admission, Admission::Ask)
-            && let Some(denial) = self
+        if matches!(admission, Admission::Ask) {
+            // The same rule for the tool's own doors: an approved call runs at the level, so a
+            // refusal the level already decides (the shell with nothing to confine it, a write
+            // outside the roots) is returned here rather than asked about and then made anyway.
+            if let Some(refusal) = tool.refusal_at_level(permission, input).await {
+                return refusal;
+            }
+            // Approval resolves *before* a detach, never inside it. A prompt surfacing minutes
+            // after the turn that caused it, with nothing on screen to explain it, is worse than
+            // the round trip it would save.
+            if let Some(denial) = self
                 .request_approval(name, input, detach, &schema, &cancellation)
                 .await
-        {
-            return denial;
+            {
+                return denial;
+            }
         }
 
         let mut output = if detach {
@@ -503,7 +511,7 @@ impl Agent {
             Err(MekaError::Interrupted) => {
                 crate::tools::ToolOutput::text("Tool execution interrupted.".to_string(), true)
             }
-            Err(error) => crate::tools::ToolOutput::text(format!("Tool error: {error}"), true),
+            Err(error) => crate::tools::ToolOutput::from_error(&error),
         }
     }
 }
@@ -571,8 +579,8 @@ async fn record_background_outcome(
         .await
     {
         tracing::error!(
-            "background task {task_id} failed to be marked failed either; its row stays `running` \
-             until the next session open sweeps it: {error}"
+            "failed to mark background task {task_id} failed; it stays listed as running until the next \
+             session opens: {error}"
         );
     }
 }
@@ -618,8 +626,8 @@ pub(super) fn admit_tool_call(
         }
         return Admission::Refuse(Box::new(crate::tools::ToolOutput::text(
             format!(
-                "Permission denied: '{name}' requires `{required}` permission, current level is \
-                 `{permission}`. Ask the user to raise it to `{required}`."
+                "'{name}' requires `{required}`; the session is at `{permission}`. Ask the user to \
+                 raise it to `{required}`."
             ),
             true,
         )));
@@ -750,7 +758,9 @@ mod tests {
         let text = output.text_content();
         assert!(output.is_error);
         assert!(text.contains("requires `workspace`"), "{text}");
-        assert!(text.contains("current level is `read`"), "{text}");
+        assert!(text.contains("the session is at `read`"), "{text}");
+        // meka's own decision is a refusal; "denied" is the user's answer at the prompt.
+        assert!(!text.contains("denied"), "{text}");
     }
 
     /// A tool that runs outside any confinement meka can apply is refused at `workspace`, for
@@ -938,6 +948,64 @@ mod tests {
         );
     }
 
+    /// With `[shell].sandbox = false`, `execute_command` at `read` is refused however the user
+    /// answers: an approved call runs at the level, and nothing can confine it there. Asking first
+    /// put a question to the user whose yes could not matter, the way `admit_detach` already
+    /// refuses a detached call ahead of the prompt. The refusal reaches the model unasked, in the
+    /// words `execute` would have used.
+    #[tokio::test]
+    async fn a_call_the_level_alone_refuses_is_not_asked_about() {
+        use crate::provider::mock::MockProvider;
+
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(crate::tools::shell::ExecuteCommandTool {
+                scope: crate::workspace::WriteScope::unconfined(),
+                #[cfg(windows)]
+                windows_grants: Arc::new(crate::sandbox::windows::WindowsGrants::default()),
+                sandbox_capability: crate::sandbox::SandboxCapability::Unavailable,
+                sandbox_backend: crate::config::SandboxBackend::Landlock,
+                backend_probe: crate::sandbox::BackendProbe::Missing {
+                    reason: "test fixture".to_string(),
+                },
+                sandbox_enabled: false,
+                site: crate::session::ToolSite::for_test()
+                    .with_permission(crate::permission::SharedPermission::new(
+                        crate::permission::Permission::Read,
+                        crate::permission::EnabledPermissions::ALL,
+                    ))
+                    .with_cwd(crate::workspace::cwd_for_test()),
+            }))
+            .expect("registration");
+        let (mut agent, _store) =
+            agent_with_registry_for_test(Arc::new(MockProvider::from_rounds(vec![])), registry)
+                .await;
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+        // `read` with the switch on: the tool requires `unrestricted`, so this call is asked about
+        // unless something ahead of the prompt has the answer.
+        agent.cells.permission.set_approvals(true);
+
+        let output = agent
+            .resolve_and_execute_tool(
+                "call-1",
+                "execute_command",
+                &serde_json::json!({"command": "true"}),
+                &[],
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        let body = output.text_content();
+        assert!(output.is_error, "{body}");
+        assert!(body.contains("`[shell].sandbox = false`"), "{body}");
+        assert!(
+            frontend.permission_requests().is_empty(),
+            "nobody is asked to approve a call the level refuses anyway: {:?}",
+            frontend.permission_requests()
+        );
+    }
+
     /// A call that never executed must not spend the tool's one advisory. Otherwise a permission
     /// denial swallows the hint, and the retry after the user grants permission is exactly the
     /// silent call this machinery exists to prevent.
@@ -962,5 +1030,123 @@ mod tests {
 
         let third = agent.schema_advisory(name, &input, &schema, &[], true);
         assert!(third.is_none(), "but a call that ran spends it");
+    }
+
+    /// Only a call that ran and succeeded spends the tool's one advisory. A call that ran and
+    /// failed is about to be retried, and a retry on silently defaulted arguments is the call the
+    /// advisory exists to prevent.
+    #[tokio::test]
+    async fn a_failed_call_keeps_the_advisory_slot_and_a_successful_one_spends_it() {
+        use crate::provider::mock::MockProvider;
+
+        async fn send(agent: &Agent, path: &str) -> crate::tools::ToolOutput {
+            agent
+                .resolve_and_execute_tool(
+                    "call-1",
+                    "mcp__bridge__send_file",
+                    &serde_json::json!({"path": path}),
+                    &[],
+                    None,
+                    CancellationToken::new(),
+                )
+                .await
+        }
+        const ADVISORY: &str = "Called without loading its schema";
+
+        let (agent, _store) = agent_with_registry_for_test(
+            Arc::new(MockProvider::from_rounds(vec![])),
+            send_file_registry(),
+        )
+        .await;
+
+        let failed = send(&agent, "/missing.png").await;
+        assert!(failed.is_error, "{}", failed.text_content());
+        assert!(
+            failed.text_content().contains(ADVISORY),
+            "{}",
+            failed.text_content()
+        );
+        let failed_again = send(&agent, "/missing.png").await;
+        assert!(
+            failed_again.text_content().contains(ADVISORY),
+            "a failed call must not have spent the slot: {}",
+            failed_again.text_content()
+        );
+
+        let succeeded = send(&agent, "/tmp/a.png").await;
+        assert!(!succeeded.is_error, "{}", succeeded.text_content());
+        assert!(
+            succeeded.text_content().contains(ADVISORY),
+            "the first call that succeeds is still told: {}",
+            succeeded.text_content()
+        );
+        let again = send(&agent, "/tmp/a.png").await;
+        assert!(
+            !again.text_content().contains(ADVISORY),
+            "and it spends the slot: {}",
+            again.text_content()
+        );
+    }
+
+    /// One `TodoListUpdated` per change with something to show. A rewrite that changes nothing
+    /// re-renders nothing, and a list emptied out renders nothing either: an empty render is a
+    /// no-op event that also corrupts REPL spacing.
+    #[tokio::test]
+    async fn an_unchanged_or_emptied_todo_list_is_not_re_rendered() {
+        use crate::provider::mock::MockProvider;
+
+        let (mut agent, _store) = agent_with_registry_for_test(
+            Arc::new(MockProvider::from_rounds(vec![])),
+            crate::tools::ToolRegistry::new(),
+        )
+        .await;
+        agent
+            .tool_registry
+            .register(Arc::new(crate::tools::todo::TodoTool {
+                todo_list: agent.cells.todo_list.clone(),
+            }))
+            .expect("registration");
+        let frontend = Arc::new(crate::frontend::testing::RecordingFrontend::new());
+        agent.cells.frontend = Arc::clone(&frontend) as Arc<dyn crate::frontend::Frontend>;
+
+        let todo_call = |input: serde_json::Value| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "todo-1".to_string(),
+                name: "todo".to_string(),
+                input,
+            }],
+        };
+        let rendered = || {
+            frontend
+                .events()
+                .iter()
+                .filter(|event| matches!(event, FrontendEvent::TodoListUpdated { .. }))
+                .count()
+        };
+
+        let list = serde_json::json!({"title": "Plan", "items": ["first"]});
+        agent
+            .execute_tool_calls(
+                &todo_call(list.clone()),
+                &[],
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(rendered(), 1, "a new list is rendered once");
+        agent
+            .execute_tool_calls(&todo_call(list), &[], None, CancellationToken::new())
+            .await;
+        assert_eq!(rendered(), 1, "rewriting the same list renders nothing");
+        agent
+            .execute_tool_calls(
+                &todo_call(serde_json::json!({"items": []})),
+                &[],
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(rendered(), 1, "an emptied list has nothing to render");
     }
 }

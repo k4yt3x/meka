@@ -104,7 +104,7 @@ pub(crate) struct SessionCapabilities {
     /// the response rather than only in the timing.
     ///
     /// Defaults to `true`, so a client that declares nothing and an imported `capabilities_json`
-    /// that omits the flag both park rather than auto-deny.
+    /// that omits the flag both park rather than refuse without asking.
     pub(crate) supports_permission_prompts: bool,
 }
 
@@ -521,11 +521,11 @@ impl HttpFrontend {
         }
     }
 
-    /// Surface a `warn`-level diagnostic notice from a safe-default short-circuit (e.g.
-    /// auto-denied permission check, auto-declined MCP elicitation). The notice ends
-    /// up in *both* sinks (recorder for blocking-mode JSON, broadcast for SSE).
-    async fn record_warn_notice(&self, text: String) {
-        self.emit(FrontendEvent::Notice(Notice::warn(text))).await;
+    /// Surface a `warn`-level diagnostic notice from a safe-default short-circuit (an approval
+    /// refused without asking, an MCP elicitation declined). The notice ends up in *both* sinks
+    /// (recorder for blocking-mode JSON, broadcast for SSE).
+    async fn record_warn_notice(&self, notice: Notice) {
+        self.emit(FrontendEvent::Notice(notice)).await;
     }
 }
 
@@ -595,12 +595,11 @@ impl Frontend for HttpFrontend {
         }
 
         if !self.is_streaming() {
-            // Blocking mode: no SSE channel to ask through. Auto-deny and surface the
+            // Blocking mode: no SSE channel to ask through. Refuse without asking and surface the
             // misconfiguration signal in the response so the operator notices.
-            self.record_warn_notice(format!(
-                "Permission for '{}' auto-denied: a blocking turn has no channel to approve on; \
-                 use `stream: true`",
-                request.tool_name
+            self.record_warn_notice(Notice::approval_refused_without_asking_because(
+                &request.tool_name,
+                "a blocking turn has no channel to approve on; use `stream: true`",
             ))
             .await;
             return PermissionOutcome::Deny;
@@ -608,12 +607,11 @@ impl Frontend for HttpFrontend {
 
         if !self.capabilities.supports_permission_prompts {
             // Streaming, but the client told us it has nowhere to show a prompt. Parking would
-            // burn the full timeout and deny anyway; do it now and say why.
-            self.record_warn_notice(format!(
-                "Permission for '{}' auto-denied: the session declared \
-                 supports_permission_prompts=false; raise its permission with \
-                 `PATCH /v1/sessions/{{id}}`",
-                request.tool_name
+            // burn the full timeout and refuse anyway; do it now and say why.
+            self.record_warn_notice(Notice::approval_refused_without_asking_because(
+                &request.tool_name,
+                "the session declared supports_permission_prompts=false; raise its permission \
+                 with `PATCH /v1/sessions/{id}`",
             ))
             .await;
             return PermissionOutcome::Deny;
@@ -878,7 +876,8 @@ mod tests {
                     event,
                     FrontendEvent::Notice(notice)
                         if notice.text.contains("execute_command")
-                            && notice.text.contains("auto-denied")
+                            && notice.text.contains("refused without asking")
+                            && notice.text.contains("`stream: true`")
                 )
             })
             .count();
@@ -935,7 +934,7 @@ mod tests {
 
     /// `meka session import` stores `capabilities_json` verbatim from a user-supplied archive, so
     /// a hand-written or third-party one can be missing a flag. An absent flag has to mean parking:
-    /// silently auto-denying every gated call in an imported session is a worse failure than a
+    /// silently refusing every gated call in an imported session is a worse failure than a
     /// stall the operator can see.
     #[test]
     fn capabilities_json_missing_a_flag_defaults_to_supporting_prompts() {
@@ -964,7 +963,7 @@ mod tests {
         );
         let recorder = frontend.drain();
         // No diagnostic notice should be emitted: the sticky path bypasses both the streaming
-        // SSE pause and the blocking-mode auto-deny.
+        // SSE pause and the blocking-mode refusal.
         assert!(
             !recorder
                 .iter()

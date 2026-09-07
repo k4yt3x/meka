@@ -1394,7 +1394,7 @@ impl BlockLimits {
         }
     }
 
-    /// For the `ask` approval prompt.
+    /// For the approval prompt.
     ///
     /// Wrapping rather than cutting, since cutting a line hides the tail of the command being
     /// approved. Twenty lines rather than thirty because a prompt blocks reading and wants to be
@@ -1798,7 +1798,7 @@ fn scalar_text(value: &serde_json::Value, budget: usize) -> String {
     }
 }
 
-/// The argument block for an `ask` approval prompt: every argument, wrapped rather than cut.
+/// The argument block for an approval prompt: every argument, wrapped rather than cut.
 ///
 /// Separate entry point from the indicator's so the two sets of limits are named at their call
 /// sites rather than passed in from the REPL, which has no business knowing them.
@@ -5861,7 +5861,7 @@ mod tests {
 
     #[test]
     fn last_n_turns_no_user_prompt_returns_empty() {
-        // Assistant-only history (rare; only happens if the materialised view starts
+        // Assistant-only history (rare; only happens if the materialized view starts
         // mid-conversation) has no turn boundaries; N doesn't find anything.
         let messages = vec![assistant_text("orphan reply")];
         assert!(last_n_turns(&messages, 1).is_empty());

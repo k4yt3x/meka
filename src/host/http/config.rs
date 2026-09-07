@@ -358,7 +358,7 @@ fn warn_if_world_readable(path: &std::path::Path) {
             let mode = metadata.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
                 tracing::warn!(
-                    "[serve.tokens] token_file '{path}' has permissions {mode:04o}; run `chmod 0600` \
+                    "`[serve.tokens].token_file` '{path}' has mode {mode:04o}; run `chmod 0600` \
                      on it",
                     path = path.display(),
                 );

@@ -680,13 +680,14 @@ impl Agent {
                             .tool_registry
                             .required_permission_for(&name)
                             .unwrap_or_else(|| tool.required_permission());
+                        let permission = self.cells.permission.get();
                         let admission = if name == "context_replace" {
                             super::dispatch::Admission::Run
                         } else {
                             super::dispatch::admit_tool_call(
                                 &name,
                                 required,
-                                self.cells.permission.get(),
+                                permission,
                                 self.cells.permission.approvals(),
                                 tool.runs_outside_confinement(),
                             )
@@ -698,18 +699,29 @@ impl Agent {
                             (Err(refusal), _) => refusal,
                             (Ok(_), super::dispatch::Admission::Refuse(refusal)) => *refusal,
                             (Ok((input, _detach)), admission) => {
-                                if matches!(admission, super::dispatch::Admission::Ask)
-                                    && let Some(denial) = self
-                                        .request_approval(
-                                            &name,
-                                            &input,
-                                            false,
-                                            &schema,
-                                            &cancellation,
-                                        )
-                                        .await
-                                {
-                                    denial
+                                let asked = matches!(admission, super::dispatch::Admission::Ask);
+                                // As dispatch does: a refusal the level already decides is
+                                // returned instead of asked about, since approval could not
+                                // lift it.
+                                let settled = if asked {
+                                    match tool.refusal_at_level(permission, &input).await {
+                                        Some(refusal) => Some(refusal),
+                                        None => {
+                                            self.request_approval(
+                                                &name,
+                                                &input,
+                                                false,
+                                                &schema,
+                                                &cancellation,
+                                            )
+                                            .await
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(settled) = settled {
+                                    settled
                                 } else {
                                     Self::run_tool(
                                         tool.as_ref(),
@@ -1472,7 +1484,7 @@ mod tests {
         );
     }
 
-    /// The emergency path runs after the provider refused the request for being too large. A
+    /// The emergency path runs after the provider rejected the request for being too large. A
     /// checkpoint turn re-sends that same conversation, so it would be refused identically; the
     /// degraded summarizer is the only call that can still get through.
     #[tokio::test]
@@ -1786,7 +1798,7 @@ mod tests {
     /// place, durably and instance-wide. With approvals on, a call above the level is a
     /// question for the user, and the checkpoint has to ask it the way dispatch does rather
     /// than run the write because nobody was watching. At `none` every tool is above the
-    /// level, so this is also the shape an `ask` session migrates to.
+    /// level, so every checkpoint write is a question.
     #[tokio::test]
     async fn approvals_are_honored_inside_the_checkpoint() {
         use crate::frontend::{PermissionOutcome, testing::RecordingFrontend};
@@ -1908,8 +1920,97 @@ mod tests {
         );
     }
 
-    /// The checkpoint is the longest thing compaction does, and at `ask` it can block on a
-    /// human. A bare token with no signal source would make Ctrl+C a no-op, which
+    /// The checkpoint door applies the rule dispatch does: a call the level alone refuses is not
+    /// put to the user, whose yes could not matter, and the checkpoint carries on with the refusal
+    /// as that call's result.
+    #[tokio::test]
+    async fn a_checkpoint_call_the_level_alone_refuses_is_not_asked_about() {
+        use crate::frontend::{PermissionOutcome, testing::RecordingFrontend};
+
+        struct RefusedAtLevel;
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for RefusedAtLevel {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "memory_write".to_string(),
+                    description: "fixture".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    ..Default::default()
+                }
+            }
+
+            fn required_permission(&self) -> crate::permission::Permission {
+                crate::permission::Permission::Workspace
+            }
+
+            async fn refusal_at_level(
+                &self,
+                level: crate::permission::Permission,
+                _input: &serde_json::Value,
+            ) -> Option<crate::tools::ToolOutput> {
+                (level != crate::permission::Permission::Unrestricted).then(|| {
+                    crate::tools::ToolOutput::text("refused at this level".to_string(), true)
+                })
+            }
+
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _context: crate::tools::ToolContext,
+            ) -> Result<crate::tools::ToolOutput> {
+                panic!("a call refused at the level must not run");
+            }
+        }
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "memory_write".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": "note"}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            replace_round("summary after a refusal", None),
+        ]));
+        // Would allow, so a prompt that reached it would run the tool and hit the panic above.
+        let frontend = Arc::new(RecordingFrontend::with_permission(PermissionOutcome::Allow));
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(RefusedAtLevel))
+            .expect("register fixture");
+        let (mut agent, store) = agent_with_registry_and_checkpoint(provider, registry).await;
+        agent.cells.frontend = frontend.clone();
+        agent.cells.permission = SharedPermission::new(
+            crate::permission::Permission::Read,
+            crate::permission::EnabledPermissions::ALL,
+        )
+        .with_approvals(true);
+        let mut messages = conversation();
+
+        let outcome = compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Manual),
+        )
+        .await;
+
+        assert_eq!(outcome.source, CompactSource::Checkpoint);
+        assert!(
+            frontend.permission_requests().is_empty(),
+            "nobody is asked about a call the level refuses anyway: {:?}",
+            frontend.permission_requests()
+        );
+    }
+
+    /// The checkpoint is the longest thing compaction does, and with approvals on it can block
+    /// on a human. A bare token with no signal source would make Ctrl+C a no-op, which
     /// `run_turn_interruptible` documents as the bug to avoid.
     #[tokio::test]
     async fn an_interrupt_ends_the_checkpoint_and_falls_back() {

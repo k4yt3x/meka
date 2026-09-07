@@ -1237,6 +1237,21 @@ impl Tool for ScratchpadSaveFileTool {
         Permission::Workspace
     }
 
+    async fn refusal_at_level(
+        &self,
+        level: Permission,
+        input: &serde_json::Value,
+    ) -> Option<ToolOutput> {
+        super::file::write_fence_refusal(
+            "scratchpad_save_file",
+            &self.site.cwd,
+            &self.scope,
+            level,
+            input,
+        )
+        .await
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,

@@ -87,7 +87,7 @@ pub(crate) struct ClaudeSubscriptionProvider {
 impl ClaudeSubscriptionProvider {
     /// Build from a profile's settings, whose credential the builder has checked is an OAuth one.
     pub(crate) fn new(settings: crate::provider::ProviderBuilder) -> Result<Self> {
-        let credential_key = settings.credential_key_or_default();
+        let credential_key = settings.resolve_credential_key()?;
         let crate::provider::ProviderBuilder {
             credential,
             model,

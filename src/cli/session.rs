@@ -89,11 +89,12 @@ pub(crate) async fn fork_session_command(
 pub(crate) async fn run_session_subcommand(
     store: &Store,
     action: &cli::SessionAction,
-    // The profile an archive that names none adopts on `import`. The caller reads two answers off
-    // disk, and this is the flag-aware one, so `meka --profile work session import` chooses per
-    // run; the migration context gets the other, which ignores `--profile` because it stamps rows
-    // once and irreversibly. Unused by every other action here.
-    default_profile: Option<&str>,
+    // How `import` settles each archived session's profile: the `--profile` flag as passed, the
+    // installation's default and its configured profiles. The flag is carried unresolved so that
+    // `meka --profile work session import` moves the archive per run, while the migration context
+    // the caller also builds ignores it, because that stamps rows once and irreversibly. Unused by
+    // every other action here.
+    profiles: crate::store::export::ImportProfiles<'_>,
     // The level such an archive's sessions adopt when they record none, for the same reason.
     default_permission: Option<crate::permission::Permission>,
 ) -> anyhow::Result<()> {
@@ -165,7 +166,7 @@ pub(crate) async fn run_session_subcommand(
             )
         }
         cli::SessionAction::Import { input } => {
-            import_session(store, input, default_profile, default_permission).await
+            import_session(store, input, profiles, default_permission).await
         }
         cli::SessionAction::Show { session_id, format } => {
             let session_id = store.resolve_session_id(session_id).await?;
@@ -449,9 +450,15 @@ fn write_export(path: &std::path::Path, body: &str) -> std::io::Result<()> {
 pub(crate) async fn import_session(
     store: &Store,
     input: &str,
-    default_profile: Option<&str>,
+    profiles: crate::store::export::ImportProfiles<'_>,
     default_permission: Option<crate::permission::Permission>,
 ) -> anyhow::Result<()> {
+    // A `config.toml` that did not parse leaves nothing to check an archive's profile name
+    // against, so the import is refused ahead of the first write rather than writing that name
+    // unchecked. Here rather than in `main.rs`, whose unreadable-config arm serves every
+    // subcommand and has to stay open for the ones that repair the file.
+    crate::config::ResolvedConfig::resolve(crate::config::CliOverrides::default())
+        .require_readable_config()?;
     let raw = if input == "-" {
         let mut buffer = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
@@ -464,13 +471,15 @@ pub(crate) async fn import_session(
     let export: crate::store::export::SessionExport = serde_json::from_str(&raw)
         .map_err(|error| anyhow::anyhow!("invalid session export JSON: {error}"))?;
 
-    // Version mismatch, an empty archive and a missing default profile all surface here, worded
-    // for the person who ran the command: the archive is theirs, so a refusal is about their input.
+    // Version mismatch, an empty archive and a profile nothing here configures all surface here,
+    // worded for the person who ran the command: the archive is theirs, so a refusal is about
+    // their input. An image blob nobody holds is refused the same way by `import_sessions`, ahead
+    // of its write.
     let crate::store::export::ImportPlan {
         records,
         blobs,
         root_new_id,
-    } = crate::store::export::plan_import(export, default_profile, default_permission)?;
+    } = crate::store::export::plan_import(export, profiles, default_permission)?;
     let count = records.len();
     store.import_sessions(records, blobs).await?;
 
@@ -784,5 +793,76 @@ mod tests {
                 "every combination spends the budget exactly"
             );
         }
+    }
+
+    /// A `config.toml` that does not parse leaves nothing to check an archive's profile against.
+    /// The import is refused before anything is written and names the parse error, rather than
+    /// writing the archive's profile name unchecked over a warning.
+    #[tokio::test]
+    async fn an_unreadable_config_refuses_an_import_before_anything_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.toml"), "bogus = 1\n").expect("write config");
+        let archive = dir.path().join("archive.json");
+        std::fs::write(
+            &archive,
+            serde_json::json!({
+                "format_version": crate::store::export::SESSION_EXPORT_FORMAT_VERSION,
+                "meka_version": "0.0.0",
+                "exported_at": "2020-01-01T00:00:00Z",
+                "root_session_id": "11111111-1111-4111-8111-111111111111",
+                "sessions": [{
+                    "id": "11111111-1111-4111-8111-111111111111",
+                    "parent_id": null,
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "updated_at": "2020-01-01T00:00:00Z",
+                    "cwd": null,
+                    "permission": null,
+                    "capabilities_json": null,
+                    "profile": "work",
+                    "stats": crate::stats::SessionStatsSnapshot::default(),
+                    "events": [],
+                    "tool_outputs": {},
+                }],
+            })
+            .to_string(),
+        )
+        .expect("write archive");
+        let store = Store::for_test().await;
+        // What `main.rs` hands this door when the file could not be read: nothing to check against.
+        let profiles = crate::store::export::ImportProfiles {
+            selected: None,
+            default: None,
+            configured: None,
+        };
+
+        // SAFETY: `MEKA_CONFIG_DIR` is process-global; `CONFIG_DIR_ENV_LOCK` serializes every test
+        // that sets it.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = import_session(
+            &store,
+            &archive.to_string_lossy(),
+            profiles,
+            Some(crate::permission::Permission::Read),
+        )
+        .await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("an unreadable config must refuse the import"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("failed to parse") && error.contains("bogus"),
+            "the parse error is the answer: {error}"
+        );
+        let (sessions, _) = store
+            .list_sessions(10, true, None, None)
+            .await
+            .expect("list");
+        assert!(
+            sessions.is_empty(),
+            "a refused import writes nothing: {sessions:?}"
+        );
     }
 }

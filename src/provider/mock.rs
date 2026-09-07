@@ -106,7 +106,7 @@ pub(crate) enum MockEvent {
     /// Synthetic *malformed-request* failure. The stream returns
     /// `Err(MekaError::InvalidRequest(message))` immediately, exercising `Agent::run_turn`'s
     /// degrade-and-retry path. Each attempt consumes one round, so
-    /// `[FailInvalidRequest, ..success events..]` simulates "the provider refused the content meka
+    /// `[FailInvalidRequest, ..success events..]` simulates "the provider rejected the content meka
     /// just appended, the retry without it succeeds".
     FailInvalidRequest {
         message: String,
@@ -179,6 +179,9 @@ pub(crate) struct MockProvider {
     completions: Mutex<Vec<Vec<Message>>>,
     /// The thinking override each `complete` call carried, in call order.
     completion_thinking: Mutex<Vec<ThinkingOverride>>,
+    /// The prompt each `complete` call was attributed to, in call order: a sub-agent runs
+    /// non-streaming, and whether it carried its parent's prompt id is visible nowhere else.
+    completion_prompt_ids: Mutex<Vec<Option<uuid::Uuid>>>,
     /// What each [`Provider::stream`] call was handed, in order.
     ///
     /// The streaming counterpart to [`Self::completions`], and added for the same reason plus one
@@ -231,6 +234,12 @@ impl MockProvider {
         crate::sync::lock(&self.completions).clone()
     }
 
+    /// The prompt id behind each `complete` call so far, in order.
+    #[cfg(test)]
+    pub(crate) fn completion_prompt_ids(&self) -> Vec<Option<uuid::Uuid>> {
+        crate::sync::lock(&self.completion_prompt_ids).clone()
+    }
+
     /// A provider that replays `rounds`, one per call, and answers nothing once they are spent.
     pub(crate) fn from_rounds(rounds: Vec<Vec<MockEvent>>) -> Self {
         Self {
@@ -254,10 +263,12 @@ impl Provider for MockProvider {
             messages,
             tools: _,
             thinking,
+            attribution,
             ..
         } = request;
         crate::sync::lock(&self.completion_thinking).push(thinking);
         crate::sync::lock(&self.completions).push(messages.to_vec());
+        crate::sync::lock(&self.completion_prompt_ids).push(attribution.prompt_id);
 
         let events = {
             let mut rounds = crate::sync::lock(&self.rounds);

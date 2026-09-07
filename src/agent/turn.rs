@@ -1515,14 +1515,26 @@ impl Agent {
     /// requests, so a redaction during a summary reaches `/status` like one during a turn.
     pub(super) async fn forward_notice(&self, notice: crate::frontend::Notice) {
         if let Some(redaction) = &notice.redaction {
-            self.session_stats.record_redaction(redaction);
-            // A retried attempt reports the same positions again; each is recorded once.
-            let mut pending = crate::sync::lock(&self.pending_redactions);
-            for position in &redaction.positions {
-                if !pending.contains(position) {
-                    pending.push(position.clone());
-                }
+            // A retried attempt rebuilds the same body and reports the same positions again. Each
+            // is recorded once, and a report that adds none is neither counted nor shown: the
+            // counters would otherwise grow with every transient failure, and the user would read
+            // one redaction as two.
+            let adds_nothing = {
+                let mut pending = crate::sync::lock(&self.pending_redactions);
+                let fresh: Vec<_> = redaction
+                    .positions
+                    .iter()
+                    .filter(|position| !pending.contains(position))
+                    .cloned()
+                    .collect();
+                let adds_nothing = fresh.is_empty() && !redaction.positions.is_empty();
+                pending.extend(fresh);
+                adds_nothing
+            };
+            if adds_nothing {
+                return;
             }
+            self.session_stats.record_redaction(redaction);
         }
         self.cells
             .frontend
@@ -1806,8 +1818,7 @@ impl Agent {
                     // cannot double-emit model output, and a notice is not model output. The
                     // Claude providers queue the image-redaction advisory before the request is
                     // even sent, so marking it would disable retry for the whole turn from the
-                    // first event onward, and re-showing one advisory line after a retry is far
-                    // cheaper than losing the turn.
+                    // first event onward; `forward_notice` drops the advisory a retry repeats.
                     self.forward_notice(notice.clone()).await;
                 }
                 StreamEvent::Error(error) => {
@@ -3185,6 +3196,67 @@ mod tests {
                 .any(|message| message.text_content().contains("answered on the retry")),
             "and the retry's answer is what lands in the conversation",
         );
+    }
+
+    /// A retried attempt rebuilds the body and reports the same redaction again; the session
+    /// counts it once and the user reads it once.
+    #[tokio::test]
+    async fn a_retried_attempt_reporting_the_same_redaction_is_counted_and_shown_once() {
+        use crate::{
+            conversation::RedactedImage,
+            provider::mock::{MockEvent, MockProvider, MockStopReason},
+        };
+
+        let redaction = || MockEvent::Redaction {
+            images: 1,
+            bytes: 4,
+            positions: vec![RedactedImage {
+                from_end: 1,
+                block: 1,
+                item: None,
+            }],
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![redaction(), MockEvent::FailRetryable {
+                message: "overloaded".to_string(),
+                retry_after_secs: Some(0),
+            }],
+            vec![
+                redaction(),
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (agent, frontend) =
+            agent_recording_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the retry carries the turn");
+
+        let snapshot = agent.session_stats_snapshot();
+        assert_eq!(snapshot.redactions, 1);
+        assert_eq!(snapshot.redacted_images, 1);
+        assert_eq!(snapshot.redacted_bytes, 4);
+        let shown = frontend
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(event, FrontendEvent::Notice(notice) if notice.redaction.is_some())
+            })
+            .count();
+        assert_eq!(shown, 1, "the same redaction is announced once");
     }
 
     /// A redaction is counted against the session the request belonged to, from the notice the

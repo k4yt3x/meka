@@ -169,7 +169,7 @@ pub(crate) enum ToolCallContentView {
         (status = 422, description = "Invalid body, the id names a sub-agent's conversation, or the request still exceeds the profile's `max_request_bytes` after redaction. Read `type`: `/errors/invalid-body` is worth resending with a corrected payload, `/errors/request-too-large` with a smaller one or after `/compact`, `/errors/session-not-drivable` never is", body = ProblemDetail),
         (status = 429, description = "Concurrency limit reached or idempotency-key cache full", body = ProblemDetail),
         (status = 500, description = "Internal server error", body = ProblemDetail),
-        (status = 502, description = "The provider refused or failed this turn. Read `type`: `/errors/provider-unavailable` was classified as transient and is worth resending after a pause, `/errors/provider` is the catch-all for everything else and usually needs the account or endpoint fixed, and `/errors/context-overflow` needs the conversation shortened first", body = ProblemDetail),
+        (status = 502, description = "The provider rejected or failed this turn. Read `type`: `/errors/provider-unavailable` was classified as transient and is worth resending after a pause, `/errors/provider` is the catch-all for everything else and usually needs the account or endpoint fixed, and `/errors/context-overflow` needs the conversation shortened first", body = ProblemDetail),
         (status = 503, description = "An MCP server marked `required` was not connected, so the turn never reached the provider", body = ProblemDetail),
     ),
     security(("bearerAuth" = ["sessions:w"]))
@@ -1054,7 +1054,7 @@ fn notify_turn_end(
     );
 }
 
-/// Await the turn task and render whatever terminal it recorded, or synthesise one if it panicked
+/// Await the turn task and render whatever terminal it recorded, or synthesize one if it panicked
 /// before it could.
 async fn join_terminal(
     join: &mut std::pin::Pin<Box<tokio::task::JoinHandle<crate::host::http::sse::SseEvent>>>,

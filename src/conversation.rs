@@ -131,17 +131,27 @@ impl Conversation {
         Self::from_events(events)
     }
 
-    /// The session's title, the same on every surface that labels one: the first `Text` block a
-    /// user message carries, its whitespace collapsed to single spaces, cut to [`TITLE_CHARS`] with
-    /// an ellipsis. Empty until a user has said something. A turn's context block is not a `Text`
-    /// block, so what rode in front of the words never becomes the label.
+    /// The session's title, the same on every surface that labels one: the first words a user
+    /// said, their whitespace collapsed to single spaces, cut to [`TITLE_CHARS`] with an ellipsis.
+    /// Empty until a user has said something.
+    ///
+    /// Read from the log rather than the view, because a compaction replaces the view's first user
+    /// message with its summary and a label that changed when the session was reopened would name
+    /// nothing. The words are the first non-blank `Text` block of a user `Append` that is not a
+    /// stand-in meka wrote ([`is_harness_stand_in`]); a turn's context block is not a `Text`
+    /// block. The store's `title_of_first_user_row` selects the same row in SQL. A log pruned by
+    /// [`Self::prune_compacted_events`] starts at its last boundary and no longer holds the first
+    /// turn; every surface that labels a stored session reads the store's rows, which do.
     pub(crate) fn title(&self) -> String {
-        self.materialized
+        self.events
             .iter()
-            .filter(|message| message.role == Role::User)
+            .filter_map(|event| match event {
+                Event::Append(message) if message.role == Role::User => Some(message),
+                _ => None,
+            })
             .flat_map(|message| &message.content)
             .find_map(|block| match block {
-                ContentBlock::Text { text } => {
+                ContentBlock::Text { text } if !is_harness_stand_in(text) => {
                     let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
                     (!words.is_empty()).then_some(words)
                 }
@@ -641,6 +651,13 @@ pub(crate) fn materialize_annotated(events: &[(String, Event)]) -> AnnotatedView
 /// already obey on sight is the worst one to make load-bearing.
 pub(crate) const HARNESS_NOTE: &str = "[meka harness]";
 
+/// Whether `text` is something meka put into a user message in place of the user's own content:
+/// the placeholder a redaction leaves or a harness note. Both are `Text` blocks, because that is
+/// the one shape every provider renders, so a reader after what the user typed has to ask.
+pub(crate) fn is_harness_stand_in(text: &str) -> bool {
+    text == IMAGE_REDACTION_PLACEHOLDER || text.starts_with(HARNESS_NOTE)
+}
+
 /// Replace every image whose bytes disagree with its declared `media_type` with a text note,
 /// returning how many were replaced.
 ///
@@ -961,6 +978,22 @@ impl Message {
             .join("")
     }
 
+    /// The `Text` blocks as paragraphs, a blank line between them. A user message's second `Text`
+    /// block is a stand-in meka put where an attachment was, and glued to the words it would read
+    /// as part of them. For the wires that take a user message as one string and for the Markdown
+    /// export; assistant text keeps [`Self::text_content`]'s join, since its blocks are one answer
+    /// split around tool calls.
+    pub(crate) fn text_paragraphs(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Everything a provider renders as text, in order: the turn's context block, a blank line,
     /// then the words. What the two were joined with when they were one string, for the wires that
     /// take a user message as a single string.
@@ -969,7 +1002,7 @@ impl Message {
             ContentBlock::TurnContext { text } => Some(text.as_str()),
             _ => None,
         });
-        let words = self.text_content();
+        let words = self.text_paragraphs();
         match context {
             Some(context) if words.is_empty() => context.to_string(),
             Some(context) => format!("{context}\n\n{words}"),
@@ -1128,7 +1161,20 @@ pub(crate) fn write_message_markdown(
                 }
             } else {
                 writeln!(output, "## User\n").ok();
-                writeln!(output, "{}\n", message.text_content()).ok();
+                let words = message.text_paragraphs();
+                if words.is_empty() {
+                    // `Message::user_turn` leaves the `Text` block out when there were no words,
+                    // so a heading over nothing is what a turn fired for background outcomes
+                    // would otherwise leave.
+                    writeln!(
+                        output,
+                        "*meka opened this turn with no words from the user; its context block \
+                         carried background outcomes or a resume notice.*\n"
+                    )
+                    .ok();
+                } else {
+                    writeln!(output, "{words}\n").ok();
+                }
             }
         }
         crate::conversation::Role::Assistant => {
@@ -1223,6 +1269,126 @@ mod tests {
         assert_eq!(conversation.title(), "", "whitespace is not words");
         conversation.append(Message::user("now with words"));
         assert_eq!(conversation.title(), "now with words");
+    }
+
+    /// A compaction summary is not what the user said. The title is read from the log, where the
+    /// summary is a boundary rather than a user `Append`, so reopening a compacted session labels
+    /// it with the first user's words and not with the summary that replaced them in the view.
+    #[test]
+    fn a_title_after_a_compaction_is_still_the_first_users_words() {
+        let conversation = Conversation::from_events(vec![
+            Event::Append(Message::user_turn(
+                "<context/>",
+                "find rust files",
+                Vec::new(),
+            )),
+            Event::Append(Message::assistant_text("ok")),
+            Event::CompactBoundary {
+                summary: Message::user("[Conversation summary from session compaction] found them"),
+                replaced_count: 2,
+                loaded_tools_snapshot: HashSet::new(),
+            },
+            Event::Append(Message::user_turn(
+                "<context/>",
+                "and python ones",
+                Vec::new(),
+            )),
+        ]);
+        assert_eq!(conversation.title(), "find rust files");
+    }
+
+    /// What meka put in place of an attachment is a `Text` block like the words, and is not a
+    /// title: a first turn that carried only an image has none, whether the image was redacted by
+    /// the budget or replaced by a harness note, until a user says something.
+    #[test]
+    fn a_title_skips_what_meka_put_in_place_of_an_attachment() {
+        let image = ImageSource::Base64 {
+            media_type: "image/png".to_string(),
+            data: "QUJD".to_string(),
+        };
+        let mut conversation = Conversation::from_events(vec![
+            Event::Append(Message::user_turn("<context/>", "", vec![image])),
+            Event::Redact {
+                images: vec![RedactedImage {
+                    from_end: 1,
+                    block: 1,
+                    item: None,
+                }],
+            },
+        ]);
+        assert_eq!(conversation.title(), "", "a redacted image is not words");
+        // The shapes a compaction re-appends verbatim from a view that carried the stand-ins.
+        conversation.append(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::TurnContext {
+                    text: "<context/>".to_string(),
+                },
+                ContentBlock::Text {
+                    text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                },
+            ],
+        });
+        conversation.append(Message::user(format!(
+            "{HARNESS_NOTE} An image here was removed."
+        )));
+        assert_eq!(
+            conversation.title(),
+            "",
+            "nor is a placeholder or a harness note"
+        );
+        conversation.append(Message::user("what is in the picture?"));
+        assert_eq!(conversation.title(), "what is in the picture?");
+    }
+
+    /// A placeholder recorded beside the user's words is its own paragraph on a single-string wire
+    /// and in the export, not a suffix of what they typed.
+    #[test]
+    fn a_users_words_and_a_placeholder_are_separate_paragraphs() {
+        let message = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::TurnContext {
+                    text: "<context/>".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "look at this".to_string(),
+                },
+                ContentBlock::Text {
+                    text: IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                },
+            ],
+        };
+        assert_eq!(
+            message.wire_text(),
+            format!("<context/>\n\nlook at this\n\n{IMAGE_REDACTION_PLACEHOLDER}")
+        );
+        let mut output = String::new();
+        write_message_markdown(&mut output, &message, &std::collections::HashMap::new());
+        assert!(
+            output.contains(&format!("look at this\n\n{IMAGE_REDACTION_PLACEHOLDER}\n")),
+            "{output}"
+        );
+        assert_eq!(
+            Message::assistant_text("one").text_content(),
+            "one",
+            "assistant text keeps its join"
+        );
+    }
+
+    /// A turn opened with no words exports as a marked line rather than a heading over nothing.
+    #[test]
+    fn a_turn_with_no_words_exports_as_a_marked_line() {
+        let mut output = String::new();
+        write_message_markdown(
+            &mut output,
+            &Message::user_turn("<context/>", "", Vec::new()),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            output.contains("## User\n\n*meka opened this turn with no words"),
+            "{output}"
+        );
     }
 
     fn assistant_with_tool_use(use_id: &str) -> Message {

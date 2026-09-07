@@ -382,7 +382,7 @@ pub(crate) async fn store_refreshed_credential(
             Err(error) => {
                 tracing::warn!(
                     "failed to read the stored credential's version for '{account}': {error}; the \
-                     stored token is now stale and the next launch will need `meka account login`"
+                     next launch will need `meka account login`"
                 );
                 return refreshed;
             }
@@ -422,8 +422,8 @@ pub(crate) async fn store_refreshed_credential(
         }
         Err(error) => {
             tracing::warn!(
-                "failed to persist the refreshed token for '{account}': {error}; the stored token is \
-                 now stale and the next launch will need `meka account login`"
+                "failed to persist the refreshed token for '{account}': {error}; the next \
+                 launch will need `meka account login`"
             );
             refreshed
         }

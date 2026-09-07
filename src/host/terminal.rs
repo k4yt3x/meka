@@ -12,13 +12,18 @@ use super::*;
 /// stops awaiting cannot drop one.
 ///
 /// Escalation counts per *turn*, not per process: publishing a turn's token resets the count, so
-/// the second press of the fifth turn means what the second press of the first one did.
+/// the second press of the fifth turn means what the second press of the first one did, and a
+/// press between turns starts a ladder of its own; see [`InterruptRelay::count_press`].
 ///
 /// Nothing here competes with the prompt. reedline reads Ctrl+C as a key event in raw mode, where
 /// the terminal generates no SIGINT at all, so this listener only ever sees a press made while a
 /// turn is running -- which is the only window it is about.
 pub(crate) struct InterruptRelay {
     pub(crate) presses: std::sync::atomic::AtomicUsize,
+    /// Whether the ladder being climbed found a turn on its first press. A ladder a turn started
+    /// ends with the turn: the next press between turns starts a new one instead of being that
+    /// turn's second press.
+    pub(crate) ladder_had_turn: std::sync::atomic::AtomicBool,
     /// Woken on every press, for the one caller that waits outside a turn.
     ///
     /// A second `tokio::signal::ctrl_c()` elsewhere in the process would be a second *handler*:
@@ -31,8 +36,35 @@ pub(crate) struct InterruptRelay {
 pub(crate) static INTERRUPT_RELAY: std::sync::LazyLock<InterruptRelay> =
     std::sync::LazyLock::new(|| InterruptRelay {
         presses: std::sync::atomic::AtomicUsize::new(0),
+        ladder_had_turn: std::sync::atomic::AtomicBool::new(false),
         pressed: tokio::sync::Notify::new(),
     });
+impl InterruptRelay {
+    /// Fire the live turn's token, if any, and count the press on the ladder.
+    ///
+    /// A ladder climbed during a turn ends with the turn. Carrying its count into the wait after
+    /// made a Ctrl+C at `/usage` or a stuck `/mcp reconnect` the second press of a turn already
+    /// over, stopping every background task with nothing on screen having asked. Presses between
+    /// turns still climb a ladder of their own, so a hung wait can be left the same way as a hung
+    /// turn: nothing, then the background tasks, then the process.
+    pub(crate) fn count_press(&self, cancel: &crate::host::CancelCell) -> usize {
+        use std::sync::atomic::Ordering::SeqCst;
+        let found_turn = cancel.cancel();
+        if !found_turn && self.ladder_had_turn.swap(false, SeqCst) {
+            self.presses.store(0, SeqCst);
+        }
+        if found_turn {
+            self.ladder_had_turn.store(true, SeqCst);
+        }
+        self.presses.fetch_add(1, SeqCst) + 1
+    }
+
+    fn reset(&self) {
+        self.presses.store(0, std::sync::atomic::Ordering::SeqCst);
+        self.ladder_had_turn
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 /// Grace given to background tasks on the press that leaves. Long enough for a child to die and its
 /// row to be written, short enough that a user who has pressed Ctrl+C three times is not made to
 /// wait: `exit` on the spot orphans the process group and leaves the row reading `running`.
@@ -96,15 +128,11 @@ pub(crate) fn install_interrupt_handler(
                 return;
             }
             INTERRUPT_RELAY.pressed.notify_waiters();
-            let press = INTERRUPT_RELAY
-                .presses
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
+            let press = INTERRUPT_RELAY.count_press(&cancel);
 
             match escalation_for(press) {
-                Escalation::CancelTurn => {
-                    cancel.cancel();
-                }
+                // `count_press` has already fired the turn's token, when there was one.
+                Escalation::CancelTurn => {}
                 Escalation::CancelBackgroundTasks => {
                     // Recorded before signaling, so what the agent hears is "you stopped it"
                     // rather than the `failed` its own interruption would otherwise write.
@@ -166,9 +194,7 @@ fn publish_for_interrupts(
 /// whatever happened during the last one. The scheduler driver's turns publish through the resident
 /// session's cell rather than [`publish_for_interrupts`], so they reset it here.
 pub(crate) fn reset_interrupt_escalation() {
-    INTERRUPT_RELAY
-        .presses
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    INTERRUPT_RELAY.reset();
 }
 
 /// Run a `/compact` with Ctrl+C wired to a fresh cancellation token.
@@ -329,4 +355,52 @@ pub(crate) fn hold_session_lock(
     lock: Option<crate::fs::FileLock>,
 ) {
     *crate::sync::lock(slot) = lock;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The handler's count, driven the way SIGINT drives it, against a relay of the test's own: the
+    /// process-wide one is shared with every other test in the binary.
+    #[test]
+    fn a_press_between_turns_starts_a_ladder_of_its_own() {
+        let relay = InterruptRelay {
+            presses: std::sync::atomic::AtomicUsize::new(0),
+            ladder_had_turn: std::sync::atomic::AtomicBool::new(false),
+            pressed: tokio::sync::Notify::new(),
+        };
+        let cancel = crate::host::CancelCell::default();
+
+        let token = CancellationToken::new();
+        let published = cancel.publish(token.clone(), cancel.admit());
+        assert_eq!(relay.count_press(&cancel), 1);
+        assert!(token.is_cancelled(), "the first press cancels the turn");
+        assert_eq!(
+            relay.count_press(&cancel),
+            2,
+            "a turn still unwinding takes the second press"
+        );
+        drop(published);
+
+        assert_eq!(
+            relay.count_press(&cancel),
+            1,
+            "a press between turns starts a ladder of its own instead of being the third"
+        );
+        assert_eq!(
+            relay.count_press(&cancel),
+            2,
+            "a second press at a hung wait still reaches the background tasks"
+        );
+
+        let token = CancellationToken::new();
+        let _published = cancel.publish(token, cancel.admit());
+        relay.reset();
+        assert_eq!(
+            relay.count_press(&cancel),
+            1,
+            "publishing a turn starts the count over, whatever the wait before it counted"
+        );
+    }
 }

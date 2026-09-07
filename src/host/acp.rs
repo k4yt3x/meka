@@ -158,15 +158,15 @@ fn acp_error_for(error: &MekaError, relay_provider_errors: bool) -> agent_client
             )
         }
         MekaError::ContextOverflow(message) => withhold_or_relay(
-            "the conversation exceeds the model's context window and compaction failed to shorten \
-             it further; shorten it before retrying",
+            "compaction failed to bring the conversation under the model's context window; \
+             shorten it before retrying",
             message,
         ),
         // The names travel and the reasons do not, which is the policy the arms above state. A
         // reason here is the connector's own text and has carried a spawn failure complete with the
         // command line and its path.
         MekaError::McpTurnGated { servers } => {
-            tracing::warn!("mcp gate refused a turn: {error}");
+            tracing::warn!("mcp gate declined a turn: {error}");
             let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
             agent_client_protocol::util::internal_error(format!(
                 "required MCP server(s) not ready: {}; each server's reason is in the meka log",

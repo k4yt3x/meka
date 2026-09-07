@@ -299,7 +299,7 @@ pub(crate) fn finalize_tool_arguments(
         return Ok(serde_json::json!({}));
     }
     serde_json::from_str(raw).map_err(|error| {
-        tracing::warn!("rejecting tool call '{name}' with unparseable JSON arguments: {error}");
+        tracing::warn!("refusing tool call '{name}' with unparseable JSON arguments: {error}");
         format!("invalid JSON arguments: {error}")
     })
 }
@@ -1339,6 +1339,7 @@ mod tests {
                 AuthCredential::ApiKey("key".to_string())
             };
             let built = ProviderBuilder::new(backend, credential, "some-model")
+                .credential_key(Some("work".to_string()))
                 .device_id("a".repeat(64))
                 .build();
             assert!(
@@ -1434,6 +1435,7 @@ mod tests {
             },
             "claude-sonnet-4-20250514",
         )
+        .credential_key(Some("work".to_string()))
         .device_id("a".repeat(64))
         .build();
         assert!(result.is_ok());
@@ -1478,9 +1480,72 @@ mod tests {
             },
             "gpt-5",
         )
+        .credential_key(Some("work".to_string()))
         .effort(Some("high".to_string()))
         .build();
         assert!(result.is_ok());
+    }
+
+    /// A subscription provider is built only with the account its credential is stored under.
+    ///
+    /// It writes refreshed tokens back to that `account_credentials` row. A default in its place
+    /// (the backend name) was a second answer to a question the registry already answers: the row
+    /// would be one no account names, `account list` would report it as an orphan, and the real
+    /// account's credential would stay stale.
+    #[test]
+    fn a_subscription_provider_is_not_built_without_the_account_its_credential_lives_under() {
+        for backend in [Backend::ClaudeSubscription, Backend::ChatGptSubscription] {
+            let builder = || {
+                ProviderBuilder::new(
+                    backend,
+                    AuthCredential::OAuthToken {
+                        access_token: "token".to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                        account_id: None,
+                    },
+                    "some-model",
+                )
+                .device_id("a".repeat(64))
+            };
+            let Err(error) = builder().build() else {
+                panic!("{backend} built with no account to write refreshed tokens to");
+            };
+            assert!(error.to_string().contains("account"), "{error}");
+            assert!(
+                builder()
+                    .credential_key(Some("work".to_string()))
+                    .build()
+                    .is_ok(),
+                "{backend} builds once the account is named"
+            );
+        }
+    }
+
+    /// The registry refuses a profile whose model is the empty string the way it refuses one with
+    /// no model: `""` is valid TOML that `is_none()` does not see, and it would go to the provider
+    /// as the model's name.
+    #[tokio::test]
+    async fn the_registry_refuses_a_profile_whose_model_is_empty() {
+        let mut profiles = profiles(&["blank", "named"]);
+        profiles.profile("blank").model = Some(String::new());
+        profiles.profile("named").model = Some("some-model".to_string());
+        let registry = provider_registry_for_test(profiles).await;
+        for account in ["blank", "named"] {
+            registry
+                .token_store
+                .save_account_credential(account, &AuthCredential::ApiKey("key".to_string()))
+                .await
+                .expect("save");
+        }
+        let Err(error) = registry.resolve("blank").await else {
+            panic!("an empty model was handed to a provider");
+        };
+        assert!(error.to_string().contains("names no model"), "{error}");
+        assert!(
+            registry.resolve("named").await.is_ok(),
+            "a profile that names a model resolves"
+        );
     }
 
     #[test]

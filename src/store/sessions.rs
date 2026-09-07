@@ -300,14 +300,35 @@ pub(super) const REDACT_ROLE: &str = "redact";
 /// The `messages` row a session's title is read from, as a `WHERE` over `messages` correlated to
 /// `sessions s`: the first user message that carries words. A `user` row is text by construction; a
 /// `user_blocks` row is a JSON array of blocks and is passed over while none of them is a `text`
-/// block, so an image sent alone does not leave the session unlabeled once words follow. This is
-/// [`crate::conversation::Conversation::title`]'s "first user `Text` block" in SQL, and
-/// [`title_of_first_user_row`] then applies that function to the row it selects.
-const TITLE_ROW_WHERE_SQL: &str = "session_id = s.id
-         AND (role = 'user'
+/// block, so an image sent alone does not leave the session unlabeled once words follow. Blank
+/// text and a stand-in meka wrote do not count as words in either shape, which is
+/// [`crate::conversation::is_harness_stand_in`] spelled in SQL. A compaction summary is under its
+/// own pseudo-role and is never selected. This is [`crate::conversation::Conversation::title`]'s
+/// rule over the log, and [`title_of_first_user_row`] then applies that function to the row it
+/// selects, so the two cannot pick different rows.
+static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let quoted = |text: &str| format!("'{}'", text.replace('\'', "''"));
+    // What `Conversation::title` takes as words, over one SQL expression holding the text.
+    let is_words = |text: &str| {
+        format!(
+            "(trim({text}, ' ' || char(9, 10, 11, 12, 13)) <> '' AND {text} <> {placeholder} \
+             AND substr({text}, 1, {note_chars}) <> {note})",
+            placeholder = quoted(crate::conversation::IMAGE_REDACTION_PLACEHOLDER),
+            note_chars = crate::conversation::HARNESS_NOTE.chars().count(),
+            note = quoted(crate::conversation::HARNESS_NOTE),
+        )
+    };
+    format!(
+        "session_id = s.id
+         AND ((role = 'user' AND {user_words})
               OR (role = 'user_blocks'
                   AND EXISTS (SELECT 1 FROM json_each(messages.content)
-                              WHERE json_extract(json_each.value, '$.type') = 'text')))";
+                              WHERE json_extract(json_each.value, '$.type') = 'text'
+                                AND {block_words})))",
+        user_words = is_words("messages.content"),
+        block_words = is_words("json_extract(json_each.value, '$.text')"),
+    )
+});
 /// A session's title from the row [`TITLE_ROW_WHERE_SQL`] selects, through the one definition in
 /// [`crate::conversation::Conversation::title`]. A `user_blocks` row holds the message's blocks as
 /// JSON; a `user` row is the text itself.
@@ -1286,6 +1307,29 @@ impl Store {
                 tool_outputs: record.tool_outputs,
             });
         }
+        // Resolved ahead of the transaction, so an archive naming a blob nobody holds is refused as
+        // the caller's mistake, in words for them; the same check inside the transaction stays as
+        // the fail-closed guard for a blob swept between the two.
+        let carried: std::collections::HashSet<&str> = archive_blobs
+            .iter()
+            .map(|blob| blob.hash.as_str())
+            .collect();
+        let mut unresolved: Vec<String> = Vec::new();
+        for session in &encoded {
+            for (_, _, _, references) in &session.events {
+                for hash in references {
+                    if !carried.contains(hash.as_str()) && !unresolved.contains(hash) {
+                        unresolved.push(hash.clone());
+                    }
+                }
+            }
+        }
+        if let Some(hash) = self.first_missing_blob(unresolved).await? {
+            return Err(MekaError::Usage(format!(
+                "the archive references image blob {hash}, which it does not carry and this store \
+                 does not hold"
+            )));
+        }
         // Each root of the tree is claimed before its row lands and released once it has, the
         // ordering every door that mints a session keeps (see `claim_a_fresh_id`): a row visible
         // before its lock is one a concurrent `meka session delete --all` enumerates and sweeps.
@@ -1909,17 +1953,18 @@ impl Store {
                 } else {
                     format!("WHERE {}", clauses.join(" AND "))
                 };
+                let title_row = TITLE_ROW_WHERE_SQL.as_str();
                 let query = format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
                             COALESCE(
                               (SELECT content FROM messages
-                               WHERE {TITLE_ROW_WHERE_SQL}
+                               WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_content,
                             COALESCE(
                               (SELECT role FROM messages
-                               WHERE {TITLE_ROW_WHERE_SQL}
+                               WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_role
@@ -2032,17 +2077,18 @@ impl Store {
     pub(crate) async fn session_info(&self, id: Uuid) -> Result<Option<SessionSummary>> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
+                let title_row = TITLE_ROW_WHERE_SQL.as_str();
                 let mut statement = connection.prepare(&format!(
                     "SELECT s.id, s.created_at, s.updated_at, s.cwd, s.permission, s.capabilities_json, s.additional_roots_json, s.token_id, s.parent_session_id, s.profile, s.approvals,
                             COALESCE(
                               (SELECT content FROM messages
-                               WHERE {TITLE_ROW_WHERE_SQL}
+                               WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_content,
                             COALESCE(
                               (SELECT role FROM messages
-                               WHERE {TITLE_ROW_WHERE_SQL}
+                               WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
                             ) AS title_role
@@ -5222,6 +5268,115 @@ mod tests {
         assert_eq!(
             info.title, summary.title,
             "both readers select the same row"
+        );
+    }
+
+    /// The SQL twin of `Conversation::title` skips what it skips: a turn whose only text is the
+    /// placeholder a redaction left, and a compaction summary, so the title is the first words a
+    /// user said even when the store replays a redacted, compacted session.
+    #[tokio::test]
+    async fn list_sessions_title_skips_a_placeholder_and_a_compaction_summary() {
+        use crate::conversation::{ContentBlock, Event, Message, Role};
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create_session");
+        let placeholder_only = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::TurnContext {
+                    text: "<context/>".to_string(),
+                },
+                ContentBlock::Text {
+                    text: crate::conversation::IMAGE_REDACTION_PLACEHOLDER.to_string(),
+                },
+            ],
+        };
+        let events = [
+            Event::Append(placeholder_only),
+            Event::Append(Message::user(format!(
+                "{} An image here was removed.",
+                crate::conversation::HARNESS_NOTE
+            ))),
+            Event::CompactBoundary {
+                summary: Message::user("[Conversation summary from session compaction] nothing"),
+                replaced_count: 2,
+                loaded_tools_snapshot: std::collections::HashSet::new(),
+            },
+            Event::Append(mock_run_turn_user_message(
+                crate::permission::Permission::Read,
+                "what is in this picture?",
+            )),
+        ];
+        for event in &events {
+            store.save_event(session_id, event).await.expect("save");
+        }
+
+        let (summaries, _next_cursor) = store
+            .list_sessions(10, false, None, None)
+            .await
+            .expect("list_sessions");
+        let summary = summaries.iter().find(|s| s.id == session_id).unwrap();
+        assert_eq!(summary.title, "what is in this picture?");
+        let info = store
+            .session_info(session_id)
+            .await
+            .expect("session_info")
+            .expect("row");
+        assert_eq!(
+            info.title, summary.title,
+            "both readers select the same row"
+        );
+    }
+
+    /// An archive naming an image blob it does not carry and the store does not hold is refused in
+    /// the caller's words, before any row of it is written.
+    #[tokio::test]
+    async fn an_archive_referencing_a_blob_nobody_holds_is_refused_before_any_write() {
+        let store = Store::for_test().await;
+        let new_id = uuid::Uuid::new_v4();
+        let hash = "0".repeat(64);
+        let record = ImportSessionRecord {
+            new_id,
+            new_parent_id: None,
+            created_at: "2026-08-31T00:00:00Z".to_string(),
+            cwd: None,
+            permission: crate::permission::Permission::Read,
+            approvals: false,
+            capabilities_json: None,
+            additional_roots: Vec::new(),
+            subagent_spec_json: None,
+            profile: "test-profile".to_string(),
+            stats: Default::default(),
+            events: vec![(
+                "2026-08-31T00:00:00Z".to_string(),
+                crate::conversation::Event::Append(crate::conversation::Message::user_with_images(
+                    "look",
+                    vec![crate::image::ImageSource::Blob {
+                        hash: hash.clone(),
+                        media_type: "image/png".to_string(),
+                        size: 3,
+                    }],
+                )),
+            )],
+            tool_outputs: Vec::new(),
+        };
+        let error = store
+            .import_sessions(vec![record], Vec::new())
+            .await
+            .expect_err("a reference nobody can resolve is refused");
+        assert!(
+            matches!(&error, MekaError::Usage(message) if message.contains(&hash)),
+            "the refusal is the caller's to act on and names the blob: {error}"
+        );
+        assert!(
+            store
+                .session_info(new_id)
+                .await
+                .expect("session_info")
+                .is_none(),
+            "nothing was written"
         );
     }
 

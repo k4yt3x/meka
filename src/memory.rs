@@ -1,7 +1,7 @@
 //! Agent memory: durable notes the agent writes for itself, surviving compaction and outliving any
 //! one session.
 //!
-//! Memories are rows in the `memories` table of meka's database (`MEKA_DATA_DIR`), one per note,
+//! Memories are rows in the `memories` table of the store (`MEKA_DATA_DIR`), one per note,
 //! carrying a required one-line `description` and an optional body, priority and tag set. The store
 //! is scoped to the meka *instance*, not to a session or a directory: meka has no Project concept,
 //! and the motivating deployment is a single always-on session reachable over chat, where the agent
