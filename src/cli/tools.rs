@@ -26,6 +26,12 @@ pub(crate) fn run_tools_subcommand(
             // Build with no filter so the catalog carries every tool's hardcoded level; overlay
             // the real filter for status/source.
             let store = store.clone();
+            // Built for its profile names only: the listing shows the `profile` choices a session
+            // would offer, and nothing here resolves one.
+            let providers = std::sync::Arc::new(crate::provider::ProviderRegistry::new(
+                &config,
+                store.token_store(),
+            ));
             let shared_permission =
                 SharedPermission::new(config.permission, config.enabled_permissions);
             let materials = crate::session::SessionMaterials {
@@ -51,6 +57,7 @@ pub(crate) fn run_tools_subcommand(
                     crate::store::memory::MemoryStore::disabled()
                 },
                 store,
+                providers,
                 mcp_manager: None,
                 session_stats: std::sync::Arc::new(crate::stats::SessionStats::default()),
                 schedule: config.schedule.clone(),

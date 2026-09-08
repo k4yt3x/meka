@@ -67,6 +67,9 @@ pub(crate) struct SessionMaterials {
     pub(crate) skills_agent_managed: bool,
     pub(crate) memories: Arc<crate::store::memory::MemoryStore>,
     pub(crate) store: Store,
+    /// Every profile the process configured, so a sub-agent can be built on one its parent
+    /// chose rather than the one it is running on.
+    pub(crate) providers: Arc<crate::provider::ProviderRegistry>,
     /// The MCP manager, held weakly: it holds every attached registry, which holds the tools that
     /// hold this, and a strong reference would keep a closed session alive until exit.
     pub(crate) mcp_manager: Option<std::sync::Weak<crate::mcp::McpClientManager>>,
@@ -247,12 +250,17 @@ impl SessionMaterials {
     /// Materials for a test: sandbox off and unavailable, both stores detached, no MCP, no
     /// sub-agents, every subsystem config at its default.
     pub(crate) fn for_test(store: Store) -> Self {
+        let providers = Arc::new(crate::provider::ProviderRegistry::for_test(
+            store.token_store(),
+            &["test-profile"],
+        ));
         Self {
             core: CoreMaterials::for_test(),
             skills: crate::skills::SkillCache::for_root(None),
             skills_agent_managed: false,
             memories: crate::store::memory::MemoryStore::detached(),
             store,
+            providers,
             mcp_manager: None,
             session_stats: Arc::new(crate::stats::SessionStats::default()),
             schedule: crate::config::ResolvedScheduleConfig::default(),

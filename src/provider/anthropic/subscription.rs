@@ -3065,6 +3065,10 @@ mod tests {
         let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -3217,6 +3221,10 @@ mod tests {
         let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -3377,6 +3385,10 @@ mod tests {
         );
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -3504,6 +3516,10 @@ mod tests {
         let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -3618,6 +3634,10 @@ mod tests {
         let todo_list = crate::todo::SharedTodoList::default();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,

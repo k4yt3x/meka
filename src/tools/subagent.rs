@@ -32,10 +32,11 @@ const SUBAGENT_ABSOLUTE_MAX_DEPTH: usize = 16;
 #[derive(Clone)]
 pub(crate) struct ToolBuilderParams {
     pub(crate) materials: crate::session::SessionMaterials,
-    /// The spawning agent's own cells. `cells.profile` is what the parent runs on *now*, read at
-    /// spawn time rather than at registration: a worker spawned after a `/profile` switch went
-    /// to the profile the user had just left, billing that account, while its own row recorded
-    /// the new one. `cells.cwd` is snapshotted per spawn so a parent `/cd` mid-turn cannot move a
+    /// The spawning agent's own cells. `cells.profile` is what the parent runs on *now*, which is
+    /// what a worker whose spawn named no profile runs on; read at spawn time rather than at
+    /// registration, because a worker spawned after a `/profile` switch went to the profile the
+    /// user had just left, billing that account, while its own row recorded the new one.
+    /// `cells.cwd` is snapshotted per spawn so a parent `/cd` mid-turn cannot move a
     /// running worker; the roots are shared, because nothing mutates them after construction. A
     /// worker bounded by `writable_roots` takes neither: its directory and roots are its own.
     pub(crate) cells: crate::session::SessionCells,
@@ -117,6 +118,12 @@ pub(crate) struct SubagentSpec {
     /// is reachable from the absence.
     #[serde(default)]
     pub(crate) writable_roots: Vec<PathBuf>,
+    /// The profile the spawn call chose, when it chose one. Absent for a worker that runs on what
+    /// its parent runs on now and follows it across a switch; named, it pins the worker to that
+    /// profile on every follow-up. Absent on the wire too, so the document does not say whether
+    /// the choice was open when nothing was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
 }
 
 impl SubagentSpec {
@@ -219,13 +226,26 @@ pub(crate) struct AgentSpawnTool {
     /// `remaining_depth` it can't be reset by `max_depth`, so it bounds real recursion at
     /// [`SUBAGENT_ABSOLUTE_MAX_DEPTH`] regardless of what the agent requests.
     pub(crate) absolute_depth: usize,
+    /// The profiles a spawn call may name, sorted; empty when `[subagents].agent_chosen_profile`
+    /// is off, and then the schema carries no `profile` parameter.
+    pub(crate) profile_choices: Vec<String>,
+}
+
+/// The profiles `agent_spawn` offers under `materials`: every configured one when
+/// `[subagents].agent_chosen_profile` is on, none otherwise. One definition for the root's tool
+/// and every nested one, so the rule is the same at every depth.
+pub(crate) fn profile_choices(materials: &crate::session::SessionMaterials) -> Vec<String> {
+    if materials.subagents.agent_chosen_profile {
+        materials.providers.profile_names()
+    } else {
+        Vec::new()
+    }
 }
 
 /// `agent_spawn`'s schema, as a free function so a caller holding no tool can still name it.
-pub(crate) fn agent_spawn_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: "agent_spawn".to_string(),
-        description: "Spawn a sub-agent to perform a research, analysis, or delegated task. \
+/// `profile_choices` is what the `profile` parameter offers; empty, the parameter is absent.
+pub(crate) fn agent_spawn_definition(profile_choices: &[String]) -> ToolDefinition {
+    let mut description = "Spawn a sub-agent to perform a research, analysis, or delegated task. \
                       The sub-agent inherits the parent's permission level, has its own \
                       private todo list and scratchpad, and returns a single text report. \
                       Multiple agent_spawn calls in one turn run in parallel. Pass `skill` \
@@ -247,113 +267,128 @@ pub(crate) fn agent_spawn_definition() -> ToolDefinition {
                       individual tools it would otherwise inherit. Restrictions only ever \
                       accumulate: these add to whatever the installation already denies \
                       sub-agents, and there is no way to grant back."
-            .to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "The task description for the sub-agent. Optional when \
-                                    `skill` is given; otherwise required."
-                },
-                "skill": {
-                    "type": "string",
-                    "description": "Name of an installed skill to run in the sub-agent. The \
-                                    skill's instructions become the sub-agent's task; \
-                                    `prompt`, if also given, is prepended as extra direction."
-                },
-                "scratchpad": {
-                    "type": "string",
-                    "description": "If provided, save the sub-agent's final report to the \
-                                    parent's scratchpad under this name instead of returning \
-                                    it inline."
-                },
-                "inherit_scratchpad": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Names of the parent's scratchpad entries the sub-agent \
-                                    is allowed to read. The sub-agent's `scratchpad_read` \
-                                    falls back to the parent for these names; \
-                                    `scratchpad_list` shows them with origin `inherited`. \
-                                    Read-only: `scratchpad_write` / `_edit` / `_delete` \
-                                    targeting an inherited name return an error so the \
-                                    sub-agent can't silently shadow your copy. Names that \
-                                    don't exist in the parent are silently skipped."
-                },
-                "permission": {
-                    "type": "string",
-                    "enum": ["none", "read", "workspace", "unrestricted"],
-                    "description": "Permission level for the sub-agent, never above your \
-                                    own. Defaults to your current level; use a lower one \
-                                    (e.g. \"read\") to sandbox risky work."
-                },
-                "writable_roots": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Directories the sub-agent may write under, and nowhere \
-                                    else. The first becomes its working directory, so relative \
-                                    paths in its tool calls resolve inside it; the rest are its \
-                                    additional workspace roots. Each must be an existing \
-                                    directory (relative entries resolve against your working \
-                                    directory) and, unless you are at `unrestricted`, must lie \
-                                    inside your own workspace: a sub-agent's reach never exceeds \
-                                    yours. Needs you at `workspace` or above; the sub-agent runs \
-                                    at `workspace` unless `permission` asks for less, and \
-                                    `permission: \"unrestricted\"` is refused alongside it since \
-                                    the list would then bound nothing. Omit it to share your \
-                                    workspace; an empty list is refused."
-                },
-                "memory": {
-                    "type": "string",
-                    "enum": ["none", "read"],
-                    "default": "none",
-                    "description": "Grant the sub-agent read access to your memory store. \
-                                    Defaults to \"none\": a sub-agent starts with a clean slate, \
-                                    since memories from unrelated work are context it pays for \
-                                    and reasons from. Grant \"read\" when the task genuinely \
-                                    depends on what you have recorded. Sub-agents can never \
-                                    write to the store; record anything worth keeping \
-                                    yourself, from the sub-agent's report."
-                },
-                "instructions": {
-                    "type": "string",
-                    "enum": ["none", "inherit"],
-                    "default": "none",
-                    "description": "Give the sub-agent the installation's instructions file. \
-                                    Defaults to \"none\", because those instructions describe \
-                                    you (your persona, how to address the user), and a \
-                                    sub-agent is not you. Pass \"inherit\" when the task needs \
-                                    the project's standing rules verbatim and quoting the \
-                                    relevant ones into `prompt` would be lossy or expensive."
-                },
-                "deny_servers": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "MCP server names the sub-agent must not see. Removes \
-                                    everything the server offers: its tools, its resources, \
-                                    and its prompts. Use this when a server exists to act on \
-                                    your behalf or to talk to the user, so a sub-agent cannot \
-                                    speak as you."
-                },
-                "deny_tools": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Individual tool names the sub-agent must not see, as they \
-                                    appear in your own tool list (e.g. \"write_file\", \
-                                    \"mcp__notion__create_page\"). For a whole server, prefer \
-                                    `deny_servers`."
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Override how many further levels of sub-agents this \
-                                    sub-agent may itself spawn. Defaults to one less than your \
-                                    own remaining budget. 0 forbids it from spawning further; \
-                                    larger values are still bounded by a built-in absolute \
-                                    recursion cap."
-                }
+        .to_string();
+    let mut parameters = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The task description for the sub-agent. Optional when \
+                                `skill` is given; otherwise required."
+            },
+            "skill": {
+                "type": "string",
+                "description": "Name of an installed skill to run in the sub-agent. The \
+                                skill's instructions become the sub-agent's task; \
+                                `prompt`, if also given, is prepended as extra direction."
+            },
+            "scratchpad": {
+                "type": "string",
+                "description": "If provided, save the sub-agent's final report to the \
+                                parent's scratchpad under this name instead of returning \
+                                it inline."
+            },
+            "inherit_scratchpad": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Names of the parent's scratchpad entries the sub-agent \
+                                is allowed to read. The sub-agent's `scratchpad_read` \
+                                falls back to the parent for these names; \
+                                `scratchpad_list` shows them with origin `inherited`. \
+                                Read-only: `scratchpad_write` / `_edit` / `_delete` \
+                                targeting an inherited name return an error so the \
+                                sub-agent can't silently shadow your copy. Names that \
+                                don't exist in the parent are silently skipped."
+            },
+            "permission": {
+                "type": "string",
+                "enum": ["none", "read", "workspace", "unrestricted"],
+                "description": "Permission level for the sub-agent, never above your \
+                                own. Defaults to your current level; use a lower one \
+                                (e.g. \"read\") to sandbox risky work."
+            },
+            "writable_roots": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Directories the sub-agent may write under, and nowhere \
+                                else. The first becomes its working directory, so relative \
+                                paths in its tool calls resolve inside it; the rest are its \
+                                additional workspace roots. Each must be an existing \
+                                directory (relative entries resolve against your working \
+                                directory) and, unless you are at `unrestricted`, must lie \
+                                inside your own workspace: a sub-agent's reach never exceeds \
+                                yours. Needs you at `workspace` or above; the sub-agent runs \
+                                at `workspace` unless `permission` asks for less, and \
+                                `permission: \"unrestricted\"` is refused alongside it since \
+                                the list would then bound nothing. Omit it to share your \
+                                workspace; an empty list is refused."
+            },
+            "memory": {
+                "type": "string",
+                "enum": ["none", "read"],
+                "default": "none",
+                "description": "Grant the sub-agent read access to your memory store. \
+                                Defaults to \"none\": a sub-agent starts with a clean slate, \
+                                since memories from unrelated work are context it pays for \
+                                and reasons from. Grant \"read\" when the task genuinely \
+                                depends on what you have recorded. Sub-agents can never \
+                                write to the store; record anything worth keeping \
+                                yourself, from the sub-agent's report."
+            },
+            "instructions": {
+                "type": "string",
+                "enum": ["none", "inherit"],
+                "default": "none",
+                "description": "Give the sub-agent the installation's instructions file. \
+                                Defaults to \"none\", because those instructions describe \
+                                you (your persona, how to address the user), and a \
+                                sub-agent is not you. Pass \"inherit\" when the task needs \
+                                the project's standing rules verbatim and quoting the \
+                                relevant ones into `prompt` would be lossy or expensive."
+            },
+            "deny_servers": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "MCP server names the sub-agent must not see. Removes \
+                                everything the server offers: its tools, its resources, \
+                                and its prompts. Use this when a server exists to act on \
+                                your behalf or to talk to the user, so a sub-agent cannot \
+                                speak as you."
+            },
+            "deny_tools": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Individual tool names the sub-agent must not see, as they \
+                                appear in your own tool list (e.g. \"write_file\", \
+                                \"mcp__notion__create_page\"). For a whole server, prefer \
+                                `deny_servers`."
+            },
+            "max_depth": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Override how many further levels of sub-agents this \
+                                sub-agent may itself spawn. Defaults to one less than your \
+                                own remaining budget. 0 forbids it from spawning further; \
+                                larger values are still bounded by a built-in absolute \
+                                recursion cap."
             }
-        }),
+        }
+    });
+    if !profile_choices.is_empty() {
+        description.push_str(
+            " Pass `profile` to run the sub-agent on another configured profile; it keeps that \
+             profile on every follow-up.",
+        );
+        parameters["properties"]["profile"] = serde_json::json!({
+            "type": "string",
+            "enum": profile_choices,
+            "description": "The profile the sub-agent runs on. Defaults to your own."
+        });
+    }
+    ToolDefinition {
+        name: "agent_spawn".to_string(),
+        description,
+        parameters,
         ..Default::default()
     }
 }
@@ -361,7 +396,7 @@ pub(crate) fn agent_spawn_definition() -> ToolDefinition {
 #[async_trait]
 impl Tool for AgentSpawnTool {
     fn definition(&self) -> ToolDefinition {
-        agent_spawn_definition()
+        agent_spawn_definition(&self.profile_choices)
     }
 
     fn required_permission(&self) -> Permission {
@@ -445,6 +480,24 @@ impl Tool for AgentSpawnTool {
         let requested_permission =
             parse_subagent_permission(optional_str(&input, "permission", "agent_spawn")?)?;
         let parent_level = self.parent_permission.get();
+
+        // The profile the worker runs on, when the call names one. Judged here, ahead of every side
+        // effect: with the choice closed the parameter is not in the schema, so a value is a model
+        // reaching for something it was not offered, and it is refused rather than read as absent.
+        // Whether the name resolves is asked by `worker_binding` once the spec exists, still ahead
+        // of the row.
+        let chosen_profile = optional_str(&input, "profile", "agent_spawn")?.map(str::to_string);
+        if let Some(name) = &chosen_profile
+            && self.profile_choices.is_empty()
+        {
+            return Err(MekaError::ToolExecution {
+                tool_name: "agent_spawn".to_string(),
+                message: format!(
+                    "`profile` ('{name}') is not accepted while `[subagents].agent_chosen_profile` \
+                     is off; spawn without it to run the sub-agent on this session's profile"
+                ),
+            });
+        }
 
         // `writable_roots`: an optional list that bounds the worker's writes and sets its working
         // directory. Judged here, ahead of every side effect, by the one acceptor `agent_followup`
@@ -656,7 +709,16 @@ impl Tool for AgentSpawnTool {
                 .as_ref()
                 .map(BoundedWorkspace::roots)
                 .unwrap_or_default(),
+            profile: chosen_profile,
         };
+        // Resolved before the row is written, so a name this installation does not configure, or a
+        // profile whose provider cannot be built, refuses the spawn and leaves nothing behind.
+        let binding = worker_binding(
+            &self.tool_builder_params,
+            spec.profile.as_deref(),
+            "agent_spawn",
+        )
+        .await?;
         let spec_json = serde_json::to_string(&spec).map_err(|error| MekaError::ToolExecution {
             tool_name: "agent_spawn".to_string(),
             message: format!("failed to encode sub-agent spec: {error}"),
@@ -676,9 +738,9 @@ impl Tool for AgentSpawnTool {
                 // The level the worker runs at, on the row like every other session's, so the row
                 // answers for it wherever a row is read.
                 sub_perm.to_string(),
-                // The same cell `build_subagent` reads a moment later, so the row this writes and
-                // the provider the worker is built on cannot come apart.
-                self.tool_builder_params.cells.profile.current().profile,
+                // The same binding `build_subagent` is handed a moment later, so the row this
+                // writes and the provider the worker is built on cannot come apart.
+                binding.profile.clone(),
             )
             .await
             .map_err(|error| MekaError::ToolExecution {
@@ -717,6 +779,7 @@ impl Tool for AgentSpawnTool {
         let sub_agent = match build_subagent(
             &self.tool_builder_params,
             &spec,
+            binding,
             parent_sid,
             sub_session_id,
             workspace,
@@ -1277,9 +1340,42 @@ impl Tool for AgentFollowupTool {
             );
         }
 
+        // A pinned worker runs on what its row names, which its spawn wrote and only an explicit
+        // act has moved since. Read here rather than off the spec so such an act is
+        // honored.
+        let pinned = match &spec.profile {
+            Some(_) => Some(
+                self.tool_builder_params
+                    .materials
+                    .store
+                    .recorded_profile(agent_id)
+                    .await
+                    .map_err(|error| MekaError::ToolExecution {
+                        tool_name: "agent_followup".to_string(),
+                        message: format!(
+                            "failed to read the profile of sub-agent '{agent_id}': {error}"
+                        ),
+                    })?
+                    .ok_or_else(|| MekaError::ToolExecution {
+                        tool_name: "agent_followup".to_string(),
+                        message: format!(
+                            "sub-agent '{agent_id}' records no profile, so it cannot be resumed \
+                             safely. Spawn a new one."
+                        ),
+                    })?,
+            ),
+            None => None,
+        };
+        let binding = worker_binding(
+            &self.tool_builder_params,
+            pinned.as_deref(),
+            "agent_followup",
+        )
+        .await?;
         let sub_agent = build_subagent(
             &self.tool_builder_params,
             &spec,
+            binding,
             parent_sid,
             agent_id,
             workspace,
@@ -1342,8 +1438,8 @@ impl Tool for AgentFollowupTool {
             })?;
 
         // The row has to follow the build, for the reason `agent_spawn` writes it from the same
-        // cell: `build_subagent` runs the worker on the parent's profile now, and a follow-up
-        // after a `/profile` switch would otherwise bill an account the worker's row does not
+        // binding: an unpinned worker runs on the parent's profile now, and a follow-up after a
+        // `/profile` switch would otherwise bill an account the worker's row does not
         // name, so every reader (`meka session list`, `GET /v1/sessions`, `session export`, a
         // later resume) would disagree with what ran.
         //
@@ -1492,6 +1588,33 @@ struct WorkerWorkspace {
     roots: SharedRoots,
 }
 
+/// What a worker runs on: `pinned`, or what its parent runs on now when there is none.
+///
+/// One door for `agent_spawn` and `agent_followup`. The spawn passes the profile its call chose;
+/// the follow-up passes what a pinned worker's own row names, because a session runs on the profile
+/// its row names and that row moves only by an explicit act (an import onto another profile),
+/// which a follow-up honors rather than undoes. An unpinned worker's row is not
+/// consulted: it is rewritten from the parent after every follow-up, so the parent's live cell is
+/// the truth. A name that no longer resolves is refused by name, as resuming a root session on a
+/// deleted profile is.
+async fn worker_binding(
+    params: &ToolBuilderParams,
+    pinned: Option<&str>,
+    tool_name: &'static str,
+) -> Result<crate::provider::ResolvedProfile> {
+    match pinned {
+        Some(name) => {
+            crate::provider::resolved_profile(&params.materials.providers, name.to_string())
+                .await
+                .map_err(|error| MekaError::ToolExecution {
+                    tool_name: tool_name.to_string(),
+                    message: format!("cannot run the sub-agent on profile '{name}': {error}"),
+                })
+        }
+        None => Ok(params.cells.profile.current()),
+    }
+}
+
 /// Build the worker described by `spec`: its tool registry, its inherited MCP toolset, its own
 /// `agent_spawn` when the recursion budget allows, its system prompt, and the `Agent` over all of
 /// it.
@@ -1505,9 +1628,16 @@ struct WorkerWorkspace {
 /// `params` supplies the *ambient* collaborators (provider, caches, store, frontend) and
 /// `spec` supplies every restriction. `params.memory_access` is deliberately not read here: the
 /// spec's copy is authoritative, because config may have changed since the spawn.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one parameter per decision the two doors make before building; a struct would carry the same names one step upstream"
+)]
 async fn build_subagent(
     params: &ToolBuilderParams,
     spec: &SubagentSpec,
+    // What the worker runs on, from [`worker_binding`]: the profile it is pinned to, or what its
+    // parent runs on now.
+    binding: crate::provider::ResolvedProfile,
     parent_session_id: Uuid,
     sub_session_id: Uuid,
     workspace: WorkerWorkspace,
@@ -1520,10 +1650,7 @@ async fn build_subagent(
     // let a worker outlive its parent's downgrade: the value was read once and frozen into a fresh
     // atomic, so nothing the user did afterwards could reach the running child.
     let parent_permission = &params.cells.permission;
-    // Read at spawn time, not at registration: the parent may have switched profile since this
-    // tool was registered, and a worker runs on what its parent runs on *now*.
-    let parent_profile = params.cells.profile.current();
-    // A worker's window comes off `parent_profile` inside `Agent::new_subagent`, not from
+    // A worker's window comes off `binding` inside `Agent::new_subagent`, not from
     // `params.parent_options`, which was cloned when the session was assembled and cannot hear
     // about a switch. Taking the provider from one and the window from the other would have a
     // worker talk to a 32k profile while auto-compacting at 80% of the 1M one the session had left.
@@ -1555,7 +1682,7 @@ async fn build_subagent(
             call.tool_call_id.clone(),
         ));
     // The worker's own cells: its clamped permission, the directory and roots it was handed, a
-    // session of its own, fresh gauges, and a profile seeded from what the parent runs on now. A
+    // session of its own, fresh gauges, and a profile seeded from its binding. A
     // worker has no prompt gauge and no session entry watching it, and it never switches, so
     // nothing outside needs the handle. The write fence and the shell sandbox are both built from
     // `roots` by `register_core_tools`, so a bounded worker's boundary is what these cells say.
@@ -1565,7 +1692,7 @@ async fn build_subagent(
         roots: workspace.roots,
         session_id: sub_shared_session_id,
         todo_list: sub_todo_list,
-        profile: crate::provider::PublishedProfile::detached(&parent_profile),
+        profile: crate::provider::PublishedProfile::detached(&binding),
         context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         background_tasks: crate::background::BackgroundTasks::default(),
@@ -1620,10 +1747,15 @@ async fn build_subagent(
         let child_params = ToolBuilderParams {
             materials: params.materials.clone(),
             cells: crate::session::SessionCells {
-                // The *parent's* handle, not a snapshot of what it currently holds: a switch the
-                // user makes later must reach the whole subtree's future spawns, not just its
-                // first level.
-                profile: params.cells.profile.clone(),
+                // A pinned worker's children default to its pinned profile, so the choice holds
+                // through the subtree. Otherwise the *parent's* handle, not a snapshot of what it
+                // currently holds: a switch the user makes later must reach the whole subtree's
+                // future spawns, not just its first level.
+                profile: if spec.profile.is_some() {
+                    sub_cells.profile.clone()
+                } else {
+                    params.cells.profile.clone()
+                },
                 ..sub_cells.clone()
             },
             // The worker's own granted level, not its parent's. `params.memory_access` is what the
@@ -1648,6 +1780,7 @@ async fn build_subagent(
             inherited_denials: denials,
             remaining_depth: spec.remaining_depth,
             absolute_depth: spec.absolute_depth,
+            profile_choices: profile_choices(&params.materials),
         })?;
     }
 
@@ -2125,6 +2258,7 @@ mod tests {
             remaining_depth: 2,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            profile: None,
         };
 
         assert_eq!(
@@ -2197,6 +2331,7 @@ mod tests {
                 remaining_depth: 2,
                 absolute_depth: 1,
                 writable_roots: Vec::new(),
+                profile: None,
             }
         }
 
@@ -2271,11 +2406,12 @@ mod tests {
         let input = serde_json::json!({
             "permission": 0,
             "memory": true,
+            "profile": 0,
             "good": "read",
             "blank": "   ",
             "explicit_null": null,
         });
-        for key in ["permission", "memory"] {
+        for key in ["permission", "memory", "profile"] {
             let error = optional_str(&input, key, "agent_spawn")
                 .expect_err("a non-string restriction must be refused");
             assert!(error.to_string().contains(key), "{error}");
@@ -2418,6 +2554,10 @@ mod tests {
 
         let sub_registry = ToolRegistry::build_for_subagent(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    Store::for_test().await.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -2482,6 +2622,7 @@ mod tests {
             remaining_depth: 2,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            profile: None,
         }
     }
 
@@ -2510,6 +2651,7 @@ mod tests {
         let worker = build_subagent(
             &params,
             &spec_for_test(Permission::Read),
+            params.cells.profile.current(),
             parent_session,
             Uuid::new_v4(),
             WorkerWorkspace {
@@ -2553,6 +2695,10 @@ mod tests {
             "an absent memory level must cost the worker the store, not hand it over"
         );
         assert_eq!(decoded.remaining_depth, 0, "and must not let it spawn");
+        assert_eq!(
+            decoded.profile, None,
+            "an absent profile is a worker that follows its parent"
+        );
         // The deny lists are the one pair that can't fail closed on their own (an empty list is
         // indistinguishable from "nothing was denied"), which is why `agent_followup` re-unions
         // them with current config rather than trusting the spec alone.
@@ -2774,6 +2920,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
         let output = spawn
             .execute(
@@ -2911,6 +3058,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            profile: None,
         };
         let (worker, held) = store
             .create_child_session(
@@ -2973,6 +3121,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            profile: None,
         };
         // On a profile the parent is not on, so a write that should not happen is visible.
         let (worker, held) = store
@@ -3066,6 +3215,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            profile: None,
         };
         let child = store
             .create_child_session(
@@ -3153,6 +3303,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            profile: None,
         };
         let child = store
             .create_child_session(
@@ -3214,6 +3365,7 @@ mod tests {
             remaining_depth: 0,
             absolute_depth: 1,
             writable_roots: Vec::new(),
+            profile: None,
         };
         let config = ToolDenials::new(vec!["mekabridge".to_string()], vec![
             "web_search".to_string(),
@@ -3261,6 +3413,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
         let output = spawn
             .execute(
@@ -3322,6 +3475,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
         let output = spawn
             .execute(
@@ -3390,6 +3544,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
         let output = spawn
             .execute(
@@ -3615,6 +3770,7 @@ mod tests {
             // Deep enough that the worker gets its own `agent_spawn`.
             remaining_depth: 2,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
         // The worker itself is granted nothing, which is the default.
         spawn
@@ -3686,6 +3842,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
 
         let redirected = spawn
@@ -3889,6 +4046,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
 
         let permitted = ToolRegistry::new();
@@ -3947,6 +4105,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         })
         .expect("register");
         for name in [
@@ -4214,6 +4373,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 0,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
         let error = spawn
             .execute(
@@ -4285,6 +4445,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         };
         let output = spawn
             .execute(
@@ -4472,6 +4633,7 @@ mod tests {
             inherited_denials: ToolDenials::default(),
             remaining_depth: 1,
             absolute_depth: 0,
+            profile_choices: Vec::new(),
         }
     }
 
@@ -4484,6 +4646,832 @@ mod tests {
             tool_builder_params: params.on_provider(provider),
             in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Params whose installation configures `other` beside `test-profile` with the choice open,
+    /// and `provider` standing in for every profile, the way `MEKA_MOCK_PROVIDER` does.
+    fn params_with_profile_choice(
+        store: Store,
+        parent_session: crate::session::SharedSessionId,
+        provider: Arc<dyn Provider>,
+    ) -> ToolBuilderParams {
+        let mut params = params_for_test(store.clone(), parent_session);
+        let providers = crate::provider::ProviderRegistry::for_test(store.token_store(), &[
+            "other",
+            "test-profile",
+        ]);
+        providers.install_scripted(provider);
+        params.materials.providers = Arc::new(providers);
+        params.materials.subagents.agent_chosen_profile = true;
+        params
+    }
+
+    /// [`spawn_tool_for`], offering whatever profiles `params` open, as `register_subagent_tools`
+    /// does.
+    fn spawn_tool_with_choices(
+        params: ToolBuilderParams,
+        provider: Arc<dyn Provider>,
+    ) -> AgentSpawnTool {
+        let profile_choices = profile_choices(&params.materials);
+        AgentSpawnTool {
+            profile_choices,
+            ..spawn_tool_for(params, provider)
+        }
+    }
+
+    /// What `agent_spawn` is registered with: nothing while the choice is closed, and exactly the
+    /// configured names, in name order, once it is open. Pinned here because the schema test below
+    /// takes its names as given.
+    #[tokio::test]
+    async fn profile_choices_are_the_configured_names_only_while_the_choice_is_open() {
+        let store = store_for_test().await;
+        let mut materials = crate::session::SessionMaterials::for_test(store.clone());
+        materials.providers = Arc::new(crate::provider::ProviderRegistry::for_test(
+            store.token_store(),
+            &["test-profile", "other"],
+        ));
+        assert!(
+            profile_choices(&materials).is_empty(),
+            "closed: the parameter must not exist"
+        );
+        materials.subagents.agent_chosen_profile = true;
+        assert_eq!(
+            profile_choices(&materials),
+            vec!["other".to_string(), "test-profile".to_string()],
+            "open: every configured name, sorted"
+        );
+    }
+
+    /// The `profile` parameter exists only while `[subagents].agent_chosen_profile` is on, so a
+    /// model is never offered a choice the operator closed, and is offered exactly the configured
+    /// names when it is open.
+    #[test]
+    fn the_schema_offers_profile_only_when_the_choice_is_open() {
+        let closed = agent_spawn_definition(&[]);
+        assert!(
+            closed.parameters["properties"].get("profile").is_none(),
+            "{closed:?}"
+        );
+        assert!(
+            !closed.description.contains("`profile`"),
+            "{}",
+            closed.description
+        );
+
+        let open = agent_spawn_definition(&["deep".to_string(), "fast".to_string()]);
+        assert_eq!(
+            open.parameters["properties"]["profile"]["enum"],
+            serde_json::json!(["deep", "fast"]),
+            "{open:?}"
+        );
+        assert!(
+            open.description.contains("`profile`"),
+            "{}",
+            open.description
+        );
+    }
+
+    /// The one door both `agent_spawn` and `agent_followup` build from: a chosen profile resolves
+    /// by name, an unnamed one is whatever the parent runs on now, and a name the installation
+    /// does not configure is refused by name.
+    #[tokio::test]
+    async fn a_worker_binding_follows_the_spec_then_the_parent() {
+        let store = store_for_test().await;
+        let provider: Arc<dyn Provider> = mock(Vec::new());
+        let params = params_with_profile_choice(
+            store,
+            crate::session::SharedSessionId::new(None),
+            Arc::clone(&provider),
+        )
+        .on_provider(provider);
+
+        let pinned = worker_binding(&params, Some("other"), "agent_spawn")
+            .await
+            .expect("a configured profile resolves");
+        assert_eq!(pinned.profile, "other");
+
+        let following = worker_binding(&params, None, "agent_spawn")
+            .await
+            .expect("the parent's own profile resolves");
+        assert_eq!(following.profile, "test-profile");
+
+        let refused = match worker_binding(&params, Some("missing"), "agent_followup").await {
+            Ok(binding) => panic!(
+                "an unconfigured profile must be refused, got '{}'",
+                binding.profile
+            ),
+            Err(error) => error,
+        };
+        assert!(refused.to_string().contains("missing"), "{refused}");
+    }
+
+    /// A spawn that names a profile records it on the worker's row and in its spec, and leaves the
+    /// parent where it was.
+    #[tokio::test]
+    async fn a_chosen_profile_is_recorded_on_the_row_and_in_the_spec() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![text_round("done on the other profile")]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let spawn = spawn_tool_with_choices(params, provider);
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        assert_eq!(
+            store
+                .recorded_profile(agent_id)
+                .await
+                .expect("row")
+                .as_deref(),
+            Some("other"),
+            "the row is the billing record"
+        );
+        let spec: SubagentSpec = serde_json::from_str(
+            &store
+                .load_subagent_spec(agent_id)
+                .await
+                .expect("load spec")
+                .expect("a worker has a spec"),
+        )
+        .expect("decode");
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("other"),
+            "the spec carries the choice for every follow-up"
+        );
+        assert_eq!(
+            store
+                .recorded_profile(parent_sid)
+                .await
+                .expect("row")
+                .as_deref(),
+            Some("test-profile"),
+            "the parent stays where it was"
+        );
+    }
+
+    /// With the choice closed the parameter is not offered, so a value is a model reaching for
+    /// something it was not given: refused rather than read as absent, and nothing is written.
+    #[tokio::test]
+    async fn a_profile_is_refused_while_the_choice_is_closed() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        let spawn = spawn_tool_for(params, mock(vec![text_round("never runs")]));
+        let error = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("the choice is closed");
+        assert!(
+            error.to_string().contains("agent_chosen_profile"),
+            "{error}"
+        );
+        assert!(
+            only_the_parent(&store, parent_sid).await,
+            "a refused spawn must leave no child row behind"
+        );
+    }
+
+    /// A name the installation does not configure is refused ahead of the row, with the text every
+    /// other door gives an unknown profile.
+    #[tokio::test]
+    async fn an_unconfigured_profile_is_refused_before_the_row() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![text_round("never runs")]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let spawn = spawn_tool_with_choices(params, provider);
+        let error = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "profile": "missing" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("an unconfigured profile is refused");
+        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(
+            only_the_parent(&store, parent_sid).await,
+            "a refused spawn must leave no child row behind"
+        );
+    }
+
+    /// A worker spawned with a profile is rebuilt on it by every follow-up, whatever its parent
+    /// runs on by then, and its row stays on it; one spawned without keeps following the
+    /// parent, which the follow-up tests above pin.
+    #[tokio::test]
+    async fn a_pinned_worker_keeps_its_profile_on_followup() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
+        let provider: Arc<dyn Provider> = mock(vec![
+            text_round("first answer"),
+            text_round("second answer"),
+        ]);
+        let params =
+            params_with_profile_choice(store.clone(), parent_session, Arc::clone(&provider));
+        let spawn = spawn_tool_with_choices(params.clone(), Arc::clone(&provider));
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let agent_id = agent_id_in(&output.text_content());
+
+        // The parent runs on `test-profile`, which is what an unpinned worker would be moved to.
+        let followup = followup_tool_for(params, provider);
+        let output = followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("the follow-up runs");
+        assert!(output.text_content().contains("second answer"));
+        assert_eq!(
+            store
+                .recorded_profile(agent_id)
+                .await
+                .expect("row")
+                .as_deref(),
+            Some("other"),
+            "a pinned worker's row does not follow the parent"
+        );
+    }
+
+    /// The same rule at every depth: a pinned worker's own child, spawned without a choice, runs on
+    /// the pinned profile rather than on what the root runs on, so the choice holds through the
+    /// subtree.
+    #[tokio::test]
+    async fn a_pinned_workers_child_defaults_to_the_pinned_profile() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        // The mock serves every agent in call order: the worker asks for a child, the child
+        // answers, the worker reports.
+        let provider: Arc<dyn Provider> = mock(vec![
+            vec![
+                crate::provider::mock::MockEvent::ToolUseStart {
+                    id: "call-1".into(),
+                    name: "agent_spawn".into(),
+                },
+                crate::provider::mock::MockEvent::ToolUseEnd {
+                    input: serde_json::json!({ "prompt": "the smaller task" }),
+                },
+                crate::provider::mock::MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+                },
+            ],
+            text_round("the child's answer"),
+            text_round("the worker's report"),
+        ]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let profile_choices = profile_choices(&params.materials);
+        let spawn = AgentSpawnTool {
+            profile_choices,
+            // Room for one more level, so the worker holds an `agent_spawn` of its own.
+            remaining_depth: 2,
+            ..spawn_tool_for(params, provider)
+        };
+        let output = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        let worker = agent_id_in(&output.text_content());
+
+        let tree = store.load_session_tree(parent_sid).await.expect("tree");
+        let grandchild = tree
+            .iter()
+            .find(|row| row.parent_id == Some(worker))
+            .unwrap_or_else(|| panic!("the worker must have spawned a child: {output:?}"));
+        assert_eq!(
+            store
+                .recorded_profile(grandchild.id)
+                .await
+                .expect("row")
+                .as_deref(),
+            Some("other"),
+            "a pinned worker's child runs on the pinned profile"
+        );
+    }
+
+    /// [`followup_tool_for`], with the parent running on `profile` rather than `test-profile`: the
+    /// switch a `/profile` between the spawn and the follow-up makes.
+    fn followup_tool_on(
+        mut params: ToolBuilderParams,
+        provider: Arc<dyn Provider>,
+        profile: &str,
+    ) -> AgentFollowupTool {
+        params.cells.profile = binding_named(provider, profile);
+        AgentFollowupTool {
+            parent_permission: params.cells.permission.clone(),
+            tool_builder_params: params,
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// One spawn with `input`, returning the worker's id.
+    async fn spawned(spawn: &AgentSpawnTool, input: serde_json::Value) -> Uuid {
+        let output = spawn
+            .execute(
+                input,
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("spawn succeeds");
+        agent_id_in(&output.text_content())
+    }
+
+    /// One follow-up on `agent_id`, returning what the worker said.
+    async fn followed_up(followup: &AgentFollowupTool, agent_id: Uuid) -> String {
+        followup
+            .execute(
+                serde_json::json!({ "id": agent_id.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("the follow-up runs")
+            .text_content()
+    }
+
+    async fn row_profile(store: &Store, id: Uuid) -> Option<String> {
+        store.recorded_profile(id).await.expect("read the row")
+    }
+
+    /// The parent switches profile after spawning two workers. The one it pinned, even to the
+    /// profile the parent was on at the time, stays; the one it left unpinned follows.
+    #[tokio::test]
+    async fn after_the_parent_switches_a_pinned_worker_stays_and_an_unpinned_one_follows() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![
+            text_round("pinned spawned"),
+            text_round("unpinned spawned"),
+            text_round("pinned followed"),
+            text_round("unpinned followed"),
+        ]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let spawn = spawn_tool_with_choices(params.clone(), Arc::clone(&provider));
+        let pinned = spawned(
+            &spawn,
+            serde_json::json!({ "prompt": "hold still", "profile": "test-profile" }),
+        )
+        .await;
+        let unpinned = spawned(&spawn, serde_json::json!({ "prompt": "come along" })).await;
+        assert_eq!(
+            row_profile(&store, pinned).await.as_deref(),
+            Some("test-profile")
+        );
+        assert_eq!(
+            row_profile(&store, unpinned).await.as_deref(),
+            Some("test-profile")
+        );
+
+        // `/profile other` in the parent.
+        let followup = followup_tool_on(params, provider, "other");
+        followed_up(&followup, pinned).await;
+        followed_up(&followup, unpinned).await;
+        assert_eq!(
+            row_profile(&store, pinned).await.as_deref(),
+            Some("test-profile"),
+            "a pinned worker stays where its spawn put it"
+        );
+        assert_eq!(
+            row_profile(&store, unpinned).await.as_deref(),
+            Some("other"),
+            "an unpinned worker follows the parent"
+        );
+    }
+
+    /// A session runs on the profile its row names. When an explicit act (an import onto another
+    /// profile) moves a pinned worker's row, the next follow-up runs there and leaves the row
+    /// there, rather than dragging it back to the name the spawn recorded.
+    #[tokio::test]
+    async fn a_pinned_workers_row_moved_by_an_explicit_act_is_where_it_runs() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![text_round("spawned"), text_round("followed")]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let spawn = spawn_tool_with_choices(params.clone(), Arc::clone(&provider));
+        let worker = spawned(
+            &spawn,
+            serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+        )
+        .await;
+
+        store
+            .update_session(worker, crate::store::SessionPatch {
+                profile: Some("test-profile".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("move the row");
+        // The parent is on `other` now, so following the parent and reverting to the spec would
+        // both land on `other`; only honoring the row lands on `test-profile`.
+        let followup = followup_tool_on(params, provider, "other");
+        followed_up(&followup, worker).await;
+        assert_eq!(
+            row_profile(&store, worker).await.as_deref(),
+            Some("test-profile"),
+            "the row is where the worker runs, and the follow-up leaves it there"
+        );
+        let spec: SubagentSpec = serde_json::from_str(
+            &store
+                .load_subagent_spec(worker)
+                .await
+                .expect("load spec")
+                .expect("a worker has a spec"),
+        )
+        .expect("decode");
+        assert_eq!(
+            spec.profile.as_deref(),
+            Some("other"),
+            "the spec keeps recording the choice the spawn made"
+        );
+    }
+
+    /// The pinned profile is removed from the config between the spawn and the follow-up: the
+    /// follow-up is refused by name, as resuming a root session on a deleted profile is, and the
+    /// row is left alone rather than moved onto whatever the parent runs on.
+    #[tokio::test]
+    async fn a_pinned_profile_gone_from_the_config_refuses_the_followup_and_leaves_the_row() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![text_round("spawned")]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let spawn = spawn_tool_with_choices(params.clone(), Arc::clone(&provider));
+        let worker = spawned(
+            &spawn,
+            serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+        )
+        .await;
+
+        // The operator removes `[profiles.other]` and restarts.
+        let mut params = params;
+        let providers =
+            crate::provider::ProviderRegistry::for_test(store.token_store(), &["test-profile"]);
+        providers.install_scripted(Arc::clone(&provider));
+        params.materials.providers = Arc::new(providers);
+        let followup = followup_tool_for(params, provider);
+        let error = followup
+            .execute(
+                serde_json::json!({ "id": worker.to_string(), "prompt": "carry on" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a profile that is gone refuses the follow-up");
+        assert!(error.to_string().contains("other"), "{error}");
+        assert_eq!(
+            row_profile(&store, worker).await.as_deref(),
+            Some("other"),
+            "a refused follow-up moves nothing"
+        );
+    }
+
+    /// A configured profile whose provider cannot be built (here, an account with no credential)
+    /// refuses the spawn ahead of the row, like an unconfigured name does.
+    #[tokio::test]
+    async fn a_profile_whose_provider_cannot_be_built_is_refused_before_the_row() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let mut params = params_for_test(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+        );
+        // Configured, but nothing scripted stands in for it and no credential was ever stored.
+        params.materials.providers = Arc::new(crate::provider::ProviderRegistry::for_test(
+            store.token_store(),
+            &["other", "test-profile"],
+        ));
+        params.materials.subagents.agent_chosen_profile = true;
+        let spawn = spawn_tool_with_choices(params, mock(vec![text_round("never runs")]));
+        let error = spawn
+            .execute(
+                serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect_err("a provider that cannot be built refuses the spawn");
+        assert!(error.to_string().contains("other"), "{error}");
+        assert!(
+            only_the_parent(&store, parent_sid).await,
+            "a refused spawn must leave no child row behind"
+        );
+    }
+
+    /// The same choice at every depth: a pinned worker may pin its own child to a third profile,
+    /// and neither row moves the other.
+    #[tokio::test]
+    async fn a_pinned_worker_may_pin_its_own_child_elsewhere() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![
+            vec![
+                crate::provider::mock::MockEvent::ToolUseStart {
+                    id: "call-1".into(),
+                    name: "agent_spawn".into(),
+                },
+                crate::provider::mock::MockEvent::ToolUseEnd {
+                    input: serde_json::json!({
+                        "prompt": "the smaller task",
+                        "profile": "test-profile",
+                    }),
+                },
+                crate::provider::mock::MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+                },
+            ],
+            text_round("the child's answer"),
+            text_round("the worker's report"),
+        ]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let profile_choices = profile_choices(&params.materials);
+        let spawn = AgentSpawnTool {
+            profile_choices,
+            remaining_depth: 2,
+            ..spawn_tool_for(params, provider)
+        };
+        let worker = spawned(
+            &spawn,
+            serde_json::json!({ "prompt": "look into it", "profile": "other" }),
+        )
+        .await;
+
+        let tree = store.load_session_tree(parent_sid).await.expect("tree");
+        let grandchild = tree
+            .iter()
+            .find(|row| row.parent_id == Some(worker))
+            .expect("the worker must have spawned a child");
+        assert_eq!(row_profile(&store, worker).await.as_deref(), Some("other"));
+        assert_eq!(
+            row_profile(&store, grandchild.id).await.as_deref(),
+            Some("test-profile"),
+            "the grandchild runs where its own spawn call put it"
+        );
+    }
+
+    /// An unpinned worker's children follow the root's live profile too: the root switches after
+    /// the worker exists, and a child the worker spawns on its next follow-up lands on the new
+    /// profile, as does the worker itself.
+    #[tokio::test]
+    async fn an_unpinned_workers_child_follows_the_roots_switch() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![
+            text_round("spawned"),
+            vec![
+                crate::provider::mock::MockEvent::ToolUseStart {
+                    id: "call-1".into(),
+                    name: "agent_spawn".into(),
+                },
+                crate::provider::mock::MockEvent::ToolUseEnd {
+                    input: serde_json::json!({ "prompt": "the smaller task" }),
+                },
+                crate::provider::mock::MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+                },
+            ],
+            text_round("the child's answer"),
+            text_round("the worker's report"),
+        ]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let spawn = AgentSpawnTool {
+            remaining_depth: 2,
+            ..spawn_tool_for(params.clone(), Arc::clone(&provider))
+        };
+        let worker = spawned(&spawn, serde_json::json!({ "prompt": "look into it" })).await;
+        assert_eq!(
+            row_profile(&store, worker).await.as_deref(),
+            Some("test-profile")
+        );
+
+        // `/profile other` in the root, then the worker is asked again and delegates.
+        let followup = followup_tool_on(params, provider, "other");
+        followed_up(&followup, worker).await;
+        let tree = store.load_session_tree(parent_sid).await.expect("tree");
+        let grandchild = tree
+            .iter()
+            .find(|row| row.parent_id == Some(worker))
+            .expect("the worker must have spawned a child");
+        assert_eq!(
+            row_profile(&store, worker).await.as_deref(),
+            Some("other"),
+            "the worker followed the root"
+        );
+        assert_eq!(
+            row_profile(&store, grandchild.id).await.as_deref(),
+            Some("other"),
+            "and so did the child it spawned afterwards"
+        );
+    }
+
+    /// A blank `profile` is "not specified", like every other optional string: the worker follows
+    /// its parent and nothing is pinned.
+    #[tokio::test]
+    async fn a_blank_profile_leaves_the_worker_unpinned() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        let provider: Arc<dyn Provider> = mock(vec![text_round("spawned")]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        );
+        let spawn = spawn_tool_with_choices(params, provider);
+        let worker = spawned(
+            &spawn,
+            serde_json::json!({ "prompt": "look into it", "profile": "   " }),
+        )
+        .await;
+        assert_eq!(
+            row_profile(&store, worker).await.as_deref(),
+            Some("test-profile")
+        );
+        let spec: SubagentSpec = serde_json::from_str(
+            &store
+                .load_subagent_spec(worker)
+                .await
+                .expect("load spec")
+                .expect("a worker has a spec"),
+        )
+        .expect("decode");
+        assert_eq!(spec.profile, None, "blank is not a choice");
+    }
+
+    /// An unpinned worker hands its children the root's *live* handle, not a snapshot taken when
+    /// the worker was built: the root switches while the worker's turn is under way, and the child
+    /// the worker spawns during that turn lands on the new profile.
+    #[tokio::test]
+    async fn a_root_switch_during_a_workers_turn_reaches_the_child_it_spawns() {
+        let store = store_for_test().await;
+        let parent_sid = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("parent");
+        // The worker delegates once, the child answers, the worker reports.
+        let provider: Arc<dyn Provider> = mock(vec![
+            vec![
+                crate::provider::mock::MockEvent::ToolUseStart {
+                    id: "call-1".into(),
+                    name: "agent_spawn".into(),
+                },
+                crate::provider::mock::MockEvent::ToolUseEnd {
+                    input: serde_json::json!({ "prompt": "the smaller task" }),
+                },
+                crate::provider::mock::MockEvent::MessageEnd {
+                    stop_reason: crate::provider::mock::MockStopReason::ToolUse,
+                },
+            ],
+            text_round("the child's answer"),
+            text_round("the worker's report"),
+        ]);
+        let params = params_with_profile_choice(
+            store.clone(),
+            crate::session::SharedSessionId::new(Some(parent_sid)),
+            Arc::clone(&provider),
+        )
+        .on_provider(Arc::clone(&provider));
+        let spec = SubagentSpec {
+            inherited_scratchpad: Vec::new(),
+            ..spec_for_test(Permission::Read)
+        };
+        let (worker_id, lock) = store
+            .create_child_session(
+                parent_sid,
+                None,
+                Vec::new(),
+                Some(serde_json::to_string(&spec).expect("encode the spec")),
+                "read".to_string(),
+                "test-profile".to_string(),
+            )
+            .await
+            .expect("child row");
+        let _lock = lock.expect("the spawn's own claim");
+        let worker = build_subagent(
+            &params,
+            &spec,
+            params.cells.profile.current(),
+            parent_sid,
+            worker_id,
+            WorkerWorkspace {
+                cwd: crate::workspace::cwd_for_test(),
+                roots: crate::workspace::roots_for_test(),
+            },
+            "agent_spawn",
+            &crate::tools::ToolContext::detached(CancellationToken::new()),
+        )
+        .await
+        .expect("build the worker");
+
+        // `/profile other` in the root, after the worker exists and before it delegates.
+        params
+            .cells
+            .profile
+            .store(&binding_named(Arc::clone(&provider), "other").current());
+        let mut messages = crate::conversation::Conversation::new();
+        worker
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look into it".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the worker's turn runs");
+
+        let tree = store.load_session_tree(parent_sid).await.expect("tree");
+        let grandchild = tree
+            .iter()
+            .find(|row| row.parent_id == Some(worker_id))
+            .expect("the worker must have spawned a child");
+        assert_eq!(
+            row_profile(&store, grandchild.id).await.as_deref(),
+            Some("other"),
+            "the child took the root's live profile, not the worker's snapshot"
+        );
     }
 
     /// One round in which the worker writes `content` to `path` through `write_file`.

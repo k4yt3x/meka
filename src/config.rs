@@ -295,7 +295,8 @@ pub(crate) struct ToolsConfig {
 
 /// `[subagents]` table: capabilities a sub-agent may never hold.
 ///
-/// Deliberately only the two deny lists. The distinction that decides what belongs here: a
+/// Two deny lists and one grant, `agent_chosen_profile`, which passes the same test: with it off,
+/// the `profile` parameter is not in the schema. The distinction that decides what belongs here: a
 /// *capability* is something config can genuinely withhold, because a tool the registry never
 /// registered cannot be reached however the parent phrases the task. *Context* (the memory store,
 /// the instructions file) cannot be withheld the same way, because a parent holding it can copy
@@ -317,6 +318,9 @@ pub(crate) struct SubagentsConfig {
     /// Individual tools a sub-agent cannot see, by registry name, so built-ins and namespaced MCP
     /// tools (`mcp__<server>__<tool>`) share one namespace.
     pub(crate) disabled_tools: Option<Vec<String>>,
+    /// Whether the spawning agent may choose the profile a sub-agent runs on. Off, a worker runs
+    /// on its parent's profile and `agent_spawn` offers no `profile` parameter.
+    pub(crate) agent_chosen_profile: Option<bool>,
 }
 
 /// How much of the memory store an agent may reach.
@@ -401,6 +405,7 @@ impl InstructionAccess {
 pub(crate) struct ResolvedSubagentsConfig {
     pub(crate) disabled_servers: Vec<String>,
     pub(crate) disabled_tools: Vec<String>,
+    pub(crate) agent_chosen_profile: bool,
 }
 
 impl ResolvedSubagentsConfig {
@@ -409,6 +414,7 @@ impl ResolvedSubagentsConfig {
         Self {
             disabled_servers: raw.disabled_servers.unwrap_or_default(),
             disabled_tools: raw.disabled_tools.unwrap_or_default(),
+            agent_chosen_profile: raw.agent_chosen_profile.unwrap_or(false),
         }
     }
 }
@@ -3790,6 +3796,7 @@ max_tasks = 3
             r#"[subagents]
 disabled_servers = ["mekabridge"]
 disabled_tools = ["mcp__notion__create_page", "write_file"]
+agent_chosen_profile = true
 "#,
         )
         .expect("config parses");
@@ -3799,6 +3806,7 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
             "mcp__notion__create_page".to_string(),
             "write_file".to_string()
         ]);
+        assert!(subagents.agent_chosen_profile);
     }
 
     /// Absent `[subagents]` denies nothing. What a sub-agent *receives* is not configured at all:
@@ -3810,6 +3818,10 @@ disabled_tools = ["mcp__notion__create_page", "write_file"]
         let subagents = ResolvedSubagentsConfig::resolve(config.subagents);
         assert!(subagents.disabled_servers.is_empty());
         assert!(subagents.disabled_tools.is_empty());
+        assert!(
+            !subagents.agent_chosen_profile,
+            "a worker runs on its parent's profile unless the operator opens the choice"
+        );
     }
 
     /// `[subagents]` deliberately has no `memory` key: config withholds capabilities, and the

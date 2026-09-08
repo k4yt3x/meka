@@ -859,6 +859,7 @@ impl SharedDeps {
             skills_agent_managed: self.config.skills_agent_managed,
             memories: self.memories.clone(),
             store: self.store.clone(),
+            providers: Arc::clone(&self.providers),
             mcp_manager: self.mcp_manager.as_ref().map(Arc::downgrade),
             session_stats,
             schedule: self.config.schedule.clone(),

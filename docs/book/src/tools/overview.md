@@ -184,6 +184,8 @@ Multiple `agent_spawn` calls in one assistant turn run in parallel; useful when 
 
 **Tools.** Pass `deny_servers` to withhold whole MCP servers from the sub-agent (its tools, its resources, and its prompts) or `deny_tools` to withhold individual tools by name. Both union with whatever [`[subagents]`](../configuration/config-file.md#subagents) already denies; there is no way to grant something back, so a nested `agent_spawn` can only ever narrow further. Config is the place to put a restriction you always want, since the failure mode this guards against is an orchestrator forgetting to ask for it.
 
+**Profile.** With [`[subagents].agent_chosen_profile`](../configuration/config-file.md#subagents) on, pass `profile` to run the sub-agent on another configured profile; the parameter lists every configured name. A sub-agent given a profile keeps it on every `agent_followup`, whatever profile the parent has since switched to. Only an act on the sub-agent's own session, such as an import onto another profile, moves it. Without the parameter the sub-agent runs on the parent's profile and follows it across a switch. The parent's own profile needs no naming.
+
 **Context is granted, not inherited.** A sub-agent starts with a clean slate and receives only what you ask for:
 
 - `memory: "read"` grants read access to your memory store. Default `"none"`, because memories from unrelated work are context the sub-agent pays for and reasons from. Sub-agents can never write to the store: record anything worth keeping yourself, from the sub-agent's report.

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[subagents].agent_chosen_profile` lets the spawning agent choose the profile a sub-agent runs on.
+- `agent_spawn` takes `profile`, a configured profile the sub-agent runs on and keeps on follow-ups.
+
 ## [0.46.1] - 2026-09-08
 
 ### Changed

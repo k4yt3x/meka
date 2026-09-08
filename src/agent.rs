@@ -329,10 +329,10 @@ impl Agent {
     /// [`crate::tools::mcp_adapter::install_on_worker_registry`] wires up.
     pub(crate) fn new_subagent(
         materials: &crate::session::SessionMaterials,
-        // The worker's own cells. Its profile is a detached cell seeded from what the parent runs
-        // on *now*: a sub-agent continues the parent's work on the parent's account, and it
-        // inherits the window with the provider rather than from `parent_options`, which is a
-        // clone frozen when the session was assembled and cannot hear about a switch.
+        // The worker's own cells. Its profile is a detached cell seeded from its binding: what the
+        // parent runs on *now*, or the profile its spawn call named. It inherits the window with
+        // the provider rather than from `parent_options`, which is a clone frozen when the session
+        // was assembled and cannot hear about a switch.
         cells: crate::session::SessionCells,
         tool_registry: ToolRegistry,
         parent_options: &AgentOptions,
@@ -633,6 +633,10 @@ mod tests {
         };
         Agent::new(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 skills: crate::skills::SkillCache::disabled(),
                 memories: crate::store::memory::MemoryStore::disabled(),
                 ..crate::session::SessionMaterials::for_test(store.clone())

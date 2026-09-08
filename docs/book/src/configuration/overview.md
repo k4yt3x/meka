@@ -41,6 +41,7 @@ credential, meka prints an error pointing at `meka profile add` / `meka account 
 |---------|--------|---------------------------|
 | Profile for an existing session | The session's own row | `--profile <name>`, which **repins** the row |
 | Profile for a new session | `default_profile` in config, or the sole profile | `--profile <name>` |
+| Profile for a sub-agent | The parent's, or the `profile` its `agent_spawn` call named when [`[subagents].agent_chosen_profile`](config-file.md#subagents) is on | none |
 | Account | `[profiles.<name>].account` | none |
 | Backend, endpoint, OAuth settings | `[accounts.<name>].*` | none |
 | Model and every model-tied setting | `[profiles.<name>].*` | none |

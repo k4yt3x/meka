@@ -1169,7 +1169,7 @@ mod tests {
         }
 
         for definition in [
-            subagent::agent_spawn_definition(),
+            subagent::agent_spawn_definition(&[]),
             subagent::agent_list_definition(),
             subagent::agent_followup_definition(),
             subagent::agent_delete_definition(),
@@ -1265,6 +1265,10 @@ mod tests {
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,

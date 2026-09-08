@@ -227,6 +227,9 @@ One word per concept, everywhere it is written or read:
   is exactly one, the remedy: no examples, no alternatives, no explanation of internals, no
   second sentence that restates the first. One sentence where one suffices. A printed line stays
   within 120 columns where its content allows, so it fits a terminal without wrapping.
+- **`--format`** is the one output-format flag, on the run and on every `list`, `show` and `export`:
+  `plain` by default, `json` where a command offers it, value sets documented per command. Never a
+  `--json` switch.
 
 ## Output: prints vs. tracing
 
@@ -267,7 +270,8 @@ output; don't demote it to `info!`.
   model and every model-tied setting. A session runs on the profile its own row names; the row moves
   only by an explicit act (`--profile` on a resume, `/profile`, `PATCH /v1/sessions/{id}`, ACP
   `session/set_config_option`). What a *new* session records follows `--profile` > `default_profile`
-  > the sole profile. Accounts are managed by `meka account` (`add`/`login`/`list`/`remove`) and
+  > the sole profile; a sub-agent's row records the profile its `agent_spawn` call named, else its
+  parent's live profile, which it keeps following. Accounts are managed by `meka account` (`add`/`login`/`list`/`remove`) and
   profiles by `meka profile` (`add`/`set`/`use`/`list`/`remove`), mirroring `meka mcp`: `use` is the
   only command that sets `default_profile` (`profile remove` unsets it when it named the removed
   profile), `account login` rotates a credential without touching the account or its profiles, and
@@ -345,7 +349,10 @@ fail-open one. Keep those where the data is read.
 Practical notes. The version is `PRAGMA user_version` (transactional, survives `VACUUM INTO`); never
 write SQLite's unrelated `PRAGMA schema_version`. Numbers are list indices, not releases. Migration is
 forward-only: downgrading means restoring the backup, and each new copy supersedes the last, so only
-the most recent schema-changing upgrade is undoable.
+the most recent schema-changing upgrade is undoable. The head shape is pinned by
+`HEAD_SCHEMA_FINGERPRINT` over `HEAD_TABLES`; after any schema change run
+`the_head_schema_fingerprint_is_pinned`, whose failure prints the new value, and give a renamed
+baseline object its new name in `BASELINE_OBJECTS` beside the old one.
 
 ## Built-in tool naming
 
@@ -375,6 +382,10 @@ find-and-replace rewrites MCP tool names containing a built-in as a substring, s
 substitution to a name boundary; and reversing word order defeats the edit-distance hint
 (`did_you_mean_hint`, behind `builtin_name_hint` and `near_miss_hint`), so nothing points a resumed
 model at the new name.
+
+Designing a tool: separate tight tools beat one polymorphic tool with an `action` enum. A family is
+fine when each member's parameters are distinct and self-describing; a single tool whose parameters
+change meaning with `action` is a family that wants splitting.
 
 ## Layering
 

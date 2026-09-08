@@ -1124,6 +1124,7 @@ impl ToolRegistry {
                 inherited_denials: config_denials,
                 remaining_depth: materials.subagent_max_depth,
                 absolute_depth: 0,
+                profile_choices: super::subagent::profile_choices(materials),
             })?;
         }
         Ok(registry)
@@ -1246,6 +1247,10 @@ mod tests {
         let sandbox_capability = crate::sandbox::detect();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -1319,6 +1324,10 @@ mod tests {
         let sandbox_capability = crate::sandbox::detect();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -1712,6 +1721,10 @@ mod tests {
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -1850,6 +1863,10 @@ mod tests {
         let sandbox_capability = crate::sandbox::detect();
         let registry = ToolRegistry::build_default(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -2230,6 +2247,10 @@ mod tests {
         let shared_session_id = crate::session::SharedSessionId::default();
         let registry = ToolRegistry::build_for_subagent(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,
@@ -2305,6 +2326,10 @@ mod tests {
         let store = Store::for_test().await;
         ToolRegistry::build_for_subagent(
             &crate::session::SessionMaterials {
+                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
+                    store.token_store(),
+                    &["test-profile"],
+                )),
                 core: crate::session::CoreMaterials {
                     web_client: crate::config::WebClientConfig::default(),
                     sandbox_enabled: true,

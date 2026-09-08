@@ -387,6 +387,12 @@ impl ProviderRegistry {
         }
     }
 
+    /// Every configured profile's name, sorted, as `config.toml` stood when this process started:
+    /// what `agent_spawn` offers when the profile a sub-agent runs on is the agent's to choose.
+    pub(crate) fn profile_names(&self) -> Vec<String> {
+        self.profiles.keys().cloned().collect()
+    }
+
     /// The settings of the profile a session's row names, refused by name when `config.toml` no
     /// longer has it: a session runs on the profile it recorded, never on the default in its place,
     /// because quietly running the conversation somewhere else is the failure this arrangement
@@ -554,6 +560,41 @@ impl ProviderRegistry {
         }
     }
 }
+
+#[cfg(test)]
+impl ProviderRegistry {
+    /// A registry over `names`, each an `anthropic-messages` profile on an account of the same
+    /// name, with everything a resolution needs and nothing it does not. Tests that run a worker
+    /// on one of them install a scripted provider, which stands in for every profile.
+    pub(crate) fn for_test(token_store: TokenStore, names: &[&str]) -> Self {
+        Self {
+            accounts: names
+                .iter()
+                .map(|name| {
+                    (name.to_string(), crate::config::AccountConfig {
+                        backend: "anthropic-messages".to_string(),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+            profiles: names
+                .iter()
+                .map(|name| {
+                    (name.to_string(), crate::config::ProfileConfig {
+                        account: name.to_string(),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
+            session_context_window: None,
+            default_thinking_budget: Some(4_096),
+            device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
+            token_store: Arc::new(token_store),
+            built: std::sync::Mutex::new(std::collections::HashMap::new()),
+            scripted: std::sync::Mutex::new(None),
+        }
+    }
+}
 /// A session's profile, resolved into everything that follows from it.
 ///
 /// One struct with one producer ([`resolved_profile`]) because these are not independent facts:
@@ -701,8 +742,8 @@ pub(crate) fn profile_context_window(providers: &ProviderRegistry, profile: &str
 /// context-token counter already use for values the agent owns and others must watch.
 ///
 /// It exists because a mid-session switch has to reach two things the agent does not own.
-/// `agent_spawn` and `agent_followup` build a sub-agent from the parent's provider, and the
-/// `context_*` tools report the window the model is being gauged against. A copy taken when the
+/// `agent_spawn` and `agent_followup` build an unpinned sub-agent from the parent's provider, and
+/// the `context_*` tools report the window the model is being gauged against. A copy taken when the
 /// session was assembled would be left behind by `/profile`, `PATCH /v1/sessions/{id}` and ACP's
 /// `session/set_config_option`: a sub-agent spawned afterwards would run on, and bill, the profile
 /// the user had just left, while the child's own row recorded the new one.
