@@ -619,17 +619,11 @@ mod tests {
     /// A registry over `configured`, with everything a resolution needs and nothing it does not.
     async fn provider_registry_for_test(configured: Configured) -> ProviderRegistry {
         let store = crate::store::Store::for_test().await;
-        ProviderRegistry {
-            accounts: configured.accounts,
-            profiles: configured.profiles,
-            session_context_window: None,
-            default_thinking_budget: Some(4_096),
-            device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
-            token_store: Arc::new(store.token_store()),
-            built: std::sync::Mutex::new(std::collections::HashMap::new()),
-            #[cfg(any(debug_assertions, feature = "mock-provider"))]
-            scripted: std::sync::Mutex::new(None),
-        }
+        ProviderRegistry::for_test_over(
+            configured.accounts,
+            configured.profiles,
+            store.token_store(),
+        )
     }
 
     /// Each profile resolves its own thinking mode, and nothing at the run level can outrank it.

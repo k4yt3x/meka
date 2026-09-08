@@ -1120,7 +1120,6 @@ impl ToolRegistry {
                 inherited_denials: config_denials,
                 remaining_depth: materials.subagent_max_depth,
                 absolute_depth: 0,
-                profile_choices: super::subagent::profile_choices(materials),
             })?;
         }
         Ok(registry)

@@ -633,10 +633,6 @@ mod tests {
         };
         Agent::new(
             &crate::session::SessionMaterials {
-                providers: std::sync::Arc::new(crate::provider::ProviderRegistry::for_test(
-                    store.token_store(),
-                    &["test-profile"],
-                )),
                 skills: crate::skills::SkillCache::disabled(),
                 memories: crate::store::memory::MemoryStore::disabled(),
                 ..crate::session::SessionMaterials::for_test(store.clone())

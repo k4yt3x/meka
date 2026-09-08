@@ -293,7 +293,8 @@ pub(crate) struct ToolsConfig {
     pub(crate) tool_permissions: Option<HashMap<String, Permission>>,
 }
 
-/// `[subagents]` table: capabilities a sub-agent may never hold.
+/// `[subagents]` table: what a sub-agent may never hold, and the one choice its parent may make
+/// for it.
 ///
 /// Two deny lists and one grant, `agent_chosen_profile`, which passes the same test: with it off,
 /// the `profile` parameter is not in the schema. The distinction that decides what belongs here: a

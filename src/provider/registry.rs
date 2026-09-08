@@ -567,8 +567,8 @@ impl ProviderRegistry {
     /// name, with everything a resolution needs and nothing it does not. Tests that run a worker
     /// on one of them install a scripted provider, which stands in for every profile.
     pub(crate) fn for_test(token_store: TokenStore, names: &[&str]) -> Self {
-        Self {
-            accounts: names
+        Self::for_test_over(
+            names
                 .iter()
                 .map(|name| {
                     (name.to_string(), crate::config::AccountConfig {
@@ -577,7 +577,7 @@ impl ProviderRegistry {
                     })
                 })
                 .collect(),
-            profiles: names
+            names
                 .iter()
                 .map(|name| {
                     (name.to_string(), crate::config::ProfileConfig {
@@ -586,11 +586,27 @@ impl ProviderRegistry {
                     })
                 })
                 .collect(),
+            token_store,
+        )
+    }
+
+    /// A registry over exactly these accounts and profiles, with everything a resolution needs
+    /// and nothing it does not. The one test constructor; [`Self::for_test`] and the provider
+    /// tests' own builder both go through it.
+    pub(crate) fn for_test_over(
+        accounts: std::collections::BTreeMap<String, crate::config::AccountConfig>,
+        profiles: std::collections::BTreeMap<String, crate::config::ProfileConfig>,
+        token_store: TokenStore,
+    ) -> Self {
+        Self {
+            accounts,
+            profiles,
             session_context_window: None,
             default_thinking_budget: Some(4_096),
             device_ids: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_store: Arc::new(token_store),
             built: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(any(debug_assertions, feature = "mock-provider"))]
             scripted: std::sync::Mutex::new(None),
         }
     }

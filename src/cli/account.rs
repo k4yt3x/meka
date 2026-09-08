@@ -19,6 +19,7 @@ use crate::{
     store::{AuthCredential, TokenStore},
 };
 
+/// Claude Code 2.1.263's `REDIRECT_URI`: the hosted page that shows the code the user pastes back.
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 /// Claude Code 2.1.263's `CLAUDE_AI_AUTHORIZE_URL`: the consumer login for a claude.ai account, as
 /// opposed to its console login at `platform.claude.com/oauth/authorize`.

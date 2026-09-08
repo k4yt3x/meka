@@ -69,14 +69,9 @@ pub(crate) fn format_session_status(
     }
     // The backend rides with the account rather than the profile because it is the account's
     // fact: two profiles on one account state it the same.
-    match (model.account, model.backend) {
-        (Some(account), Some(backend)) => {
-            out.push_str(&format!("  Account:         {account} ({backend})\n"));
-        }
-        (Some(account), None) => {
-            out.push_str(&format!("  Account:         {account}\n"));
-        }
-        (None, _) => {}
+    // Both come off one settings lookup, so they are present together or absent together.
+    if let (Some(account), Some(backend)) = (model.account, model.backend) {
+        out.push_str(&format!("  Account:         {account} ({backend})\n"));
     }
     if let Some(name) = model.model {
         out.push_str(&format!("  Model:           {name}\n"));

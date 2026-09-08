@@ -1407,7 +1407,7 @@ Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-i
 
 ## `[subagents]`
 
-Capabilities a sub-agent may never hold. Where `[tools]` restricts everyone, this block restricts only sub-agents.
+What a sub-agent may never hold, and the one choice its parent may make for it. Where `[tools]` restricts everyone, this block applies only to sub-agents.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
