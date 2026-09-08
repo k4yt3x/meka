@@ -53,6 +53,10 @@ use crate::{
 /// Claude Code's OAuth client id, which the `claude-subscription` backend authenticates as.
 pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID: &str =
     "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// The token endpoint Claude Code 2.1.263 exchanges the login code at and refreshes against
+/// (`TOKEN_URL` in the binary); `[accounts.<name>].oauth_token_url` overrides it.
+pub(crate) const DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL: &str =
+    "https://platform.claude.com/v1/oauth/token";
 
 /// Codex's hardcoded OpenAI OAuth client ID. Mirrors the value used by the first-party CLI at
 /// `codex-rs/login/src/auth/manager.rs`.

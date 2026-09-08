@@ -104,7 +104,7 @@ The OAuth client id defaults to Claude Code's client id but can be overridden pe
 4. meka refreshes the access token automatically when it's within 5 minutes of expiry; the new token is written back to the store under the same account.
 5. If the refresh token dies, run `meka account login <name>` to re-authenticate. meka says so itself: a refresh the authorization server *rejects* ends the turn with that command in the error, naming the account. A refresh that fails because the token endpoint is rate-limited or down is retried with backoff instead, since neither answer means the grant is bad.
 
-**Token refresh URL:** defaults to `https://api.anthropic.com/v1/oauth/token`. Configurable via `oauth_token_url` on the account.
+**Token refresh URL:** defaults to `https://platform.claude.com/v1/oauth/token`. Configurable via `oauth_token_url` on the account.
 
 ## Supported models
 

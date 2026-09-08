@@ -12,15 +12,20 @@ use crate::{
     cli::AccountAction,
     config,
     oauth::{generate_pkce_pair, generate_state},
-    provider::{DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID, DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID},
+    provider::{
+        DEFAULT_CHATGPT_SUBSCRIPTION_CLIENT_ID, DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID,
+        DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL,
+    },
     store::{AuthCredential, TokenStore},
 };
 
 const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
-const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const TOKEN_URL: &str = "https://api.anthropic.com/v1/oauth/token";
-const SCOPES: &str =
-    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers";
+/// Claude Code 2.1.263's `CLAUDE_AI_AUTHORIZE_URL`: the consumer login for a claude.ai account, as
+/// opposed to its console login at `platform.claude.com/oauth/authorize`.
+const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+/// The scope set Claude Code 2.1.263 requests for a claude.ai login, in its order.
+const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code \
+                      user:mcp_servers user:file_upload";
 
 /// `chatgpt-subscription` OAuth flow constants. Mirror Codex's first-party CLI: the authorization
 /// server lives at `auth.openai.com`, the redirect listener binds on `localhost:1455`.
@@ -907,7 +912,7 @@ async fn claude_login(
     oauth_token_url: Option<&str>,
 ) -> anyhow::Result<AuthCredential> {
     let client_id = client_id.unwrap_or(DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID);
-    let token_url = oauth_token_url.unwrap_or(TOKEN_URL);
+    let token_url = oauth_token_url.unwrap_or(DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL);
     let (code_verifier, code_challenge) = generate_pkce_pair();
     let state = generate_state();
     let url = build_authorize_url(client_id, &code_challenge, &state)?;
@@ -2136,6 +2141,15 @@ mod tests {
     fn build_authorize_url_contains_params() {
         let url = build_authorize_url("cid", "challenge", "state").unwrap();
         assert!(url.starts_with(AUTHORIZE_URL));
+        // The scope set as Claude Code 2.1.263 sends it, captured from its own authorization URL:
+        // the same names in the same order, so a login is indistinguishable from the first-party
+        // client's.
+        assert!(
+            url.contains(
+                "scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&"
+            ),
+            "{url}"
+        );
         assert!(url.contains("client_id=cid"));
         assert!(url.contains("code_challenge=challenge"));
         assert!(url.contains("state=state"));

@@ -158,8 +158,9 @@ impl ClaudeSubscriptionProvider {
             model,
             client_id: client_id
                 .unwrap_or_else(|| DEFAULT_CLAUDE_SUBSCRIPTION_CLIENT_ID.to_string()),
-            oauth_token_url: oauth_token_url
-                .unwrap_or_else(|| "https://api.anthropic.com/v1/oauth/token".to_string()),
+            oauth_token_url: oauth_token_url.unwrap_or_else(|| {
+                crate::provider::DEFAULT_CLAUDE_SUBSCRIPTION_TOKEN_URL.to_string()
+            }),
             token_store,
             credential_key,
             session_id: Uuid::new_v4().to_string(),

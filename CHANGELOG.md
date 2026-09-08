@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[subagents].agent_chosen_profile` lets the spawning agent choose the profile a sub-agent runs on.
 - `agent_spawn` takes `profile`, a configured profile the sub-agent runs on and keeps on follow-ups.
 
+### Changed
+
+- `claude-subscription` logs in and refreshes at Claude Code 2.1.263's endpoints, with its scopes.
+
 ### Removed
 
 - **Breaking:** `search_web` is gone. Add an MCP search server instead; the upgrade guide names one.

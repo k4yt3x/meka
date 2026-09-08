@@ -152,7 +152,7 @@ The OAuth token endpoint meka posts to, for the initial code exchange at `meka a
 `login` and for every refresh thereafter. Both, not just refreshes: it overrides a constant, so it
 overrides it everywhere that constant is used. Defaults:
 
-- `https://api.anthropic.com/v1/oauth/token` for `claude-subscription`
+- `https://platform.claude.com/v1/oauth/token` for `claude-subscription`
 - `https://auth.openai.com/oauth/token` for `chatgpt-subscription`
 
 It exists because that endpoint is the provider's fact, not meka's, and a value baked into the
