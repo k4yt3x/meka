@@ -37,6 +37,27 @@ use crate::{
 const CC_SYSTEM_PROMPT_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// The `claude-subscription` backend: one profile's model and the OAuth credential it bills.
+/// The window at which a profile asks for the 1M-context beta.
+const CONTEXT_1M_TOKENS: u64 = 1_000_000;
+
+/// The two values `thinking.display` can carry on the wire; the `redacted` mode sends none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WireThinkingDisplay {
+    /// A running token count in place of the text, under the display-updates beta.
+    Updates,
+    /// A short readable summary of the reasoning.
+    Summarized,
+}
+
+impl WireThinkingDisplay {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Updates => "updates",
+            Self::Summarized => "summarized",
+        }
+    }
+}
+
 pub(crate) struct ClaudeSubscriptionProvider {
     client: reqwest::Client,
     credential: tokio::sync::RwLock<AuthCredential>,
@@ -77,7 +98,9 @@ pub(crate) struct ClaudeSubscriptionProvider {
     resolved_effort: Option<String>,
     /// When true, request `redacted_thinking` blocks via the `redact-thinking-2026-02-12` beta
     /// header.
-    redact_thinking: bool,
+    thinking_display: crate::config::ThinkingDisplay,
+    /// The profile's window; a million or more asks for the 1M-context beta.
+    context_window: Option<u64>,
     /// Per-request output token cap from the profile; `None` keeps the built-in default.
     max_output_tokens: Option<u64>,
     /// See [`crate::config::ProfileConfig::max_request_bytes`].
@@ -99,7 +122,8 @@ impl ClaudeSubscriptionProvider {
             thinking_budget_tokens,
             device_id,
             effort,
-            redact_thinking,
+            thinking_display,
+            context_window,
             max_output_tokens,
             max_request_bytes,
             ..
@@ -145,7 +169,8 @@ impl ClaudeSubscriptionProvider {
             thinking_budget_tokens,
             rejected_access_token: std::sync::Mutex::new(None),
             resolved_effort,
-            redact_thinking,
+            thinking_display,
+            context_window,
             max_output_tokens,
             max_request_bytes,
         })
@@ -169,45 +194,47 @@ impl ClaudeSubscriptionProvider {
         self.resolved_effort.is_some()
     }
 
-    /// Mirrors Claude Code 2.1.241's CLI beta assembly, validated against a live wire capture:
-    /// first-party OAuth subscriber, opus-5 with tools and thinking, twelve betas in this
-    /// order.
+    /// Mirrors Claude Code 2.1.263's beta assembly for a first-party OAuth turn, validated against
+    /// a live capture of its interactive CLI: opus-5 with tools, thinking on and display updates,
+    /// fourteen betas in this order.
+    ///
+    /// `context-1m-2025-08-07` is sent when the profile's `context_window` is a million tokens or
+    /// more. Claude Code sends it for the `[1m]` model variant its user selected, and the profile's
+    /// window is where a meka user states the same choice.
+    ///
+    /// `redact-thinking-2026-02-12` and `thinking-display-updates-2026-08-18` are the two halves
+    /// of Claude Code's display switch; see [`Self::sends_redaction_beta`] and
+    /// [`Self::wire_thinking_display`].
     ///
     /// `has_tools` gates `advanced-tool-use-2025-11-20`. Claude Code's own gate is narrower (it
     /// sends that beta when its *tool search* is active rather than merely when tools are present),
     /// but tool search is on for every agentic CLI turn, so the wire is the same, and meka has
     /// tools on every turn anyway.
     ///
-    /// No `context-1m-2025-08-07`: Claude Code stopped sending it after 2.1.185. On the current 1M
-    /// models the window is the default, so the beta is redundant; this matches the
-    /// anthropic-messages path.
-    ///
     /// `fallback-credit-2026-06-01` is sent unconditionally. Claude Code latches it whenever a
     /// model is visible in its UI, which is every interactive turn, and it only advertises that the
     /// server may answer with a fallback credit; meka sends no `fallbacks` or
     /// `fallback_credit_token` of its own, exactly like the captured turns that carry the beta.
     ///
-    /// `redact-thinking-2026-02-12` is sent by default (matching Claude Code) for capable models;
-    /// the `redact_thinking` knob (default on) is an opt-out. With it on, the model returns empty
-    /// `thinking` blocks carrying only a signature, plus opaque `redacted_thinking` blocks; both
-    /// are preserved and replayed verbatim (see
-    /// [`crate::conversation::ContentBlock::RedactedThinking`]).
-    fn compute_betas(&self, has_tools: bool) -> Option<String> {
+    /// `cache-diagnosis-2026-04-07` is sent unconditionally too, paired with the body's
+    /// `diagnostics.previous_message_id`.
+    fn compute_betas(&self, has_tools: bool, thinking_on: bool) -> Option<String> {
         let model = self.model.as_str();
-        let mut parts: Vec<&'static str> = Vec::with_capacity(12);
+        let mut parts: Vec<&'static str> = Vec::with_capacity(14);
 
         if !model_is_haiku(model) {
             parts.push("claude-code-20250219");
         }
         parts.push("oauth-2025-04-20");
+        if self.asks_for_1m_context() {
+            parts.push("context-1m-2025-08-07");
+        }
 
         if model_supports_modern_features(model) {
             parts.push("interleaved-thinking-2025-05-14");
-
-            if self.redact_thinking {
+            if self.sends_redaction_beta(thinking_on) {
                 parts.push("redact-thinking-2026-02-12");
             }
-
             parts.push("thinking-token-count-2026-05-13");
             parts.push("context-management-2025-06-27");
         }
@@ -230,9 +257,44 @@ impl ClaudeSubscriptionProvider {
         }
 
         parts.push("fallback-credit-2026-06-01");
+        if self.wire_thinking_display(thinking_on) == Some(WireThinkingDisplay::Updates) {
+            parts.push("thinking-display-updates-2026-08-18");
+        }
         parts.push("extended-cache-ttl-2025-04-11");
+        parts.push("cache-diagnosis-2026-04-07");
 
         Some(parts.join(","))
+    }
+
+    /// Whether the profile asks for the 1M context window: a `context_window` of
+    /// [`CONTEXT_1M_TOKENS`] or more.
+    fn asks_for_1m_context(&self) -> bool {
+        self.context_window
+            .is_some_and(|window| window >= CONTEXT_1M_TOKENS)
+    }
+
+    /// The `display` the thinking field carries, or `None` where Claude Code sends none: thinking
+    /// off, a model that cannot think, or the `redacted` mode.
+    fn wire_thinking_display(&self, thinking_on: bool) -> Option<WireThinkingDisplay> {
+        if !thinking_on || !model_supports_modern_features(&self.model) {
+            return None;
+        }
+        match self.thinking_display {
+            crate::config::ThinkingDisplay::Updates => Some(WireThinkingDisplay::Updates),
+            crate::config::ThinkingDisplay::Summarized => Some(WireThinkingDisplay::Summarized),
+            crate::config::ThinkingDisplay::Redacted => None,
+        }
+    }
+
+    /// Claude Code pushes the redaction beta for every model that can think unless summaries are
+    /// on, then removes it again on the turns where display updates apply, which is every turn
+    /// with thinking on. Collapsed here to what reaches the wire.
+    fn sends_redaction_beta(&self, thinking_on: bool) -> bool {
+        match self.thinking_display {
+            crate::config::ThinkingDisplay::Redacted => true,
+            crate::config::ThinkingDisplay::Summarized => false,
+            crate::config::ThinkingDisplay::Updates => !thinking_on,
+        }
     }
 
     /// Resolve a valid Authorization header, refreshing the OAuth token if it's within 5 minutes of
@@ -583,7 +645,7 @@ impl ClaudeSubscriptionProvider {
         // through to the wire:
         //
         //     model, messages, system, tools, metadata, max_tokens, thinking,
-        //     [temperature], [context_management], [output_config], stream
+        //     [temperature], [context_management], [output_config], diagnostics, stream
         //
         // Nothing depends on this ordering, which is the point: the attestation locates its
         // placeholder structurally (see [`attestation::patch_request_body`]) rather than by
@@ -637,6 +699,8 @@ impl ClaudeSubscriptionProvider {
             self.effective_thinking(thinking),
             self.thinking_budget_tokens,
             self.max_output_tokens,
+            self.wire_thinking_display(self.effective_thinking(thinking).is_on())
+                .map(WireThinkingDisplay::name),
         );
 
         // Claude Code sends `temperature: 1` only when thinking is off AND the model is on the
@@ -662,6 +726,15 @@ impl ClaudeSubscriptionProvider {
             body.insert(
                 "output_config".to_string(),
                 serde_json::json!({ "effort": effort }),
+            );
+        }
+
+        // Only a conversation turn carries the field, `null` on its first request and after a
+        // resume: Claude Code sends nothing here on its side queries, and meka's compaction is one.
+        if attribution.is_conversation_turn() {
+            body.insert(
+                "diagnostics".to_string(),
+                serde_json::json!({ "previous_message_id": attribution.previous_message_id() }),
             );
         }
 
@@ -732,7 +805,7 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
         request: reqwest::RequestBuilder,
         has_tools: bool,
         _stream: bool,
-        _thinking: ThinkingOverride,
+        thinking: ThinkingOverride,
     ) -> Result<reqwest::RequestBuilder> {
         let (auth_header_name, auth_header_value) = self.ensure_valid_credential().await?;
         Ok(attestation::apply_headers(
@@ -740,7 +813,8 @@ impl shared::ClaudeBackend for ClaudeSubscriptionProvider {
             auth_header_name,
             &auth_header_value,
             &self.session_id,
-            self.compute_betas(has_tools).as_deref(),
+            self.compute_betas(has_tools, self.effective_thinking(thinking).is_on())
+                .as_deref(),
         ))
     }
 
@@ -1044,7 +1118,7 @@ mod tests {
             .thinking(ThinkingMode::Off, 10000)
             .device_id("a".repeat(64))
             .effort(Some("high".to_string()))
-            .redact_thinking(false)
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )
@@ -1147,7 +1221,7 @@ mod tests {
             .thinking(ThinkingMode::Off, 10000)
             .device_id("a".repeat(64))
             .effort(Some("high".to_string()))
-            .redact_thinking(false)
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )
@@ -1165,7 +1239,7 @@ mod tests {
             &[],
             false,
             ThinkingOverride::Inherit,
-            &crate::provider::Attribution::default(),
+            &conversation_attribution(),
         );
 
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
@@ -1206,6 +1280,7 @@ mod tests {
             // would send `{"type":"disabled"}`. See `insert_thinking_fields`, which is shared
             // with the `anthropic-messages` backend and its arbitrary endpoints.
             "temperature",
+            "diagnostics",
             "stream",
         ]);
 
@@ -1579,7 +1654,7 @@ mod tests {
             &tools,
             true,
             ThinkingOverride::Inherit,
-            &crate::provider::Attribution::default(),
+            &conversation_attribution(),
         );
 
         assert!(body.get("system").is_some());
@@ -1597,6 +1672,7 @@ mod tests {
             // would send `{"type":"disabled"}`. See `insert_thinking_fields`, which is shared
             // with the `anthropic-messages` backend and its arbitrary endpoints.
             "temperature",
+            "diagnostics",
             "stream",
         ]);
 
@@ -1746,7 +1822,7 @@ mod tests {
             .thinking(ThinkingMode::Off, 10000)
             .device_id("a".repeat(64))
             .effort(None)
-            .redact_thinking(false)
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )
@@ -1777,7 +1853,7 @@ mod tests {
             .thinking(ThinkingMode::Off, 10000)
             .device_id("a".repeat(64))
             .effort(Some("high".to_string()))
-            .redact_thinking(false)
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )
@@ -1938,7 +2014,12 @@ mod tests {
     }
 
     fn provider_with(model: &str, thinking: bool) -> ClaudeSubscriptionProvider {
-        provider_full(model, thinking, "high", false)
+        provider_full(
+            model,
+            thinking,
+            "high",
+            crate::config::ThinkingDisplay::Summarized,
+        )
     }
 
     fn provider_effort(model: &str, effort: Option<&str>) -> ClaudeSubscriptionProvider {
@@ -1956,7 +2037,7 @@ mod tests {
             .thinking(ThinkingMode::Off, 10000)
             .device_id("a".repeat(64))
             .effort(effort.map(str::to_string))
-            .redact_thinking(false)
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )
@@ -1969,7 +2050,7 @@ mod tests {
         model: &str,
         thinking: bool,
         effort: &str,
-        redact_thinking: bool,
+        thinking_display: crate::config::ThinkingDisplay,
     ) -> ClaudeSubscriptionProvider {
         ClaudeSubscriptionProvider::new(
             crate::provider::ProviderBuilder::new(
@@ -1992,7 +2073,7 @@ mod tests {
             )
             .device_id("a".repeat(64))
             .effort(Some(effort.to_string()))
-            .redact_thinking(redact_thinking)
+            .thinking_display(thinking_display)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )
@@ -2008,7 +2089,9 @@ mod tests {
             ("claude-opus-4-8", true),
             ("claude-opus-4-6-20250514", false),
         ] {
-            let betas = provider_with(model, thinking).compute_betas(true).unwrap();
+            let betas = provider_with(model, thinking)
+                .compute_betas(true, true)
+                .unwrap();
             assert!(
                 !betas.contains("adaptive-thinking"),
                 "{model} (thinking={thinking}) must not send an adaptive-thinking beta: {betas}"
@@ -2018,12 +2101,17 @@ mod tests {
 
     #[test]
     fn betas_modern_thinking_model_full_set() {
-        // Tools + thinking + redact_thinking on: matches the live Claude Code 2.1.241 interactive
-        // CLI wire capture exactly (12 betas in this order, no `context-1m`;
-        // `redact-thinking-2026-02-12` present, which CC sends by default).
-        let betas = provider_full("claude-opus-4-8", true, "high", true)
-            .compute_betas(true)
-            .unwrap();
+        // Tools + thinking + the default display: matches the live Claude Code 2.1.263 interactive
+        // CLI wire capture exactly, minus `context-1m-2025-08-07`, which this profile's window does
+        // not ask for. Display updates replace the redaction beta on a turn with thinking on.
+        let betas = provider_full(
+            "claude-opus-4-8",
+            true,
+            "high",
+            crate::config::ThinkingDisplay::Updates,
+        )
+        .compute_betas(true, true)
+        .unwrap();
         let parts: Vec<&str> = betas.split(',').collect();
         assert_eq!(
             parts,
@@ -2031,7 +2119,6 @@ mod tests {
                 "claude-code-20250219",
                 "oauth-2025-04-20",
                 "interleaved-thinking-2025-05-14",
-                "redact-thinking-2026-02-12",
                 "thinking-token-count-2026-05-13",
                 "context-management-2025-06-27",
                 "prompt-caching-scope-2026-01-05",
@@ -2039,9 +2126,11 @@ mod tests {
                 "advanced-tool-use-2025-11-20",
                 "effort-2025-11-24",
                 "fallback-credit-2026-06-01",
+                "thinking-display-updates-2026-08-18",
                 "extended-cache-ttl-2025-04-11",
+                "cache-diagnosis-2026-04-07",
             ],
-            "Claude Code 2.1.241 CLI beta set"
+            "Claude Code 2.1.263 CLI beta set"
         );
     }
 
@@ -2051,7 +2140,7 @@ mod tests {
         // the thinking toggle, so they appear whether thinking is on or off.
         for thinking in [true, false] {
             let betas = provider_with("claude-opus-4-6-20250514", thinking)
-                .compute_betas(true)
+                .compute_betas(true, true)
                 .unwrap();
             assert!(betas.contains("interleaved-thinking-2025-05-14"), "{betas}");
             assert!(betas.contains("thinking-token-count-2026-05-13"), "{betas}");
@@ -2059,10 +2148,10 @@ mod tests {
     }
 
     #[test]
-    fn betas_never_send_context_1m() {
-        // Current Claude Code (2.1.241) does not send `context-1m-2025-08-07`; 1M is the default
-        // (no beta) on the current 1M models, so meka never sends it either, across the
-        // lineup.
+    fn the_1m_context_beta_is_not_sent_without_a_1m_window() {
+        // Claude Code sends `context-1m-2025-08-07` only for the `[1m]` variant its user picked,
+        // and meka only for a profile whose window is a million or more; these profiles state no
+        // window, so the beta is absent across the lineup.
         for model in [
             "claude-opus-4-8",
             "claude-opus-4-6-20250514",
@@ -2073,7 +2162,7 @@ mod tests {
         ] {
             assert!(
                 !provider_with(model, false)
-                    .compute_betas(true)
+                    .compute_betas(true, true)
                     .unwrap()
                     .contains("context-1m-2025-08-07"),
                 "{model} must not send context-1m"
@@ -2091,7 +2180,7 @@ mod tests {
         ] {
             assert!(
                 provider_with(model, false)
-                    .compute_betas(true)
+                    .compute_betas(true, true)
                     .unwrap()
                     .contains("extended-cache-ttl-2025-04-11"),
                 "{model} must send extended-cache-ttl"
@@ -2105,7 +2194,7 @@ mod tests {
         // absolute and would send it; see
         // output_config_omitted_when_unset_and_model_lacks_effort.)
         let betas = provider_effort("claude-haiku-4-5-20251001", None)
-            .compute_betas(true)
+            .compute_betas(true, true)
             .unwrap();
         assert!(!betas.contains("claude-code-20250219"), "{betas}");
         assert!(!betas.contains("effort-2025-11-24"), "{betas}");
@@ -2124,7 +2213,7 @@ mod tests {
             "claude-haiku-4-5-20251001",
         ] {
             let provider = provider_with(model, false);
-            let betas = provider.compute_betas(true).unwrap();
+            let betas = provider.compute_betas(true, true).unwrap();
             assert!(betas.contains("oauth-2025-04-20"), "{model} → {betas}");
             assert!(
                 betas.contains("prompt-caching-scope-2026-01-05"),
@@ -2154,7 +2243,12 @@ mod tests {
     #[test]
     fn output_config_effort_uses_configured_value() {
         for value in ["low", "medium", "high"] {
-            let provider = provider_full("claude-opus-4-6-20250514", false, value, false);
+            let provider = provider_full(
+                "claude-opus-4-6-20250514",
+                false,
+                value,
+                crate::config::ThinkingDisplay::Summarized,
+            );
             let body = provider.build_request_body(
                 "system prompt",
                 &[Message::user("hi")],
@@ -2201,7 +2295,7 @@ mod tests {
             assert_eq!(body["output_config"]["effort"], "high", "{model}");
             assert!(
                 provider
-                    .compute_betas(true)
+                    .compute_betas(true, true)
                     .unwrap_or_default()
                     .contains("effort-2025-11-24"),
                 "{model} takes an effort, so the beta rides with it"
@@ -2227,7 +2321,7 @@ mod tests {
                 );
                 assert!(
                     !provider
-                        .compute_betas(true)
+                        .compute_betas(true, true)
                         .unwrap_or_default()
                         .contains("effort-2025-11-24"),
                     "{model} {configured:?}"
@@ -2249,7 +2343,7 @@ mod tests {
         assert_eq!(body["output_config"]["effort"], "max");
         assert!(
             forced
-                .compute_betas(true)
+                .compute_betas(true, true)
                 .unwrap()
                 .contains("effort-2025-11-24"),
             "effort beta must accompany an explicit override in the body"
@@ -2294,14 +2388,14 @@ mod tests {
         let provider = provider_with("claude-opus-4-8", true);
         assert!(
             provider
-                .compute_betas(true)
+                .compute_betas(true, true)
                 .unwrap()
                 .contains("advanced-tool-use-2025-11-20"),
             "advanced-tool-use must be sent when the request carries tools"
         );
         assert!(
             !provider
-                .compute_betas(false)
+                .compute_betas(false, true)
                 .unwrap()
                 .contains("advanced-tool-use-2025-11-20"),
             "advanced-tool-use must be omitted when there are no tools"
@@ -2311,11 +2405,11 @@ mod tests {
     #[test]
     fn betas_mid_conversation_system_gated_on_model() {
         // The gate is a denylist, so the newer models get it and the named older ones do not
-        // (mirrors Claude Code 2.1.241's own list).
+        // (mirrors Claude Code 2.1.263's own list).
         for model in ["claude-opus-4-8", "claude-opus-5", "claude-sonnet-5"] {
             assert!(
                 provider_with(model, true)
-                    .compute_betas(true)
+                    .compute_betas(true, true)
                     .unwrap()
                     .contains("mid-conversation-system-2026-04-07"),
                 "{model} must send mid-conversation-system"
@@ -2324,7 +2418,7 @@ mod tests {
         for model in ["claude-opus-4-6-20250514", "claude-haiku-4-5-20251001"] {
             assert!(
                 !provider_with(model, true)
-                    .compute_betas(true)
+                    .compute_betas(true, true)
                     .unwrap()
                     .contains("mid-conversation-system-2026-04-07"),
                 "{model} must not send mid-conversation-system"
@@ -2346,7 +2440,7 @@ mod tests {
         ] {
             assert!(
                 provider_with(model, true)
-                    .compute_betas(true)
+                    .compute_betas(true, true)
                     .unwrap()
                     .contains("mid-conversation-system-2026-04-07"),
                 "{model} is newer than the denylist and must still send mid-conversation-system"
@@ -2512,36 +2606,188 @@ mod tests {
         assert_eq!(id_of(&first), id_of(&second));
     }
 
+    /// An attribution as a conversation turn carries it: with a message slot, so the body has the
+    /// `diagnostics` field a side query lacks.
+    fn conversation_attribution() -> crate::provider::Attribution {
+        crate::provider::Attribution {
+            previous_message: Some(crate::provider::PreviousMessageSlot::default()),
+            ..Default::default()
+        }
+    }
+
+    fn body_for(provider: &ClaudeSubscriptionProvider) -> serde_json::Value {
+        provider.build_request_body(
+            "system prompt",
+            &[Message::user("hi")],
+            &[],
+            true,
+            ThinkingOverride::Inherit,
+            &crate::provider::Attribution::default(),
+        )
+    }
+
+    /// Claude Code's default: a turn with thinking on asks for display updates and drops the
+    /// redaction beta; a turn with thinking off has nothing to display and keeps the redaction
+    /// beta, as its own turns do.
     #[test]
-    fn betas_redact_thinking_added_when_enabled() {
-        // Adaptive-thinking-capable model + thinking on + redact_thinking on.
-        let provider = provider_full("claude-opus-4-6-20250514", true, "high", true);
-        let betas = provider.compute_betas(true).unwrap();
+    fn display_updates_follows_whether_thinking_is_on() {
+        let on = provider_full(
+            "claude-opus-4-6-20250514",
+            true,
+            "high",
+            crate::config::ThinkingDisplay::Updates,
+        );
+        let betas = on.compute_betas(true, true).unwrap();
         assert!(
-            betas.contains("redact-thinking-2026-02-12"),
-            "redact-thinking beta must be present when redact_thinking=true: {betas}"
+            betas.contains("thinking-display-updates-2026-08-18"),
+            "{betas}"
+        );
+        assert!(!betas.contains("redact-thinking-2026-02-12"), "{betas}");
+        assert_eq!(
+            body_for(&on)["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "updates"})
+        );
+
+        let off = provider_full(
+            "claude-opus-4-6-20250514",
+            false,
+            "high",
+            crate::config::ThinkingDisplay::Updates,
+        );
+        let betas = off.compute_betas(true, false).unwrap();
+        assert!(betas.contains("redact-thinking-2026-02-12"), "{betas}");
+        assert!(
+            !betas.contains("thinking-display-updates-2026-08-18"),
+            "{betas}"
+        );
+        assert!(body_for(&off).get("thinking").is_none());
+    }
+
+    #[test]
+    fn display_summarized_asks_for_summaries_and_never_redacts() {
+        let on = provider_full(
+            "claude-opus-4-6-20250514",
+            true,
+            "high",
+            crate::config::ThinkingDisplay::Summarized,
+        );
+        let betas = on.compute_betas(true, true).unwrap();
+        assert!(!betas.contains("redact-thinking-2026-02-12"), "{betas}");
+        assert!(
+            !betas.contains("thinking-display-updates-2026-08-18"),
+            "{betas}"
+        );
+        assert_eq!(
+            body_for(&on)["thinking"],
+            serde_json::json!({"type": "adaptive", "display": "summarized"})
+        );
+        let off = provider_full(
+            "claude-opus-4-6-20250514",
+            false,
+            "high",
+            crate::config::ThinkingDisplay::Summarized,
+        );
+        assert!(
+            !off.compute_betas(true, false)
+                .unwrap()
+                .contains("redact-thinking")
         );
     }
 
     #[test]
-    fn betas_redact_thinking_omitted_when_disabled() {
-        let provider = provider_full("claude-opus-4-6-20250514", true, "high", false);
-        let betas = provider.compute_betas(true).unwrap();
+    fn display_redacted_keeps_the_redaction_beta_and_sends_no_display() {
+        let provider = provider_full(
+            "claude-opus-4-6-20250514",
+            true,
+            "high",
+            crate::config::ThinkingDisplay::Redacted,
+        );
+        let betas = provider.compute_betas(true, true).unwrap();
+        assert!(betas.contains("redact-thinking-2026-02-12"), "{betas}");
         assert!(
-            !betas.contains("redact-thinking-2026-02-12"),
-            "redact-thinking beta must be omitted when redact_thinking=false: {betas}"
+            !betas.contains("thinking-display-updates-2026-08-18"),
+            "{betas}"
+        );
+        assert_eq!(
+            body_for(&provider)["thinking"],
+            serde_json::json!({"type": "adaptive"})
         );
     }
 
+    /// Claude Code sends the 1M beta for the `[1m]` model variant its user picked; the profile's
+    /// window is where a meka user states the same choice.
     #[test]
-    fn betas_redact_thinking_independent_of_toggle() {
-        // Claude Code gates redact-thinking on model capability, not the thinking toggle, so meka
-        // sends it whenever the `redact_thinking` knob is on (here with thinking off).
-        let provider = provider_full("claude-opus-4-6-20250514", false, "high", true);
-        let betas = provider.compute_betas(true).unwrap();
+    fn the_1m_context_beta_follows_the_profiles_window() {
+        let with_window = |window: Option<u64>| {
+            ClaudeSubscriptionProvider::new(
+                crate::provider::ProviderBuilder::new(
+                    crate::config::Backend::ClaudeSubscription,
+                    AuthCredential::ApiKey("test-key".to_string()),
+                    "claude-opus-5".to_string(),
+                )
+                .credential_key(Some("test".to_string()))
+                .thinking(ThinkingMode::Adaptive, 10000)
+                .device_id("a".repeat(64))
+                .context_window(window),
+            )
+            .expect("provider")
+        };
+        let betas = with_window(Some(1_000_000))
+            .compute_betas(true, true)
+            .unwrap();
+        assert_eq!(
+            betas.split(',').nth(2),
+            Some("context-1m-2025-08-07"),
+            "third, after oauth, as Claude Code orders it: {betas}"
+        );
+        for window in [None, Some(200_000), Some(999_999)] {
+            let betas = with_window(window).compute_betas(true, true).unwrap();
+            assert!(
+                !betas.contains("context-1m-2025-08-07"),
+                "{window:?}: {betas}"
+            );
+        }
+    }
+
+    /// `diagnostics.previous_message_id` is `null` until a response has carried a message id, and
+    /// then names the last one; a malformed id is ignored rather than sent.
+    #[test]
+    fn diagnostics_carry_the_last_recorded_message_id() {
+        let provider = provider_for_test();
+        let slot = crate::provider::PreviousMessageSlot::default();
+        let attribution = crate::provider::Attribution {
+            previous_message: Some(Arc::clone(&slot)),
+            ..Default::default()
+        };
+        let body = |attribution: &crate::provider::Attribution| {
+            provider.build_request_body(
+                "system prompt",
+                &[Message::user("hi")],
+                &[],
+                true,
+                ThinkingOverride::Inherit,
+                attribution,
+            )
+        };
+        assert_eq!(
+            body(&attribution)["diagnostics"],
+            serde_json::json!({"previous_message_id": null})
+        );
+        attribution.record_message_id("not an id");
+        assert_eq!(
+            body(&attribution)["diagnostics"]["previous_message_id"],
+            serde_json::Value::Null
+        );
+        attribution.record_message_id("msg_011Cepw4KgcVvSiBJbcdRbqv");
+        assert_eq!(
+            body(&attribution)["diagnostics"]["previous_message_id"],
+            "msg_011Cepw4KgcVvSiBJbcdRbqv"
+        );
+        // A side query has no slot and no field, as Claude Code's own side queries have none.
         assert!(
-            betas.contains("redact-thinking-2026-02-12"),
-            "redact-thinking is toggle-independent (gated on the knob + capability): {betas}"
+            body(&crate::provider::Attribution::default())
+                .get("diagnostics")
+                .is_none()
         );
     }
 
@@ -4228,7 +4474,7 @@ mod tests {
                 .thinking(ThinkingMode::Off, 10000)
                 .device_id("a".repeat(64))
                 .effort(None)
-                .redact_thinking(false)
+                .thinking_display(crate::config::ThinkingDisplay::Summarized)
                 .max_output_tokens(None)
                 .max_request_bytes(None),
             )
@@ -4317,7 +4563,7 @@ mod tests {
                 .thinking(ThinkingMode::Off, 10000)
                 .device_id("a".repeat(64))
                 .effort(Some("high".to_string()))
-                .redact_thinking(false)
+                .thinking_display(crate::config::ThinkingDisplay::Summarized)
                 .max_output_tokens(None)
                 .max_request_bytes(None),
             )
@@ -4396,7 +4642,7 @@ mod tests {
             .thinking(ThinkingMode::Off, 10000)
             .device_id("a".repeat(64))
             .effort(Some("high".to_string()))
-            .redact_thinking(false)
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )
@@ -4526,7 +4772,7 @@ mod tests {
             .thinking(ThinkingMode::Off, 10000)
             .device_id("a".repeat(64))
             .effort(None)
-            .redact_thinking(false)
+            .thinking_display(crate::config::ThinkingDisplay::Summarized)
             .max_output_tokens(None)
             .max_request_bytes(None),
         )

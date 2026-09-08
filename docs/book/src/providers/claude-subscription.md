@@ -43,7 +43,7 @@ account = "anthropic"
 model = "claude-opus-5"
 effort = "xhigh"         # optional; unset sends "high", as Claude Code does
 thinking = "adaptive"    # optional; "adaptive"|"budgeted"|"off", default "adaptive"
-redact_thinking = true   # optional; default on, matching Claude Code
+thinking_display = "updates"  # optional; updates|summarized|redacted, default updates
 ```
 
 See [Configuration → Config file](../configuration/config-file.md) for the full list of fields.
@@ -58,9 +58,17 @@ Sent as `output_config.effort` under the `effort-2025-11-24` beta. When unset, m
 
 `adaptive` (the default) sends `thinking: {"type": "adaptive"}`; `budgeted` sends `{"type": "enabled", "budget_tokens": N}` from the profile's `thinking_budget` (falling back to [`[thinking].budget`](../configuration/config-file.md#thinkingbudget)), which pre-4.6 models require; `off` sends no thinking field. `temperature` follows whether thinking is on at all, not which encoding it uses. The betas do not: they are gated on the model alone.
 
-### `redact_thinking`
+### `thinking_display`
 
-Adds the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which sends it by default. With it on, the server withholds the readable chain of thought: `thinking` blocks come back with empty text plus a signature, and any `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn reasoning continuity is maintained. The practical effect is that live thinking output goes quiet for these models (there is no readable text to show), exactly as in Claude Code. Defaults to `true`; set `redact_thinking = false` to drop the beta and keep interleaved thinking visible.
+How the model's thinking is presented, one of Claude Code's three display modes. `updates`, the
+default and Claude Code's own since 2.1.263, sends `thinking.display = "updates"` under the
+`thinking-display-updates-2026-08-18` beta: the server streams a running token count instead of
+the text, which the REPL draws as `Thinking... (150 tokens)`. `summarized` sends
+`thinking.display = "summarized"` and streams a short readable summary. `redacted` sends the
+`redact-thinking-2026-02-12` beta and no display field, and the server may answer with opaque
+`redacted_thinking` blocks. In every mode the `thinking` blocks come back signed, and meka stores
+and replays them verbatim, so multi-turn reasoning continuity is maintained. With thinking off
+nothing is displayed and the redaction beta is sent, as Claude Code does.
 
 A stored block records that its signature is Claude's, so resuming the session under an OpenAI profile does not replay a Claude signature as encrypted reasoning. A session recorded by 0.41 holds its blocks under a shape that names no provider, and meka does not reshape them when it opens a session; the [one-shot upgrade script](../getting-started/upgrading.md) does. Until it runs, such a block keeps its readable text and loses its signature, so those turns are not replayed as verified reasoning.
 
@@ -120,14 +128,15 @@ meka forwards the model string verbatim and doesn't gate which strings are valid
 
 ### Beta header
 
-Composed dynamically from the model + thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.241 interactive-CLI wire capture (tools present, thinking on) exactly:
+Composed dynamically from the model, window and thinking settings, mirroring Claude Code's own assembly. Order is significant; the list below matches the Claude Code 2.1.263 interactive-CLI wire capture (tools present, thinking on, display updates) exactly:
 
 | Beta | When |
 |------|------|
 | `claude-code-20250219` | All models *except* Haiku family |
 | `oauth-2025-04-20` | Always (subscription auth) |
+| `context-1m-2025-08-07` | The profile's `context_window` is a million tokens or more; Claude Code sends it for the `[1m]` model variant its user selected |
 | `interleaved-thinking-2025-05-14` | Any modern Claude (4.x+) |
-| `redact-thinking-2026-02-12` | Any modern Claude (4.x+); on by default, `redact_thinking = false` opts out |
+| `redact-thinking-2026-02-12` | Any modern Claude under `thinking_display = "redacted"`, or with thinking off unless the display is `summarized` |
 | `thinking-token-count-2026-05-13` | Any modern Claude (4.x+) |
 | `context-management-2025-06-27` | Any modern Claude (4.x+) |
 | `prompt-caching-scope-2026-01-05` | Always |
@@ -135,9 +144,9 @@ Composed dynamically from the model + thinking settings, mirroring Claude Code's
 | `advanced-tool-use-2025-11-20` | When the request carries tools (meka always does) |
 | `effort-2025-11-24` | Every model that takes an effort at all, whether or not the profile set one |
 | `fallback-credit-2026-06-01` | Always. Claude Code latches it on every interactive turn; it only advertises that the server may answer with a fallback credit, and meka sends no `fallbacks` of its own |
+| `thinking-display-updates-2026-08-18` | Any modern Claude with thinking on under `thinking_display = "updates"`, paired with `thinking.display = "updates"` |
 | `extended-cache-ttl-2025-04-11` | Always (meka sends a 1h cache TTL) |
-
-meka does **not** send `context-1m-2025-08-07`: Claude Code stopped sending it after 2.1.185, because 1M is the default context window (no beta header) on the current large-context models.
+| `cache-diagnosis-2026-04-07` | Always, paired with the body's `diagnostics.previous_message_id`: the id of the previous response's message, or `null` on a conversation's first request and after a resume |
 
 ### System prompt
 
@@ -157,7 +166,7 @@ Keys are serialized in Claude Code's own order, which HTTP preserves:
 
 ```
 model, messages, system, tools, metadata, max_tokens, thinking,
-[temperature], [context_management], [output_config], stream
+[temperature], [context_management], [output_config], [diagnostics], stream
 ```
 
 Nothing in meka depends on that order. `patch_request_body` finds the `cch=00000` placeholder by walking the JSON structurally to the *top-level* `system` key rather than by searching for the billing header, so a conversation that quotes one (which any session about this code does) cannot capture the attestation.
@@ -167,6 +176,8 @@ Nothing in meka depends on that order. `patch_request_body` finds the `cch=00000
 - `metadata.user_id`: JSON-encoded `{"device_id": "...", "account_uuid": "...", "session_id": "..."}` (`device_id` from the account's `device_id`; `account_uuid` from the OAuth token, empty until one is known; `session_id` is per-process).
 - `context_management.edits = [{type: "clear_thinking_20251015", keep: "all"}]`: present when thinking is enabled on a context-management-capable model. Mirrors Claude Code's `apiMicrocompact`.
 - `output_config.effort`: see [Reasoning effort](#reasoning-effort).
+- `thinking.display`: see [`thinking_display`](#thinking_display); absent with thinking off and under `redacted`.
+- `diagnostics.previous_message_id`: the id of the previous response's message in this conversation, `null` on the first request and after a resume; absent on a compaction request, which is a side query. Pairs with the `cache-diagnosis-2026-04-07` beta.
 - `temperature: 1` (only when `thinking = "off"`, and only for models that still accept sampling params).
 - `max_tokens`: `64_000` under `thinking = "adaptive"`, `max(thinking_budget * 2, 32_000)` under `budgeted`, `32_000` under `off`.
 
@@ -180,7 +191,7 @@ Claude Code never leaves `output_config.effort` to the server on a model that ta
 | profile sets nothing | `high` |
 | model takes no effort | nothing, and no beta; a configured value is dropped with a warning |
 
-One value for every model, not a copy of that table. `high` is what Claude Code's own resolution produces for almost every effort-capable model in the 2.1.241 table once the clamps have run, and it is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
+One value for every model, not a copy of that table. `high` is what Claude Code's own resolution produces for almost every effort-capable model in the 2.1.263 table once the clamps have run, and it is what Claude Code falls back to for any model the table does not list. Carrying the per-model figures instead would add facts about Anthropic's data that go stale on their release schedule and buy nothing, because the server cannot tell a default meka chose from a value you configured. Models that take no effort at all are the Claude 3.x line, Opus 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5.
 
 A value you configure is absolute. Claude Code silently lowers `xhigh` or `max` to `high` on a model whose bundled entry lacks the capability; meka does not, because that table is a snapshot of someone else's system and quietly overriding what you asked for on the strength of it is worse than letting the API answer.
 

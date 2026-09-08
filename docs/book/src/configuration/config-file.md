@@ -224,7 +224,7 @@ Override the per-request output (completion) token cap. When unset, each backend
 | Claude, `off` | 32000 |
 | Every other backend | the endpoint's own |
 
-The Claude figures are meka's own defaults for the two Anthropic backends, taken from what Claude Code 2.1.241 sends on the wire; stating one here replaces them. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
+The Claude figures are meka's own defaults for the two Anthropic backends, taken from what Claude Code 2.1.263 sends on the wire; stating one here replaces them. The OpenAI backends send no cap unless the profile states one, because each reaches whatever `base_url` names and the endpoint's default is that endpoint's fact.
 
 Under `thinking = "budgeted"` the value must exceed the profile's resolved thinking budget ([`thinking_budget`](#thinking_budget), else [`[thinking].budget`](#thinkingbudget), else 16000). `meka profile add` and `meka profile set` both refuse a profile that fails this, and it is validated again at startup.
 
@@ -312,14 +312,28 @@ account           = "gateway"
 max_request_bytes = 8388608
 ```
 
-### `redact_thinking`
+### `thinking_display`
 
-`claude-subscription` only. Sends the `redact-thinking-2026-02-12` beta header for capable models, matching Claude Code, which enables it by default. With it on the server withholds the readable chain of thought: `thinking` blocks return with empty text plus a signature, and `redacted_thinking` blocks carry an opaque `data` payload. meka preserves and replays both verbatim, so multi-turn continuity holds. No reasoning text is shown for these models; in its place the REPL draws a live `Thinking... (150 tokens)` indicator from the server's running estimate, redrawn as the count climbs and left on screen when the phase ends, so a long silence reads as progress and stays legible afterwards. Defaults to `true`; set `false` to drop the beta and keep interleaved thinking visible.
+`claude-subscription` only. How the model's thinking is presented, one of Claude Code's three
+display modes:
+
+- `updates` (the default, Claude Code's own): the server streams a running token count in place
+  of the text, and the REPL draws `Thinking... (150 tokens)` from it, redrawn as the count climbs
+  and left on screen when the phase ends. Sent as `thinking.display = "updates"` under the
+  `thinking-display-updates-2026-08-18` beta.
+- `summarized`: the server streams a short summary of the reasoning, shown as thinking text. Sent
+  as `thinking.display = "summarized"`.
+- `redacted`: the server withholds the text and may return opaque `redacted_thinking` blocks. Sent
+  as the `redact-thinking-2026-02-12` beta with no display field.
+
+Every mode returns signed `thinking` blocks, which meka stores and replays verbatim, so multi-turn
+continuity holds in all three. With thinking off there is nothing to display, and meka sends the
+redaction beta as Claude Code does.
 
 ```toml
 [profiles.work]
-account         = "anthropic"
-redact_thinking = false
+account          = "anthropic"
+thinking_display = "summarized"
 ```
 
 ## `meka account` CLI
@@ -353,7 +367,7 @@ login.
 
 | Command | Action |
 |---|---|
-| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5` on a Claude account and `gpt-5.6-sol` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes` and `--redact-thinking`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Does not touch `default_profile`. |
+| `meka profile add <name> [--account A] [--model M] [...]` | Add a profile. Prompts for the account and model when not flagged (a sole account is offered as the default; the model prompt offers `claude-opus-5` on a Claude account and `gpt-5.6-sol` on an OpenAI one), then offers an optional advanced step covering thinking, context window and effort, plus the thinking budget if you answer `budgeted`. Every other [profile field](#profile-fields) has a flag writing the key of the same name: `--context-window`, `--max-output-tokens`, `--effort`, `--vision`, `--thinking`, `--thinking-budget`, `--max-request-bytes` and `--thinking-display <DISPLAY>`, so one non-interactive command can create a profile of any shape. An unflagged setting is left out of the profile so its documented default applies. Does not touch `default_profile`. |
 | `meka profile list` | List configured profiles with account, backend, model and the default marker; `--format json` prints the same as one document. Names any profile whose account is not configured. |
 | `meka profile set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka profile use <name>` | Set `default_profile` to this profile. |
@@ -394,7 +408,7 @@ Nine keys are settable, each named after the [profile field](#profile-fields) it
 | `thinking` | `adaptive`, `budgeted`, or `off` |
 | `thinking_budget` | A whole number of tokens |
 | `max_request_bytes` | A whole number of bytes |
-| `redact_thinking` | `true` or `false` |
+| `thinking_display` | `updates`, `summarized` or `redacted` |
 
 A token count must be whole and at most 9223372036854775807, the largest integer TOML can represent;
 anything else is refused before the file is opened. A boolean takes `true` or `false` and nothing
@@ -416,9 +430,9 @@ can leave behind a profile the other would have declined:
 - **A key on a backend that never sends it.** `thinking` and `thinking_budget` are Anthropic
   Messages request fields, so profiles on `anthropic-messages` and `claude-subscription` accounts
   carry them and nothing else does.
-  [`redact_thinking`](#redact_thinking) is narrower still: it gates a beta header only
+  [`thinking_display`](#thinking_display) is narrower still: it shapes a request only
   `claude-subscription` sends, so a profile on an `anthropic-messages` account takes a thinking
-  field and declines the redaction flag beside it. `set` refuses the key and writes nothing; `add`
+  field and declines the display beside it. `set` refuses the key and writes nothing; `add`
   drops the flag with a warning and creates the profile without it. Same outcome either way: the
   key never lands where it would read plausibly and do nothing. `set --unset` is allowed on all of
   them, because removing an inert key is the remedy rather than the offense, and a hand-edited file

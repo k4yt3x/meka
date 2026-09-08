@@ -338,13 +338,15 @@ pub(crate) enum ProfileAction {
         /// default to 30 MiB)
         #[arg(long = "max-request-bytes", value_name = "BYTES")]
         max_request_bytes: Option<u64>,
-        /// Redact thinking blocks (claude-subscription only; default: true)
+        /// Thinking display: updates, summarized, redacted (claude-subscription only; default:
+        /// updates)
         #[arg(
-            long = "redact-thinking",
+            long = "thinking-display",
+            value_enum,
             hide_possible_values = true,
-            value_name = "BOOL"
+            value_name = "DISPLAY"
         )]
-        redact_thinking: Option<bool>,
+        thinking_display: Option<crate::config::ThinkingDisplay>,
     },
     /// List configured profiles
     List {
@@ -355,7 +357,7 @@ pub(crate) enum ProfileAction {
     /// Change one setting on a profile
     ///
     /// Keys: model, context_window, max_output_tokens, effort, vision, thinking, thinking_budget,
-    /// max_request_bytes, redact_thinking. `account` is not settable; add a profile on the other
+    /// max_request_bytes, thinking_display. `account` is not settable; add a profile on the other
     /// account instead.
     Set {
         /// Profile name

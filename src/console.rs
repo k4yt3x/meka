@@ -715,9 +715,9 @@ impl Console {
     ///
     /// The thinking events fire on turns that stream no reasoning at all: a block completing with
     /// nothing readable emits `ThinkingEnded`, which is the ordinary shape under sealed reasoning
-    /// and under Claude's `redact-thinking`. Closing indiscriminately there ends the *answer's*
-    /// run mid-paragraph, and the next delta opens a second one -- splitting one paragraph across
-    /// two on the stream a caller pipes.
+    /// and under Claude's `redact-thinking` or display updates. Closing indiscriminately there ends
+    /// the *answer's* run mid-paragraph, and the next delta opens a second one -- splitting one
+    /// paragraph across two on the stream a caller pipes.
     pub(crate) fn close_thinking(&mut self) {
         if self.open_stream_kind() == Some(StreamKind::Thinking) {
             self.close_stream();

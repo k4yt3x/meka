@@ -1,6 +1,6 @@
 /// Claude Code version string. Single source of truth; also emitted as
 /// `CC_VERSION` for use via `env!("CC_VERSION")` in the main crate.
-const CC_VERSION: &str = "2.1.241";
+const CC_VERSION: &str = "2.1.263";
 
 /// Returns rather than `expect`s, because `[lints.clippy] expect_used` reaches the build script
 /// too: the Windows lint job compiles this file, and the panicking call was a hard error there

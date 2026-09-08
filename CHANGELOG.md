@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** a 0.45 `config.toml` is refused at startup until the script converts it.
 - **Breaking:** config durations are strings like `"30d"`; `_seconds` and `_days` keys are gone.
 - **Breaking:** `[mcp].strict` is `default_required` and `[thinking].budget_tokens` is `budget`.
+- **Breaking:** `redact_thinking` is `thinking_display`, one of `updates`, `summarized`, `redacted`.
 - **Breaking:** `MEKA_MCP_STDIO_CONCURRENCY` and `MEKA_MCP_HTTP_CONCURRENCY` are gone.
 - `[mcp].stdio_concurrency` (3) and `[mcp].http_concurrency` (20) replace them; zero is refused.
 - **Breaking:** `MEKA_MCP_TOOL_TIMEOUT` takes a duration such as `10m`, not milliseconds.
@@ -105,6 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A gate may call a tool that needs `read` or less, not only one that needs exactly `read`.
 - Only `meka mcp login` runs the OAuth flow; a host marks a server with no credential as failed.
 - `anthropic-messages` sends no one-hour cache TTL or beta; `claude-subscription` keeps both.
+- `claude-subscription` matches Claude Code 2.1.263.
 - **Breaking:** an image block in session messages and exports carries a `hash`, not its bytes.
 - **Breaking:** per-turn context is a typed `turn_context` block ahead of a user message's `text`.
 - **Breaking:** a session export archive names its `profile`, and its `format_version` is 2.

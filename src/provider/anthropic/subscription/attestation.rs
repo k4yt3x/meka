@@ -22,7 +22,7 @@ use crate::{
 /// Claude Code version string. Single source of truth defined in `build.rs`.
 pub(super) const CC_VERSION: &str = env!("CC_VERSION");
 
-/// Fingerprint salt. `MHE` in the shipped 2.1.241 binary.
+/// Fingerprint salt. `MHE` in the shipped 2.1.241 binary, present unchanged in 2.1.263.
 const FINGERPRINT_SALT: &str = "59cf53e54c78";
 
 /// `SHA256(SALT + message[4] + message[7] + message[20] + version)[:3]`.
@@ -72,8 +72,8 @@ fn compute_fingerprint_from_messages(messages: &[Message]) -> String {
 /// derived from the first user message per Claude Code's behavior. The `cch` is replaced with the
 /// real attestation by [`patch_request_body`] after serialization.
 ///
-/// The optional segments follow in the order Claude Code's builder emits them (2.1.241, verified
-/// against a wire capture): `cch`, then `cc_workload`, `cc_is_subagent`, `cc_prev_req`,
+/// The optional segments follow in the order Claude Code's builder emits them (2.1.241 and 2.1.263,
+/// verified against wire captures): `cch`, then `cc_workload`, `cc_is_subagent`, `cc_prev_req`,
 /// `cc_prompt_id`. meka never has a workload, so that one is always absent; the rest appear
 /// exactly when their source does.
 pub(super) fn generate_billing_header(
@@ -461,10 +461,10 @@ fn stainless_os() -> &'static str {
 /// Applies all HTTP headers Claude Code sends, in the order it sends them.
 ///
 /// The order is not cosmetic: HTTP/2 preserves it, so it is as much a client signature as the
-/// values are. What the 2.1.241 wire capture shows is the Stainless SDK's `Headers` object
-/// serialized in a case-sensitive sort (uppercase before lowercase), then the transport's own
-/// `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it. `reqwest`'s `HeaderMap`
-/// iterates in insertion order, so inserting in that order reproduces it.
+/// values are. What the 2.1.241 and 2.1.263 wire captures show is the Stainless SDK's `Headers`
+/// object serialized in a case-sensitive sort (uppercase before lowercase), then the transport's
+/// own `Connection` / `Host` / `Accept-Encoding` / `Content-Length` after it. `reqwest`'s
+/// `HeaderMap` iterates in insertion order, so inserting in that order reproduces it.
 ///
 /// Two parts of it are outside meka's reach and stay different. Header *names* go out lowercased
 /// (`http::HeaderName` normalizes, and HTTP/2 requires it anyway, so this is invisible on the real

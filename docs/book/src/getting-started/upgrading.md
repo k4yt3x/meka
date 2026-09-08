@@ -72,7 +72,7 @@ the store keeps its 0.45 shape until the launch after the script has run.
 |---|---|
 | `default_provider = "work"` | `default_profile = "work"` |
 | `[providers.work]` with `type`, `base_url`, `client_id`, `oauth_token_url`, `device_id` | `[accounts.work]` with `backend` in place of `type`, and the other four unchanged |
-| `[providers.work]` with `model`, `context_window`, `max_output_tokens`, `effort`, `vision`, `thinking`, `thinking_budget`, `max_request_bytes`, `redact_thinking` | `[profiles.work]` with `account = "work"` and the nine keys unchanged |
+| `[providers.work]` with `model`, `context_window`, `max_output_tokens`, `effort`, `vision`, `thinking`, `thinking_budget`, `max_request_bytes`, `redact_thinking` | `[profiles.work]` with `account = "work"` and eight keys unchanged; `redact_thinking = true` becomes `thinking_display = "redacted"` and `false` becomes `"summarized"` |
 | `[permissions].enabled` containing `"ask"` | `"none"` in its place |
 | `[permissions].default = "ask"` | `default = "none"` and `approvals = true` |
 | `[web].request_timeout_seconds = 30`, `connect_timeout_seconds`, `read_timeout_seconds` | `request_timeout = "30s"`, `connect_timeout`, `read_timeout`, by value; a `0`, which meant the default, is removed |

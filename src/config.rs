@@ -824,11 +824,11 @@ impl Backend {
     /// Whether this backend actually sends the profile key `key`.
     ///
     /// [`Self::takes_thinking`] answers for the request *field*, which is the right question for
-    /// `thinking` and `thinking_budget` and the wrong one for `redact_thinking`. That key gates the
-    /// `redact-thinking-…` beta header, which only `claude-subscription` sends: the string does not
-    /// appear in the Messages API backend at all. So `profile set apikey redact_thinking false`
-    /// reported success and did nothing, which is exactly what `refuse_an_inert_key` exists to
-    /// stop one field over.
+    /// `thinking` and `thinking_budget` and the wrong one for `thinking_display`. That key shapes a
+    /// request only `claude-subscription` sends: the display values are a first-party feature
+    /// the Messages API backend never asks for. So `profile set apikey thinking_display
+    /// summarized` reported success and did nothing, which is exactly what
+    /// `refuse_an_inert_key` exists to stop one field over.
     ///
     /// Every other key is read by every backend that has it, so the fallback is `true` rather than
     /// an enumeration that would need editing whenever a field is added; `max_request_bytes` is
@@ -836,7 +836,7 @@ impl Backend {
     /// write doors and the load-time check all ask this one function.
     pub(crate) fn reads_profile_key(self, key: &str) -> bool {
         match key {
-            "redact_thinking" => matches!(self, Self::ClaudeSubscription),
+            "thinking_display" => matches!(self, Self::ClaudeSubscription),
             "thinking" | "thinking_budget" => self.takes_thinking(),
             _ => true,
         }
@@ -894,7 +894,7 @@ fn warn_about_inert_profile_keys(
         let set = [
             ("thinking", profile.thinking.is_some()),
             ("thinking_budget", profile.thinking_budget.is_some()),
-            ("redact_thinking", profile.redact_thinking.is_some()),
+            ("thinking_display", profile.thinking_display.is_some()),
         ];
         for (key, is_set) in set {
             if is_set && !backend.reads_profile_key(key) {
@@ -2433,6 +2433,80 @@ impl From<ThinkingMode> for String {
     }
 }
 
+/// How a `claude-subscription` turn asks for its thinking to be presented: Claude Code's three
+/// display modes, one wire shape each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub(crate) enum ThinkingDisplay {
+    /// `thinking.display = "updates"` under the `thinking-display-updates-2026-08-18` beta, and no
+    /// redaction beta: Claude Code's default from 2.1.263.
+    #[default]
+    Updates,
+    /// `thinking.display = "summarized"` and no redaction beta: Claude Code's
+    /// `showThinkingSummaries` setting.
+    Summarized,
+    /// No display field and the `redact-thinking-2026-02-12` beta: Claude Code with display
+    /// updates switched off.
+    Redacted,
+}
+
+impl ThinkingDisplay {
+    pub(crate) const ALL: [ThinkingDisplay; 3] = [Self::Updates, Self::Summarized, Self::Redacted];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Updates => "updates",
+            Self::Summarized => "summarized",
+            Self::Redacted => "redacted",
+        }
+    }
+
+    pub(crate) fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|display| display.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for ThinkingDisplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ThinkingDisplay {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|display| display.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a thinking display. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for ThinkingDisplay {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ThinkingDisplay> for String {
+    fn from(display: ThinkingDisplay) -> Self {
+        display.name().to_string()
+    }
+}
+
 /// `headers` and `env` are the two places a user is most likely to put a bearer token, and a
 /// `{:?}` on this struct (in a connect error, a `tracing::debug!`, a panic message) printed them.
 /// Names are kept: knowing that `Authorization` was set is the diagnostic; knowing its value is the
@@ -3492,7 +3566,7 @@ account = "main"
     }
 
     #[test]
-    fn provider_profile_deserializes_effort_and_redact_thinking() {
+    fn a_profile_deserializes_effort_and_thinking_display() {
         let toml_str = r#"
 [accounts.work]
 backend = "claude-subscription"
@@ -3502,7 +3576,7 @@ account = "work"
 model = "claude-opus-4-6-20250514"
 effort = "medium"
 thinking = "budgeted"
-redact_thinking = true
+thinking_display = "redacted"
 "#;
         let config: ConfigFile = toml::from_str(toml_str).expect("failed to parse toml");
         let profile = config
@@ -3514,7 +3588,10 @@ redact_thinking = true
             profile.thinking,
             Some(crate::config::ThinkingMode::Budgeted)
         );
-        assert_eq!(profile.redact_thinking, Some(true));
+        assert_eq!(
+            profile.thinking_display,
+            Some(crate::config::ThinkingDisplay::Redacted)
+        );
     }
 
     #[test]

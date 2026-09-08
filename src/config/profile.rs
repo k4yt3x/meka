@@ -61,7 +61,7 @@ pub(crate) struct AccountConfig {
 /// it: [`ProfileSettings`], [`resolve_profile`], `ProfileTuning`, `upsert_profile_document`,
 /// `SETTABLE_PROFILE_KEYS`, the `profile add` flags, and the `config.toml` reference. `account`
 /// leads, then `model`, then every model-tied knob, widest reach first and ending with
-/// `redact_thinking` as the only `claude-subscription` setting.
+/// `thinking_display` as the only `claude-subscription` setting.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProfileConfig {
@@ -103,11 +103,9 @@ pub(crate) struct ProfileConfig {
     /// Anthropic's endpoint caps at 32 MiB and the Anthropic backends default to 30 MiB, but an
     /// `anthropic-messages` account reaches whatever `base_url` names, whose cap is its own fact.
     pub(crate) max_request_bytes: Option<u64>,
-    /// `claude-subscription` only: when true, meka sends the `redact-thinking-2026-02-12` beta
-    /// header so the server returns `redacted_thinking` blocks instead of full thinking summaries
-    /// (saves bandwidth, but the redacted payloads can't be replayed back to the server in
-    /// multi-turn conversations). Defaults to true.
-    pub(crate) redact_thinking: Option<bool>,
+    /// `claude-subscription` only: how the model's thinking is presented, one of Claude Code's
+    /// three display modes. Defaults to `updates`, Claude Code's own default.
+    pub(crate) thinking_display: Option<crate::config::ThinkingDisplay>,
 }
 /// [`AccountConfig`]'s field order, as the key names a `config.toml` account table carries.
 pub(crate) const ACCOUNT_KEY_ORDER: &[&str] = &[
@@ -132,7 +130,7 @@ pub(crate) const PROFILE_KEY_ORDER: &[&str] = &[
     "thinking",
     "thinking_budget",
     "max_request_bytes",
-    "redact_thinking",
+    "thinking_display",
 ];
 /// Put one table's keys into `order`.
 ///
@@ -203,7 +201,7 @@ pub(crate) struct ProfileSettings {
     /// window is what [`crate::provider::profile_context_window`] reports rather than dividing by
     /// a figure meka has no reason to believe.
     pub(crate) thinking_budget: u64,
-    pub(crate) redact_thinking: bool,
+    pub(crate) thinking_display: crate::config::ThinkingDisplay,
     /// See [`ProfileConfig::max_request_bytes`]; `None` leaves the backend's default.
     pub(crate) max_request_bytes: Option<usize>,
 }
@@ -314,9 +312,7 @@ pub(crate) fn resolve_profile(
             .thinking_budget
             .or(default_thinking_budget)
             .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
-        // Default on to match Claude Code, which sends `redact-thinking` for every capable model.
-        // Profiles opt out with `redact_thinking = false` to keep interleaved thinking visible.
-        redact_thinking: profile.redact_thinking.unwrap_or(true),
+        thinking_display: profile.thinking_display.unwrap_or_default(),
     })
 }
 /// The `claude-subscription` device identifier for one account, seeding and persisting one when
@@ -659,7 +655,11 @@ mod tests {
         .expect("resolves");
 
         assert!(settings.vision, "vision defaults on");
-        assert!(settings.redact_thinking, "redact_thinking defaults on");
+        assert_eq!(
+            settings.thinking_display,
+            crate::config::ThinkingDisplay::Updates,
+            "thinking display defaults to updates"
+        );
         assert_eq!(
             settings.context_window,
             Some(200_000),
@@ -914,7 +914,7 @@ mod tests {
             "thinking = \"budgeted\"\n",
             "thinking_budget = 32000\n",
             "max_request_bytes = 8388608\n",
-            "redact_thinking = true\n",
+            "thinking_display = \"redacted\"\n",
         );
 
         let parsed: ConfigFile =
@@ -954,7 +954,7 @@ mod tests {
     fn sorting_a_profile_orders_its_keys_and_carries_the_comments_with_them() {
         let mut document: toml_edit::DocumentMut = concat!(
             "[profiles.work]\n",
-            "redact_thinking = false\n",
+            "thinking_display = \"summarized\"\n",
             "\n",
             "# the window this model really has\n",
             "context_window = 200000\n",
@@ -978,7 +978,7 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            ["account", "model", "context_window", "redact_thinking"],
+            ["account", "model", "context_window", "thinking_display"],
             "keys should follow PROFILE_KEY_ORDER: {rendered}"
         );
         assert!(

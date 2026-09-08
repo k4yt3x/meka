@@ -112,6 +112,9 @@ pub(crate) struct Agent {
     /// spawner's. Read and written only by the Claude subscription provider, which is the one
     /// backend that puts it on the wire (`cc_prev_req`); every other backend leaves it empty.
     previous_request: crate::provider::PreviousRequestSlot,
+    /// The message id twin of [`Self::previous_request`], read for
+    /// `diagnostics.previous_message_id`.
+    previous_message: crate::provider::PreviousMessageSlot,
     /// Conversation length at the time of the most recent request the provider *accepted*, or
     /// [`LAST_ACCEPTED_UNKNOWN`] before the first one. Everything appended past it is what a
     /// `MekaError::InvalidRequest` is allowed to blame: the failing request differs from the last
@@ -199,6 +202,7 @@ impl Agent {
             // Fresh per agent: it describes one conversation, and a worker's requests are not its
             // spawner's.
             previous_request: crate::provider::PreviousRequestSlot::default(),
+            previous_message: crate::provider::PreviousMessageSlot::default(),
             last_accepted_len: std::sync::atomic::AtomicUsize::new(LAST_ACCEPTED_UNKNOWN),
         }
     }

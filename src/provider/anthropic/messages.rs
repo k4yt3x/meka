@@ -126,6 +126,7 @@ impl AnthropicMessagesProvider {
             self.effective_thinking(thinking),
             self.thinking_budget_tokens,
             self.max_output_tokens,
+            None,
         );
 
         body.insert("stream".to_string(), serde_json::json!(stream));

@@ -21,7 +21,8 @@ pub(crate) struct ProviderBuilder {
     pub(super) thinking_budget_tokens: u64,
     pub(super) device_id: String,
     pub(super) effort: Option<String>,
-    pub(super) redact_thinking: bool,
+    pub(super) thinking_display: crate::config::ThinkingDisplay,
+    pub(super) context_window: Option<u64>,
     pub(super) max_output_tokens: Option<u64>,
     pub(super) max_request_bytes: Option<usize>,
 }
@@ -44,7 +45,8 @@ impl ProviderBuilder {
             thinking_budget_tokens: 0,
             device_id: String::new(),
             effort: None,
-            redact_thinking: true,
+            thinking_display: crate::config::ThinkingDisplay::default(),
+            context_window: None,
             max_output_tokens: None,
             max_request_bytes: None,
         }
@@ -106,9 +108,16 @@ impl ProviderBuilder {
         self
     }
 
-    /// Request `redacted_thinking` blocks. Only consumed by `claude-subscription`.
-    pub(crate) fn redact_thinking(mut self, value: bool) -> Self {
-        self.redact_thinking = value;
+    /// How thinking is presented. Only consumed by `claude-subscription`.
+    pub(crate) fn thinking_display(mut self, value: crate::config::ThinkingDisplay) -> Self {
+        self.thinking_display = value;
+        self
+    }
+
+    /// The profile's context window, which decides the 1M-context beta. Only consumed by
+    /// `claude-subscription`.
+    pub(crate) fn context_window(mut self, value: Option<u64>) -> Self {
+        self.context_window = value;
         self
     }
 
@@ -487,7 +496,8 @@ impl ProviderRegistry {
             .thinking(settings.thinking, settings.thinking_budget)
             .device_id(settings.device_id.clone())
             .effort(settings.effort.clone())
-            .redact_thinking(settings.redact_thinking)
+            .thinking_display(settings.thinking_display)
+            .context_window(settings.context_window)
             .max_output_tokens(settings.max_output_tokens)
             .max_request_bytes(settings.max_request_bytes)
             .build()?;

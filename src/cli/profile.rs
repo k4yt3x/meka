@@ -29,7 +29,7 @@ pub(crate) async fn run(
             thinking,
             thinking_budget,
             max_request_bytes,
-            redact_thinking,
+            thinking_display,
         } => run_add(name, account.as_deref(), model.clone(), ProfileTuning {
             context_window: *context_window,
             max_output_tokens: *max_output_tokens,
@@ -38,7 +38,7 @@ pub(crate) async fn run(
             thinking: *thinking,
             thinking_budget: *thinking_budget,
             max_request_bytes: *max_request_bytes,
-            redact_thinking: *redact_thinking,
+            thinking_display: *thinking_display,
         }),
         ProfileAction::List { format } => run_list(*format),
         ProfileAction::Set {
@@ -74,7 +74,7 @@ struct ProfileTuning {
     thinking: Option<config::ThinkingMode>,
     thinking_budget: Option<u64>,
     max_request_bytes: Option<u64>,
-    redact_thinking: Option<bool>,
+    thinking_display: Option<crate::config::ThinkingDisplay>,
 }
 
 fn run_add(
@@ -270,7 +270,7 @@ const SETTABLE_PROFILE_KEYS: &[&str] = &[
     "thinking",
     "thinking_budget",
     "max_request_bytes",
-    "redact_thinking",
+    "thinking_display",
 ];
 
 /// Parse one `key`/`value` pair into the TOML value the profile should carry.
@@ -308,7 +308,12 @@ fn parse_profile_value(name: &str, key: &str, value: &str) -> anyhow::Result<tom
         "vision" => boolean("vision"),
         "thinking_budget" => integer("thinking_budget"),
         "max_request_bytes" => integer("max_request_bytes"),
-        "redact_thinking" => boolean("redact_thinking"),
+        "thinking_display" => {
+            let display = value
+                .parse::<crate::config::ThinkingDisplay>()
+                .map_err(anyhow::Error::msg)?;
+            Ok(toml_edit::Value::from(display.name()))
+        }
         "thinking" => {
             let mode = value
                 .parse::<crate::config::ThinkingMode>()
@@ -675,8 +680,8 @@ fn upsert_profile_document(
             toml_edit::value(toml_integer("max_request_bytes", bytes)?),
         );
     }
-    if let Some(redact) = tuning.redact_thinking {
-        profile.insert("redact_thinking", toml_edit::value(redact));
+    if let Some(display) = tuning.thinking_display {
+        profile.insert("thinking_display", toml_edit::value(display.name()));
     }
     // Redundant here, since the inserts above already run in order, and deliberately kept: it is
     // the one line that makes "every writer leaves the canonical order" true of this writer too,
@@ -886,8 +891,8 @@ fn resolve_tuning(
     if !backend.reads_profile_key("thinking_budget") && flags.thinking_budget.take().is_some() {
         dropped.push("--thinking-budget");
     }
-    if !backend.reads_profile_key("redact_thinking") && flags.redact_thinking.take().is_some() {
-        dropped.push("--redact-thinking");
+    if !backend.reads_profile_key("thinking_display") && flags.thinking_display.take().is_some() {
+        dropped.push("--thinking-display");
     }
     if !dropped.is_empty() {
         tracing::warn!(
@@ -979,7 +984,7 @@ fn resolve_tuning(
         // the advanced step twice as long for settings that are stated far less often.
         vision: flags.vision,
         max_output_tokens: flags.max_output_tokens,
-        redact_thinking: flags.redact_thinking,
+        thinking_display: flags.thinking_display,
         max_request_bytes: flags.max_request_bytes,
     })
 }
@@ -1118,7 +1123,7 @@ mod tests {
         let flags = || ProfileTuning {
             thinking: Some(config::ThinkingMode::Budgeted),
             thinking_budget: Some(2_048),
-            redact_thinking: Some(true),
+            thinking_display: Some(crate::config::ThinkingDisplay::Redacted),
             context_window: Some(1_024),
             effort: Some("low".to_string()),
             ..Default::default()
@@ -1138,7 +1143,7 @@ mod tests {
             "the budget is the same request field, one key over"
         );
         assert_eq!(
-            openai.redact_thinking, None,
+            openai.thinking_display, None,
             "and so is the redaction of what it produces"
         );
         assert_eq!(openai.context_window, Some(1_024));
@@ -1162,12 +1167,12 @@ mod tests {
             Some(2_048),
             "and so must the budget"
         );
-        // Not the redaction flag, which is a narrower question: `redact_thinking` gates a beta
+        // Not the redaction flag, which is a narrower question: `thinking_display` gates a beta
         // header only `claude-subscription` sends, so an `anthropic-messages` profile that stored
         // it would carry a setting that reads plausibly and is never consulted. See
         // `Backend::reads_profile_key`.
         assert_eq!(
-            claude.redact_thinking, None,
+            claude.thinking_display, None,
             "anthropic-messages takes a thinking field but never sends the redaction beta"
         );
         let subscription = resolve_tuning(
@@ -1179,8 +1184,8 @@ mod tests {
         )
         .expect("resolve");
         assert_eq!(
-            subscription.redact_thinking,
-            Some(true),
+            subscription.thinking_display,
+            Some(crate::config::ThinkingDisplay::Redacted),
             "the one backend that does send it keeps the flag"
         );
     }
@@ -1599,7 +1604,7 @@ model = "m"
         .parse::<toml_edit::DocumentMut>()
         .expect("parse");
 
-        for key in ["thinking", "thinking_budget", "redact_thinking"] {
+        for key in ["thinking", "thinking_budget", "thinking_display"] {
             let error = refuse_an_inert_key(&document, "oai", key)
                 .expect_err("inert on a Responses profile");
             let message = error.to_string();
@@ -1610,7 +1615,7 @@ model = "m"
             // `anthropic-messages` sends a thinking field but not the redaction beta, so the two
             // groups part company here rather than moving together.
             let on_messages = refuse_an_inert_key(&document, "work", key);
-            if key == "redact_thinking" {
+            if key == "thinking_display" {
                 let message = on_messages
                     .expect_err("the redaction beta is claude-subscription's alone")
                     .to_string();
@@ -1699,7 +1704,8 @@ account = "work"
             let sample = match *key {
                 "context_window" | "max_output_tokens" | "thinking_budget"
                 | "max_request_bytes" => "1000",
-                "vision" | "redact_thinking" => "true",
+                "vision" => "true",
+                "thinking_display" => "updates",
                 "thinking" => "adaptive",
                 _ => "value",
             };
@@ -1801,7 +1807,7 @@ account = "work"
             "thinking_budget",
             "vision",
             "max_output_tokens",
-            "redact_thinking",
+            "thinking_display",
             "max_request_bytes",
         ] {
             assert!(!rendered.contains(key), "{key} written unasked: {rendered}");
@@ -1823,7 +1829,7 @@ account = "work"
                 thinking_budget: Some(4_096),
                 vision: Some(false),
                 max_output_tokens: Some(32_000),
-                redact_thinking: Some(false),
+                thinking_display: Some(crate::config::ThinkingDisplay::Summarized),
                 max_request_bytes: Some(8_388_608),
                 ..Default::default()
             },
@@ -1838,7 +1844,10 @@ account = "work"
         assert_eq!(profile.thinking_budget, Some(4_096));
         assert_eq!(profile.vision, Some(false));
         assert_eq!(profile.max_output_tokens, Some(32_000));
-        assert_eq!(profile.redact_thinking, Some(false));
+        assert_eq!(
+            profile.thinking_display,
+            Some(crate::config::ThinkingDisplay::Summarized)
+        );
         assert_eq!(profile.max_request_bytes, Some(8_388_608));
     }
 

@@ -262,7 +262,8 @@ impl Frontend for ReplFrontend {
             //
             // Only a *thinking* block. This is not a failure signal -- it fires on any block that
             // completes with nothing readable, which is every block under sealed reasoning and
-            // under `redact-thinking`, on turns whose answer is streaming perfectly well.
+            // under `redact-thinking` or display updates, on turns whose answer is streaming
+            // perfectly well.
             FrontendEvent::ThinkingEnded => {
                 with_console(&self.config.console, |console| console.close_thinking());
             }
@@ -593,8 +594,9 @@ mod tests {
     ///
     /// `ThinkingEnded` is not a failure signal: it fires whenever a block completes carrying no
     /// visible text, which is every block under sealed reasoning and under Claude's
-    /// `redact-thinking`. Those turns stream their answer through the same one slot, so closing it
-    /// indiscriminately cuts a paragraph in two on the stream a caller pipes.
+    /// `redact-thinking` or display updates. Those turns stream their answer through the same one
+    /// slot, so closing it indiscriminately cuts a paragraph in two on the stream a caller
+    /// pipes.
     #[tokio::test]
     async fn a_silent_thinking_block_does_not_close_the_answer() {
         for ender in [FrontendEvent::ThinkingEnded, FrontendEvent::ThinkingBlock {

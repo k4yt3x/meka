@@ -478,6 +478,7 @@ impl Agent {
             subagent: self.role.is_worker(),
             prompt_id: Some(self.role.inherited_prompt_id().unwrap_or_else(Uuid::new_v4)),
             previous_request: Some(Arc::clone(&self.previous_request)),
+            previous_message: Some(Arc::clone(&self.previous_message)),
         }
     }
 
@@ -4535,16 +4536,17 @@ mod tests {
     /// A thinking block that carries no text still has to announce that it ended.
     ///
     /// This is the contract the live indicator rests on: it holds a line open across the reasoning
-    /// phase, and under `redact-thinking` no text ever arrives to close it. Without this event the
-    /// line stays open until some later event happens to occur, and a turn that errors or is
-    /// interrupted emits none, so an error message would print onto the indicator's row.
+    /// phase, and under `redact-thinking` or display updates no text ever arrives to close it.
+    /// Without this event the line stays open until some later event happens to occur, and a
+    /// turn that errors or is interrupted emits none, so an error message would print onto the
+    /// indicator's row.
     #[tokio::test]
     async fn a_silent_thinking_block_announces_that_it_ended() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
 
         let provider = Arc::new(MockProvider::from_rounds(vec![vec![
             // No `ThinkingDelta`: the block produces a signature and nothing readable, which is
-            // every block under `redact-thinking`.
+            // every block under `redact-thinking` or display updates.
             MockEvent::ThinkingComplete {
                 opaque: Some(crate::conversation::OpaqueReasoning::Signed {
                     signature: "sig".to_string(),

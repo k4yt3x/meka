@@ -525,6 +525,10 @@ impl Agent {
             subagent: self.role.is_worker(),
             prompt_id: Some(request.prompt_id.unwrap_or_else(Uuid::new_v4)),
             previous_request: Some(Arc::clone(&self.previous_request)),
+            // A compaction is a side query, not a message of the conversation: its response must
+            // not become the conversation's previous message, and Claude Code's side queries
+            // carry no `diagnostics` at all.
+            previous_message: None,
         }
     }
 

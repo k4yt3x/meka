@@ -1222,7 +1222,8 @@ pub(crate) fn resolve_large_output_tags(
     })
     .into_owned()
 }
-/// Stands in for a block whose text the server withheld, under Claude's `redact-thinking` beta.
+/// Stands in for a block whose text the server withheld, under Claude's `redact-thinking` beta or
+/// display updates.
 ///
 /// meka's own words rather than the model's, but rendered down the same path so there is one way a
 /// thinking block reaches the terminal. It survives CommonMark unchanged: a bracketed run is a

@@ -135,6 +135,10 @@ pub(crate) fn build_http_client(
 /// name it. Held by the [`crate::agent::Agent`] and carried on each of its requests.
 pub(crate) type PreviousRequestSlot = Arc<std::sync::Mutex<Option<String>>>;
 
+/// Where a conversation's most recent provider *message* id waits, as [`PreviousRequestSlot`] does
+/// for the request id: Claude Code names it as `diagnostics.previous_message_id`.
+pub(crate) type PreviousMessageSlot = Arc<std::sync::Mutex<Option<String>>>;
+
 /// Who a request is for, as the billing header has to describe it.
 ///
 /// None of this can live on the provider: one `Arc<dyn Provider>` serves the main agent and every
@@ -156,6 +160,7 @@ pub(crate) struct Attribution {
     /// one's last response. Claude Code reads that off the last assistant message in its history
     /// (`t0E`); meka's conversation doesn't carry request ids, so the provider deposits them here.
     pub(crate) previous_request: Option<PreviousRequestSlot>,
+    pub(crate) previous_message: Option<PreviousMessageSlot>,
 }
 
 impl Attribution {
@@ -177,6 +182,49 @@ impl Attribution {
             *crate::sync::lock(slot) = Some(request_id.to_string());
         }
     }
+
+    pub(crate) fn previous_message_id(&self) -> Option<String> {
+        self.previous_message
+            .as_ref()
+            .and_then(|slot| crate::sync::lock(slot).clone())
+    }
+
+    /// Keep the id of the message a response carried, for the next request's
+    /// `diagnostics.previous_message_id`. Recorded from the body on the non-streaming path; the
+    /// streaming parser records into the slot itself through [`record_message_id`], since only it
+    /// sees `message_start`. Either way an errored response leaves the previous id in place.
+    pub(crate) fn record_message_id(&self, message_id: &str) {
+        if let Some(slot) = &self.previous_message {
+            record_message_id(slot, message_id);
+        }
+    }
+
+    /// Whether this request is a turn of the conversation rather than a side query such as a
+    /// compaction: only a turn carries a message slot, and only a turn reports
+    /// `diagnostics.previous_message_id`.
+    pub(crate) fn is_conversation_turn(&self) -> bool {
+        self.previous_message.is_some()
+    }
+}
+
+/// Record a response's message id into `slot`, ignoring anything that is not an Anthropic id.
+pub(crate) fn record_message_id(slot: &PreviousMessageSlot, message_id: &str) {
+    if !is_anthropic_message_id(message_id) {
+        tracing::debug!("ignoring malformed provider message id '{message_id}'");
+        return;
+    }
+    *crate::sync::lock(slot) = Some(message_id.to_string());
+}
+
+fn is_anthropic_message_id(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("msg_") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 64
+        && rest
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn is_anthropic_request_id(value: &str) -> bool {
@@ -380,9 +428,10 @@ impl MessageAccumulator {
             StreamEvent::ThinkingDelta(text) => self.thinking.push_str(&text),
             StreamEvent::ThinkingComplete { opaque } => {
                 // Kept whenever it carries replayable state: visible text and/or something opaque.
-                // Under `redact-thinking` the text is empty but the signature must survive to
-                // continue the reasoning chain on the next turn, and under the Responses API the
-                // sealed reasoning is the whole of what can be replayed.
+                // Under `redact-thinking` or display updates the text is empty but the signature
+                // must survive to continue the reasoning chain on the next turn,
+                // and under the Responses API the sealed reasoning is the whole of
+                // what can be replayed.
                 let thinking = std::mem::take(&mut self.thinking);
                 if !thinking.is_empty() || opaque.is_some() {
                     self.content

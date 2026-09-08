@@ -133,10 +133,11 @@ pub(super) fn model_is_haiku(model: &str) -> bool {
 /// reaching an arbitrary Anthropic-compatible endpoint needs, since meka cannot tell which of the
 /// two forms that endpoint implements.
 ///
-/// No `display` field is set: real Claude Code 2.1.241 sends `{type:"adaptive"}` with no `display`
-/// (verified by wire capture), so the model default applies.
+/// `display` is the backend's to add, through [`with_display`]: `claude-subscription` sends Claude
+/// Code's display mode, and `anthropic-messages` sends none, because the display values are a
+/// first-party feature an arbitrary endpoint may not implement.
 ///
-/// The `max_tokens` sent when the profile states no `max_output_tokens` are Claude Code 2.1.241's
+/// The `max_tokens` sent when the profile states no `max_output_tokens` are Claude Code 2.1.263's
 /// (verified by wire capture): 64000 under adaptive thinking, 32000 otherwise, raised to twice
 /// the budget under budgeted thinking when that is more. The API requires the field, so omitting
 /// it is not a way to ask for a default.
@@ -145,6 +146,7 @@ pub(super) fn insert_thinking_fields(
     thinking: ThinkingMode,
     budget_tokens: u64,
     max_output_tokens: Option<u64>,
+    display: Option<&str>,
 ) {
     match thinking {
         ThinkingMode::Adaptive => {
@@ -152,7 +154,7 @@ pub(super) fn insert_thinking_fields(
             body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
             body.insert(
                 "thinking".to_string(),
-                serde_json::json!({ "type": "adaptive" }),
+                with_display(serde_json::json!({ "type": "adaptive" }), display),
             );
         }
         ThinkingMode::Budgeted => {
@@ -164,10 +166,13 @@ pub(super) fn insert_thinking_fields(
             body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
             body.insert(
                 "thinking".to_string(),
-                serde_json::json!({
-                    "type": "enabled",
-                    "budget_tokens": budget_tokens
-                }),
+                with_display(
+                    serde_json::json!({
+                        "type": "enabled",
+                        "budget_tokens": budget_tokens
+                    }),
+                    display,
+                ),
             );
         }
         ThinkingMode::Off => {
@@ -175,6 +180,14 @@ pub(super) fn insert_thinking_fields(
             body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
     }
+}
+
+/// The thinking object with Claude Code's `display` added when the backend asks for one.
+fn with_display(mut thinking: serde_json::Value, display: Option<&str>) -> serde_json::Value {
+    if let (Some(display), Some(object)) = (display, thinking.as_object_mut()) {
+        object.insert("display".to_string(), serde_json::json!(display));
+    }
+    thinking
 }
 
 /// Mirrors Claude Code's `modelSupportsThinking` (and the equivalent
@@ -186,7 +199,7 @@ pub(super) fn model_supports_modern_features(model: &str) -> bool {
 }
 
 /// Whether a Claude model accepts the `temperature` sampling parameter. Mirrors Claude Code
-/// 2.1.241's `rQo`, which is an **allowlist** of the older models that still accept sampling
+/// 2.1.263's `rQo`, which is an **allowlist** of the older models that still accept sampling
 /// params: the Claude 3.x line, Opus 4.0/4.1/4.5/4.6, Sonnet 4.0/4.5/4.6, and Haiku 4.5. Everything
 /// newer (Opus 4.7/4.8/5, Sonnet 5, Fable/Mythos 5) rejects `temperature` with a 400.
 ///
@@ -216,7 +229,7 @@ pub(super) fn model_supports_temperature(model: &str) -> bool {
 
 /// Whether a Claude model accepts `output_config.effort`.
 ///
-/// A denylist mirroring Claude Code 2.1.241's own gate, which excludes the Claude 3.x line, Opus
+/// A denylist mirroring Claude Code 2.1.263's own gate, which excludes the Claude 3.x line, Opus
 /// 4.0/4.1, Sonnet 4.0/4.5 and Haiku 4.5 and sends the field to everything else on the first-party
 /// endpoint. Same reasoning and same single caller as
 /// [`model_supports_mid_conversation_system`]: an unrecognized name here is one *newer* than the
@@ -243,7 +256,7 @@ pub(super) fn model_supports_effort(model: &str) -> bool {
 /// The effort `claude-subscription` sends when the profile configures none.
 ///
 /// Claude Code reads a per-model `default_effort` out of a table bundled in its binary and clamps
-/// it to what that model accepts; almost every effort-capable model in the 2.1.241 table comes out
+/// it to what that model accepts; almost every effort-capable model in the 2.1.263 table comes out
 /// of that as `high`, and `high` is also the value Claude Code falls back to for any model the
 /// table does not list.
 ///
@@ -257,7 +270,7 @@ pub(super) const DEFAULT_EFFORT: &str = "high";
 /// Whether a Claude model supports mid-conversation system messages (the
 /// `mid-conversation-system-2026-04-07` beta).
 ///
-/// A **denylist**, mirroring Claude Code 2.1.241's gate model for model: the Claude 3.x line, Opus
+/// A **denylist**, mirroring Claude Code 2.1.263's gate model for model: the Claude 3.x line, Opus
 /// 4.0/4.1/4.5/4.6/4.7, Sonnet 4.0/4.5/4.6 and Haiku 4.5 are excluded, and everything else on the
 /// first-party endpoint is sent it. The direction is the opposite of
 /// [`model_supports_temperature`]'s and deliberately so, because the two fail in opposite ways: an
@@ -718,6 +731,9 @@ pub(super) async fn complete<B: ClaudeBackend>(
 
     let response_json: serde_json::Value = serde_json::from_str(&response_text)
         .map_err(|error| MekaError::Provider(format!("invalid JSON response: {error}")))?;
+    if let Some(message_id) = response_json.get("id").and_then(|id| id.as_str()) {
+        attribution.record_message_id(message_id);
+    }
     let (message, stop_reason, usage) = parse_non_streaming_response(&response_json)?;
     Ok(crate::provider::Completion {
         message,
@@ -782,7 +798,13 @@ pub(super) async fn stream<B: ClaudeBackend>(
     )
     .await?;
     backend.remember_request_id(&attribution, response.headers());
-    drive_claude_sse_stream(response, event_sender, cancellation).await
+    drive_claude_sse_stream(
+        response,
+        event_sender,
+        cancellation,
+        attribution.previous_message.clone(),
+    )
+    .await
 }
 
 /// Read a Claude SSE response to its end, forwarding each event on the channel.
@@ -790,8 +812,12 @@ pub(super) async fn drive_claude_sse_stream(
     response: reqwest::Response,
     event_sender: mpsc::Sender<StreamEvent>,
     cancellation: CancellationToken,
+    previous_message: Option<crate::provider::PreviousMessageSlot>,
 ) -> Result<()> {
-    let mut protocol = ClaudeStream::default();
+    let mut protocol = ClaudeStream {
+        previous_message,
+        ..ClaudeStream::default()
+    };
     match crate::provider::sse::drive(
         response,
         "Claude",
@@ -826,6 +852,9 @@ pub(super) async fn drive_claude_sse_stream(
 /// The Claude driver's state between frames.
 #[derive(Default)]
 struct ClaudeStream {
+    /// Where `message_start`'s id is recorded for the next request's
+    /// `diagnostics.previous_message_id`; `None` on a stream that is not a conversation turn.
+    previous_message: Option<crate::provider::PreviousMessageSlot>,
     current_tool_input: String,
     in_tool_use: bool,
     /// Retained past `ToolUseStart` so a call whose arguments never parse can be *rejected* by id
@@ -1070,6 +1099,14 @@ impl crate::provider::sse::Protocol for ClaudeStream {
                 return Ok(Step::Finished);
             }
             "message_start" => {
+                if let (Some(slot), Some(message_id)) = (
+                    &self.previous_message,
+                    data.get("message")
+                        .and_then(|message| message.get("id"))
+                        .and_then(|id| id.as_str()),
+                ) {
+                    crate::provider::record_message_id(slot, message_id);
+                }
                 if let Some(usage) = data.get("message").and_then(|m| m.get("usage")) {
                     let token_usage = parse_usage_object(usage);
                     if event_sender
@@ -1296,6 +1333,31 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// `message_start` is where the streaming path learns the message id the next request names
+    /// as `diagnostics.previous_message_id`.
+    #[tokio::test]
+    async fn message_start_records_the_message_id_on_the_attribution() {
+        let slot = crate::provider::PreviousMessageSlot::default();
+        let mut protocol = super::ClaudeStream {
+            previous_message: Some(std::sync::Arc::clone(&slot)),
+            ..super::ClaudeStream::default()
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let event = eventsource_stream::Event {
+            event: "message_start".to_string(),
+            data: r#"{"type":"message_start","message":{"id":"msg_011Cepw4KgcVvSiBJbcdRbqv","usage":{"input_tokens":1,"output_tokens":0}}}"#.to_string(),
+            id: String::new(),
+            retry: None,
+        };
+        crate::provider::sse::Protocol::frame(&mut protocol, event, &sender)
+            .await
+            .expect("frame");
+        assert_eq!(
+            crate::sync::lock(&slot).as_deref(),
+            Some("msg_011Cepw4KgcVvSiBJbcdRbqv")
+        );
+    }
+
     use super::*;
     use crate::image::ImageSource;
 
@@ -1312,7 +1374,8 @@ mod tests {
             .expect("build response")
             .into();
         let (sender, mut receiver) = mpsc::channel(64);
-        let outcome = drive_claude_sse_stream(response, sender, CancellationToken::new()).await;
+        let outcome =
+            drive_claude_sse_stream(response, sender, CancellationToken::new(), None).await;
         let mut events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             events.push(event);
@@ -1852,7 +1915,7 @@ mod tests {
         // legitimately be asked for either form - which is what an arbitrary Anthropic-compatible
         // endpoint needs.
         let mut adaptive = serde_json::Map::new();
-        insert_thinking_fields(&mut adaptive, ThinkingMode::Adaptive, 10_000, None);
+        insert_thinking_fields(&mut adaptive, ThinkingMode::Adaptive, 10_000, None, None);
         assert_eq!(adaptive["max_tokens"], 64_000);
         assert_eq!(adaptive["thinking"]["type"], "adaptive");
         assert!(adaptive["thinking"].get("budget_tokens").is_none());
@@ -1860,13 +1923,13 @@ mod tests {
         assert!(adaptive["thinking"].get("display").is_none());
 
         let mut budgeted = serde_json::Map::new();
-        insert_thinking_fields(&mut budgeted, ThinkingMode::Budgeted, 10_000, None);
+        insert_thinking_fields(&mut budgeted, ThinkingMode::Budgeted, 10_000, None, None);
         assert_eq!(budgeted["max_tokens"], 32_000);
         assert_eq!(budgeted["thinking"]["type"], "enabled");
         assert_eq!(budgeted["thinking"]["budget_tokens"], 10_000);
 
         let mut off = serde_json::Map::new();
-        insert_thinking_fields(&mut off, ThinkingMode::Off, 10_000, None);
+        insert_thinking_fields(&mut off, ThinkingMode::Off, 10_000, None, None);
         assert_eq!(off["max_tokens"], 32_000);
         assert!(off.get("thinking").is_none());
     }
@@ -1874,18 +1937,30 @@ mod tests {
     #[test]
     fn a_max_output_override_replaces_the_default_but_never_undercuts_the_budget() {
         let mut adaptive = serde_json::Map::new();
-        insert_thinking_fields(&mut adaptive, ThinkingMode::Adaptive, 10_000, Some(80_000));
+        insert_thinking_fields(
+            &mut adaptive,
+            ThinkingMode::Adaptive,
+            10_000,
+            Some(80_000),
+            None,
+        );
         assert_eq!(adaptive["max_tokens"], 80_000);
 
         let mut off = serde_json::Map::new();
-        insert_thinking_fields(&mut off, ThinkingMode::Off, 10_000, Some(50_000));
+        insert_thinking_fields(&mut off, ThinkingMode::Off, 10_000, Some(50_000), None);
         assert_eq!(off["max_tokens"], 50_000);
 
         // Budgeted draws the budget from `max_tokens`, so an override at or below it would be a
         // 400. Clamped rather than rejected: the config guard catches the configured case, and this
         // keeps a request valid regardless.
         let mut clamped = serde_json::Map::new();
-        insert_thinking_fields(&mut clamped, ThinkingMode::Budgeted, 20_000, Some(5_000));
+        insert_thinking_fields(
+            &mut clamped,
+            ThinkingMode::Budgeted,
+            20_000,
+            Some(5_000),
+            None,
+        );
         assert_eq!(clamped["max_tokens"], 20_001);
         assert_eq!(clamped["thinking"]["budget_tokens"], 20_000);
     }
