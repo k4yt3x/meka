@@ -333,7 +333,8 @@ pub(crate) enum WarnContext {
 ///   boundary.
 /// * **Warn 2** (could be stronger): the user has not pinned a backend and the backend
 ///   auto-resolved to landlock because bubblewrap was not usable. Nudges them once toward
-///   installing bwrap, with an explicit escape hatch (pin landlock to suppress). Startup only.
+///   installing bwrap, names what Landlock gives up, with an explicit escape hatch (pin landlock to
+///   suppress). Startup only.
 pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext) {
     if !state.enabled {
         return;
@@ -356,10 +357,7 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
     // read leaves over the open network.
     #[cfg(windows)]
     if context == WarnContext::Startup {
-        tracing::warn!(
-            "the Windows sandbox cannot hide meka's config and credential store: `read` can read \
-             them, a root containing them can write them"
-        );
+        tracing::warn!("the Windows sandbox cannot hide meka's config and credential store");
     }
 
     #[cfg(target_os = "linux")]
@@ -375,29 +373,19 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             return;
         }
 
+        // Quiet once the backend is pinned: a user who wrote `landlock` into the config chose it
+        // over Bubblewrap, and the shell page documents what that accepts. The store is named
+        // because Landlock rules only ever add access, so there is no way to subtract meka's own
+        // directories from the read grant on `/`, or from a workspace root that contains them;
+        // Bubblewrap masks both.
         if context == WarnContext::Startup
             && state.auto_resolved
             && matches!(state.backend, crate::config::SandboxBackend::Landlock)
         {
             tracing::warn!(
-                "sandboxing with Landlock because Bubblewrap is unavailable; set \
-                 `[shell].sandbox_backend = \"landlock\"` to silence this"
-            );
-        }
-
-        // Landlock rules only ever add access, so there is no way to subtract meka's own
-        // directories from the read grant on `/`, or from a workspace root that contains them.
-        // Bubblewrap masks both. Said whether or not the backend was pinned: pinning accepts the
-        // weaker backend, not necessarily this particular hole, which nothing else reports.
-        if context == WarnContext::Startup
-            && matches!(
-                &state.probe,
-                BackendProbe::Ok(SandboxCapability::Landlock { .. })
-            )
-        {
-            tracing::warn!(
-                "Landlock cannot hide meka's config and credential store (`read` reads them, a \
-                 root containing them writes them); Bubblewrap can"
+                "sandboxing with Landlock because Bubblewrap is unavailable; Landlock isolates \
+                 less and cannot hide meka's config and credential store; pin the sandbox backend \
+                 to 'landlock' to silence this warning"
             );
         }
 
@@ -412,12 +400,12 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
         {
             let mut missing: Vec<&str> = Vec::new();
             if *abi_version < 5 {
-                missing.push("device ioctls (v5)");
+                missing.push("device ioctls");
             }
             if *abi_version < 6 {
-                missing.push("abstract Unix sockets and cross-domain signals (v6)");
+                missing.push("abstract Unix sockets and cross-domain signals");
             }
-            missing.push("pathname Unix sockets (v9)");
+            missing.push("pathname Unix sockets");
             // Deliberately does not name Bubblewrap as the remedy. Measured: bwrap masks four
             // directories and unmounts nothing else, and it never unshares the network namespace,
             // so a socket in the abstract namespace or under `$HOME` stays reachable from inside
@@ -425,8 +413,7 @@ pub(crate) fn warn_if_sandbox_issues(state: &SandboxState, context: WarnContext)
             // install bwrap to close these channels would send them the wrong way.
             let missing = missing.join(", ");
             tracing::warn!(
-                "Landlock ABI v{abi_version} does not restrict {missing}; a command at `read` can \
-                 reach a local service over them; only a newer kernel closes them"
+                "Landlock ABI v{abi_version} does not restrict {missing}; only a newer kernel does"
             );
         }
     }
@@ -988,17 +975,14 @@ mod tests {
             "a directory named `bwrap` is not a binary"
         );
     }
-    /// Between ABI 3 and 9 the filesystem is genuinely write-protected but the later mitigations
-    /// are absent, and the warning naming them is the only way a user learns which.
+    /// Everything [`super::warn_if_sandbox_issues`] logs at startup for `state`.
     ///
-    /// Without the block a host believes `read` restricts more than the running kernel actually
-    /// does. Driven through a subscriber pinned to `WARN` because that is the default floor, so
-    /// this also fails if the level is dropped to `info` where `-v` would be needed to see it.
+    /// Driven through a subscriber pinned to `WARN` because that is the default floor, so a caller
+    /// also fails if a warning is dropped to `info`, where `-v` would be needed to see it.
     ///
-    /// Linux-gated because [`super::SandboxCapability::Landlock`] is.
+    /// Linux-gated because every caller is, and an unused helper fails the lint gate.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_landlock_abi_below_9_names_the_mitigations_it_does_not_provide() {
+    fn startup_warnings(state: &super::SandboxState) -> String {
         use std::sync::{Arc, Mutex};
 
         #[derive(Clone)]
@@ -1023,6 +1007,57 @@ mod tests {
             }
         }
 
+        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+        let buffer = Arc::clone(&capture.0);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::warn_if_sandbox_issues(state, super::WarnContext::Startup);
+        });
+        String::from_utf8(crate::sync::lock(&buffer).clone()).expect("log output is utf-8")
+    }
+
+    /// A usable Landlock backend at ABI v9, which has every mitigation and so owes no ABI warning.
+    #[cfg(target_os = "linux")]
+    fn landlock_state(auto_resolved: bool) -> super::SandboxState {
+        super::SandboxState {
+            enabled: true,
+            backend: crate::config::SandboxBackend::Landlock,
+            auto_resolved,
+            probe: super::BackendProbe::Ok(super::SandboxCapability::Landlock { abi_version: 9 }),
+        }
+    }
+
+    /// Pinning Landlock is the escape hatch the fallback warning names: a user who wrote the
+    /// backend into the config chose it over Bubblewrap, and repeating the cost on every start
+    /// trains them to skip warnings.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinning_landlock_silences_the_fallback_warning() {
+        let unpinned = startup_warnings(&landlock_state(true));
+        assert!(
+            unpinned.contains("because Bubblewrap is unavailable")
+                && unpinned.contains("cannot hide meka's config and credential store")
+                && unpinned.contains("to silence this warning"),
+            "an unpinned fallback names the cause, the cost and the remedy: {unpinned:?}"
+        );
+        let pinned = startup_warnings(&landlock_state(false));
+        assert!(
+            !pinned.contains("Bubblewrap"),
+            "a pinned backend is not argued with: {pinned:?}"
+        );
+    }
+
+    /// Between ABI 3 and 9 the filesystem is genuinely write-protected but the later mitigations
+    /// are absent, and the warning naming them is the only way a user learns which.
+    ///
+    /// Without the block a host believes `read` restricts more than the running kernel actually
+    /// does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_landlock_abi_below_9_names_the_mitigations_it_does_not_provide() {
         // v3 clears the floor, so this is the "protected, but not fully" band the warning owns.
         for (abi, expected) in [
             (3, vec![
@@ -1032,27 +1067,12 @@ mod tests {
             ]),
             (6, vec!["pathname Unix sockets"]),
         ] {
-            let capture = Capture(Arc::new(Mutex::new(Vec::new())));
-            let buffer = Arc::clone(&capture.0);
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(capture)
-                .with_max_level(tracing::Level::WARN)
-                .finish();
-
-            let state = super::SandboxState {
-                enabled: true,
-                backend: crate::config::SandboxBackend::Landlock,
-                auto_resolved: false,
+            let logged = startup_warnings(&super::SandboxState {
                 probe: super::BackendProbe::Ok(super::SandboxCapability::Landlock {
                     abi_version: abi,
                 }),
-            };
-            tracing::subscriber::with_default(subscriber, || {
-                super::warn_if_sandbox_issues(&state, super::WarnContext::Startup);
+                ..landlock_state(false)
             });
-
-            let logged =
-                String::from_utf8(crate::sync::lock(&buffer).clone()).expect("log output is utf-8");
             for gap in expected {
                 assert!(
                     logged.contains(gap),
@@ -1062,23 +1082,7 @@ mod tests {
         }
 
         // v9 has them all, so there is nothing to warn about and a warning would be noise.
-        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
-        let buffer = Arc::clone(&capture.0);
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let state = super::SandboxState {
-            enabled: true,
-            backend: crate::config::SandboxBackend::Landlock,
-            auto_resolved: false,
-            probe: super::BackendProbe::Ok(super::SandboxCapability::Landlock { abi_version: 9 }),
-        };
-        tracing::subscriber::with_default(subscriber, || {
-            super::warn_if_sandbox_issues(&state, super::WarnContext::Startup);
-        });
-        let logged =
-            String::from_utf8(crate::sync::lock(&buffer).clone()).expect("log output is utf-8");
+        let logged = startup_warnings(&landlock_state(false));
         assert!(
             !logged.contains("does not restrict"),
             "v9 restricts all of them; warning anyway trains the user to ignore it: {logged:?}"

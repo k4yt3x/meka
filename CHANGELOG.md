@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.1] - 2026-09-08
+
+### Changed
+
+- `/status` prints the profile and its account on their own lines, the backend beside the account.
+- Falling back to Landlock logs one warning: why, what it gives up, and the pin that silences it.
+- The Windows and Landlock ABI warnings are one clause each; the shell page holds the detail.
+- A pinned `landlock` sandbox backend no longer warns that it cannot hide meka's store.
+
 ## [0.46.0] - 2026-09-08
 
 ### Added

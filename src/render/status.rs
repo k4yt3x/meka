@@ -64,19 +64,19 @@ pub(crate) fn format_session_status(
     // then the model, then the model-tied knobs in the order `[profiles.<name>]` declares them
     // (`context_window`, `effort`, `thinking`), so the block reads beside the config it came from.
     // The cumulative counters follow, and answer a different question.
-    match (model.profile, model.account, model.backend) {
-        (Some(profile), Some(account), Some(backend)) => {
-            out.push_str(&format!(
-                "  Profile:         {profile} ({account}, {backend})\n"
-            ));
+    if let Some(profile) = model.profile {
+        out.push_str(&format!("  Profile:         {profile}\n"));
+    }
+    // The backend rides with the account rather than the profile because it is the account's
+    // fact: two profiles on one account state it the same.
+    match (model.account, model.backend) {
+        (Some(account), Some(backend)) => {
+            out.push_str(&format!("  Account:         {account} ({backend})\n"));
         }
-        (Some(profile), None, Some(backend)) => {
-            out.push_str(&format!("  Profile:         {profile} ({backend})\n"));
+        (Some(account), None) => {
+            out.push_str(&format!("  Account:         {account}\n"));
         }
-        (None, _, Some(backend)) => {
-            out.push_str(&format!("  Profile:         {backend}\n"));
-        }
-        _ => {}
+        (None, _) => {}
     }
     if let Some(name) = model.model {
         out.push_str(&format!("  Model:           {name}\n"));
@@ -338,7 +338,7 @@ mod tests {
             &ModelStatus {
                 model: Some("some-model"),
                 profile: Some("p"),
-                account: None,
+                account: Some("a"),
                 backend: Some(crate::config::Backend::AnthropicMessages),
                 effort: Some("high"),
                 thinking: ThinkingMode::Adaptive,
@@ -358,6 +358,7 @@ mod tests {
                 // `account`, `model`, `context_window`, `effort`, `thinking`: the profile's own
                 // order, for the fields that come from it.
                 "Profile",
+                "Account",
                 "Model",
                 "Context",
                 "Effort",
@@ -370,6 +371,11 @@ mod tests {
                 "Messages",
             ],
             "{body}"
+        );
+        assert!(
+            body.contains("  Profile:         p\n")
+                && body.contains("  Account:         a (anthropic-messages)\n"),
+            "the backend is the account's fact and sits beside it: {body}"
         );
     }
 

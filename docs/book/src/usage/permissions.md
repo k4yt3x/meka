@@ -116,8 +116,9 @@ the credential store even from a workspace root at `$HOME` that contains it, and
 in-process read tools (`read_file`, `search_contents`, `find_files`, `scratchpad_load_file`) refuse
 them below `unrestricted` too, and a search from a root above them steps around them. Landlock
 and the Windows token cannot express that denial: their rules only add access, so under either a
-command at `read` can still read the store, and a workspace root containing it can write it. Both
-say so at startup. Only `unrestricted` writes there on the backends that can hide it.
+command at `read` can still read the store, and a workspace root containing it can write it.
+Windows says so at startup, and Landlock does too unless `sandbox_backend` pins it. Only
+`unrestricted` writes there on the backends that can hide it.
 
 Windows works differently enough to be worth stating. meka mints a deterministic capability SID per
 workspace root, adds an inheritable write ACE for it on that root, and runs the shell under a

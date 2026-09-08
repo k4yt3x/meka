@@ -157,7 +157,8 @@ Print the session's resolved model parameters followed by its cumulative counter
 
 ```
 Session status
-  Profile:         work (anthropic, claude-subscription)
+  Profile:         work
+  Account:         anthropic (claude-subscription)
   Model:           claude-opus-4-8
   Context:         128.4k / 1.0M (13% used, 871.6k left)
   Effort:          xhigh
