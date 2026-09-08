@@ -2112,12 +2112,12 @@ mod tests {
             "access_token": "at",
             "refresh_token": "rt",
             "expires_in": 3600,
-            "account": { "uuid": "7194a774-10cb-47f6-a031-78078f9054c9" },
+            "account": { "uuid": "0f0e7b2c-1d3a-4b5c-8e9f-a1b2c3d4e5f6" },
         });
         let token: TokenResponse = serde_json::from_value(json).unwrap();
         assert_eq!(
             token.account.map(|account| account.uuid).as_deref(),
-            Some("7194a774-10cb-47f6-a031-78078f9054c9"),
+            Some("0f0e7b2c-1d3a-4b5c-8e9f-a1b2c3d4e5f6"),
         );
     }
 

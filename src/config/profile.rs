@@ -1111,12 +1111,12 @@ mod tests {
         let path = dir.path().join("claude.json");
         std::fs::write(
             &path,
-            r#"{"userID": "af5986c7cb3b5e8d00eaf3da3b81730c6f523b1e68e1720c7128a96167534be3", "other": "stuff"}"#,
+            r#"{"userID": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "other": "stuff"}"#,
         )
         .expect("write");
         assert_eq!(
             device_id::read_user_id_from(&path).as_deref(),
-            Some("af5986c7cb3b5e8d00eaf3da3b81730c6f523b1e68e1720c7128a96167534be3")
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
     }
 

@@ -1841,7 +1841,7 @@ mod tests {
                     access_token: "token".to_string(),
                     refresh_token: None,
                     expires_at: None,
-                    account_id: Some("7194a774-10cb-47f6-a031-78078f9054c9".to_string()),
+                    account_id: Some("0f0e7b2c-1d3a-4b5c-8e9f-a1b2c3d4e5f6".to_string()),
                 },
                 "claude-opus-4-8".to_string(),
             )
@@ -1870,7 +1870,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(user_id_str).unwrap();
         assert_eq!(
             parsed["account_uuid"],
-            "7194a774-10cb-47f6-a031-78078f9054c9"
+            "0f0e7b2c-1d3a-4b5c-8e9f-a1b2c3d4e5f6"
         );
     }
 
