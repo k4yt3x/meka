@@ -817,11 +817,11 @@ input_style = "none"    # or "cyan", "bold", "dim", etc.
 
 ## `[web]`
 
-Settings for the HTTP client shared by `fetch_url` and `search_web`. All keys are optional; unset fields use the defaults shown below.
+Settings for the HTTP client `fetch_url` uses. All keys are optional; unset fields use the defaults shown below.
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `user_agent` | string | Real Chrome UA | Some search engines block non-browser UAs. Override if you need a specific identifier. |
+| `user_agent` | string | Real Chrome UA | Some sites block non-browser UAs. Override if you need a specific identifier. |
 | `request_timeout` | duration | `"30s"` | Total request budget (connect + TLS + read). `"0s"` is refused at startup. |
 | `connect_timeout` | duration | unset | Separate cap on TCP + TLS handshake. Fail fast on unreachable hosts without shortening the whole request budget. `"0s"` is refused at startup. |
 | `read_timeout` | duration | unset | Per-chunk idle timeout. Catches bodies that stall mid-stream. `"0s"` is refused at startup. |
@@ -1156,7 +1156,7 @@ env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
 
 #### Examples
 
-**Exa**: reliable web search when the built-in DuckDuckGo scraper gets CAPTCHA'd. The free tier works without an API key; paste a key into the `headers` table for the paid tier:
+**Exa**: web search, which meka has no built-in tool for. The free tier works without an API key; paste a key into the `headers` table for the paid tier:
 ```bash
 # Free tier, no key required
 meka mcp add exa https://mcp.exa.ai/mcp
@@ -1375,7 +1375,7 @@ If `client_id` is omitted, meka attempts [dynamic client registration](https://d
 
 ## `[tools]`: built-in tool filters
 
-The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`read_file`, `write_file`, `execute_command`, `search_web`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
+The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`read_file`, `write_file`, `execute_command`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
 
 | Key | Purpose |
 |---|---|
@@ -1400,7 +1400,7 @@ execute_command = "unrestricted"
 Disable web access entirely in a locked-down environment:
 ```toml
 [tools]
-disabled_tools = ["search_web", "fetch_url"]
+disabled_tools = ["fetch_url"]
 ```
 
 Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-in is disabled everywhere. To take something away from sub-agents *only*, use [`[subagents]`](#subagents). Run `meka tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.

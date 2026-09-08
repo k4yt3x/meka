@@ -6,7 +6,7 @@ A general-purpose AI agent harness.
 > Agents can perform potentially destructive actions. Exercise caution when granting a permission level that can modify files or run commands.
 
 > [!IMPORTANT]
-> meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats change between releases. Read the changelog before upgrading.
+> meka is opinionated software and has not stabilized. Defaults, configuration keys, tool names, and stored formats may change between releases. Read the changelog before upgrading.
 
 ![meka Screenshot](https://github.com/user-attachments/assets/2efa1688-1461-4d26-9743-a3e88203e522)
 
@@ -87,7 +87,6 @@ The agent has access to the following built-in tools:
 - `find_files`: find files by name or glob pattern
 - `search_contents`: search file contents with regex, powered by ripgrep
 - `fetch_url`: fetch a web page as markdown
-- `search_web`: search the web for current information
 - `scratchpad_*`: session-scoped working memory for intermediate results
 - `todo`: structured task tracking, with live progress display
 - `memory_*`: notes that survive the session, loaded into every later one

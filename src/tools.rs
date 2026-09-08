@@ -890,7 +890,6 @@ fn builtin_primary_param(name: &str, input: &serde_json::Value) -> Option<String
         "scratchpad_rename" => "old",
         "scratchpad_save_file" => "name",
         "search_contents" => "pattern",
-        "search_web" => "query",
         "skill_delete" | "skill_read" | "skill_write" => "name",
         "skill_search" => "pattern",
         _ => return None,
@@ -1689,9 +1688,9 @@ mod tests {
         assert!(hint.contains("`skill_write`"), "{hint}");
     }
 
-    /// The prefix has to be a *name segment*, not any shared start, or `search_web` would answer
-    /// for `search` alongside genuinely-related tools and `scratchpad_read` would answer for
-    /// `scratch`.
+    /// The prefix has to be a *name segment*, not any shared start, or `search_contents` would
+    /// answer for `search` alongside genuinely-related tools and `scratchpad_read` would answer
+    /// for `scratch`.
     #[test]
     fn did_you_mean_prefix_rule_requires_an_underscore_boundary() {
         let registered = ["skillet_read"];
@@ -1727,7 +1726,6 @@ mod tests {
         assert!(registry.get("search_contents").is_some());
         assert!(registry.get("execute_command").is_some());
         assert!(registry.get("fetch_url").is_some());
-        assert!(registry.get("search_web").is_some());
         assert!(registry.get("todo").is_some());
         assert!(registry.get("scratchpad_write").is_some());
         assert!(registry.get("scratchpad_read").is_some());
@@ -1841,15 +1839,15 @@ mod tests {
     async fn registry_filter_drops_disabled_tools() {
         let filter = BuiltinToolFilter::from_config(
             None,
-            vec!["search_web".to_string(), "fetch_url".to_string()],
+            vec!["render_image".to_string(), "fetch_url".to_string()],
             HashMap::new(),
         );
         let registry = tool_registry_for_test_with_filter(filter).await;
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("write_file").is_some());
         assert!(
-            registry.get("search_web").is_none(),
-            "search_web should be filtered out"
+            registry.get("render_image").is_none(),
+            "render_image should be filtered out"
         );
         assert!(
             registry.get("fetch_url").is_none(),
@@ -1869,7 +1867,7 @@ mod tests {
         assert!(registry.get("find_files").is_some());
         assert!(registry.get("write_file").is_none());
         assert!(registry.get("execute_command").is_none());
-        assert!(registry.get("search_web").is_none());
+        assert!(registry.get("fetch_url").is_none());
     }
 
     /// Stub tool that sleeps for a known duration before returning a payload derived from its

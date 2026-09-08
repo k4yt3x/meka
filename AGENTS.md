@@ -172,6 +172,10 @@ cargo check --locked --all-targets   # on the MSRV in Cargo.toml's rust-version
 mdbook build docs/book
 ```
 
+The `mock-provider` feature exists so a release-profile build can run the suite; debug builds carry
+it regardless. A shipped artifact must never have it, because `MEKA_MOCK_PROVIDER=1` then stands in
+for every profile.
+
 `--all-targets` matters: plain clippy skips tests and benches. In rustdoc, watch
 `rustdoc::invalid_html_tags`: a bare `<word>` parses as an unclosed tag. Backtick it, or rephrase if
 the comment is also a clap help string, where backticks render literally.

@@ -1,4 +1,4 @@
-# Web tools
+# Web
 
 ## `fetch_url`
 
@@ -45,39 +45,3 @@ If the response `Content-Type` is a supported raster image format, `fetch_url` r
 - Detection uses the response's actual `Content-Type` header, so redirect chains and extension-less URLs are handled correctly.
 
 Only fetch image URLs when the current model supports vision input; text-only models will either error or silently drop the image block.
-
----
-
-## `search_web`
-
-Search DuckDuckGo and return the top results.
-
-**Permission:** Read
-
-### Parameters
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `query` | string | yes | The search query |
-| `headers` | object | no | Custom HTTP headers (overrides defaults like `User-Agent`) |
-| `scratchpad` | string | no | Save output to the scratchpad under this name |
-
-### Behavior
-
-- Returns up to 10 results per search.
-- Each result includes the title, source domain, URL, and a snippet with matched terms emphasized in **bold**.
-- Snippets are capped at 300 characters; use `fetch_url` on the result URL for the full page.
-- Uses HTML scraping (no API key required).
-- HTTP timeout: 30 seconds by default, from the same [`[web]`](../configuration/config-file.md#web) keys as `fetch_url`, and the same 10 MiB streamed body cap.
-- A non-2xx response is an error rather than an empty result set. A block or rate-limit page still carries HTML, and parsing it found no result rows, so being turned away used to read as "No search results found.", a statement about the query rather than about the request.
-
-### CAPTCHA detection
-
-DuckDuckGo occasionally serves a bot-challenge page instead of results (detected by the `anomaly-modal` element). `search_web` returns a distinct error so the agent doesn't silently retry:
-
-```
-DuckDuckGo served a CAPTCHA challenge (bot detection / rate limit).
-Retry later.
-```
-
-If this happens often in your environment, configure a search-capable MCP server; see the [MCP configuration examples](../configuration/config-file.md) for patterns that work well.

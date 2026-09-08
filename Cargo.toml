@@ -1,6 +1,6 @@
 [package]
 name = "meka"
-version = "0.46.1"
+version = "0.47.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -9,11 +9,7 @@ repository = "https://github.com/k4yt3x/meka"
 
 [features]
 default = ["serve"]
-# The scripted provider the test suites drive every host with. Compiled into debug builds
-# regardless, so `cargo test` needs nothing; enabled explicitly to make a release-profile build
-# testable. Never on in a shipped artifact: it lets `MEKA_MOCK_PROVIDER=1` stand in for every profile.
 mock-provider = []
-# `meka serve`: the HTTP API and everything only it pulls in.
 serve = ["dep:axum", "dep:tower-http", "dep:utoipa", "dep:utoipa-swagger-ui"]
 
 [dependencies]
@@ -49,7 +45,6 @@ regex = "1"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "gzip", "deflate", "brotli", "cookies"] }
 rmcp = { version = "3.1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "auth-client-credentials-jwt"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
-scraper = { version = "0.27", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9.42"
@@ -99,7 +94,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] 
 [lints.clippy]
 await_holding_lock = "deny"
 expect_used = "warn"
-# 125 production and 411 integration-test sites at 0.46; kept explicit so the next pass sees it.
 indexing_slicing = "allow"
 match_wildcard_for_single_variants = "warn"
 panic = "warn"

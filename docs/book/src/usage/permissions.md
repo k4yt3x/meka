@@ -9,7 +9,7 @@ control over the agent's capabilities and prevent accidental modifications.
 | Level | Indicator | What it allows |
 |-------|-----------|----------------|
 | **None** | `[n]` (green) | No tools. The agent can only respond with text. |
-| **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`, `execute_command` (sandboxed read-only), `todo`, `agent_spawn`, scratchpad tools |
+| **Read** | `[r]` (yellow) | Read-only tools: `read_file`, `find_files`, `search_contents`, `fetch_url`, `execute_command` (sandboxed read-only), `todo`, `agent_spawn`, scratchpad tools |
 | **Workspace** | `[w]` (orange) | Every tool, but **writes are confined to the workspace roots**. Reads stay unrestricted. `execute_command` runs in a sandbox that permits writes only under those roots |
 | **Unrestricted** | `[u]` (red) | Every tool, no boundary. `execute_command` runs with no sandbox at all |
 
@@ -393,7 +393,7 @@ MCP tools are classified through a 5-step resolution chain: per-tool override â†
 
 ### Built-in tool permissions
 
-Any built-in tool's required permission can be overridden from `config.toml` without editing code; see [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). The same section documents how to allow-list or block-list specific built-ins (e.g. disabling `search_web` in a locked-down environment).
+Any built-in tool's required permission can be overridden from `config.toml` without editing code; see [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). The same section documents how to allow-list or block-list specific built-ins (e.g. disabling `fetch_url` in a locked-down environment).
 
 ### Sub-agent permissions
 

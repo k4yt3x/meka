@@ -986,7 +986,7 @@ mod tests {
         let cwd = SharedCwd::new(PathBuf::from("/"));
         let input = serde_json::json!({"command": "ls"});
         assert!(tool_locations("execute_command", &input, &cwd).is_empty());
-        assert!(tool_locations("search_web", &input, &cwd).is_empty());
+        assert!(tool_locations("todo", &input, &cwd).is_empty());
     }
 
     #[test]
@@ -1051,10 +1051,6 @@ mod tests {
         assert_eq!(
             tool_call_title("fetch_url", Some("https://example.com")),
             "fetch_url https://example.com"
-        );
-        assert_eq!(
-            tool_call_title("search_web", Some("rust acp")),
-            "search_web rust acp"
         );
         // An MCP tool's name is the server's, shown as the server spells it.
         assert_eq!(

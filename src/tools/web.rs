@@ -1,5 +1,5 @@
-//! Web tools: `fetch_url` (HTTP GET with HTML→markdown conversion or multimodal image return) and
-//! `search_web` (DuckDuckGo HTML scraping with CAPTCHA detection).
+//! The web tool: `fetch_url`, an HTTP GET with HTML-to-markdown conversion or a multimodal image
+//! return.
 
 use std::sync::LazyLock;
 
@@ -20,7 +20,7 @@ use crate::{
     tools::util::build_image_tool_output,
 };
 
-/// Build the shared `reqwest::Client` for `fetch_url` + `search_web` from the resolved
+/// Build the `reqwest::Client` for `fetch_url` from the resolved
 /// [`WebClientConfig`].
 ///
 /// Refused as [`MekaError::Installation`] rather than built from a fallback that ignores the
@@ -143,41 +143,6 @@ pub(crate) fn build_web_client(config: &WebClientConfig) -> Result<reqwest::Clie
         .map_err(|error| MekaError::Installation(format!("failed to build web client: {error}")))
 }
 
-#[allow(
-    clippy::expect_used,
-    reason = "a literal selector; a parse failure is a typo the first test run catches"
-)]
-static DDG_RESULT: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse(".result").expect("static CSS selector"));
-#[allow(
-    clippy::expect_used,
-    reason = "a literal selector; a parse failure is a typo the first test run catches"
-)]
-static DDG_LINK: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse("a.result__a").expect("static CSS selector"));
-#[allow(
-    clippy::expect_used,
-    reason = "a literal selector; a parse failure is a typo the first test run catches"
-)]
-static DDG_URL: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse(".result__url").expect("static CSS selector"));
-#[allow(
-    clippy::expect_used,
-    reason = "a literal selector; a parse failure is a typo the first test run catches"
-)]
-static DDG_SNIPPET: LazyLock<scraper::Selector> =
-    LazyLock::new(|| scraper::Selector::parse(".result__snippet").expect("static CSS selector"));
-/// DDG's bot-challenge modal uses this id (and also a `data-testid` of the same value). Either
-/// marker being present in the DOM means the endpoint gated us rather than returning results.
-#[allow(
-    clippy::expect_used,
-    reason = "a literal selector; a parse failure is a typo the first test run catches"
-)]
-static DDG_CAPTCHA: LazyLock<scraper::Selector> = LazyLock::new(|| {
-    scraper::Selector::parse("#anomaly-modal, [data-testid=\"anomaly-modal\"]")
-        .expect("static CSS selector")
-});
-
 /// Matches the open/close tags of `<nav>` and `<footer>` elements (with any attributes). The name
 /// is anchored by the trailing `(\s|>|/)` group so sibling elements like `<navbar>` or a custom
 /// `<nav-menu>` are left untouched.
@@ -214,11 +179,6 @@ fn html_to_markdown(html: &str, base_url: &Option<url::Url>) -> String {
         base_url,
     )
 }
-
-/// Cap on a single result's snippet text (after `**bold**` markers are added). 10 results × 300
-/// chars = ~3 KB of snippets, a sane default for the model; longer content is available via
-/// `fetch_url` on the result URL.
-const SNIPPET_MAX_CHARS: usize = 300;
 
 /// Default `limit` applied when the caller doesn't pass one. Single source of truth for both the
 /// parameter unwrap and the description shown to the agent. Pass `0` to disable the cap.
@@ -338,7 +298,7 @@ impl Tool for FetchUrlTool {
         // the type matches `html_to_markdown` regardless of reqwest's `url` re-export.
         let document_url: Option<url::Url> = url::Url::parse(response.url().as_str()).ok();
 
-        let body_bytes = read_body_capped(response, "fetch_url").await?;
+        let body_bytes = read_body_capped(response).await?;
 
         // A response the server labeled as an image becomes a multimodal Image block rather than
         // going through html2md. `Content-Type` only gates whether to try: the media type comes
@@ -437,12 +397,12 @@ const MAX_RESPONSE_BYTES: usize = 10 * crate::text::MIB;
 /// and `text()` would have allocated all of it before anything could object. `Content-Length` is
 /// checked first when the server offers one, which turns the common case into one refusal instead
 /// of ten megabytes of reading.
-async fn read_body_capped(response: reqwest::Response, tool_name: &str) -> Result<Vec<u8>> {
+async fn read_body_capped(response: reqwest::Response) -> Result<Vec<u8>> {
     if let Some(len) = response.content_length()
         && len as usize > MAX_RESPONSE_BYTES
     {
         return Err(MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
+            tool_name: "fetch_url".to_string(),
             message: format!(
                 "response Content-Length {len} exceeds cap {MAX_RESPONSE_BYTES} bytes"
             ),
@@ -453,12 +413,12 @@ async fn read_body_capped(response: reqwest::Response, tool_name: &str) -> Resul
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| MekaError::ToolExecution {
-            tool_name: tool_name.to_string(),
+            tool_name: "fetch_url".to_string(),
             message: format!("failed to read response body: {error}"),
         })?;
         if body_bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(MekaError::ToolExecution {
-                tool_name: tool_name.to_string(),
+                tool_name: "fetch_url".to_string(),
                 message: format!(
                     "response body exceeded {MAX_RESPONSE_BYTES} bytes during streaming \
                      (possible decompression bomb)"
@@ -470,294 +430,6 @@ async fn read_body_capped(response: reqwest::Response, tool_name: &str) -> Resul
     Ok(body_bytes)
 }
 
-pub(super) struct WebSearchTool {
-    pub(crate) client: reqwest::Client,
-}
-
-#[async_trait]
-impl Tool for WebSearchTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "search_web".to_string(),
-            description: "Search DuckDuckGo and return the top results. May occasionally \
-                fail with a CAPTCHA error when DuckDuckGo rate-limits us."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query."
-                    },
-                    "headers": {
-                        "type": "object",
-                        "description": "Optional HTTP headers. Overrides defaults (e.g., User-Agent).",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    "scratchpad": {
-                        "type": "string",
-                        "description": "If provided, save the output to the scratchpad under this name instead of returning it inline."
-                    }
-                },
-                "required": ["query"]
-            }),
-            ..Default::default()
-        }
-    }
-
-    fn required_permission(&self) -> Permission {
-        Permission::Read
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        _context: crate::tools::ToolContext,
-    ) -> Result<ToolOutput> {
-        let query = require_str(&input, "query", "search_web")?;
-
-        let request = apply_headers(
-            self.client
-                .get("https://html.duckduckgo.com/html/")
-                .query(&[("q", query.as_str())]),
-            &input,
-        );
-        let response = request
-            .send()
-            .await
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "search_web".to_string(),
-                message: format!(
-                    "search request failed: {}",
-                    crate::error::format_reqwest_error(&error)
-                ),
-            })?;
-
-        // A rate-limit or block page is a 4xx/5xx that still carries HTML with no result rows, so
-        // parsing it would report "No search results found." about a query that was turned away.
-        let status = response.status();
-        if !status.is_success() {
-            return Err(MekaError::ToolExecution {
-                tool_name: "search_web".to_string(),
-                message: format!("search request returned HTTP {status}"),
-            });
-        }
-
-        let html_bytes = read_body_capped(response, "search_web").await?;
-        let html = String::from_utf8_lossy(&html_bytes).into_owned();
-
-        let parsed = tokio::task::spawn_blocking(move || parse_duckduckgo_results(&html))
-            .await
-            .map_err(|error| MekaError::ToolExecution {
-                tool_name: "search_web".to_string(),
-                message: format!("result parsing task failed: {error}"),
-            })?;
-        match parsed {
-            DdgOutcome::Results(text) => Ok(ToolOutput::text(text, false)),
-            DdgOutcome::Empty => Ok(ToolOutput::text(
-                "No search results found.".to_string(),
-                false,
-            )),
-            DdgOutcome::Captcha => Err(MekaError::ToolExecution {
-                tool_name: "search_web".to_string(),
-                message: "DuckDuckGo served a CAPTCHA challenge (bot detection / rate limit). \
-                          Retry later."
-                    .to_string(),
-            }),
-        }
-    }
-}
-
-/// The three meaningful states of a DuckDuckGo HTML response. A CAPTCHA page and a zero-hit query
-/// both parse to no results, and reporting the first as the second invites blind retries against a
-/// rate-limited endpoint.
-enum DdgOutcome {
-    /// At least one result was parsed. The inner string is the rendered, numbered,
-    /// markdown-formatted result list.
-    Results(String),
-    /// The page parsed cleanly but contained zero `.result` blocks and no CAPTCHA marker, a
-    /// legitimate zero-hit query.
-    Empty,
-    /// `#anomaly-modal` or `data-testid="anomaly-modal"` found in the DOM. DDG gated us with their
-    /// bot challenge.
-    Captcha,
-}
-
-/// Normalize arbitrary text-node content into a single-line string. Collapses runs of whitespace
-/// (including newlines and tabs) into a single ASCII space and trims. Applied to every user-visible
-/// field (title, source domain, snippet) so the rendered output isn't broken up by DDG's layout
-/// whitespace.
-fn collapse_whitespace(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut prev_space = false;
-    for ch in raw.chars() {
-        if ch.is_whitespace() {
-            if !prev_space && !out.is_empty() {
-                out.push(' ');
-            }
-            prev_space = true;
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
-    }
-    out.trim_end().to_string()
-}
-
-/// Extract a snippet from DDG's `.result__snippet` element, preserving `<b>…</b>` emphasis (which
-/// marks matched query terms) as markdown `**…**`. Current DDG wraps matched terms in `<b>` tags;
-/// stripping them via `.text()` loses a useful signal the agent can use to see which words actually
-/// hit.
-fn render_snippet(snippet_el: scraper::ElementRef<'_>) -> String {
-    use scraper::Node;
-    let mut out = String::new();
-    for node in snippet_el.children() {
-        match node.value() {
-            Node::Text(text) => out.push_str(text),
-            Node::Element(element) => {
-                // Collect the inner text and wrap in `**` iff this is a `<b>` or `<strong>`. Other
-                // elements (rare, e.g. `<a>` inside snippets) fall through as plain text so we
-                // don't miss content.
-                #[allow(
-                    clippy::expect_used,
-                    reason = "`ElementRef::wrap` is `Some` for every `Node::Element`, which is this arm"
-                )]
-                let inner_el =
-                    scraper::ElementRef::wrap(node).expect("element node wraps element ref");
-                let inner_text: String = inner_el.text().collect();
-                let tag = element.name();
-                if tag == "b" || tag == "strong" {
-                    if !inner_text.trim().is_empty() {
-                        out.push_str("**");
-                        out.push_str(inner_text.trim());
-                        out.push_str("**");
-                    }
-                } else {
-                    out.push_str(&inner_text);
-                }
-            }
-            _ => {}
-        }
-    }
-    collapse_whitespace(&out)
-}
-
-/// Truncate `text` to at most `max_chars` characters on a UTF-8 char boundary. When truncated,
-/// trims trailing whitespace and appends a single Unicode `…`.
-fn clip_snippet(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max_chars).collect();
-    format!("{}…", clipped.trim_end())
-}
-
-/// Return true when a `.result` block is a sponsored ad rather than an organic result. DDG marks
-/// ads two independent ways and we check both; any match filters the block out. Confirmed in
-/// `tests/fixtures/ddg_with_ad.html`:
-///
-/// 1. **Wrapper class**: ads carry `result--ad` on the outer `<div class="result …">`. Organic
-///    results use `web-result`.
-/// 2. **Resolved link target**: after decoding DDG's `/l/?uddg=…` redirect, the ad's destination is
-///    `duckduckgo.com/y.js?ad_domain=…` (their ad-click tracker). This catches ads even if DDG
-///    drops the `result--ad` class without warning.
-fn is_ad_result(block: scraper::ElementRef<'_>, resolved_url: Option<&str>) -> bool {
-    if block.value().classes().any(|c| c == "result--ad") {
-        return true;
-    }
-    if let Some(url) = resolved_url {
-        // Normalize leading `//` (schemeless) so `.contains` matches on the host+path portion only.
-        // The `y.js?ad_domain=` combo is specific enough that false-positives on organic URLs are
-        // effectively impossible.
-        if url.contains("duckduckgo.com/y.js") || url.contains("/y.js?ad_domain=") {
-            return true;
-        }
-    }
-    false
-}
-
-/// Decode DDG's legacy `/l/?uddg=<percent-encoded-url>` redirect into the direct URL. Current DDG
-/// usually puts the direct URL on the href already, but older cached pages and the `/lite/`
-/// endpoint still emit the redirect wrapper.
-fn resolve_result_href(href: &str) -> String {
-    if let Some(pos) = href.find("uddg=") {
-        let encoded = &href[pos + 5..];
-        let replaced = encoded.replace('+', " ");
-        let decoded = percent_encoding::percent_decode_str(&replaced).decode_utf8_lossy();
-        decoded.split('&').next().unwrap_or(&decoded).to_string()
-    } else {
-        href.to_string()
-    }
-}
-
-fn parse_duckduckgo_results(html: &str) -> DdgOutcome {
-    let document = scraper::Html::parse_document(html);
-
-    // Detect the bot-challenge modal before even trying to parse results. A page that has *both* a
-    // modal and stale cached markup (hypothetical) should still surface as blocked.
-    if document.select(&DDG_CAPTCHA).next().is_some() {
-        return DdgOutcome::Captcha;
-    }
-
-    let mut results = Vec::new();
-    for block in document.select(&DDG_RESULT) {
-        let link = match block.select(&DDG_LINK).next() {
-            Some(link) => link,
-            None => continue,
-        };
-
-        let title_raw: String = link.text().collect();
-        let title = collapse_whitespace(&title_raw);
-        if title.is_empty() {
-            continue;
-        }
-
-        let url = link.value().attr("href").map(resolve_result_href);
-
-        // Drop sponsored ad blocks before they hit the agent. DDG interleaves ads among organic
-        // results; without this filter the agent sees a tracker URL
-        // (`duckduckgo.com/y.js?ad_domain=…`) and surfaces the advertiser as a "top result".
-        if is_ad_result(block, url.as_deref()) {
-            continue;
-        }
-
-        let source_domain = block.select(&DDG_URL).next().map(|url_el| {
-            let text: String = url_el.text().collect();
-            collapse_whitespace(&text)
-        });
-
-        let snippet = block
-            .select(&DDG_SNIPPET)
-            .next()
-            .map(render_snippet)
-            .filter(|s| !s.is_empty())
-            .map(|s| clip_snippet(&s, SNIPPET_MAX_CHARS));
-
-        let mut result_text = format!("{}. **{}**", results.len() + 1, title);
-        if let Some(source) = &source_domain
-            && !source.is_empty()
-        {
-            result_text.push_str(&format!("\n   Source: {source}"));
-        }
-        if let Some(url) = &url {
-            result_text.push_str(&format!("\n   URL: {url}"));
-        }
-        if let Some(snippet) = &snippet {
-            result_text.push_str(&format!("\n   {snippet}"));
-        }
-        results.push(result_text);
-        if results.len() >= 10 {
-            break;
-        }
-    }
-
-    if results.is_empty() {
-        DdgOutcome::Empty
-    } else {
-        DdgOutcome::Results(results.join("\n\n"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // The raw, un-pre-processed converter, used below to demonstrate the boilerplate-drop that
@@ -766,268 +438,6 @@ mod tests {
     use regex::Regex;
 
     use super::*;
-
-    /// Extract the rendered string from a `DdgOutcome::Results`; panics otherwise. Keeps the
-    /// assertions in tests below readable.
-    fn expect_results(outcome: DdgOutcome) -> String {
-        match outcome {
-            DdgOutcome::Results(text) => text,
-            DdgOutcome::Empty => panic!("expected Results, got Empty"),
-            DdgOutcome::Captcha => panic!("expected Results, got Captcha"),
-        }
-    }
-
-    #[test]
-    fn duckduckgo_results_are_parsed_with_title_url_and_snippet() {
-        let html = r#"<html><body>
-            <div class="result">
-                <a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.com%2Fpage1&rut=x">
-                    First Result
-                </a>
-                <a class="result__url" href="/l/?uddg=x"> example.com </a>
-                <a class="result__snippet">First snippet text.</a>
-            </div>
-            <div class="result">
-                <a class="result__a" href="https://example.com/page2">
-                    Second Result
-                </a>
-                <a class="result__url" href="https://example.com/page2"> example.com </a>
-                <a class="result__snippet">Second snippet text.</a>
-            </div>
-        </body></html>"#;
-        let text = expect_results(parse_duckduckgo_results(html));
-        assert!(text.contains("First Result"));
-        assert!(text.contains("Second Result"));
-        assert!(text.contains("example.com/page1"));
-        assert!(text.contains("example.com/page2"));
-        assert!(text.contains("First snippet text."));
-        assert!(text.contains("Second snippet text."));
-        // `Source:` line comes from `.result__url`.
-        assert!(text.contains("Source: example.com"));
-    }
-
-    #[test]
-    fn parse_duckduckgo_empty_is_empty_outcome() {
-        assert!(matches!(
-            parse_duckduckgo_results("<html><body></body></html>"),
-            DdgOutcome::Empty
-        ));
-    }
-
-    #[test]
-    fn parse_duckduckgo_detects_captcha_fixture() {
-        // The saved CAPTCHA response: `#anomaly-modal` is the primary marker. Any future
-        // regression in detection fails this test against the real DDG bot-challenge page.
-        let html = include_str!("../../tests/fixtures/ddg_captcha.html");
-        assert!(matches!(
-            parse_duckduckgo_results(html),
-            DdgOutcome::Captcha
-        ));
-    }
-
-    #[test]
-    fn parse_duckduckgo_detects_captcha_by_testid_alone() {
-        // Guard against DDG renaming the `id` but keeping the `data-testid`. The second marker
-        // should still catch it.
-        let html = r#"<html><body>
-            <div data-testid="anomaly-modal"><p>Bot check</p></div>
-        </body></html>"#;
-        assert!(matches!(
-            parse_duckduckgo_results(html),
-            DdgOutcome::Captcha
-        ));
-    }
-
-    #[test]
-    fn parse_duckduckgo_parses_real_results_fixture() {
-        // A real 10-result response captured via a clean-IP WARP proxy. Guards against structural
-        // regressions the snippet here can't cover (`<b>` highlights, direct-URL hrefs,
-        // trailing-whitespace domain text, etc.).
-        let html = include_str!("../../tests/fixtures/ddg_results.html");
-        let text = expect_results(parse_duckduckgo_results(html));
-        // Expect all 10 numbered results.
-        for i in 1..=10 {
-            assert!(
-                text.contains(&format!("{i}. **")),
-                "result {i} missing; output was:\n{text}"
-            );
-        }
-        // At least one result carries the Source line (every real DDG result has `.result__url`).
-        assert!(text.contains("Source: "));
-        // `<b>` emphasis in the snippet becomes markdown bold.
-        assert!(
-            text.contains("**Rust**") || text.contains("**rust**"),
-            "expected **Rust**/**rust** markdown-bold in:\n{text}"
-        );
-    }
-
-    #[test]
-    fn parse_duckduckgo_trims_whitespace_in_title() {
-        let html = r#"<html><body>
-            <div class="result">
-                <a class="result__a" href="https://example.com/">
-                    Lots
-                    of
-                    whitespace
-                </a>
-            </div>
-        </body></html>"#;
-        let text = expect_results(parse_duckduckgo_results(html));
-        // Rendered title collapses to single spaces. The broader output has `   ` indent on
-        // continuation lines (expected), so only assert against the title itself.
-        assert!(text.contains("**Lots of whitespace**"), "{}", text);
-        let title_line = text
-            .lines()
-            .find(|l| l.contains("**Lots"))
-            .expect("title line");
-        assert!(
-            !title_line.contains("  "),
-            "double-space in title: {title_line}"
-        );
-    }
-
-    #[test]
-    fn parse_duckduckgo_omits_source_when_missing() {
-        // No `.result__url` sibling → no `Source:` line.
-        let html = r#"<html><body>
-            <div class="result">
-                <a class="result__a" href="https://example.com/">Title</a>
-            </div>
-        </body></html>"#;
-        let text = expect_results(parse_duckduckgo_results(html));
-        assert!(text.contains("**Title**"));
-        assert!(!text.contains("Source:"), "unexpected Source line: {text}");
-    }
-
-    #[test]
-    fn parse_duckduckgo_preserves_bold_as_markdown() {
-        let html = r#"<html><body>
-            <div class="result">
-                <a class="result__a" href="https://example.com/">Title</a>
-                <a class="result__snippet"><b>rust</b> is a <b>fast</b> language</a>
-            </div>
-        </body></html>"#;
-        let text = expect_results(parse_duckduckgo_results(html));
-        assert!(text.contains("**rust**"), "{}", text);
-        assert!(text.contains("**fast**"), "{}", text);
-    }
-
-    #[test]
-    fn parse_duckduckgo_caps_long_snippet() {
-        // 500-char snippet → capped at 300 and suffixed with `…`.
-        let long_snippet = "word ".repeat(200); // ~1000 chars
-        let html = format!(
-            r#"<html><body>
-                <div class="result">
-                    <a class="result__a" href="https://example.com/">Title</a>
-                    <a class="result__snippet">{long_snippet}</a>
-                </div>
-            </body></html>"#
-        );
-        let text = expect_results(parse_duckduckgo_results(&html));
-        assert!(text.contains('…'), "expected ellipsis; got:\n{text}");
-        // The capped snippet + surrounding format exceeds 300, but the snippet portion itself
-        // shouldn't carry more than ~305 chars (300 + `…` allowance).
-        let snippet_line = text
-            .lines()
-            .find(|line| line.trim().ends_with('…'))
-            .expect("snippet line with ellipsis");
-        let snippet_content = snippet_line.trim_start();
-        assert!(
-            snippet_content.chars().count() <= SNIPPET_MAX_CHARS + 2,
-            "snippet too long after cap: {} chars in {:?}",
-            snippet_content.chars().count(),
-            snippet_content
-        );
-    }
-
-    #[test]
-    fn parse_duckduckgo_skips_ad_by_wrapper_class() {
-        // Ad block identified by `result--ad`; organic block follows. Only the organic result
-        // should come through.
-        let html = r#"<html><body>
-            <div class="result result--ad">
-                <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dexample.com">Sponsored</a>
-                <a class="result__url" href="//duckduckgo.com/l/?uddg=x"> example.com </a>
-                <a class="result__snippet">Buy our stuff!</a>
-            </div>
-            <div class="result web-result">
-                <a class="result__a" href="https://organic.example/page">Organic</a>
-                <a class="result__url" href="https://organic.example/page"> organic.example </a>
-                <a class="result__snippet">Real content.</a>
-            </div>
-        </body></html>"#;
-        let text = expect_results(parse_duckduckgo_results(html));
-        assert!(text.contains("Organic"), "organic result missing: {text}");
-        assert!(!text.contains("Sponsored"), "ad leaked into output: {text}");
-        assert!(!text.contains("ad_domain"), "ad URL leaked: {text}");
-        // Ad was dropped, so organic becomes result #1.
-        assert!(text.starts_with("1. **Organic**"), "{}", text);
-    }
-
-    #[test]
-    fn parse_duckduckgo_skips_ad_by_y_js_url() {
-        // Ad without the `result--ad` class, caught via the resolved-URL signal. Guards against
-        // DDG silently renaming the class but keeping the y.js ad-click tracker.
-        let html = r#"<html><body>
-            <div class="result web-result">
-                <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fduckduckgo.com%2Fy.js%3Fad_domain%3Dsponsor.com">Sponsored</a>
-                <a class="result__snippet">Buy our stuff!</a>
-            </div>
-            <div class="result web-result">
-                <a class="result__a" href="https://organic.example/page">Organic</a>
-                <a class="result__snippet">Real content.</a>
-            </div>
-        </body></html>"#;
-        let text = expect_results(parse_duckduckgo_results(html));
-        assert!(text.contains("Organic"), "{}", text);
-        assert!(!text.contains("Sponsored"), "y.js ad leaked: {text}");
-    }
-
-    #[test]
-    fn parse_duckduckgo_real_ad_fixture_drops_only_ad() {
-        // 11 result blocks total (1 ad + 10 organic) captured from `best mechanical keyboard 2026`.
-        // The ad advertises `oneclearwinner.ca` via a Bing-backed y.js redirect. Expect exactly 10
-        // organic results, zero ad leakage.
-        let html = include_str!("../../tests/fixtures/ddg_with_ad.html");
-        let text = expect_results(parse_duckduckgo_results(html));
-        assert!(
-            !text.contains("oneclearwinner"),
-            "ad domain leaked into output: {text}"
-        );
-        assert!(!text.contains("y.js"), "y.js tracker URL leaked: {text}");
-        assert!(
-            !text.contains("ad_domain"),
-            "ad_domain param leaked: {text}"
-        );
-        // 10 organic results should remain after filtering.
-        for i in 1..=10 {
-            assert!(
-                text.contains(&format!("{i}. **")),
-                "result {i} missing; output:\n{text}"
-            );
-        }
-        assert!(
-            !text.contains("11. **"),
-            "too many results; ad wasn't dropped: {text}"
-        );
-    }
-
-    #[test]
-    fn resolve_result_href_decodes_uddg_redirect() {
-        assert_eq!(
-            resolve_result_href("/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=x"),
-            "https://example.com/page"
-        );
-    }
-
-    #[test]
-    fn resolve_result_href_passes_direct_url_through() {
-        assert_eq!(
-            resolve_result_href("https://example.com/page"),
-            "https://example.com/page"
-        );
-    }
 
     #[test]
     fn nav_links_survive_markdown_conversion() {
@@ -1371,9 +781,9 @@ mod tests {
         assert!(props.get("raw").is_some());
     }
 
-    /// A canary on the response cap, which both `fetch_url` and `search_web` read through. It
-    /// catches an accidental bump in either direction; end-to-end coverage of the streaming check
-    /// itself needs a real server and lives in the manual verification step.
+    /// A canary on the response cap, which `fetch_url` reads through. It catches an accidental
+    /// bump in either direction; end-to-end coverage of the streaming check itself needs a real
+    /// server and lives in the manual verification step.
     #[test]
     fn fetch_url_size_cap_is_10_mib() {
         assert_eq!(MAX_RESPONSE_BYTES, 10_485_760);
@@ -1387,15 +797,5 @@ mod tests {
         let without = serde_json::json!({ "limit": 100 });
         assert!(redirects_to_scratchpad(&with));
         assert!(!redirects_to_scratchpad(&without));
-    }
-
-    #[test]
-    fn search_web_definition_has_headers() {
-        let tool = WebSearchTool {
-            client: reqwest::Client::new(),
-        };
-        let def = tool.definition();
-        let props = &def.parameters["properties"];
-        assert!(props.get("headers").is_some());
     }
 }

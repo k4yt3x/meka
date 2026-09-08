@@ -1,6 +1,6 @@
 # Introduction
 
-**meka** is a general-purpose AI agent harness, the layer that wraps a large language model with everything it needs to act as an autonomous agent: a tool set, working memory, context management, persistent sessions, a permission model, and several ways to drive it. You bring a model (Claude or OpenAI, API key or subscription); meka turns it into an agent that can read and edit files, run commands, search the web, call MCP servers, and delegate to sub-agents to get real work done.
+**meka** is a general-purpose AI agent harness, the layer that wraps a large language model with everything it needs to act as an autonomous agent: a tool set, working memory, context management, persistent sessions, a permission model, and several ways to drive it. You bring a model (Claude or OpenAI, API key or subscription); meka turns it into an agent that can read and edit files, run commands, fetch web pages, call MCP servers, and delegate to sub-agents to get real work done.
 
 The name reflects the design: the model is the pilot, and meka is the mech it operates. The pilot (the model and the backend serving it) is swappable; the harness around it stays the same.
 
@@ -21,7 +21,7 @@ The same agent core is exposed through four front-ends:
 
 ## What the harness provides
 
-- **Built-in tools**: file read/write/edit, glob search, regex content search (ripgrep), web fetch, web search, and shell command execution
+- **Built-in tools**: file read/write/edit, glob search, regex content search (ripgrep), web fetch and shell command execution
 - **Pluggable backends**: `anthropic-messages`, `claude-subscription`, `openai-chat-completions`, `openai-responses`, `chatgpt-subscription`, and any endpoint serving one of those protocols
 - **MCP support**: extend the agent with tools, resources, and prompts from external MCP servers
 - **Permission model**: control what the agent can do (none/read/workspace/unrestricted), switchable mid-session

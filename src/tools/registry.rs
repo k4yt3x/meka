@@ -234,7 +234,6 @@ pub(crate) const BUILTIN_TOOL_NAMES: &[&str] = &[
     "scratchpad_save_file",
     "scratchpad_write",
     "search_contents",
-    "search_web",
     "skill_delete",
     "skill_read",
     "skill_search",
@@ -799,10 +798,7 @@ impl ToolRegistry {
         // A malformed proxy URL or unreadable CA file surfaces as a startup error rather than
         // silently falling back to an unconfigured client (which would ignore the user's intent).
         let web_client = web::build_web_client(web_client_config)?;
-        self.register_builtin(Arc::new(web::FetchUrlTool {
-            client: web_client.clone(),
-        }));
-        self.register_builtin(Arc::new(web::WebSearchTool { client: web_client }));
+        self.register_builtin(Arc::new(web::FetchUrlTool { client: web_client }));
         self.register_builtin(Arc::new(shell::ExecuteCommandTool {
             scope: write_scope,
             #[cfg(windows)]
@@ -1134,7 +1130,7 @@ impl ToolRegistry {
     ///
     /// Nothing session-scoped is registered: a gate is a predicate, and `memory_*` / `skill_*` /
     /// `todo` are not questions about the world. What it does get is the read-only built-ins a
-    /// watcher wants (`read_file`, `fetch_url`, `search_web`), built against the job's cwd rather
+    /// watcher wants (`read_file`, `fetch_url`), built against the job's cwd rather
     /// than the host process's, for the same reason a shell gate runs there.
     ///
     /// Construction is allocation only, no I/O, so a caller may build one per evaluation.
@@ -2083,7 +2079,6 @@ mod tests {
             "agent_spawn",
             "schedule_create",
             "fetch_url",
-            "search_web",
             "memory_delete",
             "scratchpad_delete",
         ] {
@@ -2240,7 +2235,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_registry_honors_filter() {
         let filter =
-            BuiltinToolFilter::from_config(None, vec!["search_web".to_string()], HashMap::new());
+            BuiltinToolFilter::from_config(None, vec!["fetch_url".to_string()], HashMap::new());
         let sandbox_capability = crate::sandbox::detect();
         let backend_probe = crate::sandbox::BackendProbe::Ok(sandbox_capability.clone());
         let store = Store::for_test().await;
@@ -2286,7 +2281,7 @@ mod tests {
         )
         .expect("default web client config should build cleanly");
         assert!(registry.get("read_file").is_some());
-        assert!(registry.get("search_web").is_none());
+        assert!(registry.get("fetch_url").is_none());
         assert!(registry.get("todo").is_some());
         assert!(registry.get("agent_spawn").is_none());
     }
@@ -2617,7 +2612,6 @@ mod tests {
             "search_contents",
             "execute_command",
             "fetch_url",
-            "search_web",
             "todo",
             "scratchpad_read",
             "scratchpad_write",

@@ -12,7 +12,6 @@ Tools are the actions that the agent can perform on your behalf. The LLM decides
 | [`find_files`](./search.md#find_files) | Read | Find files by glob pattern |
 | [`search_contents`](./search.md#search_contents) | Read | Search file contents with regex |
 | [`fetch_url`](./web.md#fetch_url) | Read | Fetch a web page as markdown |
-| [`search_web`](./web.md#search_web) | Read | Search the web |
 | [`execute_command`](./shell.md#execute_command) | Read | Run a shell command (see the note below) |
 | [`todo`](./overview.md#todo) | Read | Manage and read a structured task list |
 | [`agent_spawn`](./overview.md#agent_spawn) | Read | Delegate tasks to a sub-agent |
@@ -55,7 +54,7 @@ The `schedule_*` tools require [`[schedule] enabled`](../configuration/config-fi
 Tools are grouped by the minimum permission level required:
 
 **Read permission** (available at `read` and above):
-- `read_file`, `find_files`, `search_contents`, `fetch_url`, `search_web`
+- `read_file`, `find_files`, `search_contents`, `fetch_url`
 - `execute_command` (sandboxed, filesystem write-protected)
 - `todo`, `agent_spawn`, `agent_list`, `agent_followup`, `agent_delete`, `render_image`
 - All skill tools, including `skill_write` and `skill_delete` when they are enabled: like memory,
@@ -138,9 +137,9 @@ execute_command({"command": "pdftotext doc.pdf -", "scratchpad": "pdf_text"})
 ```
 
 It is honored on **every** tool, MCP servers included: the redirect happens where the result is
-recorded, not inside the tool. Twelve built-ins also *advertise* it in their schema, which is how the
+recorded, not inside the tool. Eleven built-ins also *advertise* it in their schema, which is how the
 model discovers it: `read_file`, `edit_file`, `write_file`, `find_files`, `search_contents`,
-`fetch_url`, `search_web`, `execute_command`, `conversation_read`, `agent_spawn`, `agent_followup`
+`fetch_url`, `execute_command`, `conversation_read`, `agent_spawn`, `agent_followup`
 and `todo`, the last for uniformity alone, since its list is kept as state and nothing is redirected.
 
 Three of those lift a cap when it is set, producing their full untruncated output: `find_files` (500

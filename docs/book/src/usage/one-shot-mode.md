@@ -30,8 +30,8 @@ meka --oneshot --permission workspace -p "create a file called notes.txt with to
 # Search
 meka --oneshot -p "find all TODO comments in this project"
 
-# Web search
-meka --oneshot -p "search the web for the latest Rust release"
+# Web page
+meka --oneshot -p "summarize https://blog.rust-lang.org"
 ```
 
 ## Combining with other flags

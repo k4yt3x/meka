@@ -4589,7 +4589,7 @@ client_secret = "my-secret"
         let toml_str = r#"
 [tools]
 allowed_tools = ["read_file", "find_files"]
-disabled_tools = ["search_web"]
+disabled_tools = ["fetch_url"]
 
 [tools.tool_permissions]
 execute_command = "workspace"
@@ -4603,7 +4603,7 @@ read_file = "unrestricted"
         );
         assert_eq!(
             tools.disabled_tools.as_deref(),
-            Some(["search_web".to_string()].as_slice())
+            Some(["fetch_url".to_string()].as_slice())
         );
         let permissions = tools.tool_permissions.expect("tool_permissions set");
         assert_eq!(

@@ -10,6 +10,19 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.46 to 0.47
+
+**`search_web` is gone.** It scraped DuckDuckGo's HTML and was turned away by the bot detection more
+often than not. Web search now comes from an MCP server, which packages one engine's key, quota and
+response shape without meka embedding any of them:
+
+```bash
+meka mcp add exa https://mcp.exa.ai/mcp
+```
+
+A `[tools]` list that still names `search_web` warns at startup and otherwise works. Existing sessions
+that called it resume unchanged: their tool results are text, and nothing re-runs them.
+
 ## 0.45 to 0.46
 
 The store migrates itself, as every release since 0.43 has. **`config.toml` does not**, and this

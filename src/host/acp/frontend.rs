@@ -1012,7 +1012,7 @@ pub(super) fn tool_kind_for(name: &str) -> ToolKind {
         "edit_file" | "write_file" => ToolKind::Edit,
         "find_files" | "search_contents" => ToolKind::Search,
         "execute_command" => ToolKind::Execute,
-        "fetch_url" | "search_web" => ToolKind::Fetch,
+        "fetch_url" => ToolKind::Fetch,
         "agent_spawn" => ToolKind::Think,
         // skill, memory_*, scratchpad_*, render_image, load_tool, mcp__*, and any
         // future built-ins.
