@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - HTTP turns may withdraw an unanswered message: `options.unanswered_message`, `keep` by default.
 - A failed or canceled HTTP turn carries `message_withdrawn`, whether its message is still there.
+- `meka account rename` and `meka profile rename` rename in place.
 
 ## [0.47.1] - 2026-09-08
 

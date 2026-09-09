@@ -275,11 +275,13 @@ output; don't demote it to `info!`.
   only by an explicit act (`--profile` on a resume, `/profile`, `PATCH /v1/sessions/{id}`, ACP
   `session/set_config_option`). What a *new* session records follows `--profile` > `default_profile`
   > the sole profile; a sub-agent's row records the profile its `agent_spawn` call named, else its
-  parent's live profile, which it keeps following. Accounts are managed by `meka account` (`add`/`login`/`list`/`remove`) and
-  profiles by `meka profile` (`add`/`set`/`use`/`list`/`remove`), mirroring `meka mcp`: `use` is the
+  parent's live profile, which it keeps following. Accounts are managed by `meka account` (`add`/`login`/`list`/`rename`/`remove`) and
+  profiles by `meka profile` (`add`/`set`/`use`/`list`/`rename`/`remove`), mirroring `meka mcp`: `use` is the
   only command that sets `default_profile` (`profile remove` unsets it when it named the removed
-  profile), `account login` rotates a credential without touching the account or its profiles, and
-  `account remove` refuses while a profile names the account.
+  profile), `account login` rotates a credential without touching the account or its profiles,
+  `account remove` refuses while a profile names the account, and a `rename` moves the name
+  everywhere it is recorded (the credential row and every profile's `account`; `default_profile`,
+  every session row and each pinned sub-agent spec) and changes no setting.
 - **Secrets live in the database**: `account_credentials` keyed by account name and
   `mcp_credentials` keyed by `(server_name, kind)`, so two accounts, or a client secret and its
   refreshable bundle, can coexist. Every secret is read from stdin, never taken

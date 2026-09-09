@@ -17,6 +17,7 @@ meka account add anthropic --backend claude-subscription
 meka account list [--format <FORMAT>]
 meka account login anthropic
 meka account remove anthropic
+meka account rename anthropic claude
 meka account usage [--profile <NAME>] [--format <FORMAT>]    # session / weekly windows
 meka account whoami [--profile <NAME>] [--format <FORMAT>]   # plan, tier, org, role and local auth status
 meka account stats [--profile <NAME>] [--format <FORMAT>]    # lifetime tokens, streaks, per-day counts
@@ -36,6 +37,7 @@ meka profile set work model claude-opus-5
 meka profile set work effort --unset   # back to the default
 meka profile use work
 meka profile remove work
+meka profile rename work daily
 ```
 
 See the [`meka profile` CLI reference](./config-file.md#meka-profile-cli) for the full flag list.

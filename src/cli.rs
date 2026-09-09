@@ -257,6 +257,13 @@ pub(crate) enum AccountAction {
         /// Account name
         name: String,
     },
+    /// Rename an account; its credential and every profile on it follow
+    Rename {
+        /// Account name
+        name: String,
+        /// New name
+        new_name: String,
+    },
     /// Show the account's rate-limit usage
     ///
     /// The session and weekly windows, with their reset times.
@@ -379,6 +386,13 @@ pub(crate) enum ProfileAction {
     Remove {
         /// Profile name
         name: String,
+    },
+    /// Rename a profile; its sessions and `default_profile` follow
+    Rename {
+        /// Profile name
+        name: String,
+        /// New name
+        new_name: String,
     },
 }
 

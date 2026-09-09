@@ -503,6 +503,11 @@ pub(super) fn decode_additional_roots(json: Option<&str>) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 impl Store {
+    /// The key under which a sub-agent's spawn terms record the profile the spawn call chose. The
+    /// spec is the sub-agent tool's document and the store never reads it, except to move this
+    /// one name when the profile is renamed; a test beside the spec pins the key to this.
+    pub(crate) const SUBAGENT_SPEC_PROFILE_KEY: &'static str = "profile";
+
     /// Create a new session, optionally recording its working directory. `cwd` is persisted as an
     /// absolute path string; pass `None` only for code paths that genuinely have no cwd context.
     ///
@@ -656,6 +661,70 @@ impl Store {
             .map(|count| count.max(0) as u64)
             .map_err(|error| {
                 MekaError::Database(format!("failed to count sessions on a profile: {error}"))
+            })
+    }
+
+    /// Move every session on `profile` to `new_profile`, the pinned spawn terms of a sub-agent
+    /// included, and answer how many rows moved.
+    ///
+    /// One transaction, because a follow-up runs a pinned worker on its row while `session show`
+    /// and an export read the spec: rows moved without specs would show a worker pinned to a
+    /// name nothing is configured under.
+    pub(crate) async fn rename_profile(&self, profile: &str, new_profile: &str) -> Result<u64> {
+        let profile = profile.to_string();
+        let new_profile = new_profile.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let transaction = connection.transaction()?;
+                let moved = transaction.execute(
+                    "UPDATE sessions SET profile = ?2 WHERE profile = ?1",
+                    rusqlite::params![profile, new_profile],
+                )?;
+                // `json_valid` first: `json_extract` raises on a spec that is not JSON, which an
+                // import writes verbatim from its archive, and one such row must not block every
+                // rename. It is left as it is, like any spec the rename has no name to move.
+                transaction.execute(
+                    &format!(
+                        "UPDATE sessions
+                         SET subagent_spec_json = json_set(subagent_spec_json, '$.{key}', ?2)
+                         WHERE json_valid(subagent_spec_json)
+                           AND json_extract(subagent_spec_json, '$.{key}') = ?1",
+                        key = Self::SUBAGENT_SPEC_PROFILE_KEY
+                    ),
+                    rusqlite::params![profile, new_profile],
+                )?;
+                transaction.commit()?;
+                Ok(moved as u64)
+            })
+            .await
+            .map_err(|error| MekaError::Database(format!("failed to rename a profile: {error}")))
+    }
+
+    /// How many rows record `profile` anywhere: on the row, root or sub-agent, or in pinned spawn
+    /// terms. What a rename onto this name would otherwise adopt, and what its undo would then
+    /// carry away with the rows it meant to put back.
+    pub(crate) async fn count_sessions_recording_profile(&self, profile: &str) -> Result<u64> {
+        let profile = profile.to_string();
+        self.connection
+            .call(move |connection| {
+                connection.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sessions
+                         WHERE profile = ?1
+                            OR (json_valid(subagent_spec_json)
+                                AND json_extract(subagent_spec_json, '$.{key}') = ?1)",
+                        key = Self::SUBAGENT_SPEC_PROFILE_KEY
+                    ),
+                    rusqlite::params![profile],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| {
+                MekaError::Database(format!(
+                    "failed to count sessions recording a profile: {error}"
+                ))
             })
     }
 
@@ -3174,6 +3243,99 @@ mod tests {
             Some(parent),
             "a sub-agent is not resumable, so offering it to `-c` is offering a dead end"
         );
+    }
+
+    /// A rename moves the rows and the pinned spawn terms together, and only those: unpinned terms
+    /// gain no `profile`, and a root's absent terms stay absent.
+    #[tokio::test]
+    async fn renaming_a_profile_moves_rows_and_pinned_specs_together() {
+        let store = Store::for_test().await;
+        let root = store
+            .create_session(None, "old".to_string())
+            .await
+            .expect("root");
+        let (pinned, _lock) = store
+            .create_child_session(
+                root,
+                None,
+                Vec::new(),
+                Some(r#"{"profile":"old"}"#.to_string()),
+                "read".to_string(),
+                "old".to_string(),
+            )
+            .await
+            .expect("pinned");
+        let (unpinned, _lock) = store
+            .create_child_session(
+                root,
+                None,
+                Vec::new(),
+                Some("{}".to_string()),
+                "read".to_string(),
+                "old".to_string(),
+            )
+            .await
+            .expect("unpinned");
+        let other = store
+            .create_session(None, "other".to_string())
+            .await
+            .expect("other");
+        // What an import copies verbatim from an archive somebody edited: not JSON at all.
+        let (malformed, _lock) = store
+            .create_child_session(
+                root,
+                None,
+                Vec::new(),
+                Some("not json".to_string()),
+                "read".to_string(),
+                "old".to_string(),
+            )
+            .await
+            .expect("malformed");
+
+        let moved = store.rename_profile("old", "new").await.expect("rename");
+
+        assert_eq!(moved, 4, "the root and all three children moved");
+        assert_eq!(
+            store
+                .load_subagent_spec(malformed)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("not json"),
+            "a spec that is not JSON neither blocks the rename nor changes"
+        );
+        for id in [root, pinned, unpinned, malformed] {
+            assert_eq!(
+                store.recorded_profile(id).await.expect("read").as_deref(),
+                Some("new")
+            );
+        }
+        assert_eq!(
+            store
+                .recorded_profile(other)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            store
+                .load_subagent_spec(pinned)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some(r#"{"profile":"new"}"#)
+        );
+        assert_eq!(
+            store
+                .load_subagent_spec(unpinned)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("{}")
+        );
+        assert_eq!(store.load_subagent_spec(root).await.expect("read"), None);
     }
 
     /// The rows `-c` and `session list` skip are the rows the refusal declines, not a near-miss.

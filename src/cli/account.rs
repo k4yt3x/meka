@@ -68,6 +68,7 @@ pub(crate) async fn run(
         }
         AccountAction::List { format } => run_list(token_store, *format).await,
         AccountAction::Remove { name } => run_remove(name, token_store).await,
+        AccountAction::Rename { name, new_name } => run_rename(name, new_name, token_store).await,
         AccountAction::Login {
             name,
             api_key_stdin,
@@ -364,6 +365,133 @@ fn profiles_on_account(document: &toml_edit::DocumentMut, account: &str) -> Vec<
                 .collect()
         })
         .unwrap_or_default()
+}
+
+async fn run_rename(name: &str, new_name: &str, token_store: &TokenStore) -> anyhow::Result<()> {
+    if new_name.trim().is_empty() {
+        anyhow::bail!("account name cannot be empty");
+    }
+    // Probed under a short guard, dropped before the `await` below, for the reason `run_remove`
+    // gives about `ConfigFileLock`; the write asks again under its own.
+    {
+        let (_lock, _path, document) = open_document()?;
+        refuse_an_unrenameable_account(&document, name, new_name)?;
+    }
+    // A leftover credential under the new name would collide with the moved one, and it is a
+    // secret nobody configured: refused by name rather than overwritten.
+    if token_store
+        .list_credential_accounts()
+        .await?
+        .iter()
+        .any(|account| account == new_name)
+    {
+        anyhow::bail!(
+            "a stored credential named '{new_name}' already exists; clear it with `meka account \
+             remove {new_name}`"
+        );
+    }
+
+    // Held until the row and the file both carry the new name. A refresh in flight in another meka
+    // stores its result against the row it read, and with that row moved it finds nothing to
+    // update and drops the rotated token, leaving the moved row holding a refresh token the issuer
+    // has already spent.
+    let Some(_refresh_guard) = token_store.try_lock_account_credential(name)? else {
+        anyhow::bail!(
+            "account '{name}' is refreshing its credential in another meka; retry shortly"
+        );
+    };
+
+    // The credential moves first, and moves back if the config write then fails, so the two never
+    // disagree for longer than this function runs. The other order has no undo: a config already
+    // renamed makes the second half unrepeatable.
+    token_store
+        .rename_account_credential(name, new_name)
+        .await?;
+    if let Err(error) = rename_account_under_lock(name, new_name) {
+        if let Err(undo) = token_store.rename_account_credential(new_name, name).await {
+            tracing::warn!(
+                "failed to move the credential back to '{name}': {undo}; log in again with `meka \
+                 account login {name}`"
+            );
+        }
+        return Err(error);
+    }
+    tracing::info!("renamed account '{name}' to '{new_name}'");
+    Ok(())
+}
+
+/// Refuse a rename that names no account or takes a name in use.
+///
+/// Asked twice by `run_rename`, of the file as it stands each time, because an `account add`
+/// taking the new name can land between the probe and the write.
+fn refuse_an_unrenameable_account(
+    document: &toml_edit::DocumentMut,
+    name: &str,
+    new_name: &str,
+) -> anyhow::Result<()> {
+    let accounts = table_names(document, "accounts");
+    if !accounts.iter().any(|account| account == name) {
+        anyhow::bail!(crate::text::unknown_name("account", name, &accounts));
+    }
+    if accounts.iter().any(|account| account == new_name) {
+        anyhow::bail!("an account named '{new_name}' already exists");
+    }
+    Ok(())
+}
+
+/// Rename `[accounts.<name>]` and repoint every profile on it, as one critical section: `_lock` is
+/// held to the end, and the document is read under it rather than carried over from `run_rename`'s
+/// probe. No `await` inside, for the reason `run_remove` gives about `ConfigFileLock`.
+fn rename_account_under_lock(name: &str, new_name: &str) -> anyhow::Result<()> {
+    let (_lock, path, mut document) = open_document()?;
+    refuse_an_unrenameable_account(&document, name, new_name)?;
+    rename_table_entry(&mut document, "accounts", name, new_name)?;
+    for profile in profiles_on_account(&document, name) {
+        if let Some(item) = document
+            .get_mut("profiles")
+            .and_then(|item| item.as_table_like_mut())
+            .and_then(|profiles| profiles.get_mut(&profile))
+            .and_then(|item| item.as_table_like_mut())
+            .and_then(|profile| profile.get_mut("account"))
+        {
+            repoint_name(item, new_name);
+        }
+    }
+    crate::fs::write_file_atomic(&path, &document.to_string())?;
+    Ok(())
+}
+
+/// Rename `[<section>.<name>]` to `[<section>.<new_name>]` where it stands. A header table's place
+/// in the file and the comments above it travel with the table itself, not with the key, so taking
+/// the entry out and putting it back under the new key moves nothing else; an inline spelling has
+/// no position to keep, and its entry lands at the end.
+///
+/// Shared with `profile.rs`, which renames under `[profiles]` the same way.
+pub(super) fn rename_table_entry(
+    document: &mut toml_edit::DocumentMut,
+    section: &str,
+    name: &str,
+    new_name: &str,
+) -> anyhow::Result<()> {
+    let table = document
+        .get_mut(section)
+        .and_then(|item| item.as_table_like_mut())
+        .ok_or_else(|| anyhow::anyhow!("no `[{section}]` table in config.toml"))?;
+    let item = table
+        .remove(name)
+        .ok_or_else(|| anyhow::anyhow!("no `[{section}.{name}]` table in config.toml"))?;
+    table.insert(new_name, item);
+    Ok(())
+}
+
+/// Point a name-valued key at `name`, keeping whatever comment sat beside the old value.
+pub(super) fn repoint_name(item: &mut toml_edit::Item, name: &str) {
+    let decor = item.as_value().map(|value| value.decor().clone());
+    let mut value = toml_edit::Value::from(name);
+    if let Some(decor) = decor {
+        *value.decor_mut() = decor;
+    }
+    *item = toml_edit::Item::Value(value);
 }
 
 async fn run_list(
@@ -1455,7 +1583,8 @@ async fn run_introspection(
         crate::cli::AccountAction::Add { .. }
         | crate::cli::AccountAction::List { .. }
         | crate::cli::AccountAction::Login { .. }
-        | crate::cli::AccountAction::Remove { .. } => {
+        | crate::cli::AccountAction::Remove { .. }
+        | crate::cli::AccountAction::Rename { .. } => {
             anyhow::bail!("not an introspection command")
         }
     };
@@ -1924,6 +2053,218 @@ mod tests {
         );
         let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
         assert!(contents.contains("[accounts.work]"), "{contents}");
+    }
+
+    /// A rename moves the name everywhere it is recorded and nothing else: the table keeps its
+    /// place and the comment above it, every profile on the account follows, and the credential
+    /// moves with it, so no login is needed.
+    #[tokio::test]
+    async fn rename_moves_the_credential_and_every_profile_on_the_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "# The work account.\n[accounts.work]\nbackend = \"anthropic-messages\"\n\n\
+             [accounts.other]\nbackend = \"openai-responses\"\n\n\
+             [profiles.daily]\naccount = \"work\" # bills work\nmodel = \"m\"\n\n\
+             [profiles.side]\naccount = \"other\"\nmodel = \"m\"\n",
+        )
+        .expect("write config");
+        let store = crate::store::Store::for_test().await.token_store();
+        store
+            .save_account_credential("work", &AuthCredential::ApiKey("key".to_string()))
+            .await
+            .expect("save");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_rename("work", "corp", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        result.expect("the rename succeeds");
+
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(
+            contents.contains("# The work account.\n[accounts.corp]\n"),
+            "the table keeps its comment and its place: {contents}"
+        );
+        assert!(!contents.contains("[accounts.work]"), "{contents}");
+        assert!(
+            contents.find("[accounts.corp]") < contents.find("[accounts.other]"),
+            "the tables keep their order: {contents}"
+        );
+        assert!(
+            contents.contains("account = \"corp\" # bills work"),
+            "the profile follows, its comment kept: {contents}"
+        );
+        assert!(
+            contents.contains("account = \"other\""),
+            "a profile on another account is untouched: {contents}"
+        );
+        assert!(
+            store
+                .load_account_credential("corp")
+                .await
+                .expect("load")
+                .is_some(),
+            "the credential moved with the account"
+        );
+        assert!(
+            store
+                .load_account_credential("work")
+                .await
+                .expect("load")
+                .is_none(),
+            "and nothing is left under the old name"
+        );
+    }
+
+    /// Refused by name before anything moves: an account that does not exist, a name already in
+    /// use, or a leftover credential stored under the new name, which is a secret nobody
+    /// configured and must not be overwritten.
+    #[tokio::test]
+    async fn rename_refuses_an_unknown_account_a_taken_name_and_a_leftover_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[accounts.work]\nbackend = \"anthropic-messages\"\n\n\
+             [accounts.other]\nbackend = \"openai-responses\"\n",
+        )
+        .expect("write config");
+        let store = crate::store::Store::for_test().await.token_store();
+        for account in ["work", "stale"] {
+            store
+                .save_account_credential(account, &AuthCredential::ApiKey("key".to_string()))
+                .await
+                .expect("save");
+        }
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let unknown = run_rename("nope", "fresh", &store).await;
+        let taken = run_rename("work", "other", &store).await;
+        let leftover = run_rename("work", "stale", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let message = |result: anyhow::Result<()>| match result {
+            Ok(()) => panic!("the rename must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message(unknown).contains("no account named 'nope'"));
+        assert!(message(taken).contains("an account named 'other' already exists"));
+        assert!(message(leftover).contains("stored credential named 'stale'"));
+        assert!(
+            store
+                .load_account_credential("work")
+                .await
+                .expect("load")
+                .is_some(),
+            "a refused rename moves nothing"
+        );
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(contents.contains("[accounts.work]"), "{contents}");
+    }
+
+    /// A refresh in flight owns the account's credential row for its duration; a rename that moved
+    /// the row under it would have the rotated token dropped and the spent one kept.
+    #[tokio::test]
+    async fn rename_is_refused_while_the_credential_is_being_refreshed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[accounts.work]\nbackend = \"anthropic-messages\"\n",
+        )
+        .expect("write config");
+        let store = crate::store::Store::for_test().await.token_store();
+        store
+            .save_account_credential("work", &AuthCredential::ApiKey("key".to_string()))
+            .await
+            .expect("save");
+        let _refreshing = store
+            .try_lock_account_credential("work")
+            .expect("lock")
+            .expect("nobody else holds it");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_rename("work", "corp", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("a rename under a live refresh must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("refreshing its credential"), "{error}");
+        assert!(
+            store
+                .load_account_credential("work")
+                .await
+                .expect("load")
+                .is_some(),
+            "nothing moved"
+        );
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(contents.contains("[accounts.work]"), "{contents}");
+    }
+
+    /// The credential moves first and comes back when the config write fails, so the two halves
+    /// agree again by the time the error is read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_write_that_fails_moves_the_credential_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root writes through a read-only directory, so there is nothing to observe there.
+        // SAFETY: `geteuid` reads a process attribute and has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // The file is a link into a read-only directory: the atomic write follows the link and
+        // creates its temporary file beside the target, which is where it fails. The config
+        // directory itself stays writable, since the write re-modes a directory it owns.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let managed = dir.path().join("managed");
+        std::fs::create_dir(&managed).expect("managed dir");
+        std::fs::write(
+            managed.join("config.toml"),
+            "[accounts.work]\nbackend = \"anthropic-messages\"\n",
+        )
+        .expect("write config");
+        std::os::unix::fs::symlink(managed.join("config.toml"), dir.path().join("config.toml"))
+            .expect("link");
+        let store = crate::store::Store::for_test().await.token_store();
+        store
+            .save_account_credential("work", &AuthCredential::ApiKey("key".to_string()))
+            .await
+            .expect("save");
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only dir");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_rename("work", "corp", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755))
+            .expect("writable again");
+
+        assert!(result.is_err(), "the config write must fail");
+        assert!(
+            store
+                .load_account_credential("work")
+                .await
+                .expect("load")
+                .is_some(),
+            "the credential is back under the name the file still has"
+        );
+        assert!(
+            store
+                .load_account_credential("corp")
+                .await
+                .expect("load")
+                .is_none()
+        );
     }
 
     /// The locked write asks the referenced-by question again, of the file as it stands then.

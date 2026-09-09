@@ -330,6 +330,29 @@ impl TokenStore {
             })
     }
 
+    /// Move an account's stored credential to a new name, for `account rename`. An account with
+    /// no credential moves nothing, which is not an error: the rename is of the account.
+    pub(crate) async fn rename_account_credential(
+        &self,
+        account: &str,
+        new_account: &str,
+    ) -> Result<()> {
+        let account = account.to_string();
+        let new_account = new_account.to_string();
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE account_credentials SET account = ?2 WHERE account = ?1",
+                    rusqlite::params![account, new_account],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to rename account credential: {error}"))
+            })
+    }
+
     /// Every account name that has a stored credential, sorted.
     ///
     /// Credentials are keyed by account name and nothing enforces that the name still exists in

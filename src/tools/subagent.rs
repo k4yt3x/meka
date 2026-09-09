@@ -2145,6 +2145,20 @@ fn build_subagent_system_prompt(
 
 #[cfg(test)]
 mod tests {
+    /// The store moves exactly one name out of the spawn terms when a profile is renamed, under
+    /// the key it names; this is the spec whose serialization that key has to match.
+    #[test]
+    fn the_spec_records_its_profile_under_the_key_the_store_renames() {
+        let spec: SubagentSpec =
+            serde_json::from_str(r#"{"permission":"read","tools":[],"profile":"work"}"#)
+                .expect("a pinned spec");
+        let document = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(
+            document[crate::store::Store::SUBAGENT_SPEC_PROFILE_KEY],
+            "work"
+        );
+    }
+
     use tokio_util::sync::CancellationToken;
 
     use super::*;

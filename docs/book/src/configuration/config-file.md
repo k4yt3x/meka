@@ -12,7 +12,7 @@ The config file is optional. If it does not exist, meka silently skips it.
 
 meka refuses unknown keys: a typo (`contex_window`) or a removed key (`reasoning_effort`) fails the load with an error naming the offending key, rather than being silently ignored. Fix or remove the key to continue.
 
-The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable`, `meka account remove` and `meka profile remove` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "No MCP servers." over a file full of them is indistinguishable from the truth.
+The commands that *edit* the file are exempt, so a broken config can still be repaired from the CLI: `meka mcp add` / `remove` / `enable` / `disable`, `meka account remove` / `rename` and `meka profile remove` / `rename` work on the raw document and don't care about an unknown key elsewhere in it. Everything that *reads* config fails instead of answering from empty defaults, because "No MCP servers." over a file full of them is indistinguishable from the truth.
 
 Those editors only reach the keys they own, so a bad key anywhere else (`[session]`, `[permissions]`, a top-level typo, a raw syntax error) has to be fixed in an editor. The error names the file, line, column, and offending key.
 
@@ -348,6 +348,7 @@ store, never the config file.
 | `meka account list` | List configured accounts with backend, base URL, and whether each has a stored credential; `--format json` prints the same as one document. Also names any stored credential that no account claims (see [Leftover credentials](#leftover-credentials)). |
 | `meka account login <name> [--api-key-stdin]` | Re-acquire the secret for an existing account (re-authenticate, recover from a dead OAuth refresh token, or rotate an API key). `--api-key-stdin` reads the key from stdin for scripted rotation, and is refused on the subscription backends, which have no key to read. Every setting on the account is kept. |
 | `meka account remove <name>` | Delete the stored credential from the store and remove the `[accounts.<name>]` entry from the config file. Refused while any profile names the account, naming the profiles: remove or repoint those first. Works on a name with only one of the two halves, so it can clean up after a hand-edit. |
+| `meka account rename <name> <new-name>` | Rename the account in place. The `[accounts.<name>]` table keeps its position and comments, every profile naming it follows, and its stored credential moves with it, so no login is needed. Refused when the new name is taken, a leftover credential is stored under it, or another meka is refreshing the account's token at that moment. Stop running hosts first: one keeps the names it started with until restarted, and a token it refreshes afterwards is dropped rather than saved. |
 | `meka account usage` / `whoami` / `stats` | The read-only account views; see [Account info](../usage/account.md). |
 
 `--api-key-stdin` reads the key from standard input instead of prompting, for scripted setup:
@@ -372,6 +373,7 @@ login.
 | `meka profile set <name> <key> <value>` | Change one setting on an existing profile, in place. `--unset` in place of the value removes the key instead. See [Changing one setting](#changing-one-setting). |
 | `meka profile use <name>` | Set `default_profile` to this profile. |
 | `meka profile remove <name>` | Remove the `[profiles.<name>]` entry from the config file. Warns if it clears a `default_profile` that other profiles are still competing for, and if any sessions are pinned to the profile it deleted (those refuse to resume until it is configured again, or moved with `meka -r <id> --profile <name>`). The account and its credential stay. |
+| `meka profile rename <name> <new-name>` | Rename the profile in place. The `[profiles.<name>]` table keeps its position and comments, `default_profile` follows when it named the profile, and every session recorded on it moves, sub-agent sessions and their pinned spawn terms included. Refused when the new name is taken, or when any session already records it. Stop running hosts first: one keeps the names it started with until restarted, and its sessions on the renamed profile are refused their next turn. |
 
 ### Changing one setting
 

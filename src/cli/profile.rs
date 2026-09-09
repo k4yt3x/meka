@@ -5,8 +5,8 @@
 //! whose config-editing and prompt helpers this module shares.
 
 use super::account::{
-    ensure_section_table, open_document, prompt_line, prompt_yes_no, reparse_after_edit,
-    table_names, validate_backend,
+    ensure_section_table, open_document, prompt_line, prompt_yes_no, rename_table_entry,
+    reparse_after_edit, repoint_name, table_names, validate_backend,
 };
 use crate::{cli::ProfileAction, config};
 
@@ -49,6 +49,7 @@ pub(crate) async fn run(
         } => run_set(name, key, value.as_deref(), *unset),
         ProfileAction::Use { name } => run_use(name),
         ProfileAction::Remove { name } => run_remove(name, store).await,
+        ProfileAction::Rename { name, new_name } => run_rename(name, new_name, store).await,
     }
 }
 
@@ -252,6 +253,83 @@ async fn run_remove(name: &str, store: &crate::store::Store) -> anyhow::Result<(
             "cleared `default_profile`, which named '{name}'; no such profile was configured"
         );
     }
+    Ok(())
+}
+
+async fn run_rename(name: &str, new_name: &str, store: &crate::store::Store) -> anyhow::Result<()> {
+    if new_name.trim().is_empty() {
+        anyhow::bail!("profile name cannot be empty");
+    }
+    // Probed under a short guard, dropped before the `await` below, for the reason `account
+    // remove` gives about `ConfigFileLock`; the write asks again under its own.
+    {
+        let (_lock, _path, document) = open_document()?;
+        refuse_an_unrenameable_profile(&document, name, new_name)?;
+    }
+
+    // Rows already recording the new name, which `profile remove` leaves behind, would be adopted
+    // by the rename and then carried onto the old name by its undo: refused by name, since only an
+    // explicit act may move a session between profiles.
+    let recorded = store.count_sessions_recording_profile(new_name).await?;
+    if recorded > 0 {
+        anyhow::bail!(
+            "{recorded} session(s) already record the profile '{new_name}'; move them first with \
+             `meka -r <id> --profile <name>`"
+        );
+    }
+
+    // The rows move first, and move back if the config write then fails, so a session never names
+    // a profile the file does not have for longer than this function runs. The other order has no
+    // undo: a config already renamed makes the second half unrepeatable.
+    let moved = store.rename_profile(name, new_name).await?;
+    if let Err(error) = rename_profile_under_lock(name, new_name) {
+        if let Err(undo) = store.rename_profile(new_name, name).await {
+            tracing::warn!(
+                "failed to move {moved} session(s) back to '{name}': {undo}; they now run on \
+                 '{new_name}'"
+            );
+        }
+        return Err(error);
+    }
+    tracing::info!("renamed profile '{name}' to '{new_name}'; {moved} session(s) follow");
+    Ok(())
+}
+
+/// Refuse a rename that names no profile or takes a name in use.
+///
+/// Asked twice by `run_rename`, of the file as it stands each time, because a `profile add` taking
+/// the new name can land between the probe and the write.
+fn refuse_an_unrenameable_profile(
+    document: &toml_edit::DocumentMut,
+    name: &str,
+    new_name: &str,
+) -> anyhow::Result<()> {
+    let profiles = table_names(document, "profiles");
+    if !profiles.iter().any(|profile| profile == name) {
+        anyhow::bail!(crate::text::unknown_name("profile", name, &profiles));
+    }
+    if profiles.iter().any(|profile| profile == new_name) {
+        anyhow::bail!("a profile named '{new_name}' already exists");
+    }
+    Ok(())
+}
+
+/// Rename `[profiles.<name>]` and repoint `default_profile` if it named it, as one critical
+/// section under the config lock. No `await` inside, for the reason `account remove` gives about
+/// `ConfigFileLock`.
+fn rename_profile_under_lock(name: &str, new_name: &str) -> anyhow::Result<()> {
+    let (_lock, path, mut document) = open_document()?;
+    refuse_an_unrenameable_profile(&document, name, new_name)?;
+    rename_table_entry(&mut document, "profiles", name, new_name)?;
+    if document
+        .get("default_profile")
+        .and_then(|item| item.as_str())
+        == Some(name)
+        && let Some(item) = document.get_mut("default_profile")
+    {
+        repoint_name(item, new_name);
+    }
+    crate::fs::write_file_atomic(&path, &document.to_string())?;
     Ok(())
 }
 
@@ -1055,6 +1133,271 @@ mod tests {
         assert!(
             contents.contains("[accounts.work]"),
             "the account the profile billed is not the profile's to remove: {contents}"
+        );
+    }
+
+    /// A rename moves the name everywhere it is recorded: the table keeps its place and comment,
+    /// `default_profile` follows, and every session on the profile moves, a pinned sub-agent's
+    /// spawn terms included, while a session on another profile stays.
+    #[tokio::test]
+    async fn rename_moves_the_default_and_every_session_and_keeps_the_table_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "default_profile = \"work\"\n\n{TWO_ACCOUNTS}# Daily driver.\n[profiles.work]\n\
+                 account = \"work\"\nmodel = \"m\"\n\n[profiles.personal]\naccount = \
+                 \"work\"\nmodel = \"m\"\n"
+            ),
+        )
+        .expect("write config");
+        let store = crate::store::Store::for_test().await;
+        let root = store
+            .create_session(None, "work".to_string())
+            .await
+            .expect("root");
+        let (pinned, _lock) = store
+            .create_child_session(
+                root,
+                None,
+                Vec::new(),
+                Some(r#"{"permission":"read","tools":[],"profile":"work"}"#.to_string()),
+                "read".to_string(),
+                "work".to_string(),
+            )
+            .await
+            .expect("pinned child");
+        let (following, _lock) = store
+            .create_child_session(
+                root,
+                None,
+                Vec::new(),
+                Some(r#"{"permission":"read","tools":[]}"#.to_string()),
+                "read".to_string(),
+                "work".to_string(),
+            )
+            .await
+            .expect("following child");
+        let elsewhere = store
+            .create_session(None, "personal".to_string())
+            .await
+            .expect("other");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_rename("work", "main", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        result.expect("the rename succeeds");
+
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(
+            contents.contains("default_profile = \"main\""),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("# Daily driver.\n[profiles.main]\n"),
+            "the table keeps its comment and its place: {contents}"
+        );
+        assert!(!contents.contains("[profiles.work]"), "{contents}");
+        assert!(
+            contents.find("[profiles.main]") < contents.find("[profiles.personal]"),
+            "the tables keep their order: {contents}"
+        );
+        for id in [root, pinned, following] {
+            assert_eq!(
+                store.recorded_profile(id).await.expect("read").as_deref(),
+                Some("main"),
+                "every row on the profile moves"
+            );
+        }
+        assert_eq!(
+            store
+                .recorded_profile(elsewhere)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("personal"),
+            "a session on another profile stays"
+        );
+        assert!(
+            store
+                .load_subagent_spec(pinned)
+                .await
+                .expect("read")
+                .is_some_and(|spec| spec.contains("\"profile\":\"main\"")),
+            "the pinned spawn terms follow"
+        );
+        assert!(
+            store
+                .load_subagent_spec(following)
+                .await
+                .expect("read")
+                .is_some_and(|spec| !spec.contains("profile")),
+            "unpinned spawn terms gain no pin"
+        );
+    }
+
+    /// `default_profile` follows the renamed profile and no other: one naming a sibling is left
+    /// exactly as it was.
+    #[tokio::test]
+    async fn rename_leaves_a_default_that_names_another_profile_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "default_profile = \"personal\" # the usual\n\n{TWO_ACCOUNTS}[profiles.work]\n\
+                 account = \"work\"\nmodel = \"m\"\n\n[profiles.personal]\naccount = \
+                 \"work\"\nmodel = \"m\"\n"
+            ),
+        )
+        .expect("write config");
+        let store = crate::store::Store::for_test().await;
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_rename("work", "main", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        result.expect("the rename succeeds");
+
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(
+            contents.contains("default_profile = \"personal\" # the usual"),
+            "{contents}"
+        );
+        assert!(contents.contains("[profiles.main]"), "{contents}");
+    }
+
+    /// Rows already recording the new name are what `profile remove` leaves behind. A rename onto
+    /// that name would adopt them, and its undo would carry them onto the old name, so it is
+    /// refused before any row moves.
+    #[tokio::test]
+    async fn rename_refuses_a_name_that_sessions_already_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("{TWO_ACCOUNTS}[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n"),
+        )
+        .expect("write config");
+        let store = crate::store::Store::for_test().await;
+        let on_work = store
+            .create_session(None, "work".to_string())
+            .await
+            .expect("on work");
+        let orphan = store
+            .create_session(None, "main".to_string())
+            .await
+            .expect("left behind by a removal");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_rename("work", "main", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let error = match result {
+            Ok(()) => panic!("a rename onto a recorded name must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("1 session(s) already record the profile 'main'"),
+            "{error}"
+        );
+        for (id, profile) in [(on_work, "work"), (orphan, "main")] {
+            assert_eq!(
+                store.recorded_profile(id).await.expect("read").as_deref(),
+                Some(profile),
+                "no row moved"
+            );
+        }
+    }
+
+    /// Refused by name before anything moves: a profile that does not exist, or a name in use.
+    #[tokio::test]
+    async fn rename_refuses_an_unknown_profile_and_a_taken_name_without_moving_a_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "{TWO_ACCOUNTS}[profiles.work]\naccount = \"work\"\nmodel = \
+                 \"m\"\n\n[profiles.personal]\naccount = \"work\"\nmodel = \"m\"\n"
+            ),
+        )
+        .expect("write config");
+        let store = crate::store::Store::for_test().await;
+        let root = store
+            .create_session(None, "work".to_string())
+            .await
+            .expect("root");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let unknown = run_rename("nope", "fresh", &store).await;
+        let taken = run_rename("work", "personal", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+
+        let message = |result: anyhow::Result<()>| match result {
+            Ok(()) => panic!("the rename must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message(unknown).contains("no profile named 'nope'"));
+        assert!(message(taken).contains("a profile named 'personal' already exists"));
+        assert_eq!(
+            store.recorded_profile(root).await.expect("read").as_deref(),
+            Some("work"),
+            "a refused rename moves no row"
+        );
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).expect("read back");
+        assert!(contents.contains("[profiles.work]"), "{contents}");
+    }
+
+    /// The rows move first and come back when the config write fails, so no session names a
+    /// profile the file does not have by the time the error is read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_write_that_fails_moves_the_sessions_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Root writes through a read-only directory, so there is nothing to observe there.
+        // SAFETY: `geteuid` reads a process attribute and has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // A link into a read-only directory, for the reason the account test gives: the atomic
+        // write fails beside the link's target, while the config directory stays writable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let managed = dir.path().join("managed");
+        std::fs::create_dir(&managed).expect("managed dir");
+        std::fs::write(
+            managed.join("config.toml"),
+            format!("{TWO_ACCOUNTS}[profiles.work]\naccount = \"work\"\nmodel = \"m\"\n"),
+        )
+        .expect("write config");
+        std::os::unix::fs::symlink(managed.join("config.toml"), dir.path().join("config.toml"))
+            .expect("link");
+        let store = crate::store::Store::for_test().await;
+        let root = store
+            .create_session(None, "work".to_string())
+            .await
+            .expect("root");
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only dir");
+
+        // SAFETY: as above.
+        let _guard = crate::config::CONFIG_DIR_ENV_LOCK.lock().await;
+        unsafe { std::env::set_var("MEKA_CONFIG_DIR", dir.path()) };
+        let result = run_rename("work", "main", &store).await;
+        unsafe { std::env::remove_var("MEKA_CONFIG_DIR") };
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755))
+            .expect("writable again");
+
+        assert!(result.is_err(), "the config write must fail");
+        assert_eq!(
+            store.recorded_profile(root).await.expect("read").as_deref(),
+            Some("work"),
+            "the row is back on the name the file still has"
         );
     }
 
