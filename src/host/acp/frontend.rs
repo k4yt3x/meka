@@ -634,9 +634,12 @@ impl Frontend for AcpFrontend {
                 return;
             }
             // REPL signage. The editor named the session it created, and the `session/prompt`
-            // response is what tells it the turn is over. Spelled out rather than left to a
-            // catch-all so a variant added later has to be placed here on purpose.
-            FrontendEvent::SessionStarted { .. } | FrontendEvent::TurnFinished => return,
+            // response is what tells it the turn is over. A withdrawn prompt is a scheduled fire's,
+            // never one the editor sent, so its transcript has nothing to amend. Spelled out rather
+            // than left to a catch-all so a variant added later has to be placed here on purpose.
+            FrontendEvent::SessionStarted { .. }
+            | FrontendEvent::TurnFinished
+            | FrontendEvent::PromptWithdrawn => return,
         };
 
         self.send_update(update);

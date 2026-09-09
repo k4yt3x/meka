@@ -94,6 +94,13 @@ pub(crate) struct TurnOptions {
     /// in the REPL and the `--skill` CLI flag. An unknown skill is a 422.
     #[serde(default)]
     pub(crate) skill: Option<String>,
+    /// What becomes of `message` if the turn ends, failed or canceled, before anything from the
+    /// model reached the conversation. `keep` (default) leaves it in place, as the REPL does for a
+    /// prompt whose turn failed; `withdraw` takes it back, for a client that will resend it. Once
+    /// a partial answer or a tool call is in the conversation, the message stays regardless.
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub(crate) unanswered_message: crate::conversation::PromptRetention,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -294,8 +301,12 @@ pub(crate) async fn submit_turn(
     };
     let images = decode_turn_images(&body.images, entry.accepts_images()).await?;
     // An image with no text passes; against prior context "look at this" is a complete request.
+    //
+    // The retention is stated before any outcome rides along: a carried outcome overrides the
+    // client's answer with `Keep`, and the override has to be the last word.
     let input = crate::agent::TurnInput::from_parts(message, images)
-        .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?;
+        .map_err(|error| ProblemDetail::for_error(&error, state.config.relay_provider_errors))?
+        .retaining(body.options.unanswered_message);
 
     // Taken only once the request is known to be one meka will act on. The guard marks the
     // session as busy, and a request rejected above never runs a turn, so acquiring first made a
@@ -714,10 +725,11 @@ async fn run_blocking_turn(
                     crate::host::http::sse::SseEventType::TurnFailed
                 };
                 notify_turn_end(&state.webhooks, event_type, turn_id, session_id);
-                Err(ProblemDetail::for_error(
-                    &error,
-                    state.config.relay_provider_errors,
-                ))
+                let problem = ProblemDetail::for_error(&error, state.config.relay_provider_errors);
+                Err(match message_withdrawn(&recorder) {
+                    Some(withdrawn) => problem.with("message_withdrawn", withdrawn),
+                    None => problem,
+                })
             }
         };
         // Inside the task, so a client that hung up still records its outcome against the key.
@@ -791,7 +803,7 @@ fn run_streaming_turn(
             .run_turn(&mut conversation, input, cancel_for_task)
             .await;
         entry_for_task.touch();
-        let usage = drain_recorder_and_extract_usage(&entry_for_task.frontend);
+        let recorder = entry_for_task.frontend.drain();
         // Computed and recorded *here*, in the task, rather than in the response stream below.
         // In the case re-attach exists for, the client's connection has already dropped and axum
         // has discarded that stream, so a terminal event computed there would be computed for
@@ -806,10 +818,11 @@ fn run_streaming_turn(
         let (event_type, data) = terminal_event_parts(
             Ok(outcome),
             cancel_reason,
-            usage,
+            usage_from(&recorder),
             turn_id,
             session_id,
             relay_for_task,
+            message_withdrawn(&recorder),
         );
         notify_turn_end(&webhooks_for_task, event_type, turn_id, session_id);
         entry_for_task.frontend.record_terminal(event_type, data)
@@ -972,6 +985,11 @@ impl CancelReason {
 ///
 /// A successful agent outcome always wins over a concurrent cancel signal, so a race between
 /// completion and cancellation does not discard an already-persisted result.
+///
+/// `message_withdrawn` rides the failed and canceled terminals of a turn that began: it is the one
+/// fact a client that resends needs, and the stream cannot be read for it, since thinking and a
+/// half-composed tool call look like output and neither reaches the conversation. `None` is a turn
+/// that never began, or one whose record died with its task, and is omitted rather than guessed.
 fn terminal_event_parts(
     turn_result: std::result::Result<crate::error::Result<TurnOutcome>, tokio::task::JoinError>,
     cancel_reason: CancelReason,
@@ -979,27 +997,36 @@ fn terminal_event_parts(
     turn_id: Uuid,
     session_id: Uuid,
     relay_provider_errors: bool,
+    message_withdrawn: Option<bool>,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
     match turn_result {
         Ok(Ok(outcome)) => finished_parts(&outcome, usage, turn_id, session_id),
         Ok(Err(crate::error::MekaError::Interrupted)) => {
             // Every stop surfaces as `Interrupted` by the time the agent loop unwinds; who asked
             // for it is carried alongside.
-            canceled_parts(cancel_reason.as_str(), turn_id, session_id)
+            canceled_parts(
+                cancel_reason.as_str(),
+                message_withdrawn,
+                turn_id,
+                session_id,
+            )
         }
         Ok(Err(error)) => {
             let instance = format!("/v1/sessions/{session_id}/turn");
             let problem =
                 crate::host::http::errors::ProblemDetail::for_error(&error, relay_provider_errors)
                     .instance(instance);
-            (
-                crate::host::http::sse::SseEventType::TurnFailed,
-                serde_json::json!({
-                    "turn_id": turn_id.to_string(),
-                    "session_id": session_id.to_string(),
-                    "error": serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
-                }),
-            )
+            let mut data = serde_json::json!({
+                "turn_id": turn_id.to_string(),
+                "session_id": session_id.to_string(),
+                "error": serde_json::to_value(problem).unwrap_or(serde_json::Value::Null),
+            });
+            // Omitted, not `null`, when there is nothing to say: the rule every optional field on
+            // this API follows.
+            if let Some(withdrawn) = message_withdrawn {
+                data["message_withdrawn"] = serde_json::Value::Bool(withdrawn);
+            }
+            (crate::host::http::sse::SseEventType::TurnFailed, data)
         }
         Err(panic) => {
             tracing::error!("streaming turn task panicked: {panic:?}");
@@ -1072,8 +1099,10 @@ async fn join_terminal(
 /// stream slot open for a reconnect to read.
 fn panic_terminal(panic: tokio::task::JoinError, turn_id: Uuid, session_id: Uuid) -> Event {
     let (event_type, data) =
-        // The flag is a don't-care here: a `JoinError` takes the panic arm, which renders a fixed
-        // `/errors/internal` payload and never reaches an upstream message to relay or withhold.
+        // The relay flag is a don't-care here: a `JoinError` takes the panic arm, which renders a
+        // fixed `/errors/internal` payload and never reaches an upstream message to relay or
+        // withhold. The record of the turn died with its task, so nothing is said about the
+        // message either.
         terminal_event_parts(
             Err(panic),
             CancelReason::Client,
@@ -1081,6 +1110,7 @@ fn panic_terminal(panic: tokio::task::JoinError, turn_id: Uuid, session_id: Uuid
             turn_id,
             session_id,
             false,
+            None,
         );
     // Sent without an `id:` field. The generator lives on the task that just died, and id 0 is
     // already `turn.started`; reusing it would have a client store 0 as its resume position and
@@ -1094,17 +1124,19 @@ fn panic_terminal(panic: tokio::task::JoinError, turn_id: Uuid, session_id: Uuid
 
 fn canceled_parts(
     reason: &'static str,
+    message_withdrawn: Option<bool>,
     turn_id: Uuid,
     session_id: Uuid,
 ) -> (crate::host::http::sse::SseEventType, serde_json::Value) {
-    (
-        crate::host::http::sse::SseEventType::TurnCanceled,
-        serde_json::json!({
-            "turn_id": turn_id.to_string(),
-            "session_id": session_id.to_string(),
-            "reason": reason,
-        }),
-    )
+    let mut data = serde_json::json!({
+        "turn_id": turn_id.to_string(),
+        "session_id": session_id.to_string(),
+        "reason": reason,
+    });
+    if let Some(withdrawn) = message_withdrawn {
+        data["message_withdrawn"] = serde_json::Value::Bool(withdrawn);
+    }
+    (crate::host::http::sse::SseEventType::TurnCanceled, data)
 }
 
 /// Wire `stop_reason` string for a finished turn. Shared by the blocking (`assemble_response`)
@@ -1147,20 +1179,12 @@ fn finished_parts(
     (crate::host::http::sse::SseEventType::TurnFinished, data)
 }
 
-/// Drain the per-session recorder at end-of-turn and pluck the most recent `TokenUsage` event
-/// off the back. Mirrors what `run_blocking_turn` does explicitly via `entry.frontend.drain()`.
-/// Both transport branches reset the recorder so the next turn starts clean. Returns `None`
-/// when the turn never reported usage (mock provider tests, refused turns, server-shutdown
-/// cancel before the agent emitted anything).
-///
-/// Only one of the two select-arm callers ever runs per turn (terminal events break the loop),
-/// so the drain happens exactly once.
-fn drain_recorder_and_extract_usage(
-    frontend: &Arc<crate::host::http::http_frontend::HttpFrontend>,
-) -> UsageView {
-    let recorder = frontend.drain();
+/// The turn's usage, from the events it recorded. The default when the turn never reported any
+/// (mock provider tests, refused turns, a server-shutdown cancel before the agent emitted
+/// anything).
+fn usage_from(recorder: &Recorder) -> UsageView {
     recorder
-        .into_iter()
+        .iter()
         .rev()
         .find_map(|event| {
             if let FrontendEvent::TokenUsage(usage) = event {
@@ -1175,6 +1199,25 @@ fn drain_recorder_and_extract_usage(
             }
         })
         .unwrap_or_default()
+}
+
+/// Whether the turn took its message back, from the events it recorded. `None` for a turn refused
+/// before it began, which never added the message and so has nothing to say about it.
+///
+/// Read from the recorder rather than kept as a flag on the frontend, because the recorder is
+/// drained before the turn and again after it, so it holds exactly this turn's events. A flag
+/// cleared on `TurnStarted` would answer for the previous turn when this one was refused ahead of
+/// that event, as the required-MCP gate refuses; here that refusal reads as no `TurnStarted` at
+/// all.
+fn message_withdrawn(recorder: &Recorder) -> Option<bool> {
+    recorder
+        .iter()
+        .any(|event| matches!(event, FrontendEvent::TurnStarted))
+        .then(|| {
+            recorder
+                .iter()
+                .any(|event| matches!(event, FrontendEvent::PromptWithdrawn))
+        })
 }
 
 fn assemble_response(

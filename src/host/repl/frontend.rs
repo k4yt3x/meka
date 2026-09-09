@@ -119,6 +119,7 @@ pub(super) fn indicator_action(event: &FrontendEvent, renders_reasoning: bool) -
         | FrontendEvent::TokenUsage(_)
         | FrontendEvent::Notice(_)
         | FrontendEvent::McpProgress(_)
+        | FrontendEvent::PromptWithdrawn
         | FrontendEvent::Compacted { .. } => IndicatorAction::Commit,
     }
 }
@@ -217,6 +218,10 @@ impl Frontend for ReplFrontend {
             // longer than a turn and outlives one that fails: a turn is simply one of the things
             // that can happen inside it.
             FrontendEvent::TurnStarted => {}
+            // Nothing to draw. A typed prompt is never withdrawn here, and a scheduled fire's
+            // withdrawal is the schedule's own bookkeeping, not news for the person at the
+            // keyboard.
+            FrontendEvent::PromptWithdrawn => {}
             // Closed here so a completed turn does not hold its last paragraph until the prompt,
             // and closed again by the episode for a turn that died without reaching this.
             FrontendEvent::TurnFinished => {

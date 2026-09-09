@@ -251,12 +251,11 @@ pub(crate) fn only_what_was_won(
 
 /// The retention a carrier prompt deserves once an outcome may be riding on it.
 ///
-/// A recurring job asks for [`crate::conversation::PromptRetention::WithdrawOnFailure`] because its
-/// next occurrence regenerates the prompt, so a failed copy carries nothing worth keeping. That
-/// stops being true the moment an outcome joins it: the row is stamped delivered before the turn
-/// starts and is never handed out again, so withdrawing the message loses the only copy. Three
-/// hosts fold an outcome into a fired job's prompt and all three ask this, rather than each
-/// remembering.
+/// A recurring job asks for [`crate::conversation::PromptRetention::Withdraw`] because its next
+/// occurrence regenerates the prompt, so a failed copy carries nothing worth keeping. That stops
+/// being true the moment an outcome joins it: the row is stamped delivered before the turn starts
+/// and is never handed out again, so withdrawing the message loses the only copy. Three hosts fold
+/// an outcome into a fired job's prompt and all three ask this, rather than each remembering.
 pub(crate) fn retention_carrying(
     riding: &[BackgroundTask],
     job: crate::conversation::PromptRetention,
@@ -728,7 +727,7 @@ mod tests {
         let carried = [task(TaskStatus::Canceled, None)];
         for asked in [
             crate::conversation::PromptRetention::Keep,
-            crate::conversation::PromptRetention::WithdrawOnFailure,
+            crate::conversation::PromptRetention::Withdraw,
         ] {
             assert_eq!(
                 retention_carrying(&carried, asked),
@@ -737,8 +736,8 @@ mod tests {
             );
         }
         assert_eq!(
-            retention_carrying(&[], crate::conversation::PromptRetention::WithdrawOnFailure),
-            crate::conversation::PromptRetention::WithdrawOnFailure,
+            retention_carrying(&[], crate::conversation::PromptRetention::Withdraw),
+            crate::conversation::PromptRetention::Withdraw,
             "and a job carrying only its own prompt keeps the job's answer: the next occurrence \
              regenerates it"
         );

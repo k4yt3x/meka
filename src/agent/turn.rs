@@ -82,8 +82,8 @@ impl TurnInput {
         }
     }
 
-    /// Whether the prompt is withdrawn when the turn fails. A scheduled job's prompt is; see
-    /// [`PromptRetention`].
+    /// What becomes of the prompt if the turn ends unanswered: the scheduler's answer per job, the
+    /// HTTP client's per turn; see [`PromptRetention`].
     pub(crate) fn retaining(mut self, retention: PromptRetention) -> Self {
         self.retention = retention;
         self
@@ -458,7 +458,8 @@ impl Agent {
         gate_on_required_servers(not_ready)
     }
 
-    /// One turn on behalf of whoever asked for it, keeping its prompt whatever happens.
+    /// One turn on behalf of whoever asked for it; what becomes of its prompt if it fails is the
+    /// input's retention.
     pub(crate) async fn run_turn(
         &self,
         messages: &mut Conversation,
@@ -1420,14 +1421,15 @@ impl Agent {
         }
 
         match &result {
-            // A scheduled fire that produced nothing at all is withdrawn, however it ended: the
-            // prompt is regenerated on the next occurrence, and a drained `meka serve` hands the
-            // occurrence back, so keeping it guarantees a duplicate. The log-length condition is
-            // the one that decides: an unchanged count since the prompt means nothing appended,
-            // where the materialized tail alone cannot tell a prompt from a compaction summary.
+            // A prompt its caller will produce again is withdrawn when the turn produced nothing at
+            // all, however it ended: a recurring job regenerates it on its next occurrence, and a
+            // drained `meka serve` hands the occurrence back, so keeping it guarantees a duplicate;
+            // an HTTP client that asked for this resends. The log-length condition is the one that
+            // decides: an unchanged count since the prompt means nothing appended, where the
+            // materialized tail alone cannot tell a prompt from a compaction summary.
             // `a_fire_interrupted_before_it_began_withdraws_its_prompt` pins the shape.
             Err(_)
-                if retention == PromptRetention::WithdrawOnFailure
+                if retention == PromptRetention::Withdraw
                     && messages.events_len() == recovery.prompt_only_events
                     && messages.ends_on_a_turn_opening() =>
             {
@@ -1463,7 +1465,12 @@ impl Agent {
                 }
             }
             Err(error) if !matches!(error, MekaError::Interrupted) && !recovery.user_saved => {
-                messages.pop_unsaved();
+                if messages.pop_unsaved().is_some() {
+                    self.cells
+                        .frontend
+                        .emit(FrontendEvent::PromptWithdrawn)
+                        .await;
+                }
                 // The popped message carried this turn's world-state announcement, so put the
                 // snapshot back to what the model has actually seen. The next turn then re-renders
                 // the change rather than assuming it was already delivered.
@@ -1965,7 +1972,7 @@ mod tests {
                         Vec::new(),
                     )
                     .expect("a prompt")
-                    .retaining(PromptRetention::WithdrawOnFailure),
+                    .retaining(PromptRetention::Withdraw),
                     CancellationToken::new(),
                 )
                 .await
@@ -2108,8 +2115,7 @@ mod tests {
     /// The row order on disk after a turn whose prompt could not be saved eagerly and whose
     /// stream then died with text on screen: the prompt first, then the partial answer. A partial
     /// persisted ahead of the lazy prompt save would replay as an answer before its question, and
-    /// a `WithdrawOnFailure` turn's `pop_unsaved` would take it out of memory in the prompt's
-    /// place.
+    /// a `Withdraw` turn's `pop_unsaved` would take it out of memory in the prompt's place.
     #[tokio::test]
     async fn a_partial_answer_never_lands_on_disk_ahead_of_its_prompt() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2540,7 +2546,7 @@ mod tests {
                     Vec::new(),
                 )
                 .expect("a prompt")
-                .retaining(PromptRetention::WithdrawOnFailure),
+                .retaining(PromptRetention::Withdraw),
                 canceled,
             )
             .await
@@ -2550,6 +2556,143 @@ mod tests {
             messages.is_empty(),
             "the occurrence comes back, so the prompt must not linger: {:?}",
             messages.as_slice()
+        );
+    }
+
+    /// The announcement of a change rides the prompt of the first turn to see it, and the snapshot
+    /// advances as if the model had been told. Withdrawing that prompt takes the only copy of the
+    /// announcement with it, so the snapshot has to go back too, or the next turn believes the
+    /// change was delivered and never mentions it.
+    #[tokio::test]
+    async fn a_withdrawn_prompt_gives_its_announcement_back_to_the_next_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(Some(&temp.path().join("meka.db")), &Default::default())
+            .await
+            .expect("open");
+        let memories = store.memory_store(true);
+        let registry = crate::tools::ToolRegistry::new();
+        registry
+            .register(Arc::new(MemoryReadFixture))
+            .expect("register memory_read");
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            text_round("first"),
+            vec![MockEvent::Fail {
+                message: "error sending request: connection refused".to_string(),
+            }],
+            text_round("third"),
+        ]));
+        let (mut agent, _unused) =
+            agent_with_registry_for_test(provider as Arc<dyn Provider>, registry).await;
+        agent.store = store.clone();
+        agent.memories = memories.clone();
+        agent.options.system_prompt_override = None;
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("first".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first turn");
+
+        memories
+            .write(crate::store::memory::WriteRequest {
+                name: "deploy-policy".to_string(),
+                description: Some("Never deploy on Fridays".to_string()),
+                tags: None,
+                body: None,
+                priority: Some(3),
+            })
+            .await
+            .expect("write");
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("doomed".to_string(), Vec::new())
+                    .expect("a prompt")
+                    .retaining(PromptRetention::Withdraw),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the provider is unreachable");
+        assert!(
+            !messages
+                .as_slice()
+                .iter()
+                .any(|message| message.wire_text().contains("deploy-policy")),
+            "the premise: the withdrawn prompt took the announcement with it"
+        );
+
+        let before = messages.len();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("third".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("third turn");
+        let third: String = messages.as_slice()[before..]
+            .iter()
+            .map(|message| message.wire_text())
+            .collect();
+        assert!(
+            third.contains("deploy-policy"),
+            "the change was never delivered, so the next turn has to say it: {third}"
+        );
+    }
+
+    /// The withdrawal is announced where it happens, so a host can tell a client whether the
+    /// conversation still holds the prompt it sent. A kept prompt announces nothing: keeping is
+    /// the absence of the act, and the host reads it as such.
+    #[tokio::test]
+    async fn a_withdrawal_is_announced_once_and_a_kept_prompt_not_at_all() {
+        let (agent, frontend) = agent_recording_for_test(unreachable_provider(2)).await;
+        let announced = |frontend: &crate::frontend::testing::RecordingFrontend| {
+            frontend
+                .events()
+                .iter()
+                .filter(|event| matches!(event, crate::frontend::FrontendEvent::PromptWithdrawn))
+                .count()
+        };
+        let mut messages = Conversation::new();
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("kept".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the provider is unreachable");
+        assert_eq!(
+            announced(&frontend),
+            0,
+            "a kept prompt is not announced as withdrawn: {:?}",
+            frontend.events()
+        );
+
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("withdrawn".to_string(), Vec::new())
+                    .expect("a prompt")
+                    .retaining(PromptRetention::Withdraw),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the provider is unreachable");
+        assert_eq!(
+            announced(&frontend),
+            1,
+            "the withdrawal is announced exactly once: {:?}",
+            frontend.events()
         );
     }
 
@@ -2607,7 +2750,7 @@ mod tests {
                     Vec::new(),
                 )
                 .expect("a prompt")
-                .retaining(PromptRetention::WithdrawOnFailure),
+                .retaining(PromptRetention::Withdraw),
                 CancellationToken::new(),
             )
             .await
@@ -2658,7 +2801,7 @@ mod tests {
                     Vec::new(),
                 )
                 .expect("a prompt")
-                .retaining(PromptRetention::WithdrawOnFailure),
+                .retaining(PromptRetention::Withdraw),
                 CancellationToken::new(),
             )
             .await

@@ -337,7 +337,7 @@ impl ScheduledJob {
     /// reasoning is about the completion rather than the claim.
     pub(crate) fn prompt_retention(&self) -> crate::conversation::PromptRetention {
         match self.schedule.is_recurring() {
-            true => crate::conversation::PromptRetention::WithdrawOnFailure,
+            true => crate::conversation::PromptRetention::Withdraw,
             false => crate::conversation::PromptRetention::Keep,
         }
     }
@@ -1764,7 +1764,7 @@ mod tests {
         ] {
             assert_eq!(
                 recurring(schedule).prompt_retention(),
-                crate::conversation::PromptRetention::WithdrawOnFailure,
+                crate::conversation::PromptRetention::Withdraw,
                 "a recurring job regenerates its prompt"
             );
         }

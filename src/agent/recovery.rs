@@ -518,14 +518,15 @@ impl TurnRecovery {
     }
 
     /// Take back a prompt whose turn produced nothing at all, for a caller whose prompt will be
-    /// produced again ([`crate::conversation::PromptRetention::WithdrawOnFailure`]).
+    /// produced again ([`crate::conversation::PromptRetention::Withdraw`]).
     ///
     /// Whether the prompt reached disk decides how. Persisted, it is withdrawn by appending an
     /// [`crate::conversation::Event::Repair`] rather than deleting a row: the log stays
     /// append-only, and the materialized view (what a later turn sends) loses the orphan.
     /// Unpersisted, it has to be dropped from memory instead, because a `Repair` is
     /// position-relative and writing one for an `Append` that never reached disk would, on reload,
-    /// delete whatever message does sit at the end of the stored log.
+    /// delete whatever message does sit at the end of the stored log. Either way the withdrawal is
+    /// announced, for a host whose client has to be told whether its prompt is still there.
     pub(super) async fn withdraw_unanswered_prompt(
         &self,
         agent: &Agent,
@@ -536,14 +537,19 @@ impl TurnRecovery {
             let withdrawal = messages.replace_tail(1, Vec::new());
             if let Err(error) = agent.store.save_event(session_id, &withdrawal).await {
                 tracing::warn!(
-                    "failed to persist the withdrawal of a failed scheduled prompt; it will \
-                     reappear if this session is resumed: {error}"
+                    "failed to persist the withdrawal of an unanswered prompt; it will reappear \
+                     if this session is resumed: {error}"
                 );
             }
         } else {
             // Reached only when a database write failed, which no test here can provoke.
             messages.pop_unsaved();
         }
+        agent
+            .cells
+            .frontend
+            .emit(FrontendEvent::PromptWithdrawn)
+            .await;
     }
 }
 /// How much of the provider's rejection text is carried into the conversation. Long enough to keep

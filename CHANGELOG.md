@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-09-09
+
+### Added
+
+- HTTP turns may withdraw an unanswered message: `options.unanswered_message`, `keep` by default.
+- A failed or canceled HTTP turn carries `message_withdrawn`, whether its message is still there.
+
 ## [0.47.1] - 2026-09-08
 
 ### Changed
@@ -2108,7 +2115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.46.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.48.0...HEAD
+[0.48.0]: https://github.com/k4yt3x/meka/compare/0.47.1...0.48.0
+[0.47.1]: https://github.com/k4yt3x/meka/compare/0.47.0...0.47.1
+[0.47.0]: https://github.com/k4yt3x/meka/compare/0.46.0...0.47.0
 [0.46.0]: https://github.com/k4yt3x/meka/compare/0.45.1...0.46.0
 [0.45.1]: https://github.com/k4yt3x/meka/compare/0.45.0...0.45.1
 [0.45.0]: https://github.com/k4yt3x/meka/compare/0.44.4...0.45.0

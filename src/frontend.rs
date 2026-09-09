@@ -343,6 +343,12 @@ pub(crate) enum FrontendEvent {
     /// The agent finished a turn cleanly. The REPL closes any open streaming text block on this, as
     /// a block boundary; the closing blank belongs to the episode, not to the turn.
     TurnFinished,
+    /// The turn took its own prompt back: it ended before anything from the model reached the
+    /// conversation, and the prompt's retention said to; see
+    /// [`crate::conversation::PromptRetention`]. Emitted from the places a prompt is withdrawn,
+    /// ahead of the host's terminal event, so a client that resends can be told whether the
+    /// conversation still holds the copy it sent.
+    PromptWithdrawn,
     /// A streamed chunk of assistant text. Multiple deltas concatenate into one logical text run;
     /// any non-text event closes the run.
     AssistantTextDelta(String),

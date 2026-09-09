@@ -146,6 +146,12 @@ pub(crate) fn translate(
             // after run_turn returns. This event is used as an internal end-of-stream marker.
             return None;
         }
+        FrontendEvent::PromptWithdrawn => {
+            // Rides the terminal event as `message_withdrawn` rather than being an event of its
+            // own: it is a fact about how the turn ended, and the terminal is where a
+            // client reads those.
+            return None;
+        }
         FrontendEvent::AssistantTextDelta(text) => (
             SseEventType::AssistantTextDelta,
             serde_json::json!({ "text": text }),

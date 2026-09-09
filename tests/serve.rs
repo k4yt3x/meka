@@ -1711,6 +1711,11 @@ fn cancel_during_in_flight_turn_emits_canceled_event() {
         body.contains("\"reason\":\"client\""),
         "cancellation reason must be 'client' when triggered by POST /cancel; body was:\n{body}",
     );
+    // The default retention keeps a canceled prompt, and the terminal says so.
+    assert!(
+        body.contains("\"message_withdrawn\":false"),
+        "turn.canceled must say the prompt was kept; body was:\n{body}",
+    );
 }
 
 /// Process-wide `max_concurrent_turns = 1` rejects the second concurrent turn (across distinct
@@ -3188,6 +3193,48 @@ fn streaming_provider_failure_emits_turn_failed_event() {
     assert!(
         body.contains("\"https://meka.so/errors/provider\""),
         "turn.failed payload must carry the provider error type; body was:\n{body}",
+    );
+    // The default retention keeps the message, and the terminal says so.
+    assert!(
+        body.contains("\"message_withdrawn\":false"),
+        "turn.failed must say the prompt was kept; body was:\n{body}",
+    );
+}
+
+/// The streaming twin of the blocking test: a turn sent with `withdraw` that produces nothing
+/// says on its terminal that the message is gone, which the stream itself cannot tell a client.
+#[test]
+fn a_streaming_failure_says_whether_the_message_was_withdrawn() {
+    let script = serde_json::json!([[{ "type": "fail", "message": "scripted upstream 529" }]]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "go",
+            "stream": true,
+            "options": {"unanswered_message": "withdraw"}
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+    let body = response.text().expect("body");
+    assert!(
+        body.contains("event: turn.failed") && body.contains("\"message_withdrawn\":true"),
+        "turn.failed must say the prompt was withdrawn; body was:\n{body}",
+    );
+    assert!(
+        user_texts(&harness, &id).is_empty(),
+        "and the conversation agrees: {:?}",
+        user_texts(&harness, &id)
     );
 }
 
@@ -8313,7 +8360,7 @@ fn a_session_with_a_running_background_task_is_not_evicted() {
 
 /// A fire that fails keeps the outcome that was riding on it.
 ///
-/// A recurring job asks for `WithdrawOnFailure`, because its next occurrence regenerates the
+/// A recurring job asks for `Withdraw`, because its next occurrence regenerates the
 /// prompt. That stops being true the moment an outcome joins it: the row is stamped delivered
 /// before the turn starts and is never handed out again, so withdrawing the message destroys the
 /// only copy. `retention_carrying` is what notices, and its three call sites were reachable only
@@ -11349,5 +11396,280 @@ fn fork_refuses_a_source_another_process_holds() {
         201,
         "a released source forks: {}",
         forked.text().unwrap_or_default()
+    );
+}
+
+/// Every user message's text in the session, in order, so a test can count how many copies of a
+/// prompt the conversation holds.
+fn user_texts(harness: &ServeTestHarness, id: &str) -> Vec<String> {
+    let body: serde_json::Value = harness
+        .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/messages"))
+        .send()
+        .expect("send")
+        .json()
+        .expect("parse");
+    body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .map(message_text)
+        .collect()
+}
+
+/// A failed turn keeps the message that was sent, as the REPL keeps a prompt whose turn failed:
+/// the person who typed it can see it and expects the agent to have it. A client that resends
+/// instead says so per turn, and then a turn that produced nothing leaves nothing for the resend to
+/// duplicate.
+#[test]
+fn a_failed_turn_keeps_its_message_unless_the_client_says_it_will_resend() {
+    let script = serde_json::json!([
+        [{ "type": "fail", "message": "scripted upstream 502" }],
+        [{ "type": "fail", "message": "scripted upstream 502" }],
+        [
+            { "type": "text", "text": "recovered" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ],
+        [{ "type": "fail", "message": "scripted upstream 502" }]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("send");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let count = |needle: &str| {
+        user_texts(&harness, &id)
+            .iter()
+            .filter(|text| text.contains(needle))
+            .count()
+    };
+
+    // Refused before anything runs, naming what would have been accepted.
+    let refused = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "never sent",
+            "options": {"unanswered_message": "drop"}
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(refused.status().as_u16(), 422);
+    let problem: serde_json::Value = refused.json().expect("parse");
+    assert!(
+        problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("keep, withdraw")),
+        "the refusal lists the accepted values: {problem}"
+    );
+    assert_eq!(count("never sent"), 0);
+
+    // The default: the failed turn's message stays.
+    let kept = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "the kept prompt"}))
+        .send()
+        .expect("send");
+    assert_eq!(kept.status().as_u16(), 502);
+    let kept: serde_json::Value = kept.json().expect("parse");
+    assert_eq!(
+        kept["message_withdrawn"], false,
+        "the failure says the message is still there: {kept}"
+    );
+    assert_eq!(
+        count("the kept prompt"),
+        1,
+        "a failed turn keeps its message by default"
+    );
+
+    // A client that will resend: the failed turn leaves nothing, and the resend is the only copy.
+    let body = serde_json::json!({
+        "message": "the resent prompt",
+        "options": {"unanswered_message": "withdraw"}
+    });
+    let withdrawn = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&body)
+        .send()
+        .expect("send");
+    assert_eq!(withdrawn.status().as_u16(), 502);
+    let withdrawn: serde_json::Value = withdrawn.json().expect("parse");
+    assert_eq!(
+        withdrawn["message_withdrawn"], true,
+        "the failure says the message was taken back: {withdrawn}"
+    );
+    assert_eq!(
+        count("the resent prompt"),
+        0,
+        "the failed turn produced nothing, so its message is withdrawn"
+    );
+    let resent = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&body)
+        .send()
+        .expect("send");
+    assert_eq!(
+        resent.status().as_u16(),
+        200,
+        "resend failed: {}",
+        resent.text().unwrap_or_default()
+    );
+    assert_eq!(
+        count("the resent prompt"),
+        1,
+        "the resend is the only copy: {:?}",
+        user_texts(&harness, &id)
+    );
+    assert_eq!(count("the kept prompt"), 1, "and the kept one is untouched");
+
+    // A later failure on the default reads its own turn, not the withdrawal before it.
+    let later = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "the later prompt"}))
+        .send()
+        .expect("send");
+    assert_eq!(later.status().as_u16(), 502);
+    let later: serde_json::Value = later.json().expect("parse");
+    assert_eq!(
+        later["message_withdrawn"], false,
+        "the fact belongs to the turn that failed: {later}"
+    );
+    assert_eq!(count("the later prompt"), 1);
+}
+
+/// `withdraw` is about what reached the conversation, not about how the turn ended: text that
+/// landed keeps the message ahead of it when the turn then fails, and a cancel that landed nothing
+/// takes the message back. The terminal says which, both ways.
+#[test]
+fn withdraw_keeps_a_message_once_text_landed_and_takes_it_back_on_a_cancel() {
+    let script = serde_json::json!([
+        [
+            { "type": "text", "text": "partial " },
+            { "type": "fail", "message": "scripted upstream 529" }
+        ],
+        [
+            { "type": "sleep", "ms": 2000 },
+            { "type": "text", "text": "should never reach client" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let count = |needle: &str| {
+        user_texts(&harness, &id)
+            .iter()
+            .filter(|text| text.contains(needle))
+            .count()
+    };
+
+    let failed = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "answered in part",
+            "stream": true,
+            "options": {"unanswered_message": "withdraw"}
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(failed.status(), 200);
+    let body = failed.text().expect("body");
+    assert!(
+        body.contains("event: turn.failed") && body.contains("\"message_withdrawn\":false"),
+        "text landed, so the message stays and the terminal says so; body was:\n{body}",
+    );
+    assert_eq!(count("answered in part"), 1);
+
+    let base_url = harness.base_url.clone();
+    let token = harness.token.clone();
+    let id_clone = id.clone();
+    let streaming = std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("client");
+        client
+            .post(format!("{base_url}/v1/sessions/{id_clone}/turn"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&serde_json::json!({
+                "message": "never answered",
+                "stream": true,
+                "options": {"unanswered_message": "withdraw"}
+            }))
+            .send()
+            .expect("stream send")
+    });
+    harness.wait_until_in_flight(&id);
+    let cancel = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/cancel"))
+        .send()
+        .expect("cancel");
+    assert_eq!(cancel.status(), 204);
+    let body = streaming.join().expect("join").text().expect("body");
+    assert!(
+        body.contains("event: turn.canceled") && body.contains("\"message_withdrawn\":true"),
+        "nothing landed before the cancel, so the message is taken back; body was:\n{body}",
+    );
+    assert_eq!(
+        count("never answered"),
+        0,
+        "and the conversation agrees: {:?}",
+        user_texts(&harness, &id)
+    );
+}
+
+/// A turn refused before it began never added its message, so its failure says nothing about one:
+/// the member is absent rather than a `false` that would read as "still there".
+#[test]
+fn a_turn_refused_before_it_began_says_nothing_about_its_message() {
+    let prelude = r#"[[mcp.servers]]
+name = "absent"
+transport = "stdio"
+command = "/nonexistent/meka-test-mcp-server"
+required = true
+
+[mcp]
+grace = "0s"
+"#;
+    let harness = ServeTestHarness::spawn_with_prelude(prelude, "", mock_simple_turn());
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let refused = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({
+            "message": "never began",
+            "options": {"unanswered_message": "withdraw"}
+        }))
+        .send()
+        .expect("send");
+    assert_eq!(refused.status().as_u16(), 503);
+    let problem: serde_json::Value = refused.json().expect("parse");
+    assert_eq!(problem["type"], "https://meka.so/errors/mcp-unavailable");
+    assert!(
+        problem.get("message_withdrawn").is_none(),
+        "a turn that never began has no message to report on: {problem}"
+    );
+    assert!(
+        user_texts(&harness, &id).is_empty(),
+        "and nothing was added: {:?}",
+        user_texts(&harness, &id)
     );
 }

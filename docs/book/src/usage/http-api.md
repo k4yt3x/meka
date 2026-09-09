@@ -314,7 +314,7 @@ POST   /v1/sessions/{id}/cancel   Cancel an in-flight turn
 
 **One turn at a time per session.** A second `POST /turn` while another is running returns `409 Conflict`. Across sessions, turns run fully concurrently.
 
-The turn request body accepts four fields:
+The turn request body accepts five fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -322,6 +322,7 @@ The turn request body accepts four fields:
 | `images` | array | `[]` | Image attachments; see [Image attachments](#image-attachments) |
 | `stream` | bool | `false` | `false` → single JSON response; `true` → SSE stream |
 | `options.skill` | string \| null | `null` | When set, activates the named [skill](./skills.md) for this turn (equivalent to `/skill <name>` in the REPL). With an empty `message` the skill body runs alone, as `--skill` does; a turn with no text, no image and no skill is a `422` |
+| `options.unanswered_message` | string | `keep` | What becomes of `message` if the turn ends, failed or canceled, before anything from the model reached the conversation. `keep` leaves it in place, as the REPL does with a typed prompt. `withdraw` takes it back, for a client that resends a failed turn; see [Resending a failed turn](#resending-a-failed-turn) |
 
 ### Image attachments
 
@@ -354,11 +355,11 @@ curl -s -X POST http://localhost:8080/v1/sessions/$SESSION_ID/turn \
 
 ### Detecting a rewritten history
 
-`GET /messages` returns the *materialized* view: what the model can currently see. Four things rewrite it rather than appending to it (compaction, `POST /rewind`, a mid-turn repair of a malformed request, and the redaction of an image that no longer fit the request size budget), and after any of them your copy is no longer a prefix of the server's.
+`GET /messages` returns the *materialized* view: what the model can currently see. Five things rewrite it rather than appending to it (compaction, `POST /rewind`, a mid-turn repair of a malformed request, the redaction of an image that no longer fit the request size budget, and the withdrawal of a prompt whose turn produced nothing, for a recurring job or a turn sent with `options.unanswered_message` set to `withdraw`), and after any of them your copy is no longer a prefix of the server's.
 
 Two signals cover this:
 
-- **`revision`** on the response increments on every rewrite. If it changed since your last poll, re-fetch rather than diff. This is the one to key on, because it covers all four causes.
+- **`revision`** on the response increments on every rewrite. If it changed since your last poll, re-fetch rather than diff. This is the one to key on, because it covers all five causes.
 - **`compaction`** on a message identifies a summary and says how many messages it replaced and which compaction it was. Only compaction leaves a message behind to carry it; a rewind removes messages with nothing in their place, which is why `revision` exists.
 
 `total` alone is not enough: a shrinking `total` is indistinguishable from the server losing your conversation.
@@ -470,10 +471,10 @@ With `stream: true`, the response is a `text/event-stream`. Every event has a mo
 |-------|---------|------|
 | `turn.started` | `turn_id`, `session_id`, `started_at` | Turn begins |
 | `turn.finished` | `turn_id`, `session_id`, `stop_reason`, `usage`, optional `refusal_text` | Turn completed successfully |
-| `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape) | Turn failed mid-stream |
-| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, or `"sse_lag"` when the only consumer fell behind and the turn was stopped for it) | Turn was canceled |
+| `turn.failed` | `turn_id`, `session_id`, `error` (Problem Detail shape), `message_withdrawn` when the turn began | Turn failed mid-stream |
+| `turn.canceled` | `turn_id`, `session_id`, `reason` (`"client"`, `"server_shutdown"`, or `"sse_lag"` when the only consumer fell behind and the turn was stopped for it), `message_withdrawn` when the turn began | Turn was canceled |
 
-`turn.finished`, `turn.failed`, and `turn.canceled` are **terminal**; the connection closes immediately after. Every terminal carries `turn_id` and `session_id`, so a client holding several streams can file it without keeping per-connection state.
+`turn.finished`, `turn.failed`, and `turn.canceled` are **terminal**; the connection closes immediately after. Every terminal carries `turn_id` and `session_id`, so a client holding several streams can file it without keeping per-connection state. `turn.failed` and `turn.canceled` also carry `message_withdrawn` when the turn began, whether it took the message it was sent back out of the conversation; see [Resending a failed turn](#resending-a-failed-turn).
 
 #### Content deltas
 
@@ -524,7 +525,7 @@ A `: keep-alive` comment is sent every 20 seconds. SSE clients ignore these auto
 
 The server buffers up to 256 events per SSE stream. If a consumer reads too slowly and falls behind, the server closes that consumer's stream, and what it sends first depends on whether anyone else was still reading:
 
-- **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.so/errors/sse-lag`. The outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"`. Retry by submitting a new turn.
+- **Nobody else was reading.** The turn is canceled to stop burning provider tokens, and the stream ends with a terminal `turn.failed` carrying error type `https://meka.so/errors/sse-lag`. That event is the stream's, sent before the turn has unwound, so it carries no `message_withdrawn`; the outcome recorded for a later re-attach is a `turn.canceled` with `reason: "sse_lag"` and does. Retry by submitting a new turn.
 - **Another consumer was keeping up.** The turn keeps running for them, so nothing has failed. The lagging stream ends with a `warn` `notice` explaining the drop (the usual `level` and `text`, plus `turn_id` and `session_id`) and closes. **Re-attach with `Last-Event-ID`** rather than retrying: the turn is still in flight, so a new turn would be refused with `409 turn-in-flight`, and re-attaching recovers the dropped events instead of redoing the work.
 
 Turn events are broadcast, so a re-attached client or a second consumer counts as a separate reader. Use `GET /messages` to inspect what the agent completed either way.
@@ -719,7 +720,7 @@ If the same key is replayed, the server returns the cached response. If the same
 
 Keys are scoped per-token **and per-session**, and expire after 24 hours. The session is part of the scope because an `Idempotency-Key` names *your* unit of work: sending the same key to two sessions is a reasonable thing to do, and it now runs both turns instead of answering the second with the first's transcript.
 
-A turn that was canceled is not cached, so the retry the cancellation invites can actually run. Neither is a 5xx, for the same reason.
+A turn that was canceled is not cached, so the retry the cancellation invites can actually run. Neither is a 5xx, for the same reason. Either retry re-executes the turn, and unless the turn was sent with `options.unanswered_message` set to `withdraw` it runs above the message the failed one left behind; see [Resending a failed turn](#resending-a-failed-turn).
 
 The cache is bounded per token by both entry count and total bytes; a response too large to keep is not cached, and its retry re-executes.
 
@@ -764,6 +765,8 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 >
 > **`provider_response` is readable at `sessions:r`.** Submitting a turn takes `sessions:w`, but the failure also rides the terminal `turn.failed` event, which `GET /v1/sessions/{id}/stream` replays to any reader. Since an upstream refusal can name the *operator's* account with the provider and its rate-limit posture, set `[serve] relay_provider_errors = false` where read-only tokens go to people who may watch a session but are not entitled to the account behind it.
 >
+> A turn that failed or was canceled after it began carries `message_withdrawn`, whether the message it was sent is still in the conversation. It is `true` only for a turn sent with `options.unanswered_message` set to `withdraw` that ended before anything from the model reached the conversation. A turn refused before it began, such as the `503` for a required MCP server, never added the message and carries no such member; see [Resending a failed turn](#resending-a-failed-turn).
+>
 > The `503` a turn gets when a required MCP server is down is not covered by that key and never relays: the server names travel, the connector's reason does not, since it is meka's own subprocess text and has carried a command line and its path. The endpoints under `/v1/mcp` do relay their reason, since a caller naming one server and asking why it will not connect is asking *for* it.
 >
 > **An installation fault is a `500`, not a `422`.** A `[web]` client meka cannot build from its `proxy` or `ca_cert_file`, or a `base_url` shape a backend refuses, is the operator's to fix and names a path or an endpoint out of their `config.toml`; the body says only "internal server error; consult server logs" and the sentence goes to the log. The common case does not reach a request at all: the web client is built at startup, so a server with a bad `[web]` block fails to start rather than answering turns.
@@ -799,7 +802,7 @@ The `type` URI is the stable, machine-readable error code. Route error handling 
 
 Streaming turns that fail mid-stream emit a `turn.failed` SSE event with the same error shape, then close the connection.
 
-> The three 502s are the ones worth branching on. `/errors/provider-unavailable` is the positive signal: meka's classifier recognized the failure as transient, which covers an overload, a 5xx, a dropped connection and a stalled stream. Resend it after a pause. `/errors/context-overflow` is the flat refusal: the request no longer fits and will not fit next time either, so retrying it unchanged loops until your client gives up; shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
+> The three 502s are the ones worth branching on. `/errors/provider-unavailable` is the positive signal: meka's classifier recognized the failure as transient, which covers an overload, a 5xx, a dropped connection and a stalled stream. Resend it after a pause; [Resending a failed turn](#resending-a-failed-turn) says what the failed turn leaves behind. `/errors/context-overflow` is the flat refusal: the request no longer fits and will not fit next time either, so retrying it unchanged loops until your client gives up; shorten the conversation with `POST /v1/sessions/{id}/compact` or send less.
 >
 > **`/errors/provider` is the absence of the first signal, not the opposite of it.** It is a catch-all covering everything meka could not place, so a revoked credential lands there and so does a 408, a truncated response body, and any mid-stream error type meka does not yet recognize. Most of the time it is permanent and worth surfacing to a human rather than retrying, but do not build a client that will *never* retry it: one unhurried resend is reasonable, an unbounded loop is not.
 >
@@ -808,6 +811,32 @@ Streaming turns that fail mid-stream emit a `turn.failed` SSE event with the sam
 > Neither provider type says how many attempts meka made first. It declines to retry at all once any output has reached the stream or its retry budget is spent, and a canceled turn abandons the sequence wherever it stands, so one of these can reach you after three attempts or after none. `/errors/provider-unavailable` claims a failure class, not that your next attempt will succeed.
 >
 > A `Retry-After` on a `/errors/provider-unavailable` response is the upstream's own, relayed up to an hour. Honor it in preference to your own backoff. The other two never carry one.
+
+### Resending a failed turn
+
+A failed turn keeps the message you sent, in the conversation and on disk. That is the REPL's
+behavior too: the person who typed the prompt can see it and expects the agent to have it, and a
+turn that got as far as a partial answer or a tool call has work behind it that refers to the
+message. For a client that answers a `502` by resending the same message it is the wrong default,
+because the resend appends a second copy of the message after the first, and the model is then shown
+the same request twice with nothing between them for the life of the session.
+
+Say so instead. A turn sent with `options.unanswered_message` set to `withdraw` takes its message
+back when the turn ends, failed or canceled, before anything from the model reached the
+conversation, so the resend is the only copy. A turn that got a partial answer or a tool call into
+the conversation keeps its message either way, so a resend after one is a new turn rather than a
+replay. Send the option on every turn you would resend; it is per turn, not per session, and it
+never touches a background outcome that was riding on the message, whose row is already spent.
+
+The response says which happened. A turn that failed or was canceled after it began carries
+`message_withdrawn`, in the Problem Detail body of a blocking turn and on the `turn.failed` and
+`turn.canceled` events of a streaming one. Branch on it rather than on what you saw arrive: thinking
+and a half-composed tool call both look like output on the stream, and neither reaches the
+conversation, while a completed reply of nothing but thinking does and is invisible to a blocking
+client. `true` means the conversation no longer holds the message and your resend will be the only
+copy. `false` means it does, and a resend appends a second one after whatever the turn produced. A
+turn refused before it began, such as the `503` for a required MCP server or any `4xx`, never added
+the message and carries no `message_withdrawn`; a resend is the first copy.
 
 ## Discovery endpoints
 

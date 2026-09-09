@@ -1034,22 +1034,88 @@ impl Message {
     }
 }
 
-/// What becomes of a turn's prompt when the turn fails before the model ever saw it.
+/// What becomes of a turn's prompt when the turn ends, failed or canceled, before the model
+/// produced anything.
 ///
 /// The prompt is persisted eagerly, before the first provider call, so a crash mid-roundtrip cannot
 /// lose it. That is right when losing it would be losing something, and wrong when the prompt will
-/// simply be produced again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// simply be produced again. Whoever submits the turn knows which, so each host states it through
+/// `TurnInput::retaining`: the scheduler per job, the HTTP API from the client's own request.
+///
+/// One spelling per value, [`Self::name`], is what `Display`, `FromStr` and serde all go through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub(crate) enum PromptRetention {
     /// Keep it. A human typed it and can see the error, or it carries something that exists nowhere
     /// else: a background-task outcome, whose row is stamped `delivered` before the turn starts
-    /// and is never handed out again.
+    /// and is never handed out again, or a one-shot job's fire, whose row is retired with the turn.
+    #[default]
     Keep,
-    /// Withdraw it. A scheduled job's prompt is regenerated from the job on its next occurrence,
-    /// and the fire that delivers it says how many were missed, so the failed copy carries
-    /// nothing. Left in place, a provider outage would deposit one unanswered user message per
-    /// fire for as long as the outage lasted.
-    WithdrawOnFailure,
+    /// Withdraw it, because whoever produced it will produce it again: a recurring job on its next
+    /// occurrence, whose fire says how many were missed, or a client that resends a failed turn and
+    /// said so. Left in place, an outage would deposit one unanswered user message per attempt for
+    /// as long as it lasted.
+    Withdraw,
+}
+
+impl PromptRetention {
+    /// Every value, in the order a refusal lists them.
+    pub(crate) const ALL: [PromptRetention; 2] = [Self::Keep, Self::Withdraw];
+
+    /// The one spelling of this value: what the HTTP turn request takes.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Withdraw => "withdraw",
+        }
+    }
+
+    /// The names, joined for a refusal that lists what would have been accepted.
+    fn supported() -> String {
+        Self::ALL
+            .iter()
+            .map(|retention| retention.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for PromptRetention {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for PromptRetention {
+    type Err = String;
+
+    /// Refuses with the names that would have been accepted.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|retention| retention.name() == value)
+            .ok_or_else(|| {
+                format!(
+                    "'{value}' is not a prompt retention. Supported: {}",
+                    Self::supported()
+                )
+            })
+    }
+}
+
+impl TryFrom<String> for PromptRetention {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<PromptRetention> for String {
+    fn from(retention: PromptRetention) -> Self {
+        retention.name().to_string()
+    }
 }
 /// The whole event log as the Markdown `meka session export` writes, compactions and repairs
 /// marked in place.
@@ -2387,5 +2453,37 @@ mod tests {
         log.sanitize_orphans();
         assert_eq!(log.len(), 1);
         assert_eq!(log.as_slice()[0].text_content(), "[summary]");
+    }
+
+    /// One spelling per retention on every surface: `name()` round-trips through `FromStr`,
+    /// `Display` and serde, and anything else is refused naming what would have been accepted.
+    #[test]
+    fn every_retention_round_trips_through_its_one_spelling_and_no_other() {
+        for retention in PromptRetention::ALL {
+            assert_eq!(retention.name().parse::<PromptRetention>(), Ok(retention));
+            assert_eq!(retention.to_string(), retention.name());
+            let json = serde_json::to_string(&retention).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", retention.name()));
+            assert_eq!(
+                serde_json::from_str::<PromptRetention>(&json).expect("deserialize"),
+                retention
+            );
+            assert!(
+                retention
+                    .name()
+                    .to_uppercase()
+                    .parse::<PromptRetention>()
+                    .is_err(),
+                "{} must be the only spelling of {retention}",
+                retention.name()
+            );
+        }
+        let refusal = "drop"
+            .parse::<PromptRetention>()
+            .expect_err("not a retention");
+        assert!(
+            refusal.contains("keep, withdraw"),
+            "the refusal lists what would have been accepted: {refusal}"
+        );
     }
 }

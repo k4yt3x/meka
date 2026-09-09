@@ -94,7 +94,8 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
    anything is in flight. The REPL and the one-shot drive one session from one thread, so they
    sample `cancel.admit()` themselves and take the conversation lock.
 2. **Input.** The host builds a `TurnInput`: the typed prompt or the outcomes it carries, images,
-   and the retention flag. `TurnInput::from_parts` is the empty-prompt rule, raising
+   and the retention, which the scheduler sets per job and the HTTP turn takes from the request.
+   `TurnInput::from_parts` is the empty-prompt rule, raising
    `MekaError::EmptyPrompt` before admission.
 3. **The loop.** `Agent::run_turn` appends one user message of two blocks: a `TurnContext` block
    holding everything meka injected (permission and environment context, todos, world state, budget,
