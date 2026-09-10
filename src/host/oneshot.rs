@@ -178,13 +178,6 @@ pub(crate) async fn run_oneshot(
     // row it lands on may be one the console intends to erase; giving the relay this handle is what
     // lets a mid-turn `warn!` settle that row first instead of being wiped with it.
     crate::relay::RELAY.install_console(&console);
-    with_console(&console, |console| {
-        console.open_episode(
-            crate::console::RowState::Empty,
-            crate::console::Neighbor::Shell,
-        )
-    });
-    let _last_episode = LastEpisode(Arc::clone(&console));
     // `--format json` records the turn instead of rendering it: stdout carries one object at the
     // end and nothing before it, so `meka -p … --format json | jq` sees only the object.
     let json_frontend = matches!(
@@ -227,7 +220,14 @@ pub(crate) async fn run_oneshot(
         repin,
         permission_to_record,
         cwd: recorded_cwd,
+        follows,
     } = resolve_session_resume(&store, &config, &console).await?;
+    // The run's one episode, opened after the resume for the reason the REPL's first is: what it
+    // follows is the banner when one printed.
+    with_console(&console, |console| {
+        console.open_episode(crate::console::RowState::Empty, follows)
+    });
+    let _last_episode = LastEpisode(Arc::clone(&console));
     // After the resume, whose lock is what spares the session this run was asked for.
     sweep_expired_sessions(&config, &store).await?;
 

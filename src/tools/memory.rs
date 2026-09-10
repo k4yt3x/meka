@@ -1516,8 +1516,8 @@ mod tests {
         };
 
         let cases = [
-            ("low", -5, memory::MIN_PRIORITY),
-            ("high", 99, memory::MAX_PRIORITY),
+            ("low", -5, crate::entry::MIN_PRIORITY),
+            ("high", 99, crate::entry::MAX_PRIORITY),
             ("mid", 3, 3),
         ];
         for (name, given, _) in cases {

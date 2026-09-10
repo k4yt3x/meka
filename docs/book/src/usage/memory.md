@@ -54,7 +54,7 @@ The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself,
 
 Within one priority band, the most recently *recorded* memory sorts first, so a fresh note never displaces a standing rule just for being new.
 
-Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. `meka memory list` prints the distribution so you can see that happening and rebalance. Search ranking compensates for the same drift from the other side: see [Search](#search).
+Because the agent picks a priority at write time and everything feels important then, priorities tend to drift downward over a long-lived instance. The Priority column of `meka memory list` shows that happening so you can rebalance. Search ranking compensates for the same drift from the other side: see [Search](#search).
 
 **Priority 0 is the always-in-context tier.** A priority-0 memory has its *body* rendered into the per-turn context in full, not just its description, because for a standing directive the body is the directive and leaving it behind a tool call means the agent has to look the rule up before it can follow it. The band is budgeted separately from the index (4 KiB in total, 1,024 characters per memory) so a long directive cannot crowd out the index and the index cannot crowd out the directives. Priority 1 is still "standing" for ranking purposes, but is listed by description like everything else.
 
@@ -145,7 +145,7 @@ What belongs in memory: who someone is and how they prefer to work, guidance you
 ## CLI
 
 ```bash
-meka memory list                                    # index order, plus the priority distribution
+meka memory list                                    # index order
 meka memory get k4yt3x-prefers-terse-replies        # every stored field
 meka memory show k4yt3x-prefers-terse-replies       # the body
 meka memory list --format json                      # {"memories": [...]}; get and show print one object
@@ -169,9 +169,9 @@ meka memory export --dir ~/backup/memory            # one Markdown file per memo
 | `--from-file <PATH>` | Read the body from this file instead of `--body`. |
 | `--force` | Update an existing memory instead of refusing; whatever is not mentioned is kept. |
 
-In the REPL, `/memory` lists what is saved and `/memory <name>` prints one memory's body. The listing is the table alone; the priority distribution is reserved for `meka memory list`, where you have gone looking for it.
+In the REPL, `/memory` lists what is saved and `/memory <name>` prints one memory's body.
 
-`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `tags`, `recorded_at`, `updated_at` as RFC 3339) plus `read_count`; `show` adds `body` as stored, and `list` and `get` leave it out. The distribution is not printed under `json`, since a script can derive it.
+`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `tags`, `recorded_at`, `updated_at` as RFC 3339) plus `read_count`; `show` adds `body` as stored, and `list` and `get` leave it out.
 
 `meka memory edit` opens the **body** only. Metadata goes through `meka memory add <name> --force --description ...`, which keeps whatever it does not mention.
 

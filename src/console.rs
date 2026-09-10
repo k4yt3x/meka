@@ -50,10 +50,12 @@ pub(crate) enum RowState {
 
 /// Which prompt an episode borders, on the side in question.
 ///
-/// The two `[display]` blanks space an episode away from *meka's* prompt. The first episode of a
-/// run has the shell's prompt above it and the last has it below, and a shell lays out its own
-/// prompt: a blank spent against one is a blank meka adds to somebody else's terminal, above
-/// `Continuing session:` on the way in and below `Leaving session:` on the way out.
+/// The two `[display]` blanks space an episode away from *meka's* prompt, and a shell lays out its
+/// own, so a blank spent against the shell's prompt is one meka adds to somebody else's terminal:
+/// the last episode of a run closes against `Shell` and prints nothing below `Leaving session:`. On
+/// the way in, the `Resuming session:` banner prints before the first episode opens and stands in
+/// for the line you typed, so a run that shows it opens against `Prompt`, and one that hides it, or
+/// resumed nothing, opens against `Shell` with the shell's own command line above.
 ///
 /// Like [`Spacing`], and for the same reason, this gates *printing* and nothing else. Declining to
 /// arm the opening blank looks equivalent and is not: `printed` is set when that blank is spent,
@@ -831,25 +833,43 @@ mod tests {
         assert!(!after[2].before_prompt_blank);
     }
 
-    /// The run's outer edges border the shell's prompt, and a shell lays out its own. Both blanks
-    /// were spent against it anyway: one above `Continuing session:` on the way in, and one below
-    /// `Leaving session:` on the way out, where meka draws nothing further.
+    /// The run's outer edges border the shell's prompt, and a shell lays out its own. On the way
+    /// out the last episode closes against it and prints nothing below `Leaving session:`. On the
+    /// way in the `Resuming session:` banner prints before any episode opens, so nothing is owed
+    /// above it, and the episode then opens against the banner as against a typed line; with the
+    /// banner hidden it opens against the shell and its first output gets no blank.
     #[test]
     fn the_shell_s_prompt_gets_neither_bracket() {
         let first = run(BOTH, &[
-            Action::OpenEpisode(RowState::Empty, Neighbor::Shell),
             Action::Block(BlockKind::Chrome),
+            Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),
+            Action::AnnounceForeign,
+            Action::CloseEpisode(Neighbor::Prompt),
+        ]);
+        assert_eq!(
+            blanks(&first[0]),
+            0,
+            "the resume banner prints before any episode opens, so nothing is owed above it",
+        );
+        assert!(
+            first[2].after_prompt_blank,
+            "the replay is spaced from the banner as from a typed line",
+        );
+        assert!(
+            first[3].before_prompt_blank,
+            "and the first prompt is bracketed like every later one",
+        );
+
+        let hidden = run(BOTH, &[
+            Action::OpenEpisode(RowState::Empty, Neighbor::Shell),
+            Action::AnnounceForeign,
             Action::CloseEpisode(Neighbor::Prompt),
         ]);
         assert!(
-            !first[1].after_prompt_blank,
-            "the resume banner has no typed line above it to be spaced from",
+            !hidden[1].after_prompt_blank,
+            "with the banner hidden, the replay is meka's first word under the shell's command line",
         );
-        assert!(
-            first[2].before_prompt_blank,
-            "and the first prompt is bracketed like every later one: the banner still records \
-             that the episode printed, it just prints no blank above itself",
-        );
+        assert!(hidden[2].before_prompt_blank);
 
         let last = run(BOTH, &[
             Action::OpenEpisode(RowState::Empty, Neighbor::Prompt),

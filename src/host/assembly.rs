@@ -556,6 +556,9 @@ pub(crate) struct ResumedSession {
     /// the deliberate exception, because its client passes an authoritative project root per
     /// request.
     pub(crate) cwd: Option<std::path::PathBuf>,
+    /// What the caller's first episode opens against: the resume banner, printed above and
+    /// standing in for the line you typed, or the shell's prompt when none was.
+    pub(crate) follows: crate::console::Neighbor,
 }
 pub(crate) async fn resolve_session_resume(
     store: &Store,
@@ -574,6 +577,7 @@ pub(crate) async fn resolve_session_resume(
         repin: None,
         // Nor a directory to reopen: a fresh session starts where the shell is, and records that.
         cwd: None,
+        follows: crate::console::Neighbor::Shell,
     };
     let resolved = match &config.request.session_resume {
         None => return Ok(fresh()),
@@ -631,9 +635,17 @@ pub(crate) async fn resolve_session_resume(
         .requested_permission
         .filter(|requested| recorded.permission != Some(*requested));
 
-    with_console(console, |console| {
-        console.session_id("Continuing session", &id.to_string())
-    });
+    // Printed before the caller opens its first episode, because the banner is what that episode
+    // follows: it stands in for the line you typed, and the blank below it is the one that would
+    // have followed a typed line.
+    let follows = if config.show_session_id_on_resume {
+        with_console(console, |console| {
+            console.session_id("Resuming session", &id.to_string())
+        });
+        crate::console::Neighbor::Prompt
+    } else {
+        crate::console::Neighbor::Shell
+    };
     let messages = hydrate_conversation(store, id).await?;
     Ok(ResumedSession {
         session_id: Some(id),
@@ -645,6 +657,7 @@ pub(crate) async fn resolve_session_resume(
         permission_to_record,
         // Read off the row already loaded above, not fetched again.
         cwd: recorded.cwd,
+        follows,
     })
 }
 /// Record where `/cd` moved the session, so the row keeps saying where the session is.

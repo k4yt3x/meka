@@ -695,6 +695,12 @@ Whether to display the session id when a new session is created.
 
 Default: `false`
 
+### `display.show_session_id_on_resume`
+
+Whether to display the session id when a session is resumed with `-c` or `-r`.
+
+Default: `true`
+
 ### `display.show_session_id_on_exit`
 
 Whether to display the session id when meka exits.
@@ -704,6 +710,7 @@ Default: `true`
 ```toml
 [display]
 show_session_id_on_create = true
+show_session_id_on_resume = false
 show_session_id_on_exit = false
 ```
 
@@ -727,7 +734,7 @@ Default: `true`
 
 ### `display.newline_after_prompt`
 
-Whether to add a blank line after the line you typed, before its output. On a resume there is no typed line: the `Continuing session:` banner takes its place, and this is the blank between that banner and the replayed history.
+Whether to add a blank line after the line you typed, before its output. On a resume there is no typed line: the `Resuming session:` banner takes its place, and this is the blank between that banner and whatever follows it, normally the replayed history. With the banner hidden, the history sits directly under your shell's command line.
 
 Default: `true`
 
@@ -739,7 +746,7 @@ never twice because two things both thought they owned the spacing.
 
 Both space output away from *meka's* prompt, so neither applies at the edges of a run, where the
 prompt is your shell's. Whatever meka prints before drawing its first prompt sits directly under the
-command you typed (`Continuing session:` on a resume, or the answer to a prompt you passed on the
+command you typed (`Resuming session:` on a resume, or the answer to a prompt you passed on the
 command line), and its last line is followed straight by the shell prompt. Start meka with no
 prompt and there is nothing above its first prompt to space away from, so the rule never comes up.
 

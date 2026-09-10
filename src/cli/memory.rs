@@ -27,39 +27,21 @@ pub(crate) struct AddArgs<'a> {
     pub(crate) force: bool,
 }
 
-/// Whether a listing ends with the priority histogram.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ListDetail {
-    /// `meka memory list`: the table plus the distribution.
-    WithDistribution,
-    /// `/memory`: the table alone. A mid-session glance is asking "what do I have saved", and a
-    /// histogram of a handful of entries is noise around the answer.
-    TableOnly,
-}
-
-/// A table of every memory in index order, optionally followed by the priority distribution.
-///
-/// The distribution is half the point of `meka memory list`. The agent picks a priority at write
-/// time and everything feels important then, so priorities drift downward (toward 0) over a
-/// long-lived instance until the index stops ranking anything. Printing the histogram makes that
-/// drift something you can see and rebalance rather than something you discover when the index
-/// stops being useful. That is a deliberate inspection, though, not what `/memory` is for.
-pub(crate) async fn run_list(store: &MemoryStore, detail: ListDetail) -> Result<()> {
+/// A table of every memory in index order, as the REPL's `/memory` prints it: plain, on stderr.
+pub(crate) async fn run_list(store: &MemoryStore) -> Result<()> {
     list(
         store,
-        detail,
         crate::cli::OutputFormat::Plain,
         crate::render::Stream::Stderr,
     )
     .await
 }
 
-/// [`run_list`] under a chosen format. The REPL's `/memory` has no format flag and takes the door
-/// above; `--format json` prints `{"memories": [...]}`, the shape `GET /v1/memory` answers with,
-/// and nothing on stderr, since the distribution is commentary a script can derive.
+/// [`run_list`] under a chosen format and stream. The REPL's `/memory` has no format flag and
+/// takes the door above; `--format json` prints `{"memories": [...]}`, the shape `GET /v1/memory`
+/// answers with.
 pub(crate) async fn list(
     store: &MemoryStore,
-    detail: ListDetail,
     format: crate::cli::OutputFormat,
     stream: crate::render::Stream,
 ) -> Result<()> {
@@ -98,25 +80,6 @@ pub(crate) async fn list(
         &["Name", "Priority", "Recorded", "Tags", "Description"],
         &rows,
     ))?;
-
-    // On stderr: the table is the data the command was invoked for, and the summary under it is
-    // commentary, so `meka memory list 2>/dev/null | awk` gets the table alone.
-    if detail == ListDetail::WithDistribution {
-        crate::streams::write_stderr_line("");
-        crate::streams::write_stderr_line(format!(
-            "{} memories. Priority distribution:",
-            index.len()
-        ));
-        for priority in memory::MIN_PRIORITY..=memory::MAX_PRIORITY {
-            let count = index
-                .iter()
-                .filter(|entry| entry.priority == priority)
-                .count();
-            if count > 0 {
-                crate::streams::write_stderr_line(format!("  p{priority}: {count}"));
-            }
-        }
-    }
 
     Ok(())
 }
@@ -753,13 +716,7 @@ pub(crate) async fn run_memory_subcommand(
     let store = store.memory_store(true);
     match action {
         crate::cli::MemoryAction::List { format } => {
-            crate::cli::memory::list(
-                &store,
-                crate::cli::memory::ListDetail::WithDistribution,
-                *format,
-                crate::render::Stream::Stdout,
-            )
-            .await?
+            crate::cli::memory::list(&store, *format, crate::render::Stream::Stdout).await?
         }
         crate::cli::MemoryAction::Get { name, format } => {
             crate::cli::memory::run_get(&store, name, *format).await?

@@ -399,12 +399,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             }
         }
         SlashCommand::MemoryList => {
-            if let Err(error) = crate::cli::memory::run_list(
-                &store.memory_store(true),
-                crate::cli::memory::ListDetail::TableOnly,
-            )
-            .await
-            {
+            if let Err(error) = crate::cli::memory::run_list(&store.memory_store(true)).await {
                 with_console(console, |console| console.error(&error));
             }
         }
@@ -589,9 +584,12 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             // `[display]` blank lines bracketing an empty region. `/history 0` asks
             // for nothing and gets the neutral wording: there may well be a
             // conversation, it just wasn't what was asked for.
+            // Announced above with every other host-answered command, so nothing is owed at the
+            // first row.
             if !render::render_message_history(
                 slice,
                 &crate::host::terminal::history_render_options(config),
+                || {},
             ) {
                 if materialized.is_empty() {
                     crate::streams::write_stderr_line("No conversation history yet.");

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-09-10
+
+### Added
+
+- `[display].show_session_id_on_resume = false` hides the banner a resumed session prints.
+
+### Changed
+
+- A resumed session announces itself as `Resuming session:` rather than `Continuing session:`.
+
+### Removed
+
+- The priority distribution `meka memory list` printed under its table.
+
 ## [0.48.0] - 2026-09-09
 
 ### Added
@@ -2116,7 +2130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.48.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.49.0...HEAD
+[0.49.0]: https://github.com/k4yt3x/meka/compare/0.48.0...0.49.0
 [0.48.0]: https://github.com/k4yt3x/meka/compare/0.47.1...0.48.0
 [0.47.1]: https://github.com/k4yt3x/meka/compare/0.47.0...0.47.1
 [0.47.0]: https://github.com/k4yt3x/meka/compare/0.46.0...0.47.0

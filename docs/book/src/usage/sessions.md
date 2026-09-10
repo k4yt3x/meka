@@ -5,8 +5,7 @@ Sessions persist your conversation so you can resume later. Each session has an 
 ## How sessions work
 
 - A session is **not** created when meka starts. It is created lazily when you send the first message.
-- When a session is created, its id is printed to stderr.
-- When you exit meka (Ctrl+D), the session id is printed again so you can note it for later.
+- Its id is printed to stderr when it is created, resumed and left, so you can note it for later. Each banner has a switch under [`[display]`](../configuration/config-file.md#displayshow_session_id_on_create); the creation banner is off by default.
 - Sessions include the full conversation: your inputs, the agent's responses, and tool call results.
 
 ## Resuming a session

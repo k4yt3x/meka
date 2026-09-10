@@ -584,10 +584,10 @@ impl Ranking {
 
     /// What the agent has since *done* with it. Spans `1.0 ..= 2.0`.
     ///
-    /// The counterweight to a priority chosen once and never revised. `meka memory list`'s
-    /// distribution exists because priorities drift toward 0 over a long-lived instance until the
-    /// index stops ranking anything; a memory opened forty times is important whatever it was
-    /// labeled two years ago, and that is a fact meka owns rather than one it has to guess.
+    /// The counterweight to a priority chosen once and never revised. Priorities drift toward 0
+    /// over a long-lived instance until the index stops ranking anything; a memory opened forty
+    /// times is important whatever it was labeled two years ago, and that is a fact meka owns
+    /// rather than one it has to guess.
     fn usage_weight(read_count: u32) -> f64 {
         if read_count == 0 {
             return 1.0;

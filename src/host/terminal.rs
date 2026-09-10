@@ -256,36 +256,28 @@ pub(crate) fn history_render_options(
         input_style: config.input_style,
         newline_before_prompt: config.newline_before_prompt,
         newline_after_prompt: config.newline_after_prompt,
-        // `/history` is separated from the command line by the episode's own blank; only the resume
-        // path asks for one, because the episode it prints in opens against the shell's prompt and
-        // so has no blank of its own. It passes `newline_after_prompt` rather than `true` so tight
-        // spacing stays tight.
-        leading_blank: false,
     }
 }
-/// `leading_blank` is emitted only once there is something to print under it, so a last message
-/// that renders to nothing (a tool-call-only turn) leaves the banner unbracketed rather than
-/// trailing a blank into the prompt. Callers pass `newline_after_prompt`: on a resume the
-/// `Continuing session:` banner stands in for the line you typed, and this is the separator that
-/// would have followed one.
+/// Reprint the last message's words on a resume. `on_output` runs immediately before the first row
+/// and not at all for a message that renders to nothing (a tool-call-only turn), so the console
+/// spends no blank on an empty region; [`crate::render::render_message_history`] holds the same
+/// contract for a slice of turns.
 pub(crate) fn reprint_last_message(
     messages: &[crate::conversation::Message],
     render_mode: crate::config::RenderMode,
-    leading_blank: bool,
-) -> bool {
+    on_output: impl FnOnce(),
+) {
     let Some(last) = messages.last() else {
-        return false;
+        return;
     };
 
     // The words for either role: a user turn's context block is not a `Text` block.
     let text = last.text_content();
     if text.is_empty() {
-        return false;
+        return;
     }
 
-    if leading_blank {
-        crate::streams::write_stderr_line("");
-    }
+    on_output();
     let mut renderer = crate::render::StreamingRenderer::new(render_mode);
     if let Err(error) = renderer.push_delta(&text) {
         crate::render::report_lost_output("a replayed message did not reach stdout", &error);
@@ -293,7 +285,6 @@ pub(crate) fn reprint_last_message(
     if let Err(error) = renderer.finish() {
         crate::render::report_lost_output("a replayed message did not reach stdout", &error);
     }
-    true
 }
 /// Borrow the shared console for one synchronous run of writes.
 ///

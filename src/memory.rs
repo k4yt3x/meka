@@ -30,10 +30,8 @@ use std::{
 
 // Re-exported rather than referenced through `crate::entry` at each use site: priority is part
 // of the memory store's public vocabulary (`meka memory add --priority`, the `memory_write`
-// schema), and the constants live there only so `skills` can share the same scale.
-pub(crate) use crate::entry::{
-    DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY, normalize_description,
-};
+// schema), and its default lives there only so `skills` can share the same scale.
+pub(crate) use crate::entry::{DEFAULT_PRIORITY, normalize_description};
 use crate::entry::{validate_entry_name, yaml_scalar};
 
 /// A single durable note, as one row of the `memories` table.
@@ -421,8 +419,8 @@ mod tests {
         assert_eq!(parse_priority(None, "n"), DEFAULT_PRIORITY);
         assert_eq!(parse_priority(Some(0), "n"), 0);
         assert_eq!(parse_priority(Some(9), "n"), 9);
-        assert_eq!(parse_priority(Some(-5), "n"), MIN_PRIORITY);
-        assert_eq!(parse_priority(Some(99), "n"), MAX_PRIORITY);
+        assert_eq!(parse_priority(Some(-5), "n"), crate::entry::MIN_PRIORITY);
+        assert_eq!(parse_priority(Some(99), "n"), crate::entry::MAX_PRIORITY);
     }
 
     /// A tag is stored space-joined in one column and rendered into a YAML flow sequence, so

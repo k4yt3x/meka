@@ -117,7 +117,7 @@ enum Owes {
 ///
 /// The indent is a boundary, not decoration. Reasoning printed at column zero in the same gray
 /// `render_session_id` and `render_hint` use renders byte-for-byte like meka's own chrome, and a
-/// model needs no escape sequence to write a line reading `Continuing session: <uuid>`. Applying it
+/// model needs no escape sequence to write a line reading `Resuming session: <uuid>`. Applying it
 /// here, at the point bytes leave, is what gives every render mode the boundary from one definition
 /// rather than one per mode.
 #[derive(Debug, Clone, Copy)]
@@ -1911,16 +1911,6 @@ pub(crate) struct HistoryRenderOptions {
     /// Blank line after each user prompt (mirrors `[display].newline_after_prompt`). Acts as the
     /// visual separator between the prompt and the agent's first response block.
     pub(crate) newline_after_prompt: bool,
-    /// Blank line before the first thing this renders, for a caller that has already printed
-    /// something the history must not butt against. Deferred to the first real output, so a slice
-    /// that renders to nothing leaves no stray blank behind.
-    ///
-    /// `/history` leaves this off: the episode's `newline_after_prompt` blank already separates it
-    /// from the command line. A resume sets it to `newline_after_prompt`, because that episode
-    /// opens against the shell's prompt and gets no blank of its own; the `Continuing session:`
-    /// banner stands in for the line you typed, so the separator below it answers to the same
-    /// setting.
-    pub(crate) leading_blank: bool,
 }
 
 /// Reprint a slice of historical messages styled to match the live REPL output. Inter-block spacing
@@ -1928,25 +1918,28 @@ pub(crate) struct HistoryRenderOptions {
 /// tool-indicator → text get a blank line; user-prompt spacing follows the `newline_before_prompt`
 /// / `newline_after_prompt` config flags just like the live REPL.
 ///
-/// Returns whether anything reached the terminal. A slice can render to nothing (it is empty, or it
-/// holds only tool results and blank text), and the caller has to know: its own blank lines bracket
-/// this output, and bracketing nothing leaves a gap that reads as a rendering fault.
+/// `on_first_output` runs immediately before the first row this prints, and not at all for a slice
+/// that renders to nothing, so the caller can announce the output to the console the moment it
+/// starts: the blank above the history is then the console's to decide, as for the first output of
+/// any episode. Returns whether anything reached the terminal. A slice can render to nothing (it is
+/// empty, or it holds only tool results and blank text), and the caller has to know, or it brackets
+/// a region with nothing in it.
 pub(crate) fn render_message_history(
     messages: &[crate::conversation::Message],
     opts: &HistoryRenderOptions,
+    on_first_output: impl FnOnce(),
 ) -> bool {
     use crate::conversation::{ContentBlock, Role};
     if messages.is_empty() {
         return false;
     }
     let mut spacing = OutputSpacing::new();
-    // The blank above this history is the caller's, either its episode's `newline_after_prompt`
-    // (`/history`) or `leading_blank` (a resume). So the very first user prompt we render must skip
-    // its own `newline_before_prompt` to avoid stacking blanks. Once anything has been emitted, the
-    // inner spacing rules take over and turn-to-turn transitions get their own blanks naturally.
+    // The blank above this history is the console's, spent when `on_first_output` announces the
+    // first row. So the very first user prompt rendered skips its own `newline_before_prompt`, or
+    // the two would stack. Once anything has been emitted, the inner spacing rules take over and
+    // turn-to-turn transitions get their own blanks naturally.
     let mut emitted_any = false;
-    // Deferred to the first real output so a slice that renders nothing leaves no stray blank.
-    let mut pending_leading_blank = opts.leading_blank;
+    let mut first_output = Some(on_first_output);
     for message in messages {
         for block in &message.content {
             match block {
@@ -1955,19 +1948,25 @@ pub(crate) fn render_message_history(
                         if text.trim().is_empty() {
                             continue;
                         }
-                        separate(spacing.before_text(), &mut pending_leading_blank);
+                        separate(spacing.before_text(), &mut first_output);
                         render_assistant_text(text, opts.render_mode);
                         emitted_any = true;
                     }
                     Role::User => {
-                        // Consumed only on success: `render_user_prompt` owns the blank and prints
-                        // nothing at all for a prompt that strips to empty.
-                        let leading_blank =
-                            pending_leading_blank || (opts.newline_before_prompt && emitted_any);
-                        if !render_user_prompt(text, opts.input_style, leading_blank) {
+                        // Decided here rather than in the renderer, because the announcement must
+                        // not run for a prompt that prints nothing.
+                        if text.trim().is_empty() {
                             continue;
                         }
-                        pending_leading_blank = false;
+                        let newline_before = match first_output.take() {
+                            // The first row: the console has just decided the blank above it.
+                            Some(announce) => {
+                                announce();
+                                false
+                            }
+                            None => opts.newline_before_prompt && emitted_any,
+                        };
+                        render_user_prompt(text, opts.input_style, newline_before);
                         if opts.newline_after_prompt {
                             write_stderr_line("");
                         }
@@ -1981,20 +1980,20 @@ pub(crate) fn render_message_history(
                 // replayed/exported transcript notes the attachment instead of dropping it
                 // silently.
                 ContentBlock::Image { .. } => {
-                    separate(spacing.before_text(), &mut pending_leading_blank);
+                    separate(spacing.before_text(), &mut first_output);
                     write_stderr_line("[image]");
                     emitted_any = true;
                 }
                 ContentBlock::Thinking { thinking, .. } => {
                     if opts.show_thinking && !thinking.trim().is_empty() {
-                        separate(spacing.before_thinking(), &mut pending_leading_blank);
+                        separate(spacing.before_thinking(), &mut first_output);
                         render_thinking_block(thinking, opts.render_mode);
                         emitted_any = true;
                     }
                 }
                 ContentBlock::RedactedThinking { .. } => {
                     if opts.show_thinking {
-                        separate(spacing.before_thinking(), &mut pending_leading_blank);
+                        separate(spacing.before_thinking(), &mut first_output);
                         render_thinking_block(REDACTED_THINKING, opts.render_mode);
                         emitted_any = true;
                     }
@@ -2002,7 +2001,7 @@ pub(crate) fn render_message_history(
                 ContentBlock::ToolUse { name, input, .. } => {
                     separate(
                         spacing.before_tool_indicator(opts.tool_params),
-                        &mut pending_leading_blank,
+                        &mut first_output,
                     );
                     render_tool_indicator(name, input, None, opts.tool_params);
                     emitted_any = true;
@@ -2031,29 +2030,28 @@ fn render_assistant_text(text: &str, render_mode: RenderMode) {
     }
 }
 
-/// Emit the blank line separating a block from what precedes it.
+/// Emit what separates a block from what precedes it: at the first row the caller's announcement,
+/// which is where the console decides the blank; after that the spacing machine's separator.
 ///
-/// `pending_leading` is taken whether or not `needed` is set, so the first block spends it and no
-/// later one can print it again. A short-circuiting `||` would leave it armed behind a block that
-/// asked for its own separator.
-fn separate(needed: bool, pending_leading: &mut bool) {
-    if std::mem::take(pending_leading) || needed {
+/// The announcement is taken whether or not `needed` is set, so the first block spends it and no
+/// later one can run it again. Left armed behind a block that asked for its own separator, it would
+/// put the console's blank in the middle of the replayed history instead of above it.
+fn separate<F: FnOnce()>(needed: bool, first_output: &mut Option<F>) {
+    if let Some(announce) = first_output.take() {
+        announce();
+    } else if needed {
         write_stderr_line("");
     }
 }
 
 /// Render a user prompt with the cyan `>` gutter plus `input_style` applied to each line,
-/// optionally preceded by a blank line. Returns `false` when the prompt was empty and nothing was
-/// emitted, so the caller can skip the after-prompt blank/state update.
-fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_before: bool) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
+/// optionally preceded by a blank line. The caller has already skipped a prompt that trims to
+/// nothing.
+fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_before: bool) {
     if newline_before {
         write_stderr_line("");
     }
-    for line in trimmed.lines() {
+    for line in text.trim().lines() {
         // Sanitized like the assistant text a few lines above. "User" here names the *role*, not
         // necessarily a person at this terminal: an ACP or HTTP client wrote it, or a `--skill`
         // body did, and a replayed session shows whatever the row holds. Leaving it raw made the
@@ -2064,7 +2062,6 @@ fn render_user_prompt(text: &str, input_style: nu_ansi_term::Style, newline_befo
             input_style.paint(sanitize_stream_text(line))
         ));
     }
-    true
 }
 
 /// Whether a live, redrawn-in-place indicator can be shown at all.
@@ -3260,8 +3257,8 @@ mod tests {
     /// which renderer produced them.
     #[test]
     fn a_full_thinking_block_cannot_forge_a_line_of_meka_chrome() {
-        let forged = "Let me check.\nContinuing session: 550e8400-e29b-41d4-a716-446655440000";
-        let chrome = "Continuing session: 550e8400-e29b-41d4-a716-446655440000";
+        let forged = "Let me check.\nResuming session: 550e8400-e29b-41d4-a716-446655440000";
+        let chrome = "Resuming session: 550e8400-e29b-41d4-a716-446655440000";
         for mode in [RenderMode::Raw, RenderMode::Termimad, RenderMode::Syntect] {
             let body = thinking_rows(forged, mode, TEST_WIDTH);
             assert!(
@@ -3294,7 +3291,7 @@ mod tests {
     /// It needs no escape sequence at all, which is why [`sanitize_stream_text`] drops it.
     #[test]
     fn a_full_thinking_block_cannot_repaint_its_own_label() {
-        let forged = "thought\rContinuing session: 4f1e0c2a-0000-4000-8000-deadbeefcafe";
+        let forged = "thought\rResuming session: 4f1e0c2a-0000-4000-8000-deadbeefcafe";
         let body = thinking_rows(forged, RenderMode::Raw, TEST_WIDTH);
         assert!(!body.contains('\r'), "{body:?}");
         assert!(body.starts_with(super::THINKING_PREFIX), "{body:?}");
@@ -3762,7 +3759,7 @@ mod tests {
                 // termimad does not reflow a code block, it lays it out at its widest line and pads
                 // every row to match. On a terminal narrower than that block, the padding runs past
                 // the row. The *text* still wraps to the budget -- verified against an indented
-                // block whose content is a forged `Continuing session:` line, which comes back
+                // block whose content is a forged `Resuming session:` line, which comes back
                 // broken across rows at the indent -- so what overruns is whitespace, and what the
                 // boundary exists to stop cannot ride it out to column zero.
                 for mode in [RenderMode::Raw, RenderMode::Termimad] {
@@ -5946,22 +5943,25 @@ mod tests {
             input_style: nu_ansi_term::Style::default(),
             newline_before_prompt: true,
             newline_after_prompt: true,
-            leading_blank: false,
         };
-        assert!(render_message_history(&messages, &opts_with_thinking));
+        assert!(render_message_history(
+            &messages,
+            &opts_with_thinking,
+            || {}
+        ));
         // And off: the call must still complete cleanly.
         let opts_no_thinking = HistoryRenderOptions {
             show_thinking: false,
             ..opts_with_thinking
         };
-        assert!(render_message_history(&messages, &opts_no_thinking));
+        assert!(render_message_history(&messages, &opts_no_thinking, || {}));
         // Also: no-newline-prompt config must still produce non-panicking output.
         let opts_tight = HistoryRenderOptions {
             newline_before_prompt: false,
             newline_after_prompt: false,
             ..opts_with_thinking
         };
-        assert!(render_message_history(&messages, &opts_tight));
+        assert!(render_message_history(&messages, &opts_tight, || {}));
     }
 
     #[test]
@@ -5973,9 +5973,8 @@ mod tests {
             input_style: nu_ansi_term::Style::default(),
             newline_before_prompt: true,
             newline_after_prompt: true,
-            leading_blank: false,
         };
-        assert!(!render_message_history(&[], &opts));
+        assert!(!render_message_history(&[], &opts, || {}));
 
         // Non-empty but invisible: tool results are deliberately not echoed and blank assistant
         // text is skipped, so this renders to nothing at all. `/history` prints its empty-state
@@ -5999,24 +5998,31 @@ mod tests {
                 }],
             },
         ];
-        assert!(!render_message_history(&invisible, &opts));
+        assert!(!render_message_history(&invisible, &opts, || {}));
     }
 
-    /// The armed blank is spent by the first block to print, whether or not that block also asked
-    /// for a separator of its own. Leaving it armed there re-arms it for a later block, which puts
-    /// the resume banner's blank line in the middle of the replayed history instead of above it.
+    /// The announcement is spent by the first block to print, whether or not that block also asked
+    /// for a separator of its own. Left armed there, it would run for a later block and put the
+    /// console's blank in the middle of the replayed history instead of above it.
     #[test]
-    fn separate_spends_the_armed_blank_even_when_the_block_asked_for_one() {
-        let mut both = true;
+    fn separate_spends_the_announcement_even_when_the_block_asked_for_a_separator() {
+        let announced = std::cell::Cell::new(0);
+        let mut both = Some(|| announced.set(announced.get() + 1));
         separate(true, &mut both);
-        assert!(!both, "a block with its own separator must still spend it");
+        assert!(
+            both.is_none(),
+            "a block with its own separator must still spend it"
+        );
+        assert_eq!(announced.get(), 1);
 
-        let mut armed_only = true;
+        let mut armed_only = Some(|| announced.set(announced.get() + 1));
         separate(false, &mut armed_only);
-        assert!(!armed_only);
+        assert!(armed_only.is_none());
+        assert_eq!(announced.get(), 2);
 
-        let mut neither = false;
-        separate(false, &mut neither);
-        assert!(!neither);
+        let mut spent: Option<fn()> = None;
+        separate(false, &mut spent);
+        assert!(spent.is_none());
+        assert_eq!(announced.get(), 2, "a spent announcement never runs again");
     }
 }

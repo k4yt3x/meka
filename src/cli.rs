@@ -507,7 +507,7 @@ pub(crate) enum InstructionsAction {
 /// `memory_*` tools; these subcommands are for reading, auditing, and pruning them by hand.
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum MemoryAction {
-    /// List saved memories and the priority distribution
+    /// List saved memories
     List {
         /// Output format: plain or json
         #[arg(long, default_value = "plain")]

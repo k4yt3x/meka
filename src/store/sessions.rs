@@ -3344,7 +3344,7 @@ mod tests {
     /// link, and `refuse_a_spawned_session` reads that row as a sub-agent -- correctly, since
     /// nothing else can reconstruct the tools and level it ran under. A filter keyed on the
     /// parent alone therefore disagreed with the refusal about the same row, which is worse
-    /// than either answer: `-c` offered the orphan, printed `Continuing session:`, and then
+    /// than either answer: `-c` offered the orphan, printed `Resuming session:`, and then
     /// declined it, *permanently*, because no later session can outrank a row that is always
     /// the newest thing in the store. The list did the mirror of it, presenting the orphan as a
     /// root session while the refusal's own text told the reader to pass `--include-children`

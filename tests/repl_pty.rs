@@ -709,7 +709,7 @@ fn the_opening_blank_precedes_the_session_notice() {
 }
 
 /// A run's outer edges border the shell's prompt rather than one of meka's, and a shell lays out
-/// its own. Both blanks were spent against it anyway: one above `Continuing session:`, which is
+/// its own. Both blanks were spent against it anyway: one above `Resuming session:`, which is
 /// meka's first word and belongs directly under the command line, and one below `Leaving session:`,
 /// which is its last unless a background task is still running. See
 /// [`the_shutdown_notice_reads_as_one_block_with_the_exit_banner`] for that case.
@@ -735,8 +735,20 @@ fn the_shell_s_prompt_gets_neither_blank() {
     assert!(
         continuing
             .first()
-            .is_some_and(|row| row.contains("Continuing session")),
+            .is_some_and(|row| row.contains("Resuming session")),
         "the resume banner is the first row, with no blank above it: {continuing:#?}"
+    );
+    assert_eq!(
+        continuing.get(1).map(String::as_str),
+        Some(""),
+        "the banner stands in for the line you typed, so the replay is spaced from it as an \
+         answer is from its prompt: {continuing:#?}"
+    );
+    assert!(
+        continuing
+            .get(2)
+            .is_some_and(|row| row.contains("First answer.")),
+        "and the replayed history follows that blank: {continuing:#?}"
     );
     // The other half, and the one the `printed` bookkeeping exists for: losing the opening blank
     // must not cost the episode its closing one. Without this the whole suite stays green while
@@ -748,6 +760,29 @@ fn the_shell_s_prompt_gets_neither_blank() {
     assert!(
         first_prompt > 0 && continuing[first_prompt - 1].is_empty(),
         "the first prompt is bracketed like every later one: {continuing:#?}"
+    );
+}
+
+/// The resume banner has a switch like the create and exit banners. Off, the replayed history is
+/// meka's first word and sits directly under the shell's command line: no banner, and no blank
+/// standing in for one.
+#[test]
+fn the_resume_banner_can_be_hidden() {
+    let install = repl_install(true, true, "show_session_id_on_resume = false\n");
+    run_repl(&install, TWO_TURNS, &["first", "/exit"]);
+
+    let continuing = run_repl(&install, TWO_TURNS, &["/exit"]);
+    assert!(
+        !continuing
+            .iter()
+            .any(|row| row.contains("Resuming session")),
+        "the banner is off: {continuing:#?}"
+    );
+    assert!(
+        continuing
+            .first()
+            .is_some_and(|row| row.contains("First answer.")),
+        "the replayed history is the first row, with no blank above it: {continuing:#?}"
     );
 }
 

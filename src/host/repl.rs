@@ -30,11 +30,6 @@ pub(crate) async fn run_interactive(
     // agent's frontend, the blocking REPL thread and this loop, because the blank lines that
     // bracket an episode follow from what the episode did rather than from which of the three
     // happened to answer it.
-    //
-    // Built before the session is resolved because the resume banner, the replayed history and any
-    // prompt queued on the command line all belong to the episode that ends at the *first* prompt.
-    // Opening it here is what gives that episode its closing bracket; it gets no opening one,
-    // because what sits above it is the shell's prompt rather than meka's.
     let console = Arc::new(std::sync::Mutex::new(crate::console::Console::new(
         crate::console::Spacing {
             newline_before_prompt: config.newline_before_prompt,
@@ -46,13 +41,6 @@ pub(crate) async fn run_interactive(
     // row it lands on may be one the console intends to erase; giving the relay this handle is what
     // lets a mid-turn `warn!` settle that row first instead of being wiped with it.
     crate::relay::RELAY.install_console(&console);
-    with_console(&console, |console| {
-        console.open_episode(
-            crate::console::RowState::Empty,
-            crate::console::Neighbor::Shell,
-        )
-    });
-    let _last_episode = LastEpisode(Arc::clone(&console));
     let repl_console = Arc::clone(&console);
 
     // Before the REPL thread exists, so the resume banner lands above the first prompt, and before
@@ -66,7 +54,17 @@ pub(crate) async fn run_interactive(
         repin,
         permission_to_record,
         cwd: recorded_cwd,
+        follows,
     } = resolve_session_resume(&store, &config, &console).await?;
+    // The first episode: the replayed history and any prompt queued on the command line belong to
+    // it, and it ends at the first prompt, which is what gives them their closing bracket. Opened
+    // after the resume because the banner is what it follows: printed, the banner stands in for the
+    // line you typed and the blank below it answers to `newline_after_prompt`; hidden, the shell's
+    // own command line is above and no opening blank is owed.
+    with_console(&console, |console| {
+        console.open_episode(crate::console::RowState::Empty, follows)
+    });
+    let _last_episode = LastEpisode(Arc::clone(&console));
     // After the resume, whose lock is what spares the session this run was asked for.
     sweep_expired_sessions(&config, &store).await?;
 
@@ -103,31 +101,19 @@ pub(crate) async fn run_interactive(
     }
 
     if !messages.is_empty() {
+        // The replay announces itself at its first row and the console decides the blank above it,
+        // as for the first output of any episode. A replay that renders nothing (a tail of tool
+        // calls with no text) announces nothing, so no blank is spent on an empty region.
+        let announce = || with_console(&console, |console| console.announce_foreign_output());
         match config.resume_show_recent {
             Some(n) if n > 0 => {
-                // The replay is part of the episode that ends at the first prompt, so its blank
-                // line is that episode's closing bracket rather than a rule of its own. Announcing
-                // only when something rendered keeps the empty case (a tail of tool calls with no
-                // text) unbracketed.
-                if crate::render::render_message_history(
+                crate::render::render_message_history(
                     crate::render::last_n_turns(messages.as_slice(), n),
-                    &crate::render::HistoryRenderOptions {
-                        leading_blank: config.newline_after_prompt,
-                        ..history_render_options(&config)
-                    },
-                ) {
-                    with_console(&console, |console| console.announce_foreign_output());
-                }
+                    &history_render_options(&config),
+                    announce,
+                );
             }
-            _ => {
-                if reprint_last_message(
-                    messages.as_slice(),
-                    config.render_mode,
-                    config.newline_after_prompt,
-                ) {
-                    with_console(&console, |console| console.announce_foreign_output());
-                }
-            }
+            _ => reprint_last_message(messages.as_slice(), config.render_mode, announce),
         }
     }
 
