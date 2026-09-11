@@ -9,24 +9,17 @@
 
 use crate::{cli, conversation, store::Store, text::Precision, view::SessionView};
 
-/// What [`list_sessions`] aims to fit in.
+/// The listing's columns: an id prefix every session command accepts, the timestamp, the profile
+/// for information, and the first message's words spending the rest.
 ///
-/// The id takes whatever distinguishes it from the others on screen, the timestamp its fixed width
-/// plus two, the profile what its longest name needs up to [`PROFILE_TRUNCATE`], and the preview
-/// the rest. A full UUID here cost 36 of the 120 to repeat what eight characters usually say, and
-/// every command that takes a session id accepts the prefix this prints; [`show_session`] has the
-/// whole one.
-const TABLE_WIDTH: usize = 120;
-
-/// Ceiling on the rendered profile column.
-///
-/// A profile name is a config key the user chose, so nothing bounds it but this. Wide enough for
-/// the descriptive names people actually use (`openrouter-anthropic-messages` is 29), since a
-/// name cut short enough to stop distinguishing two profiles is worse than a shorter preview.
-const PROFILE_TRUNCATE: usize = 32;
-
-/// Floor on the preview, so a pathological profile name cannot squeeze it to nothing.
-const PREVIEW_MINIMUM: usize = 24;
+/// A full UUID would cost 36 of the 120 to repeat what eight characters usually say, and
+/// [`show_session`] has the whole one.
+const SESSION_COLUMNS: [crate::text::Column; 4] = [
+    crate::text::Column::content("ID"),
+    crate::text::Column::content("Updated"),
+    crate::text::Column::capped("Profile", crate::text::NAME_WIDTH),
+    crate::text::Column::remainder("Title"),
+];
 
 /// `meka session fork <id>`: copy a session's conversation into a new one and print the new id.
 ///
@@ -315,35 +308,22 @@ pub(crate) async fn list_sessions(
     // The universe a printed prefix will be resolved against, which is every session rather than
     // the ones this listing chose to show.
     let resolvable = store.all_session_ids().await?;
-    let headers: &[&str] = &["ID", "Updated", "Profile", "Title"];
-    crate::render::write_stdout(crate::text::format_columns(
-        headers,
+    crate::render::write_stdout(crate::text::format_table(
+        &SESSION_COLUMNS,
         &session_rows(&sessions, &resolvable),
     ))?;
 
     Ok(())
 }
 
-/// One row per session, separated from printing so the sanitizing can be asserted.
+/// One row per session, separated from printing so the layout can be asserted.
 ///
-/// Both authored cells go through the same helper, which drops `\n` and caps in terminal columns.
+/// The id is the shortest prefix that resolves against every session in the store, since this
+/// listing filters and the resolvers do not.
 fn session_rows(
     sessions: &[crate::store::SessionSummary],
     resolvable: &[String],
 ) -> Vec<Vec<String>> {
-    // A profile name is a config key the user chose, so nothing bounds it but `PROFILE_TRUNCATE`.
-    // Sized to the longest one actually present rather than to that ceiling: `format_columns` pads
-    // to the widest cell either way, so reserving the ceiling would spend width on nobody.
-    let profiles: Vec<String> = sessions
-        .iter()
-        .map(|session| crate::text::sanitize_to_line(&session.profile, PROFILE_TRUNCATE))
-        .collect();
-    let profile_width = profiles
-        .iter()
-        .map(|profile| unicode_width::UnicodeWidthStr::width(profile.as_str()))
-        .chain(std::iter::once("Profile".len()))
-        .max()
-        .unwrap_or(PROFILE_TRUNCATE);
     let ids: Vec<String> = sessions
         .iter()
         .map(|session| session.id.to_string())
@@ -353,24 +333,18 @@ fn session_rows(
         resolvable.iter().map(String::as_str),
     )
     .max("ID".len());
-    let preview_width = TABLE_WIDTH
-        .saturating_sub(id_width + 2)
-        .saturating_sub(Precision::Minutes.width() + 2)
-        .saturating_sub(profile_width + 2)
-        .max(PREVIEW_MINIMUM);
 
     sessions
         .iter()
-        .zip(profiles)
         .zip(&ids)
-        .map(|((session, profile), id)| {
+        .map(|(session, id)| {
             vec![
                 id.get(..id_width).unwrap_or(id).to_string(),
                 format_stored_timestamp(&session.updated_at, Precision::Minutes),
-                profile,
+                session.profile.clone(),
                 // A first message's words: a model composed it, or an API caller sent it through
                 // `POST /v1/sessions`.
-                crate::text::sanitize_to_line(&session.title, preview_width),
+                crate::text::prose_cell(&session.title),
             ]
         })
         .collect()
@@ -710,21 +684,21 @@ mod tests {
             .list_sessions(10, false, None, None)
             .await
             .expect("list");
-        let rows = session_rows(&sessions, &ids_of(&sessions));
-        let [row] = rows.as_slice() else {
-            panic!("one session, one row: {rows:?}");
-        };
-        for cell in row {
+        let table = crate::text::format_table(
+            &SESSION_COLUMNS,
+            &session_rows(&sessions, &ids_of(&sessions)),
+        );
+        assert_eq!(table.lines().count(), 2, "one session, one row: {table}");
+        for line in table.lines() {
             assert!(
-                !cell.contains('\u{1b}') && !cell.contains('\n'),
-                "a cell reaches a terminal verbatim, so neither may survive: {cell:?}"
+                !line.contains('\u{1b}'),
+                "a line reaches a terminal verbatim, so an escape may not survive: {line:?}"
+            );
+            assert!(
+                crate::text::display_width(line) <= crate::text::TABLE_WIDTH,
+                "and the preview is capped in columns: {line:?}"
             );
         }
-        assert!(
-            unicode_width::UnicodeWidthStr::width(row[3].as_str()) <= TABLE_WIDTH,
-            "and the preview is capped in columns: {:?}",
-            row[3]
-        );
     }
     /// The profile column takes what real names need, and the preview spends what is left.
     ///
@@ -734,7 +708,7 @@ mod tests {
     /// one four-character name.
     #[tokio::test]
     async fn the_provider_column_takes_what_it_needs_and_the_preview_takes_the_rest() {
-        async fn widths(providers: &[&str]) -> (usize, usize) {
+        async fn table(providers: &[&str]) -> String {
             let manager = Store::for_test().await;
             for provider in providers {
                 let id = manager
@@ -755,43 +729,40 @@ mod tests {
                 .list_sessions(10, false, None, None)
                 .await
                 .expect("list");
-            let rows = session_rows(&sessions, &ids_of(&sessions));
-            let width = |index: usize| {
-                rows.iter()
-                    .map(|row| unicode_width::UnicodeWidthStr::width(row[index].as_str()))
-                    .max()
-                    .unwrap_or(0)
-            };
-            (width(2).max("Profile".len()), width(3))
+            crate::text::format_table(
+                &SESSION_COLUMNS,
+                &session_rows(&sessions, &ids_of(&sessions)),
+            )
         }
+        let preview_of = |table: &str| {
+            table
+                .lines()
+                .nth(1)
+                .and_then(|row| row.find("word"))
+                .map(|start| {
+                    crate::text::display_width(&table.lines().nth(1).expect("row")[start..])
+                })
+                .expect("a row with a preview")
+        };
 
-        let (short_provider, wide_preview) = widths(&["stub"]).await;
-        let (long_provider, narrow_preview) =
-            widths(&["openrouter-anthropic-messages", "claude-max"]).await;
-
-        assert_eq!(
-            long_provider, 29,
-            "a real profile name is shown in full, not cut to a fixed ceiling"
+        let short = table(&["stub"]).await;
+        let long = table(&["openrouter-anthropic-messages", "claude-max"]).await;
+        assert!(
+            long.contains("openrouter-anthropic-messages  word"),
+            "a real profile name is shown in full, not cut to a fixed ceiling: {long}"
         );
         assert!(
-            narrow_preview < wide_preview,
-            "and the preview pays for it: {narrow_preview} should be under {wide_preview}"
+            preview_of(&long) < preview_of(&short),
+            "and the preview pays for it:\n{long}\n{short}"
         );
-        for (provider, preview) in [
-            (short_provider, wide_preview),
-            (long_provider, narrow_preview),
-        ] {
-            assert_eq!(
-                crate::text::ID_PREFIX
-                    + 2
-                    + Precision::Minutes.width()
-                    + 2
-                    + provider
-                    + 2
-                    + preview,
-                TABLE_WIDTH,
-                "every combination spends the budget exactly"
-            );
+        for table in [&short, &long] {
+            for row in table.lines().skip(1) {
+                assert_eq!(
+                    crate::text::display_width(row),
+                    crate::text::TABLE_WIDTH,
+                    "every combination spends the budget exactly: {row}"
+                );
+            }
         }
     }
 

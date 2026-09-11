@@ -125,19 +125,21 @@ pub(crate) async fn list_servers(
         })
         .collect();
 
-    let headers: &[&str] = if with_state {
-        &[
-            "Name",
-            "Transport",
-            "State",
-            "Required",
-            "Permission",
-            "Target",
-        ]
-    } else {
-        &["Name", "Transport", "Required", "Permission", "Target"]
-    };
-    stream.write(crate::text::format_columns(headers, &rows))?;
+    // The name is what every `meka mcp` command takes, so it is shown in full; the target is a URL
+    // or a command line shown for information, and `get` has the whole one.
+    let mut columns = vec![
+        crate::text::Column::content("Name"),
+        crate::text::Column::content("Transport"),
+    ];
+    if with_state {
+        columns.push(crate::text::Column::content("State"));
+    }
+    columns.extend([
+        crate::text::Column::content("Required"),
+        crate::text::Column::content("Permission"),
+        crate::text::Column::remainder("Target"),
+    ]);
+    stream.write(crate::text::format_table(&columns, &rows))?;
     report_orphaned_credentials(&orphans)?;
     Ok(())
 }
@@ -356,8 +358,9 @@ pub(crate) async fn run_get(
 }
 
 /// Run `meka mcp tools <name>`: connect to the server, list every advertised tool, resolve
-/// permissions, and print a column-aligned table. Disabled-by-allow/block tools are still shown
-/// (marked `blocked`) so users can edit their config without leaving the CLI to discover names.
+/// permissions, and print a column-aligned table. A tool that `allowed_tools` or `disabled_tools`
+/// filters out is still shown, marked `disabled`, so users can edit their config without leaving
+/// the CLI to discover names.
 pub(crate) async fn run_tools(
     servers: &[McpServerConfig],
     mcp_default: Option<crate::permission::Permission>,
@@ -426,15 +429,7 @@ pub(crate) async fn run_tools(
         .iter()
         .map(|tool| {
             vec![
-                // The server chose this name and it is never validated on the way in, so it
-                // reaches this table exactly as sent. The one listing an operator reads to decide
-                // what a server may do is not a place to reproduce a newline or an escape.
-                //
-                // Sanitized but never truncated, unlike every other authored cell here. This is
-                // the string the user retypes into `tools`, a per-tool `permission` override or
-                // `--eager-load-tool`, and no command prints it in full elsewhere, so a name cut
-                // to fit a column matches nothing, silently.
-                crate::text::sanitize_to_line(&tool.raw_name, usize::MAX),
+                tool.raw_name.clone(),
                 tool.resolved_permission.to_string(),
                 // A declined hint has to say so here, because this table is where a user checks
                 // what `trust_read_only_hint = false` moved, and the winning source alone cannot
@@ -447,28 +442,15 @@ pub(crate) async fn run_tools(
                 } else {
                     tool.permission_source.as_str().to_string()
                 },
-                if tool.allowed { "allowed" } else { "blocked" }.to_string(),
-                describe_one_line(&tool.description),
+                if tool.allowed { "enabled" } else { "disabled" }.to_string(),
+                crate::text::prose_cell(&tool.description),
             ]
         })
         .collect();
-    crate::render::write_stdout(crate::text::format_columns(
-        &["Name", "Permission", "Source", "Status", "Description"],
+    crate::render::write_stdout(crate::text::format_table(
+        &crate::cli::tool::TOOL_TABLE_COLUMNS,
         &rows,
     ))?;
-
-    // Commentary on the table, not part of it: on stdout it would append a sentence to the data a
-    // caller piped.
-    let total = tools.len();
-    let allowed = tools.iter().filter(|tool| tool.allowed).count();
-    crate::streams::write_stderr_line("");
-    crate::streams::write_stderr_line(format!(
-        "{} tool{} total, {} allowed, {} blocked",
-        total,
-        if total == 1 { "" } else { "s" },
-        allowed,
-        total - allowed
-    ));
 
     warn_about_dropped_tools(dropped);
     Ok(())
@@ -480,6 +462,7 @@ pub(crate) async fn run_tools(
 /// time is not where they will be looking.
 fn warn_about_dropped_tools(dropped: usize) {
     if dropped > 0 {
+        crate::streams::write_stderr_line("");
         crate::streams::write_stderr_line(format!(
             "{} further tool{} advertised by this server {} not registered: the per-server ceiling \
              is {}",
@@ -491,37 +474,8 @@ fn warn_about_dropped_tools(dropped: usize) {
     }
 }
 
-/// Collapse a (possibly multi-line) description into one short line so the table stays legible. MCP
-/// descriptions can be kilobytes; the first sentence or ~80 chars is enough for a listing.
-fn describe_one_line(description: &str) -> String {
-    const MAX: usize = 80;
-    let mut collapsed = String::with_capacity(description.len().min(MAX + 8));
-    let mut prev_space = false;
-    for ch in description.chars() {
-        if ch.is_whitespace() {
-            if !prev_space && !collapsed.is_empty() {
-                collapsed.push(' ');
-            }
-            prev_space = true;
-        } else {
-            collapsed.push(ch);
-            prev_space = false;
-        }
-        if collapsed.chars().count() > MAX {
-            break;
-        }
-    }
-    let trimmed = collapsed.trim_end();
-    if trimmed.chars().count() > MAX {
-        let clipped: String = trimmed.chars().take(MAX).collect();
-        format!("{}…", clipped.trim_end())
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// Run `meka mcp reconnect <name>`: connect once as a smoke test, print `ok` on success and the
-/// error otherwise. Does not mutate config.
+/// Run `meka mcp reconnect <name>`: connect once as a smoke test, silent on success and failing
+/// with the error otherwise. Does not mutate config.
 pub(crate) async fn run_reconnect(
     servers: &[McpServerConfig],
     token_store: &TokenStore,
@@ -2371,29 +2325,6 @@ mod tests {
         assert_eq!(round_trip(true), Some(true));
         // Left out entirely when false, so the server keeps inheriting `[mcp].default_required`.
         assert_eq!(round_trip(false), None);
-    }
-
-    #[test]
-    fn describe_one_line_collapses_whitespace() {
-        assert_eq!(describe_one_line("one\n\ntwo  three"), "one two three");
-    }
-
-    #[test]
-    fn describe_one_line_short_input_passes_through() {
-        assert_eq!(describe_one_line("Read a file."), "Read a file.");
-    }
-
-    #[test]
-    fn describe_one_line_caps_at_80_chars_with_ellipsis() {
-        let long = "a".repeat(200);
-        let out = describe_one_line(&long);
-        assert!(out.ends_with('…'));
-        assert!(out.chars().count() <= 81);
-    }
-
-    #[test]
-    fn describe_one_line_empty_passes_through() {
-        assert_eq!(describe_one_line(""), "");
     }
 
     fn server_named(name: &str) -> McpServerConfig {

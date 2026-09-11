@@ -494,7 +494,7 @@ pub(crate) async fn report_background_survivors(agent: &Agent) {
     let running = agent.background_tasks().running_count_all().await;
     if running > 0 {
         crate::streams::write_stderr_line(format!(
-            "{running} background task(s) still running; stop them with `/tasks cancel --all`."
+            "{running} background task(s) still running; stop them with `/task cancel --all`."
         ));
     }
 }

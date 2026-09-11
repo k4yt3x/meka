@@ -1,17 +1,29 @@
-//! `meka tools`: the built-in tool catalog as the model would see it.
+//! `meka tool`: the built-in tool catalog as the model would see it.
 
 use crate::{
     config::ResolvedConfig, permission::SharedPermission, store::Store, tools::ToolRegistry,
 };
 
-/// Handle `meka tools <action>`.
-pub(crate) fn run_tools_subcommand(
+/// The columns of both tool tables, `meka tool list` and `meka mcp tools`: they answer the same
+/// questions about a tool and are read side by side. The name is what the reader retypes into
+/// `[tools]`, a per-tool `permission` or `--eager-load-tool`, and no command prints it in full
+/// elsewhere, so it is never cut.
+pub(super) const TOOL_TABLE_COLUMNS: [crate::text::Column; 5] = [
+    crate::text::Column::content("Name"),
+    crate::text::Column::content("Permission"),
+    crate::text::Column::content("Source"),
+    crate::text::Column::content("Status"),
+    crate::text::Column::remainder("Description"),
+];
+
+/// Handle `meka tool <action>`.
+pub(crate) fn run_tool_subcommand(
     store: &Store,
-    action: &crate::cli::ToolsAction,
+    action: &crate::cli::ToolAction,
     cli_args: &crate::cli::Cli,
 ) -> anyhow::Result<()> {
     match action {
-        crate::cli::ToolsAction::List { format } => {
+        crate::cli::ToolAction::List { format } => {
             let config = ResolvedConfig::resolve(cli_args.overrides());
             // The table's permission and status columns come from config, so rendering it off
             // defaults would misreport every tool the user has overridden.
@@ -42,7 +54,7 @@ pub(crate) fn run_tools_subcommand(
                     crate::config::BuiltinToolFilter::default(),
                     &crate::sandbox::resolve_backend(config.sandbox_backend, false),
                 ),
-                // `meka tools list` only prints the catalog, so neither store's metadata is read
+                // `meka tool list` only prints the catalog, so neither store's metadata is read
                 // and the filesystem walk is skipped. The switches still have to be honored: this
                 // listing exists to show what a real session would have.
                 skills: if config.skills_enabled {
@@ -115,9 +127,6 @@ pub(crate) fn run_tools_subcommand(
                 crate::cli::write_json_listing("tools", &views)?;
                 return Ok(());
             }
-            // `format_columns`, like every other listing meka prints. A hand-rolled `{:<20}`
-            // silently runs its columns together for any name longer than the width, and a
-            // namespaced MCP tool (`mcp__mekabridge__send_file`) is 26 characters.
             let rows: Vec<Vec<String>> = views
                 .iter()
                 .map(|view| {
@@ -135,21 +144,11 @@ pub(crate) fn run_tools_subcommand(
                             "disabled"
                         }
                         .to_string(),
-                        view.tool
-                            .description
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .chars()
-                            .take(60)
-                            .collect::<String>(),
+                        crate::text::prose_cell(&view.tool.description),
                     ]
                 })
                 .collect();
-            crate::render::write_stdout(crate::text::format_columns(
-                &["Name", "Required", "Source", "Visibility", "Description"],
-                &rows,
-            ))?;
+            crate::render::write_stdout(crate::text::format_table(&TOOL_TABLE_COLUMNS, &rows))?;
         }
     }
     Ok(())

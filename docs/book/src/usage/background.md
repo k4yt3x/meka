@@ -66,7 +66,7 @@ Every task ends in one of four states, and every one of them is reported (as a t
 |--------|---------|
 | `completed` | The tool returned successfully |
 | `failed` | The tool returned an error |
-| `canceled` | Stopped on request, via `task_cancel`, `/tasks cancel`, or a second Ctrl+C |
+| `canceled` | Stopped on request, via `task_cancel`, `/task cancel`, or a second Ctrl+C |
 | `interrupted` | The process holding it went away |
 
 `interrupted` is the one that matters most. A task in flight when meka exits cannot be resumed, so it is retired and reported the next time something takes ownership of that session: a REPL resume, a `meka serve` reattach, or an ACP `session/load`. Nothing is written at exit; the *next* owner does the retiring, because holding the session lock is what proves the previous owner is gone. Without this the agent would wait forever on a result it had usually already promised someone.
@@ -78,10 +78,10 @@ Large output is written to a [scratchpad](../tools/scratchpad.md) entry and the 
 The agent has `task_list` and `task_cancel`. You have:
 
 ```bash
-/tasks                    # list this session's tasks
-/tasks show 7f3a1c22      # one task in full, including its whole id
-/tasks cancel 7f3a1c22    # stop one
-/tasks cancel --all       # stop all of them
+/task                    # list this session's tasks
+/task show 7f3a1c22      # one task in full, including its whole id
+/task cancel 7f3a1c22    # stop one
+/task cancel --all       # stop all of them
 ```
 
 A canceled task still reports back, so the agent learns it stopped rather than waiting on it, but
@@ -111,10 +111,10 @@ meka prints what survived so nothing is hidden:
 
 ```text
 (interrupted)
-2 background task(s) still running; stop them with `/tasks cancel --all`.
+2 background task(s) still running; stop them with `/task cancel --all`.
 ```
 
-A **second** Ctrl+C during the same turn stops them. Between turns, `/tasks cancel --all` is the route.
+A **second** Ctrl+C during the same turn stops them. Between turns, `/task cancel --all` is the route.
 
 ## Where it works
 

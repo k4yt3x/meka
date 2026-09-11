@@ -1328,7 +1328,7 @@ fn a_canceled_task_rides_the_next_prompt_in_the_repl() {
 
     let rows = run_repl(&install, script, &[
         "run it",
-        "/tasks cancel --all",
+        "/task cancel --all",
         "what is in this CSV?",
         "exit",
     ]);

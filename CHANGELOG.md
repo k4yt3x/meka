@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-09-11
+
+### Added
+
+- `meka account list` and `meka profile list` flag an account whose `backend` meka does not know.
+
+### Changed
+
+- **Breaking:** `meka tools` is `meka tool`, so the catalog is `meka tool list`.
+- **Breaking:** the REPL's `/tasks` is `/task`, with the same `show` and `cancel` forms.
+- Every listing fits 120 columns: a name you retype is shown whole; the description takes the rest.
+- One vocabulary for listings: `Permission`, `Status`, `Priority`, `yes`/`no`, `enabled`/`disabled`.
+- `skill get`, `memory get`, `account whoami` and `stats` print aligned `label: value` lines.
+- `meka instructions path` is a `Path`/`Exists` table rather than tab-separated lines.
+- Plain listings are for reading; a script should take `--format json`, whose shapes are unchanged.
+
+### Removed
+
+- The tool count `meka mcp tools` printed under its table.
+
+### Fixed
+
+- `/help` keeps every description in one column, whatever the length of a command's argument hint.
+- A listing row that ends in an empty cell no longer carries trailing spaces.
+
 ## [0.49.0] - 2026-09-10
 
 ### Added
@@ -2130,7 +2155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.49.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.50.0...HEAD
+[0.50.0]: https://github.com/k4yt3x/meka/compare/0.49.0...0.50.0
 [0.49.0]: https://github.com/k4yt3x/meka/compare/0.48.0...0.49.0
 [0.48.0]: https://github.com/k4yt3x/meka/compare/0.47.1...0.48.0
 [0.47.1]: https://github.com/k4yt3x/meka/compare/0.47.0...0.47.1

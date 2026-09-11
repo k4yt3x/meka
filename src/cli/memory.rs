@@ -13,7 +13,18 @@ use crate::{
     },
 };
 
-const DESCRIPTION_TRUNCATE: usize = 50;
+/// Ceiling on the tags column, shown for information; `get` lists them all.
+const TAGS_TRUNCATE: usize = 24;
+
+/// The listing's columns: the name `get`, `show` and `remove` take, three facts, and the
+/// description spending the rest.
+const MEMORY_COLUMNS: [crate::text::Column; 5] = [
+    crate::text::Column::content("Name"),
+    crate::text::Column::content("Priority"),
+    crate::text::Column::content("Recorded"),
+    crate::text::Column::capped("Tags", TAGS_TRUNCATE),
+    crate::text::Column::remainder("Description"),
+];
 
 /// Argument bag for [`run_add`], borrowed so callers don't clone every field out of the
 /// clap-derived `cli::MemoryAction::Add` variant.
@@ -68,18 +79,12 @@ pub(crate) async fn list(
                 entry.priority.to_string(),
                 memory::render_age(entry.recorded_at, now),
                 entry.tags.join(","),
-                truncate(
-                    &memory::render_description_for_model(&entry.description),
-                    DESCRIPTION_TRUNCATE,
-                ),
+                crate::text::prose_cell(&memory::render_description_for_model(&entry.description)),
             ]
         })
         .collect();
 
-    stream.write(crate::text::format_columns(
-        &["Name", "Priority", "Recorded", "Tags", "Description"],
-        &rows,
-    ))?;
+    stream.write(crate::text::format_table(&MEMORY_COLUMNS, &rows))?;
 
     Ok(())
 }
@@ -96,31 +101,28 @@ pub(crate) async fn run_get(
         return Ok(());
     }
     let now = std::time::SystemTime::now();
-    crate::render::write_stdout_line(format!("name: {}", entry.name))?;
-    crate::render::write_stdout_line(format!(
-        "description: {}",
-        memory::render_description_for_model(&entry.description)
-    ))?;
-    crate::render::write_stdout_line(format!("priority: {}", entry.priority))?;
-    // Two dates, because they answer different questions. "recorded" is when the note was made and
-    // is stamped once; "updated" is when the row last changed, which a priority nudge moves without
-    // the note saying anything new.
-    crate::render::write_stdout_line(format!(
-        "recorded: {}",
-        memory::render_age(entry.recorded_at, now)
-    ))?;
-    crate::render::write_stdout_line(format!(
-        "updated: {}",
-        memory::render_age(entry.updated_at, now)
-    ))?;
-    crate::render::write_stdout_line(format!("read count: {}", entry.read_count))?;
+    let mut fields = vec![
+        ("name", entry.name.clone()),
+        (
+            "description",
+            memory::render_description_for_model(&entry.description),
+        ),
+        ("priority", entry.priority.to_string()),
+        // Two dates, because they answer different questions. "recorded" is when the note was made
+        // and is stamped once; "updated" is when the row last changed, which a priority nudge
+        // moves without the note saying anything new.
+        ("recorded", memory::render_age(entry.recorded_at, now)),
+        ("updated", memory::render_age(entry.updated_at, now)),
+        ("read count", entry.read_count.to_string()),
+    ];
     if !entry.tags.is_empty() {
-        crate::render::write_stdout_line(format!("tags: {}", entry.tags.join(", ")))?;
+        fields.push(("tags", entry.tags.join(", ")));
     }
-    crate::render::write_stdout_line(format!(
-        "body: {} bytes",
-        entry.body.as_deref().unwrap_or_default().len()
-    ))?;
+    fields.push((
+        "body",
+        format!("{} bytes", entry.body.as_deref().unwrap_or_default().len()),
+    ));
+    crate::render::write_stdout(crate::text::format_fields(&fields))?;
     Ok(())
 }
 
@@ -698,15 +700,6 @@ async fn require_memory(store: &MemoryStore, name: &str) -> Result<memory::Memor
         .ok_or_else(|| MekaError::Config(format!("no memory named '{name}'")))
 }
 
-fn truncate(text: &str, max: usize) -> String {
-    let flattened = text.replace('\n', " ");
-    if flattened.chars().count() <= max {
-        return flattened;
-    }
-    let cut: String = flattened.chars().take(max.saturating_sub(1)).collect();
-    format!("{cut}…")
-}
-
 pub(crate) async fn run_memory_subcommand(
     store: &Store,
     action: &crate::cli::MemoryAction,
@@ -766,17 +759,6 @@ pub(crate) async fn run_memory_subcommand(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn truncate_leaves_short_text_alone() {
-        assert_eq!(truncate("short", 10), "short");
-    }
-
-    #[test]
-    fn truncate_flattens_newlines_and_elides() {
-        assert_eq!(truncate("a\nb", 10), "a b");
-        assert_eq!(truncate("abcdefghij", 5), "abcd…");
-    }
 
     async fn store_with(entries: &[(&str, u8, &str, &str)]) -> std::sync::Arc<MemoryStore> {
         let store = MemoryStore::for_test().await.expect("store");

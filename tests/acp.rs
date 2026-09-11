@@ -7186,7 +7186,7 @@ enabled = true
     let mut harness = AcpTestHarness::spawn(config_toml, Some(script));
     let session_id = harness.new_session();
 
-    // A terminal, undelivered, unannounced task: exactly what `/tasks cancel` leaves behind.
+    // A terminal, undelivered, unannounced task: exactly what `/task cancel` leaves behind.
     {
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         connection

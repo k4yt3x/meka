@@ -239,12 +239,12 @@ fn mcp_list_with_empty_config_prints_no_servers_and_exits_zero() {
 /// Provider>` it has no credential for, so without that catalog they would be a sentence on stderr.
 /// This is the wiring the unit tests in `src/tools/subagent.rs` cannot see.
 #[test]
-fn tools_list_puts_the_agent_family_in_the_table() {
+fn tool_list_puts_the_agent_family_in_the_table() {
     let install = Install::new();
-    let output = run_isolated(&install, &["tools", "list"]);
+    let output = run_isolated(&install, &["tool", "list"]);
     assert!(
         output.status.success(),
-        "meka tools list exited non-zero: {:?}\nstderr: {}",
+        "meka tool list exited non-zero: {:?}\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -278,7 +278,7 @@ fn tools_list_puts_the_agent_family_in_the_table() {
 /// Denying `agent_spawn` takes the three lifecycle tools with it, so all four have to read as
 /// disabled. Listing `agent_list` as enabled here would describe a session nobody can have.
 #[test]
-fn tools_list_reports_the_whole_agent_family_as_denied_with_agent_spawn() {
+fn tool_list_reports_the_whole_agent_family_as_denied_with_agent_spawn() {
     let install = Install::new();
     let config_dir = install.config_dir();
     std::fs::create_dir_all(&config_dir).expect("config dir");
@@ -287,7 +287,7 @@ fn tools_list_reports_the_whole_agent_family_as_denied_with_agent_spawn() {
         "[tools]\ndisabled_tools = [\"agent_spawn\"]\n",
     )
     .expect("write config.toml");
-    let output = run_isolated(&install, &["tools", "list"]);
+    let output = run_isolated(&install, &["tool", "list"]);
     assert!(output.status.success(), "{:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     for name in [
@@ -310,7 +310,7 @@ fn tools_list_reports_the_whole_agent_family_as_denied_with_agent_spawn() {
 /// `session.subagent_max_depth = 0` is the documented way to turn delegation off, and the listing
 /// missed it entirely while the family was described in prose.
 #[test]
-fn tools_list_reports_the_agent_family_as_denied_at_depth_zero() {
+fn tool_list_reports_the_agent_family_as_denied_at_depth_zero() {
     let install = Install::new();
     let config_dir = install.config_dir();
     std::fs::create_dir_all(&config_dir).expect("config dir");
@@ -319,7 +319,7 @@ fn tools_list_reports_the_agent_family_as_denied_at_depth_zero() {
         "[session]\nsubagent_max_depth = 0\n",
     )
     .expect("write config.toml");
-    let output = run_isolated(&install, &["tools", "list"]);
+    let output = run_isolated(&install, &["tool", "list"]);
     assert!(output.status.success(), "{:?}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     for name in [
@@ -2336,7 +2336,7 @@ fn a_oneshot_run_carries_an_outcome_that_was_waiting() {
     );
     let id = only_session(&install);
 
-    // Exactly what `/tasks cancel` leaves behind for the next process to carry.
+    // Exactly what `/task cancel` leaves behind for the next process to carry.
     let now = chrono::Utc::now().to_rfc3339();
     store(&install)
         .execute(
@@ -3210,10 +3210,10 @@ fn history_list_prints_json() {
     assert_eq!(listed["history"], serde_json::json!(["first", "second"]));
 }
 
-/// `tools list --format json` carries what the table shows: the effective level, where it came
+/// `tool list --format json` carries what the table shows: the effective level, where it came
 /// from, and whether the config admits the tool, beside the description the table cuts short.
 #[test]
-fn tools_list_prints_json_with_the_source_and_visibility_of_each_tool() {
+fn tool_list_prints_json_with_the_source_and_status_of_each_tool() {
     let install = Install::new();
     let config_dir = install.config_dir();
     std::fs::create_dir_all(&config_dir).expect("config dir");
@@ -3225,7 +3225,7 @@ fn tools_list_prints_json_with_the_source_and_visibility_of_each_tool() {
     .expect("write config.toml");
 
     let listed = json_stdout(run_isolated(&install, &[
-        "tools", "list", "--format", "json",
+        "tool", "list", "--format", "json",
     ]));
     let tools = listed["tools"].as_array().expect("an array");
     let find = |name: &str| {

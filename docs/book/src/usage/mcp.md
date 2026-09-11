@@ -21,7 +21,7 @@ Manage configured servers without editing `config.toml` by hand:
 | `meka mcp remove <name>` | Best-effort revoke stored OAuth tokens (RFC 7009) at the provider, then delete the server entry, clear stored credentials, and drop any resource-update ledger entries. A name with stored credentials but no config entry is cleaned rather than refused. |
 | `meka mcp disable <name>` | Set `disabled = true` on the server entry. The next `meka` start skips it entirely. |
 | `meka mcp enable <name>` | Clear the `disabled` flag, so the server connects on the next start. |
-| `meka mcp reconnect <name>` | Smoke-test a connect; prints `ok` or the error. |
+| `meka mcp reconnect <name>` | Smoke-test a connect; exits non-zero with the error when it fails. |
 | `meka mcp tools <name> [--format json]` | Connect and list every advertised tool with its resolved permission, the chain step that decided it, and whether the current config allows it. Useful for populating `--allow-tool`, `--disable-tool`, or `--tool-permission` overrides without leaving the CLI. Under `json`, the object `GET /v1/mcp/{name}/tools` answers with (`server`, `tools[]` of `raw_name`, `description`, `required_permission`, `permission_source`, `allowed`) plus `read_only_hint_declined`. |
 | `meka mcp login <name>` | Drive interactive OAuth. If the server has no `[auth]` block and uses HTTP, assumes `type = "oauth"` and persists the block on success. With `--auth-token-stdin` or `--client-secret-stdin`, stores that secret and exits instead, which is also how you rotate one. |
 | `meka mcp logout <name>` | Call the provider's `revocation_endpoint` (RFC 7009) best-effort, then clear every stored credential for the server. |

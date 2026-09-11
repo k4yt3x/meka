@@ -7237,7 +7237,7 @@ const AGENT_FAMILY: [&str; 4] = [
 /// `assemble_agent` gates the family on `agent_tools_registered`, and every other test of that rule
 /// calls `register_subagent_tools` directly on a registry it built itself. This is the only door
 /// that walks the live path, so a predicate that answered wrongly for a real session would show up
-/// nowhere else -- including in `meka tools list`, which reproduces the rule rather than observing
+/// nowhere else -- including in `meka tool list`, which reproduces the rule rather than observing
 /// it.
 #[test]
 fn a_session_registers_the_whole_agent_family_by_default() {

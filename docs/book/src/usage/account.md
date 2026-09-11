@@ -50,12 +50,14 @@ credential (no network), so even when the identity call fails because the token 
 
 ```console
 $ meka account whoami
-Account: claude-max (claude-subscription, via profile work)
-  Auth:          valid (5h 45m)
-  Plan:          claude_max
-  Tier:          default_claude_max_20x
-  Subscription:  active
-  Role:          admin
+account:       claude-max
+backend:       claude-subscription
+profile:       work
+auth:          valid (5h 45m)
+plan:          claude_max
+tier:          default_claude_max_20x
+subscription:  active
+role:          admin
 
 $ meka account whoami --format json
 {
@@ -78,8 +80,9 @@ counts); `claude-subscription` reports only a first-used date:
 
 ```console
 $ meka account stats
-Account history: claude-max (work)
-  First used:        2026-04-01
+account:     claude-max
+profile:     work
+first used:  2026-04-01
 
 $ meka account stats --format json
 { "profile": "work", "account": "claude-max", "lifetime_tokens": null, "peak_daily_tokens": null,

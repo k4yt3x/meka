@@ -100,7 +100,7 @@ The agent has access to the following built-in tools:
 - `mcp_resource_*` / `mcp_prompt_*`: read or render content from MCP servers
 - `load_tool`: fetch the full schema for a tool held back to keep the prompt small
 
-Run `meka tools list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.so/tools/overview.html).
+Run `meka tool list` for the current set with descriptions. Long-output tools take an optional `scratchpad` parameter to save their output there instead of returning it. See the [tool reference](https://docs.meka.so/tools/overview.html).
 
 ## Permissions
 

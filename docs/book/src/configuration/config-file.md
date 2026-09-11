@@ -739,7 +739,7 @@ Whether to add a blank line after the line you typed, before its output. On a re
 Default: `true`
 
 Both apply to **anything printed between two prompts**, not only agent responses. That span is the
-unit, whatever filled it: a turn, a slash command's output (`/tasks`, `/memory`, `/help`, …), an
+unit, whatever filled it: a turn, a slash command's output (`/task`, `/memory`, `/help`, …), an
 error, a scheduled job waking the shell to run several turns at once, or any combination. It is
 bracketed once, by whichever of those printed first and last, never once per turn inside it, and
 never twice because two things both thought they owned the spacing.
@@ -1388,7 +1388,7 @@ The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's bui
 
 | Key | Purpose |
 |---|---|
-| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with one exception: the seven [MCP meta-tools](../usage/mcp.md#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all. Naming one here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tools list` to see the canonical names. |
+| `allowed_tools` | Optional allow-list of built-in tool names. When set and non-empty, only these built-ins register, with one exception: the seven [MCP meta-tools](../usage/mcp.md#resources-and-prompts) register regardless, because they are how the agent reaches a configured server's resources and prompts at all. Naming one here is inert and warns at startup; use `disabled_tools` to remove one. Use `meka tool list` to see the canonical names. |
 | `disabled_tools` | Block-list of built-in tool names. Applied **after** `allowed_tools`; a tool here is never registered even if it also appears in the allow-list. |
 | `tool_permissions` | Per-tool required-permission override keyed by built-in name. Beats the hardcoded required level from the tool's impl. Levels: `none`, `read`, `workspace`, `unrestricted`; any other value is refused at startup, naming the line. |
 
@@ -1412,7 +1412,7 @@ Disable web access entirely in a locked-down environment:
 disabled_tools = ["fetch_url"]
 ```
 
-Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-in is disabled everywhere. To take something away from sub-agents *only*, use [`[subagents]`](#subagents). Run `meka tools list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
+Sub-agents spawned via `agent_spawn` inherit the same filter; a disabled built-in is disabled everywhere. To take something away from sub-agents *only*, use [`[subagents]`](#subagents). Run `meka tool list` to see every built-in's effective required permission, whether a `[tools.tool_permissions]` override is in effect, and whether the current config enables it.
 
 ## `[subagents]`
 

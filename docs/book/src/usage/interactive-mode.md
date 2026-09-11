@@ -120,7 +120,7 @@ stderr, beside the prompts and notices; the model's answers stay on stdout.
 | `/skill [name] [extra...]` | List skills, or invoke one with extra context |
 | `/memory [name]` | List saved memories, or show one by name |
 | `/schedule [show <id> \| cancel <id>]` | List this session's scheduled jobs, show one, or cancel one by id |
-| `/tasks [show <id> \| cancel <id\|--all>]` | List background tasks, show one, or cancel one by id |
+| `/task [show <id> \| cancel <id\|--all>]` | List background tasks, show one, or cancel one by id |
 | `/mcp <subcommand>` | Manage MCP servers and prompts |
 | `/mcp list` | List configured MCP servers |
 | `/mcp reconnect <server>` | Reconnect smoke-test for one server |
@@ -132,8 +132,8 @@ stderr, beside the prompts and notices; the model's answers stay on stdout.
 | `/history [N]` | Reprint past conversation (bare = all, N = last N turns) |
 
 Some of the grammar the table compresses: a bare `/mcp` is `/mcp list`, and the listing shows each
-server's live state (`pending` / `connected` / `failed` / `disabled`); `/tasks cancel all` is
-accepted for `--all`; `/schedule cancel`, `/tasks cancel` and the two `show`s take an id or any
+server's live state (`pending` / `connected` / `failed` / `disabled`); `/task cancel all` is
+accepted for `--all`; `/schedule cancel`, `/task cancel` and the two `show`s take an id or any
 unique prefix; `/cd ~` still goes home; `/export` writes `session-<id>.md` in the working directory
 and prints where it landed; `/skill <name>` prepends anything typed after the name to the skill body;
 `/memory` lists memories most important first.

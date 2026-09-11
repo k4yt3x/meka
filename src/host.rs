@@ -225,7 +225,7 @@ pub(crate) const COMMANDS: &[HostCommand] = &[
         for_editors: false,
     },
     HostCommand {
-        name: "tasks",
+        name: "task",
         aliases: &[],
         help: "List background tasks, show one, or cancel one by id",
         arg_hint: "[show <id> | cancel <id|--all>]",

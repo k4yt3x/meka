@@ -9,17 +9,26 @@ use crate::{
     store::{Store, background::TaskStatus},
 };
 
-/// What [`render`] aims to fit in: the id takes whatever distinguishes it, the fixed columns take
-/// theirs, and the two authored cells split what is left.
-const TABLE_WIDTH: usize = 120;
-
-/// Ceiling on the tool name. Server-chosen, so nothing else bounds it.
+/// Ceiling on the tool name. Server-chosen, so nothing else bounds it, and `show` has it in full.
 const TOOL_TRUNCATE: usize = 24;
 
-/// Floor on each of the two authored columns, so a long tool name cannot squeeze them to nothing.
-const AUTHORED_MINIMUM: usize = 16;
+/// Ceiling on the command line a task ran, so the result keeps a share of the row. Chosen with
+/// [`TOOL_TRUNCATE`] so that a row whose fixed cells are all at their widest (`completed`, a
+/// seven-column elapsed) still leaves the result its floor.
+const LABEL_TRUNCATE: usize = 36;
 
-/// `/tasks` in the REPL: one row per task in this conversation.
+/// The listing's columns: the id prefix `show` and `cancel` accept, three facts, the two cells the
+/// model or a program wrote for information, and the result spending the rest.
+const TASK_COLUMNS: [crate::text::Column; 6] = [
+    crate::text::Column::content("ID"),
+    crate::text::Column::content("Status"),
+    crate::text::Column::capped("Tool", TOOL_TRUNCATE),
+    crate::text::Column::capped("What", LABEL_TRUNCATE),
+    crate::text::Column::content("Elapsed"),
+    crate::text::Column::remainder("Result"),
+];
+
+/// `/task` in the REPL: one row per task in this conversation.
 pub(crate) async fn run_list_for_session(store: &Store, session: uuid::Uuid) -> Result<()> {
     render(
         store
@@ -40,72 +49,25 @@ fn render(
         return Ok(());
     }
 
-    let rows = task_rows(&tasks);
-
-    stream.write(crate::text::format_columns(
-        &["ID", "Status", "Tool", "What", "Elapsed", "Result"],
-        &rows,
-    ))?;
+    stream.write(crate::text::format_table(&TASK_COLUMNS, &task_rows(&tasks)))?;
     Ok(())
 }
 
-/// One row per task, separated from printing so the widths and the sanitizing can be asserted.
-///
-/// `What` and `Result` both carry text meka did not write (a command line the model composed, and
-/// an excerpt of whatever that command printed), so both go through
-/// [`crate::text::sanitize_to_line`], which caps in terminal columns rather than characters.
+/// One row per task, separated from printing so the layout can be asserted.
 fn task_rows(tasks: &[crate::store::background::BackgroundTask]) -> Vec<Vec<String>> {
     let ids: Vec<&str> = tasks.iter().map(|task| task.id.as_str()).collect();
     let id_width = crate::text::unique_prefix_len(ids.iter().copied()).max("ID".len());
-    let width_of = |cells: Vec<String>, header: usize| {
-        cells
-            .iter()
-            .map(|cell| unicode_width::UnicodeWidthStr::width(cell.as_str()))
-            .chain(std::iter::once(header))
-            .max()
-            .unwrap_or(header)
-    };
-    let tools: Vec<String> = tasks
-        .iter()
-        .map(|task| crate::text::sanitize_to_line(&task.tool_name, TOOL_TRUNCATE))
-        .collect();
-    let tool_width = width_of(tools.clone(), "Tool".len());
-    let elapsed: Vec<String> = tasks.iter().map(format_elapsed).collect();
-    let elapsed_width = width_of(elapsed.clone(), "Elapsed".len());
-    let status_width = width_of(
-        tasks
-            .iter()
-            .map(|task| task.status.name().to_string())
-            .collect(),
-        "Status".len(),
-    );
-
-    // What is left after the fixed columns, split between the two authored ones.
-    let remaining = TABLE_WIDTH
-        .saturating_sub(id_width + 2)
-        .saturating_sub(status_width + 2)
-        .saturating_sub(tool_width + 2)
-        .saturating_sub(elapsed_width + 2)
-        .saturating_sub(2);
-    let label_width = (remaining / 2).max(AUTHORED_MINIMUM);
-    let result_width = remaining.saturating_sub(label_width).max(AUTHORED_MINIMUM);
-
     tasks
         .iter()
-        .zip(tools)
-        .zip(elapsed)
-        .map(|((task, tool), elapsed)| {
+        .map(|task| {
             vec![
                 task.id.get(..id_width).unwrap_or(&task.id).to_string(),
                 task.status.name().to_string(),
-                tool,
-                crate::text::sanitize_to_line(&collapse(&task.label), label_width),
-                elapsed,
+                task.tool_name.clone(),
+                crate::text::prose_cell(&task.label),
+                format_elapsed(task),
                 match &task.outcome {
-                    Some(outcome) if task.status.is_terminal() => crate::text::sanitize_to_line(
-                        &collapse(&crate::background::excerpt(outcome, result_width)),
-                        result_width,
-                    ),
+                    Some(outcome) if task.status.is_terminal() => crate::text::prose_cell(outcome),
                     _ => "-".to_string(),
                 },
             ]
@@ -113,7 +75,7 @@ fn task_rows(tasks: &[crate::store::background::BackgroundTask]) -> Vec<Vec<Stri
         .collect()
 }
 
-/// `/tasks show <id>`: one task, with the id in full.
+/// `/task show <id>`: one task, with the id in full.
 ///
 /// The listing shortens an id to whatever distinguishes it, which is only safe because this prints
 /// the whole thing. It also carries the two cells a column cannot hold: the command line as
@@ -260,13 +222,6 @@ fn format_elapsed(task: &crate::store::background::BackgroundTask) -> String {
         .join(" ")
 }
 
-/// Collapse runs of whitespace, for legibility rather than safety: a command line and a build-log
-/// excerpt both wrap. `sanitize_to_line` is what makes the cell safe; `\u{1b}` is not whitespace,
-/// so this alone leaves an escape intact.
-fn collapse(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,7 +366,7 @@ mod tests {
         assert_eq!(undelivered[0].status, TaskStatus::Canceled);
     }
 
-    /// `/tasks cancel ""` must not stop the only running task.
+    /// `/task cancel ""` must not stop the only running task.
     ///
     /// `id.starts_with("")` is true of every id, so an unset variable would resolve to whichever
     /// task happened to be alone and cancel it, and the ambiguity error only appears once a second
@@ -482,14 +437,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_collapsed_cell_is_legible_but_not_yet_safe() {
-        assert_eq!(collapse("cargo   test\n--all"), "cargo test --all");
-        // The half `collapse` deliberately does not do, and why every cell it feeds goes through
-        // `sanitize_to_line` after it.
-        assert!(collapse("cargo\u{1b}[31m test").contains('\u{1b}'));
-    }
-
     /// The table has a budget, and both cells that carry authored text respect it.
     ///
     /// `tool_name` is chosen by an MCP server, so nothing else bounds it, and a long one would push
@@ -510,24 +457,19 @@ mod tests {
             delivered_at: None,
         };
 
-        let rows = task_rows(&[task]);
-        let [row] = rows.as_slice() else {
-            panic!("one task, one row: {rows:?}");
-        };
-        for cell in row {
+        let table = crate::text::format_table(&TASK_COLUMNS, &task_rows(&[task]));
+        assert_eq!(table.lines().count(), 2, "one task, one row: {table}");
+        for line in table.lines() {
             assert!(
-                !cell.contains('\u{1b}') && !cell.contains('\n'),
-                "a cell reaches a terminal verbatim, so neither may survive: {cell:?}"
+                !line.contains('\u{1b}'),
+                "a line reaches a terminal verbatim, so an escape may not survive: {line:?}"
+            );
+            let width = crate::text::display_width(line);
+            assert!(
+                width <= crate::text::TABLE_WIDTH,
+                "the row spends {width} of a {} budget: {line}",
+                crate::text::TABLE_WIDTH
             );
         }
-        let width: usize = row
-            .iter()
-            .map(|cell| unicode_width::UnicodeWidthStr::width(cell.as_str()))
-            .sum::<usize>()
-            + 2 * (row.len() - 1);
-        assert!(
-            width <= TABLE_WIDTH,
-            "the row spends {width} of a {TABLE_WIDTH} budget: {row:?}"
-        );
     }
 }

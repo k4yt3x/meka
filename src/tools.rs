@@ -1744,7 +1744,7 @@ mod tests {
 
     /// A store with no root is an *empty* store, not a disabled one: its tools still register, so
     /// the agent can write the first memory into a directory that doesn't exist yet. Conflating
-    /// the two is what made `meka tools list` hide tools a real session would have had.
+    /// the two is what made `meka tool list` hide tools a real session would have had.
     #[tokio::test]
     async fn empty_store_still_registers_its_tools() {
         let registry = tool_registry_for_test().await;

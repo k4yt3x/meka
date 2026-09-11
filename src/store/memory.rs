@@ -729,7 +729,7 @@ fn parse_stamp(raw: &str) -> SystemTime {
 /// thing to back up, lock, and explain for the sake of two tables. Cloneable and cheap; the
 /// underlying connection is shared, and a transaction is what serializes concurrent writers.
 pub(crate) struct MemoryStore {
-    /// `None` for a store with no database behind it: `meka tools list`, which prints the
+    /// `None` for a store with no database behind it: `meka tool list`, which prints the
     /// catalog without running anything, and test fixtures that never touch the store. Reads
     /// answer empty; writes report that there is nowhere to write.
     connection: Option<Arc<Connection>>,
@@ -737,7 +737,7 @@ pub(crate) struct MemoryStore {
     ///
     /// Deliberately separate from [`Self::connection`], because they answer different questions.
     /// A store with no database is an *empty* store and its `memory_*` tools still belong in the
-    /// registry; conflating the two makes `meka tools list` hide tools a real session would have.
+    /// registry; conflating the two makes `meka tool list` hide tools a real session would have.
     /// A *disabled* store is one whose tools are not registered and whose `[Memory]` section
     /// never renders, but which the CLI and the HTTP API still read and write, because those are
     /// the operator rather than the agent.
@@ -2860,7 +2860,7 @@ mod tests {
     }
 
     /// A store with no database answers empty rather than erroring, and refuses a write rather than
-    /// reporting a silent success. `meka tools list` is the caller: it prints the catalog without
+    /// reporting a silent success. `meka tool list` is the caller: it prints the catalog without
     /// opening anything, and its `memory_*` tools still have to be in the listing.
     #[tokio::test]
     async fn a_detached_store_reads_empty_and_refuses_to_write() {

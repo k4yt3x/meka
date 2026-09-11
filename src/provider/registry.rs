@@ -826,7 +826,7 @@ impl PublishedProfile {
 }
 
 /// A provider for a session that never asks the model anything: the reference registry `meka
-/// tools list` builds, and a gate probe's. Every request is refused, so a call reaching it is a
+/// tool list` builds, and a gate probe's. Every request is refused, so a call reaching it is a
 /// bug that surfaces rather than a silent hang.
 struct Unbound;
 

@@ -10,39 +10,14 @@ use crate::{
     store::Store,
 };
 
-/// Ceiling on the rendered schedule column. `format_columns` widens a column to its longest cell,
-/// so an unbounded value here would push every following column off the terminal.
+/// Ceiling on the schedule column: a spec is shown for information, and `show` has the whole one.
 const SCHEDULE_TRUNCATE: usize = 24;
-/// Same, for the trailing prompt, and the column that spends whatever the others leave.
-///
-/// The table is a width budget rather than a set of independent ceilings. Worst case is `8 + 2`
-/// id, `8 + 2` session, `24 + 2` schedule, `8 + 2` next (`999d 23h`, which is what
-/// [`NEVER_SOON_DAYS`] exists to keep it under), `5 + 2` gate, and this: 120 exactly. An id widened
-/// by [`crate::text::unique_prefix_len_within`] is taken back off this, so a collision costs
-/// prompt rather than the budget.
-const PROMPT_TRUNCATE: usize = 57;
-
-/// Floor on the prompt, so two widened ids cannot squeeze it to nothing.
-///
-/// Both ids widening to a full UUID leaves `57 - 28 - 28 = 1`, and a one-column prompt says less
-/// than no column would. Overrunning the budget in that case is the better trade: it takes a
-/// deliberate pair of colliding ids to reach, and the same floor is why the other two tables have
-/// one.
-const PROMPT_MINIMUM: usize = 16;
-
-/// What a row is allowed to occupy, which the constants above add up to exactly.
-///
-/// Only the test asserts it: the widths are chosen to sum to this rather than derived from it, so
-/// naming it in the production path would imply a division of it that does not happen.
-#[cfg(test)]
-const TABLE_BUDGET: usize = 120;
 
 /// Where the `Next` column stops counting and starts saying "not soon".
 ///
-/// Chosen so the cell fits the `8 + 2` the budget above reserves for it. `format_duration_short`
-/// renders `{days}d {hours}h`, which is nine columns once the day count reaches four digits and the
-/// hour two, so the clamp has to land before four digits, not at them. `999d 23h` is eight and
-/// `>999d` is five.
+/// Chosen so the cell stays eight columns wide. `format_duration_short` renders `{days}d {hours}h`,
+/// which is nine columns once the day count reaches four digits and the hour two, so the clamp has
+/// to land before four digits, not at them. `999d 23h` is eight and `>999d` is five.
 const NEVER_SOON_DAYS: i64 = 999;
 const NEVER_SOON: chrono::TimeDelta = chrono::TimeDelta::days(NEVER_SOON_DAYS);
 
@@ -197,13 +172,26 @@ async fn list(
 /// `Session` only where it can differ. `meka schedule list` spans every session, so a row without
 /// it names no owner; `/schedule` in the REPL is already scoped to one conversation, where the
 /// column would repeat the same id on every line.
-const COLUMNS: [&str; 6] = ["ID", "Session", "Schedule", "Next", "Gate", "Prompt"];
+const COLUMNS: [crate::text::Column; 6] = [
+    crate::text::Column::content("ID"),
+    crate::text::Column::content("Session"),
+    crate::text::Column::capped("Schedule", SCHEDULE_TRUNCATE),
+    crate::text::Column::content("Next"),
+    crate::text::Column::content("Gate"),
+    crate::text::Column::remainder("Prompt"),
+];
 
 /// [`COLUMNS`] with `Held` in place of `Session`: one is unanswerable on the surface that has room
 /// for the other. It sits last-but-one rather than second, because dropping a column shifts the row
-/// rather than blanking a cell, and `Held` reads beside the gate it is a verdict about. Narrower
-/// than the column it replaces, so this table ends inside the budget the other one exactly fills.
-const SESSION_SCOPED_COLUMNS: [&str; 6] = ["ID", "Schedule", "Next", "Gate", "Held", "Prompt"];
+/// rather than blanking a cell, and `Held` reads beside the gate it is a verdict about.
+const SESSION_SCOPED_COLUMNS: [crate::text::Column; 6] = [
+    crate::text::Column::content("ID"),
+    crate::text::Column::capped("Schedule", SCHEDULE_TRUNCATE),
+    crate::text::Column::content("Next"),
+    crate::text::Column::content("Gate"),
+    crate::text::Column::content("Held"),
+    crate::text::Column::remainder("Prompt"),
+];
 
 /// Which of the two tables is being built.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -266,9 +254,8 @@ fn rows_for(
     resolvable: &Resolvable,
 ) -> Vec<Vec<String>> {
     let now = chrono::Utc::now();
-    // Widened only as far as resolving requires, and paid for out of the prompt so the table holds
-    // its budget either way. Sized against `resolvable` rather than the rows, because `--session`
-    // narrows the listing while `show` and `cancel` still scan every job.
+    // Widened only as far as resolving requires, and sized against `resolvable` rather than the
+    // rows, because `--session` narrows the listing while `show` and `cancel` still scan every job.
     let job_width = crate::text::unique_prefix_len_within(
         jobs.iter().map(|(job, _)| job.id.as_str()),
         resolvable.jobs.iter().map(String::as_str),
@@ -283,13 +270,6 @@ fn rows_for(
         resolvable.sessions.iter().map(String::as_str),
     )
     .max(crate::text::ID_PREFIX);
-    let prompt_width = PROMPT_TRUNCATE
-        .saturating_sub(job_width.saturating_sub(crate::text::ID_PREFIX))
-        .saturating_sub(match layout {
-            Layout::Unscoped => session_width.saturating_sub(crate::text::ID_PREFIX),
-            Layout::SessionScoped => 0,
-        })
-        .max(PROMPT_MINIMUM);
 
     jobs.iter()
         .zip(sessions.iter())
@@ -298,10 +278,7 @@ fn rows_for(
             if layout == Layout::Unscoped {
                 row.push(session.get(..session_width).unwrap_or(session).to_string());
             }
-            row.push(crate::text::sanitize_to_line(
-                &job.schedule.describe(),
-                SCHEDULE_TRUNCATE,
-            ));
+            row.push(job.schedule.describe());
             // Relative, because the absolute instant cost 23 columns to answer a question a reader
             // asks in the relative form. An occurrence already due reads as `due` rather than as
             // `0s`: a host that was down through it has not missed it, and the two are different
@@ -323,23 +300,18 @@ fn rows_for(
                 Some(gate) => gate.probe.kind_str().to_string(),
                 None => "-".to_string(),
             });
-            // Three answers, and blank is one of them: a job that will fire says nothing, so the
-            // column is quiet on the common case and speaks on the two that need attention.
+            // Three answers, all spelled: a blank cell reads as a missing field to anything that
+            // splits the row on whitespace.
             if layout == Layout::SessionScoped {
                 row.push(
                     match crate::schedule::job_withheld(memory, job, *level, tools) {
                         crate::schedule::Withheld::Yes(_) => "yes".to_string(),
-                        crate::schedule::Withheld::Undetermined => "?".to_string(),
-                        crate::schedule::Withheld::No => String::new(),
+                        crate::schedule::Withheld::Undetermined => "unknown".to_string(),
+                        crate::schedule::Withheld::No => "no".to_string(),
                     },
                 );
             }
-            // Whitespace collapsed first, then sanitized. The collapse is for legibility (a prompt
-            // is prose and wraps), not safety: `\u{1b}` is not whitespace and survives it.
-            row.push(crate::text::sanitize_to_line(
-                &job.prompt.split_whitespace().collect::<Vec<_>>().join(" "),
-                prompt_width,
-            ));
+            row.push(crate::text::prose_cell(&job.prompt));
             row
         })
         .collect()
@@ -372,12 +344,12 @@ fn render(
         return Ok(());
     }
 
-    let headers: &[&str] = match layout {
+    let columns: &[crate::text::Column] = match layout {
         Layout::Unscoped => &COLUMNS,
         Layout::SessionScoped => &SESSION_SCOPED_COLUMNS,
     };
-    stream.write(crate::text::format_columns(
-        headers,
+    stream.write(crate::text::format_table(
+        columns,
         &rows_for(memory, jobs, layout, tools, resolvable),
     ))?;
     Ok(())
@@ -466,7 +438,7 @@ async fn show_job(
         }
         None => fields.push(("gate", "none (fires on schedule)".to_string())),
     }
-    // Line structure preserved and indented, as `/tasks show` does for a task's output: a job's
+    // Line structure preserved and indented, as `/task show` does for a task's output: a job's
     // prompt is prose the model wrote for its own future self and is routinely multi-line, and the
     // indent is what stops a line in it reading as another field.
     fields.push(("prompt", String::new()));
@@ -701,34 +673,28 @@ mod tests {
         // way something hostile arrives in this column.
         job.prompt =
             "watch the thing\u{1b}[31m\nffffffff  every 1m  now  -  -  -  harmless".to_string();
+        let jobs = [(job, None)];
         let rows = rows_for(
             &crate::schedule::SchedulerMemory::default(),
-            &[(job, None)],
+            &jobs,
             Layout::Unscoped,
             None,
-            &Resolvable::of(&[]),
+            &Resolvable::of(&jobs),
         );
 
-        let [row] = rows.as_slice() else {
-            panic!("one job, one row: {rows:?}");
-        };
-        for cell in row {
+        let table = crate::text::format_table(&COLUMNS, &rows);
+        assert_eq!(table.lines().count(), 2, "one job, one row: {table}");
+        for line in table.lines() {
             assert!(
-                !cell.contains('\u{1b}') && !cell.contains('\n'),
-                "a cell reaches a terminal verbatim, so neither may survive: {cell:?}"
+                !line.contains('\u{1b}'),
+                "a line reaches a terminal verbatim, so an escape may not survive: {line:?}"
+            );
+            assert!(
+                crate::text::display_width(line) <= crate::text::TABLE_WIDTH,
+                "and the row is bounded, or one long spec or a paragraph of prompt wraps it into \
+                 unreadability: {line:?}"
             );
         }
-        assert!(
-            row[2].chars().count() <= SCHEDULE_TRUNCATE,
-            "and the schedule is bounded, or one long spec pushes every later column off the \
-             screen: {:?}",
-            row[2]
-        );
-        assert!(
-            row[5].chars().count() <= PROMPT_TRUNCATE,
-            "the prompt too, since a paragraph would wrap the row into unreadability: {:?}",
-            row[5]
-        );
     }
 
     /// The recorded level is clamped by the enabled set before anything is concluded from it.
@@ -902,15 +868,15 @@ mod tests {
                 Some(shell_gate("gh pr checks", GatePredicate::Changed)),
                 Some(Permission::Unrestricted)
             ),
-            "",
-            "an authorized gate will fire, and blank means that rather than `not checked`"
+            "no",
+            "an authorized gate will fire, and the column says so rather than `not checked`"
         );
         assert_eq!(
             held_cell(
                 Some(shell_gate("gh pr checks", GatePredicate::Changed)),
                 None
             ),
-            "?",
+            "unknown",
             "a level that could not be established is unanswerable, not healthy"
         );
     }
@@ -936,24 +902,29 @@ mod tests {
         ] {
             let mut job = job.clone();
             job.next_fire_at = chrono::Utc::now() + offset;
-            for layout in [Layout::Unscoped, Layout::SessionScoped] {
+            for (layout, columns) in [
+                (Layout::Unscoped, &COLUMNS),
+                (Layout::SessionScoped, &SESSION_SCOPED_COLUMNS),
+            ] {
                 let jobs = [(job.clone(), Some(Permission::Read))];
-                let rows = rows_for(
-                    &crate::schedule::SchedulerMemory::default(),
-                    &jobs,
-                    layout,
-                    None,
-                    &Resolvable::of(&jobs),
+                let table = crate::text::format_table(
+                    columns,
+                    &rows_for(
+                        &crate::schedule::SchedulerMemory::default(),
+                        &jobs,
+                        layout,
+                        None,
+                        &Resolvable::of(&jobs),
+                    ),
                 );
-                let width: usize = rows[0]
-                    .iter()
-                    .map(|cell| crate::text::display_width(cell))
-                    .sum::<usize>()
-                    + 2 * (rows[0].len() - 1);
-                assert!(
-                    width <= TABLE_BUDGET,
-                    "{layout:?} row is {width} columns against a budget of {TABLE_BUDGET}: {rows:?}"
-                );
+                for row in table.lines() {
+                    let width = crate::text::display_width(row);
+                    assert!(
+                        width <= crate::text::TABLE_WIDTH,
+                        "{layout:?} row is {width} columns against a budget of {}: {row}",
+                        crate::text::TABLE_WIDTH
+                    );
+                }
             }
         }
     }
@@ -1145,16 +1116,18 @@ mod tests {
             "two jobs in one session are not two sessions: {:?}",
             rows[0][1]
         );
-        assert_eq!(
-            rows[0][5].chars().count(),
-            PROMPT_TRUNCATE,
-            "and the prompt keeps its full width, having paid for nothing"
-        );
+        for row in crate::text::format_table(&COLUMNS, &rows).lines().skip(1) {
+            assert_eq!(
+                crate::text::display_width(row),
+                crate::text::TABLE_WIDTH,
+                "and the prompt keeps its full width, having paid for nothing: {row}"
+            );
+        }
     }
 
     /// Widening an id is paid for out of the prompt, so the table holds its budget either way.
     #[test]
-    fn a_widened_id_is_taken_out_of_the_prompt() {
+    fn a_widened_id_is_paid_for_out_of_the_prompt() {
         let long = "x".repeat(200);
         let mut first = job_with(None);
         let mut second = job_with(None);
@@ -1173,11 +1146,16 @@ mod tests {
         );
         let widened = rows[0][0].chars().count();
         assert!(widened > crate::text::ID_PREFIX);
-        assert_eq!(
-            rows[0][5].chars().count(),
-            PROMPT_TRUNCATE - (widened - crate::text::ID_PREFIX),
-            "the prompt gives back exactly what the id took"
-        );
+        for row in crate::text::format_table(&SESSION_SCOPED_COLUMNS, &rows)
+            .lines()
+            .skip(1)
+        {
+            assert_eq!(
+                crate::text::display_width(row),
+                crate::text::TABLE_WIDTH,
+                "the prompt gives back exactly what the id took: {row}"
+            );
+        }
     }
 
     /// An occurrence that is already due is a different state from one due in no time at all.

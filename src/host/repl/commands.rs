@@ -579,7 +579,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                 None => materialized,
             };
             // Say so rather than printing nothing, like every other list command
-            // (`/tasks`, `/memory`, `/skill`). Silence here would be ambiguous between
+            // (`/task`, `/memory`, `/skill`). Silence here would be ambiguous between
             // "no history" and "the command did not run", and it would leave the
             // `[display]` blank lines bracketing an empty region. `/history 0` asks
             // for nothing and gets the neutral wording: there may well be a
@@ -709,13 +709,13 @@ pub(crate) enum SlashCommand {
     ScheduleCancel {
         id: String,
     },
-    /// `/tasks`: list this session's background tasks.
+    /// `/task`: list this session's background tasks.
     TaskList,
     /// One task in full, including the id the listing shortens.
     TaskShow {
         id: String,
     },
-    /// `/tasks cancel <id>`, or `/tasks cancel --all`.
+    /// `/task cancel <id>`, or `/task cancel --all`.
     TaskCancel {
         /// `None` means every running task in this session.
         id: Option<String>,
@@ -824,7 +824,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "session" => Some(SlashCommand::Session),
         "memory" => Some(parse_memory_slash(argument.as_deref().unwrap_or(""))),
         "schedule" => Some(parse_schedule_slash(argument.as_deref().unwrap_or(""))),
-        "tasks" => Some(parse_tasks_slash(argument.as_deref().unwrap_or(""))),
+        "task" => Some(parse_task_slash(argument.as_deref().unwrap_or(""))),
         "permission" => Some(SlashCommand::Permission(argument)),
         "approvals" => Some(SlashCommand::Approvals(argument)),
         "profile" => Some(SlashCommand::Profile(argument)),
@@ -884,12 +884,12 @@ pub(super) fn parse_schedule_slash(rest: &str) -> SlashCommand {
         _ => SlashCommand::ScheduleList,
     }
 }
-/// Parse the argument to `/tasks …`.
+/// Parse the argument to `/task …`.
 ///
-/// Bare `/tasks` lists; `/tasks show <id>` prints one in full; `/tasks cancel <id>` stops one;
-/// `/tasks cancel --all` stops them all. There is no way to *start* one here, for the same reason
+/// Bare `/task` lists; `/task show <id>` prints one in full; `/task cancel <id>` stops one;
+/// `/task cancel --all` stops them all. There is no way to *start* one here, for the same reason
 /// `/schedule` has no `create`: the decision to detach belongs to the agent making the call.
-pub(super) fn parse_tasks_slash(rest: &str) -> SlashCommand {
+pub(super) fn parse_task_slash(rest: &str) -> SlashCommand {
     let rest = rest.trim();
     if let Some(id) = rest.strip_prefix("show").map(str::trim)
         && !id.is_empty()
@@ -975,44 +975,82 @@ pub(crate) fn unknown_command_message(line: &str) -> String {
     let command = line.split(char::is_whitespace).next().unwrap_or(line);
     format!("Unknown command: {command}. Type /help for available commands.")
 }
-pub(super) fn print_help() {
-    crate::streams::write_stderr_line("Commands:");
+/// The `/mcp` subcommands are arguments, not top-level commands, so they are absent from
+/// `COMMANDS`; `/help` lists them under `/mcp` so it still documents the full grammar. Keep this
+/// set in step with `parse_mcp_slash` and `MCP_SUBCOMMANDS`.
+const MCP_HELP_ROWS: [(&str, &str); 5] = [
+    ("/mcp list", "List configured MCP servers"),
+    (
+        "/mcp reconnect <server>",
+        "Reconnect smoke-test for one server",
+    ),
+    ("/mcp login <server>", "Run the OAuth flow for a server"),
+    (
+        "/mcp logout <server>",
+        "Clear stored credentials for a server",
+    ),
+    (
+        "/mcp <server>:<prompt> [args]",
+        "Render an MCP prompt as the next turn",
+    ),
+];
+
+/// The `Commands:` block of `/help`: one row per command, every description starting in the same
+/// column.
+fn help_command_rows() -> String {
+    let mut rows: Vec<(String, &str)> = Vec::new();
     for command in crate::host::COMMANDS {
         let left = if command.arg_hint.is_empty() {
             format!("/{}", command.name)
         } else {
             format!("/{} {}", command.name, command.arg_hint)
         };
-        crate::streams::write_stderr_line(format!("  {left:<33}  {}", command.help));
+        rows.push((left, command.help));
         if command.name == "mcp" {
-            // The /mcp subcommands are arguments, not top-level commands, so they are absent from
-            // COMMANDS; list them here so help still documents the full grammar. Keep this set in
-            // step with `parse_mcp_slash` and `MCP_SUBCOMMANDS`.
-            crate::streams::write_stderr_line(format!(
-                "  {:<33}  List configured MCP servers",
-                "/mcp list"
-            ));
-            crate::streams::write_stderr_line(format!(
-                "  {:<33}  Reconnect smoke-test for one server",
-                "/mcp reconnect <server>"
-            ));
-            crate::streams::write_stderr_line(format!(
-                "  {:<33}  Run the OAuth flow for a server",
-                "/mcp login <server>"
-            ));
-            crate::streams::write_stderr_line(format!(
-                "  {:<33}  Clear stored credentials for a server",
-                "/mcp logout <server>"
-            ));
-            crate::streams::write_stderr_line(format!(
-                "  {:<33}  Render an MCP prompt as the next turn",
-                "/mcp <server>:<prompt> [args]"
-            ));
+            rows.extend(
+                MCP_HELP_ROWS
+                    .iter()
+                    .map(|(left, help)| ((*left).to_string(), *help)),
+            );
         }
     }
+    // Sized to the widest row: the hints are free text, and a literal width holds only until one
+    // grows past it.
+    let width = rows
+        .iter()
+        .map(|(left, _)| crate::text::display_width(left))
+        .max()
+        .unwrap_or(0);
+    let mut out = String::from("Commands:\n");
+    for (left, help) in &rows {
+        out.push_str("  ");
+        out.push_str(&crate::text::format_columns_row(&[left, help], &[width]));
+    }
+    out
+}
+
+pub(super) fn print_help() {
+    crate::streams::write_stderr(help_command_rows());
     crate::streams::write_stderr_line("");
     crate::streams::write_stderr_line("Shortcuts:");
     crate::streams::write_stderr_line("  !<command>    Execute a shell command directly");
     crate::streams::write_stderr_line("  Shift+Tab     Cycle permission level");
     crate::streams::write_stderr_line("  Ctrl+D        Exit the shell");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_help_description_starts_in_the_same_column() {
+        let text = help_command_rows();
+        // A description follows the one run of two or more spaces on its row.
+        let columns: std::collections::BTreeSet<usize> = text
+            .lines()
+            .skip(1)
+            .map(|row| row.rfind("  ").map_or(0, |gap| gap + 2))
+            .collect();
+        assert_eq!(columns.len(), 1, "{text}");
+    }
 }

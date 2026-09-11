@@ -1,7 +1,7 @@
 //! `meka skill`: list, get, show, add, remove. Parseable data goes to stdout and lifecycle and
 //! diagnostics go through `tracing`, as in [`crate::cli::mcp`].
 
-use std::{collections::BTreeMap, path::Path};
+use std::{borrow::Cow, collections::BTreeMap, path::Path};
 
 use crate::{
     config::ResolvedConfig,
@@ -9,12 +9,14 @@ use crate::{
     skills,
 };
 
-const DESCRIPTION_TRUNCATE: usize = 40;
-
-/// Attribution is free text from a file meka may not have written, and
-/// [`crate::text::format_columns`] pads every column to its widest cell, so one long author would
-/// indent every later column on every row.
+/// Ceiling on the author column: attribution is free text from a file meka may not have written,
+/// shown for information.
 const AUTHOR_TRUNCATE: usize = 20;
+
+/// Ceiling on the `--paths` column. The flag answers which root a skill lives in, which the root
+/// and the leaf say between them; `get` has the whole path. Chosen with [`AUTHOR_TRUNCATE`] so a
+/// row with an ordinary name still leaves the description its floor.
+const PATH_TRUNCATE: usize = 32;
 
 /// Argument bag for [`run_add`]. Borrowed so callers don't have to clone every field out of the
 /// clap-derived `cli::SkillAction::Add` variant.
@@ -67,8 +69,8 @@ pub(crate) fn list(
 ///
 /// The column set is *fixed*, not adaptive: this goes to stdout so it can be piped, and a column
 /// that appeared only when the store happened to contain a foreign skill would silently change the
-/// field offsets a script reads. `External` is therefore always present and always a boolean, even
-/// in the common case where every row says `false`.
+/// field offsets a script reads. `External` is therefore always present and always `yes` or `no`,
+/// even in the common case where every row says `no`.
 ///
 /// `native_root` is meka's own store, the only directory anything writes to. A skill from anywhere
 /// else came from `[skills] extra_paths`, which is what `External` reports; `paths` answers the
@@ -95,12 +97,16 @@ fn print_list(
 /// sees without capturing stdout; nothing else may call it, or the two would drift and the test
 /// would be checking a copy of the layout rather than the layout.
 fn render_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool) -> String {
-    let mut headers = vec!["Name", "Author", "Pri", "External"];
+    let mut columns = vec![
+        crate::text::Column::content("Name"),
+        crate::text::Column::capped("Author", AUTHOR_TRUNCATE),
+        crate::text::Column::content("Priority"),
+        crate::text::Column::content("External"),
+    ];
     if paths {
-        headers.push("Path");
+        columns.push(crate::text::Column::capped("Path", PATH_TRUNCATE).elided());
     }
-    // Last, and the only unpadded column, so it is the one that may run long.
-    headers.push("Description");
+    columns.push(crate::text::Column::remainder("Description"));
 
     let rows: Vec<Vec<String>> = skills
         .iter()
@@ -108,29 +114,21 @@ fn render_list(skills: &[skills::Skill], native_root: Option<&Path>, paths: bool
             let external = native_root.is_none_or(|native| skill.root != native);
             let mut row = vec![
                 skill.name.clone(),
-                truncate(
-                    &display_metadata(skill.author().as_deref()),
-                    AUTHOR_TRUNCATE,
-                ),
+                display_metadata(skill.author().as_deref()),
                 skill.priority.to_string(),
-                external.to_string(),
+                if external { "yes" } else { "no" }.to_string(),
             ];
             if paths {
-                // Sanitized like the author cell beside it. A path is not meka's text either: its
-                // last component is a directory name someone else chose, and a newline in one
-                // splits this row in two, which for a table this file advertises as pipeable is a
-                // fabricated record rather than a cosmetic smudge.
                 row.push(display_path(&skill.source_dir));
             }
-            row.push(truncate(
+            row.push(crate::text::prose_cell(
                 &crate::memory::render_description_for_model(&skill.description),
-                DESCRIPTION_TRUNCATE,
             ));
             row
         })
         .collect();
 
-    crate::text::format_columns(&headers, &rows)
+    crate::text::format_table(&columns, &rows)
 }
 
 /// `meka skill get <name>`: the frontmatter as `key: value` lines.
@@ -150,45 +148,53 @@ pub(crate) fn run_get(
     let body_bytes = std::fs::metadata(&skill.body_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    crate::render::write_stdout_line(format!("name: {}", skill.name))?;
-    // Sanitized like every other cell: a directory name is chosen by whoever put the skill on disk
-    // and can carry a newline or an escape, and this line goes straight to a terminal.
-    crate::render::write_stdout_line(format!("source_dir: {}", display_path(&skill.source_dir)))?;
-    crate::render::write_stdout_line(format!("body_path: {}", display_path(&skill.body_path)))?;
-    crate::render::write_stdout_line(format!(
-        "description: {}",
-        crate::memory::render_description_for_model(&skill.description)
-    ))?;
-    crate::render::write_stdout_line(format!("priority: {}", skill.priority))?;
-    crate::render::write_stdout_line(format!("license: {}", optional(skill.license.as_deref())))?;
-    crate::render::write_stdout_line(format!(
-        "compatibility: {}",
-        optional(skill.compatibility.as_deref())
-    ))?;
-    crate::render::write_stdout_line(format!(
-        "allowed-tools: {}",
-        optional(skill.allowed_tools.as_deref())
-    ))?;
+    crate::render::write_stdout(crate::text::format_fields(&get_fields(&skill, body_bytes)))?;
+    Ok(())
+}
+
+/// The `label: value` lines of [`run_get`], separated from printing so the namespacing can be
+/// asserted.
+fn get_fields(skill: &skills::Skill, body_bytes: u64) -> Vec<(Cow<'static, str>, String)> {
+    let mut fields: Vec<(Cow<'static, str>, String)> = vec![
+        ("name".into(), skill.name.clone()),
+        // Sanitized like every other cell: a directory name is chosen by whoever put the skill on
+        // disk and can carry a newline or an escape, and this line goes straight to a terminal.
+        ("source_dir".into(), display_path(&skill.source_dir)),
+        ("body_path".into(), display_path(&skill.body_path)),
+        (
+            "description".into(),
+            crate::memory::render_description_for_model(&skill.description),
+        ),
+        ("priority".into(), skill.priority.to_string()),
+        ("license".into(), optional(skill.license.as_deref())),
+        (
+            "compatibility".into(),
+            optional(skill.compatibility.as_deref()),
+        ),
+        (
+            "allowed-tools".into(),
+            optional(skill.allowed_tools.as_deref()),
+        ),
+    ];
     // Both halves sanitized: a key is arbitrary YAML text from a file meka may not have written,
     // and an escape or a newline in one reaches the terminal or fakes an extra output line.
+    let sanitized = |value: &serde_norway::Value| {
+        crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(value))
+    };
     match skill.metadata_map() {
         Some(map) => {
             for (key, value) in map {
-                crate::render::write_stdout_line(format!(
-                    "metadata.{}: {}",
-                    crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(key)),
-                    crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(value))
-                ))?;
+                fields.push((
+                    format!("metadata.{}", sanitized(key)).into(),
+                    sanitized(value),
+                ));
             }
         }
         // Whatever the file put there instead. Shown rather than skipped: meka keeps it verbatim
         // across a rewrite, so a command that hid it would hide the thing being preserved.
         None => {
             if let Some(value) = skill.metadata.as_ref() {
-                crate::render::write_stdout_line(format!(
-                    "metadata: {}",
-                    crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(value))
-                ))?;
+                fields.push(("metadata".into(), sanitized(value)));
             }
         }
     }
@@ -198,14 +204,10 @@ pub(crate) fn run_get(
     // hostile one could add a second `source_dir:` or `body:` line contradicting the real one. This
     // is stdout, which the project treats as parseable data.
     for (key, value) in &skill.extra {
-        crate::render::write_stdout_line(format!(
-            "extra.{}: {}",
-            crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(key)),
-            crate::entry::sanitize_stored_description(&skills::yaml_value_to_string(value))
-        ))?;
+        fields.push((format!("extra.{}", sanitized(key)).into(), sanitized(value)));
     }
-    crate::render::write_stdout_line(format!("body: {body_bytes} bytes"))?;
-    Ok(())
+    fields.push(("body".into(), format!("{body_bytes} bytes")));
+    fields
 }
 
 /// `meka skill show <name>`: print the body as the agent receives it, i.e. the base-directory
@@ -557,16 +559,6 @@ fn optional(value: Option<&str>) -> String {
         || "(unset)".to_string(),
         crate::entry::sanitize_stored_description,
     )
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 pub(crate) async fn run_skill_subcommand(
@@ -1310,7 +1302,12 @@ mod tests {
         // Native only: the column is still there, and every row says so.
         let narrow = render(std::slice::from_ref(&mine), Some(&native), false);
         assert!(narrow.contains("External"), "{narrow}");
-        assert!(narrow.contains("false"), "{narrow}");
+        assert!(
+            narrow
+                .lines()
+                .any(|line| line.starts_with("mine") && line.contains("  no  ")),
+            "{narrow}"
+        );
         assert!(
             !narrow.contains("Version") && !narrow.contains("Path"),
             "{narrow}"
@@ -1318,7 +1315,7 @@ mod tests {
 
         // A skill from a read-only root is flagged, without the header changing.
         let mixed = render(&[mine, theirs.clone()], Some(&native), false);
-        // Fields, not bytes: `format_columns` pads to the widest cell, so adding a row legitimately
+        // Fields, not bytes: `format_table` pads to the widest cell, so adding a row legitimately
         // changes the spacing. What must not change is which columns exist, or in what order.
         assert_eq!(
             fields(&mixed),
@@ -1328,7 +1325,7 @@ mod tests {
         assert!(
             mixed
                 .lines()
-                .any(|line| line.starts_with("theirs") && line.contains("true")),
+                .any(|line| line.starts_with("theirs") && line.contains("  yes  ")),
             "{mixed}"
         );
 
@@ -1337,7 +1334,14 @@ mod tests {
         let with_paths = render(&[theirs], Some(&native), true);
         assert_eq!(
             fields(&with_paths),
-            vec!["Name", "Author", "Pri", "External", "Path", "Description"],
+            vec![
+                "Name",
+                "Author",
+                "Priority",
+                "External",
+                "Path",
+                "Description"
+            ],
             "--paths adds exactly one column, and Description stays last"
         );
         // Joined rather than spelled, because the rendered path uses the host separator and the
@@ -1349,7 +1353,7 @@ mod tests {
         );
     }
 
-    /// `format_columns` pads to the widest cell, so an untruncated author indents every other
+    /// `format_table` pads to the widest cell, so an untruncated author indents every other
     /// column on every row. This is the layout bug, not merely a long cell.
     #[test]
     fn a_long_author_cannot_widen_the_whole_table() {
@@ -1367,12 +1371,39 @@ mod tests {
         );
         for line in rendered.lines() {
             assert!(
-                line.chars().count() < 80,
+                crate::text::display_width(line) <= crate::text::TABLE_WIDTH,
                 "a {}-char author widened the table to {}: {line}",
                 long.chars().count(),
-                line.chars().count()
+                crate::text::display_width(line)
             );
         }
+    }
+
+    /// A frontmatter key the file chose cannot overwrite a line meka wrote: the file's own
+    /// `priority` and `body` arrive under `extra.`, beside the modeled ones rather than in place
+    /// of them.
+    #[test]
+    fn get_namespaces_every_key_the_file_chose() {
+        let native = std::path::PathBuf::from("/config/skills");
+        let mut skill = sample_skill("mine", &native, "Jane Doe");
+        skill.extra.insert("priority".into(), 3.into());
+        skill.extra.insert("body".into(), "forged".into());
+        let labels: Vec<String> = get_fields(&skill, 12)
+            .into_iter()
+            .map(|(label, _)| label.into_owned())
+            .collect();
+        for label in ["priority", "body", "metadata.author"] {
+            assert_eq!(
+                labels
+                    .iter()
+                    .filter(|candidate| *candidate == label)
+                    .count(),
+                1,
+                "{labels:?}"
+            );
+        }
+        assert!(labels.contains(&"extra.priority".to_string()), "{labels:?}");
+        assert!(labels.contains(&"extra.body".to_string()), "{labels:?}");
     }
 
     fn sample_skill(name: &str, root: &Path, author: &str) -> skills::Skill {
@@ -1436,18 +1467,5 @@ mod tests {
 
         // The column is still there and still names the directory, minus what it cannot carry.
         assert!(table.contains("INJECTED"), "{table:?}");
-    }
-
-    #[test]
-    fn truncate_short() {
-        assert_eq!(truncate("hello", 40), "hello");
-    }
-
-    #[test]
-    fn truncate_long() {
-        let long = "a".repeat(80);
-        let truncated = truncate(&long, 40);
-        assert_eq!(truncated.chars().count(), 40);
-        assert!(truncated.ends_with('…'));
     }
 }

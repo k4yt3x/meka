@@ -1095,7 +1095,7 @@ impl ToolRegistry {
         );
         // `subagent_max_depth == 0` disables sub-agents entirely (the root gets no `agent_spawn`);
         // `>= 1` seeds the root's soft recursion budget, and `absolute_depth` starts at 0 for the
-        // root. The predicate folds in the `[tools]` half too, and is named because `meka tools
+        // root. The predicate folds in the `[tools]` half too, and is named because `meka tool
         // list` has to reach the same answer with no provider to assemble a session with.
         if super::subagent::agent_tools_registered(
             &materials.core.builtin_filter,

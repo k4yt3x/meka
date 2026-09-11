@@ -416,7 +416,7 @@ impl TaskStatus {
     /// Whether a finished task should wake a host, or wait for the next turn to carry it.
     ///
     /// Every terminal outcome is delivered; this decides only whether delivering it is worth a turn
-    /// nobody asked for. A cancellation is always somebody's deliberate act (`/tasks cancel`, the
+    /// nobody asked for. A cancellation is always somebody's deliberate act (`/task cancel`, the
     /// `task_cancel` tool, a second Ctrl+C, `POST .../cancel`), so the one party who would learn
     /// something from the turn already knows, and a command whose whole purpose is to stop work
     /// would be starting some. The outcome still reaches the model, on the next turn there is.

@@ -75,7 +75,7 @@ At **none**, no tools are available. The agent can only respond with text.
 
 ## Filtering built-in tools
 
-Any built-in can be allow-listed, blocked, or have its required permission overridden via the `[tools]` table in `config.toml`. See [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). Run `meka tools list` to see every built-in with its effective permission and current status.
+Any built-in can be allow-listed, blocked, or have its required permission overridden via the `[tools]` table in `config.toml`. See [`[tools]`: built-in tool filters](../configuration/config-file.md#tools-built-in-tool-filters). Run `meka tool list` to see every built-in with its effective permission and current status.
 
 ## MCP tools
 
@@ -204,7 +204,7 @@ A sub-agent is not a one-shot. Its conversation persists under its own session, 
 
 All three refuse an id that isn't a child of the current session, so one session can never drive or delete another's sub-agents.
 
-**All four go together.** Denying `agent_spawn` in [`[tools].disabled_tools`](../configuration/config-file.md#tools-built-in-tool-filters), or setting [`session.subagent_max_depth = 0`](../configuration/config-file.md#sessionsubagent_max_depth), removes the three lifecycle tools too: an agent that cannot delegate has no sub-agents for them to act on, and leaving them behind would let it drive the ones a previous run left in the store. `meka tools list` reports all four as `disabled` in either case. Denying only `agent_list` removes just that one.
+**All four go together.** Denying `agent_spawn` in [`[tools].disabled_tools`](../configuration/config-file.md#tools-built-in-tool-filters), or setting [`session.subagent_max_depth = 0`](../configuration/config-file.md#sessionsubagent_max_depth), removes the three lifecycle tools too: an agent that cannot delegate has no sub-agents for them to act on, and leaving them behind would let it drive the ones a previous run left in the store. `meka tool list` reports all four as `disabled` in either case. Denying only `agent_list` removes just that one.
 
 **A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a sub-agent at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a sub-agent you deliberately restricted. A sub-agent that shares your workspace keeps the working directory it was spawned in; at `workspace`, a follow-up is refused once that directory lies outside your own boundary, the same check a sub-agent's `writable_roots` get.
 

@@ -682,7 +682,7 @@ pub(crate) struct SkillCache {
     /// Deliberately separate from `root`: a cache with no root is an *empty* store (nothing on
     /// disk, or test scaffolding), and its `skill_*` tools still belong in the registry. A
     /// disabled cache means the feature is off, so they are not registered and the `[Skills]`
-    /// section never renders. Conflating the two would make `meka tools list` hide tools that a
+    /// section never renders. Conflating the two would make `meka tool list` hide tools that a
     /// real session has.
     enabled: bool,
     state: Mutex<CacheState>,
@@ -702,7 +702,7 @@ impl SkillCache {
     }
 
     /// Construct a cache backed by a specific root. `None` produces a permanently-empty cache,
-    /// useful for tests and for subcommands (`meka tools list`) that don't read skill metadata.
+    /// useful for tests and for subcommands (`meka tool list`) that don't read skill metadata.
     pub(crate) fn for_root(root: Option<PathBuf>) -> Arc<Self> {
         Self::new(root, Vec::new())
     }

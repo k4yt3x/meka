@@ -92,14 +92,14 @@ meka mcp logout <NAME>
 
 See [MCP](../usage/mcp.md#meka-mcp-cli) for the `add` flags and what each command does.
 
-### `tools`
+### `tool`
 
-Inspect the built-in tool filters. `meka tools list` prints every built-in with its `Required`
-permission, the `Source` of that requirement (`builtin`, or `override` from `[tools]`), its
-`Visibility` (`enabled`, `deferred`, or `disabled`), and the first line of its description.
+Inspect the built-in tool filters. `meka tool list` prints every built-in with its `Permission`,
+the `Source` of that requirement (`builtin`, or `override` from `[tools]`), its `Status`
+(`enabled`, `deferred`, or `disabled`), and the start of its description.
 
 ```bash
-meka tools list [--format <FORMAT>]
+meka tool list [--format <FORMAT>]
 ```
 
 See [Filtering built-in tools](../tools/overview.md#filtering-built-in-tools).
@@ -371,11 +371,11 @@ meka --oneshot -p "what changed?" --format json | jq -r .text
 ```
 
 Every listing and `show` command takes the same `--format plain|json`: `session list|show`,
-`account list`, `profile list`, `mcp list|get|tools`, `schedule list|show`, `memory list|get|show`,
-`tools list`, `history list` and `skill list|get|show`. Under `json`, a `show` prints one object and
-a listing prints `{"<nouns>": [...]}` (`sessions`, `accounts`, `profiles`, `servers`, `jobs`,
-`memories`, `tools`, `history`, `skills`), with the field names the [HTTP API](../usage/http-api.md)
-uses for the same object where it has one. An empty listing is the envelope around an empty array
+`account list|usage|whoami|stats`, `profile list`, `mcp list|get|tools`, `schedule list|show`,
+`memory list|get|show`, `tool list`, `history list` and `skill list|get|show`. Under `json`, a
+`show` prints one object and a listing prints `{"<nouns>": [...]}` (`sessions`, `accounts`,
+`profiles`, `servers`, `jobs`, `memories`, `tools`, `history`, `skills`), with the field names the
+[HTTP API](../usage/http-api.md) uses for the same object where it has one. An empty listing is the envelope around an empty array
 and nothing on stderr; in `plain`, it is a `No <nouns>.` note on stderr and nothing on stdout.
 Warnings and hints stay on stderr under either format, so `meka … --format json 2>/dev/null | jq`
 sees only the document.

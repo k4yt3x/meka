@@ -257,8 +257,8 @@ fn run_on_runtime(runtime: &tokio::runtime::Runtime, cli: cli::Cli) -> anyhow::R
                 cli::Command::Mcp { action } => {
                     cli::mcp::run_mcp_subcommand(&store, action, cli_ref).await
                 }
-                cli::Command::Tools { action } => {
-                    cli::tools::run_tools_subcommand(&store, action, cli_ref)
+                cli::Command::Tool { action } => {
+                    cli::tool::run_tool_subcommand(&store, action, cli_ref)
                 }
                 cli::Command::Skill { action } => {
                     cli::skills::run_skill_subcommand(action, cli_ref).await

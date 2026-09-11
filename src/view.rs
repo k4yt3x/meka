@@ -390,7 +390,7 @@ impl MemoryDetail {
 }
 
 /// One entry of a tool catalog: what `GET /v1/sessions/{id}/tools` answers with, and the core of
-/// what `meka tools list` prints.
+/// what `meka tool list` prints.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "serve", derive(utoipa::ToSchema))]
 pub(crate) struct ToolView {
@@ -421,7 +421,7 @@ impl ToolView {
     }
 }
 
-/// A built-in tool as `meka tools list` prints it: the catalog entry plus the two facts this
+/// A built-in tool as `meka tool list` prints it: the catalog entry plus the two facts this
 /// listing exists to show and a session's catalog cannot, where the required level came from and
 /// whether the config admits the tool at all.
 #[derive(Debug, Clone, Serialize)]

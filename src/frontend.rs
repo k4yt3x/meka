@@ -700,7 +700,7 @@ impl Frontend for PermissionForwardingFrontend {
 }
 
 /// Fully-silent frontend: drops every emit and denies every permission request. Used by tests and
-/// `meka tools list`'s reference registry. Both want a frontend that never reaches out to a user.
+/// `meka tool list`'s reference registry. Both want a frontend that never reaches out to a user.
 /// Sub-agents use [`PermissionForwardingFrontend`] instead so their permission prompts surface in
 /// the parent's UI.
 pub(crate) struct SilentFrontend;

@@ -15,7 +15,7 @@ pub(crate) mod profile;
 pub(crate) mod schedule;
 pub(crate) mod session;
 pub(crate) mod skills;
-pub(crate) mod tools;
+pub(crate) mod tool;
 
 #[allow(
     clippy::large_enum_variant,
@@ -49,9 +49,9 @@ pub(crate) enum Command {
         action: McpAction,
     },
     /// Inspect built-in tool filters
-    Tools {
+    Tool {
         #[command(subcommand)]
-        action: ToolsAction,
+        action: ToolAction,
     },
     /// Manage user skills
     Skill {
@@ -89,7 +89,7 @@ pub(crate) enum Command {
 }
 
 #[derive(clap::Subcommand, Debug)]
-pub(crate) enum ToolsAction {
+pub(crate) enum ToolAction {
     /// List every built-in tool with its effective permission and status
     List {
         /// Output format: plain or json
@@ -1296,10 +1296,13 @@ mod tests {
     /// has, defaulting to plain, and refuses a spelling it does not have.
     #[test]
     fn every_listing_and_show_command_takes_the_same_format_flag() {
-        let commands: [&[&str]; 17] = [
+        let commands: [&[&str]; 20] = [
             &["session", "list"],
             &["session", "show", "0e5f"],
             &["account", "list"],
+            &["account", "usage"],
+            &["account", "whoami"],
+            &["account", "stats"],
             &["profile", "list"],
             &["mcp", "list"],
             &["mcp", "get", "s"],
@@ -1309,7 +1312,7 @@ mod tests {
             &["memory", "list"],
             &["memory", "get", "m"],
             &["memory", "show", "m"],
-            &["tools", "list"],
+            &["tool", "list"],
             &["history", "list"],
             &["skill", "list"],
             &["skill", "get", "s"],
@@ -1324,7 +1327,7 @@ mod tests {
             let json = Cli::try_parse_from(&arguments)
                 .unwrap_or_else(|error| panic!("{command:?} must take --format json: {error}"));
             // The flag is inside each variant, so its value is read back through `Debug`: one
-            // assertion shape for seventeen variants.
+            // assertion shape for twenty variants.
             assert!(
                 format!("{:?}", plain.command).contains("format: Plain"),
                 "{command:?} must default to plain: {:?}",

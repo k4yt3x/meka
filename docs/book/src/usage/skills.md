@@ -174,12 +174,12 @@ There is deliberately no automatic project-level scan. meka does not treat the w
 
 ```console
 $ meka skill list
-Name             Author                Pri  External  Description
-deploy-service   Jane Doe              2    false     How to deploy the service. Use when the…
-borrowed         -                     5    true      A skill another client installed.
+Name            Author    Priority  External  Description
+deploy-service  Jane Doe  2         no        How to deploy the service. Use when asked to ship.
+borrowed        -         5         yes       A skill another client installed.
 ```
 
-`External` is `true` for a skill found under [`extra_paths`](#reading-skills-from-other-directories) rather than in meka's own store. It is always present, even when nothing is external, so a script's field offsets do not shift with the store's contents.
+`External` is `yes` for a skill found under [`extra_paths`](#reading-skills-from-other-directories) rather than in meka's own store. It is always present, even when nothing is external, so a script's field offsets do not shift with the store's contents.
 
 `--paths` adds the on-disk `Path`, which is how you find out *where* an external skill lives. Nothing else goes in this table: `license`, `compatibility`, `allowed-tools`, `version` and arbitrary `metadata` keys are per-skill detail, and `meka skill get <name>` prints all of them.
 

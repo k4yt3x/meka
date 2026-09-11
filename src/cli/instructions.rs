@@ -26,16 +26,31 @@ pub(crate) fn run_instructions_subcommand(
             }
         }
         crate::cli::InstructionsAction::Path => {
-            for path in [
+            let rows: Vec<Vec<String>> = [
                 crate::instructions::instructions_dir(),
                 crate::instructions::instructions_file(),
             ]
             .into_iter()
             .flatten()
-            {
-                let state = if path.exists() { "present" } else { "absent" };
-                crate::render::write_stdout_line(format!("{}\t{}", path.display(), state))?;
+            .map(|path| {
+                vec![
+                    path.display().to_string(),
+                    if path.exists() { "yes" } else { "no" }.to_string(),
+                ]
+            })
+            .collect();
+            if rows.is_empty() {
+                crate::streams::write_stderr_line("No config directory.");
+                return Ok(());
             }
+            // The path is what you open, so it is shown in full.
+            crate::render::write_stdout(crate::text::format_table(
+                &[
+                    crate::text::Column::content("Path"),
+                    crate::text::Column::content("Exists"),
+                ],
+                &rows,
+            ))?;
         }
     }
     Ok(())

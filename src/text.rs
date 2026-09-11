@@ -446,14 +446,14 @@ pub(crate) fn sanitize_stream_text(text: &str) -> String {
         .filter(|c| !crate::text::is_bidi_control(*c as u32))
         .collect()
 }
-/// Format `rows` into a left-aligned, space-padded column layout, the shared renderer for meka's
-/// CLI list tables (`skill list`, `mcp list`, `list`, `scratchpad_list`).
+/// Format `rows` into a left-aligned, space-padded column layout, for a table handed to the model,
+/// which has no terminal to fit. A listing a person reads goes through [`format_table`].
 ///
 /// Each column is widened to its longest cell, the matching header included. Columns are separated
-/// by two spaces; the final column is left unpadded so a long trailing value (a path, a URL, a
-/// preview) doesn't drag a run of trailing whitespace. The returned string has one trailing newline
-/// per line and no extra blank line; the caller picks the stream (`print!` for stdout list
-/// commands, or embed it in a tool result).
+/// by two spaces; the final column is left unpadded and a row ends at its last non-empty cell, so
+/// no line carries trailing whitespace. The returned string has one trailing newline per line and
+/// no extra blank line; the caller picks the stream (`print!` for stdout list commands, or embed it
+/// in a tool result).
 ///
 /// (Distinct from the private `format_table`, which lays out *markdown* pipe tables for the
 /// streaming renderer.)
@@ -478,6 +478,173 @@ pub(crate) fn format_columns(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut out = format_columns_row(headers, &widths);
     for row in rows {
         let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        out.push_str(&format_columns_row(&cells, &widths));
+    }
+    out
+}
+/// What a row of a listing aims to occupy: a terminal's width, so a table is read without wrapping.
+pub(crate) const TABLE_WIDTH: usize = 120;
+/// Ceiling on a name shown for information.
+///
+/// Wide enough for the descriptive names people use (`openrouter-anthropic-messages` is 29), since
+/// a name cut short enough to stop distinguishing two is worse than a shorter remainder.
+pub(crate) const NAME_WIDTH: usize = 32;
+/// Floor on the remainder column. Below this a description says nothing, so a row whose other
+/// columns leave less overruns [`TABLE_WIDTH`] rather than cutting an identifier to fit.
+const REMAINDER_MINIMUM: usize = 24;
+
+/// How wide a column of a listing may be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Width {
+    /// Its widest cell, never cut: an identifier the reader retypes elsewhere, or a fact meka
+    /// composes and so bounds itself.
+    Content,
+    /// Its widest cell up to a ceiling, cut past it: text shown for information, whose full form
+    /// is one `show` away.
+    Capped(usize),
+    /// What the budget leaves once every other column has its width, never below the floor and
+    /// never wider than its widest cell: the one prose column.
+    Remainder,
+}
+
+/// Where a cell wider than its column is cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The end goes; prose reads left to right.
+    Tail,
+    /// The middle goes; a path is told apart by its root and its leaf.
+    Middle,
+}
+
+/// One column of a listing: its header, and how much of the row it may take.
+///
+/// A listing declares its columns once and hands the rows over raw; [`format_table`] sanitizes
+/// every cell, sizes each column by its role, and cuts what does not fit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Column {
+    header: &'static str,
+    width: Width,
+    cut: Cut,
+}
+
+impl Column {
+    /// A column shown in full: an identifier the reader retypes, or a fact meka composes.
+    pub(crate) const fn content(header: &'static str) -> Self {
+        Self {
+            header,
+            width: Width::Content,
+            cut: Cut::Tail,
+        }
+    }
+
+    /// A column shown for information, cut past `max_columns`.
+    pub(crate) const fn capped(header: &'static str, max_columns: usize) -> Self {
+        Self {
+            header,
+            width: Width::Capped(max_columns),
+            cut: Cut::Tail,
+        }
+    }
+
+    /// The column that spends what the row has left. One per table.
+    pub(crate) const fn remainder(header: &'static str) -> Self {
+        Self {
+            header,
+            width: Width::Remainder,
+            cut: Cut::Tail,
+        }
+    }
+
+    /// Cut in the middle rather than at the tail, for a path.
+    pub(crate) const fn elided(self) -> Self {
+        Self {
+            cut: Cut::Middle,
+            ..self
+        }
+    }
+}
+
+/// A run of prose as a listing cell: whitespace runs collapsed to one space. The table does the
+/// sanitizing and the cut; this is only about a paragraph break or an indent in a description,
+/// which is layout for a page rather than information for a row.
+pub(crate) fn prose_cell(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Lay `rows` out under `columns` for a terminal, within [`TABLE_WIDTH`] where the columns allow.
+///
+/// Every cell is sanitized here, once, because every cell reaches a terminal and a cut measured
+/// before flattening is measured on the wrong text. A row with fewer cells than columns is padded
+/// with empty ones; extra cells are dropped. A header is never cut, so a column is at least as
+/// wide as its header whatever its role says.
+pub(crate) fn format_table(columns: &[Column], rows: &[Vec<String>]) -> String {
+    if columns.is_empty() {
+        return String::new();
+    }
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            (0..columns.len())
+                .map(|index| {
+                    row.get(index)
+                        .map(|cell| sanitize_to_line(cell, usize::MAX))
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
+    let widest = |index: usize| {
+        rows.iter()
+            .map(|row| display_width(&row[index]))
+            .chain(std::iter::once(display_width(columns[index].header)))
+            .max()
+            .unwrap_or(0)
+    };
+    let mut widths: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| match column.width {
+            Width::Content => widest(index),
+            Width::Capped(max_columns) => {
+                widest(index).min(max_columns.max(display_width(column.header)))
+            }
+            Width::Remainder => 0,
+        })
+        .collect();
+    let remainders = columns
+        .iter()
+        .filter(|column| column.width == Width::Remainder)
+        .count();
+    let spent = widths.iter().sum::<usize>() + 2 * (columns.len() - 1);
+    // Shared equally should a table declare more than one, so a row still fits; one is the design.
+    if let Some(share) = TABLE_WIDTH.saturating_sub(spent).checked_div(remainders) {
+        let available = share.max(REMAINDER_MINIMUM);
+        for (index, column) in columns.iter().enumerate() {
+            if column.width == Width::Remainder {
+                widths[index] = widest(index).min(available.max(display_width(column.header)));
+            }
+        }
+    }
+
+    let headers: Vec<&str> = columns.iter().map(|column| column.header).collect();
+    let mut out = format_columns_row(&headers, &widths);
+    for row in &rows {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(columns)
+            .zip(&widths)
+            .map(|((cell, column), &width)| {
+                if display_width(cell) <= width {
+                    cell.clone()
+                } else {
+                    match column.cut {
+                        Cut::Tail => truncate_to_width(cell, width),
+                        Cut::Middle => elide_to_width(cell, width),
+                    }
+                }
+            })
+            .collect();
+        let cells: Vec<&str> = cells.iter().map(String::as_str).collect();
         out.push_str(&format_columns_row(&cells, &widths));
     }
     out
@@ -563,7 +730,8 @@ pub(crate) fn unique_prefix_len<'a>(ids: impl Iterator<Item = &'a str> + Clone) 
     // to a full UUID to distinguish an id from itself.
     unique_prefix_len_within(ids.clone(), ids)
 }
-/// One row of [`format_columns`]: every cell but the last padded to its column's width.
+/// One row of [`format_columns`]: every cell but the last padded to its column's width, and
+/// nothing after the last non-empty cell.
 pub(crate) fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
     let mut line = String::new();
     let last = cells.len().saturating_sub(1);
@@ -582,6 +750,9 @@ pub(crate) fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
             line.push_str("  ");
         }
     }
+    // An empty final cell would otherwise leave the previous column's padding and separator on the
+    // row, the trailing run the unpadded last column exists to avoid.
+    line.truncate(line.trim_end_matches(' ').len());
     line.push('\n');
     line
 }
@@ -591,15 +762,16 @@ pub(crate) fn format_columns_row(cells: &[&str], widths: &[usize]) -> String {
 /// whose value is empty is a heading over the indented block its caller appends next (`prompt:`,
 /// `result:`) and is written bare, so no row ends in a run of spaces; it takes no part in the width
 /// either, because nothing lines up against it.
-pub(crate) fn format_fields(fields: &[(&str, String)]) -> String {
+pub(crate) fn format_fields<Label: AsRef<str>>(fields: &[(Label, String)]) -> String {
     let width = fields
         .iter()
         .filter(|(_, value)| !value.is_empty())
-        .map(|(label, _)| display_width(label) + 1)
+        .map(|(label, _)| display_width(label.as_ref()) + 1)
         .max()
         .unwrap_or(0);
     let mut out = String::new();
     for (label, value) in fields {
+        let label = label.as_ref();
         out.push_str(label);
         out.push(':');
         if !value.is_empty() {
@@ -737,9 +909,128 @@ pub(crate) fn bearer(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Precision, elide_to_width, format_fields, format_size, format_timestamp,
-        id_prefix_for_matching, take_columns, unknown_name, wrap_to_width,
+        Column, Precision, TABLE_WIDTH, elide_to_width, format_fields, format_size, format_table,
+        format_timestamp, id_prefix_for_matching, prose_cell, take_columns, unknown_name,
+        wrap_to_width,
     };
+
+    #[test]
+    fn a_prose_cell_collapses_whitespace_and_nothing_else() {
+        assert_eq!(prose_cell("one\n\ntwo  three"), "one two three");
+        assert_eq!(prose_cell(""), "");
+    }
+
+    const LISTING: [Column; 3] = [
+        Column::content("ID"),
+        Column::capped("Profile", 32),
+        Column::remainder("Title"),
+    ];
+
+    /// The remainder spends exactly what the others leave, so a long title lands the row on the
+    /// budget, cut and marked.
+    #[test]
+    fn a_table_spends_the_budget_exactly_when_prose_overflows() {
+        let table = format_table(&LISTING, &[vec![
+            "4d71eeca".to_string(),
+            "p".repeat(40),
+            "t".repeat(400),
+        ]]);
+        let row = table.lines().nth(1).expect("row");
+        assert_eq!(super::display_width(row), TABLE_WIDTH, "{table}");
+        assert!(row.ends_with("..."), "{row}");
+        assert!(
+            row.contains(&format!("{}...", "p".repeat(29))),
+            "capped at 32: {row}"
+        );
+    }
+
+    #[test]
+    fn a_short_table_stays_as_narrow_as_its_content() {
+        let table = format_table(&LISTING, &[vec![
+            "4d71eeca".to_string(),
+            "work".to_string(),
+            "hello".to_string(),
+        ]]);
+        assert_eq!(
+            table,
+            "ID        Profile  Title\n4d71eeca  work     hello\n"
+        );
+    }
+
+    /// An identifier is what the reader retypes, so it is never cut; the remainder keeps its floor
+    /// and the row overruns, which is the failure the floor chooses.
+    #[test]
+    fn an_identifier_is_never_cut_and_the_remainder_keeps_its_floor() {
+        let name = "n".repeat(150);
+        let table = format_table(
+            &[Column::content("Name"), Column::remainder("Description")],
+            &[vec![name.clone(), "d".repeat(400)]],
+        );
+        let row = table.lines().nth(1).expect("row");
+        assert!(row.starts_with(&name), "{row}");
+        assert_eq!(
+            super::display_width(row),
+            150 + 2 + super::REMAINDER_MINIMUM,
+            "{row}"
+        );
+        assert!(row.ends_with("..."), "{row}");
+    }
+
+    /// A ceiling is a ceiling, not a reservation: a capped column is as wide as its widest cell.
+    #[test]
+    fn a_capped_column_takes_only_what_its_cells_need() {
+        let table = format_table(&LISTING, &[vec![
+            "4d71eeca".to_string(),
+            "work".to_string(),
+            "t".repeat(400),
+        ]]);
+        let row = table.lines().nth(1).expect("row");
+        assert!(row.starts_with("4d71eeca  work     t"), "{row}");
+        assert_eq!(super::display_width(row), TABLE_WIDTH, "{row}");
+    }
+
+    #[test]
+    fn a_path_is_cut_in_the_middle() {
+        let table = format_table(
+            &[
+                Column::capped("Path", 20).elided(),
+                Column::content("Exists"),
+            ],
+            &[vec![
+                "/home/someone/.config/meka/skills/deploy-service".to_string(),
+                "yes".to_string(),
+            ]],
+        );
+        let row = table.lines().nth(1).expect("row");
+        assert_eq!(row, "/home/so...y-service  yes");
+    }
+
+    #[test]
+    fn a_header_is_never_cut() {
+        let table = format_table(
+            &[Column::capped("Priority", 3), Column::content("Name")],
+            &[vec!["5".to_string(), "x".to_string()]],
+        );
+        assert_eq!(table, "Priority  Name\n5         x\n");
+    }
+
+    /// Every cell reaches a terminal, so every cell is flattened and stripped, the ones meka wrote
+    /// included; a row short of cells is padded rather than misaligned.
+    #[test]
+    fn every_cell_is_sanitized_and_a_short_row_is_padded() {
+        let table = format_table(&LISTING, &[
+            vec![
+                "4d71eeca".to_string(),
+                "wo\u{1b}[31mrk".to_string(),
+                "line\none".to_string(),
+            ],
+            vec!["ffffffff".to_string()],
+        ]);
+        assert_eq!(
+            table,
+            "ID        Profile  Title\n4d71eeca  work     line one\nffffffff\n"
+        );
+    }
 
     /// Every value starts two columns past the widest `label:`, a heading is written bare and does
     /// not widen the column, and a label is measured in terminal columns rather than bytes.
@@ -755,7 +1046,7 @@ mod tests {
             rendered,
             "id:          7f3a\npermission:  read\na heading that is longer:\n日本:        wide\n"
         );
-        assert_eq!(format_fields(&[]), "");
+        assert_eq!(format_fields::<&str>(&[]), "");
     }
 
     /// The unit ladder and the one decimal. `3_145_727` is the case integer division got wrong:

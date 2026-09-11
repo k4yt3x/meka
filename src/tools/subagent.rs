@@ -926,7 +926,7 @@ pub(crate) fn register_subagent_tools(
 /// Whether a session assembled with these settings gets the `agent_*` family at all.
 ///
 /// The two all-or-nothing conditions [`register_subagent_tools`] and `assemble_agent` between them
-/// impose, named once so `meka tools list` can answer the question without assembling a session.
+/// impose, named once so `meka tool list` can answer the question without assembling a session.
 /// Per-tool `[tools]` entries are *not* here: denying `agent_list` alone removes only that one, and
 /// the caller applies [`BuiltinToolFilter::admits`] per name on top of this.
 ///
@@ -4096,7 +4096,7 @@ mod tests {
         }
     }
 
-    /// Each registered tool has to actually describe itself: `meka tools list` reads the same
+    /// Each registered tool has to actually describe itself: `meka tool list` reads the same
     /// registration a session does, so a definition that lost its description or its schema would
     /// tell the model and the listing nothing while still registering cleanly.
     #[tokio::test]

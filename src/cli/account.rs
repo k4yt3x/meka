@@ -521,12 +521,12 @@ async fn run_list(
     }
     if format == crate::cli::OutputFormat::Json {
         crate::cli::write_json_listing("accounts", &views)?;
-        report_orphaned_accounts(&orphans)?;
+        report_account_problems(&orphans, &config_file)?;
         return Ok(());
     }
     if views.is_empty() {
         crate::streams::write_stderr_line("No accounts.");
-        report_orphaned_accounts(&orphans)?;
+        report_account_problems(&orphans, &config_file)?;
         return Ok(());
     }
     let rows: Vec<Vec<String>> = views
@@ -540,12 +540,64 @@ async fn run_list(
             ]
         })
         .collect();
-    crate::render::write_stdout(crate::text::format_columns(
-        &["Name", "Backend", "Base URL", "Authenticated"],
-        &rows,
-    ))?;
-    report_orphaned_accounts(&orphans)?;
+    crate::render::write_stdout(crate::text::format_table(&ACCOUNT_COLUMNS, &rows))?;
+    report_account_problems(&orphans, &config_file)?;
     Ok(())
+}
+
+/// The listing's columns: the name every `meka account` command takes, the backend, the endpoint
+/// for information, and whether a credential is stored.
+const ACCOUNT_COLUMNS: [crate::text::Column; 4] = [
+    crate::text::Column::content("Name"),
+    crate::text::Column::content("Backend"),
+    crate::text::Column::remainder("Base URL"),
+    crate::text::Column::content("Authenticated"),
+];
+
+/// What this listing reveals about the store and the file beyond the table, said on stderr under
+/// either format.
+fn report_account_problems(
+    orphans: &[String],
+    config_file: &config::ConfigFile,
+) -> anyhow::Result<()> {
+    report_orphaned_accounts(orphans)?;
+    report_unknown_backends(config_file);
+    Ok(())
+}
+
+/// Accounts whose `backend` is not one meka knows, each with the parser's refusal.
+///
+/// `[accounts.<name>]` keeps `backend` as written, so a hand-edited typo loads and lists, and fails
+/// only when a session on the account is built. A listing is where the user comes to check, so it
+/// is where the discrepancy belongs; `meka profile list` reports it too, because every profile on
+/// the account refuses to run.
+fn unknown_backends(config_file: &config::ConfigFile) -> Vec<(String, String)> {
+    config_file
+        .accounts
+        .iter()
+        .filter_map(|(name, account)| {
+            account
+                .backend
+                .parse::<config::Backend>()
+                .err()
+                .map(|error| (name.clone(), error))
+        })
+        .collect()
+}
+
+/// Say each of [`unknown_backends`] on stderr with its remedy, in the shape of the orphan report.
+pub(super) fn report_unknown_backends(config_file: &config::ConfigFile) {
+    for (name, error) in unknown_backends(config_file) {
+        // Both halves are text from the file: the name is a key the user chose, and the refusal
+        // quotes the value as written.
+        let name = crate::text::sanitize_for_display(&name);
+        let error = crate::text::sanitize_for_display(&error);
+        crate::streams::write_stderr_line("");
+        crate::streams::write_stderr_line(format!("Account '{name}': {error}"));
+        crate::render::render_hint(&format!(
+            "set `backend` under `[accounts.{name}]` to one of those"
+        ));
+    }
 }
 
 /// Account names holding a stored credential that no configured account claims.
@@ -1618,12 +1670,11 @@ async fn run_introspection(
                     crate::render::write_stdout(crate::render::format_account_usage(&usage))?;
                 }
                 crate::cli::OutputFormat::Json => {
-                    let out = UsageOutput {
+                    crate::cli::write_json(&UsageOutput {
                         profile: &name,
                         account: &settings.account,
                         usage: &usage,
-                    };
-                    crate::render::write_stdout_line(&serde_json::to_string_pretty(&out)?)?;
+                    })?;
                 }
             },
             None => {
@@ -1669,9 +1720,7 @@ async fn run_introspection(
                 crate::cli::OutputFormat::Plain => {
                     crate::render::write_stdout(format_whoami_plain(&out))
                 }
-                crate::cli::OutputFormat::Json => {
-                    crate::render::write_stdout_line(&serde_json::to_string_pretty(&out)?)
-                }
+                crate::cli::OutputFormat::Json => crate::cli::write_json(&out),
             };
             // Checked before the write is, because on this one command the status *is* the answer:
             // a script reads it to decide whether to re-authenticate. Propagating a failed write
@@ -1693,9 +1742,7 @@ async fn run_introspection(
                     crate::cli::OutputFormat::Plain => {
                         crate::render::write_stdout(format_stats_plain(&out))?
                     }
-                    crate::cli::OutputFormat::Json => {
-                        crate::render::write_stdout_line(&serde_json::to_string_pretty(&out)?)?
-                    }
+                    crate::cli::OutputFormat::Json => crate::cli::write_json(&out)?,
                 }
             }
             None => {
@@ -1718,80 +1765,133 @@ struct StatsOutput<'a> {
     history: &'a crate::provider::UsageHistory,
 }
 
-/// Plain-text (ANSI-free) rendering of `meka account stats`.
+/// `meka account stats` as `label: value` lines, the recent days indented under a bare `recent:`
+/// heading the way `schedule show` prints a prompt.
 fn format_stats_plain(out: &StatsOutput<'_>) -> String {
     let history = out.history;
-    let mut text = format!("Account history: {} ({})\n", out.account, out.profile);
-    let row_tokens = |text: &mut String, label: &str, value: Option<i64>| {
-        if let Some(value) = value {
-            text.push_str(&format!(
-                "  {label:<18} {}\n",
-                crate::text::format_token_count(value.max(0) as u64)
-            ));
-        }
+    let tokens = |value: Option<i64>| {
+        value.map(|value| crate::text::format_token_count(value.max(0) as u64))
     };
-    let row_days = |text: &mut String, label: &str, value: Option<i64>| {
-        if let Some(value) = value {
-            text.push_str(&format!("  {label:<18} {value} days\n"));
-        }
-    };
+    let days = |value: Option<i64>| value.map(|value| format!("{value} days"));
+    let mut fields = vec![
+        ("account", out.account.to_string()),
+        ("profile", out.profile.to_string()),
+    ];
     if let Some(first) = &history.first_used {
-        // Trim an RFC 3339 timestamp to just the date for the human view.
-        let date = first.split('T').next().unwrap_or(first);
-        text.push_str(&format!("  {:<18} {date}\n", "First used:"));
+        // An RFC 3339 timestamp trimmed to its date: the time of day says nothing here.
+        fields.push((
+            "first used",
+            first.split('T').next().unwrap_or(first).to_string(),
+        ));
     }
-    row_tokens(&mut text, "Lifetime tokens:", history.lifetime_tokens);
-    row_tokens(&mut text, "Peak daily:", history.peak_daily_tokens);
-    row_days(&mut text, "Current streak:", history.current_streak_days);
-    row_days(&mut text, "Longest streak:", history.longest_streak_days);
-    if !history.daily.is_empty() {
-        text.push_str("  Recent:\n");
-        for day in history.daily.iter().rev().take(7) {
-            text.push_str(&format!(
-                "    {}  {}\n",
-                day.date,
-                crate::text::format_token_count(day.tokens.max(0) as u64)
-            ));
+    for (label, value) in [
+        ("lifetime tokens", tokens(history.lifetime_tokens)),
+        ("peak daily", tokens(history.peak_daily_tokens)),
+        ("current streak", days(history.current_streak_days)),
+        ("longest streak", days(history.longest_streak_days)),
+    ] {
+        if let Some(value) = value {
+            fields.push((label, value));
         }
+    }
+    if !history.daily.is_empty() {
+        fields.push(("recent", String::new()));
+    }
+    let mut text = crate::text::format_fields(&fields);
+    // Indented, because a date on its own would read as one more field.
+    for day in history.daily.iter().rev().take(7) {
+        text.push_str(&format!(
+            "  {}  {}\n",
+            day.date,
+            crate::text::format_token_count(day.tokens.max(0) as u64)
+        ));
     }
     text
 }
 
-/// Plain-text (ANSI-free) rendering of `meka account whoami`.
+/// `meka account whoami` as `label: value` lines; an identity field the backend did not report
+/// is left out rather than printed empty.
 fn format_whoami_plain(out: &WhoamiOutput<'_>) -> String {
-    let mut text = format!(
-        "Account: {} ({}, via profile {})\n",
-        out.account, out.backend, out.profile
-    );
     let auth = match (out.auth.valid, out.auth.expires_in_seconds) {
         (true, Some(secs)) => format!(
             "valid ({})",
             crate::text::format_duration_short(secs.max(0))
         ),
         (true, None) => "valid".to_string(),
-        (false, _) => "EXPIRED: run `meka account login`".to_string(),
+        (false, _) => "expired; run `meka account login`".to_string(),
     };
-    text.push_str(&format!("  Auth:          {auth}\n"));
+    let mut fields = vec![
+        ("account", out.account.to_string()),
+        ("backend", out.backend.to_string()),
+        ("profile", out.profile.to_string()),
+        ("auth", auth),
+    ];
     if let Some(identity) = &out.identity {
-        let row = |text: &mut String, label: &str, value: &Option<String>| {
+        for (label, value) in [
+            ("name", &identity.display_name),
+            ("email", &identity.email),
+            ("plan", &identity.plan),
+            ("tier", &identity.tier),
+            ("subscription", &identity.subscription_status),
+            ("organization", &identity.organization),
+            ("role", &identity.role),
+        ] {
             if let Some(value) = value {
-                text.push_str(&format!("  {label:<14} {value}\n"));
+                fields.push((label, value.clone()));
             }
-        };
-        row(&mut text, "Name:", &identity.display_name);
-        row(&mut text, "Email:", &identity.email);
-        row(&mut text, "Plan:", &identity.plan);
-        row(&mut text, "Tier:", &identity.tier);
-        row(&mut text, "Subscription:", &identity.subscription_status);
-        row(&mut text, "Organization:", &identity.organization);
-        row(&mut text, "Role:", &identity.role);
+        }
     }
-    text
+    crate::text::format_fields(&fields)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_backend_meka_does_not_know_is_named_with_the_parser_s_refusal() {
+        let config_file: config::ConfigFile = toml::from_str(
+            "[accounts.good]\nbackend = \"anthropic-messages\"\n\n[accounts.typo]\nbackend = \"anthropic\"\n",
+        )
+        .expect("parses");
+        let unknown = unknown_backends(&config_file);
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert_eq!(unknown[0].0, "typo");
+        assert!(
+            unknown[0].1.contains("'anthropic' is not a backend"),
+            "{unknown:?}"
+        );
+    }
+
+    #[test]
+    fn stats_indent_the_recent_days_under_a_bare_heading() {
+        let history = crate::provider::UsageHistory {
+            lifetime_tokens: Some(1_200_000),
+            peak_daily_tokens: None,
+            current_streak_days: Some(3),
+            longest_streak_days: None,
+            first_used: Some("2026-04-01T17:36:16Z".to_string()),
+            daily: vec![crate::provider::DailyUsage {
+                date: "2026-09-10".to_string(),
+                tokens: 950,
+            }],
+        };
+        let text = format_stats_plain(&StatsOutput {
+            profile: "work",
+            account: "codex",
+            history: &history,
+        });
+        assert_eq!(
+            text,
+            "account:          codex\n\
+             profile:          work\n\
+             first used:       2026-04-01\n\
+             lifetime tokens:  1.2M\n\
+             current streak:   3 days\n\
+             recent:\n\
+             \x20 2026-09-10  950\n"
+        );
+    }
 
     #[test]
     fn auth_status_from_credential() {

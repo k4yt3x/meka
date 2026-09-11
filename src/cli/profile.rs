@@ -599,6 +599,16 @@ fn run_use(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The listing's columns: the name `--profile` and `/profile` take, the account and the model for
+/// information, and the two facts.
+const PROFILE_COLUMNS: [crate::text::Column; 5] = [
+    crate::text::Column::content("Name"),
+    crate::text::Column::capped("Account", crate::text::NAME_WIDTH),
+    crate::text::Column::content("Backend"),
+    crate::text::Column::remainder("Model"),
+    crate::text::Column::content("Default"),
+];
+
 fn run_list(format: crate::cli::OutputFormat) -> anyhow::Result<()> {
     let config_file = config::load_config_file_or_err()?;
     let views = profile_views(&config_file);
@@ -616,14 +626,11 @@ fn run_list(format: crate::cli::OutputFormat) -> anyhow::Result<()> {
                         view.account.clone(),
                         view.backend.clone().unwrap_or_else(|| "-".to_string()),
                         view.model.clone().unwrap_or_else(|| "-".to_string()),
-                        if view.active { "*" } else { "" }.to_string(),
+                        if view.active { "yes" } else { "no" }.to_string(),
                     ]
                 })
                 .collect();
-            crate::render::write_stdout(crate::text::format_columns(
-                &["Name", "Account", "Backend", "Model", "Default"],
-                &rows,
-            ))?;
+            crate::render::write_stdout(crate::text::format_table(&PROFILE_COLUMNS, &rows))?;
         }
     }
     // After every branch, the empty one included: a `default_profile` naming nothing over zero
@@ -658,36 +665,39 @@ fn profile_views(config_file: &config::ConfigFile) -> Vec<crate::view::ProfileVi
         .collect()
 }
 
-/// The two states a listing can reveal and a run then fails on, said on stderr under either format.
+/// Every state a listing can reveal and a run then fails on, said on stderr under either format.
 fn report_broken_profiles(config_file: &config::ConfigFile) {
     let default = config_file.default_profile.as_deref();
-    // A `default_profile` naming nothing renders as a table with no `*`, which is exactly what "no
-    // default set" looks like, and the next `meka` run then fails on a setting the user believes is
-    // fine. This listing is where they come to check, so it is where the discrepancy belongs.
+    // A `default_profile` naming nothing renders as a table with `no` in every `Default` cell,
+    // which is exactly what "no default set" looks like, and the next `meka` run then fails on
+    // a setting the user believes is fine. This listing is where they come to check, so it is
+    // where the discrepancy belongs.
     if let Some(default) = default
         && !config_file.profiles.contains_key(default)
     {
+        let default = crate::text::sanitize_for_display(default);
+        crate::streams::write_stderr_line("");
         crate::streams::write_stderr_line(format!(
-            "`default_profile` names '{}': {}; point it at one with `meka profile use <name>`",
-            crate::text::sanitize_for_display(default),
-            crate::text::unknown_name(
-                "profile",
-                &crate::text::sanitize_for_display(default),
-                config_file.profiles.keys()
-            )
+            "`default_profile` names '{default}': {}",
+            crate::text::unknown_name("profile", &default, config_file.profiles.keys())
         ));
+        crate::render::render_hint("point it at one with `meka profile use <name>`");
     }
     // A profile whose account is gone is listed with `-` for its backend, and said aloud: it is the
     // state a hand-deleted `[accounts.<name>]` leaves, and every session on it refuses to run.
     for (name, profile) in &config_file.profiles {
         if !config_file.accounts.contains_key(&profile.account) {
+            let name = crate::text::sanitize_for_display(name);
             let account = crate::text::sanitize_for_display(&profile.account);
+            crate::streams::write_stderr_line("");
             crate::streams::write_stderr_line(format!(
-                "profile '{name}': {}; create it with `meka account add {account}`",
+                "Profile '{name}': {}",
                 crate::text::unknown_name("account", &account, config_file.accounts.keys())
             ));
+            crate::render::render_hint(&format!("create it with `meka account add {account}`"));
         }
     }
+    crate::cli::account::report_unknown_backends(config_file);
 }
 
 // ----- Config file editing (toml_edit, comment-preserving) ---------------------------------------

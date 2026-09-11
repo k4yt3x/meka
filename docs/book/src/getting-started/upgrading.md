@@ -10,6 +10,17 @@ takes `meka.db` alone can therefore carry a schema version its tables have not c
 meka checks for that on open and refuses the store rather than running against it. Copy the `-wal`
 and `-shm` companions with the file.
 
+## 0.49 to 0.50
+
+**`meka tools` is `meka tool`.** Every top-level command names the object it manages in the
+singular, and this was the one that did not. `meka tools list` is `meka tool list`; the flags and
+the JSON envelope are unchanged. `meka mcp tools <name>` keeps its name, since it lists the tools
+of a server rather than managing tools.
+
+**`/tasks` is `/task` in the REPL**, for the same reason: `/skill`, `/memory` and `/schedule` are
+singular. `/task`, `/task show <id>`, `/task cancel <id>` and `/task cancel --all` do what the
+plural did. The HTTP route `/v1/sessions/{id}/tasks` is unchanged.
+
 ## 0.46 to 0.47
 
 **`search_web` is gone.** It scraped DuckDuckGo's HTML and was turned away by the bot detection more

@@ -231,6 +231,15 @@ One word per concept, everywhere it is written or read:
   is exactly one, the remedy: no examples, no alternatives, no explanation of internals, no
   second sentence that restates the first. One sentence where one suffices. A printed line stays
   within 120 columns where its content allows, so it fits a terminal without wrapping.
+- A listing is a `text::format_table` over a column declaration, never hand-rolled widths: an
+  identifier the reader retypes is shown in full, text shown for information is capped (a name at
+  `NAME_WIDTH`), and one prose column takes what is left of `TABLE_WIDTH`, never below its floor.
+  Rows reach the printer raw; it sanitizes and cuts. A table handed to the model uses
+  `format_columns`.
+- A top-level command whose verbs act on instances names the object in the singular (`account`,
+  `profile`, `session`, `skill`, `memory`, `schedule`, `tool`, the REPL's `/task`); a command over
+  one thing keeps the concept's own word (`history`, `instructions`). `mcp tools <name>` lists a
+  server's tools and is a verb, not a noun.
 - **`--format`** is the one output-format flag, on the run and on every `list`, `show` and `export`:
   `plain` by default, `json` where a command offers it, value sets documented per command. Never a
   `--json` switch.

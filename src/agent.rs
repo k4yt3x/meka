@@ -471,7 +471,7 @@ impl Agent {
         self.background_max_tasks = max_tasks;
     }
 
-    /// The shared registry, for the REPL's `/tasks` command and its Ctrl+C handling.
+    /// The shared registry, for the REPL's `/task` command and its Ctrl+C handling.
     pub(crate) fn background_tasks(&self) -> crate::background::BackgroundTasks {
         self.cells.background_tasks.clone()
     }

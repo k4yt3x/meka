@@ -2610,6 +2610,15 @@ mod tests {
     }
 
     #[test]
+    fn format_columns_ends_a_row_at_its_last_non_empty_cell() {
+        let table = format_columns(&["Name", "Default"], &[
+            vec!["local".to_string(), String::new()],
+            vec!["work".to_string(), "yes".to_string()],
+        ]);
+        assert_eq!(table, "Name   Default\nlocal\nwork   yes\n");
+    }
+
+    #[test]
     fn highlight_markdown_emits_ansi() {
         let out = highlight_markdown_to_string("# Hello\n");
         // ANSI escape prefix for any colored output.
