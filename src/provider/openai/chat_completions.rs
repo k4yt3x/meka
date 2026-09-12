@@ -384,11 +384,16 @@ impl OpenAiChatCompletionsProvider {
     }
 }
 
+// An API key has nothing to refresh; the impl exists so every send goes through the one site that
+// races a stop, `crate::oauth::send_with_one_refresh`.
+impl crate::oauth::RefreshesCredential for OpenAiChatCompletionsProvider {}
+
 #[async_trait]
 impl Provider for OpenAiChatCompletionsProvider {
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
+        cancellation: CancellationToken,
     ) -> Result<crate::provider::Completion> {
         let CompletionRequest {
             system_prompt,
@@ -399,23 +404,26 @@ impl Provider for OpenAiChatCompletionsProvider {
         let (body_json, redaction_notice) =
             self.request_body_within_budget(system_prompt, messages, tools, false)?;
 
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", crate::text::bearer(&self.api_key))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body_json)
-            .send()
-            .await
-            .map_err(|error| {
-                crate::error::provider_transport_error("HTTP request failed", &error, None)
-            })?;
+        let response = crate::oauth::send_with_one_refresh(
+            self,
+            crate::error::ProviderRequest::Completion,
+            |error| crate::error::provider_transport_error("HTTP request failed", error, None),
+            || async {
+                Ok(self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .header("Authorization", crate::text::bearer(&self.api_key))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body_json.clone()))
+            },
+            &cancellation,
+        )
+        .await?;
 
         let status = response.status();
         let retry_after = crate::error::parse_retry_after(response.headers());
-        let response_text = response.text().await.map_err(|error| {
-            crate::error::provider_transport_error("failed to read response", &error, retry_after)
-        })?;
+        let response_text =
+            crate::provider::read_whole_reply(response, retry_after, &cancellation).await?;
 
         if !status.is_success() {
             return Err(crate::error::provider_http_error(
@@ -463,17 +471,21 @@ impl Provider for OpenAiChatCompletionsProvider {
             tracing::trace!("stream event receiver dropped");
         }
 
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", crate::text::bearer(&self.api_key))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body_json)
-            .send()
-            .await
-            .map_err(|error| {
-                crate::error::provider_transport_error("HTTP request failed", &error, None)
-            })?;
+        let response = crate::oauth::send_with_one_refresh(
+            self,
+            crate::error::ProviderRequest::Completion,
+            |error| crate::error::provider_transport_error("HTTP request failed", error, None),
+            || async {
+                Ok(self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .header("Authorization", crate::text::bearer(&self.api_key))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body_json.clone()))
+            },
+            &cancellation,
+        )
+        .await?;
 
         let mut protocol = ChatCompletionsStream::default();
         let end = crate::provider::sse::drive(

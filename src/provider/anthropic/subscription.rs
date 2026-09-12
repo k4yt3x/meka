@@ -527,6 +527,7 @@ impl ClaudeSubscriptionProvider {
                     Some("oauth-2025-04-20"),
                 ))
             },
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await?;
         let status = response.status();
@@ -833,8 +834,9 @@ impl Provider for ClaudeSubscriptionProvider {
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
+        cancellation: CancellationToken,
     ) -> Result<crate::provider::Completion> {
-        shared::complete(self, request).await
+        shared::complete(self, request, cancellation).await
     }
 
     async fn stream(
@@ -4819,7 +4821,10 @@ mod tests {
 
         let provider = provider_against(local);
         let message = provider
-            .complete(CompletionRequest::new("", &[Message::user("hi")], &[]))
+            .complete(
+                CompletionRequest::new("", &[Message::user("hi")], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("the call sent again on the refreshed token succeeds")
             .message;
@@ -4863,7 +4868,10 @@ mod tests {
 
         let provider = provider_against(local);
         let error = provider
-            .complete(CompletionRequest::new("", &[Message::user("hi")], &[]))
+            .complete(
+                CompletionRequest::new("", &[Message::user("hi")], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect_err("a token refused after its refresh is a failure");
         match error {

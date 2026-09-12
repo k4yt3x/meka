@@ -14,18 +14,18 @@ pub(crate) const MAX_PROVIDER_RETRIES: u32 = 2;
 /// from the first attempt.
 ///
 /// The attempt cap bounds the number of tries, not what they cost. An attempt that fails by running
-/// out `read_timeout` costs 300 seconds ([`crate::provider::STREAM_IDLE_TIMEOUT`]), and three of
+/// out the idle timeout costs 300 seconds ([`crate::provider::STREAM_IDLE_TIMEOUT`]), and three of
 /// those is fifteen minutes of a user waiting on a turn that will fail anyway, plus up to three
 /// completions a non-streaming provider may have generated and charged for.
 ///
-/// One window, so a call that hung for its whole `read_timeout` spends the budget exactly and
+/// One window, so a stream that hung for its whole idle timeout spends the budget exactly and
 /// `elapsed >= RETRY_BUDGET` refuses the next attempt. Retrying is for a call that failed without
 /// costing much: a reset connection, a refused port, a body that stopped short.
 ///
 /// It bounds when the next attempt may *start*, not what the sequence totals, so a failure just
 /// short of the window permits a second attempt that may itself run the full 300. A total is not
-/// available to bound, because a streaming attempt has no length of its own (`read_timeout` resets
-/// on every event), so the only honest ceiling is on starting another one.
+/// available to bound, because a streaming attempt has no length of its own (the idle timeout
+/// resets on every event), so the only honest ceiling is on starting another one.
 ///
 /// Tied to that timeout rather than picked, so the two cannot drift. This is also the only layer
 /// that *can* bound the cost: the classifier sees one failure with no idea how long the sequence

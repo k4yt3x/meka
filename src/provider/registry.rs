@@ -832,7 +832,11 @@ struct Unbound;
 
 #[async_trait]
 impl Provider for Unbound {
-    async fn complete(&self, _request: CompletionRequest<'_>) -> Result<Completion> {
+    async fn complete(
+        &self,
+        _request: CompletionRequest<'_>,
+        _cancellation: CancellationToken,
+    ) -> Result<Completion> {
         Err(MekaError::Provider(
             "no provider is bound to this session".to_string(),
         ))

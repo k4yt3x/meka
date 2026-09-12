@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-09-12
+
+### Changed
+
+- A whole reply is never timed out; a dead connection is found by TCP and HTTP/2 keepalives.
+- Sub-agents follow their parent's `--no-stream` and `display.stream` setting.
+
+### Fixed
+
+- A reply over five minutes in the making no longer fails a `--no-stream` turn or a compaction.
+- Canceling a turn drops a reply the provider is still generating, instead of waiting for it.
+
 ## [0.50.0] - 2026-09-11
 
 ### Added
@@ -2155,7 +2167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.50.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.51.0...HEAD
+[0.51.0]: https://github.com/k4yt3x/meka/compare/0.50.0...0.51.0
 [0.50.0]: https://github.com/k4yt3x/meka/compare/0.49.0...0.50.0
 [0.49.0]: https://github.com/k4yt3x/meka/compare/0.48.0...0.49.0
 [0.48.0]: https://github.com/k4yt3x/meka/compare/0.47.1...0.48.0

@@ -115,13 +115,39 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// worse every day rather than occasionally.
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 
+/// How often an HTTP/2 connection with a request in flight pings its peer, and how long an
+/// unanswered PING is waited for before the connection is declared dead.
+///
+/// A dead peer is found by the transport, never by a clock on the reply. A whole reply is silent
+/// from the moment the request is sent until the model has finished it, and nothing on this side
+/// can tell that silence from a route that has gone. A read timeout cannot either: reqwest runs it
+/// across the wait for the response headers as well as the body, and for a whole reply that wait is
+/// the generation itself, a long draft or a deep think being the ordinary case rather than a
+/// failure. A PING is answered by the peer's HTTP/2 layer whether or not the reply is ready, so it
+/// separates the two without bounding how long a reply may take.
+///
+/// reqwest's own TCP keepalive stays at its defaults, which reach a verdict on a vanished peer in a
+/// minute or two on the platform's own probe schedule; the PING sits on the same scale so the two
+/// transports agree, and a failure found that early is one the retry budget can still afford to
+/// retry. The hosted providers speak HTTP/2
+/// over TLS; an endpoint reached through `base_url` may not, and there the TCP keepalive is the
+/// only probe.
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// See [`HTTP2_KEEPALIVE_INTERVAL`].
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The HTTP client every provider backend uses.
 ///
-/// Deliberately sets `connect_timeout` and `read_timeout` and *not* `timeout`. A whole-request
-/// deadline would kill a legitimate long turn, which is the one thing the harness must not do;
-/// `read_timeout` resets on every successful read, so it fires only when the connection has gone
-/// quiet. Without either, a dropped route left the turn waiting on a socket that would never
-/// produce another byte, with no error and no retry.
+/// Deliberately sets `connect_timeout` and neither `timeout` nor `read_timeout`. A whole-request
+/// deadline would kill a legitimate long turn, which is the one thing the harness must not do, and
+/// a read timeout does the same to a whole reply, because reqwest runs it across the wait for the
+/// response headers, which for a non-streaming request is the whole generation. A dead connection
+/// is found by the keepalives instead (reqwest's TCP defaults and [`HTTP2_KEEPALIVE_INTERVAL`]); a
+/// stream that carries nothing is bounded by [`STREAM_IDLE_TIMEOUT`] at the SSE layer, the one
+/// place silence means something; and a stop drops a pending request in
+/// `crate::oauth::send_with_one_refresh` and its body in [`read_whole_reply`], the one place every
+/// request a turn makes is sent and the one place every whole reply is read.
 pub(crate) fn build_http_client(
     backend: &str,
     configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
@@ -129,7 +155,8 @@ pub(crate) fn build_http_client(
     configure(
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(STREAM_IDLE_TIMEOUT),
+            .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+            .http2_keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT),
     )
     .build()
     .map_err(|error| MekaError::Provider(format!("failed to build {backend} HTTP client: {error}")))
@@ -266,8 +293,13 @@ pub(crate) trait Provider: Send + Sync {
     /// and any user-visible notices that arose during the request (e.g. the redaction hint from
     /// `anthropic::shared::build_body_within_budget`). The caller is expected to forward each
     /// notice to the active frontend; an empty `Vec` means nothing to surface. No streaming;
-    /// the agent awaits the full response.
-    async fn complete(&self, request: CompletionRequest<'_>) -> Result<Completion>;
+    /// the agent awaits the full response, and `cancellation` is what ends that wait early: the
+    /// request is dropped where it stands, which aborts it on the wire.
+    async fn complete(
+        &self,
+        request: CompletionRequest<'_>,
+        cancellation: CancellationToken,
+    ) -> Result<Completion>;
 
     /// Streaming variant. The provider pushes `StreamEvent`s onto `event_sender` as they arrive.
     /// Cancellation is observed via `cancellation`; implementors must check the token and abort
@@ -335,6 +367,27 @@ pub(crate) async fn succeeded(
         retry_after,
         crate::error::ProviderRequest::Completion,
     ))
+}
+
+/// Read a whole reply's body, or stop reading the moment the turn is canceled.
+///
+/// The other half of the race in `crate::oauth::send_with_one_refresh`. A provider may answer the
+/// headers at once and spend the whole generation inside the body, which is exactly what a proxy
+/// that keeps the connection warm does, so a stop that only dropped the send would still wait out a
+/// reply already announced. Every whole-reply body is read here; a stream's body is read by
+/// [`sse::drive`], which races the token on every event.
+pub(crate) async fn read_whole_reply(
+    response: reqwest::Response,
+    retry_after: Option<std::time::Duration>,
+    cancellation: &CancellationToken,
+) -> Result<String> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(MekaError::Interrupted),
+        text = response.text() => text.map_err(|error| {
+            crate::error::provider_transport_error("failed to read response", &error, retry_after)
+        }),
+    }
 }
 
 /// What a tool call's raw argument text becomes, for every driver. An empty body is a legitimate
@@ -546,6 +599,137 @@ mod tests {
 
     use super::*;
     use crate::{conversation::Role, image::ImageSource};
+
+    /// The two clocks a reply could run out are the whole-request `timeout` and `read_timeout`,
+    /// and reqwest renders each in the client's debug output when it is set (`TotalTimeout` by its
+    /// type name). The deterministic half of the guard; the test below proves the same thing on a
+    /// socket.
+    #[test]
+    fn the_client_runs_no_clock_on_a_reply() {
+        let client = build_http_client("test", |builder| builder).expect("client");
+        let rendered = format!("{client:?}");
+        assert!(
+            !rendered.contains("read_timeout") && !rendered.contains("TotalTimeout"),
+            "the client carries a timeout a reply could run out: {rendered}"
+        );
+    }
+
+    /// The headers can arrive long before the reply: a proxy that keeps the connection warm
+    /// answers them at once and spends the generation inside the body, so the body read is raced
+    /// as well, or a stop would wait out every reply that had been announced.
+    #[tokio::test]
+    async fn a_stop_ends_the_wait_for_a_body_at_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("the request arrives");
+                assert!(read > 0, "the client closed the connection");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("announce the reply");
+            std::future::pending::<()>().await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/v1/messages"))
+            .send()
+            .await
+            .expect("the headers arrive at once");
+        let cancellation = CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_whole_reply(response, None, &cancellation),
+        )
+        .await
+        .expect("the stop must end the read, not the test's own deadline");
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "a stop is reported as the interruption it is: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop must end the read at once: {:?}",
+            started.elapsed()
+        );
+        peer.abort();
+    }
+
+    /// A whole reply is silent from the moment it is sent until the model has finished it, so
+    /// nothing on this side may run a clock on that silence, and reqwest's read timeout would,
+    /// across the wait for the response headers. The peer here holds the connection open and
+    /// never answers, which is what a model still generating looks like from this side; paused
+    /// time makes an hour of it instant. The connection is made on real time first, because the
+    /// paused clock would run the handshake deadline out ahead of the handshake.
+    #[tokio::test]
+    async fn a_whole_reply_may_take_as_long_as_it_takes() {
+        use tokio::io::AsyncWriteExt;
+
+        /// Reads until the request head has arrived, however the kernel splits it. A `GET` has
+        /// no body, so the head is the whole request.
+        async fn read_request(socket: &mut tokio::net::TcpStream) {
+            use tokio::io::AsyncReadExt;
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("the request arrives");
+                assert!(read > 0, "the client closed the connection");
+                head.extend_from_slice(&chunk[..read]);
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("answer the first request");
+            read_request(&mut socket).await;
+            std::future::pending::<()>().await;
+        });
+        let client = build_http_client("test", |builder| builder).expect("client");
+        let url = format!("http://{address}/v1/messages");
+        client
+            .get(&url)
+            .send()
+            .await
+            .expect("the warm-up request is answered");
+
+        tokio::time::pause();
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60 * 60), client.get(&url).send()).await;
+        assert!(
+            outcome.is_err(),
+            "an hour on a live connection with the reply still coming must not end the request: {:?}",
+            outcome.map(|response| response.map(|response| response.status()))
+        );
+        peer.abort();
+    }
 
     /// What a host reports for a session it has not loaded, pinned to three distinct answers.
     ///

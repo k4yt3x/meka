@@ -932,6 +932,7 @@ impl Agent {
                             .complete(
                                 CompletionRequest::new(&system_prompt, &api_messages, &tools)
                                     .attributed(attribution.clone()),
+                                cancellation.clone(),
                             )
                             .await
                         {
@@ -1672,8 +1673,15 @@ impl Agent {
         });
 
         let mut accumulator = crate::provider::MessageAccumulator::new();
+        // Whether the provider has answered at all. A driver emits nothing before `succeeded` has
+        // seen a 2xx, except the redaction notice, which the Claude drivers queue before the
+        // request is even sent, so any other event is proof the request was judged.
+        let mut response_started = false;
 
         while let Some(event) = event_receiver.recv().await {
+            if !matches!(event, StreamEvent::Notice(_)) {
+                response_started = true;
+            }
             // What the user sees is decided here, event by event; what the conversation keeps is
             // the accumulator's one answer, shared with every other reader of a stream.
             match &event {
@@ -1849,9 +1857,15 @@ impl Agent {
 
         match stream_handle.await {
             Ok(Ok(())) => {}
+            Ok(Err(MekaError::Interrupted)) if !response_started => {
+                // Stopped before the provider answered, so nothing has been judged: this is the
+                // whole-reply interrupt and not a partial answer. Falling through would book the
+                // request as accepted and persist a repair the provider never saw.
+                return Err(MekaError::Interrupted);
+            }
             Ok(Err(MekaError::Interrupted)) => {
-                // Interrupted. Fall through to return partial content. The caller detects
-                // interruption via the cancellation token.
+                // Interrupted mid-stream, after a 2xx. Fall through to return partial content. The
+                // caller detects interruption via the cancellation token.
             }
             Ok(Err(error)) => {
                 progress.partial = accumulator.partial();
@@ -2444,7 +2458,9 @@ mod tests {
                         item: None,
                     }],
                 },
-                MockEvent::Sleep { ms: 300 },
+                // Stalled rather than slept: a stop cuts a slept reply short, and this one has
+                // to arrive, redaction and all, for there to be anything to record.
+                MockEvent::Stall { ms: 300 },
                 MockEvent::Text {
                     text: "half".to_string(),
                 },
@@ -2524,6 +2540,59 @@ mod tests {
             ),
             "the next request carries the placeholder, not the image: {:?}",
             sent[1][0].content
+        );
+    }
+
+    /// A whole reply is silent until the provider has finished it, and a stop must not wait that
+    /// out. The mock's slept reply stands in for one still being generated.
+    #[tokio::test]
+    async fn an_interrupt_drops_a_whole_reply_still_being_generated() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![vec![
+            MockEvent::Sleep { ms: 3000 },
+            MockEvent::Text {
+                text: "never delivered".to_string(),
+            },
+            MockEvent::MessageEnd {
+                stop_reason: MockStopReason::EndTurn,
+            },
+        ]]));
+        let (mut agent, store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        agent.options.streaming = false;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("session");
+        agent.cells().session_id.set(session_id);
+        let mut messages = Conversation::new();
+
+        let cancellation = CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("go".to_string(), Vec::new())
+                    .expect("a prompt"),
+                cancellation,
+            )
+            .await;
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "the turn was interrupted: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop must drop the reply, not wait for it: {:?}",
+            started.elapsed()
         );
     }
 
@@ -3861,6 +3930,77 @@ mod tests {
                 .flat_map(|message| message.content.iter())
                 .all(|block| !matches!(block, ContentBlock::Image { .. })),
             "the repair must be persisted, not just applied in memory"
+        );
+    }
+
+    /// A stop that lands before the provider has answered has judged nothing. On the streaming
+    /// path the send answers a stop with `Interrupted` ahead of any response, and treating that
+    /// like a stop mid-stream would book the request as accepted and persist a repair the
+    /// provider never saw: the refused image would leave the store for good on the strength of a
+    /// keystroke.
+    #[tokio::test]
+    async fn a_stop_before_the_provider_answers_vindicates_nothing() {
+        use crate::{
+            conversation::Event,
+            provider::mock::{MockEvent, MockProvider, MockStopReason},
+        };
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![MockEvent::FailInvalidRequest {
+                message: REJECTION.to_string(),
+            }],
+            vec![
+                MockEvent::Sleep { ms: 3000 },
+                MockEvent::Text {
+                    text: "never delivered".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+        ]));
+        let (mut agent, store) = agent_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        agent.options.streaming = true;
+        let mut messages = Conversation::new();
+        let cancellation = CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let outcome = agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("look at this".to_string(), vec![
+                    image_source(),
+                ])
+                .expect("a prompt"),
+                cancellation,
+            )
+            .await;
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "the retry was stopped: {outcome:?}"
+        );
+        // The repair was applied for the retry and undone when the retry was stopped unjudged:
+        // the image is back in the live conversation and never left the store.
+        let user = &messages.as_slice()[0];
+        assert!(
+            user.content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image { .. })),
+            "an unjudged repair is undone in memory: {:?}",
+            user.content
+        );
+        let session_id = agent.session_id().expect("session created");
+        let events = store.load_events(session_id).await.expect("load events");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Repair { .. })),
+            "a repair the provider never saw must not be persisted: {events:?}"
         );
     }
 

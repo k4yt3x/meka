@@ -83,11 +83,20 @@ pub(crate) trait RefreshesCredential {
 /// refusal return the error with the login remedy. `build` produces each attempt's request, so a
 /// backend that refreshes does it there. `transport_error` names a send that never got an answer;
 /// any status other than a rejection is the caller's to read.
+///
+/// `cancellation` ends the wait for the response headers, and only that;
+/// `crate::provider::read_whole_reply` is the other half. Dropping the send is what aborts a
+/// request on the wire, so a stop reaches a whole reply the provider is still generating as fast as
+/// it reaches a stream, and this is the one place every request a turn makes goes out. `build` is
+/// deliberately outside the race: a backend may be refreshing its credential there, an exchange
+/// followed by a store write that must not be torn, so a stop that arrives during it lands once the
+/// refreshed credential is on disk.
 pub(crate) async fn send_with_one_refresh<R, B, F>(
     refresher: &R,
     request: ProviderRequest,
     transport_error: impl Fn(&reqwest::Error) -> MekaError,
     mut build: B,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<reqwest::Response>
 where
     R: RefreshesCredential + Sync + ?Sized,
@@ -96,11 +105,13 @@ where
 {
     let mut retried_after_rejection = false;
     loop {
-        let response = build()
-            .await?
-            .send()
-            .await
-            .map_err(|error| transport_error(&error))?;
+        let request_builder = build().await?;
+        let sent = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(MekaError::Interrupted),
+            sent = request_builder.send() => sent,
+        };
+        let response = sent.map_err(|error| transport_error(&error))?;
         let status = response.status();
         if !credential_was_rejected(status) {
             return Ok(response);
@@ -448,6 +459,59 @@ pub(crate) fn generate_state() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stop must reach a request the provider is still answering. The wait for a response is
+    /// the one place a whole reply spends its time and nothing else on this side may end it, so
+    /// the send is raced against the token here, where every request goes out. The peer holds
+    /// the connection open and never answers, which is what a model still generating looks like
+    /// from this side.
+    #[tokio::test]
+    async fn a_stop_ends_the_wait_for_a_response_at_once() {
+        struct NoRefresh;
+        impl RefreshesCredential for NoRefresh {}
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let peer = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::new();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_with_one_refresh(
+                &NoRefresh,
+                crate::error::ProviderRequest::Completion,
+                |error| MekaError::Provider(error.to_string()),
+                || async { Ok(client.get(format!("http://{address}/v1/messages"))) },
+                &cancellation,
+            ),
+        )
+        .await
+        .expect("the stop must end the wait, not the test's own deadline");
+        stop.await.expect("the stop landed");
+        assert!(
+            matches!(outcome, Err(MekaError::Interrupted)),
+            "a stop is reported as the interruption it is: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop must end the wait at once, not when the peer gives up: {:?}",
+            started.elapsed()
+        );
+        peer.abort();
+    }
 
     /// A refresh that loses its swap adopts what the row holds only when that can authenticate the
     /// request in hand.

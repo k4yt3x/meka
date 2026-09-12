@@ -828,7 +828,7 @@ pub(super) fn refusal_may_blame_content(error: &MekaError, content_started: bool
 ///
 /// `elapsed` is measured from the first attempt, and refuses a further one once the sequence has
 /// been running for [`crate::provider::retry::RETRY_BUDGET`]. That limits cost in a way the attempt
-/// cap alone does not: an attempt that fails by running out `read_timeout` costs 300 seconds, and
+/// cap alone does not: an attempt that fails by running out the idle timeout costs 300 seconds, and
 /// three of those is fifteen minutes of waiting on a turn that fails anyway, plus up to three
 /// completions the provider may have generated and billed. It bounds where the next attempt may
 /// begin rather than where the sequence ends, since the attempt that spends the budget still runs
@@ -871,21 +871,27 @@ pub(super) fn should_retry_provider_error(
 /// 429 mid-compaction is not terminal.
 ///
 /// `content_started` is `false` by construction: nothing streamed, so a retry cannot double-emit.
-/// The wait races the caller's token, as the loops in `run_streaming` and `run_turn` do, or a
-/// `Retry-After` could hold Ctrl+C for a minute. The token gates the *waits* and not the first
-/// attempt, deliberately: a canceled token here means the checkpoint was interrupted and
-/// `compact_session` has fallen back to [`Agent::summarize_via_provider`], the tier that guarantees
-/// the window shrinks, so refusing to send would leave a `/compact` the user just pressed Ctrl+C
-/// on with the window as full as before. `an_interrupt_ends_the_checkpoint_and_falls_back` pins it.
+/// `cancellation` gates the *waits*, as the loops in `run_streaming` and `run_turn` do, or a
+/// `Retry-After` could hold Ctrl+C for a minute; `attempt_cancellation` gates the request itself,
+/// and the two differ on purpose. The checkpoint hands its turn's token to both, so a stop drops a
+/// reply it is still waiting on. The summarizer hands `attempt_cancellation` a token nothing fires:
+/// a canceled token there means the checkpoint was interrupted and `compact_session` has fallen
+/// back to [`Agent::summarize_via_provider`], the tier that guarantees the window shrinks, so
+/// refusing to send would leave a `/compact` the user just pressed Ctrl+C on with the window as
+/// full as before. `an_interrupt_ends_the_checkpoint_and_falls_back` pins it.
 pub(super) async fn complete_with_retry(
     provider: &Arc<dyn Provider>,
     request: CompletionRequest<'_>,
     cancellation: &CancellationToken,
+    attempt_cancellation: &CancellationToken,
 ) -> Result<crate::provider::Completion> {
     let started = std::time::Instant::now();
     let mut retries = 0_u32;
     loop {
-        match provider.complete(request.clone()).await {
+        match provider
+            .complete(request.clone(), attempt_cancellation.clone())
+            .await
+        {
             Ok(completed) => return Ok(completed),
             Err(error) => {
                 let Some(delay) =
@@ -2000,7 +2006,7 @@ mod tests {
     /// The budget stops a sequence the attempt cap alone would let run for fifteen minutes.
     ///
     /// The cap counts tries, not what they cost. Two retries of a failure that returns instantly is
-    /// three seconds of backoff; two retries of one that fails by running out `read_timeout` is
+    /// three seconds of backoff; two retries of one that fails by running out the idle timeout is
     /// three times three hundred seconds, and on a non-streaming call up to three completions the
     /// provider generated and charged for. This is the only thing standing between a user and that,
     /// since the classifier retries timeouts (it cannot tell a delivered request from an

@@ -153,8 +153,9 @@ impl Provider for OpenAiResponsesProvider {
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
+        cancellation: CancellationToken,
     ) -> Result<crate::provider::Completion> {
-        super::responses_wire::complete(self, request).await
+        super::responses_wire::complete(self, request, cancellation).await
     }
 
     async fn stream(

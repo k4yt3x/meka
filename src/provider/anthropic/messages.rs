@@ -220,8 +220,9 @@ impl Provider for AnthropicMessagesProvider {
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
+        cancellation: CancellationToken,
     ) -> Result<crate::provider::Completion> {
-        shared::complete(self, request).await
+        shared::complete(self, request, cancellation).await
     }
 
     async fn stream(
@@ -296,7 +297,10 @@ mod tests {
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let error = provider
-            .complete(CompletionRequest::new("", &[Message::user("hello")], &[]))
+            .complete(
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect_err("nothing is listening there");
 
@@ -406,7 +410,10 @@ mod tests {
             Some(&format!("http://127.0.0.1:{port}")),
         );
         let error = provider
-            .complete(CompletionRequest::new("", &[Message::user("hello")], &[]))
+            .complete(
+                CompletionRequest::new("", &[Message::user("hello")], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect_err("the body stops short of its declared length");
 

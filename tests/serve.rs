@@ -10775,7 +10775,7 @@ fn a_locked_worker_is_refused_as_undrivable_rather_than_as_busy() {
 #[test]
 fn a_worker_session_refuses_a_turn_posted_straight_at_it() {
     // Three rounds in one queue, drained in order: the parent's `agent_spawn` call, the worker's
-    // own (non-streaming) reply, then the parent's closing text.
+    // own reply, then the parent's closing text.
     let harness = ServeTestHarness::spawn(
         "",
         serde_json::json!([

@@ -85,6 +85,14 @@ your provider plan, not to the harness. What these bound is *silence*. A model t
 thinking is still sending, so a stream that goes quiet for five minutes has died, and waiting on it
 forever is not patience.
 
+A whole reply (`--no-stream`, and the summary a compaction asks for) is silent until it is finished,
+so it gets no clock at all: a reply may take as long as it takes. A connection whose peer has gone
+is found by TCP and HTTP/2 keepalives instead, which a busy server answers and a vanished one does
+not, so a dropped route still surfaces as an error within a minute or two. A peer that is up and
+never answers is not found this way: such a request waits until it is canceled, which is the trade
+a `base_url` behind a gateway with no timeout of its own makes. A cancel drops a pending reply at
+once, in either mode.
+
 ## `default_profile`
 
 Top-level field naming the profile to use when `--profile` isn't passed. Set it with
@@ -777,7 +785,8 @@ Default: `false`
 ### `display.stream`
 
 Whether the answer streams to the terminal as it arrives, or lands whole when the turn ends. The
-`--no-stream` flag turns streaming off for one run; this key is the standing preference.
+`--no-stream` flag turns streaming off for one run; this key is the standing preference, and it
+applies to sub-agents as well.
 
 Default: `true`
 

@@ -113,3 +113,5 @@ The first two differ by protocol; the last two differ only by auth and endpoint.
 By default, meka uses streaming mode: tokens appear in the terminal as they are generated. Use `--no-stream` to wait for the complete response before displaying it.
 
 Streaming is recommended for interactive use. Non-streaming may be useful for scripting or when the provider does not support SSE.
+
+`--no-stream` applies to every agent in the run, sub-agents included, whichever profile a sub-agent is pinned to. Neither mode puts a clock on a reply: a stream that stays silent for five minutes is treated as dead, and a whole reply may take as long as it takes, with a connection whose peer has gone caught by TCP and HTTP/2 keepalives instead.

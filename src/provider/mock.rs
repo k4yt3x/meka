@@ -166,7 +166,7 @@ impl From<MockStopReason> for StopReason {
 /// A scripted multi-round response. Each call to [`Provider::stream`] *or* [`Provider::complete`]
 /// drains one round (`Vec<MockEvent>`); subsequent rounds satisfy subsequent agent loop iterations
 /// after tool results return. The two paths share the one queue, so a script that spawns a
-/// sub-agent (which runs non-streaming) must budget a round for each of the sub-agent's turns.
+/// sub-agent must budget a round for each of the sub-agent's turns.
 #[derive(Debug, Default)]
 pub(crate) struct MockProvider {
     rounds: Mutex<VecDeque<Vec<MockEvent>>>,
@@ -179,8 +179,9 @@ pub(crate) struct MockProvider {
     completions: Mutex<Vec<Vec<Message>>>,
     /// The thinking override each `complete` call carried, in call order.
     completion_thinking: Mutex<Vec<ThinkingOverride>>,
-    /// The prompt each `complete` call was attributed to, in call order: a sub-agent runs
-    /// non-streaming, and whether it carried its parent's prompt id is visible nowhere else.
+    /// The prompt each `complete` call was attributed to, in call order: a sub-agent under
+    /// `--no-stream` runs this way, and whether it carried its parent's prompt id is visible
+    /// nowhere else.
     completion_prompt_ids: Mutex<Vec<Option<uuid::Uuid>>>,
     /// What each [`Provider::stream`] call was handed, in order.
     ///
@@ -252,11 +253,12 @@ impl MockProvider {
 #[async_trait]
 impl Provider for MockProvider {
     /// Drains one round and folds it into a finished message, so a single script drives either
-    /// path. Non-streaming is not an exotic corner: sub-agents run this way (`Agent::new_subagent`
-    /// sets `streaming: false`), as does auto-compaction.
+    /// path. Non-streaming is not an exotic corner: `--no-stream` runs this way, sub-agents
+    /// included, as does auto-compaction's summarizer.
     async fn complete(
         &self,
         request: CompletionRequest<'_>,
+        cancellation: CancellationToken,
     ) -> Result<crate::provider::Completion> {
         let CompletionRequest {
             system_prompt: _,
@@ -321,9 +323,17 @@ impl Provider for MockProvider {
                 MockEvent::FailInvalidRequest { message } => {
                     return Err(crate::error::MekaError::InvalidRequest(message));
                 }
-                // `complete` takes no cancellation token, so the two delays are the same thing
-                // here.
-                MockEvent::Sleep { ms } | MockEvent::Stall { ms } => {
+                MockEvent::Sleep { ms } => {
+                    // Raced like the real send is: a stop drops a whole reply still being
+                    // generated. `Stall` is the reply that had already left when the stop came.
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                        _ = cancellation.cancelled() => {
+                            return Err(crate::error::MekaError::Interrupted);
+                        }
+                    }
+                }
+                MockEvent::Stall { ms } => {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
                 MockEvent::Text { text: chunk } => text.push_str(&chunk),
@@ -476,11 +486,14 @@ impl Provider for MockProvider {
                     return Err(crate::error::MekaError::InvalidRequest(message));
                 }
                 MockEvent::Sleep { ms } => {
-                    // Race the sleep against cancellation so a mid-turn `session/cancel` doesn't
-                    // have to wait for the full delay to elapse.
+                    // Raced against cancellation, and answered the way `sse::drive` answers it,
+                    // so a mid-turn `session/cancel` neither waits out the delay nor looks like a
+                    // stream that ended on its own.
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
-                        _ = cancellation.cancelled() => return Ok(()),
+                        _ = cancellation.cancelled() => {
+                            return Err(crate::error::MekaError::Interrupted);
+                        }
                     }
                     continue;
                 }
@@ -768,7 +781,10 @@ mod tests {
             stop_reason,
             ..
         } = provider
-            .complete(CompletionRequest::new("", &[], &[]))
+            .complete(
+                CompletionRequest::new("", &[], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("complete");
         assert!(matches!(message.role, Role::Assistant));
@@ -782,7 +798,10 @@ mod tests {
 
         // The queue is shared with `stream`, so the first round is gone for both paths.
         let message = provider
-            .complete(CompletionRequest::new("", &[], &[]))
+            .complete(
+                CompletionRequest::new("", &[], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("second round")
             .message;
@@ -801,7 +820,10 @@ mod tests {
             stop_reason,
             ..
         } = provider
-            .complete(CompletionRequest::new("", &[], &[]))
+            .complete(
+                CompletionRequest::new("", &[], &[]),
+                tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .expect("complete");
         assert!(message.content.is_empty());

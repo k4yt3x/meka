@@ -361,9 +361,9 @@ impl Agent {
                 .collect();
 
         // The last point before the window is destroyed, and the one that catches an interrupt
-        // arriving inside the summarizer, whose `provider.complete` takes no token at all: without
-        // it a stop lands mid-summary and the conversation is replaced by a summary written without
-        // the agent.
+        // arriving inside the summarizer, whose request is sent under a token nothing fires:
+        // without it a stop lands mid-summary and the conversation is replaced by a summary written
+        // without the agent.
         //
         // Every origin but `Manual`: a compaction the turn asked for is incidental to work the user
         // has just stopped, whereas `/compact` is itself the thing asked for, so an interrupt there
@@ -620,18 +620,30 @@ impl Agent {
                 tracing::warn!("checkpoint turn interrupted; summarizing instead");
                 return Ok(None);
             }
+            let completed = match complete_with_retry(
+                &self.provider(),
+                CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
+                    .attributed(attribution.clone()),
+                &cancellation,
+                &cancellation,
+            )
+            .await
+            {
+                Ok(completed) => completed,
+                // A stop that landed on the reply itself rather than between rounds: the same
+                // outcome as the check above, for the same reason.
+                Err(MekaError::Interrupted) => {
+                    tracing::warn!("checkpoint turn interrupted; summarizing instead");
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             let crate::provider::Completion {
                 message: assistant_message,
                 usage,
                 notices,
                 ..
-            } = complete_with_retry(
-                &self.provider(),
-                CompletionRequest::new(&system_prompt, &checkpoint_messages, &definitions)
-                    .attributed(attribution.clone()),
-                &cancellation,
-            )
-            .await?;
+            } = completed;
             self.session_stats.record_untracked_tokens(&usage);
             for notice in notices {
                 self.forward_notice(notice).await;
@@ -883,6 +895,9 @@ impl Agent {
                 .attributed(self.compaction_attribution(request))
                 .without_thinking(),
             cancellation,
+            // Sent under a token nothing fires: the caller's may already have, and the summary is
+            // the one thing a stop must not deny. See `complete_with_retry`.
+            &CancellationToken::new(),
         )
         .await?;
         self.session_stats.record_untracked_tokens(&usage);
@@ -1002,6 +1017,7 @@ mod tests {
             &provider,
             CompletionRequest::new("system", &[], &[]),
             &CancellationToken::new(),
+            &CancellationToken::new(),
         )
         .await
         .expect_err("three failures spend the cap, so the fourth round is never asked for");
@@ -1059,6 +1075,7 @@ mod tests {
         let error = complete_with_retry(
             &provider,
             CompletionRequest::new("system", &[], &[]),
+            &cancellation,
             &cancellation,
         )
         .await
@@ -2042,6 +2059,58 @@ mod tests {
         // Interrupting the checkpoint must not fail the compaction: the user asked for the
         // checkpoint to stop, not for the window to stay full.
         assert_eq!(outcome.source, CompactSource::Summarizer);
+    }
+
+    /// A stop that lands while the checkpoint's reply is still being generated drops that reply
+    /// rather than waiting it out, and the summarizer then does the job, as it does for a stop
+    /// that lands between rounds. The mock's slept reply stands in for one still being generated.
+    #[tokio::test]
+    async fn an_interrupt_drops_a_checkpoint_reply_still_being_generated() {
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Sleep { ms: 3000 },
+                MockEvent::Text {
+                    text: "never delivered".to_string(),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::EndTurn,
+                },
+            ],
+            text_round("fallback"),
+        ]));
+        let (agent, store) = agent_with_checkpoint(provider, true).await;
+        let mut messages = conversation();
+        agent.cells().session_id.set(
+            store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("create session"),
+        );
+
+        let cancellation = CancellationToken::new();
+        let stop = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancellation.cancel();
+            }
+        });
+        let started = std::time::Instant::now();
+        let outcome = agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Manual),
+                cancellation,
+            )
+            .await
+            .expect("compaction still completes");
+        stop.await.expect("the stop landed");
+        assert_eq!(outcome.source, CompactSource::Summarizer);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the stop must drop the checkpoint's reply, not wait for it: {:?}",
+            started.elapsed()
+        );
     }
 
     /// An automatic compaction that finds its token fired ends before the summarizer is paid

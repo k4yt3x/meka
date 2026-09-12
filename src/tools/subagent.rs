@@ -818,9 +818,8 @@ impl Tool for AgentSpawnTool {
         // against the sub-session, so the audit trail is identical to the root agent's. Silent
         // rendering and the omitted MCP gate are baked into the options via `new_subagent`.
         let mut messages = Conversation::new();
-        // Mark every provider request made during this run as a sub-agent request so the Claude
-        // OAuth billing header carries `cc_is_subagent=true;` (the provider is a shared `Arc`, so
-        // the flag rides a task-local rather than provider state).
+        // Every request the sub-agent makes is attributed as one (`Attribution::subagent`, from its
+        // role), which the Claude OAuth billing header reports as `cc_is_subagent=true;`.
         sub_agent
             .run_turn(
                 &mut messages,
@@ -6154,6 +6153,46 @@ mod tests {
             vec![Some(spawning_prompt), Some(followup_prompt)],
             "a follow-up's request must bill to the prompt that asked for it"
         );
+    }
+
+    /// Whether a sub-agent streams is its parent's setting, not a rule of its own. `--no-stream`
+    /// is the one lever for an endpoint that has no SSE, so a sub-agent that streamed regardless
+    /// would fail on exactly the endpoint the flag was set for; and nothing of the sub-agent's
+    /// output is rendered, so the flag is about the wire alone. Both directions, because a
+    /// constant passes either one on its own.
+    #[tokio::test]
+    async fn a_sub_agent_streams_exactly_when_its_parent_does() {
+        for parent_streams in [false, true] {
+            let store = store_for_test().await;
+            let parent_session_id = store
+                .create_session(None, "test-profile".to_string())
+                .await
+                .expect("parent");
+            let mut params = params_for_test(
+                store.clone(),
+                crate::session::SharedSessionId::new(Some(parent_session_id)),
+            );
+            params.parent_options.streaming = parent_streams;
+            let provider = mock(vec![text_round("done")]);
+            let spawn = spawn_tool_for(params, provider.clone());
+            spawn
+                .execute(
+                    serde_json::json!({ "prompt": "draft a chapter", "permission": "read" }),
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("spawn succeeds");
+            assert_eq!(
+                provider.streams().len(),
+                usize::from(parent_streams),
+                "streamed requests under a parent with streaming = {parent_streams}"
+            );
+            assert_eq!(
+                provider.completions().len(),
+                usize::from(!parent_streams),
+                "whole-reply requests under a parent with streaming = {parent_streams}"
+            );
+        }
     }
 
     /// The row answers for a worker wherever a row is read (`meka session show`, `GET

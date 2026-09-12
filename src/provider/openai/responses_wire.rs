@@ -697,10 +697,11 @@ pub(super) trait ResponsesBackend: crate::oauth::RefreshesCredential + Send + Sy
 pub(super) async fn complete<B: ResponsesBackend>(
     backend: &B,
     request: CompletionRequest<'_>,
+    cancellation: CancellationToken,
 ) -> Result<crate::provider::Completion> {
     let (event_sender, event_receiver) = mpsc::channel::<StreamEvent>(1024);
     let (stream_result, aggregated) = tokio::join!(
-        stream(backend, request, event_sender, CancellationToken::new()),
+        stream(backend, request, event_sender, cancellation),
         aggregate_stream(event_receiver),
     );
     stream_result?;
@@ -746,6 +747,7 @@ pub(super) async fn stream<B: ResponsesBackend>(
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body_json.clone()))
         },
+        &cancellation,
     )
     .await?;
     drive_responses_sse_stream(response, event_sender, cancellation).await

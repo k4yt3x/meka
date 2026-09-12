@@ -312,7 +312,7 @@ rewritten and it keeps that profile from then on. See
 
 ### `--no-stream`
 
-Disable streaming for this run. The agent waits for the complete response before displaying it. By default, responses are streamed token-by-token; [`display.stream`](./config-file.md#displaystream) is the persistent form.
+Disable streaming for this run. The agent waits for the complete response before displaying it. By default, responses are streamed token-by-token; [`display.stream`](./config-file.md#displaystream) is the persistent form. Applies to sub-agents as well.
 
 ```bash
 meka --no-stream

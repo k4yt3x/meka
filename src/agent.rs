@@ -352,8 +352,13 @@ impl Agent {
             // `crate::tools::subagent::build_subagent_system_prompt` and skills are the reusable
             // worker-instruction unit.
             user_instructions: None,
-            // Sub-agents run silent: no streaming UI, no MCP readiness gate.
-            streaming: false,
+            // Follows the parent because the flag is the one lever a user has for an endpoint that
+            // lacks SSE, and a sub-agent on that endpoint would fail streaming where its parent
+            // does not. Nothing of the sub-agent's output is rendered either way, so the choice is
+            // about the wire alone, and a whole reply is safe to wait for because a dead peer is
+            // found by the transport (`provider::build_http_client`) rather than by a clock on the
+            // reply. No MCP readiness gate.
+            streaming: parent_options.streaming,
             // Auto-compaction is inherited: a worker handed a large task has the same context
             // window as its parent and the same need to compact within it.
             auto_compact: parent_options.auto_compact,
