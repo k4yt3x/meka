@@ -4,7 +4,7 @@
 use super::*;
 use crate::{
     conversation::PromptRetention,
-    session::{AUTO_COMPACT_THRESHOLD_PERCENT, CompactOrigin, CompactRequest},
+    session::{CompactOrigin, CompactRequest},
 };
 
 /// Why an [`Agent::run_turn`] invocation finished cleanly. Callers that drive a user-facing
@@ -505,6 +505,7 @@ impl Agent {
     ) -> Result<TurnOutcome> {
         let retention = input.retention;
         let words = input.words();
+        let request_in_flight = words.clone();
         let outcomes = input.delivered_outcomes();
         let TurnInput { images, .. } = input;
         let attribution = self.turn_attribution();
@@ -547,22 +548,25 @@ impl Agent {
 
         self.cells.frontend.emit(FrontendEvent::TurnStarted).await;
 
-        // Auto-compact if the last turn's context occupancy exceeded the threshold fraction of the
+        // Auto-compact if the last turn's context occupancy exceeded the ceiling fraction of the
         // context window. This check runs between turns, before the loop opens, which is why it
         // needs no re-anchoring of its own. Compaction itself is not confined here: the emergency
-        // retry and the agent's own `context_compact` both run inside the loop and re-anchor
-        // through `TurnRecovery::after_conversation_rewrite`.
-        if let Some(threshold) = self.auto_compact_threshold() {
-            let last_tokens = self
-                .cells
-                .context_tokens
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if last_tokens > threshold && messages.len() > 1 {
+        // retry, the agent's own `context_compact` and the same check after each round all run
+        // inside the loop and re-anchor through `TurnRecovery::after_conversation_rewrite`.
+        // Whether a compaction was attempted before the loop opened, so the check between rounds
+        // treats the crossing as answered: a first round still over the ceiling after one gets
+        // nothing from a second pass against the same conversation, and one that failed would fail
+        // the same way.
+        let mut compacted_before_the_loop = false;
+        if let Some(ceiling) = self.auto_compact_ceiling() {
+            let last_tokens = self.cells.context_occupancy();
+            if last_tokens > ceiling && messages.len() > 1 {
                 let window = self.context_window();
                 tracing::info!(
-                    "auto-compacting: {last_tokens} tokens in context exceeds \
-                     {AUTO_COMPACT_THRESHOLD_PERCENT}% of the {window} window"
+                    "auto-compacting: {last_tokens} tokens in context exceeds the ceiling of \
+                     {ceiling} on the {window} window"
                 );
+                compacted_before_the_loop = true;
                 if let Err(error) = self
                     .compact_session(
                         messages,
@@ -752,20 +756,21 @@ impl Agent {
         // *previous* round's reported usage, so a turn whose own input jumps over the window (a
         // huge paste, a large tool result carried in) would be sent uncompacted and hard-fail.
         // Project this request locally (conversation + system prompt) and compact before sending if
-        // it would cross the threshold. `estimate_messages` under-reads (no tool schemas), so this
+        // it would cross the ceiling. `estimate_messages` under-reads (no tool schemas), so this
         // is a floor that complements, not replaces, the reactive check and the overflow recovery
         // below.
-        if let Some(threshold) = self.auto_compact_threshold()
+        if let Some(ceiling) = self.auto_compact_ceiling()
             && messages.len() > 1
         {
             let projected = crate::tokens::estimate_messages(messages.as_slice())
                 .saturating_add(crate::tokens::estimate_text(&system_prompt));
-            if projected > threshold {
+            if projected > ceiling {
                 let window = self.context_window();
                 tracing::info!(
-                    "proactive compaction: projected {projected} input tokens exceeds \
-                     {AUTO_COMPACT_THRESHOLD_PERCENT}% of the {window} window"
+                    "proactive compaction: projected {projected} input tokens exceeds the \
+                     ceiling of {ceiling} on the {window} window"
                 );
+                compacted_before_the_loop = true;
                 match self
                     .compact_session(
                         messages,
@@ -802,6 +807,9 @@ impl Agent {
             prompt_only_events,
             overflow_retries: 0,
             requested_compactions: 0,
+            ceiling_compacted: compacted_before_the_loop,
+            // An outcome-only or image-only turn has no words to quote.
+            request_in_flight: Some(request_in_flight).filter(|words| !words.trim().is_empty()),
             tiers_tried: 0,
             pending_repair: None,
             user_saved: user_eagerly_saved,
@@ -976,7 +984,7 @@ impl Agent {
                 let (mut assistant_message, stop_reason, usage) = match call_result {
                     Ok(value) => value,
                     Err(MekaError::ContextOverflow(message))
-                        if self.auto_compact_threshold().is_some()
+                        if self.auto_compact_ceiling().is_some()
                             && messages.len() > 1
                             && recovery.overflow_retries < MAX_OVERFLOW_RETRIES =>
                     {
@@ -1041,15 +1049,15 @@ impl Agent {
                 // Total of all tiers including output = everything in context as of this exchange,
                 // which is what the next request re-sends (minus the new user prompt). Summing the
                 // input tiers + output (Claude reports cached tokens in separate fields) is the
-                // true occupancy and what the `/status` gauge and auto-compact threshold read.
-                self.cells.context_tokens.store(
+                // true occupancy and what the `/status` gauge and the auto-compact ceiling read.
+                self.record_context_tokens(
                     usage
                         .input_tokens
                         .saturating_add(usage.cache_creation_input_tokens)
                         .saturating_add(usage.cache_read_input_tokens)
                         .saturating_add(usage.output_tokens),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                )
+                .await;
                 turn_usage.input_tokens =
                     turn_usage.input_tokens.saturating_add(usage.input_tokens);
                 turn_usage.output_tokens =
@@ -1329,6 +1337,7 @@ impl Agent {
                     // The guard is dropped before the `.await` below; held across one it would make
                     // this future non-`Send` and break every `tokio::spawn` of a turn.
                     let requested = crate::sync::lock(&self.cells.pending_compaction).take();
+                    let mut compaction_attempted_this_round = false;
                     if let Some(request) = requested {
                         // An early-out, not the safety net. `context_compact` ignores its
                         // cancellation token, so the request outlives an interrupt; starting a
@@ -1343,9 +1352,14 @@ impl Agent {
                             tracing::debug!("dropping a compaction request on an interrupted turn");
                         } else if recovery.requested_compactions < MAX_REQUESTED_COMPACTIONS {
                             recovery.requested_compactions += 1;
+                            compaction_attempted_this_round = true;
                             tracing::info!("compacting at the agent's request");
                             match self
-                                .compact_session(messages, request, cancellation.clone())
+                                .compact_session(
+                                    messages,
+                                    request.answering(recovery.request_in_flight.clone()),
+                                    cancellation.clone(),
+                                )
                                 .await
                             {
                                 // Every index the turn holds addresses the conversation this just
@@ -1369,6 +1383,51 @@ impl Agent {
                                  ask again next turn"
                             );
                         }
+                    }
+
+                    // The question the turn's start asks, asked after every round: the checks
+                    // between turns let a long tool loop carry the context any distance past the
+                    // ceiling, with the provider's rejection as the only stop. Here the overshoot
+                    // is one round's results. The occupancy is the round's own measurement plus
+                    // what its whole reads reserved; the rest of its results are bounded and land
+                    // in the next measurement.
+                    //
+                    // Once per crossing: a compaction that leaves the context past the line, this
+                    // round's own included, gets nothing from a second pass, so the flag holds
+                    // until a measurement reads under the ceiling. An attempt the agent made this
+                    // round counts whether or not it succeeded: a second try against the same
+                    // conversation would fail the same way.
+                    match self.auto_compact_ceiling() {
+                        Some(ceiling) if self.cells.context_occupancy() > ceiling => {
+                            if compaction_attempted_this_round || recovery.ceiling_compacted {
+                                recovery.ceiling_compacted = true;
+                            } else if !cancellation.is_cancelled() {
+                                recovery.ceiling_compacted = true;
+                                let occupancy = self.cells.context_occupancy();
+                                let window = self.context_window();
+                                tracing::info!(
+                                    "compacting between rounds: {occupancy} tokens in context \
+                                     exceeds the ceiling of {ceiling} on the {window} window"
+                                );
+                                match self
+                                    .compact_session(
+                                        messages,
+                                        CompactRequest::new(CompactOrigin::Reactive)
+                                            .attributed_to(attribution.prompt_id)
+                                            .answering(recovery.request_in_flight.clone()),
+                                        cancellation.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(_) => recovery.after_conversation_rewrite(self, messages),
+                                    Err(_) if cancellation.is_cancelled() => {}
+                                    Err(error) => {
+                                        tracing::warn!("compaction between rounds failed: {error}")
+                                    }
+                                }
+                            }
+                        }
+                        _ => recovery.ceiling_compacted = false,
                     }
                 } else {
                     // No tool calls: the assistant message stands alone and ends the turn. Save it
@@ -2287,6 +2346,462 @@ mod tests {
         );
     }
 
+    /// Every door of a whole read, driven through the loop: the read tool's gauge is the agent's
+    /// own cells, so the usage the provider just reported is what the read is sized against; the
+    /// dispatcher records the reply as sized; the spill pass leaves it inline; and the next
+    /// measurement clears the reservation.
+    async fn run_a_whole_read(
+        entry: &str,
+        usage_before_the_read: u64,
+        usage_after: u64,
+    ) -> (Agent, Store, Conversation, Uuid) {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Usage {
+                    input_tokens: usage_before_the_read,
+                },
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "scratchpad_read".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": "big", "limit": 100_000}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![
+                MockEvent::Usage {
+                    input_tokens: usage_after,
+                },
+                MockEvent::Text {
+                    text: "done".to_string(),
+                },
+            ],
+        ]));
+        let (mut agent, store) = agent_with_registry_for_test(
+            provider as Arc<dyn Provider>,
+            crate::tools::ToolRegistry::new(),
+        )
+        .await;
+        agent.options.auto_compact = true;
+        agent.set_context_window_for_test(200_000);
+        // The production registry over the agent's own cells, which is where the read tool's
+        // gauge comes from.
+        agent.tool_registry = crate::tools::ToolRegistry::build_default(
+            &crate::session::SessionMaterials {
+                skills: crate::skills::SkillCache::disabled(),
+                memories: crate::store::memory::MemoryStore::disabled(),
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            agent.cells(),
+            &agent.options,
+        )
+        .expect("registry");
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        store
+            .save_scratchpad_entry(session_id, "big", entry)
+            .await
+            .expect("save");
+
+        let mut messages = Conversation::new();
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("read it".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("turn");
+        (agent, store, messages, session_id)
+    }
+
+    fn the_read_reply(messages: &Conversation) -> String {
+        messages
+            .as_slice()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "call-1" => {
+                    Some(ContentBlock::tool_result_text_content(content))
+                }
+                _ => None,
+            })
+            .expect("the read was answered")
+    }
+
+    #[tokio::test]
+    async fn a_whole_read_of_a_spilled_output_reaches_the_model_intact() {
+        // 10k of 200k used: 150k tokens of headroom, far more than the 100 KB asked for.
+        let (_agent, store, messages, session_id) =
+            run_a_whole_read(&"x".repeat(100_000), 10_000, 40_000).await;
+        let reply = the_read_reply(&messages);
+        assert!(
+            reply.starts_with(&"x".repeat(100_000)),
+            "the whole entry, not a preview: {}",
+            &reply[..reply.len().min(200)]
+        );
+        assert!(
+            reply.ends_with("(showing bytes 0..100000 of 100000)"),
+            "{reply}"
+        );
+        let entries = store
+            .list_scratchpad_entries(session_id)
+            .await
+            .expect("list");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big"],
+            "the reply was not spilled into a second copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_read_is_cut_to_the_agents_own_gauge_and_a_measurement_clears_it() {
+        // 120k of 200k used against a ceiling at 160k: 40k tokens of room, which is 40 KB of
+        // digits under the bound, above the inline floor.
+        let (agent, store, messages, session_id) =
+            run_a_whole_read(&"7".repeat(100_000), 120_000, 160_000).await;
+        let reply = the_read_reply(&messages);
+        assert!(
+            reply.ends_with(
+                "(showing bytes 0..40000 of 100000; cut to what fits in the context window now, \
+                 continue from offset 40000)"
+            ),
+            "{}",
+            &reply[reply.len() - 200..]
+        );
+        assert_eq!(
+            agent
+                .cells()
+                .context_reserved
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the round's measurement carries what was reserved, so the reservation is spent"
+        );
+        assert_eq!(
+            agent
+                .cells()
+                .context_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            160_000
+        );
+        assert_eq!(
+            store.load_context_tokens(session_id).await.expect("load"),
+            Some(160_000),
+            "the row carries the last measurement, for the resume that seeds from it"
+        );
+    }
+
+    /// A round's own measurement is checked against the ceiling before the next request, so a
+    /// tool loop overshoots the line by one round rather than by the whole loop. Each tool round
+    /// reports its usage; where a compaction is expected to follow, the summarizer's `complete`
+    /// call consumes a scripted round of its own, so the script carries one there.
+    async fn run_a_tool_loop(
+        occupancy_before_the_turn: Option<u64>,
+        usages: &[(u64, bool)],
+    ) -> (Arc<MockProvider>, Conversation) {
+        use crate::provider::mock::MockStopReason;
+
+        let mut rounds = Vec::new();
+        // An occupancy past the ceiling compacts at the turn's start, before any round: the
+        // summarizer's round comes first in the script.
+        if occupancy_before_the_turn.is_some() {
+            rounds.push(text_round("the summary before the loop"));
+        }
+        for (index, (usage, compaction_follows)) in usages.iter().enumerate() {
+            rounds.push(vec![
+                MockEvent::Usage {
+                    input_tokens: *usage,
+                },
+                MockEvent::ToolUseStart {
+                    id: format!("call-{index}"),
+                    name: "does_not_exist".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ]);
+            if *compaction_follows {
+                rounds.push(text_round("the summary"));
+            }
+        }
+        rounds.push(text_round("done"));
+        let provider = Arc::new(MockProvider::from_rounds(rounds));
+        let (agent, _store) =
+            agent_that_compacts_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        if let Some(occupancy) = occupancy_before_the_turn {
+            agent.cells().record_context_tokens(occupancy);
+        }
+        // Enough history for the split to have a head to summarize.
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts("work".to_string(), Vec::new())
+                    .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        (provider, messages)
+    }
+
+    #[tokio::test]
+    async fn a_round_past_the_ceiling_compacts_before_the_next_request() {
+        // The ceiling is 160k of 200k. The summarizer takes the `text_round` after the second tool
+        // round, and the model's next request answers "done".
+        let (provider, _messages) =
+            run_a_tool_loop(None, &[(100_000, false), (170_000, true)]).await;
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "the summarizer ran once, between the second round and the next request"
+        );
+        let requests = provider.streams();
+        assert_eq!(
+            requests.len(),
+            3,
+            "two tool rounds and the request after compaction"
+        );
+        assert!(
+            requests[2].messages.len() < requests[1].messages.len(),
+            "the request after the compaction carries less than the one before it"
+        );
+    }
+
+    /// A compaction that leaves the context past the line, this turn's own rounds included, is not
+    /// repeated every round; a measurement under the ceiling re-arms the check.
+    #[tokio::test]
+    async fn a_crossing_is_answered_once_until_a_measurement_reads_under_the_ceiling() {
+        let (provider, _messages) = run_a_tool_loop(None, &[
+            (100_000, false),
+            (170_000, true),
+            (175_000, false),
+            (100_000, false),
+            (170_000, true),
+        ])
+        .await;
+        assert_eq!(
+            provider.completions().len(),
+            2,
+            "170k compacts, 175k right after it does not, 100k re-arms, 170k compacts again"
+        );
+    }
+
+    /// The two other compactions the loop can run inside a turn carry the request too: the
+    /// agent's own `context_compact`, and the recovery from a rejected request. Each is a call site
+    /// of its own, so each is checked, or a summary at one of them would read the task second-hand.
+    #[tokio::test]
+    async fn a_requested_compaction_inside_a_turn_quotes_the_request() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "context_compact".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("the summary"),
+            text_round("done"),
+        ]));
+        let (mut agent, store) =
+            agent_that_compacts_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        agent.tool_registry = crate::tools::ToolRegistry::build_default(
+            &crate::session::SessionMaterials {
+                skills: crate::skills::SkillCache::disabled(),
+                memories: crate::store::memory::MemoryStore::disabled(),
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            agent.cells(),
+            &agent.options,
+        )
+        .expect("registry");
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts(
+                    "finish the report in exactly two lines".to_string(),
+                    Vec::new(),
+                )
+                .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(provider.completions().len(), 1, "the summarizer ran once");
+        let summary = messages.as_slice()[0].text_content();
+        assert!(
+            summary.contains("[The request this turn is answering, as the user wrote it]")
+                && summary.contains("finish the report in exactly two lines"),
+            "{summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovery_from_a_rejected_request_quotes_the_request() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Usage {
+                    input_tokens: 100_000,
+                },
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "does_not_exist".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![MockEvent::FailContextOverflow {
+                message: "prompt is too long: 250000 tokens > 200000 maximum".to_string(),
+            }],
+            text_round("the summary"),
+            text_round("done"),
+        ]));
+        let (agent, _store) =
+            agent_that_compacts_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts(
+                    "finish the report in exactly two lines".to_string(),
+                    Vec::new(),
+                )
+                .expect("a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the compacted retry succeeds");
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "the emergency summarizer ran once"
+        );
+        let summary = messages.as_slice()[0].text_content();
+        assert!(
+            summary.contains("[The request this turn is answering, as the user wrote it]")
+                && summary.contains("finish the report in exactly two lines"),
+            "{summary}"
+        );
+    }
+
+    /// A turn with no words, an image-only prompt or a delivery of background outcomes, has no
+    /// request to quote, and must not leave the model an empty heading to puzzle over.
+    #[tokio::test]
+    async fn a_turn_without_words_quotes_no_request() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            vec![
+                MockEvent::Usage {
+                    input_tokens: 170_000,
+                },
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "does_not_exist".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            text_round("the summary"),
+            text_round("done"),
+        ]));
+        let (agent, _store) =
+            agent_that_compacts_for_test(Arc::clone(&provider) as Arc<dyn Provider>).await;
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+        agent
+            .run_turn(
+                &mut messages,
+                crate::agent::TurnInput::from_parts(String::new(), vec![
+                    crate::image::ImageSource::Base64 {
+                        media_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    },
+                ])
+                .expect("an image is a prompt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the turn runs");
+        assert_eq!(provider.completions().len(), 1, "the round compacted");
+        let summary = messages.as_slice()[0].text_content();
+        assert!(
+            !summary.contains("[The request this turn is answering"),
+            "{summary}"
+        );
+    }
+
+    /// A compaction at the turn's start answers the crossing the first round is still in: the
+    /// round's measurement over the ceiling must not buy a second pass against the same
+    /// conversation.
+    #[tokio::test]
+    async fn a_compaction_before_the_loop_answers_the_first_crossing() {
+        let (provider, _messages) = run_a_tool_loop(Some(170_000), &[(170_000, false)]).await;
+        assert_eq!(
+            provider.completions().len(),
+            1,
+            "the turn's start compacted; the first round, still over, must not"
+        );
+    }
+
     /// A tool round whose save fails still answers every `tool_use` in memory.
     ///
     /// The tools have run, so the only conversation that describes what happened is one that ends
@@ -3007,14 +3522,14 @@ mod tests {
         );
     }
 
-    /// The reactive check fires *above* the threshold, not at it, and never on one message.
+    /// The reactive check fires *above* the ceiling, not at it, and never on one message.
     ///
-    /// [`Agent::auto_compact_threshold`] pins the number; this pins the comparisons that read it,
+    /// [`Agent::auto_compact_ceiling`] pins the number; this pins the comparisons that read it,
     /// which the tests that force compaction never approach. `>=` is the interesting one: it would
     /// compact a session sitting exactly on 80%, and since a compaction resets occupancy well below
     /// the line it would not loop, just fire one turn early, forever, invisibly.
     #[tokio::test]
-    async fn the_reactive_compaction_fires_above_the_threshold_and_not_at_it() {
+    async fn the_reactive_compaction_fires_above_the_ceiling_and_not_at_it() {
         use crate::provider::mock::{MockEvent, MockProvider, MockStopReason};
 
         let round = || {
@@ -3035,7 +3550,7 @@ mod tests {
         let occupancy = Arc::new(std::sync::atomic::AtomicU64::new(0));
         agent.set_context_tokens_for_test(Arc::clone(&occupancy));
         let threshold = agent
-            .auto_compact_threshold()
+            .auto_compact_ceiling()
             .expect("the compacting harness enables auto-compaction");
         assert_eq!(threshold, 160_000, "80% of the harness's 200k window");
 
@@ -3060,7 +3575,7 @@ mod tests {
         assert_eq!(
             provider.completions().len(),
             0,
-            "occupancy exactly at the threshold must not compact: the check is `>`, not `>=`"
+            "occupancy exactly at the ceiling must not compact: the check is `>`, not `>=`"
         );
 
         // One token over. The turn writes the counter itself, so re-arm it first.
@@ -3077,7 +3592,7 @@ mod tests {
         assert_eq!(
             provider.completions().len(),
             1,
-            "one token over the threshold must compact, or the window is never respected"
+            "one token over the ceiling must compact, or the window is never respected"
         );
     }
 

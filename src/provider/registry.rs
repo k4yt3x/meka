@@ -622,7 +622,7 @@ impl ProviderRegistry {
 pub(crate) struct ResolvedProfile {
     pub(crate) provider: Arc<dyn Provider>,
     pub(crate) profile: String,
-    /// What the context gauge and the auto-compaction threshold read.
+    /// What the context gauge and the auto-compaction ceiling read.
     pub(crate) context_window: u64,
     /// Whether this profile's model accepts image input. The agent does not read it: admitting an
     /// attachment is the host's decision, made before a turn exists, and every host asks

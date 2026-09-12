@@ -1967,9 +1967,11 @@ impl ContextBudget {
         }
         let percent = self.used.saturating_mul(100) / self.window;
         let policy = match self.compact_at_percent {
-            Some(threshold) => format!(
-                "The conversation is summarized automatically at {threshold}%, which loses detail, so \
-                 prefer to finish or checkpoint work before then."
+            Some(ceiling) => format!(
+                "The conversation is summarized automatically past {ceiling}%, between turns or \
+                 between two of your tool rounds, which loses detail; your most recent rounds and \
+                 the request you are answering survive it verbatim. Prefer to finish or checkpoint \
+                 work before then."
             ),
             None => {
                 "Auto-compaction is off, so a request past the window fails the turn.".to_string()
@@ -4651,7 +4653,7 @@ mod tests {
     }
 
     #[test]
-    fn context_budget_reports_occupancy_and_the_compaction_threshold() {
+    fn context_budget_reports_occupancy_and_the_context_ceiling() {
         let rendered = ContextBudget {
             used: 84_000,
             window: 200_000,
@@ -4664,7 +4666,7 @@ mod tests {
         assert!(rendered.contains("[Context budget]"));
         assert!(rendered.contains("~84k of 200k tokens (42%)"), "{rendered}");
         assert!(
-            rendered.contains("summarized automatically at 80%"),
+            rendered.contains("summarized automatically past 80%"),
             "{rendered}"
         );
     }

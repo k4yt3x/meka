@@ -82,10 +82,18 @@ pub(super) fn checkpoint_instruction(request: &CompactRequest) -> String {
               rather than when you would have chosen.\n\n"
         }
     });
-    instruction.push_str(
+    instruction.push_str(if request.request_in_flight.is_some() {
+        "Everything above is about to be replaced by a summary you write here, except for a short \
+         run of your most recent rounds, kept as they are, and the request this turn is answering, \
+         which survives as the user wrote it. This is the one moment you can act before that \
+         happens.\n\n"
+    } else {
         "Everything above is about to be replaced by a summary you write here, except for a short \
          run of the most recent turns, which is kept as-is. This is the one moment you can act \
-         before that happens.\n\n\
+         before that happens.\n\n"
+    });
+    instruction.push_str(
+        "\
          First, save whatever must outlive this conversation. `memory_write` is for what should \
          still be true in a future session: facts about the user, standing preferences, decisions \
          and the reasons behind them. The scratchpad is for working material this task still \
@@ -113,13 +121,17 @@ pub(super) fn checkpoint_instruction(request: &CompactRequest) -> String {
     instruction
 }
 /// Split a conversation for compaction into `(to_summarize, to_keep)`. The kept tail is the largest
-/// recent suffix whose estimated tokens stay within `keep_budget`, then snapped backward to a clean
-/// `User`-without-`tool_results` boundary so a tool_use/tool_result pair is never orphaned and the
-/// kept window starts on a valid user turn. If that leaves fewer than `MIN_SUMMARIZE` messages to
-/// summarize, the whole conversation is summarized and no tail is kept (a smaller head saves too
-/// little to be worth a boundary), except for a trailing user message nobody has answered: that is
-/// the request the model is about to answer, and it stays verbatim however short the conversation,
-/// or the model answers a summary of it and the user's words are gone from the window.
+/// recent suffix whose estimated tokens stay within `keep_budget`, then snapped backward to a
+/// boundary that splits no tool_use/tool_result pair: a plain user message, or an assistant message
+/// that opens a tool round, whose result then follows it into the tail. The second kind is what
+/// lets a compaction inside a turn keep that turn's latest rounds and summarize its earlier ones
+/// along with the history; a boundary only at user messages kept a whole turn or none of it. The
+/// summary that precedes the tail is a user message, so a tail opening on an assistant message
+/// still alternates. If that leaves fewer than `MIN_SUMMARIZE` messages to summarize, the whole
+/// conversation is summarized and no tail is kept (a smaller head saves too little to be worth a
+/// boundary), except for a trailing user message nobody has answered: that is the request the
+/// model is about to answer, and it stays verbatim however short the conversation, or the model
+/// answers a summary of it and the user's words are gone from the window.
 pub(super) fn compute_compaction_split(
     view: &[Message],
     keep_budget: u64,
@@ -141,13 +153,13 @@ pub(super) fn compute_compaction_split(
         split -= 1;
     }
 
-    // Snap back to a clean user boundary. This only grows the tail, so it never orphans a
-    // tool_result and guarantees the kept window starts on a User turn.
+    // Snap back to a boundary that splits no pair. This only grows the tail, so it never orphans
+    // a tool_result.
     while split > 0 {
         let Some(message) = view.get(split) else {
             break;
         };
-        if message.role == Role::User && !has_tool_results(&message.content) {
+        if opens_a_boundary(message) {
             break;
         }
         split -= 1;
@@ -158,6 +170,55 @@ pub(super) fn compute_compaction_split(
         (head.to_vec(), tail.to_vec())
     } else {
         summarize_all_but_a_trailing_prompt(view)
+    }
+}
+
+/// The section of a summary message that quotes the request a running turn is answering. One
+/// definition, so the writer and [`carries_the_request`] cannot disagree about its shape.
+fn request_section(words: &str) -> String {
+    format!(
+        "\n\n[The request this turn is answering, as the user wrote it]\n\n{}",
+        quote_request(words)
+    )
+}
+
+/// Whether a kept message already puts the request in the window: the prompt itself, whose words
+/// are its whole text, or an earlier summary that quoted it.
+fn carries_the_request(message: &Message, words: &str) -> bool {
+    if message.role != Role::User {
+        return false;
+    }
+    let text = message.text_content();
+    text == words || text.contains(&request_section(words))
+}
+
+/// The request a mid-turn compaction quotes, cut in the middle when it is longer than what any
+/// single tool result may carry inline: a pasted document with the question at either end keeps
+/// both ends, and the archive keeps all of it.
+fn quote_request(words: &str) -> String {
+    let limit = crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES;
+    if words.len() <= limit {
+        return words.to_string();
+    }
+    let head_end = words.floor_char_boundary(limit / 2);
+    let tail_start = words.ceil_char_boundary(words.len() - limit / 2);
+    format!(
+        "{}\n[... {} bytes of the request omitted here; `conversation_read` reaches all of it ...]\n{}",
+        &words[..head_end],
+        tail_start - head_end,
+        &words[tail_start..]
+    )
+}
+
+/// Whether a kept tail may start on `message`: a plain user message, or an assistant message that
+/// opens a tool round, since its result is the next message and follows it into the tail.
+fn opens_a_boundary(message: &Message) -> bool {
+    match message.role {
+        Role::User => !has_tool_results(&message.content),
+        Role::Assistant => message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. })),
     }
 }
 
@@ -239,6 +300,14 @@ impl Agent {
         // the moment it runs and the turn can still fail or be canceled afterwards; returned by
         // value it would be dropped on exactly those paths, and the caller told none were written.
         let mut memories_written: Vec<String> = Vec::new();
+        // The checkpoint's own reads reserve on the session's gauge, and nothing they return enters
+        // the conversation, so the charge is put back whatever the checkpoint's outcome; a failure
+        // below would otherwise leave it counting against the next turn's headroom until the next
+        // measurement.
+        let reserved_before_checkpoint = self
+            .cells
+            .context_reserved
+            .load(std::sync::atomic::Ordering::Relaxed);
         let checkpoint =
             if request.origin == CompactOrigin::Emergency || !self.options.compact_checkpoint {
                 None
@@ -263,6 +332,10 @@ impl Agent {
                     }
                 }
             };
+        self.cells.context_reserved.store(
+            reserved_before_checkpoint,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let keep_recent = match &checkpoint {
             // `context_replace` decided last and knew most, having just read the conversation, so
@@ -335,16 +408,37 @@ impl Agent {
 
         let mut context_message =
             format!("[Conversation summary from session compaction]\n\n{summary_text}");
+        // The request the running turn is answering, when the split took it into the head: quoted
+        // as the user wrote it, for the reason the split keeps a trailing prompt verbatim. A turn
+        // that carries on against a paraphrase of its own task drifts from it, and the live case
+        // was an agent spending rounds in the archive recovering the wording its own summary had
+        // garbled. A tail that holds the prompt, or an earlier summary's quote of it, needs no
+        // second copy; judged by the words themselves, since a kept tail can also open on a plain
+        // user message that is neither, such as the nudge after a thinking-only reply.
+        if let Some(words) = request.request_in_flight.as_deref().filter(|words| {
+            !to_keep
+                .iter()
+                .any(|message| carries_the_request(message, words))
+        }) {
+            context_message.push_str(&request_section(words));
+        }
         if !post_context.is_empty() {
             context_message.push_str(&format!("\n\n[Post-compaction context]\n\n{post_context}"));
         }
         // Behavioral directive (always last, most salient): pick the work back up rather than
         // narrate the summary. Without it, the turn after an auto-compaction tends to open with
         // "Based on the summary, I'll continue..." preambles that waste output and add nothing.
+        // The kept rounds, when there are any, come right after this message, and the sentence
+        // that says so keeps the model from reading its own first kept call as an answer to the
+        // summary.
         context_message.push_str(
             "\n\n[Continue the work directly from the summary above. Do not acknowledge or recap \
-             this summary; resume as if the conversation had not been interrupted.]",
+             this summary; resume as if the conversation had not been interrupted.",
         );
+        if !to_keep.is_empty() {
+            context_message.push_str(" Your most recent rounds follow, kept as they were.");
+        }
+        context_message.push(']');
 
         // Snapshot the deferred-tool active set before compaction so the `CompactBoundary` event
         // carries it forward; otherwise tools the model loaded pre-compaction would silently drop
@@ -467,10 +561,8 @@ impl Agent {
         // Seed the live context gauge with an estimate of the compacted working set so `/status`
         // (and the prompt indicator) immediately reflect the smaller size; the next real turn
         // overwrites it with the exact provider-reported total.
-        self.cells.context_tokens.store(
-            crate::tokens::estimate_messages(messages.as_slice()),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.record_context_tokens(crate::tokens::estimate_messages(messages.as_slice()))
+            .await;
 
         report_checkpoint_memories(&memories_written);
 
@@ -587,8 +679,8 @@ impl Agent {
 
         // Bounded by the same window a normal turn uses. Without this the checkpoint would be the
         // largest request meka ever sends: the reactive trigger means "the last
-        // `context_messages`-bounded request already filled 80% of the window", so handing the
-        // whole log over invites an overflow whose only trace is a warn line and a silent fallback.
+        // `context_messages`-bounded request already crossed the ceiling", so handing the whole
+        // log over invites an overflow whose only trace is a warn line and a silent fallback.
         let mut checkpoint_messages: Vec<Message> =
             truncate_messages_for_context(messages, self.options.context_messages);
         for message in &mut checkpoint_messages {
@@ -1158,11 +1250,50 @@ mod tests {
             assistant_message("final"),
         ];
         // A budget that naively cuts inside the assistant(tool_use)->user(tool_result) chain must
-        // snap back to the user boundary before it.
+        // snap back to the call that opens it, so the pair stays together in the tail.
         let (head, tail) = compute_compaction_split(&messages, 20);
         assert_eq!(head.len() + tail.len(), messages.len());
-        assert_eq!(tail[0].role, Role::User);
+        assert!(opens_a_boundary(&tail[0]), "{:?}", tail[0]);
         assert!(!has_tool_results(&tail[0].content));
+        if tail[0].role == Role::Assistant {
+            assert!(
+                has_tool_results(&tail[1].content),
+                "a tail opened by a call carries the call's result next"
+            );
+        }
+    }
+
+    /// A compaction inside a turn keeps that turn's latest rounds and summarizes the earlier ones
+    /// with the history. A boundary only at plain user messages had two outcomes here, neither of
+    /// them this: the whole turn kept, or none of it.
+    #[test]
+    fn a_compaction_inside_a_turn_keeps_its_latest_rounds() {
+        let mut messages = vec![
+            user_message("earlier question"),
+            assistant_message("earlier answer"),
+            user_message("another question"),
+            assistant_message("another answer"),
+            user_message("the task this turn is on"),
+        ];
+        for _ in 0..6 {
+            messages.push(assistant_tool_use());
+            messages.push(tool_result_message());
+        }
+        // Room for the last two rounds and not a third.
+        let budget: u64 = messages[messages.len() - 4..]
+            .iter()
+            .map(crate::tokens::estimate_message)
+            .sum();
+        let (head, tail) = compute_compaction_split(&messages, budget);
+        assert_eq!(tail.len(), 4, "two rounds, each a call and its result");
+        assert_eq!(tail[0].role, Role::Assistant);
+        assert!(has_tool_results(&tail[1].content));
+        assert_eq!(head.len(), messages.len() - 4);
+        assert!(
+            head.iter()
+                .any(|message| message.text_content() == "the task this turn is on"),
+            "the turn's prompt and earlier rounds go into the summary"
+        );
     }
 
     // Compaction strategy selection and the fallback ladder.
@@ -1349,6 +1480,305 @@ mod tests {
             .compact_session(messages, request, CancellationToken::new())
             .await
             .expect("compaction")
+    }
+
+    /// A running turn's rounds, each large enough that the tail budget holds only a few.
+    fn a_turn_in_progress(prompt: &str, rounds: usize) -> Conversation {
+        let mut messages = Conversation::new();
+        for round in 0..2 {
+            messages.append(Message::user(format!("earlier question {round}")));
+            messages.append(Message::assistant_text(format!("earlier answer {round}")));
+        }
+        messages.append(Message::user(prompt));
+        for _ in 0..rounds {
+            messages.append(assistant_tool_use());
+            messages.append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: vec![crate::conversation::ToolResultContent::Text {
+                        text: "x".repeat(5_000),
+                    }],
+                    is_error: false,
+                }],
+            });
+        }
+        messages
+    }
+
+    /// The summary message a compaction left at the head of the window.
+    fn the_summary_message(messages: &Conversation) -> String {
+        messages
+            .as_slice()
+            .first()
+            .expect("a compacted conversation opens on its summary")
+            .text_content()
+    }
+
+    /// A compaction inside a turn cuts it at a round, and the prompt then sits in the head. The
+    /// summary message carries it as the user wrote it, and says the kept rounds follow, so the
+    /// turn continues against the request rather than a paraphrase of it.
+    #[tokio::test]
+    async fn a_compaction_inside_a_turn_quotes_the_request_it_is_answering() {
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::from_rounds(vec![text_round("the summary")]));
+        let (agent, store) = agent_with_checkpoint(provider, false).await;
+        let prompt = "Read the entry to the end, then reply with exactly two lines.";
+        let mut messages = a_turn_in_progress(prompt, 6);
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive).answering(Some(prompt.to_string())),
+        )
+        .await;
+
+        let summary = the_summary_message(&messages);
+        assert!(
+            summary.contains("[The request this turn is answering, as the user wrote it]"),
+            "{summary}"
+        );
+        assert!(summary.contains(prompt), "{summary}");
+        assert!(
+            summary.contains("Your most recent rounds follow, kept as they were."),
+            "{summary}"
+        );
+        assert_eq!(
+            messages.as_slice()[1].role,
+            Role::Assistant,
+            "the kept tail opens on a call, so the prompt was the summary's to carry"
+        );
+    }
+
+    /// A kept tail can open on a plain user message that is not the prompt: the nudge the loop
+    /// appends after a thinking-only reply. The request is still in the head then, and judging
+    /// "the prompt survived" by the tail's first role would drop the quote exactly where it is
+    /// needed.
+    #[tokio::test]
+    async fn a_nudge_at_the_head_of_the_tail_does_not_stand_in_for_the_request() {
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::from_rounds(vec![text_round("the summary")]));
+        let (agent, store) = agent_with_checkpoint(provider, false).await;
+        let prompt = "Read the entry to the end, then reply with exactly two lines.";
+        let mut messages = a_turn_in_progress(prompt, 2);
+        messages.append(Message::user(crate::agent::turn::THINKING_ONLY_NUDGE));
+        // Large enough that the nudge plus these two rounds clear the tail budget's floor, so the
+        // window below sets the budget exactly.
+        for _ in 0..2 {
+            messages.append(assistant_tool_use());
+            messages.append(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: vec![crate::conversation::ToolResultContent::Text {
+                        text: "x".repeat(10_000),
+                    }],
+                    is_error: false,
+                }],
+            });
+        }
+        // Room for the nudge and the two rounds after it, and not the round before.
+        let budget: u64 = messages.as_slice()[messages.len() - 5..]
+            .iter()
+            .map(crate::tokens::estimate_message)
+            .sum();
+        assert_eq!(
+            compaction_tail_budget(budget * 10),
+            budget,
+            "the window must reproduce the budget through the tail's clamp"
+        );
+        let (_, tail) = compute_compaction_split(messages.as_slice(), budget);
+        assert_eq!(
+            tail.first().map(|first| first.text_content()),
+            Some(crate::agent::turn::THINKING_ONLY_NUDGE.to_string()),
+            "the fixture must put the nudge at the head of the tail"
+        );
+        agent.set_context_window_for_test(budget * 10);
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive).answering(Some(prompt.to_string())),
+        )
+        .await;
+
+        let summary = the_summary_message(&messages);
+        assert!(
+            summary.contains("[The request this turn is answering, as the user wrote it]")
+                && summary.contains(prompt),
+            "{summary}"
+        );
+    }
+
+    /// The same turn compacted at its start, with no request in flight, quotes nothing: the
+    /// previous turn's request is finished and the summary's to tell.
+    #[tokio::test]
+    async fn a_compaction_between_turns_quotes_no_request() {
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::from_rounds(vec![text_round("the summary")]));
+        let (agent, store) = agent_with_checkpoint(provider, false).await;
+        let mut messages = a_turn_in_progress("a request that has been answered", 6);
+        messages.append(Message::assistant_text("done"));
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive),
+        )
+        .await;
+
+        let summary = the_summary_message(&messages);
+        assert!(
+            !summary.contains("[The request this turn is answering"),
+            "{summary}"
+        );
+    }
+
+    /// When the kept tail opens on the prompt itself, the request is already in the window and is
+    /// not quoted a second time.
+    #[tokio::test]
+    async fn a_request_kept_in_the_tail_is_not_quoted_again() {
+        let provider: Arc<dyn Provider> =
+            Arc::new(MockProvider::from_rounds(vec![text_round("the summary")]));
+        let (agent, store) = agent_with_checkpoint(provider, false).await;
+        // A long history the budget cannot hold, then a short turn it can, whole.
+        let mut messages = Conversation::new();
+        for round in 0..8 {
+            messages.append(Message::user("q ".repeat(2_500)));
+            messages.append(Message::assistant_text(format!("earlier answer {round}")));
+        }
+        let prompt = "Reply with exactly two lines.";
+        messages.append(Message::user(prompt));
+        messages.append(assistant_tool_use());
+        messages.append(tool_result_message());
+
+        compact(
+            &agent,
+            &store,
+            &mut messages,
+            CompactRequest::new(CompactOrigin::Reactive).answering(Some(prompt.to_string())),
+        )
+        .await;
+
+        let summary = the_summary_message(&messages);
+        assert!(
+            !summary.contains("[The request this turn is answering"),
+            "{summary}"
+        );
+        assert!(
+            messages
+                .as_slice()
+                .iter()
+                .skip(1)
+                .any(|message| message.role == Role::User && message.text_content() == prompt),
+            "the prompt is in the kept tail: {:?}",
+            messages.as_slice()
+        );
+    }
+
+    /// A request longer than any single tool result may carry inline is quoted from both ends,
+    /// so a pasted document with the question at either end keeps the question.
+    #[test]
+    fn a_long_request_is_quoted_from_both_ends() {
+        let short = "a short request";
+        assert_eq!(quote_request(short), short);
+
+        let long = format!("HEAD{}TAIL", "x".repeat(100_000));
+        let quoted = quote_request(&long);
+        assert!(quoted.starts_with("HEAD"), "{}", &quoted[..40]);
+        assert!(quoted.ends_with("TAIL"), "{}", &quoted[quoted.len() - 40..]);
+        assert!(
+            quoted.contains("bytes of the request omitted here"),
+            "{quoted}"
+        );
+        assert!(
+            quoted.len() < crate::tools::scratchpad::MAX_INLINE_RESULT_BYTES + 200,
+            "{}",
+            quoted.len()
+        );
+    }
+
+    /// A checkpoint's `scratchpad_read` reserves on the session's gauge for a result that lands in
+    /// the checkpoint's own messages, never in the conversation. Whatever the compaction's outcome,
+    /// the charge must not survive it, or the next turn's headroom and its check against the
+    /// ceiling read a read that never happened.
+    #[tokio::test]
+    async fn a_checkpoints_reads_leave_no_reservation_behind() {
+        use crate::provider::mock::MockStopReason;
+
+        let provider = Arc::new(MockProvider::from_rounds(vec![
+            // The checkpoint turn reads a whole entry, then the checkpoint dies.
+            vec![
+                MockEvent::ToolUseStart {
+                    id: "call-1".to_string(),
+                    name: "scratchpad_read".to_string(),
+                },
+                MockEvent::ToolUseEnd {
+                    input: serde_json::json!({"name": "big", "limit": 100_000}),
+                },
+                MockEvent::MessageEnd {
+                    stop_reason: MockStopReason::ToolUse,
+                },
+            ],
+            vec![MockEvent::Fail {
+                message: "the checkpoint dies".to_string(),
+            }],
+            // So does the summarizer it falls back to, so the compaction fails outright.
+            vec![MockEvent::Fail {
+                message: "the summarizer dies".to_string(),
+            }],
+        ]));
+        let (mut agent, store) =
+            agent_with_checkpoint(Arc::clone(&provider) as Arc<dyn Provider>, true).await;
+        agent.tool_registry = crate::tools::ToolRegistry::build_default(
+            &crate::session::SessionMaterials {
+                skills: crate::skills::SkillCache::disabled(),
+                memories: crate::store::memory::MemoryStore::disabled(),
+                ..crate::session::SessionMaterials::for_test(store.clone())
+            },
+            agent.cells(),
+            &agent.options,
+        )
+        .expect("registry");
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        agent.cells().session_id.set(session_id);
+        store
+            .save_scratchpad_entry(session_id, "big", &"x".repeat(100_000))
+            .await
+            .expect("save");
+        let mut messages = Conversation::new();
+        for round in 0..4 {
+            messages.append(Message::user(format!("question {round}")));
+            messages.append(Message::assistant_text(format!("answer {round}")));
+        }
+
+        agent
+            .compact_session(
+                &mut messages,
+                CompactRequest::new(CompactOrigin::Manual),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("both the checkpoint and the summarizer failed");
+        assert_eq!(
+            provider.completions().len(),
+            3,
+            "the read ran inside the checkpoint before anything failed"
+        );
+        assert_eq!(
+            agent
+                .cells()
+                .context_reserved
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the checkpoint's read must not stay charged to the conversation"
+        );
     }
 
     /// The summary is the one request that turns thinking off, and it says so on the request
@@ -1583,6 +2013,7 @@ mod tests {
             instructions: None,
             keep_recent: Some(false),
             prompt_id: None,
+            request_in_flight: None,
         })
         .await;
 
@@ -1653,6 +2084,7 @@ mod tests {
             instructions: None,
             keep_recent: Some(false),
             prompt_id: None,
+            request_in_flight: None,
         })
         .await;
 
@@ -1767,6 +2199,7 @@ mod tests {
             instructions: None,
             keep_recent: Some(false),
             prompt_id: None,
+            request_in_flight: None,
         })
         .await;
 

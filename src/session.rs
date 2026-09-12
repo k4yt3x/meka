@@ -118,6 +118,11 @@ pub(crate) struct SessionCells {
     pub(crate) profile: crate::provider::PublishedProfile,
     /// Tokens in context after the last provider round; a frontend gauge holds the same cell.
     pub(crate) context_tokens: Arc<std::sync::atomic::AtomicU64>,
+    /// Tokens a whole read has charged for what it returned since that round, which the provider
+    /// has not yet measured; every other tool's result is bounded by the spill and lands in the
+    /// next measurement uncharged. Cleared by [`Self::record_context_tokens`], the one place a
+    /// measurement lands.
+    pub(crate) context_reserved: Arc<std::sync::atomic::AtomicU64>,
     /// Estimated fixed overhead (system prompt and tool schemas); `context_check` reads it.
     pub(crate) context_overhead: Arc<std::sync::atomic::AtomicU64>,
     /// Background tool calls in flight; inert unless `[background] enabled`.
@@ -151,12 +156,49 @@ impl SessionCells {
             todo_list: crate::todo::SharedTodoList::default(),
             profile,
             context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            context_reserved: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             background_tasks: crate::background::BackgroundTasks::default(),
             frontend,
             session_lock: crate::store::SessionLockSlot::default(),
             pending_compaction: PendingCompaction::default(),
         }
+    }
+
+    /// What is in context as far as meka knows: the last measurement plus what tools have reserved
+    /// since. The figure every check against the ceiling reads, and the one the gauge's headroom
+    /// is the complement of.
+    pub(crate) fn context_occupancy(&self) -> u64 {
+        self.context_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(
+                self.context_reserved
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+    }
+
+    /// Seed the gauge from what the session's row recorded, for a session reopened over its row:
+    /// every host's resume and a sub-agent's follow-up. The last measurement wins over whatever
+    /// estimate a host seeded, since the checks against the ceiling read this cell and an
+    /// estimate under-reads by the system prompt and tool schemas, enough to let the first turn
+    /// back run past the line. A row that recorded nothing leaves the cell as it is.
+    pub(crate) async fn seed_context_tokens(&self, store: &crate::store::Store, session_id: Uuid) {
+        match store.load_context_tokens(session_id).await {
+            Ok(Some(total)) => self
+                .context_tokens
+                .store(total, std::sync::atomic::Ordering::Relaxed),
+            Ok(None) => {}
+            Err(error) => tracing::warn!("failed to load the context occupancy: {error}"),
+        }
+    }
+
+    /// Publish what is in context now, measured by the provider or estimated after a rewrite. The
+    /// reservation is cleared with it: everything a tool reserved is inside this figure or gone.
+    pub(crate) fn record_context_tokens(&self, total: u64) {
+        self.context_tokens
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+        self.context_reserved
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The same cells, bound to a session that already exists. Every host but the REPL's first
@@ -291,10 +333,6 @@ impl SessionCells {
     }
 }
 
-/// Trigger auto-compaction once a turn's input tokens exceed this fraction of the configured
-/// context window.
-pub(crate) const AUTO_COMPACT_THRESHOLD_PERCENT: u64 = 80;
-
 /// Per-turn configuration knobs for `Agent`. Constructed once by `main` from the
 /// [`crate::config::ResolvedConfig`] and held immutably for the agent's lifetime; mid-session
 /// permission cycling and tool loading are handled by shared state (see
@@ -321,9 +359,13 @@ pub(crate) struct AgentOptions {
     /// rather than lifting it. Only a directly-constructed `AgentOptions` (tests, and a sub-agent
     /// inheriting one) can be `None`.
     pub(crate) context_messages: Option<usize>,
-    /// When true, the agent auto-compacts the conversation once a turn's input tokens cross
-    /// [`AUTO_COMPACT_THRESHOLD_PERCENT`] of the session's context window. Requires a window above
-    /// zero.
+    /// The share of the session's context window the conversation may fill on its own
+    /// (`[session].context_ceiling_percent`): a whole read is cut at the line, and with
+    /// [`Self::auto_compact`] on the conversation is compacted once past it.
+    pub(crate) context_ceiling_percent: u64,
+    /// Whether the agent compacts the conversation once it is past the ceiling
+    /// (`[session].auto_compact`). Requires a window above zero to act. Off moves nothing: reads
+    /// still stop at the ceiling, and a request past the window fails the turn.
     pub(crate) auto_compact: bool,
     /// When true, a compaction is preceded by a *checkpoint turn*: the agent itself, holding its
     /// real system prompt and memory index, decides what survives and writes durable notes for
@@ -371,6 +413,11 @@ pub(crate) type PendingCompaction = Arc<std::sync::Mutex<Option<CompactRequest>>
 pub(crate) fn compaction_tail_budget(context_window: u64) -> u64 {
     (context_window / 10).clamp(4_000, 16_000)
 }
+/// The context ceiling in tokens: the share of the window the conversation may fill on its own.
+/// One formula for the agent's checks and the gauge a read is sized against.
+pub(crate) fn context_ceiling(context_window: u64, percent: u64) -> u64 {
+    context_window.saturating_mul(percent) / 100
+}
 /// What set a compaction going. Selects the summarization strategy, so it is not merely
 /// diagnostic.
 ///
@@ -381,7 +428,7 @@ pub(crate) fn compaction_tail_budget(context_window: u64) -> u64 {
 /// `Agent::summarize_via_provider` is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactOrigin {
-    /// The previous turn's reported usage crossed the threshold.
+    /// A measured occupancy crossed the ceiling, between turns or between two tool rounds.
     Reactive,
     /// This turn's projected request would cross it.
     Proactive,
@@ -407,6 +454,11 @@ pub(crate) struct CompactRequest {
     /// The prompt the compaction serves, when a turn asked for it; a host-driven `/compact` has
     /// none and its requests mint one.
     pub(crate) prompt_id: Option<Uuid>,
+    /// The words of the request a turn still in progress is answering, when the compaction runs
+    /// inside that turn. Quoted after the summary if the split takes the request into the head,
+    /// so the turn continues against what the user wrote rather than a paraphrase of it. `None`
+    /// for a compaction between turns, whose finished request is the summary's to tell.
+    pub(crate) request_in_flight: Option<String>,
 }
 impl CompactRequest {
     pub(crate) fn new(origin: CompactOrigin) -> Self {
@@ -415,7 +467,15 @@ impl CompactRequest {
             instructions: None,
             keep_recent: None,
             prompt_id: None,
+            request_in_flight: None,
         }
+    }
+
+    /// The request the running turn is answering; see [`Self::request_in_flight`].
+    #[must_use]
+    pub(crate) fn answering(mut self, words: Option<String>) -> Self {
+        self.request_in_flight = words;
+        self
     }
 
     /// Bill the compaction's requests to the turn that asked for it.
@@ -438,6 +498,7 @@ impl AgentOptions {
             sandboxed_shell,
             gate_tools,
             context_messages: config.context_messages,
+            context_ceiling_percent: config.context_ceiling_percent,
             auto_compact: config.auto_compact,
             compact_checkpoint: config.compact_checkpoint,
             user_instructions,
@@ -454,6 +515,7 @@ impl AgentOptions {
             sandboxed_shell: false,
             gate_tools: None,
             context_messages: None,
+            context_ceiling_percent: crate::config::DEFAULT_CONTEXT_CEILING_PERCENT,
             auto_compact: false,
             compact_checkpoint: false,
             user_instructions: None,

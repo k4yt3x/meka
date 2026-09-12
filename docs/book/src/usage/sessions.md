@@ -153,6 +153,7 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 | `subagent_spec_json` | TEXT | The terms a sub-agent was spawned under |
 | `stat_*` | INTEGER | Eight cumulative counters behind `/status` |
 | `profile` | TEXT | Profile the session runs on. Never NULL, though a row carried forward from a store that predates the column can hold `''` |
+| `context_tokens` | INTEGER | Context occupancy the provider last reported, which a resume checks its first turn against; NULL until a turn records one, and after a rewind |
 
 **blobs** and **message_blobs**: image bytes by SHA-256 content hash, and which message rows
 reference them. A message row holds a reference in place of the bytes, so a screenshot read twice is
@@ -272,17 +273,18 @@ Turning it off leaves the standalone summarizer to write every summary, which sa
 
 ### Auto-compact
 
-When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation when the input token count exceeds 80% of the context window. The threshold check runs between turns, not during tool loops. It is both reactive (the previous turn's reported usage) and proactive (an estimate of the next request, so a turn whose own input jumps over the window is compacted before it is sent). As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
+When `auto_compact` is enabled (default: `true`), meka automatically compacts the conversation once it is past `context_ceiling_percent` of the context window (default: 90%). The check runs at three points. At the start of a turn it reads the last reported usage, which a resumed session takes from its row, so the first turn after a resume is checked against the real number. Before the first request it projects the request from an estimate, so a turn whose own input jumps over the ceiling is compacted before it is sent. And after every round of tool results inside a turn it reads that round's reported usage, so a long tool loop overshoots the line by one round rather than by the whole loop; the turn's most recent rounds are kept verbatim within the budget, its earlier ones are summarized with the history, the request the turn is answering is quoted after the summary as the user wrote it, and one crossing is answered once, until a later measurement reads under the line again. As a last resort, if the provider still rejects a request for exceeding the context window, meka compacts once and retries the turn instead of failing.
 
 ```toml
 [session]
 auto_compact = true
+context_ceiling_percent = 90  # default
 context_window = 200000  # optional override
 ```
 
 ### Agent-initiated compaction
 
-The agent doesn't have to wait for the threshold. `context_compact` asks for a compaction before the agent's next step: it runs once the current batch of tool calls finishes, and the turn then carries on against the summary. What it reclaims is history from earlier turns: with the default `keep_recent`, the tail is cut back to a clean user boundary, so the current turn stays verbatim and an agent that filled its window with this turn's own tool results gets little back. One compaction per turn: a further request once the first has run is ignored, and the agent can ask again on a later turn.
+The agent doesn't have to wait for the ceiling. `context_compact` asks for a compaction before the agent's next step: it runs once the current batch of tool calls finishes, and the turn then carries on against the summary. With the default `keep_recent`, the tail keeps the most recent rounds within the verbatim budget, cut at a call so no call is parted from its result, and everything before that, the history and the current turn's earlier rounds alike, goes into the summary; the request the turn is answering is quoted after the summary as the user wrote it, so the turn continues against the user's words rather than a paraphrase. One compaction per turn: a further request once the first has run is ignored, and the agent can ask again on a later turn.
 
 ```text
 context_compact(instructions: "the day's work is in memory now", keep_recent: false)
@@ -294,12 +296,13 @@ The request is parked rather than applied where it is made: a tool cannot rewrit
 
 ### What the agent sees
 
-Once a turn has been measured, the per-turn context block carries a `[Context budget]` line reporting occupancy and the threshold compaction fires at:
+Once a turn has been measured, the per-turn context block carries a `[Context budget]` line reporting occupancy and the ceiling compaction fires past:
 
 ```text
 [Context budget]
-Using ~84k of 200k tokens (42%). The conversation is summarized automatically at
-80%, which loses detail, so prefer to finish or checkpoint work before then.
+Using ~84k of 200k tokens (42%). The conversation is summarized automatically past
+90%, between turns or between two of your tool rounds, which loses detail; your most
+recent rounds are kept verbatim. Prefer to finish or checkpoint work before then.
 ```
 
 The agent is expected to budget its own reading and to decide when a task will fit, so it needs the same number the harness uses. Without it, those are guesses. The line is suppressed when the window is unknown, and on the first turn of a session, when there is no measurement yet rather than a genuine zero.

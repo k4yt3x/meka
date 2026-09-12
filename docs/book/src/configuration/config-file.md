@@ -970,13 +970,26 @@ retention = "30d"
 
 ### `session.auto_compact`
 
-Automatically compact the conversation when input tokens exceed 80% of the context window. Compaction summarizes older messages and preserves recent ones, the todo list, and scratchpad entries.
+Automatically compact the conversation once it is past `context_ceiling_percent` of the context window, between turns or between two tool rounds of one turn. Compaction summarizes older messages and preserves recent ones, the todo list, and scratchpad entries. Off changes nothing else: a whole `scratchpad_read` still stops at the ceiling, and a request past the window fails the turn.
 
 Default: `true`
 
 ```toml
 [session]
 auto_compact = false
+```
+
+### `session.context_ceiling_percent`
+
+The share of the context window meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
+
+What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the default leaves 100k tokens on a 1M window against a Claude reply budget of 64000, and on a small window it needs lowering, or `max_output_tokens` does.
+
+Default: `90`
+
+```toml
+[session]
+context_ceiling_percent = 70
 ```
 
 ### `session.compact_checkpoint`
@@ -996,7 +1009,7 @@ compact_checkpoint = false
 
 ### `session.context_window`
 
-Override the model's context window size (in tokens). Used for auto-compact threshold calculation. A per-profile `[profiles.<name>].context_window` takes precedence over this.
+Override the model's context window size (in tokens). Used for the context ceiling. A per-profile `[profiles.<name>].context_window` takes precedence over this.
 
 When neither is set, meka assumes **1000000**. It does not infer the window from the model name, query the provider's models API, or cache anything: the window is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, and the user is the one who knows the truth.
 

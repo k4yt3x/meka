@@ -77,8 +77,11 @@ impl Agent {
             if name == "todo" {
                 todo_fired = true;
             }
-            if let Some(hint) = output.scratchpad_hint.clone() {
-                self.scratchpad_hints.write().await.insert(id.clone(), hint);
+            if output.spill_hint != crate::tools::SpillHint::default() {
+                self.scratchpad_hints
+                    .write()
+                    .await
+                    .insert(id.clone(), output.spill_hint.clone());
             }
             // Notify the frontend of completion BEFORE building the ToolResult content block so ACP
             // `tool_call_update` notifications arrive before the next assistant turn's text starts

@@ -583,14 +583,46 @@ impl ReadStamp {
 /// command, a concurrent agent, or the user's editor) silently clobbered.
 pub(crate) type ReadTracker = Arc<RwLock<HashMap<PathBuf, ReadStamp>>>;
 
+/// What a tool told the spill pass about its result. The dispatcher keeps it per call id until
+/// [`crate::tools::scratchpad::persist_oversized_results`] runs, which is after the output has
+/// become a conversation block that cannot carry it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SpillHint {
+    /// The name to spill under instead of the tool's own. MCP adapters set it so the entry is
+    /// named `mcp_<server>_<remote_tool>`.
+    pub(crate) name: Option<String>,
+    /// The tool sized this result against the context itself, so the spill pass leaves it inline
+    /// however large. Only a tool that reserved its bytes on the
+    /// [`crate::tools::context::ContextGauge`] may say so; an unsized result over the bound would
+    /// go out unbounded.
+    pub(crate) sized_to_context: bool,
+}
+
+impl SpillHint {
+    /// Spill under `name`.
+    pub(crate) fn under(name: String) -> Self {
+        Self {
+            name: Some(name),
+            sized_to_context: false,
+        }
+    }
+
+    /// Never spill: the tool reserved what it returns.
+    pub(crate) fn sized_to_context() -> Self {
+        Self {
+            name: None,
+            sized_to_context: true,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ToolOutput {
     pub(crate) content: Vec<ToolResultContent>,
     pub(crate) is_error: bool,
-    /// When `persist_oversized_results` has to spill to the scratchpad, use this name instead of
-    /// the caller-supplied tool name. Set by MCP tool adapters so the persisted blob is namespaced
-    /// as `mcp_<server>_<remote_tool>` for easier debugging.
-    pub(crate) scratchpad_hint: Option<String>,
+    /// What the spill pass is to make of a result over the inline bound; the default spills it
+    /// under the tool's name.
+    pub(crate) spill_hint: SpillHint,
     /// Tool-specific structured side-channel for frontends that know how to render it (e.g. ACP's
     /// `diff` content block). Tools that don't produce extra structure leave this as `None`; the
     /// regular `content` text remains the source of truth for the model.
@@ -616,7 +648,7 @@ impl ToolOutput {
         Self {
             content: vec![ToolResultContent::Text { text: content }],
             is_error,
-            scratchpad_hint: None,
+            spill_hint: SpillHint::default(),
             frontend_metadata: None,
             structured: None,
         }

@@ -100,6 +100,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                     .map(str::to_string),
                 keep_recent: None,
                 prompt_id: None,
+                request_in_flight: None,
             };
             match crate::host::terminal::compact_interruptible(
                 cancel,
@@ -138,7 +139,7 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
             };
             match (session_id, rewound) {
                 (Some(id), Some(event)) => {
-                    if let Err(error) = store.save_event(id, &event).await {
+                    if let Err(error) = store.save_rewind(id, &event).await {
                         // Put the turns back rather than leave memory and disk
                         // disagreeing, which would resurrect them on the next resume
                         // and make the rewind look like it silently un-did itself.
@@ -146,6 +147,14 @@ pub(crate) async fn answer(command: SlashCommand, context: HostCommandContext<'_
                         with_console(console, |console| console.error(&error));
                     } else {
                         agent.reset_conversation_markers().await;
+                        // The gauge described turns that are gone; an estimate of what is
+                        // left stands in until the next measurement, or the next turn's
+                        // check reads the dropped turns as still there.
+                        agent
+                            .cells()
+                            .record_context_tokens(crate::tokens::estimate_messages(
+                                messages.as_slice(),
+                            ));
                         with_console(console, |console| {
                             console.hint(&format!("Rewound {turns} turn(s)."))
                         });

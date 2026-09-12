@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-09-12
+
+### Added
+
+- `[session] context_ceiling_percent` sets where auto-compaction fires and whole reads stop.
+
+### Changed
+
+- Auto-compaction fires past 90% of the context window instead of 80%.
+- Auto-compaction also runs between two tool rounds of one turn, not only between turns.
+- A compaction cuts a turn larger than the verbatim budget at a round, keeping its latest rounds.
+- A compaction inside a turn quotes the request being answered after the summary, as written.
+- A resumed session checks its first turn against the occupancy last measured, not an estimate.
+- A rewind forgets the occupancy the session recorded, so a resume does not compact against it.
+- A whole `scratchpad_read` is cut at the context ceiling and says where to continue.
+- `context_check` reports headroom to the ceiling, net of what this round's whole reads took.
+
+### Fixed
+
+- A `scratchpad_read` reply is never spilled back into the scratchpad it was read from.
+
 ## [0.51.0] - 2026-09-12
 
 ### Changed
@@ -2167,7 +2188,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.51.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.52.0...HEAD
+[0.52.0]: https://github.com/k4yt3x/meka/compare/0.51.0...0.52.0
 [0.51.0]: https://github.com/k4yt3x/meka/compare/0.50.0...0.51.0
 [0.50.0]: https://github.com/k4yt3x/meka/compare/0.49.0...0.50.0
 [0.49.0]: https://github.com/k4yt3x/meka/compare/0.48.0...0.49.0

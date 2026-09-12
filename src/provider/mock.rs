@@ -11,8 +11,8 @@
 //!
 //! The mock is intentionally minimal: text deltas, thinking deltas, tool-use lifecycle,
 //! `MessageEnd`, plus a synthetic `Fail` event that returns an error from [`Provider::stream`] so
-//! the agent's non-Interrupted error path can be exercised end-to-end. Image content and
-//! token-usage events are not supported; tests that need them should extend the mock first.
+//! the agent's non-Interrupted error path can be exercised end-to-end. Image content is not
+//! supported; tests that need it should extend the mock first.
 
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -138,6 +138,11 @@ pub(crate) enum MockEvent {
     /// was too large, the compacted retry fit".
     FailContextOverflow {
         message: String,
+    },
+    /// The input tokens the round reports, as a provider's `usage` does. What the agent gauges the
+    /// context by, so a script can put the occupancy where a test needs it.
+    Usage {
+        input_tokens: u64,
     },
 }
 
@@ -283,6 +288,7 @@ impl Provider for MockProvider {
         let mut pending_tool: Option<(String, String)> = None;
         let mut stop_reason = StopReason::EndTurn;
         let mut notices = Vec::new();
+        let mut usage = TokenUsage::default();
 
         for event in events {
             match event {
@@ -378,6 +384,7 @@ impl Provider for MockProvider {
                 MockEvent::MessageEnd {
                     stop_reason: reason,
                 } => stop_reason = reason.into(),
+                MockEvent::Usage { input_tokens } => usage.input_tokens = input_tokens,
             }
         }
 
@@ -391,7 +398,7 @@ impl Provider for MockProvider {
                 content,
             },
             stop_reason,
-            usage: TokenUsage::default(),
+            usage,
             notices,
         })
     }
@@ -526,6 +533,10 @@ impl Provider for MockProvider {
                         MockEvent::MessageEnd { stop_reason } => StreamEvent::MessageEnd {
                             stop_reason: stop_reason.into(),
                         },
+                        MockEvent::Usage { input_tokens } => StreamEvent::Usage(TokenUsage {
+                            input_tokens,
+                            ..TokenUsage::default()
+                        }),
                         #[allow(
                             clippy::unreachable,
                             reason = "the control events are consumed by the match above this one"

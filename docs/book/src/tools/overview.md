@@ -208,7 +208,7 @@ All three refuse an id that isn't a child of the current session, so one session
 
 **A follow-up runs under the terms of the spawn, not your current ones.** The permission level, the deny lists, the memory level and the inherited scratchpad names are recorded when the sub-agent is created and replayed on every follow-up. If you spawned a sub-agent at `read` and have since switched to `unrestricted`, following up on it still runs it at `read`. That is deliberate: otherwise a second question would be a way to escalate a sub-agent you deliberately restricted. A sub-agent that shares your workspace keeps the working directory it was spawned in; at `workspace`, a follow-up is refused once that directory lies outside your own boundary, the same check a sub-agent's `writable_roots` get.
 
-Two things do *not* survive a follow-up, because they only ever lived in memory: the sub-agent's todo list, and which files it had read. It is told as much at the start of the turn.
+Two things do *not* survive a follow-up, because they only ever lived in memory: the sub-agent's todo list, and which files it had read. It is told as much at the start of the turn. Its context gauge does survive: the follow-up starts from the occupancy the sub-agent's row last recorded, so its first turn back is checked against the ceiling like any other.
 
 One follow-up at a time per sub-agent. A second concurrent call on the same sub-agent is refused rather than interleaved, since both would be appending to one conversation from a view of it that the other has already changed.
 
@@ -281,7 +281,8 @@ Where `conversation_*` reads the **archive** (the full log on disk, including tu
 
 ```text
 Using 84000 of 200000 tokens (42%).
-Headroom: 76000 tokens before auto-compaction fires at 80%.
+Headroom: 96000 tokens before the context ceiling at 90%. Auto-compaction fires there,
+between turns or between two of your tool rounds.
 Kept verbatim on compaction: about 16000 tokens of the most recent turns; everything
 older is replaced by a summary.
 Fixed overhead: about 12000 tokens of system prompt and tool schemas (estimated).
@@ -290,7 +291,7 @@ Conversation: about 72000 tokens, which is the part compaction acts on.
 Compactions so far: none, so nothing has been summarized away yet.
 ```
 
-This exists because the pushed `[Context budget]` block is rendered once, at the start of a turn, and so does not move while the agent works. During a long tool loop it is stale. See [What the agent sees](../usage/sessions.md#what-the-agent-sees).
+This exists because the pushed `[Context budget]` block is rendered once, at the start of a turn, and so does not move while the agent works. During a long tool loop it is stale. See [What the agent sees](../usage/sessions.md#what-the-agent-sees). The headroom is net of what this round's whole `scratchpad_read` calls have already taken, so it is the room the next read gets.
 
 `context_compact` requests a compaction before the agent's next step. It runs once the current batch of tool calls finishes, and the turn then continues against the summary; one request is honored per turn.
 

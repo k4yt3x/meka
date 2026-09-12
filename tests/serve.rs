@@ -4106,6 +4106,73 @@ fn created_at_survives_gc_and_reattach() {
     );
 }
 
+/// The first turn after a re-attach is checked against the occupancy the row recorded, not an
+/// estimate of the conversation. The third turn reports a usage past the ceiling and the session is
+/// then evicted; on re-attach the reactive check must compact before the fourth turn, which the
+/// script makes visible: the summarizer consumes the round scripted for it, and the turn gets the
+/// round after. Without the seed the estimate reads far under the ceiling, nothing compacts, and
+/// the fourth turn answers with the summarizer's line instead.
+#[test]
+fn a_reattached_session_compacts_on_the_measurement_its_row_recorded() {
+    let turn = |text: &str, usage: Option<u64>| {
+        let mut events = Vec::new();
+        if let Some(input_tokens) = usage {
+            events.push(serde_json::json!({ "type": "usage", "input_tokens": input_tokens }));
+        }
+        events.push(serde_json::json!({ "type": "text", "text": text }));
+        events.push(serde_json::json!({ "type": "message_end", "stop_reason": "end_turn" }));
+        serde_json::Value::Array(events)
+    };
+    let script = serde_json::json!([
+        turn("first", None),
+        turn("second", None),
+        turn("third", Some(190_000)),
+        turn("the summary", None),
+        turn("fourth", None),
+    ]);
+    // 90% of 200k is 180k, under the 190k the third turn reports. No checkpoint, so the compaction
+    // is one summarizer round rather than a checkpoint turn plus a fallback.
+    let harness = ServeTestHarness::spawn_with(
+        "[session]\ncontext_window = 200000\ncompact_checkpoint = false\n",
+        "idle_timeout = \"1s\"\ngc_scan_interval = \"1s\"\n",
+        script,
+        "sk_test_token",
+        &["sessions:r", "sessions:w"],
+    );
+    let create = harness
+        .request(reqwest::Method::POST, "/v1/sessions")
+        .json(&serde_json::json!({"cwd": std::env::temp_dir().to_string_lossy()}))
+        .send()
+        .expect("create");
+    assert_eq!(create.status(), 201);
+    let id = create.json::<serde_json::Value>().expect("parse")["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    for prompt in ["one", "two", "three"] {
+        let response = harness
+            .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+            .json(&serde_json::json!({"message": prompt}))
+            .send()
+            .expect("turn");
+        assert_eq!(response.status(), 200);
+    }
+
+    harness.wait_until_evicted(&id);
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/turn"))
+        .json(&serde_json::json!({"message": "four"}))
+        .send()
+        .expect("turn after re-attach");
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().expect("parse");
+    assert_eq!(
+        body["final_text"], "fourth",
+        "the re-attached turn must compact first, spending the summarizer's round: {body}"
+    );
+}
+
 /// A typo on a top-level TurnRequest field (e.g. "streem" instead of "stream") returns
 /// 422 invalid-body thanks to `#[serde(deny_unknown_fields)]`.
 #[test]
@@ -5658,6 +5725,48 @@ fn rewind_drops_the_last_turn_and_persists_it() {
     assert_eq!(
         messages["total"], 0,
         "the persisted log must reflect the rewind: {messages}"
+    );
+}
+
+/// A rewind drops turns the gauge counted, so the gauge follows: left at the measurement, the
+/// next turn's check against the ceiling would read the dropped turns as still there, and a resume
+/// would seed from a row describing a conversation that no longer exists.
+#[test]
+fn rewind_takes_the_context_gauge_down_with_the_turns() {
+    let script = serde_json::json!([
+        [
+            { "type": "usage", "input_tokens": 150_000 },
+            { "type": "text", "text": "first" },
+            { "type": "message_end", "stop_reason": "end_turn" }
+        ]
+    ]);
+    let harness = ServeTestHarness::spawn("", script);
+    let id = session_with_one_turn(&harness);
+    let context = |harness: &ServeTestHarness| -> serde_json::Value {
+        harness
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{id}/context"))
+            .send()
+            .expect("send")
+            .json()
+            .expect("parse")
+    };
+    assert_eq!(
+        context(&harness)["used"],
+        150_000,
+        "the turn's measurement is the gauge"
+    );
+
+    let response = harness
+        .request(reqwest::Method::POST, &format!("/v1/sessions/{id}/rewind"))
+        .json(&serde_json::json!({"turns": 1}))
+        .send()
+        .expect("send");
+    assert_eq!(response.status(), 200);
+
+    let after = context(&harness);
+    assert!(
+        after["used"].is_null(),
+        "rewinding the only turn leaves nothing measured: {after}"
     );
 }
 

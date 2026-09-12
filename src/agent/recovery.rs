@@ -96,6 +96,14 @@ pub(super) struct TurnRecovery {
     /// session: asking again on the next turn is a fresh decision, and refusing it there would
     /// leave a long session unable to compact on purpose at all.
     pub(super) requested_compactions: u32,
+    /// A compaction has answered the current crossing of the ceiling, so the between-rounds check
+    /// stays quiet until a measurement shows the context under the line again. A turn whose own
+    /// rounds are past the ceiling gets nothing back from a second pass, and without this every
+    /// round after the first would pay for one; the rejection recovery remains the last resort.
+    pub(super) ceiling_compacted: bool,
+    /// The words this turn is answering, handed to every compaction the loop runs so a summary
+    /// that takes the prompt quotes it as the user wrote it.
+    pub(super) request_in_flight: Option<String>,
     /// How many entries of [`DEGRADE_TIERS`] this turn has already spent, so a tier that failed is
     /// not tried again and the turn runs out of ideas after the last one. Bounds the
     /// degrade-and-retry the way [`Self::overflow_retries`] bounds the compact-and-retry, but
@@ -148,7 +156,8 @@ impl TurnRecovery {
         if let Err(compact_error) = agent
             .compact_session(
                 messages,
-                CompactRequest::new(CompactOrigin::Emergency),
+                CompactRequest::new(CompactOrigin::Emergency)
+                    .answering(self.request_in_flight.clone()),
                 cancellation.clone(),
             )
             .await
@@ -163,6 +172,7 @@ impl TurnRecovery {
             return Err(MekaError::ContextOverflow(reason));
         }
         self.after_conversation_rewrite(agent, messages);
+        self.ceiling_compacted = true;
         Ok(())
     }
 
@@ -176,11 +186,11 @@ impl TurnRecovery {
     /// withdrawal from firing against a rewritten log, and `overflow_retries`, which bounds the
     /// emergency retry per turn and must survive a compaction to do that.
     ///
-    /// Absent for a different reason: `pending_repair`. Both callers sit where it is already
-    /// `None`: the overflow path undoes it first, and the tool loop's drain runs after
-    /// `persist_vindicated_repair` has taken it. A third caller placed before a 2xx would need to
-    /// undo the repair itself; this does not, and would otherwise leave the log describing a
-    /// conversation the compaction replaced.
+    /// Absent for a different reason: `pending_repair`. Every caller sits where it is already
+    /// `None`: the overflow path undoes it first, and the tool loop's two compactions, the agent's
+    /// request and the check against the ceiling, run after `persist_vindicated_repair` has taken
+    /// it. A caller placed before a 2xx would need to undo the repair itself; this does not, and
+    /// would otherwise leave the log describing a conversation the compaction replaced.
     ///
     /// Present although it is not a position: `user_saved`. The rewrite persisted the prompt, in
     /// the kept tail or inside the boundary's summary, so the lazy save on the 2xx would write a
@@ -1067,6 +1077,8 @@ mod tests {
             prompt_only_events: 0,
             overflow_retries: 0,
             requested_compactions: 0,
+            ceiling_compacted: false,
+            request_in_flight: None,
             tiers_tried: 1,
             pending_repair,
             user_saved: false,
@@ -1137,6 +1149,8 @@ mod tests {
             prompt_only_events: 0,
             overflow_retries: 0,
             requested_compactions: 0,
+            ceiling_compacted: false,
+            request_in_flight: None,
             tiers_tried: 1,
             pending_repair,
             user_saved: false,
@@ -1195,6 +1209,8 @@ mod tests {
             prompt_only_events: 0,
             overflow_retries: 0,
             requested_compactions: 0,
+            ceiling_compacted: false,
+            request_in_flight: None,
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
@@ -1278,6 +1294,8 @@ mod tests {
             prompt_only_events: 0,
             overflow_retries: 0,
             requested_compactions: 0,
+            ceiling_compacted: false,
+            request_in_flight: None,
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
@@ -1340,6 +1358,8 @@ mod tests {
             prompt_only_events: 0,
             overflow_retries: 0,
             requested_compactions: 0,
+            ceiling_compacted: false,
+            request_in_flight: None,
             tiers_tried: 0,
             pending_repair: None,
             user_saved: true,
@@ -1831,6 +1851,8 @@ mod tests {
             prompt_only_events: 0,
             overflow_retries: 0,
             requested_compactions: 0,
+            ceiling_compacted: false,
+            request_in_flight: None,
             tiers_tried: 1,
             pending_repair: None,
             user_saved: true,

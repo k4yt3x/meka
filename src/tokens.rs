@@ -1,7 +1,9 @@
 //! Cheap, dependency-free token estimation for the context gauge's fallback paths: the
-//! post-compaction interim and pre-first-turn-on-resume, where there is no fresh provider `usage`
-//! to read. The authoritative figure is always the provider's reported usage (see
-//! `Agent::last_context_tokens`); this only fills the gap until the next real response corrects it.
+//! post-compaction interim, the pre-send projection, and a resume of a row that recorded no
+//! measurement, where there is no fresh provider `usage` to read. The authoritative figure is
+//! always the provider's reported usage (see `Agent::record_context_tokens`); this only fills the
+//! gap until the next real response corrects it. [`bound_text`] is the other kind of number this
+//! module gives: not an estimate but a bound, for the one caller that acts before any correction.
 //!
 //! We estimate on UTF-8 **byte** length, not `char` count. BPE tokenizers merge roughly four bytes
 //! per token for ASCII, and byte length tracks token count far better than code-point count for
@@ -26,6 +28,70 @@ const MESSAGE_OVERHEAD_TOKENS: u64 = 4;
 /// text never estimates to zero.
 pub(crate) fn estimate_text(text: &str) -> u64 {
     (text.len() as u64).div_ceil(BYTES_PER_TOKEN)
+}
+
+/// A *bound* on the tokens a string will cost, for text about to be put into context by a tool
+/// that sizes its own result. The estimate above is corrected by the next measurement; a bound is
+/// acted on before any measurement can correct it, and its wrong answers are not symmetric: too
+/// low sends a request the window cannot hold, too high cuts a read the model can continue. So it
+/// counts the way BPE tokenizers split at their finest, not on average: a run of letters merges
+/// about five to a token, but every digit, symbol and non-ASCII character is counted as one, which
+/// is where four bytes per token under-reads by two to three times (measured: 736 KB of digits
+/// reported as 460k tokens). Whitespace merges into its neighbor, except that a run of it, the
+/// indentation of code, costs one.
+#[derive(Default)]
+struct TokenBound {
+    total: u64,
+    letters: u32,
+    whitespace: u32,
+}
+
+impl TokenBound {
+    /// Letters per token in a run, the rate ordinary English words merge at.
+    const LETTERS_PER_TOKEN: u32 = 5;
+
+    fn push(&mut self, character: char) {
+        if character.is_ascii_alphabetic() {
+            self.whitespace = 0;
+            self.letters += 1;
+            if self.letters % Self::LETTERS_PER_TOKEN == 1 {
+                self.total += 1;
+            }
+            return;
+        }
+        self.letters = 0;
+        if character.is_ascii_whitespace() {
+            self.whitespace += 1;
+            if self.whitespace == 2 {
+                self.total += 1;
+            }
+            return;
+        }
+        self.whitespace = 0;
+        self.total += 1;
+    }
+}
+
+/// The most tokens `text` is expected to cost; see [`TokenBound`].
+pub(crate) fn bound_text(text: &str) -> u64 {
+    let mut bound = TokenBound::default();
+    for character in text.chars() {
+        bound.push(character);
+    }
+    bound.total
+}
+
+/// The longest prefix of `text`, in bytes and on a character boundary, whose [`bound_text`] is
+/// within `tokens`.
+pub(crate) fn prefix_within(text: &str, tokens: u64) -> usize {
+    let mut bound = TokenBound::default();
+    for (index, character) in text.char_indices() {
+        bound.push(character);
+        if bound.total > tokens {
+            return index;
+        }
+    }
+    text.len()
 }
 
 /// Estimate the tokens one message contributes to the context.
@@ -94,6 +160,37 @@ mod tests {
         assert_eq!(estimate_text("abcdefgh"), 2);
         // Rounds up: 5 bytes -> 2.
         assert_eq!(estimate_text("hello"), 2);
+    }
+
+    /// Each class at the rate the bound gives it, on text whose true cost is known to sit under
+    /// that rate: prose merges, digits and symbols and CJK do not, single spaces ride along.
+    #[test]
+    fn the_bound_counts_letters_in_runs_and_everything_else_singly() {
+        assert_eq!(bound_text(""), 0);
+        assert_eq!(bound_text("the"), 1);
+        assert_eq!(bound_text("conversation"), 3);
+        assert_eq!(bound_text("12345"), 5);
+        assert_eq!(bound_text("a, b"), 3);
+        assert_eq!(bound_text("    x"), 2);
+        assert_eq!(bound_text("a b\nc"), 3);
+        assert_eq!(bound_text("字字"), 2);
+        // Nine digits, ten words of which `number` spans two tokens, single spaces free.
+        assert_eq!(
+            bound_text("01573 the quick brown fox jumps over the lazy dog number 1573\n"),
+            20
+        );
+    }
+
+    /// The prefix stops at the character that would break the budget and never inside one.
+    #[test]
+    fn the_prefix_within_a_budget_ends_on_a_character_boundary() {
+        assert_eq!(prefix_within("abcdefghij", 1), 5);
+        assert_eq!(prefix_within("abcdefghij", 2), 10);
+        assert_eq!(prefix_within("12345", 10), 5);
+        assert_eq!(prefix_within("12345", 3), 3);
+        assert_eq!(prefix_within("12345", 0), 0);
+        assert_eq!(prefix_within("é1", 1), 2);
+        assert_eq!(prefix_within("", 5), 0);
     }
 
     #[test]

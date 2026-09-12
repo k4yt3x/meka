@@ -6,7 +6,7 @@ The scratchpad is a session-scoped working memory that the agent can use to stor
 
 - **Proactively**: The agent stores intermediate results (extracted text, API responses, research notes) for later use.
 - **Via `scratchpad` parameter**: any tool call carrying one has its output saved there instead of returned inline. See [Scratchpad parameter](./overview.md#scratchpad-parameter) for which tools advertise it.
-- **Automatically**: when a tool's output exceeds 30,000 bytes, it is saved under a generated name (e.g. `execute_command_a1b2c3_1`) and replaced with a preview.
+- **Automatically**: when a tool's output exceeds 30,000 bytes, it is saved under a generated name (e.g. `execute_command_a1b2c3_1`) and replaced with a preview. Reading the entry back is never treated that way: a `scratchpad_read` reply stays inline however large, sized to what fits in the context window (see `limit` below).
 
 ## Tools
 
@@ -33,7 +33,7 @@ Read or search a scratchpad entry by name.
 |------|------|----------|-------------|
 | `name` | string | yes | The entry name |
 | `offset` | integer | no | Byte offset to start reading from (default: 0) |
-| `limit` | integer | no | Maximum bytes to return; no hard cap. Pass the entry's `size` to load all content in one call. (Default and exact value are advertised in the tool's parameter schema.) |
+| `limit` | integer | no | Maximum bytes to return. Pass the entry's `size` to load all content in one call; a read that would carry the context past the `context_ceiling_percent` line is cut there, whether or not `auto_compact` is on, and the reply names the offset to continue from. The cut is sized by a token bound that errs toward cutting: letters count about five to a token, every digit, symbol and non-ASCII character counts as one, so dense text such as numbers, hashes or JSON is cut sooner than prose. A read never returns less than the 30,000 bytes any tool may return inline. (Default and exact value are advertised in the tool's parameter schema.) |
 | `regex` | string | no | Search the entry and return matching lines (capped, exact value advertised in the tool's parameter schema). |
 
 ### `scratchpad_edit`

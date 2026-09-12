@@ -355,6 +355,9 @@ pub(crate) async fn build_session_agent(
     );
     cells.context_tokens = context_tokens;
     cells.context_overhead = context_overhead;
+    if let Some(id) = session_id {
+        cells.seed_context_tokens(&shared.store, id).await;
+    }
     let cells = match session_id {
         Some(id) => cells.with_session(id),
         None => cells,

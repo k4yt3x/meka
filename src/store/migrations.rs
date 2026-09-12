@@ -240,6 +240,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "background_tasks_spell_canceled_with_one_l",
         step: Step::Sql(BACKGROUND_TASKS_CANCELED),
     },
+    // The session row records the occupancy the provider last measured, so a resume checks its
+    // first turn against the real number rather than a byte estimate of the conversation.
+    Migration {
+        name: "sessions_record_their_context_tokens",
+        step: Step::Rust(sessions_record_their_context_tokens),
+    },
 ];
 
 const PROMPT_HISTORY_0_46: &str = "CREATE TABLE IF NOT EXISTS prompt_history (
@@ -250,6 +256,23 @@ const PROMPT_HISTORY_0_46: &str = "CREATE TABLE IF NOT EXISTS prompt_history (
 
 const BACKGROUND_TASKS_CANCELED: &str =
     "UPDATE background_tasks SET status = 'canceled' WHERE status = 'cancelled'";
+
+/// A session records the context occupancy the provider last reported.
+fn sessions_record_their_context_tokens(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let columns = {
+        let mut statement = transaction.prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = statement.query_map(["sessions"], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<String>>>()?
+    };
+    // Guarded for the reason the module docs give: a store that lost its `user_version` replays
+    // every step after the baseline, and a bare `ADD COLUMN` would then refuse it forever.
+    if !columns.iter().any(|column| column == "context_tokens") {
+        transaction.execute_batch("ALTER TABLE sessions ADD COLUMN context_tokens INTEGER")?;
+    }
+    Ok(())
+}
 
 /// What [`plan`] decided, and what [`apply`] will do about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,7 +365,7 @@ const HEAD_TABLES: &[&str] = &[
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 4_495_506_424_273_589_879;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 9_822_245_109_218_416_917;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -2446,6 +2469,10 @@ mod tests {
             (
                 "background_tasks_spell_canceled_with_one_l",
                 10686117140380679488_u64,
+            ),
+            (
+                "sessions_record_their_context_tokens",
+                878754235509908731_u64,
             ),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,

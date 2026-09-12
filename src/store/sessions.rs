@@ -1127,7 +1127,8 @@ impl Store {
                          stat_turns,
                          stat_input_tokens, stat_output_tokens,
                          stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
-                         stat_redactions, stat_redacted_images, stat_redacted_bytes
+                         stat_redactions, stat_redacted_images, stat_redacted_bytes,
+                         context_tokens
                      )
                      SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
                             COALESCE(?3, cwd), permission, approvals,
@@ -1136,7 +1137,8 @@ impl Store {
                             stat_turns,
                             stat_input_tokens, stat_output_tokens,
                             stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
-                            stat_redactions, stat_redacted_images, stat_redacted_bytes
+                            stat_redactions, stat_redacted_images, stat_redacted_bytes,
+                            context_tokens
                      FROM sessions WHERE id = ?7",
                     rusqlite::params![
                         new_id_string,
@@ -1757,6 +1759,71 @@ impl Store {
             })
             .await
             .map_err(|error| MekaError::Database(format!("failed to load session stats: {error}")))
+    }
+
+    /// Record the context occupancy the provider last reported for a session, so a resume seeds its
+    /// gauge from a measurement. Best-effort at the caller: a failed write must never fail a turn.
+    pub(crate) async fn save_context_tokens(&self, session_id: Uuid, total: u64) -> Result<()> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET context_tokens = ?2 WHERE id = ?1",
+                    rusqlite::params![
+                        session_id.to_string(),
+                        i64::try_from(total).unwrap_or(i64::MAX)
+                    ],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to save the context occupancy: {error}"))
+            })
+    }
+
+    /// Persist a rewind and forget the occupancy the row recorded: the turns that number counted
+    /// are gone, and a resume that seeded from it would compact against a conversation that no
+    /// longer exists. The next measurement records a fresh one.
+    pub(crate) async fn save_rewind(
+        &self,
+        session_id: Uuid,
+        event: &crate::conversation::Event,
+    ) -> Result<()> {
+        self.save_event(session_id, event).await?;
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                connection.execute(
+                    "UPDATE sessions SET context_tokens = NULL WHERE id = ?1",
+                    rusqlite::params![session_id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to forget the context occupancy: {error}"))
+            })
+    }
+
+    /// The context occupancy last recorded for a session, or `None` for a row no turn has recorded
+    /// on yet, and for one a rewind cleared.
+    pub(crate) async fn load_context_tokens(&self, session_id: Uuid) -> Result<Option<u64>> {
+        self.connection
+            .call(move |connection| -> rusqlite::Result<_> {
+                let result = connection.query_row(
+                    "SELECT context_tokens FROM sessions WHERE id = ?1",
+                    rusqlite::params![session_id.to_string()],
+                    |row| row.get::<_, Option<i64>>(0),
+                );
+                match result {
+                    Ok(total) => Ok(total.map(|total| total.max(0) as u64)),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .map_err(|error| {
+                MekaError::Database(format!("failed to load the context occupancy: {error}"))
+            })
     }
 
     /// Fetch raw rows for a session. Internal helper for [`Self::load_events`]; external consumers
@@ -3546,6 +3613,9 @@ mod tests {
             // Copied by a fork for the same reason `permission` is: the copy continues under the
             // terms the source was running on.
             "approvals",
+            // Copied by a fork: the copy holds the same conversation, so it starts as full as the
+            // source was, and its first turn is checked against that rather than an estimate.
+            "context_tokens",
         ]);
     }
 
@@ -4131,6 +4201,62 @@ mod tests {
                 .session_exists(session_id)
                 .await
                 .expect("failed to check")
+        );
+    }
+
+    /// The occupancy is `None` until a turn records it, so a resume of a row nothing has recorded
+    /// on falls back to its estimate rather than reading a zero as a measurement.
+    #[tokio::test]
+    async fn the_context_occupancy_persists_and_is_absent_until_recorded() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create session");
+        assert_eq!(
+            store.load_context_tokens(session_id).await.expect("load"),
+            None
+        );
+        store
+            .save_context_tokens(session_id, 123_456)
+            .await
+            .expect("save");
+        assert_eq!(
+            store.load_context_tokens(session_id).await.expect("load"),
+            Some(123_456)
+        );
+        assert_eq!(
+            store
+                .load_context_tokens(Uuid::new_v4())
+                .await
+                .expect("load"),
+            None,
+            "an unknown row reads as nothing recorded, not as an error"
+        );
+
+        // A fork holds the same conversation, so it starts as full as its source.
+        let (fork, _lock) = store
+            .fork_session_locked(session_id, ForkOverrides::default(), SourceLock::Probe)
+            .await
+            .expect("fork")
+            .expect("the source exists");
+        assert_eq!(
+            store.load_context_tokens(fork.id).await.expect("load"),
+            Some(123_456)
+        );
+
+        // A rewind drops turns the number counted, so the row forgets it.
+        let mut conversation = crate::conversation::Conversation::new();
+        conversation.append(crate::conversation::Message::user("a question"));
+        conversation.append(crate::conversation::Message::assistant_text("an answer"));
+        let rewind = conversation.rewind(1).expect("one turn to drop");
+        store
+            .save_rewind(session_id, &rewind)
+            .await
+            .expect("save rewind");
+        assert_eq!(
+            store.load_context_tokens(session_id).await.expect("load"),
+            None
         );
     }
 

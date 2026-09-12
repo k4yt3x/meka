@@ -29,7 +29,7 @@ mod turn;
 
 use self::recovery::*;
 pub(crate) use self::{compaction::*, turn::*};
-use crate::session::{AUTO_COMPACT_THRESHOLD_PERCENT, AgentOptions, SessionCells};
+use crate::session::{AgentOptions, SessionCells};
 
 /// Driver for a single conversation. One [`Agent`] handles one or more sequential turns against a
 /// single provider, with a shared tool registry, shared permission state, and a persistent SQLite
@@ -84,10 +84,11 @@ pub(crate) struct Agent {
     /// is enough and a resumed session still reports its true generation. `context_check` goes to
     /// the database directly, since it is on demand and can afford to be authoritative.
     compaction_generation: std::sync::atomic::AtomicU64,
-    /// Per-turn map of `tool_use_id` → scratchpad-name hint. Populated by MCP tool adapters so
-    /// oversized-output persistence uses `mcp_<server>_<tool>` instead of the plain tool name.
-    /// Cleared between turns by `persist_oversized_results`.
-    scratchpad_hints: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Per-turn map of `tool_use_id` → what the tool said about spilling its result: the name an
+    /// MCP adapter wants an oversized output persisted under, or that the tool sized the result to
+    /// the context itself. Taken by the turn loop each round for `persist_oversized_results`.
+    scratchpad_hints:
+        Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::tools::SpillHint>>>,
     /// Tools that have already been the subject of a [`Self::schema_advisory`]. Held rather than
     /// re-sent, because the advisory lives on in the conversation and a second copy teaches
     /// nothing while costing context on every later call.
@@ -274,17 +275,31 @@ impl Agent {
     /// The occupancy above which a turn compacts, or `None` when auto-compaction cannot apply.
     ///
     /// `None` for auto-compaction switched off, and for a zero window, which is not a small window
-    /// but "unknown": a threshold of zero would compact every turn including the first.
+    /// but "unknown": a ceiling of zero would compact every turn including the first.
     ///
-    /// One function for the three sites that need it (the reactive check after a turn, the
-    /// proactive projection before one, and the overflow-recovery guard), so the formula and its
-    /// two-part guard cannot drift between them.
-    pub(crate) fn auto_compact_threshold(&self) -> Option<u64> {
+    /// One function for the four sites that need it (the reactive check at a turn's start and
+    /// after each of its rounds, the proactive projection before the first request, and the
+    /// overflow-recovery guard), so the formula and its two-part guard cannot drift between them.
+    pub(crate) fn auto_compact_ceiling(&self) -> Option<u64> {
         if !self.options.auto_compact {
             return None;
         }
         let window = self.context_window();
-        (window > 0).then(|| window * AUTO_COMPACT_THRESHOLD_PERCENT / 100)
+        (window > 0)
+            .then(|| crate::session::context_ceiling(window, self.options.context_ceiling_percent))
+    }
+
+    /// Publish what is in context now and record it on the session row, so a resume seeds its
+    /// gauge from this measurement rather than an estimate. The write is best-effort: the gauge is
+    /// what decides, and a row that missed a write reads one measurement stale, which the next
+    /// turn corrects.
+    pub(super) async fn record_context_tokens(&self, total: u64) {
+        self.cells.record_context_tokens(total);
+        if let Some(session_id) = self.cells.session_id.get()
+            && let Err(error) = self.store.save_context_tokens(session_id, total).await
+        {
+            tracing::warn!("failed to record the context occupancy: {error}");
+        }
     }
 
     /// What this agent runs on, for a host that has to report it.
@@ -359,10 +374,11 @@ impl Agent {
             // found by the transport (`provider::build_http_client`) rather than by a clock on the
             // reply. No MCP readiness gate.
             streaming: parent_options.streaming,
-            // Auto-compaction is inherited: a worker handed a large task has the same context
-            // window as its parent and the same need to compact within it.
+            // The ceiling and auto-compaction are inherited: a worker handed a large task has the
+            // same context window as its parent and the same need to compact within it.
+            context_ceiling_percent: parent_options.context_ceiling_percent,
             auto_compact: parent_options.auto_compact,
-            // Inherited for the same reason as `auto_compact`: a worker that compacts is about to
+            // Inherited for the same reason: a worker that compacts is about to
             // discard its own working state, and the checkpoint is what lets it keep the part that
             // mattered. It reaches its own memory only if the spawn granted it any, so a worker
             // with no memory access still gets the better summary and simply has nowhere to write.
@@ -415,8 +431,8 @@ impl Agent {
     /// waiting on the runtime mutex. The two agree because they read the same handles, not because
     /// they share this function, so a change here has to be mirrored there.
     ///
-    /// `used` is `0` until the first provider response of this process lands, which is also true of
-    /// a session that was just re-attached from disk: the conversation is long but nothing has
+    /// `used` is `0` until the first provider response of this process lands, and for a session
+    /// reopened over a row that recorded no measurement: the conversation is long but nothing has
     /// measured it yet. Callers that render a percentage must treat `0` as unmeasured rather than
     /// empty, the way [`crate::prompt::ContextBudget::render`] does.
     pub(crate) async fn context_budget(&self, session_id: Uuid) -> crate::prompt::ContextBudget {
@@ -429,7 +445,7 @@ impl Agent {
             compact_at_percent: self
                 .options
                 .auto_compact
-                .then_some(AUTO_COMPACT_THRESHOLD_PERCENT),
+                .then_some(self.options.context_ceiling_percent),
             generation: self.compaction_generation(session_id).await,
         }
     }
@@ -558,10 +574,10 @@ mod tests {
     /// The number three separate sites divide by, pinned exactly.
     ///
     /// The tests that drive compaction all force it, so they prove the machinery runs and say
-    /// nothing about when it starts, and a wrong threshold is silent either way: compact every
+    /// nothing about when it starts, and a wrong ceiling is silent either way: compact every
     /// turn and lose history, or never compact and have the provider reject the turn.
     #[tokio::test]
-    async fn the_auto_compaction_threshold_is_eighty_percent_of_the_window() {
+    async fn the_auto_compaction_ceiling_is_the_configured_percent_of_the_window() {
         let provider: Arc<dyn Provider> =
             Arc::new(crate::provider::mock::MockProvider::from_rounds(Vec::new()));
         let (mut agent, _manager) = agent_for_test(provider).await;
@@ -569,19 +585,24 @@ mod tests {
         agent.options.auto_compact = true;
         agent.set_context_window_for_test(200_000);
         assert_eq!(
-            agent.auto_compact_threshold(),
+            agent.auto_compact_ceiling(),
             Some(160_000),
             "80% of 200k; a `*`/`/` slip here moves the trigger by orders of magnitude"
         );
 
         agent.set_context_window_for_test(1_000_000);
-        assert_eq!(agent.auto_compact_threshold(), Some(800_000));
+        assert_eq!(agent.auto_compact_ceiling(), Some(800_000));
+
+        // The percent is the user's, not a constant the switch merely turns on.
+        agent.options.context_ceiling_percent = 50;
+        assert_eq!(agent.auto_compact_ceiling(), Some(500_000));
+        agent.options.context_ceiling_percent = 80;
 
         // Not "a tiny window": a zero window means meka does not know the size, and a threshold of
         // zero would compact on the very first turn, before there is anything to summarize.
         agent.set_context_window_for_test(0);
         assert_eq!(
-            agent.auto_compact_threshold(),
+            agent.auto_compact_ceiling(),
             None,
             "an unknown window must disable auto-compaction, not set the trigger to zero"
         );
@@ -589,7 +610,7 @@ mod tests {
         agent.set_context_window_for_test(200_000);
         agent.options.auto_compact = false;
         assert_eq!(
-            agent.auto_compact_threshold(),
+            agent.auto_compact_ceiling(),
             None,
             "the config switch must win over any window"
         );
@@ -630,6 +651,9 @@ mod tests {
             sandboxed_shell: false,
             gate_tools: None,
             context_messages: None,
+            // 80 rather than the shipped default so the tests that switch compaction on keep
+            // their round numbers: 160k of a 200k window.
+            context_ceiling_percent: 80,
             auto_compact: false,
             compact_checkpoint: false,
             user_instructions: None,

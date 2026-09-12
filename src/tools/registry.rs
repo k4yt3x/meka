@@ -847,6 +847,8 @@ impl ToolRegistry {
             schedule,
             gate_tools,
             background,
+            context_ceiling_percent,
+            auto_compact,
         } = scope;
         let store = materials.store.clone();
         let site = cells.site();
@@ -931,6 +933,7 @@ impl ToolRegistry {
             parent_session_id,
             inherited_names: inherited_scratchpad_names.clone(),
             site: site.clone(),
+            gauge: context::ContextGauge::new(cells, context_ceiling_percent, auto_compact),
         }));
         self.register_builtin(Arc::new(conversation::ConversationSearchTool {
             store: store.clone(),
@@ -1073,6 +1076,8 @@ impl ToolRegistry {
             schedule: Some(materials.schedule.clone()),
             gate_tools: options.gate_tools.clone(),
             background: true,
+            context_ceiling_percent: options.context_ceiling_percent,
+            auto_compact: options.auto_compact,
         });
         if materials.background.enabled {
             registry.enable_background();
@@ -1080,14 +1085,11 @@ impl ToolRegistry {
         // The `context_*` tools read the same cells the agent gauges with, so the two never
         // disagree about occupancy or about a compaction one of them asked for.
         registry.register_context_tools(
-            context::ContextGauge {
-                used: Arc::clone(&cells.context_tokens),
-                overhead: Arc::clone(&cells.context_overhead),
-                window: cells.profile.window(),
-                compact_at_percent: options
-                    .auto_compact
-                    .then_some(crate::session::AUTO_COMPACT_THRESHOLD_PERCENT),
-            },
+            context::ContextGauge::new(
+                cells,
+                options.context_ceiling_percent,
+                options.auto_compact,
+            ),
             Arc::clone(&cells.pending_compaction),
             options.compact_checkpoint,
             materials,
@@ -1178,6 +1180,8 @@ impl ToolRegistry {
             schedule: None,
             gate_tools: None,
             background: false,
+            context_ceiling_percent: scope.context_ceiling_percent,
+            auto_compact: scope.auto_compact,
         });
         Ok(registry)
     }
@@ -1191,6 +1195,10 @@ pub(crate) struct RegistryScope {
     /// [`ToolRegistry::build_for_subagent`].
     pub(crate) parent_session_id: Option<Uuid>,
     pub(crate) inherited_scratchpad_names: Vec<String>,
+    /// The sub-agent's own `AgentOptions::context_ceiling_percent` and `auto_compact`, for the
+    /// gauge its reads are sized against and `context_check` reports.
+    pub(crate) context_ceiling_percent: u64,
+    pub(crate) auto_compact: bool,
 }
 
 /// Which of the session-scoped tools a registry gets, and at what level.
@@ -1205,6 +1213,10 @@ pub(super) struct SessionScope {
     pub(super) gate_tools: Option<Arc<dyn crate::schedule::GateTools>>,
     /// The `task_*` tools, when the registry offers `background` at all.
     pub(super) background: bool,
+    /// `AgentOptions::context_ceiling_percent` and `auto_compact` of the agent the registry
+    /// serves, for the context gauge `scratchpad_read` sizes a whole read against.
+    pub(super) context_ceiling_percent: u64,
+    pub(super) auto_compact: bool,
 }
 
 #[cfg(test)]
@@ -2276,6 +2288,8 @@ mod tests {
                 memory_access: crate::config::MemoryAccess::Write,
                 parent_session_id: None,
                 inherited_scratchpad_names: Vec::new(),
+                context_ceiling_percent: 80,
+                auto_compact: false,
             },
         )
         .expect("default web client config should build cleanly");
@@ -2355,6 +2369,8 @@ mod tests {
                 memory_access,
                 parent_session_id: None,
                 inherited_scratchpad_names: Vec::new(),
+                context_ceiling_percent: 80,
+                auto_compact: false,
             },
         )
         .expect("subagent registry should build")

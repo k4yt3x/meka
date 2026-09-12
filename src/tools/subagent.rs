@@ -1661,7 +1661,7 @@ async fn build_subagent(
     // A worker's window comes off `binding` inside `Agent::new_subagent`, not from
     // `params.parent_options`, which was cloned when the session was assembled and cannot hear
     // about a switch. Taking the provider from one and the window from the other would have a
-    // worker talk to a 32k profile while auto-compacting at 80% of the 1M one the session had left.
+    // worker talk to a 32k profile while auto-compacting against the 1M one the session had left.
     let parent_options = params.parent_options.clone();
     let sub_shared_perm = spec.shared_permission_bounded(parent_permission);
     let effective_permission = spec.effective_permission(parent_permission.get());
@@ -1702,6 +1702,7 @@ async fn build_subagent(
         todo_list: sub_todo_list,
         profile: crate::provider::PublishedProfile::detached(&binding),
         context_tokens: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        context_reserved: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         context_overhead: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         background_tasks: crate::background::BackgroundTasks::default(),
         frontend: sub_frontend,
@@ -1710,6 +1711,12 @@ async fn build_subagent(
         session_lock: crate::store::SessionLockSlot::default(),
         pending_compaction: crate::session::PendingCompaction::default(),
     };
+
+    // A follow-up rebuilds the worker over a row that recorded what the provider last measured
+    // for it; a spawn's row recorded nothing yet and leaves the fresh gauge alone.
+    sub_cells
+        .seed_context_tokens(&params.materials.store, sub_session_id)
+        .await;
 
     let sub_registry = ToolRegistry::build_for_subagent(
         &params.materials,
@@ -1723,6 +1730,10 @@ async fn build_subagent(
                 Some(parent_session_id)
             },
             inherited_scratchpad_names: spec.inherited_scratchpad.clone(),
+            // The worker's own options inherit both (`Agent::new_subagent`), so its reads are sized
+            // against the same line its compaction fires at.
+            context_ceiling_percent: params.parent_options.context_ceiling_percent,
+            auto_compact: params.parent_options.auto_compact,
         },
     )
     .map_err(|error| MekaError::ToolExecution {
@@ -2612,6 +2623,8 @@ mod tests {
                 memory_access: MemoryAccess::Write,
                 parent_session_id: None,
                 inherited_scratchpad_names: Vec::new(),
+                context_ceiling_percent: 80,
+                auto_compact: false,
             },
         )
         .expect("subagent registry should build");
@@ -2907,6 +2920,7 @@ mod tests {
                 sandboxed_shell: false,
                 gate_tools: None,
                 context_messages: None,
+                context_ceiling_percent: 80,
                 auto_compact: false,
                 compact_checkpoint: false,
                 user_instructions: Some("never inherited by a worker".to_string()),
@@ -2927,11 +2941,20 @@ mod tests {
             .await
             .expect("parent session");
         let parent_session = crate::session::SharedSessionId::new(Some(parent_sid));
-        let provider: Arc<dyn Provider> =
-            Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
-                text_round("first answer"),
-                text_round("second answer"),
-            ]));
+        // The first answer reports a usage, so the worker's row records it and the follow-up's
+        // rebuilt worker is checked against that rather than a fresh zero.
+        let mock = Arc::new(crate::provider::mock::MockProvider::from_rounds(vec![
+            vec![
+                crate::provider::mock::MockEvent::Usage {
+                    input_tokens: 12_345,
+                },
+                crate::provider::mock::MockEvent::Text {
+                    text: "first answer".to_string(),
+                },
+            ],
+            text_round("second answer"),
+        ]));
+        let provider: Arc<dyn Provider> = Arc::clone(&mock) as Arc<dyn Provider>;
         let params = params_for_test(store.clone(), parent_session.clone());
 
         let spawn = AgentSpawnTool {
@@ -2971,6 +2994,11 @@ mod tests {
         )
         .expect("spec decodes");
         assert_eq!(spec.permission, Permission::Read);
+        assert_eq!(
+            store.load_context_tokens(agent_id).await.expect("load"),
+            Some(12_345),
+            "the worker's row records the measurement its own turn reported"
+        );
 
         let list = AgentListTool {
             tool_builder_params: params.clone(),
@@ -3002,6 +3030,26 @@ mod tests {
             .expect("followup succeeds")
             .text_content();
         assert!(second.contains("second answer"), "{second}");
+
+        // The worker's row carried the first turn's measurement, and the rebuilt worker took it as
+        // its own: the follow-up's request gauges itself at that occupancy, where a worker that
+        // started from zero would carry no budget line at all.
+        let requests = mock.completions();
+        assert_eq!(requests.len(), 2, "the spawn's turn and the follow-up's");
+        let followup_request = requests[1]
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                crate::conversation::ContentBlock::Text { text }
+                | crate::conversation::ContentBlock::TurnContext { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            followup_request.contains("[Context budget]") && followup_request.contains("~12k"),
+            "the follow-up must be gauged at the row's 12,345 tokens: {followup_request}"
+        );
 
         // The worker's own history carried into the second turn rather than starting over: its log
         // now holds both tasks and both answers.

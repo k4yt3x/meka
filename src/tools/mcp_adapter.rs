@@ -197,7 +197,7 @@ fn tool_output_from_result(
     ToolOutput {
         content,
         is_error: result.is_error.unwrap_or(false),
-        scratchpad_hint: Some(scratchpad_hint),
+        spill_hint: crate::tools::SpillHint::under(scratchpad_hint),
         frontend_metadata: None,
         structured: result.structured_content.clone(),
     }

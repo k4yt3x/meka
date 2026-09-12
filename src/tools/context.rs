@@ -43,7 +43,7 @@ pub(crate) type SubmissionSlot = Arc<std::sync::Mutex<Option<Submission>>>;
 #[derive(Clone)]
 pub(crate) struct ContextGauge {
     /// Total tokens behind the most recent provider round: the same handle
-    /// `Agent::last_context_tokens` writes after every response, so this moves within a turn
+    /// `Agent::record_context_tokens` writes after every response, so this moves within a turn
     /// rather than only between turns.
     pub(crate) used: Arc<AtomicU64>,
     /// Estimated system prompt + tool schemas, re-stamped by the agent each turn. Separate from
@@ -57,8 +57,104 @@ pub(crate) struct ContextGauge {
     /// the model for the rest of the session. Written by `Agent::set_provider` through
     /// [`crate::provider::PublishedProfile`].
     pub(crate) window: Arc<AtomicU64>,
-    /// Occupancy at which auto-compaction fires, or `None` when it is off.
-    pub(crate) compact_at_percent: Option<u64>,
+    /// Tokens whole reads have charged for what they returned since `used` was measured; the same
+    /// cell as `SessionCells::context_reserved`, cleared with every measurement.
+    pub(crate) reserved: Arc<AtomicU64>,
+    /// The share of the window the conversation may fill on its own
+    /// (`[session].context_ceiling_percent`): where a whole read stops, and where auto-compaction
+    /// fires when it is on.
+    pub(crate) ceiling_percent: u64,
+    /// Whether auto-compaction fires past the ceiling. Reported, never consulted for the line
+    /// itself: the switch decides what reclaims the space, not how far a read may go.
+    pub(crate) auto_compact: bool,
+}
+
+impl ContextGauge {
+    /// The gauge over a session's own cells, so every reader of it and the agent agree.
+    pub(crate) fn new(
+        cells: &crate::session::SessionCells,
+        ceiling_percent: u64,
+        auto_compact: bool,
+    ) -> Self {
+        Self {
+            used: Arc::clone(&cells.context_tokens),
+            overhead: Arc::clone(&cells.context_overhead),
+            window: cells.profile.window(),
+            reserved: Arc::clone(&cells.context_reserved),
+            ceiling_percent,
+            auto_compact,
+        }
+    }
+
+    /// The occupancy a read must stay under, in tokens.
+    fn ceiling(&self, window: u64) -> u64 {
+        crate::session::context_ceiling(window, self.ceiling_percent)
+    }
+
+    /// Tokens left under the ceiling now: what was measured plus what has been reserved since.
+    /// `None` when the window is unknown, which is not a small window but no window at all.
+    pub(crate) fn headroom(&self) -> Option<u64> {
+        (self.window.load(Ordering::Relaxed) > 0)
+            .then(|| self.headroom_with(self.reserved.load(Ordering::Relaxed)))
+    }
+
+    /// Reserve room for `text` and return how many of its bytes may go into context: all of it
+    /// where its token bound fits under the ceiling, the longest prefix that does where it does
+    /// not, and at least the inline bound, granted and charged like the rest so a read is never a
+    /// worse tool than any other; the clamp governs only the excess. `None` when the window is
+    /// unknown: nothing can be sized against it, so the caller leaves the result for the spill to
+    /// bound as it bounds every other tool's.
+    ///
+    /// Sized by `tokens::bound_text` rather than by bytes, because this is the one place an
+    /// estimate is acted on before a measurement can correct it, and a byte count under-reads
+    /// digits, symbols and non-ASCII text by two to three times. The grant is charged to the
+    /// reservation before it is returned, so two reads in one round share the headroom rather
+    /// than each taking all of it.
+    pub(crate) fn reserve(&self, text: &str) -> Option<usize> {
+        if self.window.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let floor =
+            text.floor_char_boundary(super::scratchpad::MAX_INLINE_RESULT_BYTES.min(text.len()));
+        let mut reserved = self.reserved.load(Ordering::Relaxed);
+        loop {
+            let headroom = self.headroom_with(reserved);
+            let granted = crate::tokens::prefix_within(text, headroom).max(floor);
+            let charged = reserved.saturating_add(crate::tokens::bound_text(&text[..granted]));
+            match self.reserved.compare_exchange(
+                reserved,
+                charged,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(granted),
+                Err(current) => reserved = current,
+            }
+        }
+    }
+
+    /// [`Self::headroom`] against a reservation the caller read, which is what the compare-and-swap
+    /// in [`Self::reserve`] needs; a zero window reads as no room, and only callers that checked
+    /// the window take that as a number.
+    fn headroom_with(&self, reserved: u64) -> u64 {
+        let window = self.window.load(Ordering::Relaxed);
+        self.ceiling(window)
+            .saturating_sub(self.used.load(Ordering::Relaxed).saturating_add(reserved))
+    }
+
+    /// A gauge over nothing: no window, so nothing is sized, nothing is reserved, and a read's
+    /// reply is left for the spill.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            used: Arc::new(AtomicU64::new(0)),
+            overhead: Arc::new(AtomicU64::new(0)),
+            window: Arc::new(AtomicU64::new(0)),
+            reserved: Arc::new(AtomicU64::new(0)),
+            ceiling_percent: crate::config::DEFAULT_CONTEXT_CEILING_PERCENT,
+            auto_compact: false,
+        }
+    }
 }
 
 pub(super) struct ContextCheckTool {
@@ -108,22 +204,27 @@ impl Tool for ContextCheckTool {
                 "Context window: unknown for this model, so occupancy cannot be reported.\n",
             ),
             Some(percent) => {
-                report.push_str(&format!("Using {used} of {window} tokens ({percent}%).\n"));
-                match self.gauge.compact_at_percent {
-                    Some(threshold) => {
-                        let limit = window.saturating_mul(threshold) / 100;
-                        report.push_str(&format!(
-                            "Headroom: {} tokens before auto-compaction fires at {}%.\n",
-                            limit.saturating_sub(used),
-                            threshold
-                        ));
-                    }
-                    None => report.push_str(&format!(
-                        "Headroom: {} tokens before the window is full. Auto-compaction is off, so \
-                         a request past it fails the turn.\n",
-                        window.saturating_sub(used)
-                    )),
+                report.push_str(&format!("Using {used} of {window} tokens ({percent}%)"));
+                // Named beside the measurement, or the headroom below would not add up to it.
+                let reserved = self.gauge.reserved.load(Ordering::Relaxed);
+                if reserved > 0 {
+                    report.push_str(&format!(", plus {reserved} reserved by this round's reads"));
                 }
+                report.push_str(".\n");
+                // The same figure a whole `scratchpad_read` is sized against, so what this
+                // reports as room is what a read may take.
+                let headroom = self.gauge.headroom().unwrap_or(0);
+                report.push_str(&format!(
+                    "Headroom: {headroom} tokens before the context ceiling at {}%. ",
+                    self.gauge.ceiling_percent
+                ));
+                report.push_str(if self.gauge.auto_compact {
+                    "Auto-compaction fires there, between turns or between two of your tool \
+                     rounds.\n"
+                } else {
+                    "Auto-compaction is off, so nothing reclaims the space past it and a request \
+                     past the window fails the turn.\n"
+                });
                 report.push_str(&format!(
                     "Kept verbatim on compaction: about {} tokens of the most recent turns; \
                      everything older is replaced by a summary.\n",
@@ -240,6 +341,7 @@ impl Tool for ContextCompactTool {
                 .map(str::to_string),
             keep_recent: input["keep_recent"].as_bool(),
             prompt_id: context.prompt_id,
+            request_in_flight: None,
         };
         let mut pending = crate::sync::lock(&self.pending);
         // Last call wins rather than first, within the batch the loop drains as a unit: a model
@@ -339,12 +441,14 @@ mod tests {
 
     use super::*;
 
-    fn gauge(used: u64, overhead: u64, window: u64, compact_at: Option<u64>) -> ContextGauge {
+    fn gauge(used: u64, overhead: u64, window: u64, auto_compact: bool) -> ContextGauge {
         ContextGauge {
             used: Arc::new(AtomicU64::new(used)),
             overhead: Arc::new(AtomicU64::new(overhead)),
             window: Arc::new(AtomicU64::new(window)),
-            compact_at_percent: compact_at,
+            reserved: Arc::new(AtomicU64::new(0)),
+            ceiling_percent: 80,
+            auto_compact,
         }
     }
 
@@ -366,11 +470,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_headroom_to_the_compaction_threshold() {
-        let report = check(gauge(40_000, 5_000, 200_000, Some(80))).await;
+    async fn reports_headroom_to_the_ceiling() {
+        let report = check(gauge(40_000, 5_000, 200_000, true)).await;
         assert!(report.contains("40000 of 200000 tokens (20%)"), "{report}");
         // 80% of 200k is 160k, so 120k of headroom is left.
         assert!(report.contains("Headroom: 120000 tokens"), "{report}");
+        assert!(report.contains("Auto-compaction fires there"), "{report}");
         assert!(
             report.contains("about 5000 tokens of system prompt"),
             "{report}"
@@ -381,21 +486,89 @@ mod tests {
         );
     }
 
-    /// The threshold is what matters when auto-compaction is on, but with it off the window itself
-    /// is the wall, and reporting headroom to a threshold that will never fire would be a lie.
+    /// The switch changes what happens past the line, not where the line is: a read is still cut
+    /// there, so the headroom reported is the same.
     #[tokio::test]
-    async fn reports_headroom_to_the_window_when_auto_compaction_is_off() {
-        let report = check(gauge(40_000, 0, 200_000, None)).await;
-        assert!(report.contains("Headroom: 160000 tokens"), "{report}");
+    async fn reports_headroom_to_the_ceiling_when_auto_compaction_is_off() {
+        let report = check(gauge(40_000, 0, 200_000, false)).await;
+        assert!(report.contains("Headroom: 120000 tokens"), "{report}");
         assert!(report.contains("Auto-compaction is off"), "{report}");
     }
 
     /// An unknown window must not divide by zero, and must not invent a percentage either.
     #[tokio::test]
     async fn suppresses_occupancy_when_the_window_is_unknown() {
-        let report = check(gauge(40_000, 0, 0, Some(80))).await;
+        let report = check(gauge(40_000, 0, 0, true)).await;
         assert!(report.contains("unknown for this model"), "{report}");
         assert!(!report.contains('%'), "{report}");
+    }
+
+    /// The room a read may take is what is left under the ceiling after what this round has
+    /// already reserved, and the grant is charged before it is returned, so two reads issued
+    /// together split the headroom instead of each taking all of it.
+    #[test]
+    fn a_reservation_takes_from_the_headroom_and_never_less_than_the_inline_bound() {
+        let gauge = gauge(100_000, 0, 200_000, true);
+        assert_eq!(gauge.headroom(), Some(60_000));
+
+        // Digits bound at one token each, so the grant reads in bytes: 60k of a 250k ask.
+        let digits = "7".repeat(250_000);
+        assert_eq!(gauge.reserve(&digits), Some(60_000));
+        assert_eq!(gauge.headroom(), Some(0));
+        // Spent, so the floor is all that is left, and it is still charged.
+        assert_eq!(
+            gauge.reserve(&digits),
+            Some(super::super::scratchpad::MAX_INLINE_RESULT_BYTES)
+        );
+        assert_eq!(gauge.reserved.load(Ordering::Relaxed), 90_000);
+
+        // A small ask is granted whole and charged for what it took: four letters, one token.
+        let gauge = self::gauge(0, 0, 200_000, true);
+        assert_eq!(gauge.reserve("abcd"), Some(4));
+        assert_eq!(gauge.headroom(), Some(159_999));
+
+        // Letters merge, so the same headroom holds five times the bytes of prose than of digits.
+        let gauge = self::gauge(100_000, 0, 200_000, true);
+        assert_eq!(gauge.reserve(&"x".repeat(400_000)), Some(300_000));
+    }
+
+    /// The switch decides what reclaims the space past the ceiling, not how far a read may go:
+    /// with it off the read stops at the same line rather than running to the window's edge,
+    /// where nothing would be left for the reply.
+    #[test]
+    fn a_read_stops_at_the_ceiling_whether_or_not_compaction_is_on() {
+        let digits = "7".repeat(100_000);
+        let on = gauge(100_000, 0, 200_000, true);
+        let off = gauge(100_000, 0, 200_000, false);
+        assert_eq!(on.headroom(), Some(60_000));
+        assert_eq!(off.headroom(), Some(60_000));
+        assert_eq!(on.reserve(&digits), Some(60_000));
+        assert_eq!(off.reserve(&digits), Some(60_000));
+    }
+
+    /// No window is no bound: nothing is sized and nothing is charged, since a percentage of an
+    /// unknown total is not a small number but no number, and the caller is told so rather than
+    /// handed the whole text as if it had been sized.
+    #[test]
+    fn an_unknown_window_sizes_no_read() {
+        let gauge = gauge(100_000, 0, 0, true);
+        assert_eq!(gauge.headroom(), None);
+        assert_eq!(gauge.reserve(&"7".repeat(500_000)), None);
+        assert_eq!(gauge.reserved.load(Ordering::Relaxed), 0);
+    }
+
+    /// What `context_check` calls headroom is the same figure a read is sized against, so a
+    /// model that checks and then reads sees the reservation its earlier read made.
+    #[tokio::test]
+    async fn reports_headroom_net_of_this_rounds_reads() {
+        let gauge = gauge(40_000, 0, 200_000, true);
+        gauge.reserve(&"7".repeat(40_000));
+        let report = check(gauge).await;
+        assert!(report.contains("Headroom: 80000 tokens"), "{report}");
+        assert!(
+            report.contains("plus 40000 reserved by this round's reads"),
+            "{report}"
+        );
     }
 
     #[tokio::test]

@@ -151,6 +151,7 @@ pub(crate) async fn compact(
         instructions: body.instructions,
         keep_recent: body.keep_recent,
         prompt_id: None,
+        request_in_flight: None,
     };
     // A *fresh* token, published the way `submit_turn` publishes one, rather than a clone of
     // whatever the last turn left behind.
@@ -367,11 +368,10 @@ pub(crate) async fn context(
             })
         }
     };
-    let compact_at_percent = state
-        .shared
-        .agent_options
+    let options = &state.shared.agent_options;
+    let compact_at_percent = options
         .auto_compact
-        .then_some(crate::session::AUTO_COMPACT_THRESHOLD_PERCENT);
+        .then_some(options.context_ceiling_percent);
     let used = (used_raw > 0).then_some(used_raw);
     let overhead = (overhead_raw > 0).then_some(overhead_raw);
     let window = window_raw.filter(|window| *window > 0);
@@ -509,7 +509,7 @@ pub(crate) async fn rewind(
     };
     let messages_after = conversation.len();
     // The in-memory log is already rewound; persisting is what makes it survive eviction.
-    if let Err(error) = state.shared.store.save_event(id, &event).await {
+    if let Err(error) = state.shared.store.save_rewind(id, &event).await {
         // Put the turns back rather than leave memory and disk disagreeing, exactly as the REPL's
         // `/rewind` does. Left diverged, `GET /messages` reads the DB and still shows the turns
         // with `revision` unmoved -- so the counter added to make a rewrite detectable reports
@@ -529,6 +529,12 @@ pub(crate) async fn rewind(
     // whose announcement the rewind just deleted. `compact_session` clears both inline; this is
     // the other path that rewrites the log, and the REPL's `/rewind` has always called this.
     entry.agent.reset_conversation_markers().await;
+    // The gauge described turns that are gone; an estimate of what is left stands in until the
+    // next measurement, or the next turn's check reads the dropped turns as still there.
+    entry
+        .agent
+        .cells()
+        .record_context_tokens(crate::tokens::estimate_messages(conversation.as_slice()));
     drop(conversation);
     // See the note in `compact`. `save_event` has already moved `updated_at` on the row, so
     // without this the resident entry reports an older timestamp than `meka session list` does for
@@ -618,7 +624,7 @@ async fn rewind_dormant_session(
     state
         .shared
         .store
-        .save_event(id, &event)
+        .save_rewind(id, &event)
         .await
         .map_err(|error| {
             ProblemDetail::internal_sanitized("failed to persist rewind event", error)
@@ -836,7 +842,7 @@ mod tests {
             include_str!("conversation.rs"),
             "async fn rewind_dormant_session(",
             "from dormant session",
-            "save_event(id, &event)",
+            "save_rewind(id, &event)",
         );
     }
 }

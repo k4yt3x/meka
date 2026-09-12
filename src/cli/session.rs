@@ -273,7 +273,7 @@ pub(crate) async fn rewind_session_command(
     let Some(event) = conversation.rewind(turns) else {
         anyhow::bail!("nothing to rewind: session {session_id} has fewer than {turns} turn(s)");
     };
-    store.save_event(session_id, &event).await?;
+    store.save_rewind(session_id, &event).await?;
 
     tracing::info!("rewound {turns} turn(s) from session {session_id}");
     crate::streams::write_stderr_line(format!(

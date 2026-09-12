@@ -637,6 +637,11 @@ pub(crate) const DEFAULT_MCP_HTTP_CONCURRENCY: usize = 20;
 const DEFAULT_CONTEXT_MESSAGES: usize = 200;
 /// Default extended-thinking token budget.
 pub(crate) const DEFAULT_THINKING_BUDGET_TOKENS: u64 = 16_000;
+/// `[session].context_ceiling_percent` when unset: the share of the window the conversation may
+/// fill before auto-compaction fires and past which a whole read is cut. A tenth of the window is
+/// left for the reply and for one round's growth past the line; on the default window that is
+/// 100k tokens against a reply budget of 64k.
+pub(crate) const DEFAULT_CONTEXT_CEILING_PERCENT: u64 = 90;
 /// Default maximum sub-agent recursion depth (root spawns down to grandchild).
 const DEFAULT_SUBAGENT_MAX_DEPTH: usize = 3;
 
@@ -779,6 +784,10 @@ pub(crate) struct SessionConfig {
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub(crate) retention: Option<std::time::Duration>,
     pub(crate) auto_compact: Option<bool>,
+    /// The share of the context window meka lets the conversation fill on its own: `auto_compact`
+    /// fires past it, and a whole `scratchpad_read` is cut at it. Default
+    /// [`DEFAULT_CONTEXT_CEILING_PERCENT`]; refused outside 1 through 100.
+    pub(crate) context_ceiling_percent: Option<u64>,
     /// Run a checkpoint turn before each compaction, letting the agent save what must survive and
     /// write the summary itself. Default `true`. Costs one extra model call per compaction; off
     /// falls back to the standalone summarizer, which has no tools and none of the agent's
@@ -1166,6 +1175,9 @@ pub(crate) struct ResolvedConfig {
     pub(crate) thinking_budget: u64,
     pub(crate) thinking_show_content: bool,
     pub(crate) auto_compact: bool,
+    /// `[session].context_ceiling_percent`, or [`DEFAULT_CONTEXT_CEILING_PERCENT`]; validated to 1
+    /// through 100 by [`Self::validate`].
+    pub(crate) context_ceiling_percent: u64,
     pub(crate) compact_checkpoint: bool,
     /// `[session].context_window` verbatim, *before* any profile is applied to it.
     ///
@@ -1945,6 +1957,9 @@ impl ResolvedConfig {
                 .unwrap_or(DEFAULT_THINKING_BUDGET_TOKENS),
             thinking_show_content: file_thinking.show_content.unwrap_or(false),
             auto_compact: file_session.auto_compact.unwrap_or(true),
+            context_ceiling_percent: file_session
+                .context_ceiling_percent
+                .unwrap_or(DEFAULT_CONTEXT_CEILING_PERCENT),
             compact_checkpoint: file_session.compact_checkpoint.unwrap_or(true),
             // Carried through unresolved; see the field. The profile > `[session]` precedence is
             // applied once, per profile, in `resolve_profile`, and the call sites in `main.rs`
@@ -2053,6 +2068,14 @@ impl ResolvedConfig {
                  the key to keep sessions"
                     .to_string(),
             ));
+        }
+        // Zero would compact every turn, including the first, and cut every read to the floor;
+        // above the window is a line nothing reaches.
+        if !(1..=100).contains(&self.context_ceiling_percent) {
+            return Err(crate::error::MekaError::Config(format!(
+                "`[session].context_ceiling_percent = {}` must be between 1 and 100",
+                self.context_ceiling_percent
+            )));
         }
         // A zero timeout fails every request before it is sent. The integer keys these replaced
         // read `0` as "the default", so a file converted by hand may still say it and has to be
@@ -4087,6 +4110,74 @@ context_messages = 0
             .validate()
             .expect_err("context_messages = 0 must not be accepted");
         assert!(error.to_string().contains("context_messages"), "{error}");
+    }
+
+    /// The percent is the user's and reaches the agent beside the switch; the two keys are checked
+    /// together so a value that parses cannot arrive as the default, and the switch cannot move
+    /// the line.
+    #[test]
+    fn context_ceiling_percent_is_configurable_and_bounded() {
+        let usable = r#"
+default_profile = "p"
+
+[accounts.p]
+backend = "openai-chat-completions"
+
+[profiles.p]
+account = "p"
+model = "m"
+"#;
+        let resolved = resolve_with_config(usable);
+        assert_eq!(
+            DEFAULT_CONTEXT_CEILING_PERCENT, 90,
+            "the documented default"
+        );
+        assert_eq!(
+            resolved.context_ceiling_percent,
+            DEFAULT_CONTEXT_CEILING_PERCENT
+        );
+        let options = crate::session::AgentOptions::from_config(&resolved, false, None, None);
+        assert_eq!(
+            options.context_ceiling_percent,
+            DEFAULT_CONTEXT_CEILING_PERCENT
+        );
+        assert!(options.auto_compact);
+
+        let resolved = resolve_with_config(&format!(
+            "{usable}[session]\ncontext_ceiling_percent = 50\n"
+        ));
+        assert_eq!(resolved.context_ceiling_percent, 50);
+        resolved.validate().expect("50 is in range");
+        assert_eq!(
+            crate::session::AgentOptions::from_config(&resolved, false, None, None)
+                .context_ceiling_percent,
+            50
+        );
+
+        let resolved = resolve_with_config(&format!(
+            "{usable}[session]\nauto_compact = false\ncontext_ceiling_percent = 50\n"
+        ));
+        let options = crate::session::AgentOptions::from_config(&resolved, false, None, None);
+        assert!(!options.auto_compact);
+        assert_eq!(
+            options.context_ceiling_percent, 50,
+            "the switch off leaves the line where the percent put it"
+        );
+
+        for out_of_range in [0, 101] {
+            let resolved = resolve_with_config(&format!(
+                "{usable}[session]\ncontext_ceiling_percent = {out_of_range}\n"
+            ));
+            let error = resolved
+                .validate()
+                .expect_err("out of range is refused")
+                .to_string();
+            assert!(
+                error.contains("`[session].context_ceiling_percent = ")
+                    && error.contains("1 and 100"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

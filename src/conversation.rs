@@ -400,8 +400,9 @@ impl Conversation {
     /// empty replacement. Returns the event to persist, or `None` when there is nothing to drop.
     ///
     /// The cut snaps to a message that opens a turn (a `User` message carrying no `tool_result`),
-    /// the same boundary `compute_compaction_split` uses, so a `tool_use` is never separated from
-    /// its `tool_result`. A compaction summary is a plain `User` message and so counts as one such
+    /// so a `tool_use` is never separated from its `tool_result`; the rounds a compaction keeps
+    /// from inside a turn open no turn, so a rewind past them takes the summary before them
+    /// too. A compaction summary is a plain `User` message and so counts as one such
     /// boundary: rewinding far enough past a compaction discards the summary too, which is right
     /// (it stands in for the turns before it) but means a big `turns` can empty a compacted session
     /// faster than the turn count suggests.

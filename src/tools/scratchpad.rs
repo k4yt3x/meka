@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::{
-    Tool, ToolOutput,
+    SpillHint, Tool, ToolOutput,
+    context::ContextGauge,
     util::{MAX_SEARCH_MATCHES, resolve_session_id, search_lines},
 };
 use crate::{
@@ -59,7 +60,8 @@ fn build_large_output_preview(name: &str, text: &str) -> String {
     let mut replacement = format!(
         "<large-output name=\"{}\" size=\"{}\">\n\
          Output too large ({}). Read with `scratchpad_read`. Use \
-         `limit: {}` to load the full content in one call, or page \
+         `limit: {}` to load the full content in one call (a read is cut to what fits in \
+         the context window and says where to continue), or page \
          with `offset`/`limit` if a partial read is enough.\n\n\
          Preview (first {} bytes):\n\
          {}",
@@ -137,15 +139,17 @@ pub(crate) async fn save_explicit_scratchpad_results(
 }
 
 /// Check each text block in tool results. If oversized, persist to DB and replace with a preview +
-/// handle. Names are derived from the tool call's `scratchpad_hint` (MCP adapters) or the tool name
-/// otherwise, with a numeric suffix on collision. `hints` is typically the per-turn map owned by
-/// the agent; empty is fine.
+/// handle. Names are derived from the tool call's [`SpillHint`] (MCP adapters) or the tool name
+/// otherwise, with a numeric suffix on collision. A result its tool sized to the context stays
+/// inline whatever its size: it is already in the scratchpad, or was cut to fit, and spilling it
+/// again would hand the model a preview of what it just asked for. `hints` is typically the
+/// per-turn map owned by the agent; empty is fine.
 pub(crate) async fn persist_oversized_results(
     store: &Store,
     session_id: Uuid,
     assistant_message: &Message,
     results: &mut [ContentBlock],
-    hints: &std::collections::HashMap<String, String>,
+    hints: &std::collections::HashMap<String, SpillHint>,
 ) -> Result<()> {
     let tool_use_map = build_tool_use_map(assistant_message);
     let mut counter: usize = 0;
@@ -157,7 +161,11 @@ pub(crate) async fn persist_oversized_results(
             ..
         } = block
         {
-            let base_name = hints.get(tool_use_id.as_str()).cloned().unwrap_or_else(|| {
+            let hint = hints.get(tool_use_id.as_str());
+            if hint.is_some_and(|hint| hint.sized_to_context) {
+                continue;
+            }
+            let base_name = hint.and_then(|hint| hint.name.clone()).unwrap_or_else(|| {
                 tool_use_map
                     .get(tool_use_id.as_str())
                     .map(|(name, _)| name.clone())
@@ -325,6 +333,10 @@ pub(super) struct ScratchpadReadTool {
     /// Allowlist of parent-scoped scratchpad names the sub-agent is permitted to read. Empty on
     /// the root agent.
     pub(crate) inherited_names: Vec<String>,
+    /// What a whole read is sized against, so a read the model asked for at full size arrives
+    /// whole where it fits and cut where it would not, rather than spilled back into the
+    /// scratchpad it came from.
+    pub(crate) gauge: ContextGauge,
 }
 
 #[async_trait]
@@ -334,13 +346,15 @@ impl Tool for ScratchpadReadTool {
             name: "scratchpad_read".to_string(),
             description: format!(
                 "Read or search a scratchpad entry by name. Default returns {DEFAULT_READ_LIMIT} \
-                 bytes from offset; pass a larger `limit` (no hard cap) to load the full \
-                 entry in one call, or page with `offset`/`limit` for partial reads. Provide \
-                 `regex` to return matching lines (max {MAX_SEARCH_MATCHES}) instead of a byte range. Also \
-                 used to access content referenced by <large-output> tags. Pass the `size` \
-                 value from the tag as `limit` when you intend to read everything. When this \
-                 is a sub-agent and the name is not found locally, looks up names from the \
-                 parent's inherited allowlist (see the system-prompt section if any).",
+                 bytes from offset; pass a larger `limit` to load the full entry in one call, \
+                 or page with `offset`/`limit` for partial reads. A read is never spilled back \
+                 to the scratchpad: it is cut to what fits in the context window now, and the \
+                 reply says where to continue. Provide `regex` to return matching lines (max \
+                 {MAX_SEARCH_MATCHES}) instead of a byte range. Also used to access content \
+                 referenced by <large-output> tags. Pass the `size` value from the tag as \
+                 `limit` when you intend to read everything. When this is a sub-agent and the \
+                 name is not found locally, looks up names from the parent's inherited \
+                 allowlist (see the system-prompt section if any).",
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -360,8 +374,9 @@ impl Tool for ScratchpadReadTool {
                         "type": "integer",
                         "default": DEFAULT_READ_LIMIT,
                         "description": format!(
-                            "Maximum bytes to return; a range that would end inside a multi-byte \
-                             character stops before it. Default: {DEFAULT_READ_LIMIT}."
+                            "Maximum bytes to return, cut to what fits in the context window; a \
+                             range that would end inside a multi-byte character stops before it. \
+                             Default: {DEFAULT_READ_LIMIT}."
                         )
                     },
                     "regex": {
@@ -417,11 +432,16 @@ impl Tool for ScratchpadReadTool {
             return search_lines(&content, pattern, "scratchpad_read");
         }
 
-        read_mode(&content, &input)
+        read_mode(&content, &input, &self.gauge)
     }
 }
 
-fn read_mode(content: &str, input: &serde_json::Value) -> Result<ToolOutput> {
+/// A byte range of an entry, sized against the context: the model chooses how much to read, the
+/// gauge says how much of that fits, and the reply is marked as sized so the spill pass leaves it
+/// inline. Only this path is marked, and only when the gauge could size it: a regex search is
+/// bounded by its match cap and still spills, and so does a read on a window meka does not know,
+/// which would otherwise go out unbounded.
+fn read_mode(content: &str, input: &serde_json::Value, gauge: &ContextGauge) -> Result<ToolOutput> {
     let offset = usize::try_from(input["offset"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
     let limit = usize::try_from(input["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64))
         .unwrap_or(usize::MAX);
@@ -435,13 +455,24 @@ fn read_mode(content: &str, input: &serde_json::Value) -> Result<ToolOutput> {
     }
 
     let start = content.floor_char_boundary(offset);
-    let end = content.floor_char_boundary(start.saturating_add(limit).min(total));
+    let wanted = content.floor_char_boundary(start.saturating_add(limit).min(total));
+    let sized = gauge.reserve(&content[start..wanted]);
+    let end = sized.map_or(wanted, |granted| start.saturating_add(granted));
     let slice = &content[start..end];
 
-    Ok(ToolOutput::text(
-        format!("{slice}\n\n(showing bytes {start}..{end} of {total})"),
-        false,
-    ))
+    let trailer = if end < wanted {
+        format!(
+            "(showing bytes {start}..{end} of {total}; cut to what fits in the context window \
+             now, continue from offset {end})"
+        )
+    } else {
+        format!("(showing bytes {start}..{end} of {total})")
+    };
+    let mut output = ToolOutput::text(format!("{slice}\n\n{trailer}"), false);
+    if sized.is_some() {
+        output.spill_hint = SpillHint::sized_to_context();
+    }
+    Ok(output)
 }
 
 pub(super) struct ScratchpadEditTool {
@@ -1536,6 +1567,243 @@ mod tests {
         assert_eq!(loaded, Some(large_text));
     }
 
+    /// The read tool's reply is what the dispatcher records as sized, and the spill pass must then
+    /// leave it alone however large: spilling it again handed the model a 2 KB preview of what it
+    /// had just asked for, and a fresh copy of the entry in the store every time.
+    #[tokio::test]
+    async fn a_read_back_of_a_spilled_output_stays_inline() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        let whole = "line of a large file\n".repeat(5000);
+        store
+            .save_scratchpad_entry(session_id, "big", &whole)
+            .await
+            .expect("save");
+
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge {
+                used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                overhead: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                window: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(200_000)),
+                reserved: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ceiling_percent: 80,
+                auto_compact: true,
+            },
+            store: store.clone(),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+        let output = tool
+            .execute(
+                serde_json::json!({"name": "big", "limit": whole.len()}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(output.spill_hint, SpillHint::sized_to_context());
+        let reply = output.text_content();
+        assert!(
+            reply.len() > MAX_INLINE_RESULT_BYTES,
+            "the fixture must exceed the bound"
+        );
+
+        let assistant_message = make_assistant_message(vec![(
+            "call-1",
+            "scratchpad_read",
+            serde_json::json!({"name": "big", "limit": whole.len()}),
+        )]);
+        let mut results = vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".to_string(),
+            content: vec![ToolResultContent::Text {
+                text: reply.clone(),
+            }],
+            is_error: false,
+        }];
+        let hints = std::collections::HashMap::from([(
+            "call-1".to_string(),
+            SpillHint::sized_to_context(),
+        )]);
+        persist_oversized_results(&store, session_id, &assistant_message, &mut results, &hints)
+            .await
+            .expect("persist");
+
+        let ContentBlock::ToolResult { content, .. } = &results[0] else {
+            panic!("expected a tool result");
+        };
+        assert_eq!(
+            ContentBlock::tool_result_text_content(content),
+            reply,
+            "the whole read reaches the model as the tool returned it"
+        );
+        let entries = store
+            .list_scratchpad_entries(session_id)
+            .await
+            .expect("list");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big"],
+            "nothing was spilled a second time"
+        );
+    }
+
+    /// A read the model sized to the whole entry is cut to the room under the compaction
+    /// threshold, charged to the reservation so the next read in the round gets what is left, and
+    /// never cut below the bound every other tool returns inline.
+    #[tokio::test]
+    async fn a_whole_read_is_cut_to_the_headroom_and_says_where_to_continue() {
+        use std::sync::{Arc, atomic::AtomicU64};
+
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        // Digits, which the bound counts one token each, so a grant reads in bytes.
+        let whole = "7".repeat(300_000);
+        store
+            .save_scratchpad_entry(session_id, "big", &whole)
+            .await
+            .expect("save");
+        // 80% of 200k is 160k; 100k used leaves 60k tokens, so 60 KB of digits.
+        let reserved = Arc::new(AtomicU64::new(0));
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge {
+                used: Arc::new(AtomicU64::new(100_000)),
+                overhead: Arc::new(AtomicU64::new(0)),
+                window: Arc::new(AtomicU64::new(200_000)),
+                reserved: Arc::clone(&reserved),
+                ceiling_percent: 80,
+                auto_compact: true,
+            },
+            store: store.clone(),
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+        let read = |input: serde_json::Value| {
+            let tool = &tool;
+            async move {
+                tool.execute(
+                    input,
+                    crate::tools::ToolContext::detached(CancellationToken::new()),
+                )
+                .await
+                .expect("execute")
+                .text_content()
+            }
+        };
+
+        let first = read(serde_json::json!({"name": "big", "limit": 300_000})).await;
+        assert!(
+            first.ends_with(
+                "(showing bytes 0..60000 of 300000; cut to what fits in the context window now, \
+                 continue from offset 60000)"
+            ),
+            "{}",
+            &first[first.len() - 200..]
+        );
+        assert_eq!(reserved.load(std::sync::atomic::Ordering::Relaxed), 60_000);
+
+        // The headroom is spent, so the second read gets the inline bound and no more: the same
+        // as any other tool's result, which the spill pass would have cut there.
+        let second =
+            read(serde_json::json!({"name": "big", "offset": 60_000, "limit": 60_000})).await;
+        assert!(
+            second.contains(&format!(
+                "(showing bytes 60000..{} of 300000; cut to what fits",
+                60_000 + MAX_INLINE_RESULT_BYTES
+            )),
+            "{}",
+            &second[second.len() - 200..]
+        );
+
+        // A read that fits says nothing about cutting.
+        let third =
+            read(serde_json::json!({"name": "big", "offset": 290_000, "limit": 1_000})).await;
+        assert!(
+            third.ends_with("(showing bytes 290000..291000 of 300000)"),
+            "{}",
+            &third[third.len() - 100..]
+        );
+    }
+
+    /// A window meka does not know sizes nothing, so the reply is left for the spill: marking it
+    /// sized would send an entry of any size inline on a profile with `context_window = 0`.
+    #[tokio::test]
+    async fn a_read_on_an_unknown_window_is_left_for_the_spill() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .save_scratchpad_entry(session_id, "big", &"7".repeat(100_000))
+            .await
+            .expect("save");
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
+            store,
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+        let output = tool
+            .execute(
+                serde_json::json!({"name": "big", "limit": 100_000}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(output.spill_hint, SpillHint::default());
+        assert!(
+            output
+                .text_content()
+                .ends_with("(showing bytes 0..100000 of 100000)"),
+            "the read itself is whole; the spill pass decides what the model sees"
+        );
+    }
+
+    /// Only the byte-range path is sized: a search is bounded by its match cap, reserves nothing,
+    /// and so must keep spilling when a few enormous lines match.
+    #[tokio::test]
+    async fn a_regex_search_of_an_entry_is_not_sized() {
+        let store = Store::for_test().await;
+        let session_id = store
+            .create_session(None, "test-profile".to_string())
+            .await
+            .expect("create");
+        store
+            .save_scratchpad_entry(session_id, "data", "alpha\nbeta\n")
+            .await
+            .expect("save");
+        let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
+            store,
+            parent_session_id: None,
+            inherited_names: Vec::new(),
+            site: crate::session::ToolSite::for_test()
+                .with_session_id(session_id_for_test(session_id)),
+        };
+        let output = tool
+            .execute(
+                serde_json::json!({"name": "data", "regex": "alp"}),
+                crate::tools::ToolContext::detached(CancellationToken::new()),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(output.spill_hint, SpillHint::default());
+    }
+
     /// The counter restarts on every call, so a name built from it alone repeats across turns, and
     /// `save_scratchpad_entry` is `INSERT OR REPLACE`, so the later spill would silently destroy
     /// the earlier one while the model still held the first handle.
@@ -1878,6 +2146,7 @@ mod tests {
             .expect("save");
 
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager,
             parent_session_id: None,
             inherited_names: Vec::new(),
@@ -1913,6 +2182,7 @@ mod tests {
             .expect("save");
 
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager,
             parent_session_id: None,
             inherited_names: Vec::new(),
@@ -1949,6 +2219,7 @@ mod tests {
             .await
             .expect("save");
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager,
             parent_session_id: None,
             inherited_names: Vec::new(),
@@ -1987,6 +2258,7 @@ mod tests {
             .expect("save");
 
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager,
             parent_session_id: None,
             inherited_names: Vec::new(),
@@ -2018,6 +2290,7 @@ mod tests {
             .expect("create");
 
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager,
             parent_session_id: None,
             inherited_names: Vec::new(),
@@ -2313,6 +2586,7 @@ mod tests {
             .expect("seed parent");
 
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager.clone(),
             parent_session_id: Some(parent),
             inherited_names: vec!["captured".to_string()],
@@ -2361,6 +2635,7 @@ mod tests {
             .expect("seed child");
 
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager,
             parent_session_id: Some(parent),
             inherited_names: vec!["shared".to_string()],
@@ -2406,6 +2681,7 @@ mod tests {
         // allowlist only mentions a different name; the parent's "secret" entry must stay
         // invisible.
         let tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager,
             parent_session_id: Some(parent),
             inherited_names: vec!["unrelated".to_string()],
@@ -2928,6 +3204,7 @@ mod tests {
             .expect("edit");
 
         let read_tool = ScratchpadReadTool {
+            gauge: ContextGauge::for_test(),
             store: manager.clone(),
             parent_session_id: None,
             inherited_names: Vec::new(),

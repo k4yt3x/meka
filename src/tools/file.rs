@@ -1046,7 +1046,7 @@ impl Tool for ReadFileTool {
                         },
                     ],
                     is_error: false,
-                    scratchpad_hint: None,
+                    spill_hint: crate::tools::SpillHint::default(),
                     frontend_metadata: None,
                     structured: None,
                 });
