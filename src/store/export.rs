@@ -6,7 +6,37 @@ use super::*;
 /// On-wire format version for `meka session export --format json`. Bumped when the envelope shape
 /// or the underlying [`crate::conversation::Event`] serialization changes incompatibly; `meka
 /// session import` rejects versions it doesn't recognize.
-pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 2;
+pub(crate) const SESSION_EXPORT_FORMAT_VERSION: u32 = 3;
+/// Decode an archive, refusing one written for another `format_version` before its shape is read.
+///
+/// The version is read on its own first, because a release that changed the shape also changed
+/// the version, and an archive from one is better refused by the number that names the remedy
+/// than by whichever field it spelled differently. [`plan_import`] checks the version again for a
+/// caller that built the envelope itself.
+pub(crate) fn parse_session_export(raw: &[u8]) -> crate::error::Result<SessionExport> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        format_version: u32,
+    }
+    let invalid = |error: serde_json::Error| {
+        MekaError::Usage(format!("invalid session export JSON: {error}"))
+    };
+    let envelope: Envelope = serde_json::from_slice(raw).map_err(invalid)?;
+    check_format_version(envelope.format_version)?;
+    serde_json::from_slice(raw).map_err(invalid)
+}
+
+/// Whether this build reads archives of `version`.
+fn check_format_version(version: u32) -> crate::error::Result<()> {
+    if version != SESSION_EXPORT_FORMAT_VERSION {
+        return Err(MekaError::Usage(format!(
+            "unsupported session export format_version {version} (this build supports \
+             {SESSION_EXPORT_FORMAT_VERSION})"
+        )));
+    }
+    Ok(())
+}
+
 /// Sessions one `POST /v1/sessions/import` will accept.
 ///
 /// Enforced by the HTTP handler, not by [`plan_import`], because the reason for it is
@@ -103,7 +133,7 @@ pub(crate) struct ExportedSession {
     pub(crate) profile: String,
     pub(crate) stats: crate::stats::SessionStatsSnapshot,
     pub(crate) events: Vec<ExportedEvent>,
-    pub(crate) tool_outputs: std::collections::BTreeMap<String, String>,
+    pub(crate) scratchpad_entries: std::collections::BTreeMap<String, String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct ExportedEvent {
@@ -134,7 +164,7 @@ pub(crate) async fn build_session_export(
                 }
             }
         }
-        let tool_outputs = store
+        let scratchpad_entries = store
             .load_all_scratchpad_entries(meta.id)
             .await?
             .into_iter()
@@ -154,7 +184,7 @@ pub(crate) async fn build_session_export(
             profile: meta.profile,
             stats,
             events,
-            tool_outputs,
+            scratchpad_entries,
         });
     }
     let blobs = store
@@ -195,13 +225,7 @@ pub(crate) fn plan_import(
     // guessing.
     default_permission: Option<crate::permission::Permission>,
 ) -> crate::error::Result<ImportPlan> {
-    if export.format_version != SESSION_EXPORT_FORMAT_VERSION {
-        return Err(crate::error::MekaError::Usage(format!(
-            "unsupported session export format_version {} (this build supports \
-             {SESSION_EXPORT_FORMAT_VERSION})",
-            export.format_version
-        )));
-    }
+    check_format_version(export.format_version)?;
     if export.sessions.is_empty() {
         return Err(crate::error::MekaError::Usage(
             "session export contains no sessions".to_string(),
@@ -351,7 +375,7 @@ pub(crate) fn plan_import(
                 .into_iter()
                 .map(|event| (event.at, event.event))
                 .collect(),
-            tool_outputs: session.tool_outputs.into_iter().collect(),
+            scratchpad_entries: session.scratchpad_entries.into_iter().collect(),
         });
     }
 
@@ -408,6 +432,20 @@ pub(crate) fn parents_first_order(
 mod tests {
     use super::*;
 
+    /// An archive from another release is refused by its version, which names the remedy, and
+    /// not by the first field that release spelled differently: the 0.53 key `tool_outputs` is
+    /// missing its 0.54 name here, and the message must not say so.
+    #[test]
+    fn an_archive_of_another_version_is_refused_by_its_version_before_its_shape() {
+        let archive = br#"{"format_version": 2, "sessions": [{"tool_outputs": {}}]}"#;
+        let Err(error) = parse_session_export(archive) else {
+            panic!("an archive of another version must be refused");
+        };
+        let error = error.to_string();
+        assert!(error.contains("format_version 2"), "{error}");
+        assert!(!error.contains("missing field"), "{error}");
+    }
+
     /// A one-session archive whose session ran on `profile`.
     fn archive_on(profile: &str) -> SessionExport {
         serde_json::from_value(serde_json::json!({
@@ -426,7 +464,7 @@ mod tests {
                 "profile": profile,
                 "stats": crate::stats::SessionStatsSnapshot::default(),
                 "events": [],
-                "tool_outputs": {},
+                "scratchpad_entries": {},
             }],
         }))
         .expect("a well-formed archive")

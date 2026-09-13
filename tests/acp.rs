@@ -6079,7 +6079,7 @@ fn acp_scheduled_job_fires_without_a_prompt() {
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let replies: i64 = connection
             .query_row(
-                "SELECT count(*) FROM messages WHERE session_id = ?1 AND role = 'assistant' \
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND kind = 'assistant' \
                  AND content LIKE '%ACP_SCHEDULED_REPLY%'",
                 rusqlite::params![&session_id],
                 |row| row.get(0),
@@ -6857,7 +6857,7 @@ poll_interval = "200ms"
         connection
             .execute(
                 "INSERT INTO background_tasks \
-                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 (id, session_id, tool, label, status, outcome, started_at, finished_at) \
                  VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
@@ -6889,7 +6889,7 @@ poll_interval = "200ms"
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let fired: Option<String> = connection
             .query_row(
-                "SELECT content FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
+                "SELECT content FROM messages WHERE session_id = ?1 AND kind IN ('user', 'user_blocks') \
                  AND content LIKE '%PROBE_ACP_FIRE%' ORDER BY id ASC LIMIT 1",
                 rusqlite::params![&session_id],
                 |row| row.get(0),
@@ -7024,7 +7024,7 @@ poll_interval = "200ms"
         connection
             .execute(
                 "INSERT INTO background_tasks \
-                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 (id, session_id, tool, label, status, outcome, started_at, finished_at) \
                  VALUES (?1, ?2, 'execute_command', 'cargo build', 'completed', '42 passed', \
                          ?3, ?3)",
                 rusqlite::params![uuid::Uuid::new_v4().to_string(), &session_id, now],
@@ -7038,7 +7038,7 @@ poll_interval = "200ms"
         let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
         let carried: i64 = connection
             .query_row(
-                "SELECT count(*) FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND kind IN ('user', 'user_blocks') \
                  AND content LIKE '%cargo build%'",
                 rusqlite::params![&session_id],
                 |row| row.get(0),
@@ -7061,7 +7061,7 @@ poll_interval = "200ms"
             std::thread::sleep(std::time::Duration::from_secs(2));
             let again: i64 = connection
                 .query_row(
-                    "SELECT count(*) FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
+                    "SELECT count(*) FROM messages WHERE session_id = ?1 AND kind IN ('user', 'user_blocks') \
                      AND content LIKE '%cargo build%'",
                     rusqlite::params![&session_id],
                     |row| row.get(0),
@@ -7111,7 +7111,7 @@ poll_interval = "200ms"
         connection
             .execute(
                 "INSERT INTO background_tasks \
-                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 (id, session_id, tool, label, status, outcome, started_at, finished_at) \
                  VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
@@ -7192,7 +7192,7 @@ enabled = true
         connection
             .execute(
                 "INSERT INTO background_tasks \
-                 (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+                 (id, session_id, tool, label, status, outcome, started_at, finished_at) \
                  VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
                 rusqlite::params![
                     uuid::Uuid::new_v4().to_string(),
@@ -7213,7 +7213,7 @@ enabled = true
     let connection = rusqlite::Connection::open(harness.database()).expect("open the store");
     let user_text: String = connection
         .query_row(
-            "SELECT content FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
+            "SELECT content FROM messages WHERE session_id = ?1 AND kind IN ('user', 'user_blocks') \
              ORDER BY id DESC LIMIT 1",
             rusqlite::params![&session_id],
             |row| row.get(0),

@@ -131,7 +131,7 @@ pub(super) fn insert_blobs(
         return Ok(());
     }
     let mut insert = transaction.prepare(
-        "INSERT OR IGNORE INTO blobs (hash, media_type, bytes, size, created_at) \
+        "INSERT OR IGNORE INTO blobs (hash, media_type, bytes, size_bytes, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for blob in blobs {

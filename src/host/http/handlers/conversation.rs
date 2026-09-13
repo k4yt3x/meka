@@ -691,7 +691,7 @@ pub(crate) async fn export(
                 ProblemDetail::internal_sanitized("failed to load session events", error)
                     .with("session_id", id.to_string())
             })?;
-            let tool_outputs: std::collections::HashMap<String, String> = manager
+            let scratchpad_entries: std::collections::HashMap<String, String> = manager
                 .load_all_scratchpad_entries(id)
                 .await
                 .map_err(|error| {
@@ -700,7 +700,8 @@ pub(crate) async fn export(
                 })?
                 .into_iter()
                 .collect();
-            let body = crate::conversation::format_session_as_markdown(id, &events, &tool_outputs);
+            let body =
+                crate::conversation::format_session_as_markdown(id, &events, &scratchpad_entries);
             Ok((
                 [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
                 body,
@@ -768,7 +769,7 @@ pub(crate) async fn import(
     _scoped: scope::Scoped<scope::SessionsWrite>,
     raw_body: Bytes,
 ) -> Result<(StatusCode, Json<ImportResponse>), ProblemDetail> {
-    let export: crate::store::export::SessionExport = serde_json::from_slice(&raw_body)
+    let export = crate::store::export::parse_session_export(&raw_body)
         .map_err(|error| ProblemDetail::invalid_body("session import", error))?;
     if export.sessions.len() > crate::store::export::MAX_IMPORT_SESSIONS {
         return Err(store_too_large(export.sessions.len()));

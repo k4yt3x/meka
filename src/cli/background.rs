@@ -63,7 +63,7 @@ fn task_rows(tasks: &[crate::store::background::BackgroundTask]) -> Vec<Vec<Stri
             vec![
                 task.id.get(..id_width).unwrap_or(&task.id).to_string(),
                 task.status.name().to_string(),
-                task.tool_name.clone(),
+                task.tool.clone(),
                 crate::text::prose_cell(&task.label),
                 format_elapsed(task),
                 match &task.outcome {
@@ -110,7 +110,7 @@ fn show_lines(task: &crate::store::background::BackgroundTask) -> String {
         ("status", task.status.name().to_string()),
         (
             "tool",
-            crate::text::sanitize_to_line(&task.tool_name, usize::MAX),
+            crate::text::sanitize_to_line(&task.tool, usize::MAX),
         ),
         ("elapsed", format_elapsed(task)),
         (
@@ -130,7 +130,7 @@ fn show_lines(task: &crate::store::background::BackgroundTask) -> String {
     // `render_outcomes` and `task_list` both tell the model where the rest went; this is the
     // human-facing surface that claims to print the outcome in full, so it is the one place the
     // pointer cannot be missing.
-    if let Some(scratchpad) = &task.scratchpad_name {
+    if let Some(scratchpad) = &task.scratchpad_entry {
         fields.push((
             "full output",
             format!(
@@ -237,11 +237,11 @@ mod tests {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::new_v4(),
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: "cargo test --all".to_string(),
             status: TaskStatus::Completed,
             outcome: Some("test result: ok".to_string()),
-            scratchpad_name: Some("build-log".to_string()),
+            scratchpad_entry: Some("build-log".to_string()),
             started_at: chrono::Utc::now(),
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,
@@ -288,11 +288,11 @@ mod tests {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::new_v4(),
-            tool_name: format!("mcp__evil__{forged}"),
+            tool: format!("mcp__evil__{forged}"),
             label: forged.to_string(),
             status: TaskStatus::Completed,
             outcome: Some(forged.to_string()),
-            scratchpad_name: Some(forged.to_string()),
+            scratchpad_entry: Some(forged.to_string()),
             started_at: chrono::Utc::now(),
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,
@@ -329,11 +329,11 @@ mod tests {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session,
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: label.to_string(),
             status: TaskStatus::Running,
             outcome: None,
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
             announced_at: None,
@@ -439,18 +439,18 @@ mod tests {
 
     /// The table has a budget, and both cells that carry authored text respect it.
     ///
-    /// `tool_name` is chosen by an MCP server, so nothing else bounds it, and a long one would push
+    /// `tool` is chosen by an MCP server, so nothing else bounds it, and a long one would push
     /// every later column off the screen.
     #[test]
     fn the_task_table_fits_its_budget_and_sanitizes_what_it_did_not_write() {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::new_v4(),
-            tool_name: "mcp__a_very_long_server_name__an_even_longer_tool".to_string(),
+            tool: "mcp__a_very_long_server_name__an_even_longer_tool".to_string(),
             label: "cargo test\u{1b}[31m\n1234abcd  running  x  y  z  forged".to_string(),
             status: TaskStatus::Completed,
             outcome: Some("out\u{1b}[31m\nput ".to_string() + &"x".repeat(400)),
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: chrono::Utc::now(),
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,

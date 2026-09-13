@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-09-13
+
+### Changed
+
+- The store's tables, columns and indexes follow one naming rule; the upgrade renames them in place.
+- The `provider_credentials` view the 0.46 upgrade left in the store is dropped.
+- **Breaking:** a background task reports `tool` and `scratchpad_entry` on the HTTP API and webhook.
+- **Breaking:** a memory's creation stamp is `created_at` over HTTP and `created` in an export.
+- **Breaking:** a session archive holds `scratchpad_entries`, not `tool_outputs`, as format 3.
+
 ## [0.53.0] - 2026-09-13
 
 ### Added
@@ -2212,7 +2222,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflows for documentation deployment and release builds.
 - MIT license.
 
-[Unreleased]: https://github.com/k4yt3x/meka/compare/0.53.0...HEAD
+[Unreleased]: https://github.com/k4yt3x/meka/compare/0.54.0...HEAD
+[0.54.0]: https://github.com/k4yt3x/meka/compare/0.53.0...0.54.0
 [0.53.0]: https://github.com/k4yt3x/meka/compare/0.52.0...0.53.0
 [0.52.0]: https://github.com/k4yt3x/meka/compare/0.51.0...0.52.0
 [0.51.0]: https://github.com/k4yt3x/meka/compare/0.50.0...0.51.0

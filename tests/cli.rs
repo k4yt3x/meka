@@ -1054,7 +1054,7 @@ fn the_prompt_can_be_read_from_stdin() {
     );
     let words: String = store(&install)
         .query_row(
-            "SELECT content FROM messages WHERE role = 'user_blocks' ORDER BY id LIMIT 1",
+            "SELECT content FROM messages WHERE kind = 'user_blocks' ORDER BY id LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -2341,7 +2341,7 @@ fn a_oneshot_run_carries_an_outcome_that_was_waiting() {
     store(&install)
         .execute(
             "INSERT INTO background_tasks \
-             (id, session_id, tool_name, label, status, outcome, started_at, finished_at) \
+             (id, session_id, tool, label, status, outcome, started_at, finished_at) \
              VALUES (?1, ?2, 'execute_command', 'sleep 900', 'canceled', NULL, ?3, ?3)",
             rusqlite::params![uuid::Uuid::new_v4().to_string(), &id, now],
         )
@@ -2356,7 +2356,7 @@ fn a_oneshot_run_carries_an_outcome_that_was_waiting() {
 
     let carrier: String = store(&install)
         .query_row(
-            "SELECT content FROM messages WHERE session_id = ?1 AND role IN ('user', 'user_blocks') \
+            "SELECT content FROM messages WHERE session_id = ?1 AND kind IN ('user', 'user_blocks') \
              ORDER BY id DESC LIMIT 1",
             rusqlite::params![&id],
             |row| row.get(0),
@@ -3046,7 +3046,7 @@ fn memory_list_get_and_show_print_json_and_only_show_carries_the_body() {
     assert_eq!(row["tags"], serde_json::json!(["people"]));
     assert_eq!(row["read_count"], 0);
     assert!(
-        row["recorded_at"].is_string() && row["updated_at"].is_string(),
+        row["created_at"].is_string() && row["updated_at"].is_string(),
         "{row}"
     );
     assert!(

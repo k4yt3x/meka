@@ -9,7 +9,7 @@ use crate::permission::Permission;
 /// [`Store::load_events`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct StoredMessage {
-    pub(super) role: String,
+    pub(super) kind: String,
     pub(super) content: String,
     pub(super) created_at: String,
 }
@@ -91,7 +91,7 @@ pub(crate) struct ImportSessionRecord {
     /// `(created_at, event)` pairs in chronological order; timestamps are preserved verbatim.
     pub(crate) events: Vec<(String, crate::conversation::Event)>,
     /// `(name, content)` scratchpad entries referenced by name from tool-call inputs.
-    pub(crate) tool_outputs: Vec<(String, String)>,
+    pub(crate) scratchpad_entries: Vec<(String, String)>,
 }
 /// A row's evidence that another session spawned it. See [`Store::spawn_terms`].
 #[derive(Debug, Clone, Copy)]
@@ -282,28 +282,28 @@ pub(super) const NOT_SPOKEN_FOR_BY_A_SCHEDULE: &str = "id NOT IN (SELECT session
 /// exist so the refusal can name what collided. Reported as "at least" when the scan hits it, since
 /// past this point the count is the cap rather than the truth.
 pub(crate) const PREFIX_MATCH_CAP: usize = 17;
-/// Pseudo-role written to the `messages` table's `role` column for `Event::CompactBoundary` rows,
-/// distinct from every role an `Event::Append` uses.
-pub(super) const COMPACT_BOUNDARY_ROLE: &str = "compact_boundary";
-/// Pseudo-role for a `Role::User` message that carries non-text blocks: every turn's message, whose
+/// The `kind` a `messages` row carries for `Event::CompactBoundary`, distinct from every role an
+/// `Event::Append` is stored under.
+pub(super) const COMPACT_BOUNDARY_KIND: &str = "compact_boundary";
+/// The `kind` for a `Role::User` message that carries non-text blocks: every turn's message, whose
 /// context block comes first, and any input images. Its full `Vec<ContentBlock>` is stored as JSON,
-/// because flattening to `text_content()` (as the plain `user` role does) would drop them. A
+/// because flattening to `text_content()` (as the plain `user` kind does) would drop them. A
 /// text-only user message, which is one meka authored (a nudge, a summary), stays plaintext under
-/// `user`. A `role`-column pseudo-role, mirroring [`COMPACT_BOUNDARY_ROLE`].
-pub(super) const USER_BLOCKS_ROLE: &str = "user_blocks";
-/// Pseudo-role for `Event::Repair` rows, mirroring [`COMPACT_BOUNDARY_ROLE`]. The superseded
+/// `user`. Mirrors [`COMPACT_BOUNDARY_KIND`].
+pub(super) const USER_BLOCKS_KIND: &str = "user_blocks";
+/// The `kind` for `Event::Repair` rows, mirroring [`COMPACT_BOUNDARY_KIND`]. The superseded
 /// messages keep their own rows, so `meka session export` still shows what was replaced.
-pub(super) const REPAIR_ROLE: &str = "repair";
-/// Pseudo-role for `Event::Redact` rows, mirroring [`REPAIR_ROLE`]: the images it names keep
+pub(super) const REPAIR_KIND: &str = "repair";
+/// The `kind` for `Event::Redact` rows, mirroring [`REPAIR_KIND`]: the images it names keep
 /// their rows, and the replay puts the placeholder over them.
-pub(super) const REDACT_ROLE: &str = "redact";
+pub(super) const REDACT_KIND: &str = "redact";
 /// The `messages` row a session's title is read from, as a `WHERE` over `messages` correlated to
 /// `sessions s`: the first user message that carries words. A `user` row is text by construction; a
 /// `user_blocks` row is a JSON array of blocks and is passed over while none of them is a `text`
 /// block, so an image sent alone does not leave the session unlabeled once words follow. Blank
 /// text and a stand-in meka wrote do not count as words in either shape, which is
 /// [`crate::conversation::is_harness_stand_in`] spelled in SQL. A compaction summary is under its
-/// own pseudo-role and is never selected. This is [`crate::conversation::Conversation::title`]'s
+/// own kind and is never selected. This is [`crate::conversation::Conversation::title`]'s
 /// rule over the log, and [`title_of_first_user_row`] then applies that function to the row it
 /// selects, so the two cannot pick different rows.
 static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -320,8 +320,8 @@ static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
     };
     format!(
         "session_id = s.id
-         AND ((role = 'user' AND {user_words})
-              OR (role = 'user_blocks'
+         AND ((kind = 'user' AND {user_words})
+              OR (kind = 'user_blocks'
                   AND EXISTS (SELECT 1 FROM json_each(messages.content)
                               WHERE json_extract(json_each.value, '$.type') = 'text'
                                 AND {block_words})))",
@@ -332,9 +332,9 @@ static TITLE_ROW_WHERE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
 /// A session's title from the row [`TITLE_ROW_WHERE_SQL`] selects, through the one definition in
 /// [`crate::conversation::Conversation::title`]. A `user_blocks` row holds the message's blocks as
 /// JSON; a `user` row is the text itself.
-pub(super) fn title_of_first_user_row(session: &str, role: &str, content: String) -> String {
+pub(super) fn title_of_first_user_row(session: &str, kind: &str, content: String) -> String {
     use crate::conversation::{ContentBlock, Conversation, Event, Message, Role};
-    let message = if role == USER_BLOCKS_ROLE {
+    let message = if kind == USER_BLOCKS_KIND {
         match serde_json::from_str::<Vec<ContentBlock>>(&content) {
             Ok(blocks) => Message {
                 role: Role::User,
@@ -353,9 +353,9 @@ pub(super) fn title_of_first_user_row(session: &str, role: &str, content: String
     };
     Conversation::from_events(vec![Event::Append(message)]).title()
 }
-/// Encode an [`crate::conversation::Event`] into the `(role, content)` columns of the `messages`
-/// table. `Event::Append` writes the message's natural role; `Event::CompactBoundary`,
-/// `Event::Repair` and `Event::Redact` write a JSON envelope under their pseudo-role.
+/// Encode an [`crate::conversation::Event`] into the `(kind, content)` columns of the `messages`
+/// table. `Event::Append` is stored under the message's role; `Event::CompactBoundary`,
+/// `Event::Repair` and `Event::Redact` write a JSON envelope under a kind of their own.
 pub(super) fn encode_event_for_db(
     event: &crate::conversation::Event,
 ) -> std::result::Result<(String, String), serde_json::Error> {
@@ -363,7 +363,7 @@ pub(super) fn encode_event_for_db(
 
     match event {
         Event::Append(message) => {
-            let (role, content) = match message.role {
+            let (kind, content) = match message.role {
                 Role::User => {
                     if message
                         .content
@@ -378,37 +378,37 @@ pub(super) fn encode_event_for_db(
                     {
                         // A user turn carrying non-text blocks (input images) can't be flattened to
                         // plain text without losing them, so persist the full block list as JSON.
-                        (USER_BLOCKS_ROLE, serde_json::to_string(&message.content)?)
+                        (USER_BLOCKS_KIND, serde_json::to_string(&message.content)?)
                     } else {
                         ("user", message.text_content())
                     }
                 }
                 Role::Assistant => ("assistant", serde_json::to_string(&message.content)?),
             };
-            Ok((role.to_string(), content))
+            Ok((kind.to_string(), content))
         }
         Event::CompactBoundary { .. } => {
             let content = serde_json::to_string(event)?;
-            Ok((COMPACT_BOUNDARY_ROLE.to_string(), content))
+            Ok((COMPACT_BOUNDARY_KIND.to_string(), content))
         }
         Event::Repair { .. } => {
             let content = serde_json::to_string(event)?;
-            Ok((REPAIR_ROLE.to_string(), content))
+            Ok((REPAIR_KIND.to_string(), content))
         }
         Event::Redact { .. } => {
             let content = serde_json::to_string(event)?;
-            Ok((REDACT_ROLE.to_string(), content))
+            Ok((REDACT_KIND.to_string(), content))
         }
     }
 }
 /// Decode one persisted row back into an [`crate::conversation::Event`]. Returns `Ok(None)` when
-/// the row's role is unrecognized (forward compatibility for new variants).
+/// the row's kind is unrecognized (forward compatibility for new variants).
 pub(super) fn decode_event_from_row(
     row: &StoredMessage,
 ) -> std::result::Result<Option<crate::conversation::Event>, serde_json::Error> {
     use crate::conversation::{ContentBlock, Event, Message, Role};
 
-    match row.role.as_str() {
+    match row.kind.as_str() {
         "user" => Ok(Some(Event::Append(Message::user(&row.content)))),
         "assistant" => match serde_json::from_str::<Vec<ContentBlock>>(&row.content) {
             Ok(content) => Ok(Some(Event::Append(Message {
@@ -430,7 +430,7 @@ pub(super) fn decode_event_from_row(
             }))),
             Err(error) => Err(error),
         },
-        role if role == USER_BLOCKS_ROLE => {
+        kind if kind == USER_BLOCKS_KIND => {
             match serde_json::from_str::<Vec<ContentBlock>>(&row.content) {
                 Ok(content) => Ok(Some(Event::Append(Message {
                     role: Role::User,
@@ -439,7 +439,7 @@ pub(super) fn decode_event_from_row(
                 Err(error) => Err(error),
             }
         }
-        role if role == COMPACT_BOUNDARY_ROLE || role == REPAIR_ROLE || role == REDACT_ROLE => {
+        kind if kind == COMPACT_BOUNDARY_KIND || kind == REPAIR_KIND || kind == REDACT_KIND => {
             let event: Event = serde_json::from_str(&row.content)?;
             Ok(Some(event))
         }
@@ -991,7 +991,7 @@ impl Store {
     /// doesn't exist (callers map that to their own not-found shape). The whole copy is one
     /// transaction, so a failure leaves no half-built session behind.
     ///
-    /// What travels: the event log verbatim (per-event timestamps included), `tool_outputs`,
+    /// What travels: the event log verbatim (per-event timestamps included), `scratchpad_entries`,
     /// `permission`, `capabilities_json`, the cumulative stats, and `cwd` / `additional_roots`
     /// unless [`ForkOverrides`] replaces them.
     ///
@@ -1124,20 +1124,20 @@ impl Store {
                          id, created_at, updated_at, parent_session_id, subagent_spec_json,
                          cwd, permission, approvals,
                          capabilities_json, token_id, additional_roots_json, profile,
-                         stat_turns,
-                         stat_input_tokens, stat_output_tokens,
-                         stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
-                         stat_redactions, stat_redacted_images, stat_redacted_bytes,
+                         turns,
+                         input_tokens, output_tokens,
+                         cache_creation_input_tokens, cache_read_input_tokens,
+                         redactions, redacted_images, redacted_bytes,
                          context_tokens
                      )
                      SELECT ?1, ?2, ?2, parent_session_id, subagent_spec_json,
                             COALESCE(?3, cwd), permission, approvals,
                             capabilities_json, ?4,
                             CASE WHEN ?5 THEN ?6 ELSE additional_roots_json END, profile,
-                            stat_turns,
-                            stat_input_tokens, stat_output_tokens,
-                            stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
-                            stat_redactions, stat_redacted_images, stat_redacted_bytes,
+                            turns,
+                            input_tokens, output_tokens,
+                            cache_creation_input_tokens, cache_read_input_tokens,
+                            redactions, redacted_images, redacted_bytes,
                             context_tokens
                      FROM sessions WHERE id = ?7",
                     rusqlite::params![
@@ -1162,11 +1162,11 @@ impl Store {
                 // it over the API.
                 {
                     let mut select = transaction.prepare(
-                        "SELECT id, role, content, created_at FROM messages \
+                        "SELECT id, kind, content, created_at FROM messages \
                          WHERE session_id = ?1 ORDER BY id ASC",
                     )?;
                     let mut insert = transaction.prepare(
-                        "INSERT INTO messages (session_id, role, content, created_at) \
+                        "INSERT INTO messages (session_id, kind, content, created_at) \
                          VALUES (?1, ?2, ?3, ?4)",
                     )?;
                     let mut link = transaction.prepare(
@@ -1182,10 +1182,10 @@ impl Store {
                         ))
                     })?;
                     for row in rows {
-                        let (source_message_id, role, content, created_at) = row?;
+                        let (source_message_id, kind, content, created_at) = row?;
                         insert.execute(rusqlite::params![
                             new_id_string,
-                            role,
+                            kind,
                             content,
                             created_at
                         ])?;
@@ -1196,9 +1196,9 @@ impl Store {
                     }
                 }
                 transaction.execute(
-                    "INSERT INTO tool_outputs (session_id, name, content, created_at)
+                    "INSERT INTO scratchpad_entries (session_id, name, content, created_at)
                      SELECT ?1, name, content, created_at
-                     FROM tool_outputs WHERE session_id = ?2",
+                     FROM scratchpad_entries WHERE session_id = ?2",
                     rusqlite::params![new_id_string, source_id],
                 )?;
 
@@ -1218,12 +1218,12 @@ impl Store {
     }
 
     /// Persist a single event from the conversation log. Events are
-    /// encoded into the existing `messages(role, content, …)` table:
+    /// encoded into the existing `messages(kind, content, …)` table:
     ///
-    /// - `Event::Append(message)` writes one row with the message's role (`user` / `assistant` /
-    ///   `tool_results`).
-    /// - `Event::CompactBoundary { … }` writes one row with the pseudo-role `compact_boundary` and
-    ///   a JSON-serialized envelope in `content`.
+    /// - `Event::Append(message)` writes one row whose kind is the message's role (`user` /
+    ///   `assistant` / `tool_results`).
+    /// - `Event::CompactBoundary { … }` writes one row of kind `compact_boundary` and a
+    ///   JSON-serialized envelope in `content`.
     pub(crate) async fn save_event(
         &self,
         session_id: Uuid,
@@ -1231,9 +1231,9 @@ impl Store {
     ) -> Result<()> {
         let (event, blobs) = super::blobs::externalize_images(event);
         let references = super::blobs::blob_references(&event);
-        let (role, content) = encode_event_for_db(&event)
+        let (kind, content) = encode_event_for_db(&event)
             .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
-        self.save_row(session_id, role, content, blobs, references)
+        self.save_row(session_id, kind, content, blobs, references)
             .await
     }
 
@@ -1260,9 +1260,9 @@ impl Store {
             let (event, mut taken) = super::blobs::externalize_images(event);
             blobs.append(&mut taken);
             let references = super::blobs::blob_references(&event);
-            let (role, content) = encode_event_for_db(&event)
+            let (kind, content) = encode_event_for_db(&event)
                 .map_err(|error| MekaError::Database(format!("failed to encode event: {error}")))?;
-            encoded.push((role, content, references));
+            encoded.push((kind, content, references));
         }
         let now = chrono::Utc::now().to_rfc3339();
         let session_id_str = session_id.to_string();
@@ -1272,11 +1272,11 @@ impl Store {
                 super::blobs::insert_blobs(&transaction, &blobs, &now)?;
                 {
                     let mut insert = transaction.prepare(
-                        "INSERT INTO messages (session_id, role, content, created_at) \
+                        "INSERT INTO messages (session_id, kind, content, created_at) \
                          VALUES (?1, ?2, ?3, ?4)",
                     )?;
-                    for (role, content, references) in &encoded {
-                        insert.execute(rusqlite::params![session_id_str, role, content, now])?;
+                    for (kind, content, references) in &encoded {
+                        insert.execute(rusqlite::params![session_id_str, kind, content, now])?;
                         let message_id = transaction.last_insert_rowid();
                         super::blobs::link_message_blobs(&transaction, message_id, references)?;
                     }
@@ -1297,7 +1297,7 @@ impl Store {
     /// Persist a set of imported sessions (a root plus its sub-agent descendants) in a single
     /// transaction: the `sessions` rows (preserving `created_at` and cumulative stats, but never
     /// the `token_id` fingerprint), each session's event log (preserving per-event timestamps), and
-    /// its `tool_outputs`. `records` MUST be ordered parents-first so every `new_parent_id`
+    /// its `scratchpad_entries`. `records` MUST be ordered parents-first so every `new_parent_id`
     /// references an already-inserted row (the `parent_session_id` foreign key is enforced).
     /// All-or-nothing: any failure rolls back the whole import, leaving no partial tree.
     ///
@@ -1331,7 +1331,7 @@ impl Store {
             profile: String,
             stats: crate::stats::SessionStatsSnapshot,
             events: Vec<(String, String, String, Vec<String>)>,
-            tool_outputs: Vec<(String, String)>,
+            scratchpad_entries: Vec<(String, String)>,
         }
         let imported_at = chrono::Utc::now().to_rfc3339();
         let root_ids: Vec<Uuid> = records
@@ -1357,10 +1357,10 @@ impl Store {
                 let (event, mut taken) = super::blobs::externalize_images(event);
                 archive_blobs.append(&mut taken);
                 let references = super::blobs::blob_references(&event);
-                let (role, content) = encode_event_for_db(&event).map_err(|error| {
+                let (kind, content) = encode_event_for_db(&event).map_err(|error| {
                     MekaError::Database(format!("failed to encode event: {error}"))
                 })?;
-                events.push((role, content, at.clone(), references));
+                events.push((kind, content, at.clone(), references));
             }
             encoded.push(EncodedSession {
                 id: record.new_id.to_string(),
@@ -1375,7 +1375,7 @@ impl Store {
                 profile: record.profile,
                 stats: record.stats,
                 events,
-                tool_outputs: record.tool_outputs,
+                scratchpad_entries: record.scratchpad_entries,
             });
         }
         // Resolved ahead of the transaction, so an archive naming a blob nobody holds is refused as
@@ -1424,9 +1424,9 @@ impl Store {
                              id, created_at, updated_at, parent_session_id, cwd, permission,
                              capabilities_json, additional_roots_json, subagent_spec_json,
                              profile, approvals,
-                             stat_turns, stat_input_tokens, stat_output_tokens,
-                             stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
-                             stat_redactions, stat_redacted_images, stat_redacted_bytes
+                             turns, input_tokens, output_tokens,
+                             cache_creation_input_tokens, cache_read_input_tokens,
+                             redactions, redacted_images, redacted_bytes
                          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                         rusqlite::params![
                             session.id,
@@ -1452,10 +1452,10 @@ impl Store {
                     )?;
                     {
                         let mut insert_event = transaction.prepare(
-                            "INSERT INTO messages (session_id, role, content, created_at) \
+                            "INSERT INTO messages (session_id, kind, content, created_at) \
                              VALUES (?1, ?2, ?3, ?4)",
                         )?;
-                        for (role, content, created_at, references) in &session.events {
+                        for (kind, content, created_at, references) in &session.events {
                             // Refused rather than linked to nothing: a reference the archive did
                             // not carry and the store does not hold would be an image no reader
                             // could ever show.
@@ -1467,7 +1467,7 @@ impl Store {
                             }
                             insert_event.execute(rusqlite::params![
                                 session.id,
-                                role,
+                                kind,
                                 content,
                                 created_at
                             ])?;
@@ -1477,10 +1477,10 @@ impl Store {
                     }
                     {
                         let mut insert_output = transaction.prepare(
-                            "INSERT INTO tool_outputs (session_id, name, content, created_at) \
+                            "INSERT INTO scratchpad_entries (session_id, name, content, created_at) \
                              VALUES (?1, ?2, ?3, ?4)",
                         )?;
-                        for (name, content) in &session.tool_outputs {
+                        for (name, content) in &session.scratchpad_entries {
                             insert_output.execute(rusqlite::params![
                                 session.id,
                                 name,
@@ -1523,14 +1523,14 @@ impl Store {
                 Ok(Some(event)) => events.push(event),
                 Ok(None) => {
                     tracing::warn!(
-                        "dropping a session row with unknown role '{role}'",
-                        role = row.role
+                        "dropping a session row with unknown kind '{kind}'",
+                        kind = row.kind
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "failed to decode a session row of role '{role}': {error}",
-                        role = row.role
+                        "failed to decode a session row of kind '{kind}': {error}",
+                        kind = row.kind
                     );
                 }
             }
@@ -1553,14 +1553,14 @@ impl Store {
                 Ok(Some(event)) => events.push((row.created_at, event)),
                 Ok(None) => {
                     tracing::warn!(
-                        "dropping a session row with unknown role '{role}'",
-                        role = row.role
+                        "dropping a session row with unknown kind '{kind}'",
+                        kind = row.kind
                     );
                 }
                 Err(error) => {
                     tracing::warn!(
-                        "failed to decode a session row of role '{role}': {error}",
-                        role = row.role
+                        "failed to decode a session row of kind '{kind}': {error}",
+                        kind = row.kind
                     );
                 }
             }
@@ -1634,12 +1634,12 @@ impl Store {
     pub(super) async fn save_message(
         &self,
         session_id: Uuid,
-        role: &str,
+        kind: &str,
         content: &str,
     ) -> Result<()> {
         self.save_row(
             session_id,
-            role.to_string(),
+            kind.to_string(),
             content.to_string(),
             Vec::new(),
             Vec::new(),
@@ -1652,7 +1652,7 @@ impl Store {
     async fn save_row(
         &self,
         session_id: Uuid,
-        role: String,
+        kind: String,
         content: String,
         blobs: Vec<super::blobs::NewBlob>,
         references: Vec<String>,
@@ -1667,8 +1667,8 @@ impl Store {
                 let transaction = connection.transaction()?;
                 super::blobs::insert_blobs(&transaction, &blobs, &now)?;
                 transaction.execute(
-                    "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session_id.to_string(), role, content, &now],
+                    "INSERT INTO messages (session_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![session_id.to_string(), kind, content, &now],
                 )?;
                 let message_id = transaction.last_insert_rowid();
                 super::blobs::link_message_blobs(&transaction, message_id, &references)?;
@@ -1695,14 +1695,14 @@ impl Store {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "UPDATE sessions SET
-                         stat_turns = ?2,
-                         stat_input_tokens = ?3,
-                         stat_output_tokens = ?4,
-                         stat_cache_creation_input_tokens = ?5,
-                         stat_cache_read_input_tokens = ?6,
-                         stat_redactions = ?7,
-                         stat_redacted_images = ?8,
-                         stat_redacted_bytes = ?9
+                         turns = ?2,
+                         input_tokens = ?3,
+                         output_tokens = ?4,
+                         cache_creation_input_tokens = ?5,
+                         cache_read_input_tokens = ?6,
+                         redactions = ?7,
+                         redacted_images = ?8,
+                         redacted_bytes = ?9
                      WHERE id = ?1",
                     rusqlite::params![
                         session_id.to_string(),
@@ -1731,9 +1731,9 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
-                    "SELECT stat_turns, stat_input_tokens, stat_output_tokens,
-                            stat_cache_creation_input_tokens, stat_cache_read_input_tokens,
-                            stat_redactions, stat_redacted_images, stat_redacted_bytes
+                    "SELECT turns, input_tokens, output_tokens,
+                            cache_creation_input_tokens, cache_read_input_tokens,
+                            redactions, redacted_images, redacted_bytes
                      FROM sessions WHERE id = ?1",
                     rusqlite::params![session_id.to_string()],
                     |row| {
@@ -1832,13 +1832,13 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC",
+                    "SELECT kind, content, created_at FROM messages WHERE session_id = ?1 ORDER BY id ASC",
                 )?;
 
                 let messages = statement
                     .query_map(rusqlite::params![session_id.to_string()], |row| {
                         Ok(StoredMessage {
-                            role: row.get(0)?,
+                            kind: row.get(0)?,
                             content: row.get(1)?,
                             created_at: row.get(2)?,
                         })
@@ -1864,8 +1864,8 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.query_row(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND role = ?2",
-                    rusqlite::params![session_id.to_string(), COMPACT_BOUNDARY_ROLE],
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = ?2",
+                    rusqlite::params![session_id.to_string(), COMPACT_BOUNDARY_KIND],
                     |row| row.get::<_, i64>(0),
                 )
             })
@@ -2099,11 +2099,11 @@ impl Store {
                               ''
                             ) AS title_content,
                             COALESCE(
-                              (SELECT role FROM messages
+                              (SELECT kind FROM messages
                                WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
-                            ) AS title_role
+                            ) AS title_kind
                      FROM sessions s
                      {where_clause}
                      ORDER BY s.updated_at DESC, s.id DESC
@@ -2136,8 +2136,8 @@ impl Store {
                     let parent_id: Option<String> = row.get(8)?;
                     let profile: String = row.get(9)?;
                     let approvals: bool = row.get(10)?;
-                    let title_role: String = row.get(12)?;
-                    let title = title_of_first_user_row(&id_str, &title_role, row.get(11)?);
+                    let title_kind: String = row.get(12)?;
+                    let title = title_of_first_user_row(&id_str, &title_kind, row.get(11)?);
                     Ok((
                         id_str,
                         created_at,
@@ -2223,11 +2223,11 @@ impl Store {
                               ''
                             ) AS title_content,
                             COALESCE(
-                              (SELECT role FROM messages
+                              (SELECT kind FROM messages
                                WHERE {title_row}
                                ORDER BY id ASC LIMIT 1),
                               ''
-                            ) AS title_role
+                            ) AS title_kind
                      FROM sessions s
                      WHERE s.id = ?1",
                 ))?;
@@ -2243,8 +2243,8 @@ impl Store {
                     let parent_id: Option<String> = row.get(8)?;
                     let profile: String = row.get(9)?;
                     let approvals: bool = row.get(10)?;
-                    let title_role: String = row.get(12)?;
-                    let title = title_of_first_user_row(&id_str, &title_role, row.get(11)?);
+                    let title_kind: String = row.get(12)?;
+                    let title = title_of_first_user_row(&id_str, &title_kind, row.get(11)?);
                     Ok((
                         id_str,
                         created_at,
@@ -2408,8 +2408,8 @@ impl Store {
         let expired: Vec<Uuid> = self
             .connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // FK CASCADE sweeps messages, tool_outputs, and any sub-agent child sessions of the
-                // expired parents.
+                // FK CASCADE sweeps messages, scratchpad entries, and any sub-agent child sessions
+                // of the expired parents.
                 //
                 // A session with a scheduled job still ahead of it is *not* expired, whatever
                 // `updated_at` says; `NOT_SPOKEN_FOR_BY_A_SCHEDULE` says why the whole parent
@@ -2643,7 +2643,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "DELETE FROM tool_outputs WHERE session_id = ?1",
+                    "DELETE FROM scratchpad_entries WHERE session_id = ?1",
                     rusqlite::params![session_id.to_string()],
                 )?;
 
@@ -2685,9 +2685,9 @@ impl Store {
     pub(super) async fn delete_session_row(&self, session_id: Uuid) -> Result<bool> {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
-                // ON DELETE CASCADE on `messages.session_id`, `tool_outputs.session_id`, and
+                // ON DELETE CASCADE on `messages.session_id`, `scratchpad_entries.session_id`, and
                 // `sessions.parent_session_id` sweeps own-session rows + any sub-agent children +
-                // their messages/tool_outputs in a single statement.
+                // their messages/scratchpad_entries in a single statement.
                 let transaction = connection.transaction()?;
                 let deleted = transaction
                     .execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![
@@ -3594,14 +3594,14 @@ mod tests {
             // sibling under the same parent, and a copy that dropped either would be a drivable
             // sub-agent with no spawn terms. See `fork_session_locked`'s doc comment.
             "subagent_spec_json",
-            "stat_turns",
-            "stat_input_tokens",
-            "stat_output_tokens",
-            "stat_cache_creation_input_tokens",
-            "stat_cache_read_input_tokens",
-            "stat_redactions",
-            "stat_redacted_images",
-            "stat_redacted_bytes",
+            "turns",
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "redactions",
+            "redacted_images",
+            "redacted_bytes",
             // Last, and after the stats, because a migration appended it and the fresh path
             // replays that same step rather than creating the column inline, so both
             // orders agree.
@@ -3642,7 +3642,7 @@ mod tests {
                     profile: "work".to_string(),
                     stats: crate::stats::SessionStatsSnapshot::default(),
                     events: Vec::new(),
-                    tool_outputs: Vec::new(),
+                    scratchpad_entries: Vec::new(),
                 }],
                 Vec::new(),
             )
@@ -4061,7 +4061,7 @@ mod tests {
         }
     }
 
-    /// A user turn carrying an input image is persisted under the `user_blocks` role as full JSON
+    /// A user turn carrying an input image is persisted under the `user_blocks` kind as full JSON
     /// so the image survives the round trip, while a text-only user turn still stores as plaintext
     /// under `user` (keeping `list_sessions`'s title intact).
     #[tokio::test]
@@ -4092,11 +4092,11 @@ mod tests {
             .await
             .expect("save text event");
 
-        // Storage roles: the image-bearing turn is JSON under `user_blocks`; the text-only turn
+        // Stored kinds: the image-bearing turn is JSON under `user_blocks`; the text-only turn
         // stays plaintext under `user`.
         let rows = store.load_messages(sid).await.expect("load messages");
-        assert_eq!(rows[0].role, "user_blocks");
-        assert_eq!(rows[1].role, "user");
+        assert_eq!(rows[0].kind, "user_blocks");
+        assert_eq!(rows[1].kind, "user");
         assert_eq!(rows[1].content, "plain text only");
 
         // The row holds a reference rather than the bytes, and the bytes come back on hydration.
@@ -4147,7 +4147,7 @@ mod tests {
             .expect("create session");
 
         // Written by hand rather than through `save_event`, so what is under test is the decoder
-        // alone: nothing here would notice the encoder changing which role it writes.
+        // alone: nothing here would notice the encoder changing which kind it writes.
         // `user_input_image_round_trips_via_user_blocks_role` is the test that closes that
         // loop.
         store
@@ -4168,7 +4168,7 @@ mod tests {
         assert!(events.iter().all(|e| matches!(e, Event::Append(_))));
     }
 
-    /// A row with an unknown role should be skipped (with a warning) so a future schema bump that
+    /// A row with an unknown kind should be skipped (with a warning) so a future schema bump that
     /// adds new event variants doesn't crash older binaries reading newer DBs.
     #[tokio::test]
     async fn load_events_skips_unknown_role() {
@@ -4335,9 +4335,9 @@ mod tests {
             .expect("failed to load messages");
 
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].kind, "user");
         assert_eq!(messages[0].content, "hello");
-        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].kind, "assistant");
         assert_eq!(messages[1].content, "hi there");
     }
 
@@ -4803,7 +4803,7 @@ mod tests {
             profile: "work".to_string(),
             stats: crate::stats::SessionStatsSnapshot::default(),
             events: Vec::new(),
-            tool_outputs: Vec::new(),
+            scratchpad_entries: Vec::new(),
         };
         store
             .import_sessions(
@@ -4858,7 +4858,7 @@ mod tests {
                     profile: "work".to_string(),
                     stats: crate::stats::SessionStatsSnapshot::default(),
                     events: Vec::new(),
-                    tool_outputs: Vec::new(),
+                    scratchpad_entries: Vec::new(),
                 }],
                 Vec::new(),
             )
@@ -5648,7 +5648,7 @@ mod tests {
                     }],
                 )),
             )],
-            tool_outputs: Vec::new(),
+            scratchpad_entries: Vec::new(),
         };
         let error = store
             .import_sessions(vec![record], Vec::new())

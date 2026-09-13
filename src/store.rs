@@ -1,5 +1,5 @@
 //! SQLite-backed session store. The tables this module owns are `sessions` and `messages` for the
-//! conversation, `tool_outputs` for results too large to keep inline (referenced from the
+//! conversation, `scratchpad_entries` for results too large to keep inline (referenced from the
 //! conversation by handle), `account_credentials` and `mcp_credentials` for secrets, and
 //! `scheduled_jobs` and `background_tasks` for work the agent starts and does not wait for. They
 //! are not the whole database, and this module does not define them: they and the memory store's
@@ -324,7 +324,7 @@ impl Store {
                 // have would leave a `.v0.bak` beside every first run. The copy carries its own
                 // `user_version`, so restoring it yields a store that migrates once when next
                 // opened rather than one mistaken for already-current.
-                let backup = if plan.from > 0 && plan.has_work() {
+                let backup = if plan.from > 0 && plan.migrates() {
                     back_up_before_migrating(connection, &database_path, plan.from)?
                 } else {
                     None
@@ -360,7 +360,7 @@ impl Store {
                 )),
             })?;
 
-        if plan.has_work() {
+        if plan.migrates() {
             match backup {
                 Some(path) => tracing::info!(
                     "brought the store forward from schema version {from} to {head}; the pre-migration copy is at {path}",
@@ -374,6 +374,11 @@ impl Store {
                     head = plan.head
                 ),
             }
+        } else if plan.classified {
+            tracing::info!(
+                "stamped schema version {head} on a store that carried none",
+                head = plan.head
+            );
         }
         Ok(())
     }

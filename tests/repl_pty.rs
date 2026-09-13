@@ -1380,7 +1380,7 @@ fn a_canceled_task_rides_the_next_prompt_in_the_repl() {
     let connection = rusqlite::Connection::open(install.database()).expect("open the store");
     let user_messages: Vec<String> = {
         let mut statement = connection
-            .prepare("SELECT content FROM messages WHERE role IN ('user', 'user_blocks') ORDER BY id ASC")
+            .prepare("SELECT content FROM messages WHERE kind IN ('user', 'user_blocks') ORDER BY id ASC")
             .expect("prepare");
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))

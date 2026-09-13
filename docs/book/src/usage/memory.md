@@ -23,15 +23,15 @@ Without it, an agent's only state is its context window. When a long session com
 | `priority` | `0`–`9`, default `5`. See [Priority](#priority). |
 | `tags` | Lowercase labels (`[a-z0-9-]`, at most 10) for grouping and filtering. |
 | `body` | Detail, loaded on demand by `memory_read`. |
-| `recorded` | When the memory was made. Stamped once, at creation. |
+| `created` | When the memory was made. Stamped once, at creation. |
 | `updated` | When the row last changed. |
 | `read count` | How many times `memory_read` has opened it. Feeds search ranking. Only `memory_read` increments it: a search hit is weaker evidence, and reading through the CLI or the HTTP API is the operator rather than the agent. |
 
-### `recorded` versus `updated`
+### `created` versus `updated`
 
 These answer different questions, and conflating them was a bug. A `memory_write` that changes only a description or a priority moves `updated`, and reading that as the observation date made a years-old note render as "today", sort to the top of its priority band, and arrive through `memory_read` captioned "Saved today. This is what you recorded then".
 
-`recorded` is stamped once, when the memory is created, and carried forward untouched by every later write. It is what the index renders as an age, what ties are broken by, and what freshness weighting reads. `updated` is reported by `meka memory get` and the HTTP API and takes no part in ordering or ranking.
+`created` is stamped once, when the memory is created, and carried forward untouched by every later write. It is what the index renders as an age, what ties are broken by, and what freshness weighting reads. `updated` is reported by `meka memory get` and the HTTP API and takes no part in ordering or ranking.
 
 The rule is enforced by the `INSERT ... ON CONFLICT DO UPDATE` statement itself, which never assigns `created_at` on the update path, rather than by each write door remembering to preserve it.
 
@@ -81,7 +81,7 @@ Nothing is lost. `memory_search` covers the whole store, including the entries t
 
 - **relevance**: BM25, weighting a hit on the name above the description, and the description above the body.
 - **importance**: the declared priority, blended with how often you have actually read the memory. A memory opened forty times is important whatever it was labeled two years ago, which is the counterweight to priority drift.
-- **freshness**: a gentle decay on `recorded`, **disabled entirely for priority 0–1**. A two-year-old standing rule is exactly as binding as a new one; a two-year-old situational note probably is not.
+- **freshness**: a gentle decay on `created`, **disabled entirely for priority 0–1**. A two-year-old standing rule is exactly as binding as a new one; a two-year-old situational note probably is not.
 
 **Fuzzy matching** works in four senses, and the result says which one answered so a guess is not mistaken for a recalled fact:
 
@@ -171,13 +171,13 @@ meka memory export --dir ~/backup/memory            # one Markdown file per memo
 
 In the REPL, `/memory` lists what is saved and `/memory <name>` prints one memory's body.
 
-`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `tags`, `recorded_at`, `updated_at` as RFC 3339) plus `read_count`; `show` adds `body` as stored, and `list` and `get` leave it out.
+`--format json` prints each memory with the fields [`GET /v1/memory`](http-api.md) uses (`name`, `description`, `priority`, `tags`, `created_at`, `updated_at` as RFC 3339) plus `read_count`; `show` adds `body` as stored, and `list` and `get` leave it out.
 
 `meka memory edit` opens the **body** only. Metadata goes through `meka memory add <name> --force --description ...`, which keeps whatever it does not mention.
 
 ## Export, backup, and git
 
-`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `priority`, `recorded`, `tags` and `read_count`, followed by the body. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
+`meka memory export` writes one `<name>.md` per memory: YAML frontmatter carrying `description`, `priority`, `created`, `tags` and `read_count`, followed by the body. That is the `grep`, git and backup answer now that memories live in the store rather than in files.
 
 `read_count` is there because it is the one value a file cannot otherwise reconstruct. Descriptions, bodies and dates are all in the note; how often the agent has actually opened it is not, and a restored backup with every counter at zero would silently lose each memory's accumulated ranking weight.
 

@@ -49,7 +49,7 @@ pub(crate) struct Memory {
     /// show a couple of hundred entries, and "4,910 more memories not shown" is not a usable
     /// signal, where "most common tags infra, people, decisions" is a query the model can act on.
     pub(crate) tags: Vec<String>,
-    /// When the memory was *recorded*: stamped once, at create, and carried across every later
+    /// When the memory was *created*: stamped once, at create, and carried across every later
     /// write by the upsert itself (see [`crate::store::memory::MemoryStore::write`]).
     ///
     /// Distinct from [`Self::updated_at`] because the two answer different questions and only one
@@ -57,7 +57,7 @@ pub(crate) struct Memory {
     /// description makes a years-old note render as "today", sort to the top of its priority band,
     /// and arrive through `memory_read` under the caption "Saved today. This is what you recorded
     /// then".
-    pub(crate) recorded_at: SystemTime,
+    pub(crate) created_at: SystemTime,
     /// When the row was last written. Reported by `meka memory get` and the HTTP API; it takes no
     /// part in ordering, ranking or the rendered age.
     pub(crate) updated_at: SystemTime,
@@ -152,14 +152,14 @@ pub(crate) fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Parse an RFC 3339 timestamp column, or `None` if it is not one.
-pub(crate) fn parse_recorded_str(raw: &str) -> Option<SystemTime> {
+pub(crate) fn parse_stamp(raw: &str) -> Option<SystemTime> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .ok()
         .map(|parsed| SystemTime::from(parsed.with_timezone(&chrono::Utc)))
 }
 
 /// Render a [`SystemTime`] as the RFC 3339 string the timestamp columns carry.
-pub(crate) fn render_recorded(time: SystemTime) -> String {
+pub(crate) fn render_stamp(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
 }
 
@@ -209,8 +209,8 @@ pub(crate) fn parse_priority(raw: Option<i64>, name: &str) -> u8 {
 pub(crate) struct MemoryFrontmatter {
     pub(crate) description: String,
     pub(crate) priority: u8,
-    /// The `recorded:` value as it will appear in the file, RFC 3339.
-    pub(crate) recorded: Option<String>,
+    /// The `created:` value as it will appear in the file, RFC 3339.
+    pub(crate) created: Option<String>,
     pub(crate) tags: Vec<String>,
     /// How many times the memory has been read, emitted only when non-zero.
     ///
@@ -228,7 +228,7 @@ pub(crate) struct MemoryFrontmatter {
 /// JSON because the point of an export is to be read and edited by a person, and to be greppable
 /// in a directory the way the rest of a notes tree is.
 ///
-/// `priority` is emitted only when it differs from [`DEFAULT_PRIORITY`], `recorded` only when
+/// `priority` is emitted only when it differs from [`DEFAULT_PRIORITY`], `created` only when
 /// known, and `tags` only when non-empty, so the common case stays a two-line header.
 pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> String {
     let mut out = String::new();
@@ -247,10 +247,10 @@ pub(crate) fn render_memory(frontmatter: &MemoryFrontmatter, body: &str) -> Stri
     if frontmatter.priority != DEFAULT_PRIORITY {
         out.push_str(&format!("priority: {}\n", frontmatter.priority));
     }
-    if let Some(recorded) = &frontmatter.recorded {
+    if let Some(created) = &frontmatter.created {
         // Quoted by `yaml_scalar` on the strength of the colons in the time, which is what keeps
         // the offset from parsing as a nested mapping.
-        out.push_str(&format!("recorded: {}\n", yaml_scalar(recorded)));
+        out.push_str(&format!("created: {}\n", yaml_scalar(created)));
     }
     if frontmatter.read_count > 0 {
         out.push_str(&format!("read_count: {}\n", frontmatter.read_count));
@@ -331,7 +331,7 @@ pub(crate) fn export_memory(memory: &Memory) -> String {
         &MemoryFrontmatter {
             description: memory.description.clone(),
             priority: memory.priority,
-            recorded: Some(render_recorded(memory.recorded_at)),
+            created: Some(render_stamp(memory.created_at)),
             tags: memory.tags.clone(),
             read_count: memory.read_count,
         },
@@ -367,16 +367,16 @@ pub(crate) fn render_description_for_model(description: &str) -> String {
 /// prompts staleness reasoning in a way a raw date does not. A memory is a point-in-time
 /// observation, and the agent needs to weigh an old one accordingly.
 ///
-/// Callers pass [`Memory::recorded_at`], never [`Memory::updated_at`]. The number is only worth
+/// Callers pass [`Memory::created_at`], never [`Memory::updated_at`]. The number is only worth
 /// rendering if it answers "how old is what this says"; an edit date dressed up as an observation
 /// date is worse than no date, because it reads as a fact the model can rely on.
-pub(crate) fn render_age(recorded: SystemTime, now: SystemTime) -> String {
+pub(crate) fn render_age(created: SystemTime, now: SystemTime) -> String {
     // A stamp in the future is its own answer, not "today". `duration_since` fails for one, and
     // folding that to zero tells the model a note dated next year was written this morning, while
     // the same row sorts to the top of its priority band, so the memory most likely to be wrong is
     // also the most prominent. Reachable through clock skew between two machines sharing a data
     // directory, or a hand-written date. Saying so is what lets the model discount it.
-    let Ok(elapsed) = now.duration_since(recorded) else {
+    let Ok(elapsed) = now.duration_since(created) else {
         return "at a future date".to_string();
     };
     match elapsed.as_secs() / 86_400 {
@@ -474,7 +474,7 @@ mod tests {
             description: "a description: with a colon".to_string(),
             priority: 2,
             tags: vec!["deploy".to_string(), "infra".to_string()],
-            recorded_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
             updated_at: SystemTime::now(),
             read_count: 3,
             body: Some("Body text.\n".to_string()),
@@ -490,7 +490,7 @@ mod tests {
         );
         assert_eq!(parsed["priority"].as_i64(), Some(2));
         assert_eq!(
-            parsed["recorded"].as_str(),
+            parsed["created"].as_str(),
             Some("2023-11-14T22:13:20+00:00")
         );
         assert_eq!(
@@ -513,7 +513,7 @@ mod tests {
             description: "plain".to_string(),
             priority: DEFAULT_PRIORITY,
             tags: Vec::new(),
-            recorded_at: SystemTime::UNIX_EPOCH,
+            created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
             read_count: 0,
             body: None,
@@ -522,7 +522,7 @@ mod tests {
         assert!(!rendered.contains("priority:"), "{rendered}");
         assert!(!rendered.contains("tags:"), "{rendered}");
         assert!(!rendered.contains("read_count:"), "{rendered}");
-        assert!(rendered.contains("recorded:"), "{rendered}");
+        assert!(rendered.contains("created:"), "{rendered}");
     }
 
     #[test]

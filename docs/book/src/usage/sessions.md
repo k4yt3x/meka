@@ -151,7 +151,7 @@ features that own them document: `scheduled_jobs` ([scheduling](./scheduling.md)
 | `token_id` | TEXT | Bearer token that created the session, for HTTP |
 | `additional_roots_json` | TEXT | Workspace roots beyond `cwd` |
 | `subagent_spec_json` | TEXT | The terms a sub-agent was spawned under |
-| `stat_*` | INTEGER | Eight cumulative counters behind `/status` |
+| `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes` | INTEGER | The cumulative counters behind `/status` |
 | `profile` | TEXT | Profile the session runs on. Never NULL, though a row carried forward from a store that predates the column can hold `''` |
 | `context_tokens` | INTEGER | Context occupancy the provider last reported, which a resume checks its first turn against; NULL until a turn records one, and after a rewind |
 
@@ -169,11 +169,11 @@ process's PID and lock a session forever.
 |--------|------|-------------|
 | `id` | INTEGER | Auto-incrementing primary key |
 | `session_id` | TEXT (UUID) | Foreign key to `sessions.id` |
-| `role` | TEXT | `user_blocks` (a turn: its `turn_context` and `text` blocks and any images), `user` (a plain text message meka wrote), `assistant`, `tool_results`, `compact_boundary`, `repair`, or `redact` |
+| `kind` | TEXT | `user_blocks` (a turn: its `turn_context` and `text` blocks and any images), `user` (a plain text message meka wrote), `assistant`, `tool_results`, `compact_boundary`, `repair`, or `redact` |
 | `content` | TEXT | Message content (plain text or JSON) |
 | `created_at` | TEXT (RFC 3339) | When the message was saved |
 
-**tool_outputs**, scratchpad entries, one row per entry:
+**scratchpad_entries**, one row per entry:
 
 | Column | Type | Description |
 |--------|------|-------------|

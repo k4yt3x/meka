@@ -46,7 +46,7 @@ fn build_tool_use_map(assistant_message: &Message) -> HashMap<String, (String, s
 
 fn build_scratchpad_reference(name: &str, size: usize) -> String {
     format!(
-        "Output saved to scratchpad '{name}' ({size} bytes). \
+        "Output saved to scratchpad entry '{name}' ({size} bytes). \
          Use scratchpad_read to access it.",
     )
 }

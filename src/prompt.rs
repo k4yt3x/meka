@@ -57,10 +57,10 @@ struct MemoryIndexEntry {
     name: String,
     description: String,
     priority: u8,
-    /// [`crate::memory::Memory::recorded_at`]: when the note was recorded, not when the row was
+    /// [`crate::memory::Memory::created_at`]: when the note was created, not when the row was
     /// last written. A metadata-only rewrite moves `updated_at`, and rendering that as the age
     /// told the model a years-old memory was written today.
-    recorded: std::time::SystemTime,
+    created: std::time::SystemTime,
     /// Labels, for the histogram that stands in for the entries the budget could not list.
     tags: Vec<String>,
     /// The body, for a priority-0 memory only, so [`render_memory_section`] can put a standing
@@ -307,7 +307,7 @@ impl WorldSnapshot {
                     // comparing what the model was actually told.
                     description: crate::memory::render_description_for_model(&memory.description),
                     priority: memory.priority,
-                    recorded: memory.recorded_at,
+                    created: memory.created_at,
                     tags: memory.tags.clone(),
                     // Only the standing band carries one, which is what `MemoryStore::index`
                     // loads. An empty body is the same as none for rendering purposes.
@@ -1087,7 +1087,7 @@ fn render_memory_section(memories: &[MemoryIndexEntry], tools: MemoryTools) -> S
             "- **{}** (p{}, {}): {}\n",
             entry.name,
             entry.priority,
-            crate::memory::render_age(entry.recorded, now),
+            crate::memory::render_age(entry.created, now),
             crate::entry::elide_description_for_index(&entry.description)
         );
         // Always emit at least one entry: a single pathological description longer than the whole
@@ -1179,7 +1179,7 @@ fn render_standing_memories(
         let mut block = format!(
             "- **{}** ({}): {}\n",
             entry.name,
-            crate::memory::render_age(entry.recorded, now),
+            crate::memory::render_age(entry.created, now),
             crate::entry::elide_description_for_index(&entry.description)
         );
         // Deliberately *not* `elide`, which collapses whitespace: it exists for one-line index
@@ -1447,7 +1447,7 @@ fn render_world_state_diff(current: &WorldSnapshot, previous: &WorldSnapshot) ->
         .memories
         .iter()
         .filter(|entry| {
-            // Compare only what the model was told, not `recorded`. Rewriting a memory with
+            // Compare only what the model was told, not `created`. Rewriting a memory with
             // identical content is noise to re-announce; the timestamp still rides in the
             // snapshot, because it decides ordering the next time the index renders in full.
             //
@@ -2098,7 +2098,7 @@ mod tests {
             description: description.to_string(),
             priority,
             tags: Vec::new(),
-            recorded_at: age,
+            created_at: age,
             updated_at: age,
             read_count: 0,
             body: None,
@@ -3951,7 +3951,7 @@ mod tests {
     /// rather than the model silently working from stale facts.
     ///
     /// One field is exempt, and it is exempt on purpose rather than by omission:
-    /// [`MemoryIndexEntry::recorded`] is in the snapshot because it decides ordering the next time
+    /// [`MemoryIndexEntry::created`] is in the snapshot because it decides ordering the next time
     /// the index renders in full, and out of the diff because rewriting a memory with identical
     /// content is not news. The pair proving that is
     /// [`a_rewritten_memory_with_nothing_new_to_say_is_not_announced`], deliberately kept out of
@@ -4148,7 +4148,7 @@ mod tests {
 
     /// The one exemption from the loop above.
     ///
-    /// `recorded` is in the snapshot and out of the diff comparison, so two snapshots differing
+    /// `created` is in the snapshot and out of the diff comparison, so two snapshots differing
     /// only in it are unequal and render nothing. That is the intent (re-saving a memory whose
     /// content has not changed is not something to announce), but the drift guard's promise reads
     /// as unconditional, so the exception needs a test of its own or the next person adding a field
@@ -4170,7 +4170,7 @@ mod tests {
 
         assert_ne!(
             before, after,
-            "the premise: the snapshots differ, in `recorded` and nothing else"
+            "the premise: the snapshots differ, in `created` and nothing else"
         );
         assert!(
             render_world_state(&after, Some(&before)).is_empty(),
@@ -4313,11 +4313,11 @@ mod tests {
         crate::store::background::BackgroundTask {
             id: format!("{short}-0000-0000-0000-000000000000"),
             session_id: uuid::Uuid::nil(),
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: label.to_string(),
             status: crate::store::background::TaskStatus::Running,
             outcome: None,
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
             announced_at: None,

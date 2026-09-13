@@ -1,4 +1,4 @@
-//! Scratchpad rows: the `tool_outputs` table.
+//! Scratchpad rows: the `scratchpad_entries` table.
 
 use super::*;
 
@@ -32,7 +32,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT OR REPLACE INTO tool_outputs (session_id, name, content, created_at) \
+                    "INSERT OR REPLACE INTO scratchpad_entries (session_id, name, content, created_at) \
                      VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![session_id.to_string(), name, content, now],
                 )?;
@@ -57,7 +57,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let updated = connection.execute(
-                    "UPDATE tool_outputs SET content = ?1 \
+                    "UPDATE scratchpad_entries SET content = ?1 \
                      WHERE session_id = ?2 AND name = ?3",
                     rusqlite::params![content, session_id.to_string(), name],
                 )?;
@@ -80,7 +80,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let deleted = connection.execute(
-                    "DELETE FROM tool_outputs WHERE session_id = ?1 AND name = ?2",
+                    "DELETE FROM scratchpad_entries WHERE session_id = ?1 AND name = ?2",
                     rusqlite::params![session_id.to_string(), name],
                 )?;
                 Ok(deleted > 0)
@@ -107,7 +107,7 @@ impl Store {
                 // so this and the UPDATE share a consistent view; the `PRIMARY KEY (session_id,
                 // name)` constraint at the schema layer is the final backstop.
                 let target_exists: i64 = connection.query_row(
-                    "SELECT COUNT(*) FROM tool_outputs WHERE session_id = ?1 AND name = ?2",
+                    "SELECT COUNT(*) FROM scratchpad_entries WHERE session_id = ?1 AND name = ?2",
                     rusqlite::params![session_id.to_string(), new],
                     |row| row.get(0),
                 )?;
@@ -115,7 +115,7 @@ impl Store {
                     return Ok(RenameOutcome::TargetExists);
                 }
                 let renamed = connection.execute(
-                    "UPDATE tool_outputs SET name = ?1 WHERE session_id = ?2 AND name = ?3",
+                    "UPDATE scratchpad_entries SET name = ?1 WHERE session_id = ?2 AND name = ?3",
                     rusqlite::params![new, session_id.to_string(), old],
                 )?;
                 Ok(if renamed > 0 {
@@ -139,7 +139,7 @@ impl Store {
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
                     "SELECT name, LENGTH(content), created_at \
-                     FROM tool_outputs WHERE session_id = ?1 ORDER BY created_at ASC",
+                     FROM scratchpad_entries WHERE session_id = ?1 ORDER BY created_at ASC",
                 )?;
 
                 let rows = statement
@@ -171,7 +171,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
-                    "SELECT content FROM tool_outputs \
+                    "SELECT content FROM scratchpad_entries \
                      WHERE session_id = ?1 AND name = ?2",
                     rusqlite::params![session_id.to_string(), name],
                     |row| row.get::<_, String>(0),
@@ -197,7 +197,7 @@ impl Store {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let mut statement = connection.prepare(
-                    "SELECT name, content FROM tool_outputs \
+                    "SELECT name, content FROM scratchpad_entries \
                      WHERE session_id = ?1 ORDER BY created_at ASC",
                 )?;
 

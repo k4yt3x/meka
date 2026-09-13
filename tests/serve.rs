@@ -7182,14 +7182,14 @@ fn memory_write_read_list_and_delete_round_trip() {
         detail
     );
     // The three fields the storage move promised on this surface, none of which anything asserted.
-    // `recorded_at` and `updated_at` are distinct concepts -- when the note was made, and when the
+    // `created_at` and `updated_at` are distinct concepts -- when the note was made, and when the
     // row was last written -- so a handler serving one for both would satisfy any test that only
     // checked they were present.
     assert!(
-        detail["recorded_at"]
+        detail["created_at"]
             .as_str()
             .is_some_and(|stamp| stamp.parse::<chrono::DateTime<chrono::Utc>>().is_ok()),
-        "recorded_at must be an RFC 3339 stamp: {detail}"
+        "created_at must be an RFC 3339 stamp: {detail}"
     );
     assert!(
         detail["updated_at"]
@@ -7214,7 +7214,7 @@ fn memory_write_read_list_and_delete_round_trip() {
         "and the list carries them too: {listed_entry}"
     );
     assert!(
-        listed_entry["recorded_at"].as_str().is_some(),
+        listed_entry["created_at"].as_str().is_some(),
         "{}",
         listed_entry
     );
@@ -8924,7 +8924,7 @@ fn task_webhook_payload_omits_the_command_line() {
                 "no `label` field at all: {}",
                 delivery.body
             );
-            assert_eq!(payload["tool_name"], "execute_command");
+            assert_eq!(payload["tool"], "execute_command");
         }
         Err(_) => panic!("a task.finished delivery must arrive"),
     }

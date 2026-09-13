@@ -71,7 +71,7 @@ pub(crate) fn split_frontmatter<'a>(content: &'a str) -> Option<(&'a str, &'a st
 ///
 /// Its remaining caller is `crate::memory::render_memory`, the export renderer, which passes three
 /// kinds of value and is safe for three separate reasons: a `description` that has been through
-/// [`normalize_description`], a `recorded` that is RFC 3339 rendered from a `SystemTime`, and
+/// [`normalize_description`], a `created` that is RFC 3339 rendered from a `SystemTime`, and
 /// `tags` whose elements have all passed `crate::memory::validate_tag` and so cannot contain a
 /// newline. (`priority` is a `u8` and never reaches here.)
 ///

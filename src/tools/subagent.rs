@@ -1567,8 +1567,8 @@ impl Tool for AgentDeleteTool {
         let (_parent_sid, row) =
             require_child_session(&self.tool_builder_params, "agent_delete", &input).await?;
         // One statement; `sessions.parent_session_id`, `messages.session_id` and
-        // `tool_outputs.session_id` all carry `ON DELETE CASCADE`, so the worker's messages, its
-        // scratchpad entries and its own descendants go with it.
+        // `scratchpad_entries.session_id` all carry `ON DELETE CASCADE`, so the worker's messages,
+        // its scratchpad entries and its own descendants go with it.
         self.tool_builder_params
             .materials
             .store
@@ -3969,7 +3969,7 @@ mod tests {
             description: description.to_string(),
             priority,
             tags: Vec::new(),
-            recorded_at: std::time::SystemTime::UNIX_EPOCH,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             read_count: 0,
             body: None,

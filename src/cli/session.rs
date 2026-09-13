@@ -368,13 +368,13 @@ pub(crate) async fn export_session(
             // older turns from the model (it appends a boundary, never deletes), so the export
             // walks the raw log and renders every turn plus a marker at each compaction point.
             let events = store.load_events(session_id).await?;
-            let tool_outputs: std::collections::HashMap<String, String> = store
+            let scratchpad_entries: std::collections::HashMap<String, String> = store
                 .load_all_scratchpad_entries(session_id)
                 .await?
                 .into_iter()
                 .collect();
             (
-                conversation::format_session_as_markdown(session_id, &events, &tool_outputs),
+                conversation::format_session_as_markdown(session_id, &events, &scratchpad_entries),
                 "md",
             )
         }
@@ -442,8 +442,7 @@ pub(crate) async fn import_session(
         std::fs::read_to_string(input)
             .map_err(|error| anyhow::anyhow!("failed to read '{input}': {error}"))?
     };
-    let export: crate::store::export::SessionExport = serde_json::from_str(&raw)
-        .map_err(|error| anyhow::anyhow!("invalid session export JSON: {error}"))?;
+    let export = crate::store::export::parse_session_export(raw.as_bytes())?;
 
     // Version mismatch, an empty archive and a profile nothing here configures all surface here,
     // worded for the person who ran the command: the archive is theirs, so a refusal is about
@@ -792,7 +791,7 @@ mod tests {
                     "profile": "work",
                     "stats": crate::stats::SessionStatsSnapshot::default(),
                     "events": [],
-                    "tool_outputs": {},
+                    "scratchpad_entries": {},
                 }],
             })
             .to_string(),

@@ -375,11 +375,11 @@ impl Agent {
         let task = crate::store::background::BackgroundTask {
             id: Uuid::new_v4().to_string(),
             session_id,
-            tool_name: name.to_string(),
+            tool: name.to_string(),
             label,
             status: crate::store::background::TaskStatus::Running,
             outcome: None,
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
             announced_at: None,
@@ -430,7 +430,7 @@ impl Agent {
             let cancellation = cancellation.clone();
             let tool_call_id = tool_call_id.to_string();
             let task_id = task.id.clone();
-            let tool_name = task.tool_name.clone();
+            let tool_name = task.tool.clone();
             async move {
                 // Published for the frontend as well as passed to the tool: a delegated `fs/*` or
                 // elicitation must race *this* token, not the session's current turn. See
@@ -466,11 +466,11 @@ impl Agent {
                 let text =
                     crate::conversation::ContentBlock::tool_result_text_content(&output.content);
                 let (inline, spilled) = crate::background::split_outcome(&text);
-                let mut scratchpad_name = None;
+                let mut scratchpad_entry = None;
                 if let Some(full) = spilled {
                     let name = crate::background::spill_entry_name(&task_id, &tool_name);
                     match store.save_scratchpad_entry(session_id, &name, &full).await {
-                        Ok(()) => scratchpad_name = Some(name),
+                        Ok(()) => scratchpad_entry = Some(name),
                         // Not fatal: the head still reaches the model, and losing the tail is far
                         // better than losing the whole report.
                         Err(error) => tracing::warn!(
@@ -484,7 +484,7 @@ impl Agent {
                 } else {
                     crate::store::background::TaskStatus::Completed
                 };
-                record_background_outcome(&store, &task_id, status, inline, scratchpad_name).await;
+                record_background_outcome(&store, &task_id, status, inline, scratchpad_entry).await;
                 tasks.forget(&task_id).await;
             }
         });
@@ -546,7 +546,7 @@ async fn record_background_outcome(
     task_id: &str,
     status: crate::store::background::TaskStatus,
     outcome: String,
-    scratchpad_name: Option<String>,
+    scratchpad_entry: Option<String>,
 ) {
     let background = store.background_store();
     let Err(error) = background
@@ -554,7 +554,7 @@ async fn record_background_outcome(
             task_id,
             status,
             Some(outcome.clone()),
-            scratchpad_name.clone(),
+            scratchpad_entry.clone(),
         )
         .await
     else {
@@ -563,7 +563,7 @@ async fn record_background_outcome(
     tracing::warn!("background task {task_id} finished but failed to record it; retrying: {error}");
     tokio::time::sleep(OUTCOME_RETRY_DELAY).await;
     let Err(error) = background
-        .finish_background_task(task_id, status, Some(outcome), scratchpad_name)
+        .finish_background_task(task_id, status, Some(outcome), scratchpad_entry)
         .await
     else {
         return;

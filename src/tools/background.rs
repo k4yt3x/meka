@@ -92,7 +92,7 @@ impl Tool for TaskListTool {
                 vec![
                     task.short_id().to_string(),
                     task.status.name().to_string(),
-                    task.tool_name.clone(),
+                    task.tool.clone(),
                     crate::background::excerpt(&task.label, LABEL_EXCERPT_CHARS),
                     humantime_serde::re::humantime::format_duration(
                         std::time::Duration::from_secs(task.elapsed().num_seconds().max(0) as u64),
@@ -103,8 +103,8 @@ impl Tool for TaskListTool {
                     // fails (a provider error, an interrupt) consumes the report. Without this the
                     // result would be reachable only by reading the database by hand, which for
                     // the agent means not at all.
-                    match (&task.outcome, &task.scratchpad_name) {
-                        (_, Some(name)) => format!("in scratchpad '{name}'"),
+                    match (&task.outcome, &task.scratchpad_entry) {
+                        (_, Some(name)) => format!("in scratchpad entry '{name}'"),
                         (Some(outcome), None) if task.status.is_terminal() => {
                             crate::background::excerpt(outcome, OUTCOME_EXCERPT_CHARS)
                         }
@@ -303,11 +303,11 @@ mod tests {
         let task = BackgroundTask {
             id: Uuid::new_v4().to_string(),
             session_id,
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: label.to_string(),
             status: TaskStatus::Running,
             outcome: None,
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
             announced_at: None,

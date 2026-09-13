@@ -77,7 +77,7 @@ pub(crate) async fn list(
             vec![
                 entry.name.clone(),
                 entry.priority.to_string(),
-                memory::render_age(entry.recorded_at, now),
+                memory::render_age(entry.created_at, now),
                 entry.tags.join(","),
                 crate::text::prose_cell(&memory::render_description_for_model(&entry.description)),
             ]
@@ -108,10 +108,10 @@ pub(crate) async fn run_get(
             memory::render_description_for_model(&entry.description),
         ),
         ("priority", entry.priority.to_string()),
-        // Two dates, because they answer different questions. "recorded" is when the note was made
+        // Two dates, because they answer different questions. "created" is when the note was made
         // and is stamped once; "updated" is when the row last changed, which a priority nudge
         // moves without the note saying anything new.
-        ("recorded", memory::render_age(entry.recorded_at, now)),
+        ("created", memory::render_age(entry.created_at, now)),
         ("updated", memory::render_age(entry.updated_at, now)),
         ("read count", entry.read_count.to_string()),
     ];
@@ -1453,7 +1453,7 @@ mod tests {
         assert_eq!(parsed["description"].as_str(), Some("first note"));
         assert_eq!(parsed["priority"].as_i64(), Some(2));
         assert_eq!(parsed["tags"][0].as_str(), Some("infra"));
-        assert!(parsed["recorded"].as_str().is_some(), "{frontmatter}");
+        assert!(parsed["created"].as_str().is_some(), "{frontmatter}");
         assert_eq!(body.trim(), "alpha body");
         assert!(directory.join("beta.md").is_file());
 

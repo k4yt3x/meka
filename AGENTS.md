@@ -214,7 +214,7 @@ One word per concept, everywhere it is written or read:
   `manager` is only `McpClientManager`.
 - **sub-agent** as the noun; "worker" only when the orchestration role is the point; never
   "delegate" as a noun. Depth 0 is the **root**, the spawner is the **parent**.
-- **scratchpad entry** in every string and identifier; the SQL table `tool_outputs` keeps its name.
+- **scratchpad entry** in every string and identifier, the table `scratchpad_entries` included.
 - **approvals** is the switch; the prompt is an **approval prompt** with the header `[approval]`;
   its answers are allow and deny.
 - **standing instructions** for the concept; "instructions file" only for the file on disk.
@@ -339,7 +339,10 @@ transaction, behind an automatic backup. Four rules:
    stamp itself current. Append; never edit a released entry.
 3. **A migration must be safe to run twice.** A `.dump`/restore round trip drops `user_version`, so
    steps replay over data that already has them. Guard `ALTER TABLE` on the current column set, prefer
-   `IF NOT EXISTS`, and have conversions test for the shape they convert *from*.
+   `IF NOT EXISTS`, and have conversions test for the shape they convert *from*. A frozen step names
+   objects by the names they had, so a step that renames or drops one a frozen step reads must also
+   move the floor in `classify_by_shape`, which classifies an unversioned store past every step before
+   the rename by a marker the rename leaves, so no replay reaches the name that is gone.
 4. **A migration may receive data it cannot work out, but may not call meka's own code** to get it.
    Only `rusqlite`, `serde_json` and the like. A function can change meaning years later; a `String`
    cannot. `Step::Contextual` takes plain data from the caller, and its `Context` is append-only for

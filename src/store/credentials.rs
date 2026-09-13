@@ -391,7 +391,7 @@ impl TokenStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let result = connection.query_row(
-                    "SELECT secret FROM mcp_credentials WHERE server_name = ?1 AND kind = ?2",
+                    "SELECT secret FROM mcp_credentials WHERE server = ?1 AND kind = ?2",
                     rusqlite::params![server_name, kind],
                     |row| row.get::<_, String>(0),
                 );
@@ -436,7 +436,7 @@ impl TokenStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "UPDATE mcp_credentials SET secret = ?3, updated_at = ?4 \
-                     WHERE server_name = ?1 AND secret = ?2 AND kind = 'oauth'",
+                     WHERE server = ?1 AND secret = ?2 AND kind = 'oauth'",
                     rusqlite::params![server_name, expected_json, json, now],
                 )
             })
@@ -468,9 +468,9 @@ impl TokenStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "INSERT INTO mcp_credentials (server_name, kind, secret, updated_at)
+                    "INSERT INTO mcp_credentials (server, kind, secret, updated_at)
                      VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(server_name, kind) DO UPDATE SET
+                     ON CONFLICT(server, kind) DO UPDATE SET
                          secret = excluded.secret,
                          updated_at = excluded.updated_at",
                     rusqlite::params![server_name, kind, secret, now],
@@ -499,7 +499,7 @@ impl TokenStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "DELETE FROM mcp_credentials WHERE server_name = ?1 AND kind = ?2",
+                    "DELETE FROM mcp_credentials WHERE server = ?1 AND kind = ?2",
                     rusqlite::params![server_name, kind],
                 )?;
                 Ok(())
@@ -516,7 +516,7 @@ impl TokenStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "DELETE FROM mcp_credentials WHERE server_name = ?1",
+                    "DELETE FROM mcp_credentials WHERE server = ?1",
                     rusqlite::params![server_name],
                 )?;
                 Ok(())
@@ -537,7 +537,7 @@ impl TokenStore {
         self.connection
             .call(move |connection| -> rusqlite::Result<_> {
                 let count: i64 = connection.query_row(
-                    "SELECT COUNT(*) FROM mcp_credentials WHERE server_name = ?1",
+                    "SELECT COUNT(*) FROM mcp_credentials WHERE server = ?1",
                     rusqlite::params![server_name],
                     |row| row.get(0),
                 )?;
@@ -563,9 +563,8 @@ impl TokenStore {
                 // DISTINCT because the table is keyed by `(server_name, kind)`: a confidential
                 // OAuth client holds two rows and a bearer beside them would make three, and this
                 // answers "which servers have a secret", not "how many secrets are there".
-                let mut statement = connection.prepare(
-                    "SELECT DISTINCT server_name FROM mcp_credentials ORDER BY server_name",
-                )?;
+                let mut statement = connection
+                    .prepare("SELECT DISTINCT server FROM mcp_credentials ORDER BY server")?;
                 let servers = statement
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<String>>>()?;

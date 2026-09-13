@@ -731,7 +731,7 @@ pub(crate) struct BackgroundTaskView {
     pub(crate) id: String,
     pub(crate) session_id: Uuid,
     /// The tool that was backgrounded, e.g. `execute_command`.
-    pub(crate) tool_name: String,
+    pub(crate) tool: String,
     /// Human-readable summary of what was started.
     pub(crate) label: String,
     /// `running`, `completed`, `failed`, `canceled`, or `interrupted`.
@@ -742,7 +742,7 @@ pub(crate) struct BackgroundTaskView {
     pub(crate) outcome: Option<String>,
     /// Scratchpad entry holding the full output, when it was too large to carry inline.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) scratchpad_name: Option<String>,
+    pub(crate) scratchpad_entry: Option<String>,
     pub(crate) started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) finished_at: Option<String>,
@@ -770,11 +770,11 @@ impl From<crate::store::background::BackgroundTask> for BackgroundTaskView {
         Self {
             id: task.id,
             session_id: task.session_id,
-            tool_name: task.tool_name,
+            tool: task.tool,
             label: task.label,
             status: task.status.name().to_string(),
             outcome: task.outcome,
-            scratchpad_name: task.scratchpad_name,
+            scratchpad_entry: task.scratchpad_entry,
             started_at: task.started_at.to_rfc3339(),
             finished_at: task.finished_at.map(|at| at.to_rfc3339()),
             announced_at: task.announced_at.map(|at| at.to_rfc3339()),

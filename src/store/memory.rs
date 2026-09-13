@@ -175,13 +175,13 @@ fn find_ignoring_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
 
 /// Bring the memory search index into line with this build, on every open.
 ///
-/// The `memories` table, its `idx_memories_rank` index and the `memories_fts` virtual table are
-/// *not* created here. They are created by [`crate::store::migrations`], which owns the `CREATE`
-/// for every table the agent reads, so that one ledger describes that schema and an older store is
-/// carried forward by the same code path a new one is built by. This function is what is left, and
-/// it is a different kind of operation: reconciliation of a derived index against the table it is
-/// derived from, which is why it sits on the open path rather than in the ledger or in a command
-/// the user has to remember to run.
+/// The `memories` table, its `idx_memories_priority_created_at` index and the `memories_fts`
+/// virtual table are *not* created here. They are created by [`crate::store::migrations`], which
+/// owns the `CREATE` for every table the agent reads, so that one ledger describes that schema and
+/// an older store is carried forward by the same code path a new one is built by. This function is
+/// what is left, and it is a different kind of operation: reconciliation of a derived index against
+/// the table it is derived from, which is why it sits on the open path rather than in the ledger or
+/// in a command the user has to remember to run.
 ///
 /// Two steps, both of which name no release and hold no knowledge of a past shape.
 /// [`sync_triggers`] asks whether this database's FTS triggers are the ones this build requires and
@@ -229,15 +229,15 @@ fn create_tables(connection: &mut rusqlite::Connection) -> rusqlite::Result<()> 
 /// of these desyncs the index in silence.
 const TRIGGER_DEFINITIONS: [(&str, &str); 3] = [
     (
-        "memories_ai",
-        "CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+        "memories_after_insert",
+        "CREATE TRIGGER IF NOT EXISTS memories_after_insert AFTER INSERT ON memories BEGIN
              INSERT INTO memories_fts(rowid, name, description, tags, body)
              VALUES (new.id, new.name, new.description, new.tags, new.body);
          END;",
     ),
     (
-        "memories_ad",
-        "CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+        "memories_after_delete",
+        "CREATE TRIGGER IF NOT EXISTS memories_after_delete AFTER DELETE ON memories BEGIN
              INSERT INTO memories_fts(memories_fts, rowid, name, description, tags, body)
              VALUES ('delete', old.id, old.name, old.description, old.tags, old.body);
          END;",
@@ -260,8 +260,8 @@ const TRIGGER_DEFINITIONS: [(&str, &str); 3] = [
         // because the comparison should follow the *content*, not the tokenizer's opinion of it:
         // a future tokenizer change, or a case-sensitive column added beside this one, would make
         // the difference real, and nothing would fail in between.
-        "memories_au",
-        "CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
+        "memories_after_update",
+        "CREATE TRIGGER IF NOT EXISTS memories_after_update AFTER UPDATE ON memories
          WHEN old.name COLLATE BINARY IS NOT new.name COLLATE BINARY
            OR old.description IS NOT new.description
            OR old.tags        IS NOT new.tags
@@ -326,8 +326,7 @@ fn canonical_trigger_sql(sql: &str) -> String {
 fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     let existing: std::collections::HashMap<String, String> = {
         let mut statement = connection.prepare(
-            "SELECT name, sql FROM sqlite_master
-             WHERE type = 'trigger' AND name IN ('memories_ai', 'memories_ad', 'memories_au')",
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'memories'",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -337,9 +336,13 @@ fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
         })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    if TRIGGER_DEFINITIONS
-        .iter()
-        .all(|(name, sql)| existing.get(*name) == Some(&canonical_trigger_sql(sql)))
+    // Every trigger on the table is compared, not only the three by this build's names: one an
+    // earlier build left under another name would otherwise stay beside the new set and feed the
+    // index twice.
+    if existing.len() == TRIGGER_DEFINITIONS.len()
+        && TRIGGER_DEFINITIONS
+            .iter()
+            .all(|(name, sql)| existing.get(*name) == Some(&canonical_trigger_sql(sql)))
     {
         return Ok(false);
     }
@@ -353,7 +356,7 @@ fn sync_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<bool> {
     // already excludes. Rare path, clean rollback, and no reason to differ from its sibling.
     let transaction =
         rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
-    for (name, _) in TRIGGER_DEFINITIONS {
+    for name in existing.keys() {
         transaction.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
     }
     for (_, sql) in TRIGGER_DEFINITIONS {
@@ -536,7 +539,7 @@ pub(crate) struct Hit {
     /// description or the name.
     pub(crate) snippet: String,
     pub(crate) priority: u8,
-    pub(crate) recorded: SystemTime,
+    pub(crate) created: SystemTime,
     pub(crate) read_count: u32,
     /// The composed [`Ranking::score`]. Higher is better, unlike the raw `bm25` it derives from.
     pub(crate) score: f64,
@@ -665,8 +668,8 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
             .filter(|tag| !tag.is_empty())
             .collect::<Vec<_>>(),
         priority: clamp_priority(row.get(3)?),
-        recorded_at: parse_stamp(&row.get::<_, String>(4)?),
-        updated_at: parse_stamp(&row.get::<_, String>(5)?),
+        created_at: stamp_or_epoch(&row.get::<_, String>(4)?),
+        updated_at: stamp_or_epoch(&row.get::<_, String>(5)?),
         read_count: clamp_read_count(row.get(6)?),
         body: row.get(7)?,
     })
@@ -715,12 +718,12 @@ fn clamp_read_count(stored: i64) -> u32 {
 
 /// Parse a stored RFC 3339 stamp, falling back to the epoch.
 ///
-/// Every stamp this reads was written by [`crate::memory::render_recorded`], so the fallback is
+/// Every stamp this reads was written by [`crate::memory::render_stamp`], so the fallback is
 /// unreachable through meka's own doors. It exists because the alternative is failing a whole
 /// query over one malformed cell in a database somebody edited by hand, and an epoch date renders
 /// as an obviously wrong age rather than as a plausible one.
-fn parse_stamp(raw: &str) -> SystemTime {
-    crate::memory::parse_recorded_str(raw).unwrap_or(SystemTime::UNIX_EPOCH)
+fn stamp_or_epoch(raw: &str) -> SystemTime {
+    crate::memory::parse_stamp(raw).unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// Handle on the memory tables, sharing the one database `Store` owns.
@@ -862,7 +865,7 @@ impl MemoryStore {
     }
 
     /// Every memory, ordered as the `[Memory]` index renders them: priority ascending, then most
-    /// recently recorded, then by name so the result is total and stable.
+    /// recently created, then by name so the result is total and stable.
     ///
     /// Bodies are loaded only for the standing band ([`crate::memory::INLINE_BODY_PRIORITY_MAX`]),
     /// which is the only tier that renders one in full. Carrying every body would put the whole
@@ -918,9 +921,10 @@ impl MemoryStore {
 
     /// Rename a row straight at the column.
     ///
-    /// No meka door renames a memory, which is exactly why this exists: `memories_au`'s `WHEN`
-    /// carries a `COLLATE BINARY` on `name` so a case-only rename fires against a `NOCASE` column,
-    /// and without a seam that guarantee is unreachable from the suite and rests on its comment.
+    /// No meka door renames a memory, which is exactly why this exists: `memories_after_update`'s
+    /// `WHEN` carries a `COLLATE BINARY` on `name` so a case-only rename fires against a
+    /// `NOCASE` column, and without a seam that guarantee is unreachable from the suite and
+    /// rests on its comment.
     #[cfg(test)]
     pub(crate) async fn rename_for_test(&self, from: &str, to: &str) -> Result<()> {
         let Some(connection) = self.connection.as_deref() else {
@@ -977,7 +981,7 @@ impl MemoryStore {
     ///
     /// Three of this subsystem's defects were omit-to-keep bugs. None of them is expressible here.
     pub(crate) async fn write(&self, request: WriteRequest) -> Result<Memory> {
-        let now = crate::memory::render_recorded(SystemTime::now());
+        let now = crate::memory::render_stamp(SystemTime::now());
         let name = request.name.clone();
         self.writable()?
             .call(move |connection| -> rusqlite::Result<_> {
@@ -1093,7 +1097,7 @@ impl MemoryStore {
     ) -> Result<BodyWrite> {
         let name = name.to_string();
         let expected = expected.to_string();
-        let now = crate::memory::render_recorded(SystemTime::now());
+        let now = crate::memory::render_stamp(SystemTime::now());
         self.writable()?
             .call(move |connection| -> rusqlite::Result<_> {
                 let updated = connection.execute(
@@ -1189,7 +1193,7 @@ impl MemoryStore {
                             description: row.get(1)?,
                             body: row.get(2)?,
                             priority: clamp_priority(row.get(3)?),
-                            recorded: parse_stamp(&row.get::<_, String>(4)?),
+                            created: stamp_or_epoch(&row.get::<_, String>(4)?),
                             read_count: clamp_read_count(row.get(5)?),
                             snippet: row.get(6)?,
                             score: row.get::<_, f64>(7)?,
@@ -1204,7 +1208,7 @@ impl MemoryStore {
             })?;
 
         for hit in hits.iter_mut() {
-            let age = now.duration_since(hit.recorded).unwrap_or(Duration::ZERO);
+            let age = now.duration_since(hit.created).unwrap_or(Duration::ZERO);
             hit.score = Ranking::score(hit.score, hit.priority, hit.read_count, age);
         }
         // `total_cmp` rather than `partial_cmp`: a NaN from a degenerate bm25 would make the
@@ -1319,7 +1323,7 @@ impl MemoryStore {
                         ),
                         body,
                         priority: clamp_priority(row.get(3)?),
-                        recorded: parse_stamp(&row.get::<_, String>(4)?),
+                        created: stamp_or_epoch(&row.get::<_, String>(4)?),
                         read_count: clamp_read_count(row.get(5)?),
                         // No bm25 here: every row matched literally, so there is no relevance to
                         // grade and the importance weights decide the order on their own. Written
@@ -1336,7 +1340,7 @@ impl MemoryStore {
             })?;
 
         for hit in hits.iter_mut() {
-            let age = now.duration_since(hit.recorded).unwrap_or(Duration::ZERO);
+            let age = now.duration_since(hit.created).unwrap_or(Duration::ZERO);
             hit.score = Ranking::score(hit.score, hit.priority, hit.read_count, age);
         }
         hits.sort_by(|left, right| right.score.total_cmp(&left.score));
@@ -1361,14 +1365,11 @@ impl MemoryStore {
     /// is briefly unreadable. Neither is expressible here.
     pub(crate) async fn record_read(&self, name: &str) -> Result<()> {
         let name = name.to_string();
-        let now = crate::memory::render_recorded(SystemTime::now());
         self.writable()?
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
-                    "UPDATE memories
-                     SET read_count = read_count + 1, last_read_at = ?2
-                     WHERE name = ?1",
-                    rusqlite::params![name, now],
+                    "UPDATE memories SET read_count = read_count + 1 WHERE name = ?1",
+                    rusqlite::params![name],
                 )?;
                 Ok(())
             })
@@ -1586,11 +1587,11 @@ mod tests {
             "an omitted priority must not demote a standing directive to the default"
         );
         assert_eq!(
-            updated.recorded_at, created.recorded_at,
-            "recorded_at is stamped once at create and carried by the upsert"
+            updated.created_at, created.created_at,
+            "created_at is stamped once at create and carried by the upsert"
         );
         assert!(
-            updated.updated_at > created.updated_at || updated.updated_at != updated.recorded_at,
+            updated.updated_at > created.updated_at || updated.updated_at != updated.created_at,
             "updated_at must move; `>=` alone passes even with the assignment deleted"
         );
 
@@ -1719,8 +1720,8 @@ mod tests {
         connection
             .call(|connection| -> rusqlite::Result<_> {
                 connection.execute_batch(
-                    "DROP TRIGGER memories_au;
-                     CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                    "DROP TRIGGER memories_after_update;
+                     CREATE TRIGGER memories_after_update AFTER UPDATE ON memories BEGIN
                          SELECT 1;
                      END;
                      UPDATE memories SET body = 'marimba' WHERE name = 'note';",
@@ -1772,7 +1773,7 @@ mod tests {
         connection
             .call(|connection| -> rusqlite::Result<_> {
                 connection.execute_batch(
-                    "DROP TRIGGER memories_au;
+                    "DROP TRIGGER memories_after_update;
                      UPDATE memories SET body = 'marimba' WHERE name = 'note';",
                 )
             })
@@ -1860,11 +1861,11 @@ mod tests {
     /// Tags reach the search index, and a tags-only edit reaches it too.
     ///
     /// Two mutations survived the whole suite here: blanking `tags` in all three triggers, and
-    /// dropping the `tags` arm from `memories_au`'s `WHEN`. The suite writes tags and renders them,
-    /// and never once *searches* by one -- so the column could have been unindexed since the day it
-    /// was added and every test would still be green. The module's own doc says "Every indexed
-    /// column has to appear in the `WHEN` or an edit to the one left out stops reaching the index";
-    /// this is what makes that sentence checkable.
+    /// dropping the `tags` arm from `memories_after_update`'s `WHEN`. The suite writes tags and
+    /// renders them, and never once *searches* by one -- so the column could have been
+    /// unindexed since the day it was added and every test would still be green. The module's
+    /// own doc says "Every indexed column has to appear in the `WHEN` or an edit to the one
+    /// left out stops reaching the index"; this is what makes that sentence checkable.
     #[tokio::test]
     async fn a_tag_reaches_the_index_when_it_is_written_and_when_it_is_changed() {
         let store = MemoryStore::for_test().await.expect("store");
@@ -1889,8 +1890,8 @@ mod tests {
             "a tag has to be findable, or indexing it is decoration"
         );
 
-        // A tags-only edit: same description, different labels. `memories_au`'s `WHEN` decides
-        // whether the index hears about it at all.
+        // A tags-only edit: same description, different labels. `memories_after_update`'s `WHEN`
+        // decides whether the index hears about it at all.
         store
             .write(WriteRequest {
                 name: "runbook".to_string(),
@@ -1926,8 +1927,9 @@ mod tests {
     /// A rename reaches the index, including one that changes only case.
     ///
     /// Nothing in meka renames a memory today, so this is latent rather than live -- but dropping
-    /// the `name` arm from `memories_au`'s `WHEN` survived the whole suite, and a rename that never
-    /// reaches the index is a search that cannot find a memory by the name it now has.
+    /// the `name` arm from `memories_after_update`'s `WHEN` survived the whole suite, and a rename
+    /// that never reaches the index is a search that cannot find a memory by the name it now
+    /// has.
     ///
     /// The case-only rename is exercised but *not* asserted on, and the distinction is the point.
     /// `unicode61` folds case when it tokenizes, so `guideline` and `GUIDELINE` index identically
@@ -2352,7 +2354,7 @@ mod tests {
     }
 
     /// The `[Memory]` render reads this, so its order and its body budget are load-bearing:
-    /// priority ascending, then most recently recorded, then by name, and a body only for the band
+    /// priority ascending, then most recently created, then by name, and a body only for the band
     /// that renders one in full.
     #[tokio::test]
     async fn the_index_is_ordered_and_carries_only_standing_bodies() {
@@ -2948,5 +2950,56 @@ mod tests {
 
         println!("index {index_elapsed:?}, search {search_elapsed:?}");
         store.integrity_check().await.expect("integrity");
+    }
+
+    /// A trigger under a name an earlier build used is replaced with the rest rather than left
+    /// beside the new set. Comparing only the three names this build writes made a fourth trigger
+    /// on the table invisible: it survived the rebuild and fed the index a second copy of every
+    /// write.
+    #[tokio::test]
+    async fn a_trigger_under_an_earlier_build_s_name_is_removed() {
+        let store = store_with(&[("note", 5, "a note", "xylophone")]).await;
+        let connection = store.writable().expect("connected");
+        connection
+            .call(|connection| -> rusqlite::Result<_> {
+                connection.execute_batch(
+                    "DROP TRIGGER memories_after_update;
+                     CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                         INSERT INTO memories_fts(memories_fts, rowid, name, description, tags, body)
+                         VALUES ('delete', old.id, old.name, old.description, old.tags, old.body);
+                         INSERT INTO memories_fts(rowid, name, description, tags, body)
+                         VALUES (new.id, new.name, new.description, new.tags, new.body);
+                     END;",
+                )
+            })
+            .await
+            .expect("the trigger an earlier build left");
+
+        connection
+            .call(|connection| -> rusqlite::Result<_> { create_tables(connection) })
+            .await
+            .expect("second open");
+
+        let names: Vec<String> = connection
+            .call(|connection| -> rusqlite::Result<_> {
+                connection
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger' \
+                         AND tbl_name = 'memories' ORDER BY name",
+                    )?
+                    .query_map([], |row| row.get(0))?
+                    .collect()
+            })
+            .await
+            .expect("the triggers on the table");
+        assert_eq!(
+            names,
+            [
+                "memories_after_delete",
+                "memories_after_insert",
+                "memories_after_update"
+            ],
+            "only this build's triggers remain"
+        );
     }
 }

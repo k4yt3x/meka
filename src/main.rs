@@ -654,7 +654,7 @@ mod tests {
                     profile: "profile".to_string(),
                     stats: Default::default(),
                     events: Vec::new(),
-                    tool_outputs: Vec::new(),
+                    scratchpad_entries: Vec::new(),
                 }],
                 Vec::new(),
             )

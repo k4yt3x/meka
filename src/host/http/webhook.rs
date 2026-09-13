@@ -186,7 +186,7 @@ impl WebhookDispatcher {
                 serde_json::json!({
                     "task_id": task.id,
                     "session_id": task.session_id,
-                    "tool_name": task.tool_name,
+                    "tool": task.tool,
                     "status": task.status.name(),
                 }),
             );
@@ -455,11 +455,11 @@ mod tests {
         let task = crate::store::background::BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id,
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: "sleep 900".to_string(),
             status: crate::store::background::TaskStatus::Canceled,
             outcome: None,
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: chrono::Utc::now(),
             finished_at: Some(chrono::Utc::now()),
             announced_at: None,

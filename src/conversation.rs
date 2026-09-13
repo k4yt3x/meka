@@ -1123,7 +1123,7 @@ impl From<PromptRetention> for String {
 pub(crate) fn format_session_as_markdown(
     session_id: uuid::Uuid,
     events: &[Event],
-    tool_outputs: &std::collections::HashMap<String, String>,
+    scratchpad_entries: &std::collections::HashMap<String, String>,
 ) -> String {
     use std::fmt::Write;
 
@@ -1137,7 +1137,7 @@ pub(crate) fn format_session_as_markdown(
     for event in events {
         match event {
             Event::Append(message) => {
-                write_message_markdown(&mut output, message, tool_outputs);
+                write_message_markdown(&mut output, message, scratchpad_entries);
             }
             Event::CompactBoundary { summary, .. } => {
                 writeln!(output, "---\n").ok();
@@ -1182,7 +1182,7 @@ pub(crate) fn format_session_as_markdown(
                 )
                 .ok();
                 for message in messages {
-                    write_message_markdown(&mut output, message, tool_outputs);
+                    write_message_markdown(&mut output, message, scratchpad_entries);
                 }
                 writeln!(output, "</details>\n").ok();
             }
@@ -1195,7 +1195,7 @@ pub(crate) fn format_session_as_markdown(
 pub(crate) fn write_message_markdown(
     output: &mut String,
     message: &crate::conversation::Message,
-    tool_outputs: &std::collections::HashMap<String, String>,
+    scratchpad_entries: &std::collections::HashMap<String, String>,
 ) {
     use std::fmt::Write;
 
@@ -1221,7 +1221,7 @@ pub(crate) fn write_message_markdown(
                         writeln!(output, "<summary>{label}</summary>\n").ok();
                         let text =
                             crate::conversation::ContentBlock::tool_result_text_content(content);
-                        let text = resolve_large_output_tags(&text, tool_outputs);
+                        let text = resolve_large_output_tags(&text, scratchpad_entries);
                         writeln!(output, "```\n{text}\n```\n").ok();
                         writeln!(output, "</details>\n").ok();
                     }
@@ -1272,7 +1272,7 @@ pub(crate) fn write_message_markdown(
 /// Replace each `<large-output>` tag with the scratchpad entry it names, where one exists.
 pub(crate) fn resolve_large_output_tags(
     text: &str,
-    tool_outputs: &std::collections::HashMap<String, String>,
+    scratchpad_entries: &std::collections::HashMap<String, String>,
 ) -> String {
     let re = match regex::Regex::new(r#"<large-output name="([^"]+)"[^>]*>[\s\S]*?</large-output>"#)
     {
@@ -1282,7 +1282,7 @@ pub(crate) fn resolve_large_output_tags(
 
     re.replace_all(text, |caps: &regex::Captures| {
         let name = &caps[1];
-        match tool_outputs.get(name) {
+        match scratchpad_entries.get(name) {
             Some(content) => content.clone(),
             None => caps[0].to_string(),
         }

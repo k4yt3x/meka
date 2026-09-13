@@ -24,7 +24,7 @@ impl BackgroundStore {
     ) -> crate::error::Result<()> {
         let id = task.id.clone();
         let session_id = task.session_id.to_string();
-        let tool_name = task.tool_name.clone();
+        let tool = task.tool.clone();
         let label = task.label.clone();
         let status = task.status.name().to_string();
         let started_at = task.started_at.to_rfc3339();
@@ -33,9 +33,9 @@ impl BackgroundStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "INSERT INTO background_tasks \
-                     (id, session_id, tool_name, label, status, started_at) \
+                     (id, session_id, tool, label, status, started_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![id, session_id, tool_name, label, status, started_at],
+                    rusqlite::params![id, session_id, tool, label, status, started_at],
                 )?;
                 Ok(())
             })
@@ -55,7 +55,7 @@ impl BackgroundStore {
         id: &str,
         status: TaskStatus,
         outcome: Option<String>,
-        scratchpad_name: Option<String>,
+        scratchpad_entry: Option<String>,
     ) -> crate::error::Result<()> {
         let id = id.to_string();
         let status = status.name().to_string();
@@ -64,9 +64,9 @@ impl BackgroundStore {
             .call(move |connection| -> rusqlite::Result<_> {
                 connection.execute(
                     "UPDATE background_tasks \
-                     SET status = ?2, outcome = ?3, scratchpad_name = ?4, finished_at = ?5 \
+                     SET status = ?2, outcome = ?3, scratchpad_entry = ?4, finished_at = ?5 \
                      WHERE id = ?1 AND status = 'running'",
-                    rusqlite::params![id, status, outcome, scratchpad_name, finished_at],
+                    rusqlite::params![id, status, outcome, scratchpad_entry, finished_at],
                 )?;
                 Ok(())
             })
@@ -82,7 +82,7 @@ impl BackgroundStore {
         session_id: Uuid,
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
-            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+            "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
              started_at, finished_at, announced_at, delivered_at FROM background_tasks \
              WHERE session_id = ?1 ORDER BY started_at DESC",
             vec![session_id.to_string()],
@@ -97,7 +97,7 @@ impl BackgroundStore {
         session_id: Uuid,
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
-            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+            "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
              started_at, finished_at, announced_at, delivered_at FROM background_tasks \
              WHERE session_id = ?1 AND status = 'running' ORDER BY started_at ASC",
             vec![session_id.to_string()],
@@ -106,7 +106,7 @@ impl BackgroundStore {
     }
 
     /// A session's finished-but-unreported tasks, oldest first. The delivery poll's query; served
-    /// by `idx_background_tasks_session_status`.
+    /// by `idx_background_tasks_session_id_status`.
     ///
     /// This and [`Self::mark_background_tasks_delivered`] are two statements, not one transaction,
     /// so two processes that both list before either marks would each render the same outcome. That
@@ -119,7 +119,7 @@ impl BackgroundStore {
         session_id: Uuid,
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
-            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+            "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
              started_at, finished_at, announced_at, delivered_at FROM background_tasks \
              WHERE session_id = ?1 AND status != 'running' AND delivered_at IS NULL \
              ORDER BY finished_at ASC",
@@ -191,7 +191,7 @@ impl BackgroundStore {
         session_id: Uuid,
     ) -> crate::error::Result<Vec<BackgroundTask>> {
         self.query_background_tasks(
-            "SELECT id, session_id, tool_name, label, status, outcome, scratchpad_name, \
+            "SELECT id, session_id, tool, label, status, outcome, scratchpad_entry, \
              started_at, finished_at, announced_at, delivered_at FROM background_tasks \
              WHERE session_id = ?1 AND status != 'running' AND announced_at IS NULL \
              AND delivered_at IS NULL ORDER BY finished_at ASC",
@@ -311,11 +311,11 @@ impl BackgroundStore {
                         Ok(BackgroundTaskRow {
                             id: row.get(0)?,
                             session_id: row.get(1)?,
-                            tool_name: row.get(2)?,
+                            tool: row.get(2)?,
                             label: row.get(3)?,
                             status: row.get(4)?,
                             outcome: row.get(5)?,
-                            scratchpad_name: row.get(6)?,
+                            scratchpad_entry: row.get(6)?,
                             started_at: row.get(7)?,
                             finished_at: row.get(8)?,
                             announced_at: row.get(9)?,
@@ -348,11 +348,11 @@ impl BackgroundStore {
 pub(crate) struct BackgroundTaskRow {
     pub(crate) id: String,
     pub(crate) session_id: String,
-    pub(crate) tool_name: String,
+    pub(crate) tool: String,
     pub(crate) label: String,
     pub(crate) status: String,
     pub(crate) outcome: Option<String>,
-    pub(crate) scratchpad_name: Option<String>,
+    pub(crate) scratchpad_entry: Option<String>,
     pub(crate) started_at: String,
     pub(crate) finished_at: Option<String>,
     pub(crate) announced_at: Option<String>,
@@ -375,11 +375,11 @@ impl BackgroundTaskRow {
             id: self.id,
             session_id: Uuid::parse_str(&self.session_id)
                 .map_err(|error| format!("bad session id: {error}"))?,
-            tool_name: self.tool_name,
+            tool: self.tool,
             label: self.label,
             status: self.status.parse()?,
             outcome: self.outcome,
-            scratchpad_name: self.scratchpad_name,
+            scratchpad_entry: self.scratchpad_entry,
             started_at: parse_time(&self.started_at)?,
             finished_at: parse_optional(self.finished_at)?,
             announced_at: parse_optional(self.announced_at)?,
@@ -494,7 +494,7 @@ pub(crate) struct BackgroundTask {
     pub(crate) id: String,
     pub(crate) session_id: Uuid,
     /// The tool that was backgrounded, e.g. `execute_command`.
-    pub(crate) tool_name: String,
+    pub(crate) tool: String,
     /// Human-readable summary of what was started, from
     /// [`crate::tools::resolve_primary_param`]. Carried so `task_list` and the delivered turn can
     /// name the work without re-deriving it from arguments that are no longer around.
@@ -504,7 +504,7 @@ pub(crate) struct BackgroundTask {
     /// [`crate::background::OUTCOME_INLINE_LIMIT`] when it is also spilled to the scratchpad.
     pub(crate) outcome: Option<String>,
     /// Scratchpad entry holding the full output, when it was too large to carry inline.
-    pub(crate) scratchpad_name: Option<String>,
+    pub(crate) scratchpad_entry: Option<String>,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) finished_at: Option<DateTime<Utc>>,
     /// When subscribers were told, which is the poller's job and happens whether or not a session
@@ -538,11 +538,11 @@ mod tests {
         let task = crate::store::background::BackgroundTask {
             id: Uuid::new_v4().to_string(),
             session_id,
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: label.to_string(),
             status: crate::store::background::TaskStatus::Running,
             outcome: None,
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
             announced_at: None,
@@ -596,7 +596,7 @@ mod tests {
             crate::store::background::TaskStatus::Completed
         );
         assert_eq!(undelivered[0].outcome.as_deref(), Some("42 passed"));
-        assert_eq!(undelivered[0].scratchpad_name.as_deref(), Some("task_log"));
+        assert_eq!(undelivered[0].scratchpad_entry.as_deref(), Some("task_log"));
         assert!(undelivered[0].finished_at.is_some());
         assert!(
             store

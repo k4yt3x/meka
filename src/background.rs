@@ -325,7 +325,7 @@ fn render_outcomes_with_trailer(tasks: &[BackgroundTask], trailer: &str) -> Stri
             task.status.headline(),
             format_elapsed(task.elapsed()),
         ));
-        if let Some(name) = &task.scratchpad_name {
+        if let Some(name) = &task.scratchpad_entry {
             rendered.push_str(&format!(
                 "\nFull output is in scratchpad entry `{name}`; the beginning follows.\n"
             ));
@@ -410,11 +410,11 @@ mod tests {
         BackgroundTask {
             id: "7f3a1c22-0000-0000-0000-000000000000".to_string(),
             session_id: Uuid::nil(),
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: "cargo test --all".to_string(),
             status,
             outcome: outcome.map(str::to_string),
-            scratchpad_name: None,
+            scratchpad_entry: None,
             started_at: Utc::now() - chrono::Duration::seconds(90),
             finished_at: Some(Utc::now()),
             announced_at: None,
@@ -652,7 +652,7 @@ mod tests {
     #[test]
     fn spilled_outcome_names_its_entry() {
         let mut spilled = task(TaskStatus::Completed, Some("head of the log"));
-        spilled.scratchpad_name = Some("task_7f3a1c22_execute_command".to_string());
+        spilled.scratchpad_entry = Some("task_7f3a1c22_execute_command".to_string());
         let rendered = render_outcomes(&[spilled]);
         assert!(
             rendered.contains("task_7f3a1c22_execute_command"),
@@ -758,11 +758,11 @@ mod tests {
         let task = BackgroundTask {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: uuid::Uuid::new_v4(),
-            tool_name: "execute_command".to_string(),
+            tool: "execute_command".to_string(),
             label: "sleep 900".to_string(),
             status: TaskStatus::Canceled,
             outcome: None,
-            scratchpad_name: None,
+            scratchpad_entry: None,
             announced_at: None,
             started_at: chrono::Utc::now(),
             finished_at: Some(chrono::Utc::now()),

@@ -239,7 +239,7 @@ enabled = ["read", "unrestricted"]
     fn message_roles(&self) -> Vec<String> {
         self.read(|connection| {
             connection
-                .prepare("SELECT role FROM messages ORDER BY id ASC")?
+                .prepare("SELECT kind FROM messages ORDER BY id ASC")?
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect()
         })
@@ -725,7 +725,9 @@ fn two_servers_do_not_both_claim_one_scheduled_occurrence() {
 /// `ALTER TABLE ... ADD COLUMN` is not idempotent.
 ///
 /// The store is rewound to the shape a 0.42 release left, stamp included, so both processes find
-/// work waiting rather than racing over nothing.
+/// work waiting rather than racing over nothing. The rewind covers what the replay reads by name:
+/// the `provider_credentials` view, without which an unversioned store is classified past every
+/// step this test races, and the `messages` and `blobs` columns the frozen 0.46 conversions name.
 #[test]
 fn two_processes_migrating_one_store_apply_it_once() {
     let cluster = Cluster::new("");
@@ -740,6 +742,11 @@ fn two_processes_migrating_one_store_apply_it_once() {
                  ALTER TABLE scheduled_jobs DROP COLUMN attempts;
                  ALTER TABLE scheduled_jobs ADD COLUMN gate_command TEXT;
                  ALTER TABLE scheduled_jobs ADD COLUMN gate_fire TEXT;
+                 ALTER TABLE messages RENAME COLUMN kind TO role;
+                 ALTER TABLE blobs RENAME COLUMN size_bytes TO size;
+                 CREATE VIEW provider_credentials AS
+                     SELECT account AS profile, credentials_json, updated_at
+                     FROM account_credentials;
                  PRAGMA user_version = 1;",
             )
             .expect("rewind the store to the 0.42 shape");

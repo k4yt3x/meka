@@ -446,7 +446,7 @@ impl Tool for MemoryReadTool {
         // Age is stated on the way out, not just in the index: a memory is a point-in-time
         // observation, and detail that was true months ago is exactly what gets asserted as
         // current fact without a nudge.
-        let age = memory::render_age(entry.recorded_at, std::time::SystemTime::now());
+        let age = memory::render_age(entry.created_at, std::time::SystemTime::now());
         // Bounded, and said when it is: a truncated note the reader is not told about reads as a
         // complete one whose author simply stopped.
         let body = memory::render_for_model(entry.body.as_deref().unwrap_or_default());
@@ -810,10 +810,10 @@ fn render_hits(
     for hit in hits {
         let mut entry = String::new();
         entry.push_str(&format!(
-            "- **{}** (p{}, recorded {}, read {}x)\n",
+            "- **{}** (p{}, created {}, read {}x)\n",
             hit.name,
             hit.priority,
-            memory::render_age(hit.recorded, now),
+            memory::render_age(hit.created, now),
             hit.read_count
         ));
         // Elided, like every other rendered description: descriptions are unbounded at parse time,
@@ -906,10 +906,10 @@ fn render_fuzzy(
         // not bounded at parse time, and this is the tier that is explicitly "candidates, not
         // answers".
         let line = format!(
-            "- **{}** (p{}, recorded {}, read {}x): {}\n",
+            "- **{}** (p{}, created {}, read {}x): {}\n",
             entry.name,
             entry.priority,
-            memory::render_age(entry.recorded_at, now),
+            memory::render_age(entry.created_at, now),
             entry.read_count,
             crate::entry::elide_description_for_index(&memory::render_description_for_model(
                 &entry.description

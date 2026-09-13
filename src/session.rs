@@ -790,7 +790,7 @@ mod tests {
             "and so must the opaque reasoning, or the imported session cannot replay it",
         );
 
-        // Child events, stats, and tool_outputs are preserved.
+        // Child events, stats, and scratchpad_entries are preserved.
         assert_eq!(
             manager
                 .load_events(child_new.id)
@@ -965,7 +965,7 @@ mod tests {
                 "capabilities_json": null,
                 "stats": crate::stats::SessionStatsSnapshot::default(),
                 "events": [],
-                "tool_outputs": {},
+                "scratchpad_entries": {},
             }],
         });
         let export: SessionExport = serde_json::from_value(json).expect("deserialize");
@@ -1006,7 +1006,7 @@ mod tests {
                 "capabilities_json": null,
                 "stats": crate::stats::SessionStatsSnapshot::default(),
                 "events": [],
-                "tool_outputs": {},
+                "scratchpad_entries": {},
             }],
         });
         let export: SessionExport = serde_json::from_value(json).expect("deserialize");
@@ -1055,7 +1055,7 @@ mod tests {
                     "base_url_override": base_url,
                     "stats": crate::stats::SessionStatsSnapshot::default(),
                     "events": [],
-                    "tool_outputs": {},
+                    "scratchpad_entries": {},
                 }],
             })
         };
@@ -1115,7 +1115,7 @@ mod tests {
             profile: "test-profile".to_string(),
             stats: crate::stats::SessionStatsSnapshot::default(),
             events: Vec::new(),
-            tool_outputs: Vec::new(),
+            scratchpad_entries: Vec::new(),
         }];
         let imported_id = records[0].new_id;
         manager

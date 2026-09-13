@@ -358,11 +358,11 @@ pub(crate) struct MemoryDetail {
     /// says how heavily to weigh a note the model is already reasoning from.
     pub(crate) priority: u8,
     /// RFC 3339, when the row was last written, which a metadata-only edit moves; see
-    /// `recorded_at` for when the note was made.
+    /// `created_at` for when the note was made.
     pub(crate) updated_at: String,
-    /// RFC 3339, when the memory was recorded. Stamped once, at creation: the one the model is
+    /// RFC 3339, when the memory was created. Stamped once, at creation: the one the model is
     /// shown as an age, and the one ties are broken by.
-    pub(crate) recorded_at: String,
+    pub(crate) created_at: String,
     /// Lowercase labels for grouping and filtering.
     pub(crate) tags: Vec<String>,
     /// How many times the agent has recalled this memory through `memory_read`. Feeds search
@@ -381,7 +381,7 @@ impl MemoryDetail {
             description: memory.description.clone(),
             priority: memory.priority,
             updated_at: chrono::DateTime::<chrono::Utc>::from(memory.updated_at).to_rfc3339(),
-            recorded_at: chrono::DateTime::<chrono::Utc>::from(memory.recorded_at).to_rfc3339(),
+            created_at: chrono::DateTime::<chrono::Utc>::from(memory.created_at).to_rfc3339(),
             tags: memory.tags.clone(),
             read_count: memory.read_count,
             body,

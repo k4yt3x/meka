@@ -22,11 +22,20 @@
 //!
 //! **A migration must be safe to run twice.** `user_version` lives in the file header, and `sqlite3
 //! old.db .dump | sqlite3 new.db` drops it where plain `VACUUM` keeps it. Such a store is
-//! classified by shape, which can only answer "fresh" or "at the baseline", so every step after the
-//! baseline replays over data that already has it. [`gates_become_kind_and_spec`] guards each `ADD
-//! COLUMN` on the column's absence and returns early when `gate_command` is already gone; a plain
-//! `Step::Sql("ALTER TABLE … ADD COLUMN x")` in that position fails with `duplicate column name`
-//! and refuses the store on every start.
+//! classified by shape, which answers "fresh", "at the baseline", or "past the step that renamed
+//! things", so every step after that point replays over data that already has it.
+//! [`gates_become_kind_and_spec`] guards each `ADD COLUMN` on the column's absence and returns
+//! early when `gate_command` is already gone; a plain `Step::Sql("ALTER TABLE … ADD COLUMN x")` in
+//! that position fails with `duplicate column name` and refuses the store on every start.
+//!
+//! **A frozen step names objects by the names they had.**
+//! [`user_turns_carry_their_context_as_a_block`] reads `messages.role`, which
+//! [`names_follow_the_vocabulary`] later made `kind`, so replaying it over a renamed store fails on
+//! `no such column`. That is why [`classify_by_shape`] classifies a store the rename has reached
+//! past every step before it, by a marker the rename leaves, rather than at the baseline: the
+//! replay rule is kept by never starting the replay, since editing the frozen step is not
+//! available. A later step that renames or drops an object a frozen step names has to move the
+//! floor to a marker of its own.
 //!
 //! What is *not* banned elsewhere: guards against hand-editing, corruption and bugs. Those name no
 //! release and are equally true of a store created five minutes ago, so they stay where the data is
@@ -246,7 +255,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "sessions_record_their_context_tokens",
         step: Step::Rust(sessions_record_their_context_tokens),
     },
+    // Every object takes the name the vocabulary gives it, and two leftovers go: the
+    // `provider_credentials` view a frozen step kept for a replay, and a column nothing read.
+    Migration {
+        name: NAMES_FOLLOW_THE_VOCABULARY,
+        step: Step::Rust(names_follow_the_vocabulary),
+    },
 ];
+
+/// The step after which a store has no `provider_credentials` object, named once because
+/// [`classify_by_shape`] classifies such a store at the version this entry leaves it.
+const NAMES_FOLLOW_THE_VOCABULARY: &str = "names_follow_the_vocabulary";
 
 const PROMPT_HISTORY_0_46: &str = "CREATE TABLE IF NOT EXISTS prompt_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,6 +293,115 @@ fn sessions_record_their_context_tokens(
     Ok(())
 }
 
+/// Every object takes the name the vocabulary gives it, and two leftovers go.
+///
+/// `tool_outputs` becomes `scratchpad_entries`, the table of what every string and identifier
+/// already calls a scratchpad entry. `messages.role` becomes `kind`: four of its seven values
+/// (`user_blocks`, `tool_results`, `compact_boundary`, `repair`, `redact`) were never roles, and
+/// `kind` is what every other discriminator in the store is called. A column that names another
+/// object is named for the object, as `profile` and `account` already are: `background_tasks.tool`
+/// and `scratchpad_entry`, `mcp_credentials.server`. `blobs.size` becomes `size_bytes`, beside a
+/// column that is literally the bytes. The eight `stat_` counters on `sessions` lose a prefix
+/// nothing above the store ever used. The two indexes not named `idx_<table>_<columns>` are.
+///
+/// `memories.last_read_at` goes: written on every read and read by nothing. The
+/// `provider_credentials` view goes: [`credentials_belong_to_accounts`] kept it so the frozen
+/// [`sessions_name_their_provider`] could replay over a store that lost its `user_version`, and
+/// [`classify_by_shape`] now classifies a store without the view past that step instead, so no
+/// replay reaches the query.
+///
+/// Every rename is guarded on the name it converts from, so a replay finds nothing to do, and the
+/// index changes are `IF EXISTS` and `IF NOT EXISTS`. [`rename_column`] is not used: its
+/// both-present arm drops the old column, which is right for the two columns a frozen step puts
+/// back empty and wrong for every column here, where the old one would be the one with the data.
+fn names_follow_the_vocabulary(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let object_type = |name: &str| -> rusqlite::Result<Option<String>> {
+        let mut statement =
+            transaction.prepare("SELECT type FROM sqlite_master WHERE name = ?1 LIMIT 1")?;
+        let mut rows = statement.query([name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get::<_, String>(0)?)),
+            None => Ok(None),
+        }
+    };
+    if object_type("provider_credentials")?.as_deref() == Some("view") {
+        transaction.execute_batch("DROP VIEW provider_credentials")?;
+    }
+    if object_type("tool_outputs")?.as_deref() == Some("table")
+        && object_type("scratchpad_entries")?.is_none()
+    {
+        transaction.execute_batch("ALTER TABLE tool_outputs RENAME TO scratchpad_entries")?;
+    }
+    for (table, from, to) in [
+        ("messages", "role", "kind"),
+        ("background_tasks", "tool_name", "tool"),
+        ("background_tasks", "scratchpad_name", "scratchpad_entry"),
+        ("mcp_credentials", "server_name", "server"),
+        ("blobs", "size", "size_bytes"),
+        ("sessions", "stat_turns", "turns"),
+        ("sessions", "stat_input_tokens", "input_tokens"),
+        ("sessions", "stat_output_tokens", "output_tokens"),
+        (
+            "sessions",
+            "stat_cache_creation_input_tokens",
+            "cache_creation_input_tokens",
+        ),
+        (
+            "sessions",
+            "stat_cache_read_input_tokens",
+            "cache_read_input_tokens",
+        ),
+        ("sessions", "stat_redactions", "redactions"),
+        ("sessions", "stat_redacted_images", "redacted_images"),
+        ("sessions", "stat_redacted_bytes", "redacted_bytes"),
+    ] {
+        rename_column_once(transaction, table, from, to)?;
+    }
+    if table_has_column(transaction, "memories", "last_read_at")? {
+        transaction.execute_batch("ALTER TABLE memories DROP COLUMN last_read_at")?;
+    }
+    transaction.execute_batch(
+        "DROP INDEX IF EXISTS idx_background_tasks_session_status;
+         CREATE INDEX IF NOT EXISTS idx_background_tasks_session_id_status
+             ON background_tasks(session_id, status);
+         DROP INDEX IF EXISTS idx_memories_rank;
+         CREATE INDEX IF NOT EXISTS idx_memories_priority_created_at
+             ON memories(priority, created_at DESC);",
+    )?;
+    Ok(())
+}
+
+/// `ALTER TABLE … RENAME COLUMN`, only while the table has `from` and not `to`.
+///
+/// A table that has both is left as it is. [`rename_column`] drops `from` in that case because a
+/// frozen step puts its two columns back empty on a replay; no column this serves has such a
+/// step, so both present means a hand-edited store, and the old column is the one holding the
+/// data. Leaving it changes nothing, and the fingerprint check names the shape on the next open.
+fn rename_column_once(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    from: &str,
+    to: &str,
+) -> rusqlite::Result<()> {
+    if table_has_column(transaction, table, from)? && !table_has_column(transaction, table, to)? {
+        transaction.execute_batch(&format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}"))?;
+    }
+    Ok(())
+}
+
+fn table_has_column(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let count: i64 = transaction.query_row(
+        "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        [table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// What [`plan`] decided, and what [`apply`] will do about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -281,13 +409,21 @@ pub(crate) struct Plan {
     pub(crate) from: u32,
     /// The version it will be at once [`apply`] returns.
     pub(crate) head: u32,
+    /// Whether `from` was read off the store's shape rather than its `user_version`. Such a store
+    /// is stamped even when no step runs, so it is classified once and believed afterwards.
+    pub(crate) classified: bool,
 }
 
 impl Plan {
-    /// Whether anything would be written. The overwhelmingly common answer is `false`, and the
-    /// caller uses it to skip both the backup and the transaction rather than paying for a
-    /// no-op write on every process start.
+    /// Whether anything would be written: a step, or the version a classified store never had.
+    /// The overwhelmingly common answer is `false`, and the caller uses it to skip the
+    /// transaction rather than paying for a no-op write on every process start.
     pub(crate) fn has_work(&self) -> bool {
+        self.migrates() || self.classified
+    }
+
+    /// Whether a step runs, which is when the store is worth copying first.
+    pub(crate) fn migrates(&self) -> bool {
         self.from < self.head
     }
 }
@@ -311,7 +447,8 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
             head
         )));
     }
-    let from = if stored <= RETIRED_INITIALIZED_FLAG {
+    let classified = stored <= RETIRED_INITIALIZED_FLAG;
+    let from = if classified {
         classify_by_shape(connection)?
     } else {
         stored
@@ -339,7 +476,11 @@ pub(crate) fn plan(connection: &rusqlite::Connection) -> Result<Plan> {
             )));
         }
     }
-    Ok(Plan { from, head })
+    Ok(Plan {
+        from,
+        head,
+        classified,
+    })
 }
 
 /// Every table the ledger owns at head, which is what the fingerprint describes. Only these: a
@@ -359,13 +500,13 @@ const HEAD_TABLES: &[&str] = &[
     "messages",
     "prompt_history",
     "scheduled_jobs",
+    "scratchpad_entries",
     "sessions",
-    "tool_outputs",
 ];
 
 /// The shape of the schema at head, as [`schema_fingerprint`] computes it. Pinned by
 /// `the_head_schema_fingerprint_is_pinned`, so a new migration updates this alongside the ledger.
-const HEAD_SCHEMA_FINGERPRINT: u64 = 9_822_245_109_218_416_917;
+const HEAD_SCHEMA_FINGERPRINT: u64 = 13_283_620_546_103_602_683;
 
 /// A digest of every table's columns, independent of how the table came to have them.
 ///
@@ -447,10 +588,10 @@ const RETIRED_INITIALIZED_FLAG: u32 = 1;
 /// for the table changes `ALTER TABLE` cannot express (changing a column's type, adding or
 /// removing `NOT NULL`, changing a default, dropping a constraint) is to build a new table, copy,
 /// drop the old, and rename, and it requires enforcement off. With it on, `DROP TABLE sessions`
-/// cascades through `messages`, `tool_outputs`, `scheduled_jobs` and `background_tasks`, deleting
-/// the entire conversation history inside a transaction that then commits successfully, with the
-/// pragma reading `1` throughout because the attempt to turn it off inside the transaction is
-/// ignored. `PRAGMA defer_foreign_keys` does not help.
+/// cascades through `messages`, `scratchpad_entries`, `scheduled_jobs` and `background_tasks`,
+/// deleting the entire conversation history inside a transaction that then commits successfully,
+/// with the pragma reading `1` throughout because the attempt to turn it off inside the transaction
+/// is ignored. `PRAGMA defer_foreign_keys` does not help.
 ///
 /// No shipped step rebuilds a table, so this changes nothing today. It is here now because
 /// `apply`'s transaction boundary is itself a shipped decision: the first migration that needs a
@@ -722,7 +863,38 @@ fn classify_by_shape(connection: &rusqlite::Connection) -> Result<u32> {
             missing.join(", ")
         )));
     }
+    // A store with no `provider_credentials` object at all, table or view, has run
+    // `names_follow_the_vocabulary`, the one step that removes it: the baseline creates the table,
+    // the check above refuses a store without it, and every shape from
+    // `credentials_belong_to_accounts` up to that step carries the view. Such a store is
+    // classified there rather than at the baseline, because the steps before it name the columns
+    // that step renamed (`sessions_name_their_provider` reads the view, the 0.46 conversions read
+    // `messages.role`) and a replay over the renamed store fails on the first of them. Skipping
+    // them loses nothing: each is a guarded no-op over data it already converted. A later step
+    // that renames or drops an object a frozen step names must move this floor to a marker of its
+    // own; see the module docs.
+    let provider_credentials: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'provider_credentials'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            MekaError::Database(format!("failed to inspect the store's objects: {error}"))
+        })?;
+    if provider_credentials == 0 {
+        return version_after(NAMES_FOLLOW_THE_VOCABULARY);
+    }
     Ok(1)
+}
+
+/// The version a store is at once the named entry has run: its index in the ledger plus one.
+fn version_after(name: &str) -> Result<u32> {
+    MIGRATIONS
+        .iter()
+        .position(|migration| migration.name == name)
+        .map(|index| index as u32 + 1)
+        .ok_or_else(|| MekaError::Database(format!("no migration named '{name}' in the ledger")))
 }
 
 /// Every **table** [`BASELINE_0_42`] creates, by the name it appears under in `sqlite_master`.
@@ -753,12 +925,13 @@ const BASELINE_OBJECTS: &[&[&str]] = &[
     &["memories"],
     &["memories_fts"],
     &["messages"],
-    // Renamed by `credentials_belong_to_accounts`. The old name survives as a view, so a store at
-    // head answers to both; see that step for why.
+    // Renamed by `credentials_belong_to_accounts`, which left the old name as a view until
+    // `names_follow_the_vocabulary` dropped it; see both steps for why.
     &["provider_credentials", "account_credentials"],
     &["scheduled_jobs"],
     &["sessions"],
-    &["tool_outputs"],
+    // Renamed by `names_follow_the_vocabulary`.
+    &["tool_outputs", "scratchpad_entries"],
 ];
 
 fn table_columns(connection: &rusqlite::Connection, table: &str) -> Result<Vec<String>> {
@@ -1415,6 +1588,9 @@ fn sessions_record_their_profile(transaction: &rusqlite::Transaction<'_>) -> rus
 /// such table` and refuse to open on every start afterwards. The view answers the frozen query with
 /// the account names, which the replay of [`sessions_record_their_profile`] then discards along
 /// with the column they were stamped into.
+///
+/// [`names_follow_the_vocabulary`] drops the view again, and [`classify_by_shape`] classifies a
+/// store without it past the frozen step, so the replay this view served never reaches the query.
 fn credentials_belong_to_accounts(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     let object_type = |name: &str| -> rusqlite::Result<Option<String>> {
         let mut statement =
@@ -2474,6 +2650,7 @@ mod tests {
                 "sessions_record_their_context_tokens",
                 878754235509908731_u64,
             ),
+            ("names_follow_the_vocabulary", 13015232274362220399_u64),
         ];
         /// The text of the column-zero `fn name(` up to its closing brace, plus, in name order,
         /// every column-zero function it calls, recursively. What a Rust step does is its body and
@@ -2932,10 +3109,10 @@ mod tests {
             .expect("a message to carry forward");
     }
 
-    /// Every stored user message, as `(role, content)`, oldest first.
+    /// Every stored user message, as `(kind, content)`, oldest first.
     fn stored_messages(connection: &rusqlite::Connection) -> Vec<(String, String)> {
         let mut statement = connection
-            .prepare("SELECT role, content FROM messages ORDER BY id ASC")
+            .prepare("SELECT kind, content FROM messages ORDER BY id ASC")
             .expect("prepare");
         statement
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -3053,7 +3230,7 @@ mod tests {
         let hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         let (count, size, media_type): (i64, i64, String) = connection
             .query_row(
-                "SELECT count(*), max(size), max(media_type) FROM blobs",
+                "SELECT count(*), max(size_bytes), max(media_type) FROM blobs",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -3202,7 +3379,7 @@ mod tests {
             "idx_sessions_parent_session_id",
             "idx_scheduled_jobs_next_fire_at",
             "idx_scheduled_jobs_session_id",
-            "idx_memories_rank",
+            "idx_memories_priority_created_at",
         ] {
             assert!(names.iter().any(|n| n == renamed), "{renamed} should exist");
         }
@@ -3211,6 +3388,7 @@ mod tests {
             "idx_scheduled_jobs_next_fire",
             "idx_scheduled_jobs_session",
             "memories_rank",
+            "idx_memories_rank",
         ] {
             assert!(!names.iter().any(|n| n == gone), "{gone} should be renamed");
         }
@@ -3378,7 +3556,7 @@ mod tests {
         apply(&mut connection, plan, &Context::adopting(Some("p"))).expect("migrated");
 
         let mut statement = connection
-            .prepare("SELECT server_name, kind, secret, updated_at FROM mcp_credentials ORDER BY 1")
+            .prepare("SELECT server, kind, secret, updated_at FROM mcp_credentials ORDER BY 1")
             .expect("the new table exists");
         let rows: Vec<(String, String, String, String)> = statement
             .query_map([], |row| {
@@ -3434,7 +3612,7 @@ mod tests {
         // A secret acquired after the migration, of a kind the old table could not hold.
         connection
             .execute_batch(
-                "INSERT INTO mcp_credentials (server_name, kind, secret, updated_at) \
+                "INSERT INTO mcp_credentials (server, kind, secret, updated_at) \
                  VALUES ('docs', 'client_secret', 'cs-not-a-real-secret', '2026-02-01T00:00:00Z')",
             )
             .expect("a client secret beside the bundle");
@@ -3451,7 +3629,7 @@ mod tests {
         .expect("the replay must not fail");
 
         let kinds: Vec<String> = connection
-            .prepare("SELECT kind FROM mcp_credentials WHERE server_name = 'docs' ORDER BY 1")
+            .prepare("SELECT kind FROM mcp_credentials WHERE server = 'docs' ORDER BY 1")
             .expect("prepare")
             .query_map([], |row| row.get(0))
             .expect("query")
@@ -3494,7 +3672,7 @@ mod tests {
         apply(&mut connection, planned, &Context::adopting(Some("p"))).expect("repaired");
 
         let carried: Vec<(String, String, String)> = connection
-            .prepare("SELECT server_name, kind, secret FROM mcp_credentials")
+            .prepare("SELECT server, kind, secret FROM mcp_credentials")
             .expect("the table the broken build never created")
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .expect("query")
@@ -3970,10 +4148,15 @@ mod tests {
     /// Survivable only because `gates_become_kind_and_spec` guards each `ALTER TABLE` and returns
     /// early once `gate_command` is gone. This pins that, so the day a step is written without
     /// those guards it fails here rather than on a stranger's machine, permanently.
+    ///
+    /// Built at the shape before [`names_follow_the_vocabulary`], the last one that still carries
+    /// the `provider_credentials` view: a store without it is classified past every step here and
+    /// replays nothing, which `a_store_without_the_view_is_classified_past_the_step_that_reads_it`
+    /// covers.
     #[test]
     fn a_store_that_lost_its_version_replays_without_damage() {
-        let mut connection = connection_for_test();
-        create_for_test(&mut connection).expect("a store at head");
+        let mut connection = store_as_0_42_left_it();
+        stopped_before(&mut connection, NAMES_FOLLOW_THE_VOCABULARY);
         connection
             .execute(
                 "INSERT INTO sessions (id, created_at, updated_at) VALUES ('s', 'now', 'now')",
@@ -3988,7 +4171,8 @@ mod tests {
                 [r#"{"shell":{"command":"gh pr checks"},"when":"changed"}"#],
             )
             .expect("an already-converted job");
-        let before = fingerprint(&connection);
+        let mut reference = connection_for_test();
+        create_for_test(&mut reference).expect("a store at head");
 
         // What `.dump` into a fresh database leaves: the schema, the rows, and no version.
         connection
@@ -4002,7 +4186,11 @@ mod tests {
         );
         apply(&mut connection, replayed, &Context::default()).expect("the replay must not fail");
 
-        assert_eq!(before, fingerprint(&connection), "the schema is unchanged");
+        assert_eq!(
+            fingerprint(&reference),
+            fingerprint(&connection),
+            "the replay carries the store to head"
+        );
         let (kind, spec) = gate_of(&connection, "j");
         assert_eq!(kind.as_deref(), Some("shell"));
         assert_eq!(
@@ -4485,5 +4673,148 @@ mod tests {
             .execute(BACKGROUND_TASKS_CANCELED, [])
             .expect("safe to run twice");
         assert_eq!(rewritten, 0, "a replay finds nothing left to rewrite");
+    }
+
+    /// The rename step's every door, once forward and once replayed.
+    #[test]
+    fn the_vocabulary_names_land_and_replay_as_a_no_op() {
+        fn columns(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
+            connection
+                .prepare("SELECT name FROM pragma_table_info(?1)")
+                .expect("prepare")
+                .query_map([table], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        }
+        fn objects(connection: &rusqlite::Connection) -> Vec<String> {
+            connection
+                .prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY 1")
+                .expect("prepare")
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        }
+        let mut connection = store_as_0_42_left_it();
+        plant_session(&connection, "s");
+        plant_message(&connection, "s", "user", "hello");
+        connection
+            .execute_batch(
+                "INSERT INTO tool_outputs (session_id, name, content, created_at) \
+                     VALUES ('s', 'out', 'c', 'now');
+                 INSERT INTO background_tasks \
+                     (id, session_id, tool_name, label, status, scratchpad_name, started_at) \
+                     VALUES ('t', 's', 'execute_command', 'l', 'completed', 'out', 'now');
+                 INSERT INTO mcp_oauth_credentials (server_name, credentials_json, updated_at) \
+                     VALUES ('docs', '{}', 'now');
+                 INSERT INTO memories (name, description, recorded_at, updated_at, last_read_at) \
+                     VALUES ('n', 'd', 'now', 'now', 'now');
+                 UPDATE sessions SET stat_turns = 3 WHERE id = 's';",
+            )
+            .expect("rows in every renamed table");
+        let first = plan(&connection).expect("classified");
+        apply(&mut connection, first, &Context::adopting(Some("p"))).expect("migrated");
+
+        let names = objects(&connection);
+        for gone in [
+            "provider_credentials",
+            "tool_outputs",
+            "idx_memories_rank",
+            "idx_background_tasks_session_status",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == gone),
+                "{gone} should be gone"
+            );
+        }
+        for present in [
+            "scratchpad_entries",
+            "idx_memories_priority_created_at",
+            "idx_background_tasks_session_id_status",
+        ] {
+            assert!(
+                names.iter().any(|name| name == present),
+                "{present} should exist"
+            );
+        }
+        assert!(columns(&connection, "messages").contains(&"kind".to_string()));
+        assert!(!columns(&connection, "messages").contains(&"role".to_string()));
+        assert!(!columns(&connection, "memories").contains(&"last_read_at".to_string()));
+        let sessions = columns(&connection, "sessions");
+        assert!(
+            !sessions.iter().any(|column| column.starts_with("stat_")),
+            "{sessions:?}"
+        );
+        assert!(columns(&connection, "blobs").contains(&"size_bytes".to_string()));
+        let (kind, content): (String, String) = connection
+            .query_row("SELECT kind, content FROM messages", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("the message row");
+        assert_eq!((kind.as_str(), content.as_str()), ("user", "hello"));
+        let (tool, entry): (String, String) = connection
+            .query_row(
+                "SELECT tool, scratchpad_entry FROM background_tasks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the task row");
+        assert_eq!((tool.as_str(), entry.as_str()), ("execute_command", "out"));
+        let server: String = connection
+            .query_row("SELECT server FROM mcp_credentials", [], |row| row.get(0))
+            .expect("the credential row");
+        assert_eq!(server, "docs");
+        let turns: i64 = connection
+            .query_row("SELECT turns FROM sessions WHERE id = 's'", [], |row| {
+                row.get(0)
+            })
+            .expect("the counter");
+        assert_eq!(turns, 3);
+        let entry: String = connection
+            .query_row("SELECT name FROM scratchpad_entries", [], |row| row.get(0))
+            .expect("the entry row");
+        assert_eq!(entry, "out");
+        let after = fingerprint(&connection);
+
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("the round trip that drops the version");
+        let replayed = plan(&connection).expect("classified by shape");
+        apply(&mut connection, replayed, &Context::adopting(Some("p")))
+            .expect("the replay must not fail");
+        assert_eq!(
+            after,
+            fingerprint(&connection),
+            "a replay finds nothing left to rename"
+        );
+    }
+
+    /// The reason the `provider_credentials` view could go. The frozen
+    /// `sessions_name_their_provider` reads that name when no default profile resolves, and a
+    /// replay from the baseline would reach it; a store without the view is classified past it
+    /// instead, so the replay never starts.
+    #[test]
+    fn a_store_without_the_view_is_classified_past_the_step_that_reads_it() {
+        let mut connection = connection_for_test();
+        create_for_test(&mut connection).expect("a store at head");
+        let before = fingerprint(&connection);
+        connection
+            .execute_batch("PRAGMA user_version = 0;")
+            .expect("lose the version");
+
+        let replayed = plan(&connection).expect("classified by shape");
+        assert_eq!(
+            replayed.from,
+            MIGRATIONS.len() as u32,
+            "no `provider_credentials` object means the rename step has run"
+        );
+        apply(&mut connection, replayed, &Context::adopting(None))
+            .expect("nothing replays, so nothing queries the view");
+        assert_eq!(before, fingerprint(&connection));
+        assert_eq!(
+            user_version(&connection).expect("version"),
+            MIGRATIONS.len() as u32
+        );
     }
 }

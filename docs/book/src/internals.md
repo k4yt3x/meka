@@ -118,21 +118,21 @@ A host admits the turn, the agent runs it, and everything the user sees comes ba
 
 Non-secret settings live in `config.toml`. Secrets live in the store. Environment variables are
 operational only. The store is one SQLite file, `meka.db` under `MEKA_DATA_DIR`, opened by `Store`,
-and its shape is whatever the migration ledger says it is: nineteen entries today, so a current store
-reads `PRAGMA user_version = 19`, and `HEAD_SCHEMA_FINGERPRINT` in `store/migrations.rs` pins the
-columns of the eleven tables in `HEAD_TABLES`. The last entry, `background_tasks_spell_canceled_with_one_l`, rewrites a task status an earlier meka stored as `cancelled` to the `canceled` the reader accepts. Before it, `root_rows_take_the_default_level_once_the_config_reads` stamps `[permissions].default` on a root row that still records no level and refuses to migrate while `config.toml` cannot be read, so the store keeps its shape until the file reads.
+and its shape is whatever the migration ledger says it is: twenty-one entries today, so a current store
+reads `PRAGMA user_version = 21`, and `HEAD_SCHEMA_FINGERPRINT` in `store/migrations.rs` pins the
+columns of the eleven tables in `HEAD_TABLES`. The last entry, `names_follow_the_vocabulary`, gives every table, column and index the name the vocabulary uses and drops the `provider_credentials` view and a column nothing read. That view existed for one replay: the frozen `sessions_name_their_provider` reads the name when no default profile resolves, so `classify_by_shape` classifies a store that lost its `user_version` and has no such view at the version this entry leaves it, past that step, rather than at the baseline. Before it, `sessions_record_their_context_tokens` adds the occupancy a resume checks its first turn against, `background_tasks_spell_canceled_with_one_l` rewrites a task status an earlier meka stored as `cancelled`, and `root_rows_take_the_default_level_once_the_config_reads` stamps `[permissions].default` on a root row that still records no level and refuses to migrate while `config.toml` cannot be read.
 
 | Table | Owner | Columns and indexes |
 |-------|-------|---------------------|
-| `sessions` | `store/sessions.rs` | `id`, `created_at`, `updated_at`, `parent_session_id`, `cwd`, `permission`, `approvals`, `profile`, `capabilities_json`, `token_id`, `additional_roots_json`, `subagent_spec_json`, the `stat_*` counters. `idx_sessions_updated_at`, `idx_sessions_parent_session_id`. |
-| `messages` | `store/sessions.rs` | `id`, `session_id`, `role`, `content`, `created_at`. `idx_messages_session_id`. |
-| `account_credentials` | `store/credentials.rs` | `account`, `credentials_json`, `updated_at`. The `credentials_belong_to_accounts` step leaves a `provider_credentials` view over it, not for any reader but for the frozen `sessions_name_their_provider` step, which queries that name and would fail a replay on a store that lost its `user_version`. |
-| `mcp_credentials` | `store/credentials.rs` | `server_name`, `kind`, `secret`, `updated_at`; keyed by `(server_name, kind)`, so a client secret and its refreshable bundle coexist. |
-| `blobs`, `message_blobs` | `store/blobs.rs` | `hash`, `media_type`, `bytes`, `size`, `created_at`; and `message_id`, `hash` for which message rows reference a blob. `idx_message_blobs_hash`. |
-| `tool_outputs` | `store/scratchpad.rs` | Scratchpad entries: `session_id`, `name`, `content`, `created_at`. The table keeps its old name. |
+| `sessions` | `store/sessions.rs` | `id`, `created_at`, `updated_at`, `parent_session_id`, `cwd`, `permission`, `approvals`, `profile`, `capabilities_json`, `token_id`, `additional_roots_json`, `subagent_spec_json`, `context_tokens`, and the eight cumulative counters `turns`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `redactions`, `redacted_images`, `redacted_bytes`. `idx_sessions_updated_at`, `idx_sessions_parent_session_id`. |
+| `messages` | `store/sessions.rs` | `id`, `session_id`, `kind`, `content`, `created_at`. `idx_messages_session_id`. |
+| `account_credentials` | `store/credentials.rs` | `account`, `credentials_json`, `updated_at`. |
+| `mcp_credentials` | `store/credentials.rs` | `server`, `kind`, `secret`, `updated_at`; keyed by `(server, kind)`, so a client secret and its refreshable bundle coexist. |
+| `blobs`, `message_blobs` | `store/blobs.rs` | `hash`, `media_type`, `bytes`, `size_bytes`, `created_at`; and `message_id`, `hash` for which message rows reference a blob. `idx_message_blobs_hash`. |
+| `scratchpad_entries` | `store/scratchpad.rs` | `session_id`, `name`, `content`, `created_at`. |
 | `scheduled_jobs` | `store/schedule.rs` | `id`, `session_id`, `kind`, `spec`, `prompt`, `gate_kind`, `gate_spec_json`, `gate_last_output`, `gate_permission`, `claimed_by`, `claim_expires_at`, `attempts`, `created_at`, `last_fired_at`, `next_fire_at`. `idx_scheduled_jobs_next_fire_at`, `idx_scheduled_jobs_session_id`. |
-| `background_tasks` | `store/background.rs` | `id`, `session_id`, `tool_name`, `label`, `status`, `outcome`, `scratchpad_name`, `started_at`, `finished_at`, `announced_at`, `delivered_at`. `idx_background_tasks_session_status`. |
-| `memories`, `memories_fts` | `store/memory.rs` | `id`, `name`, `description`, `tags`, `body`, `priority`, `created_at`, `updated_at`, `read_count`, `last_read_at`. `idx_memories_rank`. The FTS index and its triggers are rebuilt to this build's definition by `reconcile_index` on every open, so they are outside the ledger's fingerprint. |
+| `background_tasks` | `store/background.rs` | `id`, `session_id`, `tool`, `label`, `status`, `outcome`, `scratchpad_entry`, `started_at`, `finished_at`, `announced_at`, `delivered_at`. `idx_background_tasks_session_id_status`. |
+| `memories`, `memories_fts` | `store/memory.rs` | `id`, `name`, `description`, `tags`, `body`, `priority`, `created_at`, `updated_at`, `read_count`. `idx_memories_priority_created_at`. The FTS index and its triggers are rebuilt to this build's definition by `reconcile_index` on every open, so they are outside the ledger's fingerprint. |
 | `prompt_history` | `store/history.rs` | The REPL's input history: `id`, `command_line`, `created_at`. |
 
 Per-process state that is not a table has an owner too: the scheduler's memory of which refusals it
