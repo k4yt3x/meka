@@ -18,9 +18,22 @@ Those editors only reach the keys they own, so a bad key anywhere else (`[sessio
 
 Set the `MEKA_CONFIG_DIR` environment variable to override the default location entirely. The value points at the `meka` directory itself (contains `config.toml` and `skills/`). Useful for tests, portable installs, and isolating a per-project config from your global one.
 
-Everything meka keeps in that directory is content you put there: `config.toml`, `skills/`, and `instructions.md` or `instructions/` if you use them. It is safe to keep under version control. Commands that edit the config take a cross-process lock on the directory itself, as does claiming a skill store, so neither leaves a lock file behind; a write is published by renaming a short-lived `config.toml.<pid>.<seq>.tmp` over the target, so that name can appear for the duration of one write. If you are upgrading from a version that wrote `.config.toml.lock`, or `.meka-store.lock` inside a skill store, delete them: nothing reads or writes them any more.
+The directory holds two more things that are not config keys. Standing instructions live at a conventional path beside the file, because prose long enough to be worth writing is miserable to maintain inside a TOML string, and skills have a directory of their own:
+
+```
+~/.config/meka/
+├── config.toml
+├── instructions.md      # or instructions/*.md
+└── skills/
+```
+
+Write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## User Instructions` section of the system prompt; see [Instructions](../usage/instructions.md). To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`.
+
+Everything in that directory is content you put there, so it is safe to keep under version control. Commands that edit the config take a cross-process lock on the directory itself, as does claiming a skill store, so neither leaves a lock file behind; a write is published by renaming a short-lived `config.toml.<pid>.<seq>.tmp` over the target, so that name can appear for the duration of one write. If you are upgrading from a version that wrote `.config.toml.lock`, or `.meka-store.lock` inside a skill store, delete them: nothing reads or writes them any more.
 
 Windows still writes both, because its file locks are mandatory rather than advisory: a lock held on `config.toml` would make the file unreadable to the command holding it, and `LockFileEx` refuses a directory handle outright. If you keep a meka config directory under version control on Windows, ignore `.config.toml.lock` and `skills/.meka-store.lock`.
+
+The sections below are in the order a file is best written in: the blocks with many entries first (`default_profile`, accounts, profiles, MCP servers), then each single table from the most to the least consequential, and `[serve]` last.
 
 ## Accounts and profiles
 
@@ -544,527 +557,6 @@ $ meka profile add sonnet --account openrouter --model anthropic/claude-sonnet-4
 $ meka profile add gpt --account openrouter --model openai/gpt-5.6-sol
 ```
 
-## `[display]`
-
-Settings for output formatting.
-
-### `display.render_mode`
-
-Output render mode. Equivalent to the `--render-mode` CLI flag.
-
-| Value | Description |
-|-------|-------------|
-| `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed |
-| `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colors as `syntect`, and code blocks are highlighted by it. The default |
-| `raw` | Raw markdown printed verbatim with aligned tables |
-
-Default: `termimad`
-
-Reflowing only happens when there is a terminal to reflow to. With output redirected or piped,
-`termimad` renders without wrapping, so a captured answer is not hard-wrapped to some fallback
-width.
-
-```toml
-[display]
-render_mode = "raw"
-```
-
-### `display.max_width`
-
-Widest line meka composes from model output, in terminal columns.
-
-Default: unset, meaning the terminal's own width, so nothing ever wraps.
-
-Set it to pin the width instead:
-
-```toml
-[display]
-max_width = 120
-```
-
-A set value is honored exactly rather than clamped to the terminal, because pinning it is how you
-get identical output across machines and a silent clamp would take that away on the narrow one. The
-cost is that a value wider than your terminal wraps, and a wrapped row starts at column zero, where
-meka's own output lives. Below 40 columns the value is clamped up and a warning is logged: every
-budget subtracts fixed chrome first, and below roughly that the subtraction leaves nothing. Above
-1000 it is clamped down, also with a warning, since no terminal is that wide and the value is far
-more likely to be a typo than a request.
-
-This covers meka's own output: tool indicators and their argument block, thinking previews, todo
-lists, and the approval prompt. Assistant markdown is not affected and keeps reflowing to the
-real terminal through [`display.render_mode`](#displayrender_mode). With output piped there is no
-terminal to measure, so an unset width falls back to 100 columns and a captured run stays byte-stable.
-
-A terminal narrower than 20 columns is treated as 20. That is not a legibility judgment: the
-thinking block's own prefix is twelve columns, so below roughly that meka's chrome no longer fits and
-the width stops meaning anything. Such a terminal wraps meka's output whatever the number says.
-
-### `display.tool_params`
-
-How much of a tool call's input the `[tool ...]` indicator shows.
-
-This setting covers the indicator only. With approvals on, the approval prompt always shows every
-argument, whatever this is set to: the indicator is a notification, the prompt is a decision,
-and setting `off` for a quiet scrollback must not leave you approving calls you cannot see.
-
-| Value | Description |
-|-------|-------------|
-| `off` | Name only: `[tool execute_command]`. No argument reaches your terminal |
-| `summary` | Name plus the one argument that identifies the call: ``[tool execute_command(`cargo test`)]`` (default) |
-| `full` | Every argument, as an indented block under the name |
-
-Default: `summary`
-
-`full` writes each parameter on its own line. A value that fits on a line follows its key; one that
-does not gets an indented block under a bare `key:`, so a multi-line `edit_file` argument stays
-readable instead of collapsing into escaped newlines. Nesting is carried by indentation, with `-`
-for array elements:
-
-```
-[tool edit_file]
-  path: src/render.rs
-  old_string:
-    let first_line = thinking.lines().next().unwrap_or("");
-    let truncated = truncate_display(first_line, 80);
-
-[tool agent_spawn]
-  prompt: Audit the scheduler for missed-occurrence bugs
-  tools:
-    - read_file
-    - search_contents
-```
-
-Consecutive calls are separated by a blank line under `full`, since each one is a block and running
-them together reads as a single call with too many parameters. Under `summary` they stay flush, which
-is what makes a run of them read as a list of steps.
-
-This is a reading format, not a data format: quotes are dropped, so `timeout: 300` doesn't say
-whether the model sent `300` or `"300"`. Four caps keep one call from filling the screen, and each
-says what it hid:
-
-| Cap | Limit | Marker |
-|-----|-------|--------|
-| One argument's value | 30 lines | `... N more lines`, indented under that argument |
-| One argument's rows | 32 rows | `... N more rows`, indented under that argument |
-| The block | 60 rows, checked at an argument boundary | `... N more arguments: name, name` |
-| One line | [`display.max_width`](#displaymax_width) | `...` at the cut |
-
-The first two caps look redundant and are not. A string value has lines to count, so it is trimmed
-by line and the marker counts lines. An array or an object has none: it fans out one row per element,
-so it needs a bound counted in rows, and the marker says rows rather than pretending they were lines.
-
-The line cap is exact, brackets and indentation included. The block cap is not: it is checked before
-an argument is rendered rather than after, so the block reaches at most the block cap plus one
-argument's own budget plus the line naming what went: 93 rows.
-
-The block cap drops whole arguments and names them rather than cutting wherever row 60 lands.
-Knowing that `path` was passed but not shown beats seeing 60 rows of `content` and never learning
-which file it was written to.
-
-**A cut keeps the end.** Where a whole argument is dropped it is named; where rows are dropped the
-last one is kept, so a long array still shows its final element and a trimmed value still shows how
-it finishes. The reasoning is the same one that elides a long path from its middle rather than its
-tail: the end of a thing too big to show is usually the half that identifies it.
-
-When you need the exact JSON a tool was called with, `meka session export` has it, untruncated and
-unflattened.
-
-**`full` puts every argument on screen, secrets included.** `summary` shows only the one argument
-that identifies a call (`write_file`'s path, `fetch_url`'s URL), so a request header carrying a token
-or a file body carrying a key stayed off screen. `full` shows all of them, and replayed history
-reprints them on every `/history` and every resume. meka never puts its own credentials into tool
-arguments, so what appears is what the model itself passed, but that is worth knowing before turning
-this on where somebody can read over your shoulder or your scrollback.
-
-Values are escape-stripped, their newlines and carriage returns flattened, and Unicode format
-characters (bidi overrides, soft hyphens, zero-width joiners) removed, so an argument cannot move
-your cursor, reorder what you read, or place text at column zero where meka's own output lives.
-
-No line exceeds [`display.max_width`](#displaymax_width), so by default nothing wraps and no row ever
-begins with model text. Setting `max_width` wider than your terminal gives that up, which is the one
-case where a long argument can still produce a row starting flush left.
-
-One residual caveat: the `... N more lines`, `... N more rows` and `... N more arguments` markers are
-ordinary text, so an argument whose content mimics one is indistinguishable from a real elision. That
-does not let an argument run anything, but it can mislead a reader who is not expecting it.
-
-Applies to the REPL, to one-shot runs (`meka --oneshot`), and to replayed history (`/history`,
-`resume_show_recent`). ACP sends structured tool-call fields to the editor and the HTTP API's SSE
-events already carry the raw input, so neither is affected.
-
-```toml
-[display]
-tool_params = "full"
-```
-
-### `display.show_session_id_on_create`
-
-Whether to display the session id when a new session is created.
-
-Default: `false`
-
-### `display.show_session_id_on_resume`
-
-Whether to display the session id when a session is resumed with `-c` or `-r`.
-
-Default: `true`
-
-### `display.show_session_id_on_exit`
-
-Whether to display the session id when meka exits.
-
-Default: `true`
-
-```toml
-[display]
-show_session_id_on_create = true
-show_session_id_on_resume = false
-show_session_id_on_exit = false
-```
-
-### `display.show_path_in_prompt`
-
-Whether to show the current working directory in the interactive prompt.
-
-Default: `true`
-
-### `display.show_context_in_prompt`
-
-Whether to show a live context-window gauge in the interactive prompt, e.g. `128.4k/1.0M 13%` (tokens in context / model window / percent used). The figure comes from the most recent turn's reported usage (and an estimate right after `/compact` or on resume), the same value `/status` shows on its `Context:` line. Hidden until the first turn produces a measurement.
-
-Default: `false`
-
-### `display.newline_before_prompt`
-
-Whether to add a blank line before the prompt, after whatever the previous line produced.
-
-Default: `true`
-
-### `display.newline_after_prompt`
-
-Whether to add a blank line after the line you typed, before its output. On a resume there is no typed line: the `Resuming session:` banner takes its place, and this is the blank between that banner and whatever follows it, normally the replayed history. With the banner hidden, the history sits directly under your shell's command line.
-
-Default: `true`
-
-Both apply to **anything printed between two prompts**, not only agent responses. That span is the
-unit, whatever filled it: a turn, a slash command's output (`/task`, `/memory`, `/help`, …), an
-error, a scheduled job waking the shell to run several turns at once, or any combination. It is
-bracketed once, by whichever of those printed first and last, never once per turn inside it, and
-never twice because two things both thought they owned the spacing.
-
-Both space output away from *meka's* prompt, so neither applies at the edges of a run, where the
-prompt is your shell's. Whatever meka prints before drawing its first prompt sits directly under the
-command you typed (`Resuming session:` on a resume, or the answer to a prompt you passed on the
-command line), and its last line is followed straight by the shell prompt. Start meka with no
-prompt and there is nothing above its first prompt to space away from, so the rule never comes up.
-
-The blank lines bracket output, so **a span that prints nothing gets neither**, and leaves the
-screen exactly as it found it. In practice every slash command says something, even if only that a
-list is empty. Three cases where nothing is printed and nothing is spaced: a successful `/cd`,
-because the prompt itself is the confirmation; a successful `/clear`, because the cleared screen is;
-and a scheduled wake that finds nothing left to run. `!command` is the one exception in the other
-direction: it is always bracketed, because meka hands the terminal to the child process and never
-learns whether it wrote anything, so a silent `!touch file` still gets its blank lines.
-
-Turning a setting off removes that blank line and nothing else. The spacing *between* blocks of a
-single response (a tool indicator and the answer that follows it, or a thinking block and the text
-after it) is not controlled by either flag and does not change.
-
-### `display.show_token_usage`
-
-When `true`, meka prints a one-line per-turn token-usage summary to stderr after each turn:
-
-```
-[in 12.3k / cache hit 96% / out 1.2k]
-```
-
-The `in` column is the total of all three Anthropic input tiers (live, cache-write, cache-read); `cache hit %` is `cache_read / total_in`. Useful for monitoring caching effectiveness during long sessions. The `/status` slash command surfaces cumulative session stats in the same vein.
-
-Default: `false`
-
-### `display.stream`
-
-Whether the answer streams to the terminal as it arrives, or lands whole when the turn ends. The
-`--no-stream` flag turns streaming off for one run; this key is the standing preference, and it
-applies to sub-agents as well.
-
-Default: `true`
-
-```toml
-[display]
-stream = false
-```
-
-### `display.resume_show_recent`
-
-When set to a positive integer `N`, resuming a session reprints the **last `N` turns** (each turn = the user's prompt plus everything the agent did in response, styled to match the live REPL) instead of just the last assistant message.
-
-Useful when you regularly resume long-running sessions and want more context than the single-message default. Inside a session, the `/history` slash command provides the same rendering on demand (`/history` dumps everything; `/history N` shows the last N turns).
-
-Default: unset (resume reprints only the last assistant message, today's behavior).
-
-```toml
-[display]
-resume_show_recent = 3
-```
-
-### `display.input_style`
-
-Visual style applied to a REPL prompt once it is submitted. Makes past prompts easy to spot when scrolling back through a long session. A line still being edited keeps the terminal's own colors; the style arrives on reedline's final paint, which is the one that lands in scrollback.
-
-The leading `/command` token is a separate signal and is colored as you type, green when meka recognizes the command and red when it does not. This setting does not affect it.
-
-Accepted values:
-- `default` (or unset): bold white-ish foreground on a slate-blue background, rendered in truecolor RGB so it looks the same across terminal themes.
-- `none`: disable styling entirely.
-- `reverse`: reverse video (swaps the terminal's current foreground and background).
-- `bold`, `dim`, `italic`, `underline`: single attribute, no color change.
-- A color name (`black`, `red`, `green`, `yellow`, `blue`, `magenta` / `purple`, `cyan`, `white`): set only the foreground, mapped to the terminal's palette.
-
-Unknown values warn at startup and fall back to `default`.
-
-Default: the banner preset described above.
-
-```toml
-[display]
-show_path_in_prompt = false
-newline_before_prompt = false
-newline_after_prompt = false
-input_style = "none"    # or "cyan", "bold", "dim", etc.
-```
-
-## `[web]`
-
-Settings for the HTTP client `fetch_url` uses. All keys are optional; unset fields use the defaults shown below.
-
-| Key | Type | Default | Purpose |
-|---|---|---|---|
-| `user_agent` | string | Real Chrome UA | Some sites block non-browser UAs. Override if you need a specific identifier. |
-| `request_timeout` | duration | `"30s"` | Total request budget (connect + TLS + read). `"0s"` is refused at startup. |
-| `connect_timeout` | duration | unset | Separate cap on TCP + TLS handshake. Fail fast on unreachable hosts without shortening the whole request budget. `"0s"` is refused at startup. |
-| `read_timeout` | duration | unset | Per-chunk idle timeout. Catches bodies that stall mid-stream. `"0s"` is refused at startup. |
-| `max_redirects` | int | `10` | Cap on 3xx hops. `0` means no redirects are followed: a 3xx is returned as the response. |
-| `proxy` | string | unset (honors `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` env) | Proxy URL. Schemes: `http://`, `https://`, `socks5://`, `socks5h://`, `socks4://`. The literal string `"none"` explicitly disables env-var auto-detection. |
-| `ca_cert_file` | path | unset | Extra PEM bundle to trust on top of the system store. Useful for corporate MITM proxies or self-signed internal services. Accepts single-cert and multi-cert files. |
-| `https_only` | bool | `false` | Refuse plain `http://` URLs. |
-| `min_tls_version` | string | unset (reqwest default) | Minimum TLS version. Accepts `"1.0"`, `"1.1"`, `"1.2"`, `"1.3"`. Unknown values log a warning and fall through. Note: the bundled rustls backend supports only TLS 1.2 and 1.3; `"1.0"` / `"1.1"` will surface a build error. |
-| `danger_accept_invalid_certs` | bool | `false` | **DANGEROUS.** Disable TLS certificate validation entirely. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
-| `danger_accept_invalid_hostnames` | bool | `false` | **DANGEROUS.** Accept certificates whose hostname doesn't match. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
-
-### Example: corporate proxy with a private CA
-
-```toml
-[web]
-proxy = "http://corp-proxy.internal:3128"
-ca_cert_file = "/etc/ssl/corp-root-ca.pem"
-min_tls_version = "1.2"
-request_timeout = "60s"
-```
-
-### Example: local testing against self-signed certs
-
-```toml
-[web]
-# Route everything through a local SOCKS proxy you control.
-proxy = "socks5h://127.0.0.1:1080"
-# Accept self-signed certs on dev.local, KEEP THIS OFF IN PROD.
-danger_accept_invalid_certs = true
-```
-
-### Example: fail-fast timeouts
-
-```toml
-[web]
-request_timeout = "5s"
-connect_timeout = "2s"
-max_redirects = 0
-```
-
-## `[shell]`
-
-Settings for shell command execution.
-
-### `shell.sandbox`
-
-Whether to enable read-only filesystem sandboxing for shell commands at `read`. When enabled (default), shell commands can be executed at `read` and `workspace` but with the filesystem write-protected outside the workspace roots. When disabled, shell commands require `unrestricted`.
-
-Default: `true`
-
-```toml
-[shell]
-sandbox = false  # disable the sandboxed shell at read
-```
-
-The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
-
-### `shell.sandbox_backend`
-
-Linux-only choice between `"landlock"` and `"bubblewrap"`:
-
-- **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
-- **Landlock** (`"landlock"`) uses the Landlock LSM to block filesystem writes, and requires **ABI v3 (kernel 6.2+)**: below that `truncate(2)` is unmediated, so a command at `read` could still empty a file, and meka reports the backend unusable instead. On kernel 7.1+ (ABI v9) it also blocks `connect()` to Unix sockets on disk, closing the dbus / systemd-user route out of the sandbox at the cost of socket-based clients like `docker` and `psql`. Between v3 and v9 that right does not exist, so a sandboxed shell can still invoke state-mutating dbus methods; meka warns at startup naming what the running ABI lacks. Kept as the lighter-weight fallback for hosts without Bubblewrap.
-
-When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. No command writes this field; leave it unset to keep auto-detection.
-
-If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `execute_command` at `read` hard-errors with a message naming the configured backend and the specific failure reason. `read` is not blocked for other tools; only `execute_command` requires a usable sandbox.
-
-Overridable for one run with `meka --sandbox-backend landlock|bubblewrap`, and for a whole
-environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
-
-Default: unset (auto-detect). Ignored on macOS and Windows.
-
-```toml
-[shell]
-sandbox = true
-sandbox_backend = "bubblewrap"  # or "landlock"
-```
-
-## `[permissions]`
-
-Controls which permission levels are reachable at runtime and which level the session starts at. See the [Permissions](../usage/permissions.md) page for what each level does.
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `default` | No | Level the session starts at. One of `"none"`, `"read"`, `"workspace"`, `"unrestricted"`. Default `"read"`. Overridden by `--permission` and `MEKA_PERMISSION`. |
-| `enabled` | No | List of levels that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "workspace", "unrestricted"]`. Disabled levels are skipped during Shift+Tab cycling and refused by `/permission` with an error. |
-| `approvals` | No | Whether a new session starts with [approvals](../usage/permissions.md#approvals) on: a tool call needing more than the session's level is put to you rather than refused. Default `false`. A session records its own switch afterwards, moved by `/approvals`, `PATCH /v1/sessions/{id}` or the ACP `approvals` config option. |
-
-A level meka does not have is refused at parse, with the line. An `enabled` list that names nothing falls back to `read` alone, with a warning, rather than to the default set, so an empty list cannot widen authority. If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest enabled level (in `none → read → workspace → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled level: meka warns and starts at the configured default rather than refusing to launch.
-
-```toml
-[permissions]
-default = "read"
-enabled = ["none", "read", "workspace", "unrestricted"]
-approvals = true   # ask me about anything above the level instead of refusing it
-```
-
-## `[session]`
-
-Settings for session history retention and context window management.
-
-### `session.retention`
-
-Delete sessions not updated for longer than this, at agent startup. A duration string like `"30d"` or `"12h"`. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
-
-Two kinds of session are spared whatever their timestamp says, and the sweep reports how many it left behind. A session another meka process has open is skipped: only turns bump `updated_at`, and resuming does not, so a REPL sitting at its prompt past the window looks expired while somebody is in front of it. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
-
-**Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session delete --older-than-days <DAYS>` to prune manually instead.
-
-```toml
-[session]
-retention = "30d"
-```
-
-### `session.auto_compact`
-
-Automatically compact the conversation once it is past `context_ceiling_percent` of the context window, between turns or between two tool rounds of one turn. Compaction summarizes older messages and preserves recent ones, the todo list, and scratchpad entries. Off changes nothing else: a whole `scratchpad_read` still stops at the ceiling, and a request past the window fails the turn.
-
-Default: `true`
-
-```toml
-[session]
-auto_compact = false
-```
-
-### `session.context_ceiling_percent`
-
-The share of the context window meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
-
-What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the default leaves 100k tokens on a 1M window against a Claude reply budget of 64000, and on a small window it needs lowering, or `max_output_tokens` does.
-
-Default: `90`
-
-```toml
-[session]
-context_ceiling_percent = 70
-```
-
-### `session.compact_checkpoint`
-
-Run a *checkpoint turn* before each compaction, in which the agent saves anything that must outlive the window and writes the replacement summary itself. See [Compacting a session](../usage/sessions.md#compacting-a-session).
-
-Costs one extra model call per compaction. Turning it off falls back to a standalone summarizer that has no tools and none of the agent's identity, so it cannot save to memory and cannot apply any judgment about what this particular agent is for.
-
-Note that this applies to automatic compactions too, so an unattended checkpoint can write memory with nobody watching.
-
-Default: `true`
-
-```toml
-[session]
-compact_checkpoint = false
-```
-
-### `session.context_window`
-
-Override the model's context window size (in tokens). Used for the context ceiling. A per-profile `[profiles.<name>].context_window` takes precedence over this.
-
-When neither is set, meka assumes **1000000**. It does not infer the window from the model name, query the provider's models API, or cache anything: the window is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, and the user is the one who knows the truth.
-
-1M suits the current flagship models and overshoots the smaller and older ones. Overshooting is survivable rather than free: planned compaction never fires, so those sessions compact only after the provider rejects an over-long request, paying a wasted round trip each time. Set the real window on any profile whose model is smaller.
-
-```toml
-[session]
-context_window = 200000
-```
-
-### `session.subagent_max_depth`
-
-Maximum recursion depth for sub-agents spawned via [`agent_spawn`](../tools/overview.md#agent_spawn). The root agent spawns at depth 1, its sub-agents at depth 2, and so on; each level below this limit is granted its own `agent_spawn`. `1` reproduces the historical behavior where sub-agents cannot spawn further sub-agents; `0` disables `agent_spawn` entirely. An agent can tune a subtree with the tool's `max_depth` parameter, but a built-in absolute cap always bounds real nesting so recursion can't run away.
-
-Default: `3`
-
-```toml
-[session]
-subagent_max_depth = 3
-```
-
-## `[thinking]`
-
-Presentation and budget settings for extended thinking (`anthropic-messages` and `claude-subscription` backends). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key, not a setting here.
-
-While the model is thinking, the REPL draws a live `Thinking...` line so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`Thinking... (150 tokens)`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the line stays bare. The count is coarse: a progress signal, not an accounting figure.
-
-When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead. Nothing is drawn when output is piped or redirected, since there is no terminal to redraw on.
-
-### `thinking.budget`
-
-Maximum number of tokens the model can use for thinking. Read only under [`thinking = "budgeted"`](#thinking); the adaptive encoding lets the model set its own budget and sends no cap. A per-profile [`[profiles.<name>].thinking_budget`](#thinking_budget) takes precedence over this.
-
-Default: `16000`
-
-### `thinking.show_content`
-
-Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width), and the history replayed on resume (`resume_show_recent`) omits it entirely. Emphasis on that line is styling rather than text, so a summary's `**Bold header**` reads as a bold header there too.
-
-When `true`, the block streams to stderr as it arrives, behind the same dimmed `Thinking... ` label, with every line after the first indented by two spaces. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text, and the live `Thinking... (N tokens)` indicator retires as soon as the first words arrive, since the text is the better progress signal.
-
-Formatting follows [`display.render_mode`](#displayrender_mode), with one difference: reasoning is painted entirely in dark gray, so emphasis carries as bold or italic rather than as color. That is what keeps a thinking block readable as a footnote rather than as the reply. Under `termimad` the markdown is rendered, so a reasoning summary's `**Bold header**` arrives as a bold header instead of as asterisks; under `raw` and `syntect` the source is shown as written, which for reasoning means those two produce the same output. Fenced code keeps its fences and is not syntax-highlighted, for the same reason.
-
-Either way the block is still sent on subsequent turns, for reasoning continuity.
-
-One cost to know about: a turn that has streamed you reasoning will not retry a transient provider failure. meka retries only while nothing the model produced has reached you, since a second attempt would repeat it, and reasoning is the first thing a turn produces. Under the default the deltas are discarded and the one-line preview is built from the completed block, so nothing is repeatable and retries behave as they always have.
-
-Default: `false`
-
-```toml
-[thinking]
-budget = 20000
-show_content = true
-```
-
-## Instructions
-
-Standing instructions are **not** a config key. They live at a conventional path beside `config.toml`, because prose long enough to be worth writing is miserable to maintain inside a TOML string:
-
-```
-~/.config/meka/
-├── config.toml
-├── instructions.md      # or instructions/*.md
-└── skills/
-```
-
-See [Instructions](../usage/instructions.md) for the full picture. In short: write `instructions.md`, or split a large set across `instructions/*.md`, and meka reads it at startup into the `## User Instructions` section of the system prompt. To pass the text as a string instead (containers, CI), use `MEKA_INSTRUCTIONS`, `MEKA_INSTRUCTIONS_FILE`, or `--instructions`.
-
 ## `[mcp]`
 
 Which MCP servers to connect to, and what their tools are allowed to do. The [MCP](../usage/mcp.md)
@@ -1391,6 +883,64 @@ redirect_port = 8400
 
 If `client_id` is omitted, meka attempts [dynamic client registration](https://datatracker.ietf.org/doc/html/rfc7591) with the server.
 
+## `[permissions]`
+
+Controls which permission levels are reachable at runtime and which level the session starts at. See the [Permissions](../usage/permissions.md) page for what each level does.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `default` | No | Level the session starts at. One of `"none"`, `"read"`, `"workspace"`, `"unrestricted"`. Default `"read"`. Overridden by `--permission` and `MEKA_PERMISSION`. |
+| `enabled` | No | List of levels that can be reached at runtime via `/permission` and Shift+Tab. Default `["none", "read", "workspace", "unrestricted"]`. Disabled levels are skipped during Shift+Tab cycling and refused by `/permission` with an error. |
+| `approvals` | No | Whether a new session starts with [approvals](../usage/permissions.md#approvals) on: a tool call needing more than the session's level is put to you rather than refused. Default `false`. A session records its own switch afterwards, moved by `/approvals`, `PATCH /v1/sessions/{id}` or the ACP `approvals` config option. |
+
+A level meka does not have is refused at parse, with the line. An `enabled` list that names nothing falls back to `read` alone, with a warning, rather than to the default set, so an empty list cannot widen authority. If `default` is not in `enabled`, meka logs a warning and falls back to `read` if it's enabled, otherwise the lowest enabled level (in `none → read → workspace → unrestricted` order). Same behavior if `--permission` or `MEKA_PERMISSION` selects a disabled level: meka warns and starts at the configured default rather than refusing to launch.
+
+```toml
+[permissions]
+default = "read"
+enabled = ["none", "read", "workspace", "unrestricted"]
+approvals = true   # ask me about anything above the level instead of refusing it
+```
+
+## `[shell]`
+
+Settings for shell command execution.
+
+### `shell.sandbox`
+
+Whether to enable read-only filesystem sandboxing for shell commands at `read`. When enabled (default), shell commands can be executed at `read` and `workspace` but with the filesystem write-protected outside the workspace roots. When disabled, shell commands require `unrestricted`.
+
+Default: `true`
+
+```toml
+[shell]
+sandbox = false  # disable the sandboxed shell at read
+```
+
+The sandbox uses one of two backends on Linux (see [`shell.sandbox_backend`](#shellsandbox_backend)), `sandbox-exec` on macOS, and a duplicated Low-integrity primary token on Windows. On platforms where no backend is usable, shell commands always require `unrestricted` regardless of this setting.
+
+### `shell.sandbox_backend`
+
+Linux-only choice between `"landlock"` and `"bubblewrap"`:
+
+- **Bubblewrap** (`"bubblewrap"`) wraps the command in `bwrap` with read-only bind of `/`, tmpfs masks over `/run` / `/tmp` / `/var/tmp` / `$XDG_RUNTIME_DIR`, and `--unshare-user --unshare-pid --unshare-uts --unshare-ipc`. The tmpfs masks hide the dbus session bus and the systemd-user socket, so state-changing IPC calls like `systemctl --user start` and `dbus-send` fail. Network is intentionally not unshared so `curl http://x | pdftotext` still works. Requires the `bubblewrap` package and a kernel with user-namespace creation enabled.
+- **Landlock** (`"landlock"`) uses the Landlock LSM to block filesystem writes, and requires **ABI v3 (kernel 6.2+)**: below that `truncate(2)` is unmediated, so a command at `read` could still empty a file, and meka reports the backend unusable instead. On kernel 7.1+ (ABI v9) it also blocks `connect()` to Unix sockets on disk, closing the dbus / systemd-user route out of the sandbox at the cost of socket-based clients like `docker` and `psql`. Between v3 and v9 that right does not exist, so a sandboxed shell can still invoke state-mutating dbus methods; meka warns at startup naming what the running ABI lacks. Kept as the lighter-weight fallback for hosts without Bubblewrap.
+
+When omitted, meka probes Bubblewrap once at startup. If Bubblewrap is available it auto-picks it; otherwise it auto-picks Landlock and emits a one-shot warning nudging you to install `bubblewrap` for stronger protection. Set the field explicitly to either value (including `"landlock"`) to suppress that warning. No command writes this field; leave it unset to keep auto-detection.
+
+If the configured backend can't be used at runtime (bwrap not installed, user namespaces denied, etc.), `execute_command` at `read` hard-errors with a message naming the configured backend and the specific failure reason. `read` is not blocked for other tools; only `execute_command` requires a usable sandbox.
+
+Overridable for one run with `meka --sandbox-backend landlock|bubblewrap`, and for a whole
+environment with `MEKA_SANDBOX_BACKEND`. Precedence is flag, then environment, then this field.
+
+Default: unset (auto-detect). Ignored on macOS and Windows.
+
+```toml
+[shell]
+sandbox = true
+sandbox_backend = "bubblewrap"  # or "landlock"
+```
+
 ## `[tools]`: built-in tool filters
 
 The three knobs `[[mcp.servers]]` exposes for MCP tools also apply to meka's built-in tools (`read_file`, `write_file`, `execute_command`, etc.) via a top-level `[tools]` table. MCP per-server filtering is separate from this and keeps its own namespaces; this block only affects the built-ins.
@@ -1563,6 +1113,456 @@ Setting `enabled = false` keeps the `background` property out of every tool sche
 Outcome delivery shares [`[schedule].poll_interval`](#schedule), so that key sets how long a finished task waits before it is reported, whether or not scheduling itself is enabled.
 
 Config-only, like the blocks above: no environment variable, no CLI flag.
+
+## `[session]`
+
+Settings for session history retention and context window management.
+
+### `session.retention`
+
+Delete sessions not updated for longer than this, at agent startup. A duration string like `"30d"` or `"12h"`. Uses `updated_at`, so an actively-resumed session is preserved even if created long ago. Deletions are reported at `warn` level.
+
+Two kinds of session are spared whatever their timestamp says, and the sweep reports how many it left behind. A session another meka process has open is skipped: only turns bump `updated_at`, and resuming does not, so a REPL sitting at its prompt past the window looks expired while somebody is in front of it. And a session with a scheduled job still ahead of it is never expired, nor is any parent of one: a gated watcher that evaluates every tick and rarely fires looks untouched for exactly as long as it is working, and deleting it would take the schedule with it.
+
+**Default: unset, meaning nothing is deleted.** `"0s"` is refused at startup, since it would delete everything on every launch. Conversation history isn't reproducible, so meka keeps it until told otherwise. Use `meka session delete --older-than-days <DAYS>` to prune manually instead.
+
+```toml
+[session]
+retention = "30d"
+```
+
+### `session.auto_compact`
+
+Automatically compact the conversation once it is past `context_ceiling_percent` of the context window, between turns or between two tool rounds of one turn. Compaction summarizes older messages and preserves recent ones, the todo list, and scratchpad entries. Off changes nothing else: a whole `scratchpad_read` still stops at the ceiling, and a request past the window fails the turn.
+
+Default: `true`
+
+```toml
+[session]
+auto_compact = false
+```
+
+### `session.context_ceiling_percent`
+
+The share of the context window meka lets the conversation fill on its own. Two things happen at the line: with `auto_compact` on, the conversation is compacted once past it; and a whole `scratchpad_read` that would carry the context past it is cut there and says where to continue, whether or not compaction is on. Refused outside 1 through 100.
+
+What is left above the line has to hold the reply and one round's growth past it, so keep at least your output budget plus a round free: the default leaves 100k tokens on a 1M window against a Claude reply budget of 64000, and on a small window it needs lowering, or `max_output_tokens` does.
+
+Default: `90`
+
+```toml
+[session]
+context_ceiling_percent = 70
+```
+
+### `session.compact_checkpoint`
+
+Run a *checkpoint turn* before each compaction, in which the agent saves anything that must outlive the window and writes the replacement summary itself. See [Compacting a session](../usage/sessions.md#compacting-a-session).
+
+Costs one extra model call per compaction. Turning it off falls back to a standalone summarizer that has no tools and none of the agent's identity, so it cannot save to memory and cannot apply any judgment about what this particular agent is for.
+
+Note that this applies to automatic compactions too, so an unattended checkpoint can write memory with nobody watching.
+
+Default: `true`
+
+```toml
+[session]
+compact_checkpoint = false
+```
+
+### `session.context_window`
+
+Override the model's context window size (in tokens). Used for the context ceiling. A per-profile `[profiles.<name>].context_window` takes precedence over this.
+
+When neither is set, meka assumes **1000000**. It does not infer the window from the model name, query the provider's models API, or cache anything: the window is a local budgeting number that is never sent on the wire, so a wrong value can't fail a request, and the user is the one who knows the truth.
+
+1M suits the current flagship models and overshoots the smaller and older ones. Overshooting is survivable rather than free: planned compaction never fires, so those sessions compact only after the provider rejects an over-long request, paying a wasted round trip each time. Set the real window on any profile whose model is smaller.
+
+```toml
+[session]
+context_window = 200000
+```
+
+### `session.subagent_max_depth`
+
+Maximum recursion depth for sub-agents spawned via [`agent_spawn`](../tools/overview.md#agent_spawn). The root agent spawns at depth 1, its sub-agents at depth 2, and so on; each level below this limit is granted its own `agent_spawn`. `1` reproduces the historical behavior where sub-agents cannot spawn further sub-agents; `0` disables `agent_spawn` entirely. An agent can tune a subtree with the tool's `max_depth` parameter, but a built-in absolute cap always bounds real nesting so recursion can't run away.
+
+Default: `3`
+
+```toml
+[session]
+subagent_max_depth = 3
+```
+
+## `[thinking]`
+
+Presentation and budget settings for extended thinking (`anthropic-messages` and `claude-subscription` backends). Whether thinking is on, and which wire encoding it uses, is the per-profile [`thinking`](#thinking) key, not a setting here.
+
+While the model is thinking, the REPL draws a live `Thinking...` line so a long pause reads as work rather than as a hang. On `claude-subscription` it carries the server's own running estimate (`Thinking... (150 tokens)`), redrawn in place as the count climbs; `anthropic-messages` does not report one, so the line stays bare. The count is coarse: a progress signal, not an accounting figure.
+
+When the block ends the line stays on screen as a record that the phase happened; if the model returned readable reasoning, that text replaces the line instead. Nothing is drawn when output is piped or redirected, since there is no terminal to redraw on.
+
+### `thinking.budget`
+
+Maximum number of tokens the model can use for thinking. Read only under [`thinking = "budgeted"`](#thinking); the adaptive encoding lets the model set its own budget and sends no cap. A per-profile [`[profiles.<name>].thinking_budget`](#thinking_budget) takes precedence over this.
+
+Default: `16000`
+
+### `thinking.show_content`
+
+Whether to show the whole text of a thinking block. When `false`, a block carrying readable reasoning is previewed as a single dimmed line, flattened across line breaks and cut to fit [`display.max_width`](#displaymax_width), and the history replayed on resume (`resume_show_recent`) omits it entirely. Emphasis on that line is styling rather than text, so a summary's `**Bold header**` reads as a bold header there too.
+
+When `true`, the block streams to stderr as it arrives, behind the same dimmed `Thinking... ` label, with every line after the first indented by two spaces. There is no height limit: asking to see the reasoning is asking to see all of it. On a model that streams its whole chain of thought this is the difference between a token counter and the text, and the live `Thinking... (N tokens)` indicator retires as soon as the first words arrive, since the text is the better progress signal.
+
+Formatting follows [`display.render_mode`](#displayrender_mode), with one difference: reasoning is painted entirely in dark gray, so emphasis carries as bold or italic rather than as color. That is what keeps a thinking block readable as a footnote rather than as the reply. Under `termimad` the markdown is rendered, so a reasoning summary's `**Bold header**` arrives as a bold header instead of as asterisks; under `raw` and `syntect` the source is shown as written, which for reasoning means those two produce the same output. Fenced code keeps its fences and is not syntax-highlighted, for the same reason.
+
+Either way the block is still sent on subsequent turns, for reasoning continuity.
+
+One cost to know about: a turn that has streamed you reasoning will not retry a transient provider failure. meka retries only while nothing the model produced has reached you, since a second attempt would repeat it, and reasoning is the first thing a turn produces. Under the default the deltas are discarded and the one-line preview is built from the completed block, so nothing is repeatable and retries behave as they always have.
+
+Default: `false`
+
+```toml
+[thinking]
+budget = 20000
+show_content = true
+```
+
+## `[web]`
+
+Settings for the HTTP client `fetch_url` uses. All keys are optional; unset fields use the defaults shown below.
+
+| Key | Type | Default | Purpose |
+|---|---|---|---|
+| `user_agent` | string | Real Chrome UA | Some sites block non-browser UAs. Override if you need a specific identifier. |
+| `request_timeout` | duration | `"30s"` | Total request budget (connect + TLS + read). `"0s"` is refused at startup. |
+| `connect_timeout` | duration | unset | Separate cap on TCP + TLS handshake. Fail fast on unreachable hosts without shortening the whole request budget. `"0s"` is refused at startup. |
+| `read_timeout` | duration | unset | Per-chunk idle timeout. Catches bodies that stall mid-stream. `"0s"` is refused at startup. |
+| `max_redirects` | int | `10` | Cap on 3xx hops. `0` means no redirects are followed: a 3xx is returned as the response. |
+| `proxy` | string | unset (honors `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` env) | Proxy URL. Schemes: `http://`, `https://`, `socks5://`, `socks5h://`, `socks4://`. The literal string `"none"` explicitly disables env-var auto-detection. |
+| `ca_cert_file` | path | unset | Extra PEM bundle to trust on top of the system store. Useful for corporate MITM proxies or self-signed internal services. Accepts single-cert and multi-cert files. |
+| `https_only` | bool | `false` | Refuse plain `http://` URLs. |
+| `min_tls_version` | string | unset (reqwest default) | Minimum TLS version. Accepts `"1.0"`, `"1.1"`, `"1.2"`, `"1.3"`. Unknown values log a warning and fall through. Note: the bundled rustls backend supports only TLS 1.2 and 1.3; `"1.0"` / `"1.1"` will surface a build error. |
+| `danger_accept_invalid_certs` | bool | `false` | **DANGEROUS.** Disable TLS certificate validation entirely. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
+| `danger_accept_invalid_hostnames` | bool | `false` | **DANGEROUS.** Accept certificates whose hostname doesn't match. Emits a `warn!` on every startup when enabled. Only use against trusted local dev servers. |
+
+### Example: corporate proxy with a private CA
+
+```toml
+[web]
+proxy = "http://corp-proxy.internal:3128"
+ca_cert_file = "/etc/ssl/corp-root-ca.pem"
+min_tls_version = "1.2"
+request_timeout = "60s"
+```
+
+### Example: local testing against self-signed certs
+
+```toml
+[web]
+# Route everything through a local SOCKS proxy you control.
+proxy = "socks5h://127.0.0.1:1080"
+# Accept self-signed certs on dev.local, KEEP THIS OFF IN PROD.
+danger_accept_invalid_certs = true
+```
+
+### Example: fail-fast timeouts
+
+```toml
+[web]
+request_timeout = "5s"
+connect_timeout = "2s"
+max_redirects = 0
+```
+
+## `[display]`
+
+Settings for output formatting.
+
+### `display.render_mode`
+
+Output render mode. Equivalent to the `--render-mode` CLI flag.
+
+| Value | Description |
+|-------|-------------|
+| `syntect` | Syntax-highlighted markdown source, incl. per-language code blocks; never reflowed |
+| `termimad` | Rendered CommonMark, reflowed to the terminal: paragraphs re-wrap, wide tables wrap, markers are consumed. Same theme colors as `syntect`, and code blocks are highlighted by it. The default |
+| `raw` | Raw markdown printed verbatim with aligned tables |
+
+Default: `termimad`
+
+Reflowing only happens when there is a terminal to reflow to. With output redirected or piped,
+`termimad` renders without wrapping, so a captured answer is not hard-wrapped to some fallback
+width.
+
+```toml
+[display]
+render_mode = "raw"
+```
+
+### `display.max_width`
+
+Widest line meka composes from model output, in terminal columns.
+
+Default: unset, meaning the terminal's own width, so nothing ever wraps.
+
+Set it to pin the width instead:
+
+```toml
+[display]
+max_width = 120
+```
+
+A set value is honored exactly rather than clamped to the terminal, because pinning it is how you
+get identical output across machines and a silent clamp would take that away on the narrow one. The
+cost is that a value wider than your terminal wraps, and a wrapped row starts at column zero, where
+meka's own output lives. Below 40 columns the value is clamped up and a warning is logged: every
+budget subtracts fixed chrome first, and below roughly that the subtraction leaves nothing. Above
+1000 it is clamped down, also with a warning, since no terminal is that wide and the value is far
+more likely to be a typo than a request.
+
+This covers meka's own output: tool indicators and their argument block, thinking previews, todo
+lists, and the approval prompt. Assistant markdown is not affected and keeps reflowing to the
+real terminal through [`display.render_mode`](#displayrender_mode). With output piped there is no
+terminal to measure, so an unset width falls back to 100 columns and a captured run stays byte-stable.
+
+A terminal narrower than 20 columns is treated as 20. That is not a legibility judgment: the
+thinking block's own prefix is twelve columns, so below roughly that meka's chrome no longer fits and
+the width stops meaning anything. Such a terminal wraps meka's output whatever the number says.
+
+### `display.tool_params`
+
+How much of a tool call's input the `[tool ...]` indicator shows.
+
+This setting covers the indicator only. With approvals on, the approval prompt always shows every
+argument, whatever this is set to: the indicator is a notification, the prompt is a decision,
+and setting `off` for a quiet scrollback must not leave you approving calls you cannot see.
+
+| Value | Description |
+|-------|-------------|
+| `off` | Name only: `[tool execute_command]`. No argument reaches your terminal |
+| `summary` | Name plus the one argument that identifies the call: ``[tool execute_command(`cargo test`)]`` (default) |
+| `full` | Every argument, as an indented block under the name |
+
+Default: `summary`
+
+`full` writes each parameter on its own line. A value that fits on a line follows its key; one that
+does not gets an indented block under a bare `key:`, so a multi-line `edit_file` argument stays
+readable instead of collapsing into escaped newlines. Nesting is carried by indentation, with `-`
+for array elements:
+
+```
+[tool edit_file]
+  path: src/render.rs
+  old_string:
+    let first_line = thinking.lines().next().unwrap_or("");
+    let truncated = truncate_display(first_line, 80);
+
+[tool agent_spawn]
+  prompt: Audit the scheduler for missed-occurrence bugs
+  tools:
+    - read_file
+    - search_contents
+```
+
+Consecutive calls are separated by a blank line under `full`, since each one is a block and running
+them together reads as a single call with too many parameters. Under `summary` they stay flush, which
+is what makes a run of them read as a list of steps.
+
+This is a reading format, not a data format: quotes are dropped, so `timeout: 300` doesn't say
+whether the model sent `300` or `"300"`. Four caps keep one call from filling the screen, and each
+says what it hid:
+
+| Cap | Limit | Marker |
+|-----|-------|--------|
+| One argument's value | 30 lines | `... N more lines`, indented under that argument |
+| One argument's rows | 32 rows | `... N more rows`, indented under that argument |
+| The block | 60 rows, checked at an argument boundary | `... N more arguments: name, name` |
+| One line | [`display.max_width`](#displaymax_width) | `...` at the cut |
+
+The first two caps look redundant and are not. A string value has lines to count, so it is trimmed
+by line and the marker counts lines. An array or an object has none: it fans out one row per element,
+so it needs a bound counted in rows, and the marker says rows rather than pretending they were lines.
+
+The line cap is exact, brackets and indentation included. The block cap is not: it is checked before
+an argument is rendered rather than after, so the block reaches at most the block cap plus one
+argument's own budget plus the line naming what went: 93 rows.
+
+The block cap drops whole arguments and names them rather than cutting wherever row 60 lands.
+Knowing that `path` was passed but not shown beats seeing 60 rows of `content` and never learning
+which file it was written to.
+
+**A cut keeps the end.** Where a whole argument is dropped it is named; where rows are dropped the
+last one is kept, so a long array still shows its final element and a trimmed value still shows how
+it finishes. The reasoning is the same one that elides a long path from its middle rather than its
+tail: the end of a thing too big to show is usually the half that identifies it.
+
+When you need the exact JSON a tool was called with, `meka session export` has it, untruncated and
+unflattened.
+
+**`full` puts every argument on screen, secrets included.** `summary` shows only the one argument
+that identifies a call (`write_file`'s path, `fetch_url`'s URL), so a request header carrying a token
+or a file body carrying a key stayed off screen. `full` shows all of them, and replayed history
+reprints them on every `/history` and every resume. meka never puts its own credentials into tool
+arguments, so what appears is what the model itself passed, but that is worth knowing before turning
+this on where somebody can read over your shoulder or your scrollback.
+
+Values are escape-stripped, their newlines and carriage returns flattened, and Unicode format
+characters (bidi overrides, soft hyphens, zero-width joiners) removed, so an argument cannot move
+your cursor, reorder what you read, or place text at column zero where meka's own output lives.
+
+No line exceeds [`display.max_width`](#displaymax_width), so by default nothing wraps and no row ever
+begins with model text. Setting `max_width` wider than your terminal gives that up, which is the one
+case where a long argument can still produce a row starting flush left.
+
+One residual caveat: the `... N more lines`, `... N more rows` and `... N more arguments` markers are
+ordinary text, so an argument whose content mimics one is indistinguishable from a real elision. That
+does not let an argument run anything, but it can mislead a reader who is not expecting it.
+
+Applies to the REPL, to one-shot runs (`meka --oneshot`), and to replayed history (`/history`,
+`resume_show_recent`). ACP sends structured tool-call fields to the editor and the HTTP API's SSE
+events already carry the raw input, so neither is affected.
+
+```toml
+[display]
+tool_params = "full"
+```
+
+### `display.show_session_id_on_create`
+
+Whether to display the session id when a new session is created.
+
+Default: `false`
+
+### `display.show_session_id_on_resume`
+
+Whether to display the session id when a session is resumed with `-c` or `-r`.
+
+Default: `true`
+
+### `display.show_session_id_on_exit`
+
+Whether to display the session id when meka exits.
+
+Default: `true`
+
+```toml
+[display]
+show_session_id_on_create = true
+show_session_id_on_resume = false
+show_session_id_on_exit = false
+```
+
+### `display.show_path_in_prompt`
+
+Whether to show the current working directory in the interactive prompt.
+
+Default: `true`
+
+### `display.show_context_in_prompt`
+
+Whether to show a live context-window gauge in the interactive prompt, e.g. `128.4k/1.0M 13%` (tokens in context / model window / percent used). The figure comes from the most recent turn's reported usage (and an estimate right after `/compact` or on resume), the same value `/status` shows on its `Context:` line. Hidden until the first turn produces a measurement.
+
+Default: `false`
+
+### `display.newline_before_prompt`
+
+Whether to add a blank line before the prompt, after whatever the previous line produced.
+
+Default: `true`
+
+### `display.newline_after_prompt`
+
+Whether to add a blank line after the line you typed, before its output. On a resume there is no typed line: the `Resuming session:` banner takes its place, and this is the blank between that banner and whatever follows it, normally the replayed history. With the banner hidden, the history sits directly under your shell's command line.
+
+Default: `true`
+
+Both apply to **anything printed between two prompts**, not only agent responses. That span is the
+unit, whatever filled it: a turn, a slash command's output (`/task`, `/memory`, `/help`, …), an
+error, a scheduled job waking the shell to run several turns at once, or any combination. It is
+bracketed once, by whichever of those printed first and last, never once per turn inside it, and
+never twice because two things both thought they owned the spacing.
+
+Both space output away from *meka's* prompt, so neither applies at the edges of a run, where the
+prompt is your shell's. Whatever meka prints before drawing its first prompt sits directly under the
+command you typed (`Resuming session:` on a resume, or the answer to a prompt you passed on the
+command line), and its last line is followed straight by the shell prompt. Start meka with no
+prompt and there is nothing above its first prompt to space away from, so the rule never comes up.
+
+The blank lines bracket output, so **a span that prints nothing gets neither**, and leaves the
+screen exactly as it found it. In practice every slash command says something, even if only that a
+list is empty. Three cases where nothing is printed and nothing is spaced: a successful `/cd`,
+because the prompt itself is the confirmation; a successful `/clear`, because the cleared screen is;
+and a scheduled wake that finds nothing left to run. `!command` is the one exception in the other
+direction: it is always bracketed, because meka hands the terminal to the child process and never
+learns whether it wrote anything, so a silent `!touch file` still gets its blank lines.
+
+Turning a setting off removes that blank line and nothing else. The spacing *between* blocks of a
+single response (a tool indicator and the answer that follows it, or a thinking block and the text
+after it) is not controlled by either flag and does not change.
+
+### `display.show_token_usage`
+
+When `true`, meka prints a one-line per-turn token-usage summary to stderr after each turn:
+
+```
+[in 12.3k / cache hit 96% / out 1.2k]
+```
+
+The `in` column is the total of all three Anthropic input tiers (live, cache-write, cache-read); `cache hit %` is `cache_read / total_in`. Useful for monitoring caching effectiveness during long sessions. The `/status` slash command surfaces cumulative session stats in the same vein.
+
+Default: `false`
+
+### `display.stream`
+
+Whether the answer streams to the terminal as it arrives, or lands whole when the turn ends. The
+`--no-stream` flag turns streaming off for one run; this key is the standing preference, and it
+applies to sub-agents as well.
+
+Default: `true`
+
+```toml
+[display]
+stream = false
+```
+
+### `display.resume_show_recent`
+
+When set to a positive integer `N`, resuming a session reprints the **last `N` turns** (each turn = the user's prompt plus everything the agent did in response, styled to match the live REPL) instead of just the last assistant message.
+
+Useful when you regularly resume long-running sessions and want more context than the single-message default. Inside a session, the `/history` slash command provides the same rendering on demand (`/history` dumps everything; `/history N` shows the last N turns).
+
+Default: unset (resume reprints only the last assistant message, today's behavior).
+
+```toml
+[display]
+resume_show_recent = 3
+```
+
+### `display.input_style`
+
+Visual style applied to a REPL prompt once it is submitted. Makes past prompts easy to spot when scrolling back through a long session. A line still being edited keeps the terminal's own colors; the style arrives on reedline's final paint, which is the one that lands in scrollback.
+
+The leading `/command` token is a separate signal and is colored as you type, green when meka recognizes the command and red when it does not. This setting does not affect it.
+
+Accepted values:
+- `default` (or unset): bold white-ish foreground on a slate-blue background, rendered in truecolor RGB so it looks the same across terminal themes.
+- `none`: disable styling entirely.
+- `reverse`: reverse video (swaps the terminal's current foreground and background).
+- `bold`, `dim`, `italic`, `underline`: single attribute, no color change.
+- A color name (`black`, `red`, `green`, `yellow`, `blue`, `magenta` / `purple`, `cyan`, `white`): set only the foreground, mapped to the terminal's palette.
+
+Unknown values warn at startup and fall back to `default`.
+
+Default: the banner preset described above.
+
+```toml
+[display]
+show_path_in_prompt = false
+newline_before_prompt = false
+newline_after_prompt = false
+input_style = "none"    # or "cyan", "bold", "dim", etc.
+```
 
 ## `[serve]`
 

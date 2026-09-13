@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** a background task reports `tool` and `scratchpad_entry` on the HTTP API and webhook.
 - **Breaking:** a memory's creation stamp is `created_at` over HTTP and `created` in an export.
 - **Breaking:** a session archive holds `scratchpad_entries`, not `tool_outputs`, as format 3.
+- `mekabox` instructs the agent not to create memories or scheduled jobs unless asked.
 
 ## [0.53.0] - 2026-09-13
 

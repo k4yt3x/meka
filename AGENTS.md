@@ -305,6 +305,13 @@ output; don't demote it to `info!`.
 - **Session and display tuning is config-only.** No env vars or flags for set-once preferences.
   Render mode is the one exception, because the program that launches meka, not the user, knows
   whether its output is a terminal.
+- **Config sections keep one order**, the same on the reference page (`config-file.md`) and in
+  `ConfigFile`'s fields, which is the order a file is best written in: the multi-entry blocks
+  first (`default_profile`, `[accounts.*]`, `[profiles.*]`, `[mcp]`), then each flat table from
+  the most to the least consequential (`[permissions]`, `[shell]`, `[tools]`, `[subagents]`,
+  `[skills]`, `[memory]`, `[schedule]`, `[background]`, `[session]`, `[thinking]`, `[web]`,
+  `[display]`), and `[serve]` last. A new section is placed by that rule in both, never appended,
+  and a note that is not a key goes in the page's intro, never between sections.
 
 ## A profile is indivisible
 

@@ -28,7 +28,8 @@ pub(crate) use profile::{
 
 /// In-memory shape of `config.toml`. Each top-level `[section]` deserializes into its own
 /// sub-struct; missing sections fall back to `Default`. This is the raw deserialized form;
-/// [`ResolvedConfig::resolve`] merges it with CLI flags and env vars.
+/// [`ResolvedConfig::resolve`] merges it with CLI flags and env vars. Fields sit in the order the
+/// config file page lists the sections, which the unknown-key error repeats to the user.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigFile {
@@ -42,19 +43,19 @@ pub(crate) struct ConfigFile {
     /// every model-tied setting.
     #[serde(default)]
     pub(crate) profiles: std::collections::BTreeMap<String, ProfileConfig>,
-    pub(crate) display: Option<DisplayConfig>,
-    pub(crate) web: Option<WebConfig>,
-    pub(crate) shell: Option<ShellConfig>,
-    pub(crate) session: Option<SessionConfig>,
-    pub(crate) thinking: Option<ThinkingConfig>,
     pub(crate) mcp: Option<McpConfig>,
+    pub(crate) permissions: Option<PermissionsConfig>,
+    pub(crate) shell: Option<ShellConfig>,
     pub(crate) tools: Option<ToolsConfig>,
+    pub(crate) subagents: Option<SubagentsConfig>,
     pub(crate) skills: Option<SkillsConfig>,
     pub(crate) memory: Option<MemoryConfig>,
-    pub(crate) permissions: Option<PermissionsConfig>,
     pub(crate) schedule: Option<ScheduleConfig>,
     pub(crate) background: Option<BackgroundConfig>,
-    pub(crate) subagents: Option<SubagentsConfig>,
+    pub(crate) session: Option<SessionConfig>,
+    pub(crate) thinking: Option<ThinkingConfig>,
+    pub(crate) web: Option<WebConfig>,
+    pub(crate) display: Option<DisplayConfig>,
     pub(crate) serve: Option<ServeConfig>,
 }
 

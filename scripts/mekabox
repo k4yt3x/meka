@@ -46,7 +46,9 @@ runtimes, and developer tooling as needed for the task. Container changes do not
 invocations except in mounted volumes.
 
 Limit all changes to within this container; do not attempt to modify the host system or rely on
-changes persisting outside mounted volumes.'
+changes persisting outside mounted volumes.
+
+Do not create memories or scheduled jobs unless the user explicitly asks for one.'
 
 # Launch the container
 exec "${sudo_prefix[@]}" "$runtime" run --rm -it \
